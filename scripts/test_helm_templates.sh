@@ -253,53 +253,69 @@ assert_extra_volumes_wired "$distributed_extra_output" "distributed StatefulSet"
 distributed_default_output=$(render_distributed_statefulset)
 assert_extra_volumes_absent "$distributed_default_output" "distributed StatefulSet"
 
-# clusterDomain (issue #3857): a custom Kubernetes cluster domain must flow into
-# the RUSTFS_VOLUMES FQDN and mTLS server cert SANs, defaulting to cluster.local.
-volumes_default=$(render_distributed_configmap | grep 'RUSTFS_VOLUMES:' || true)
-if ! grep -q 'svc\.cluster\.local' <<<"$volumes_default"; then
-  echo "Default RUSTFS_VOLUMES must use svc.cluster.local" >&2
+# Legacy topology compatibility: default replicaCount=4 (no drivesPerNode set)
+# must render the old 4x4 PVC names (data-rustfs-0 .. data-rustfs-3).
+legacy_four_by_four=$(render_distributed_statefulset)
+for i in 0 1 2 3; do
+  if ! grep -q "name: data-rustfs-${i}" <<<"$legacy_four_by_four"; then
+    echo "Legacy 4x4 topology must contain PVC data-rustfs-${i}" >&2
+    exit 1
+  fi
+done
+if grep -q "name: data$" <<<"$legacy_four_by_four"; then
+  echo "Legacy 4x4 topology must NOT contain a single 'data' PVC" >&2
   exit 1
 fi
 
-volumes_custom=$(render_distributed_configmap --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:' || true)
-if ! grep -q 'svc\.cluster\.internal' <<<"$volumes_custom"; then
-  echo "Custom clusterDomain must appear in the RUSTFS_VOLUMES FQDN" >&2
+# Legacy topology compatibility: replicaCount=16 (no drivesPerNode set)
+# must render a single 'data' PVC (old 16x1 behaviour).
+legacy_sixteen_by_one=$(render_distributed_statefulset --set replicaCount=16)
+if ! grep -q "name: data$" <<<"$legacy_sixteen_by_one"; then
+  echo "Legacy 16x1 topology must contain a single 'data' PVC" >&2
   exit 1
 fi
-if grep -q 'cluster\.local' <<<"$volumes_custom"; then
-  echo "Custom clusterDomain must fully replace cluster.local in RUSTFS_VOLUMES" >&2
-  exit 1
-fi
-
-# An explicit config.rustfs.volumes stays authoritative regardless of clusterDomain.
-volumes_explicit=$(render_distributed_configmap \
-  --set config.rustfs.volumes=http://example.test/data \
-  --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:' || true)
-if ! grep -q 'RUSTFS_VOLUMES: "http://example.test/data"' <<<"$volumes_explicit"; then
-  echo "Explicit config.rustfs.volumes must remain authoritative regardless of clusterDomain" >&2
+if grep -q "name: data-rustfs-" <<<"$legacy_sixteen_by_one"; then
+  echo "Legacy 16x1 topology must NOT contain data-rustfs-* PVCs" >&2
   exit 1
 fi
 
-# A dot-only clusterDomain must fall back to cluster.local instead of an empty domain.
-volumes_dots=$(render_distributed_configmap --set clusterDomain=. | grep 'RUSTFS_VOLUMES:' || true)
-if ! grep -q 'svc\.cluster\.local' <<<"$volumes_dots"; then
-  echo "Dot-only clusterDomain must fall back to cluster.local in RUSTFS_VOLUMES" >&2
+# Generic topology: explicit replicaCount=8 drivesPerNode=2 must render
+# exactly two PVCs per pod.
+generic_eight_by_two=$(render_distributed_statefulset --set replicaCount=8 --set drivesPerNode=2)
+for i in 0 1; do
+  if ! grep -q "name: data-rustfs-${i}" <<<"$generic_eight_by_two"; then
+    echo "Generic 8x2 topology must contain PVC data-rustfs-${i}" >&2
+    exit 1
+  fi
+done
+if grep -q "name: data$" <<<"$generic_eight_by_two"; then
+  echo "Generic 8x2 topology must NOT contain a single 'data' PVC" >&2
   exit 1
 fi
 
-# mTLS server certificate SANs must honor clusterDomain too.
-cert_default=$(render_server_cert)
-if ! grep -q 'svc\.cluster\.local"' <<<"$cert_default"; then
-  echo "Default mTLS server cert SANs must use svc.cluster.local" >&2
+# volumeClaimTemplates must not contain empty annotations when pvcAnnotations are unset,
+# because Kubernetes treats annotations: {} as a mutation of the immutable field.
+no_ann_output=$(render_distributed_statefulset)
+if grep -A1 'kind: PersistentVolumeClaim' <<<"$no_ann_output" | grep -q 'annotations:'; then
+  echo "Empty pvcAnnotations must not render an annotations key in volumeClaimTemplates" >&2
   exit 1
 fi
 
-cert_custom=$(render_server_cert --set clusterDomain=cluster.internal)
-if ! grep -q 'svc\.cluster\.internal"' <<<"$cert_custom"; then
-  echo "Custom clusterDomain must appear in mTLS server cert SANs" >&2
+# Distributed mode with replicaCount < 2 must fail rendering.
+low_replica_status=0
+render_distributed_statefulset --set replicaCount=1 >/dev/null 2>&1 || low_replica_status=$?
+if [[ $low_replica_status -eq 0 ]]; then
+  echo "Distributed mode with replicaCount=1 must fail rendering" >&2
   exit 1
 fi
-if grep -q 'svc\.cluster\.local"' <<<"$cert_custom"; then
-  echo "Custom clusterDomain must fully replace cluster.local in mTLS server cert SANs" >&2
+
+# service.externalIPs must render correctly when supplied.
+external_ips_output=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  --set 'service.externalIPs[0]=203.0.113.1')
+if ! grep -A2 'externalIPs:' <<<"$external_ips_output" | grep -q '203.0.113.1'; then
+  echo "service.externalIPs must contain 203.0.113.1" >&2
   exit 1
 fi

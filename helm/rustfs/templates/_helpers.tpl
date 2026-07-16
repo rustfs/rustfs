@@ -43,6 +43,19 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
+Render extra labels for the main Service resource.
+Merges (in order of increasing precedence):
+  - commonLabels
+  - service.labels
+*/}}
+{{- define "rustfs.serviceLabels" -}}
+{{- $labels := mergeOverwrite (dict) (default (dict) .Values.commonLabels) (default (dict) .Values.service.labels) }}
+{{- if $labels }}
+{{- toYaml $labels }}
+{{- end }}
+{{- end }}
+
+{{/*
 Selector labels
 */}}
 {{- define "rustfs.selectorLabels" -}}
@@ -224,6 +237,12 @@ One volume expression per server pool, joined with spaces (the server splits
 RUSTFS_VOLUMES on spaces, one pool per expression).
 */}}
 {{- define "rustfs.volumes" -}}
+{{- $replicas := int .Values.replicaCount -}}
+{{- $drives := int (include "rustfs.drivesPerNode" .) -}}
+{{- if lt $replicas 1 -}}
+{{- fail "rustfs.volumes requires .Values.replicaCount to be >= 1" -}}
+{{- end -}}
+
 {{- $protocol := "http" -}}
 {{- if .Values.mtls.enabled -}}
   {{- $protocol = "https" -}}
@@ -237,7 +256,7 @@ RUSTFS_VOLUMES on spaces, one pool per expression).
 {{- $n := int $pool.replicaCount -}}
 {{- if eq $n 4 -}}
 {{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port (sub $n 1)) -}}
-{{- else if eq $n 16 -}}
+{{- else -}}
 {{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port) -}}
 {{- end -}}
 {{- end -}}
