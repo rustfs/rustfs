@@ -30,6 +30,9 @@ pub enum SkipReason {
     EntryCap,
     /// Global `max_total_bytes` budget exhausted.
     ByteCap,
+    /// A line exceeded `max_line_bytes`; its tail was discarded (recorded once
+    /// per file — the truncated prefix is still parsed).
+    LineTooLong,
     /// A nested archive needed in-memory buffering beyond `max_in_memory_archive`.
     ArchiveTooLargeForMemory,
     /// IO/format error opening or reading this input.

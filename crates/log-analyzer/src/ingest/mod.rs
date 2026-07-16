@@ -47,6 +47,9 @@ pub struct IngestOptions {
     pub max_total_bytes: u64,
     /// Nested archives (which need Seek) are buffered in memory up to this. Default 512 MiB.
     pub max_in_memory_archive: u64,
+    /// Longest single line kept in memory; the excess is discarded (but still
+    /// counted against `max_total_bytes`) and disclosed once per file. Default 1 MiB.
+    pub max_line_bytes: usize,
 }
 
 impl Default for IngestOptions {
@@ -56,6 +59,7 @@ impl Default for IngestOptions {
             max_entries_per_archive: 10_000,
             max_total_bytes: 8 * 1024 * 1024 * 1024,
             max_in_memory_archive: 512 * 1024 * 1024,
+            max_line_bytes: 1024 * 1024,
         }
     }
 }
@@ -317,22 +321,30 @@ fn parse_lines(reader: &mut dyn Read, provenance: String, node: Option<Arc<str>>
     let mut buffered = BufReader::with_capacity(64 * 1024, reader);
     let mut raw = Vec::new();
     let mut line_no = 0u64;
+    let mut long_line_disclosed = false;
     loop {
         raw.clear();
-        let read = match std::io::BufRead::read_until(&mut buffered, b'\n', &mut raw) {
-            Ok(0) => break,
-            Ok(n) => n,
+        let remaining = ctx.opts.max_total_bytes - ctx.report.bytes_fed;
+        let line = match read_line_capped(&mut buffered, &mut raw, ctx.opts.max_line_bytes, remaining) {
+            Ok(line) => line,
             Err(_) => {
                 ctx.skip(file.to_string(), SkipReason::Unreadable);
                 break;
             }
         };
-        if ctx.report.bytes_fed + read as u64 > ctx.opts.max_total_bytes {
+        ctx.report.bytes_fed += line.consumed;
+        if line.hit_budget {
             ctx.byte_budget_exhausted = true;
             ctx.skip(file.to_string(), SkipReason::ByteCap);
             break;
         }
-        ctx.report.bytes_fed += read as u64;
+        if line.consumed == 0 {
+            break;
+        }
+        if line.truncated && !long_line_disclosed {
+            long_line_disclosed = true;
+            ctx.skip(file.to_string(), SkipReason::LineTooLong);
+        }
         line_no += 1;
         let text = String::from_utf8_lossy(&raw);
         let line = text.trim_end_matches(['\n', '\r']);
@@ -345,6 +357,64 @@ fn parse_lines(reader: &mut dyn Read, provenance: String, node: Option<Arc<str>>
     }
     ctx.report.files_parsed += 1;
     ctx.report.stats.merge(parser.stats());
+}
+
+struct LineRead {
+    /// Bytes consumed from the stream, including any discarded over-cap tail.
+    consumed: u64,
+    /// The line exceeded `max_line` and only its prefix is in the buffer.
+    truncated: bool,
+    /// Consuming the next chunk would exceed the global byte budget.
+    hit_budget: bool,
+}
+
+/// Bounded replacement for `read_until(b'\n')`: never grows `buf` beyond
+/// `max_line` and never consumes past `remaining`, so a single multi-GB line
+/// (a decompression bomb, or a corrupt file with no newlines) cannot allocate
+/// unboundedly before the caps are enforced (PR #4876 review).
+fn read_line_capped(
+    reader: &mut impl std::io::BufRead,
+    buf: &mut Vec<u8>,
+    max_line: usize,
+    mut remaining: u64,
+) -> std::io::Result<LineRead> {
+    let mut consumed = 0u64;
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(LineRead {
+                consumed,
+                truncated,
+                hit_budget: false,
+            });
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(available.len(), |pos| pos + 1);
+        if take as u64 > remaining {
+            return Ok(LineRead {
+                consumed,
+                truncated,
+                hit_budget: true,
+            });
+        }
+        let room = max_line.saturating_sub(buf.len());
+        let stored = take.min(room);
+        buf.extend_from_slice(&available[..stored]);
+        if stored < take {
+            truncated = true;
+        }
+        reader.consume(take);
+        consumed += take as u64;
+        remaining -= take as u64;
+        if newline.is_some() {
+            return Ok(LineRead {
+                consumed,
+                truncated,
+                hit_budget: false,
+            });
+        }
+    }
 }
 
 /// First path segment of an archive entry path, if any ("node1/rustfs.log"
@@ -552,6 +622,48 @@ mod tests {
         assert!(reasons.contains(&SkipReason::ByteCap));
         // The second file is skipped up-front once the budget is gone.
         assert_eq!(reasons.iter().filter(|r| **r == SkipReason::ByteCap).count(), 2);
+    }
+
+    #[test]
+    fn overlong_line_is_truncated_disclosed_and_fully_charged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // One 4 KiB line with no newline until the end, then a normal line.
+        let long = format!("ERROR long prefix {}\n{JSON_LINE}\n", "x".repeat(4096));
+        let path = write_file(dir.path(), "a.log", long.as_bytes());
+
+        let opts = IngestOptions {
+            max_line_bytes: 256,
+            ..Default::default()
+        };
+        let (events, report) = collect(&path, &opts);
+        // Truncated prefix still parses; the (shorter) JSON line after it is intact.
+        assert_eq!(events.len(), 2, "skipped: {:?}", report.skipped);
+        assert!(events[0].message.len() <= 256);
+        assert!(events[0].message.starts_with("ERROR long prefix"));
+        assert_eq!(events[1].kind, EventKind::Json);
+        // Discarded tail bytes still count against the global budget.
+        assert_eq!(report.bytes_fed, long.len() as u64);
+        // Disclosed exactly once per file.
+        assert_eq!(report.skipped.iter().filter(|(_, r)| *r == SkipReason::LineTooLong).count(), 1);
+        assert_eq!(report.files_parsed, 1);
+    }
+
+    #[test]
+    fn single_line_larger_than_byte_budget_stops_without_buffering_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A single huge line with no trailing newline: the pre-fix code buffered
+        // it whole via read_until before checking the cap.
+        let path = write_file(dir.path(), "bomb.log", "y".repeat(256 * 1024).as_bytes());
+
+        let opts = IngestOptions {
+            max_total_bytes: 1024,
+            max_line_bytes: 64,
+            ..Default::default()
+        };
+        let (events, report) = collect(&path, &opts);
+        assert!(events.is_empty());
+        assert!(report.bytes_fed <= opts.max_total_bytes);
+        assert_eq!(report.skipped.last().expect("skip").1, SkipReason::ByteCap);
     }
 
     #[test]

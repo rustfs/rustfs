@@ -176,6 +176,7 @@ fn reason_slug(reason: crate::ingest::SkipReason) -> &'static str {
         TooDeep => "too_deep",
         EntryCap => "entry_cap",
         ByteCap => "byte_cap",
+        LineTooLong => "line_too_long",
         ArchiveTooLargeForMemory => "archive_too_large_for_memory",
         Unreadable => "unreadable",
     }
