@@ -33,14 +33,14 @@ metrics = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 num_cpus = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 metrics-util = { version = "0.20", features = ["debugging"] }
-tokio = { workspace = true, features = ["test-util", "rt", "macros", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["test-util", "macros", "fs", "rt-multi-thread"] }
 
 [lints]
 workspace = true

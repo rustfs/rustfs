@@ -45,7 +45,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 
 [dev-dependencies]
 test-case.workspace = true
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 
 [features]
 default = ["crypto", "fips"]

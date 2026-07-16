@@ -68,7 +68,7 @@ hotpath = { workspace = true, optional = true }
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "notify", "server-config-model"] }
+rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
@@ -145,7 +145,7 @@ rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", 
 rustls-pki-types = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
-time = { workspace = true, features = ["parsing", "formatting", "serde", "std", "macros"] }
+time = { workspace = true, features = ["parsing", "formatting", "serde", "macros"] }
 
 # Utilities and Tools
 astral-tokio-tar = { workspace = true }

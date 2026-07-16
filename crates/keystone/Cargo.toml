@@ -26,13 +26,13 @@ categories = ["authentication", "web-programming"]
 authors.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["full", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["full"] }
 reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 moka = { workspace = true, features = ["future"] }
 rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }

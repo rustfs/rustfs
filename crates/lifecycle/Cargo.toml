@@ -32,7 +32,7 @@ rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-replication.workspace = true
 rustfs-storage-api.workspace = true
 s3s = { workspace = true, features = ["minio"] }
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 tracing.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
@@ -41,7 +41,7 @@ uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnos
 proptest = "1"
 serial_test.workspace = true
 temp-env.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "fs", "rt-multi-thread"] }
 
 [lints]
 workspace = true

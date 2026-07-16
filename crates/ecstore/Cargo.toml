@@ -49,7 +49,7 @@ rustfs-signer.workspace = true
 rustfs-storage-api.workspace = true
 rustfs-tls-runtime.workspace = true
 rustfs-checksums.workspace = true
-rustfs-config = { workspace = true, features = ["constants", "notify", "audit", "server-config-model"] }
+rustfs-config = { workspace = true, features = ["notify", "audit", "server-config-model"] }
 rustfs-concurrency.workspace = true
 rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
@@ -73,7 +73,7 @@ futures-util.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 serde = { workspace = true, features = ["derive"] }
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 bytesize.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
@@ -141,7 +141,7 @@ google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
 faster-hex = { workspace = true }
 ratelimit = { workspace = true }
-aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rustls-aws-lc"] }
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 
 # Observability and Metrics
 metrics = { workspace = true }

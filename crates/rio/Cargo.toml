@@ -35,7 +35,7 @@ hotpath = ["dep:hotpath", "hotpath/hotpath"]
 [dependencies]
 hotpath = { workspace = true, optional = true }
 arc-swap.workspace = true
-tokio = { workspace = true, features = ["full", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["full"] }
 rand = { workspace = true, features = ["serde"] }
 http.workspace = true
 aes-gcm = { workspace = true, features = ["rand_core"] }
