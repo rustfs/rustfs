@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
@@ -450,21 +451,81 @@ const REFRESH_JOINER_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// never overflow.
 const MAX_BACKGROUND_INTERVAL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-#[derive(Clone, Copy, Debug, Default)]
-struct WriteBucket {
-    second: u64,
-    count: usize,
+/// A single second-granular write bucket packed into one `u64` so it can be
+/// updated with a lock-free compare-and-swap. The high 32 bits hold the
+/// monotonic-second key, the low 32 bits hold the write count for that second.
+/// A per-second count never approaches `u32::MAX`, and the count saturates
+/// rather than wrapping into the second key (backlog#1315).
+#[derive(Default)]
+struct AtomicWriteBucket(AtomicU64);
+
+const WRITE_BUCKET_COUNT_MASK: u64 = 0xFFFF_FFFF;
+
+impl AtomicWriteBucket {
+    #[inline]
+    fn unpack(packed: u64) -> (u64, usize) {
+        let second = packed >> 32;
+        let count = (packed & WRITE_BUCKET_COUNT_MASK) as usize;
+        (second, count)
+    }
+
+    #[inline]
+    fn pack(second: u64, count: usize) -> u64 {
+        let count = (count as u64).min(WRITE_BUCKET_COUNT_MASK);
+        (second << 32) | count
+    }
+
+    /// Record one write for `now_second`, resetting the bucket if it holds a
+    /// different (older or future) second. Lock-free CAS loop tolerating
+    /// concurrent writers landing on the same bucket.
+    fn record(&self, now_second: u64) {
+        loop {
+            let current = self.0.load(Ordering::Acquire);
+            let (second, count) = Self::unpack(current);
+            let next = if second == now_second {
+                Self::pack(now_second, count.saturating_add(1))
+            } else {
+                Self::pack(now_second, 1)
+            };
+            if self
+                .0
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn snapshot(&self) -> (u64, usize) {
+        Self::unpack(self.0.load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    fn store(&self, second: u64, count: usize) {
+        self.0.store(Self::pack(second, count), Ordering::Release);
+    }
 }
 
-/// Write record for tracking write operations
-#[derive(Debug)]
+/// Lock-free write record for tracking write operations.
+///
+/// Previously guarded by an async `RwLock` taken on every successful write in
+/// the PUT response path; the write side is now a set of relaxed/CAS atomic
+/// updates so concurrent small-object PUTs no longer serialize on a single
+/// writer lock (backlog#1315). Counters use saturating arithmetic and monotonic
+/// second keys, preserving the exact debounce/frequency semantics the refresh
+/// scheduler relies on.
 pub struct WriteRecord {
-    /// Last write time
-    pub last_write_time: Option<Instant>,
-    /// Write count
-    pub write_count: usize,
+    /// Last write time, encoded as monotonic nanoseconds since `epoch`.
+    last_write_nanos: AtomicU64,
+    /// Whether any write has been recorded (`0` == never). Kept separate from
+    /// `last_write_nanos` so a genuine near-zero-nanos first write is still
+    /// distinguished from "no write yet".
+    has_write: AtomicU64,
+    /// Total write count (saturating). Observability only.
+    write_count: AtomicU64,
     /// Fixed-size time buckets for the recent write window.
-    write_buckets: [WriteBucket; WRITE_WINDOW_BUCKETS],
+    write_buckets: [AtomicWriteBucket; WRITE_WINDOW_BUCKETS],
     /// Monotonic origin for bucket keys. Wall-clock keys made an NTP step
     /// backwards mark recent buckets as "future" and silently suppress
     /// write-triggered refreshes until the clock catches up (backlog#1022 S32).
@@ -474,9 +535,10 @@ pub struct WriteRecord {
 impl WriteRecord {
     fn new() -> Self {
         Self {
-            last_write_time: None,
-            write_count: 0,
-            write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
+            last_write_nanos: AtomicU64::new(0),
+            has_write: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+            write_buckets: std::array::from_fn(|_| AtomicWriteBucket::default()),
             epoch: Instant::now(),
         }
     }
@@ -485,31 +547,48 @@ impl WriteRecord {
         self.epoch.elapsed().as_secs()
     }
 
+    /// Total number of writes recorded (saturating). Observability only.
+    fn total_write_count(&self) -> u64 {
+        self.write_count.load(Ordering::Relaxed)
+    }
+
+    /// Elapsed time since the last write, or `None` if no write has been
+    /// recorded yet.
+    fn time_since_last_write(&self) -> Option<Duration> {
+        if self.has_write.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let last = self.last_write_nanos.load(Ordering::Acquire);
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        Some(Duration::from_nanos(now.saturating_sub(last)))
+    }
+
     fn recent_write_count(&self, now_second: u64) -> usize {
         self.write_buckets
             .iter()
-            .filter(|bucket| {
-                bucket.count > 0 && bucket.second <= now_second && now_second.saturating_sub(bucket.second) < WRITE_WINDOW_SECS
+            .filter_map(|bucket| {
+                let (second, count) = bucket.snapshot();
+                if count > 0 && second <= now_second && now_second.saturating_sub(second) < WRITE_WINDOW_SECS {
+                    Some(count)
+                } else {
+                    None
+                }
             })
-            .map(|bucket| bucket.count)
             .sum()
     }
 
-    fn record_write(&mut self, now: Instant) -> usize {
+    fn record_write(&self, _now: Instant) -> usize {
         let now_second = self.monotonic_second();
         let bucket_idx = (now_second % WRITE_WINDOW_BUCKETS as u64) as usize;
-        let bucket = &mut self.write_buckets[bucket_idx];
+        self.write_buckets[bucket_idx].record(now_second);
 
-        if bucket.second != now_second {
-            *bucket = WriteBucket {
-                second: now_second,
-                count: 0,
-            };
-        }
-
-        bucket.count = bucket.count.saturating_add(1);
-        self.last_write_time = Some(now);
-        self.write_count = self.write_count.saturating_add(1);
+        self.last_write_nanos
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::Release);
+        self.has_write.store(1, Ordering::Release);
+        // Single atomic add (wraps only after 2^64 writes; effectively saturating
+        // for any real deployment). Observability only — the frequency window
+        // used for refresh decisions is tracked per-bucket above.
+        self.write_count.fetch_add(1, Ordering::Relaxed);
 
         self.recent_write_count(now_second)
     }
@@ -641,8 +720,9 @@ impl Drop for RefreshLeaderGuard {
 pub struct HybridCapacityManager {
     /// Capacity cache
     cache: Arc<RwLock<Option<CachedCapacity>>>,
-    /// Write record
-    write_record: Arc<RwLock<WriteRecord>>,
+    /// Write record. Lock-free atomics (backlog#1315): the PUT response path no
+    /// longer takes an async writer lock to record a write.
+    write_record: Arc<WriteRecord>,
     /// Dirty disks recorded from write-side scope propagation, keyed to the
     /// instant they were last marked so a commit only clears marks that
     /// predate its scan (backlog#1020 S19).
@@ -680,7 +760,7 @@ impl HybridCapacityManager {
     pub fn new(config: HybridStrategyConfig) -> Self {
         Self {
             cache: Arc::new(RwLock::new(None)),
-            write_record: Arc::new(RwLock::new(WriteRecord::new())),
+            write_record: Arc::new(WriteRecord::new()),
             dirty_disks: Arc::new(RwLock::new(HashMap::new())),
             disk_cache: Arc::new(RwLock::new(HashMap::new())),
             disk_cache_complete: Arc::new(RwLock::new(false)),
@@ -815,9 +895,8 @@ impl HybridCapacityManager {
 
     /// Record write operation
     pub async fn record_write_operation(&self) {
-        let mut record = self.write_record.write().await;
         let now = Instant::now();
-        let recent_write_count = record.record_write(now);
+        let recent_write_count = self.write_record.record_write(now);
 
         record_capacity_write_operation(recent_write_count);
         debug!(
@@ -825,7 +904,7 @@ impl HybridCapacityManager {
             component = LOG_COMPONENT_CAPACITY,
             subsystem = LOG_SUBSYSTEM_REFRESH,
             state = "recorded",
-            total_writes = record.write_count,
+            total_writes = self.write_record.total_write_count(),
             recent_writes = recent_write_count,
             "capacity refresh write recorded"
         );
@@ -873,15 +952,13 @@ impl HybridCapacityManager {
                 return false;
             }
 
-            let write_record = self.write_record.read().await;
+            let write_record = &self.write_record;
             let write_frequency = write_record.recent_write_count(write_record.monotonic_second());
             if write_frequency <= self.config.write_frequency_threshold {
                 return false;
             }
 
-            if let Some(last_write_time) = write_record.last_write_time {
-                let time_since_write = last_write_time.elapsed();
-
+            if let Some(time_since_write) = write_record.time_since_last_write() {
                 if time_since_write < self.config.write_trigger_delay {
                     debug!(
                         event = EVENT_CAPACITY_REFRESH_DEBOUNCE_STATE,
@@ -923,7 +1000,7 @@ impl HybridCapacityManager {
     /// Get write frequency (writes/minute)
     #[allow(dead_code)]
     pub async fn get_write_frequency(&self) -> usize {
-        let record = self.write_record.read().await;
+        let record = &self.write_record;
         record.recent_write_count(record.monotonic_second())
     }
 
@@ -1465,15 +1542,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_recent_write_count_ignores_future_buckets() {
-        let mut record = WriteRecord {
-            last_write_time: None,
-            write_count: 1,
-            write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
-            epoch: Instant::now(),
-        };
-
-        record.write_buckets[0] = WriteBucket { second: 120, count: 3 };
-        record.write_buckets[1] = WriteBucket { second: 90, count: 2 };
+        let record = WriteRecord::new();
+        record.write_buckets[0].store(120, 3);
+        record.write_buckets[1].store(90, 2);
 
         assert_eq!(
             record.recent_write_count(100),
@@ -1614,6 +1685,35 @@ mod tests {
 
         assert!(manager.get_capacity().await.is_some());
         assert_eq!(manager.get_write_frequency().await, 10);
+    }
+
+    // backlog#1315: the lock-free write record must not drop concurrent writes.
+    // The previous async RwLock serialized every write; the CAS bucket must be
+    // exact under heavy same-second contention or the frequency window (and the
+    // write-trigger decision) would undercount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[serial]
+    async fn test_record_write_operation_lock_free_is_exact_under_contention() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+        let mut handles = Vec::new();
+        const WRITERS: usize = 16;
+        const PER_WRITER: usize = 64;
+
+        for _ in 0..WRITERS {
+            let mgr = manager.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..PER_WRITER {
+                    mgr.record_write_operation().await;
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // All writes land in the same monotonic second (the test runs well under
+        // one second), so the recent-window frequency must equal the exact total.
+        assert_eq!(manager.get_write_frequency().await, WRITERS * PER_WRITER);
     }
 
     #[tokio::test]

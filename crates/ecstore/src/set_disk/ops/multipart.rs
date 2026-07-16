@@ -1542,7 +1542,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
-        record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
+        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
 
         fi.is_latest = true;
 

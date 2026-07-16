@@ -140,7 +140,7 @@ use rustfs_lock::local_lock::LocalLock;
 use rustfs_lock::{FastLockGuard, LockManager, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
 use rustfs_object_capacity::capacity_scope::{
-    CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
+    CapacityScope, CapacityScopeDisk, current_dirty_generation, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
@@ -164,6 +164,7 @@ use std::hash::Hash;
 use std::mem::{self};
 use std::pin::Pin;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
@@ -349,10 +350,145 @@ fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -
         || metadata.contains_key(SSEC_KEY_MD5_HEADER)
 }
 
+/// Per-set memoized capacity dirty scope.
+///
+/// The disk endpoint/path identity of each slot in a set is immutable for the
+/// set's lifetime (heal replaces the [`DiskStore`] instance but keeps the same
+/// endpoint and root), so the dirty scope only needs to be built once instead
+/// of allocating a `String` per online disk on every successful write
+/// (backlog#1315). Slots are filled lazily as disks are observed online; once
+/// every slot has contributed, `complete` latches and the hot path returns the
+/// shared `Arc` without any scan.
+#[derive(Default, Debug)]
+struct CapacityScopeCache {
+    /// Per-slot resolved disk identity; `None` slots have not been seen online.
+    slots: Vec<Option<CapacityScopeDisk>>,
+    /// Deduplicated scope covering every slot resolved so far.
+    scope: Option<Arc<CapacityScope>>,
+    /// Latches once every slot is resolved; the scope is then stable.
+    complete: bool,
+}
+
+impl CapacityScopeCache {
+    /// Whether `disks` contains an online disk whose slot has not been recorded
+    /// yet. Read-only, allocation-free (used under the read lock).
+    fn has_unresolved_slot(&self, disks: &[Option<DiskStore>]) -> bool {
+        disks
+            .iter()
+            .enumerate()
+            .any(|(idx, disk)| disk.is_some() && self.slots.get(idx).is_none_or(|slot| slot.is_none()))
+    }
+}
+
+impl SetDisks {
+    /// Return the memoized dirty scope for this set, resolving any newly-online
+    /// slots first. Steady-state writes hit the fast path (a read lock and an
+    /// `Arc` clone) with no per-disk `String` allocation.
+    fn capacity_scope(&self, disks: &[Option<DiskStore>]) -> Arc<CapacityScope> {
+        {
+            let cache = self.capacity_scope_cache.read().unwrap_or_else(|p| p.into_inner());
+            if let Some(scope) = cache.scope.as_ref()
+                && (cache.complete || !cache.has_unresolved_slot(disks))
+            {
+                return scope.clone();
+            }
+        }
+        self.resolve_capacity_scope(disks)
+    }
+
+    /// Slow path: fill newly-observed slots and rebuild the deduplicated scope.
+    fn resolve_capacity_scope(&self, disks: &[Option<DiskStore>]) -> Arc<CapacityScope> {
+        let mut cache = self.capacity_scope_cache.write().unwrap_or_else(|p| p.into_inner());
+        if cache.slots.len() < self.set_drive_count {
+            cache.slots.resize(self.set_drive_count, None);
+        }
+
+        let mut changed = false;
+        for (idx, disk) in disks.iter().enumerate() {
+            let Some(slot) = cache.slots.get_mut(idx) else {
+                break;
+            };
+            if slot.is_some() {
+                continue;
+            }
+            if let Some(disk) = disk {
+                *slot = Some(CapacityScopeDisk {
+                    endpoint: disk.endpoint().to_string(),
+                    drive_path: disk.to_string(),
+                });
+                changed = true;
+            }
+        }
+
+        if changed || cache.scope.is_none() {
+            let mut unique = HashSet::with_capacity(cache.slots.len());
+            let mut scoped_disks = Vec::with_capacity(cache.slots.len());
+            for slot in cache.slots.iter().flatten() {
+                if unique.insert(slot.clone()) {
+                    scoped_disks.push(slot.clone());
+                }
+            }
+            cache.complete = !cache.slots.is_empty() && cache.slots.iter().all(|slot| slot.is_some());
+            cache.scope = Some(Arc::new(CapacityScope { disks: scoped_disks }));
+        }
+
+        cache.scope.clone().unwrap_or_else(|| Arc::new(CapacityScope::default()))
+    }
+
+    /// Record the set's dirty scope after a successful write.
+    ///
+    /// The global dirty registry is only upgraded on the first write of each
+    /// registry generation: once this set has marked its disks, subsequent
+    /// writes skip the global mutex until a refresh drain advances the
+    /// generation, forcing a re-mark (backlog#1315). The scope-token registry
+    /// (multipart completion) still records per token so the app-side write
+    /// settle can consume it.
+    fn record_capacity_scope_if_needed(&self, scope_token: Option<Uuid>, disks: &[Option<DiskStore>]) {
+        let scope = self.capacity_scope(disks);
+        if scope.disks.is_empty() {
+            return;
+        }
+
+        let generation = current_dirty_generation();
+        if self.capacity_dirty_generation.load(Ordering::Acquire) != generation {
+            // First write of this generation (or after a drain): upgrade the
+            // global registry and cache the generation observed under its lock.
+            let observed = record_global_dirty_scope((*scope).clone());
+            self.capacity_dirty_generation.store(observed, Ordering::Release);
+        }
+
+        if let Some(token) = scope_token {
+            record_capacity_scope(token, (*scope).clone());
+        }
+    }
+
+    /// Mark healed disks dirty from the (infrequent) heal path.
+    ///
+    /// Heal passes disks in erasure-distribution order (`shuffle_disks`), not
+    /// physical-slot order, so they must not seed the slot-indexed memo — doing
+    /// so could record a disk under the wrong slot and drop another from the
+    /// steady-state scope. Heal therefore builds an ad-hoc scope from the disks
+    /// it actually rewrote and marks the global registry directly. This runs at
+    /// heal frequency, so it does not use the per-generation skip fast-path
+    /// (backlog#1315).
+    fn record_healed_capacity_scope(&self, disks: &[Option<DiskStore>]) {
+        let scope = capacity_scope_from_disks(disks);
+        if scope.disks.is_empty() {
+            return;
+        }
+        // Do not advance the set's generation marker here: this ad-hoc scope is
+        // only the subset of disks heal rewrote, whereas the marker asserts the
+        // full set was marked. Leaving the marker untouched keeps the next write
+        // free to upgrade the full-set scope if it has not been marked yet.
+        let _ = record_global_dirty_scope(scope);
+    }
+}
+
+/// Build an ad-hoc, deduplicated dirty scope from `disks`. Used by the heal
+/// path where disks are not in physical-slot order (backlog#1315).
 fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
     let mut unique = HashSet::with_capacity(disks.len());
     let mut scoped_disks = Vec::with_capacity(disks.len());
-
     for disk in disks.iter().flatten() {
         let scope_disk = CapacityScopeDisk {
             endpoint: disk.endpoint().to_string(),
@@ -362,21 +498,7 @@ fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
             scoped_disks.push(scope_disk);
         }
     }
-
     CapacityScope { disks: scoped_disks }
-}
-
-fn record_capacity_scope_if_needed(scope_token: Option<Uuid>, disks: &[Option<DiskStore>]) {
-    let scope = capacity_scope_from_disks(disks);
-    if scope.disks.is_empty() {
-        return;
-    }
-
-    record_global_dirty_scope(scope.clone());
-
-    if let Some(token) = scope_token {
-        record_capacity_scope(token, scope);
-    }
 }
 
 /// Get the duplex buffer size from environment variable or use default.
@@ -1628,6 +1750,15 @@ pub struct SetDisks {
     /// Slice 3 sources `local_lock_manager` from this context to give each
     /// instance its own lock namespace.
     ctx: Arc<InstanceContext>,
+    /// Memoized capacity dirty scope so successful writes reuse a prebuilt
+    /// `Arc` instead of allocating a `String` per online disk (backlog#1315).
+    /// `Arc` so clones of a set share one memo.
+    capacity_scope_cache: Arc<std::sync::RwLock<CapacityScopeCache>>,
+    /// Last global dirty-registry generation this set marked. `u64::MAX` until
+    /// the first write; equality with the current generation lets steady-state
+    /// writes skip the global registry mutex (backlog#1315). `Arc` so clones of
+    /// a set share one generation marker.
+    capacity_dirty_generation: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1828,6 +1959,8 @@ impl SetDisks {
             // process lock-manager singleton, so this is unchanged.
             local_lock_manager: ctx.lock_manager(),
             ctx,
+            capacity_scope_cache: Arc::new(std::sync::RwLock::new(CapacityScopeCache::default())),
+            capacity_dirty_generation: Arc::new(AtomicU64::new(u64::MAX)),
         })
     }
 
@@ -4626,6 +4759,109 @@ mod tests {
             )))],
         )
         .await
+    }
+
+    // backlog#1315: the memoized dirty scope must be byte-for-byte identical to
+    // the ad-hoc scope the previous per-write construction produced, otherwise
+    // dirty-disk keys diverge from the disk-cache keys and capacity counts drift.
+    #[tokio::test]
+    #[serial]
+    async fn capacity_scope_memo_matches_adhoc_and_is_reused() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        let (dir_a, disk_a) = make_single_local_disk().await;
+        let (dir_b, disk_b) = make_single_local_disk().await;
+        let disks = vec![Some(disk_a), Some(disk_b)];
+        let set = make_set_disks_with(disks.clone()).await;
+
+        let expected = capacity_scope_from_disks(&disks);
+        let first = set.capacity_scope(&disks);
+        assert_eq!(*first, expected, "memoized scope must equal the ad-hoc per-disk construction bit-for-bit");
+
+        // Second call on a fully-resolved set returns the very same Arc (no new
+        // allocation): proving steady-state writes do not rebuild String/HashSet.
+        let second = set.capacity_scope(&disks);
+        assert!(Arc::ptr_eq(&first, &second), "steady-state scope must reuse the cached Arc");
+
+        let _ = drain_global_dirty_scopes();
+        drop((dir_a, dir_b));
+    }
+
+    // backlog#1315: the global registry mutex must be upgraded only on the first
+    // write of each generation; steady-state writes skip it. Reverting the
+    // generation skip makes the upgrade count grow per write and fails this test.
+    #[tokio::test]
+    #[serial]
+    async fn record_capacity_scope_upgrades_registry_once_per_generation() {
+        use rustfs_object_capacity::capacity_scope::{drain_global_dirty_scopes, global_dirty_upgrade_count};
+
+        let (dir_a, disk_a) = make_single_local_disk().await;
+        let (dir_b, disk_b) = make_single_local_disk().await;
+        let disks = vec![Some(disk_a), Some(disk_b)];
+        let set = make_set_disks_with(disks.clone()).await;
+
+        // Start from a clean registry generation.
+        let _ = drain_global_dirty_scopes();
+        let before = global_dirty_upgrade_count();
+
+        // First write of this generation upgrades the registry exactly once.
+        set.record_capacity_scope_if_needed(None, &disks);
+        assert_eq!(
+            global_dirty_upgrade_count(),
+            before + 1,
+            "first write of a generation must upgrade the global registry"
+        );
+
+        // Subsequent writes in the same generation must not touch the mutex.
+        for _ in 0..16 {
+            set.record_capacity_scope_if_needed(None, &disks);
+        }
+        assert_eq!(
+            global_dirty_upgrade_count(),
+            before + 1,
+            "steady-state writes must reuse the generation mark, not re-upgrade"
+        );
+
+        // A drain advances the generation; the next write must re-mark so the
+        // disks it wrote are captured by the following refresh (no lost update).
+        let drained = drain_global_dirty_scopes();
+        assert_eq!(drained.len(), 2, "both set disks must have been recorded dirty");
+        set.record_capacity_scope_if_needed(None, &disks);
+        assert_eq!(
+            global_dirty_upgrade_count(),
+            before + 2,
+            "the first write after a drain must re-upgrade the registry"
+        );
+
+        let _ = drain_global_dirty_scopes();
+        drop((dir_a, dir_b));
+    }
+
+    // backlog#1315: an offline slot must not force the per-write slow path, and
+    // the resolved scope must still cover every online disk.
+    #[tokio::test]
+    #[serial]
+    async fn capacity_scope_tolerates_offline_slot_without_reallocating() {
+        use rustfs_object_capacity::capacity_scope::drain_global_dirty_scopes;
+
+        let (dir_a, disk_a) = make_single_local_disk().await;
+        // Slot 1 is permanently offline (None); the set never resolves it.
+        let disks = vec![Some(disk_a), None];
+        let set = make_set_disks_with(disks.clone()).await;
+
+        let first = set.capacity_scope(&disks);
+        assert_eq!(first.disks.len(), 1, "only the online disk contributes to the scope");
+        // Even though the set is not "complete" (slot 1 unresolved), repeated
+        // writes with the same online set reuse the cached Arc via the
+        // no-unresolved-slot fast path.
+        let second = set.capacity_scope(&disks);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a stable online subset must reuse the cached Arc even with an offline slot"
+        );
+
+        let _ = drain_global_dirty_scopes();
+        drop(dir_a);
     }
 
     // issue #4189: an orphan directory tree (empty dirs, no xl.meta) must be purged.
