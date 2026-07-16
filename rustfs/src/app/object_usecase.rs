@@ -520,6 +520,11 @@ struct MemoryTrackedBytesStream {
     emitted: bool,
     completed: bool,
     expected: usize,
+    /// Set when the materialized buffer length disagrees with the declared
+    /// content length. Such a body would be truncated (short) or over-long
+    /// relative to the already-committed `Content-Length`, so the stream must
+    /// surface an error instead of a clean short/over-long body. See #1324.
+    length_mismatch: bool,
     started: std::time::Instant,
     source: &'static str,
     _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
@@ -618,11 +623,13 @@ impl MemoryTrackedBytesStream {
         guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
         lifecycle: GetObjectBodyLifecycle,
     ) -> Self {
+        let length_mismatch = bytes.len() != expected;
         Self {
             bytes,
             emitted: false,
-            completed: expected == 0,
+            completed: !length_mismatch && expected == 0,
             expected,
+            length_mismatch,
             started: std::time::Instant::now(),
             source,
             _guard: guard,
@@ -677,6 +684,26 @@ impl futures::Stream for MemoryTrackedBytesStream {
             return Poll::Ready(None);
         }
 
+        // Strict materialization guard (#1324): a body whose length disagrees
+        // with the declared content length must fail the transfer rather than be
+        // delivered as a clean short body (truncation) or an over-long body
+        // (protocol violation). The HTTP layer has already committed to
+        // `Content-Length == expected`, so there is no safe way to serve a
+        // differently sized body. This is a defense-in-depth backstop; the
+        // buffered/cache callers reject the mismatch before headers are sent.
+        if this.length_mismatch {
+            this.emitted = true;
+            this.finish_err();
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "materialized GET body length mismatch: expected {}, got {}",
+                    this.expected,
+                    this.bytes.len()
+                ),
+            ))));
+        }
+
         let first_byte_elapsed = (!this.bytes.is_empty()).then(|| this.started.elapsed());
         this.emitted = true;
         if let Some(elapsed) = first_byte_elapsed {
@@ -708,6 +735,96 @@ impl Drop for MemoryTrackedBytesStream {
         } else {
             self.finish_err();
         }
+    }
+}
+
+/// Failure modes of strictly materializing an object body into memory (#1324).
+#[derive(Debug)]
+enum StrictMaterializeError {
+    /// The reader produced a different number of bytes than the declared content
+    /// length (short or over-long). The response has already committed to
+    /// `Content-Length == expected`, so any other length is an unrecoverable,
+    /// broken HTTP response and must fail before headers are sent.
+    LengthMismatch { expected: usize, actual: usize },
+    /// A read error occurred after `consumed` bytes were already drained from the
+    /// reader. The caller MUST NOT fall back to streaming the same reader: the
+    /// drained prefix is gone, so streaming would ship a body missing its prefix
+    /// (the seek-buffer prefix-misalignment bug this issue closes).
+    Read { consumed: usize, source: std::io::Error },
+}
+
+impl std::fmt::Display for StrictMaterializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthMismatch { expected, actual } => {
+                write!(f, "materialized length mismatch: expected {expected}, got {actual}")
+            }
+            Self::Read { consumed, source } => {
+                write!(f, "read failed after {consumed} bytes: {source}")
+            }
+        }
+    }
+}
+
+impl StrictMaterializeError {
+    fn into_s3_error(self, response_content_length: i64) -> S3Error {
+        match self {
+            Self::LengthMismatch { expected, actual } => ApiError::from(StorageError::other(format!(
+                "GET object materialized length mismatch: declared content length {response_content_length}, expected {expected}, got {actual}"
+            )))
+            .into(),
+            Self::Read { consumed, source } => ApiError::from(StorageError::other(format!(
+                "Failed to read object body into memory after {consumed} bytes: {source}"
+            )))
+            .into(),
+        }
+    }
+}
+
+/// Strictly materialize an object body into memory, enforcing an exact-length
+/// contract (#1324).
+///
+/// Reads at most `expected + 1` bytes so an over-long stream is detected without
+/// buffering it unbounded, then requires `bytes_read == expected`. A short read
+/// (clean EOF before `expected`), an over-long read, or a mid-stream read error
+/// all return an error; only an exact-length read yields the buffer. Because the
+/// HTTP response commits to `Content-Length == expected` before the body is
+/// produced, this mirrors the streaming path (which already fails a short read
+/// with `UnexpectedEof`) and the ODC materialize-fill path, closing the
+/// warn-and-serve holes in the encrypted, seek, and cache memory branches.
+///
+/// On error the reader has already been (partially) consumed, so callers must
+/// propagate the error rather than fall back to streaming the same reader.
+async fn strict_materialize_object_body<R>(
+    reader: R,
+    expected: usize,
+    stage: &'static str,
+) -> Result<Vec<u8>, StrictMaterializeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(expected);
+    // Read one byte past the declared length so an over-long stream is detected
+    // rather than silently truncated to `Content-Length`.
+    let mut bounded = tokio::io::AsyncReadExt::take(reader, expected as u64 + 1);
+    let read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+    let read_result = tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut buf).await;
+    record_get_object_s3_handler_stage_duration(stage, read_start);
+    match read_result {
+        Ok(_) => {
+            if buf.len() == expected {
+                Ok(buf)
+            } else {
+                Err(StrictMaterializeError::LengthMismatch {
+                    expected,
+                    actual: buf.len(),
+                })
+            }
+        }
+        Err(source) => Err(StrictMaterializeError::Read {
+            consumed: buf.len(),
+            source,
+        }),
     }
 }
 
@@ -3128,7 +3245,7 @@ impl DefaultObjectUsecase {
     }
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body<R>(
-        mut final_stream: R,
+        final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
@@ -3150,30 +3267,25 @@ impl DefaultObjectUsecase {
                 should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range, concurrent_requests);
 
             if should_buffer_encrypted_object {
-                let mut buf = Vec::with_capacity(response_content_length as usize);
-                let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-                let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
-                record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ, buffer_read_start);
-                if let Err(e) = read_result {
-                    lifecycle.finish_err();
-                    error!(error = %e, "GetObject decrypted object buffering failed");
-                    return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
+                // Strict materialization (#1324): a decrypted body that is shorter
+                // or longer than the declared content length must hard-fail before
+                // headers, not warn-and-serve a truncated/over-long body.
+                let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+                match strict_materialize_object_body(final_stream, expected, GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ).await {
+                    Ok(buf) => {
+                        return Ok(Self::build_memory_blob(
+                            buf,
+                            response_content_length,
+                            GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
+                            lifecycle,
+                        ));
+                    }
+                    Err(e) => {
+                        lifecycle.finish_err();
+                        error!(error = %e, "GetObject decrypted object strict materialization failed");
+                        return Err(e.into_s3_error(response_content_length));
+                    }
                 }
-
-                if buf.len() != response_content_length as usize {
-                    warn!(
-                        expected = response_content_length,
-                        actual = buf.len(),
-                        "Encrypted object size mismatch during read"
-                    );
-                }
-
-                return Ok(Self::build_memory_blob(
-                    buf,
-                    response_content_length,
-                    GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
-                    lifecycle,
-                ));
             }
 
             debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
@@ -3193,12 +3305,23 @@ impl DefaultObjectUsecase {
         }
 
         if let Some(buffered_body) = buffered_body {
-            if buffered_body.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
-                warn!(
+            // Strict materialization (#1324): the buffered body is the exact
+            // response payload; a length disagreement means an upstream/cache bug
+            // and must hard-fail before headers rather than serve a body that does
+            // not match its committed Content-Length.
+            let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+            if buffered_body.len() != expected {
+                lifecycle.finish_err();
+                error!(
                     expected = response_content_length,
                     actual = buffered_body.len(),
-                    "Buffered GetObject body size mismatch"
+                    "Buffered GetObject body length mismatch"
                 );
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Buffered GetObject body length mismatch: expected {response_content_length}, got {}",
+                    buffered_body.len()
+                )))
+                .into());
             }
 
             return Ok(Self::build_memory_bytes_blob(
@@ -3213,20 +3336,16 @@ impl DefaultObjectUsecase {
             should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range, concurrent_requests);
 
         if should_provide_seek_support {
-            let mut buf = Vec::with_capacity(response_content_length as usize);
-            let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
-            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ, buffer_read_start);
-            match read_result {
-                Ok(_) => {
-                    if buf.len() != response_content_length as usize {
-                        warn!(
-                            expected = response_content_length,
-                            actual = buf.len(),
-                            "Object size mismatch during seek-support read"
-                        );
-                    }
-
+            // Strict materialization (#1324): the previous implementation only
+            // WARNed on a length mismatch, and — most dangerously — on a read
+            // error it fell through to streaming the *same* reader after
+            // `read_to_end` had already drained K bytes, shipping a body missing
+            // its prefix (prefix-misaligned data). Both are now hard errors: an
+            // exact-length read is required, and any read error returns without
+            // reusing the partially consumed reader.
+            let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+            match strict_materialize_object_body(final_stream, expected, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await {
+                Ok(buf) => {
                     return Ok(Self::build_memory_blob(
                         buf,
                         response_content_length,
@@ -3235,7 +3354,12 @@ impl DefaultObjectUsecase {
                     ));
                 }
                 Err(e) => {
-                    error!(error = %e, "GetObject seek-support buffering failed");
+                    lifecycle.finish_err();
+                    error!(
+                        error = %e,
+                        "GetObject seek-support strict materialization failed; refusing to reuse the partially consumed reader"
+                    );
+                    return Err(e.into_s3_error(response_content_length));
                 }
             }
         }
@@ -3377,35 +3501,19 @@ impl DefaultObjectUsecase {
                 )
                 .await;
             };
-            let mut buf = Vec::with_capacity(materialized_capacity);
-            // ODC-07: bound the read so a stream yielding more than the declared
-            // length cannot grow `buf` past the in-memory GET threshold. Reading
-            // one byte past the capacity is enough to detect an over-long stream.
-            let mut bounded_stream = tokio::io::AsyncReadExt::take(final_stream, materialized_capacity as u64 + 1);
-            let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut bounded_stream, &mut buf).await;
-            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ, buffer_read_start);
-
-            match read_result {
-                Ok(_) => {
-                    // ODC-07: treat a length mismatch as a hard error, matching
-                    // the direct-memory GET path. Serving a body whose decoded
-                    // length disagrees with the declared content length would
-                    // ship a truncated or over-long response.
-                    if buf.len() != materialized_capacity {
-                        lifecycle.finish_err();
-                        error!(
-                            expected = response_content_length,
-                            actual = buf.len(),
-                            "materialize-fill GET decoded length mismatch"
-                        );
-                        return Err(ApiError::from(StorageError::other(format!(
-                            "materialize-fill GET decoded length mismatch: expected {response_content_length}, got {}",
-                            buf.len()
-                        )))
-                        .into());
-                    }
-
+            // ODC-07 / #1324: share the strict exact-length materialization gate
+            // with the encrypted and seek memory branches. The helper bounds the
+            // read to `capacity + 1` (so an over-long stream is detected without
+            // buffering it unbounded), rejects short and over-long reads, and on a
+            // partial-read error refuses to reuse the consumed reader.
+            match strict_materialize_object_body(
+                final_stream,
+                materialized_capacity,
+                GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ,
+            )
+            .await
+            {
+                Ok(buf) => {
                     let bytes = Bytes::from(buf);
                     // ODC-15: fill off the response's critical path (see the
                     // buffered-body branch above).
@@ -3425,14 +3533,12 @@ impl DefaultObjectUsecase {
                 }
                 Err(e) => {
                     lifecycle.finish_err();
-                    error!(error = %e, "GetObject materialize-fill buffering failed");
-                    // The stream is partially consumed; falling back to the
-                    // streaming path would send a body missing its prefix, so
-                    // fail the request like the encrypted-buffer path does.
-                    return Err(ApiError::from(StorageError::other(format!(
-                        "Failed to read object body for cache materialization: {e}"
-                    )))
-                    .into());
+                    error!(error = %e, "GetObject materialize-fill strict materialization failed");
+                    // A short/over-long body would ship a truncated or over-long
+                    // response; a partial-read error leaves the stream consumed so
+                    // falling back to streaming would send a prefix-misaligned
+                    // body. Both fail the request.
+                    return Err(e.into_s3_error(response_content_length));
                 }
             }
         }
@@ -7460,6 +7566,130 @@ mod tests {
         }
     }
 
+    // Emits `fail_after` bytes from `data`, then returns a hard read error. Used
+    // to inject the "read K bytes then Err" partial-read case (#1324).
+    struct ErrAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        fail_after: usize,
+        emitted: usize,
+    }
+
+    impl AsyncRead for ErrAfterReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.emitted >= self.fail_after {
+                return Poll::Ready(Err(std::io::Error::other("injected mid-stream read error")));
+            }
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let want = (self.fail_after - self.emitted).min(remaining);
+            let position = usize::try_from(self.data.position()).unwrap_or(usize::MAX);
+            let source = self.data.get_ref();
+            let end = position.saturating_add(want).min(source.len());
+            if end <= position {
+                return Poll::Ready(Err(std::io::Error::other("injected mid-stream read error")));
+            }
+            let chunk_len = end - position;
+            buf.put_slice(&source[position..end]);
+            self.data.set_position(u64::try_from(end).unwrap_or(u64::MAX));
+            self.emitted += chunk_len;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn cursor_reader(bytes: &[u8]) -> std::io::Cursor<Vec<u8>> {
+        std::io::Cursor::new(bytes.to_vec())
+    }
+
+    // #1324: the strict materialization helper is the shared exact-length gate
+    // for the encrypted, seek, and cache memory branches. For a declared length N
+    // only an exact N-byte read succeeds; a short read (N-1), an over-long read
+    // (N+1), and a mid-stream read error all hard-fail. This is the reversal
+    // guard for every one of those sources at once: restoring WARN-and-serve or a
+    // partial fallback would flip the short/over-long/error assertions to Ok.
+    #[tokio::test]
+    async fn strict_materialize_object_body_requires_exact_length() {
+        // Exact length: the only accepted outcome.
+        let buf = strict_materialize_object_body(cursor_reader(b"hello"), 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ)
+            .await
+            .expect("exact-length read must materialize");
+        assert_eq!(buf, b"hello");
+
+        // Short read (actual = expected - 1): a clean EOF before the declared
+        // length must be a hard error, never a truncated served body.
+        let short = strict_materialize_object_body(cursor_reader(b"hell"), 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await;
+        assert!(
+            matches!(short, Err(StrictMaterializeError::LengthMismatch { expected: 5, actual: 4 })),
+            "short read must fail with a length mismatch, got {short:?}",
+            short = short.as_ref().map(|b| b.len())
+        );
+
+        // Over-long read (actual = expected + 1): must fail rather than silently
+        // truncate to the committed Content-Length.
+        let long = strict_materialize_object_body(cursor_reader(b"hello!"), 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await;
+        assert!(
+            matches!(long, Err(StrictMaterializeError::LengthMismatch { expected: 5, actual: 6 })),
+            "over-long read must fail with a length mismatch, got {long:?}",
+            long = long.as_ref().map(|b| b.len())
+        );
+
+        // Read K bytes then Err: must surface the read error and never return the
+        // partially consumed buffer (which the caller could otherwise re-stream).
+        let reader = ErrAfterReader {
+            data: cursor_reader(b"hello"),
+            fail_after: 3,
+            emitted: 0,
+        };
+        let errored = strict_materialize_object_body(reader, 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await;
+        assert!(
+            matches!(errored, Err(StrictMaterializeError::Read { consumed: 3, .. })),
+            "a mid-stream read error must be reported as a read failure"
+        );
+    }
+
+    // #1324: the in-memory (buffered/cache) source is guarded by
+    // MemoryTrackedBytesStream. A buffer whose length disagrees with the declared
+    // content length must yield a stream error on first poll instead of a clean
+    // short body or an over-long body. Reverting to the old warn-and-serve
+    // behavior would make these assertions observe Ok chunks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn memory_tracked_bytes_stream_fails_short_body() {
+        let mut stream = MemoryTrackedBytesStream::new(
+            Bytes::from_static(b"test"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            None,
+            GetObjectBodyLifecycle::disabled(),
+        );
+        let err = stream
+            .next()
+            .await
+            .expect("mismatched memory body must yield an item")
+            .expect_err("a short memory body must fail the stream instead of serving a truncated body");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(stream.next().await.is_none(), "stream must terminate after the error");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn memory_tracked_bytes_stream_fails_over_long_body() {
+        let mut stream = MemoryTrackedBytesStream::new(
+            Bytes::from_static(b"hello!"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            None,
+            GetObjectBodyLifecycle::disabled(),
+        );
+        let err = stream
+            .next()
+            .await
+            .expect("mismatched memory body must yield an item")
+            .expect_err("an over-long memory body must fail the stream instead of serving mismatched bytes");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
     #[tokio::test]
     async fn get_object_streaming_reader_times_out_when_body_stalls() {
         let reader = GetObjectStreamingReader::new(
@@ -8333,6 +8563,189 @@ mod tests {
         assert!(
             result.is_err(),
             "an over-long materialize read must be a hard error, not a truncated served body"
+        );
+    }
+
+    // #1324: a materialize-fill read that ends short of the declared content
+    // length (clean EOF at N-1 for a declared N) must hard-fail, matching the
+    // over-long case above. Reverting to warn-and-serve would return Ok with a
+    // truncated body.
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_materialize_rejects_short_read() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        // Declared content length is 5, but the stream only yields 4 bytes.
+        let reader = DataProbeReader {
+            reads: Arc::clone(&reads),
+            data: std::io::Cursor::new(b"hell".to_vec()),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let result = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            "test-bucket",
+            "short-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a short materialize read must be a hard error, not a truncated served body"
+        );
+    }
+
+    // #1324: a materialize-fill read that fails after draining K bytes must
+    // propagate the read error and must NOT fall back to streaming the same
+    // (partially consumed) reader, which would ship a prefix-misaligned body.
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_materialize_rejects_partial_read_error() {
+        let reader = ErrAfterReader {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            fail_after: 3,
+            emitted: 0,
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let result = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            "test-bucket",
+            "partial-read-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a partial-read error during materialization must fail the request, not stream a prefix-misaligned body"
+        );
+    }
+
+    // #1324: the buffered-body (direct-memory / cache-served) source must also
+    // enforce the exact-length contract. A buffered body shorter than the
+    // declared content length is a hard error before headers.
+    #[tokio::test]
+    async fn build_get_object_body_rejects_short_buffered_body() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            ..Default::default()
+        };
+
+        let result = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            // Declared length 5 but only 4 buffered bytes.
+            Some(Bytes::from_static(b"hell")),
+            "test-bucket",
+            "short-buffered-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(result.is_err(), "a buffered body shorter than the declared content length must hard-fail");
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "the mismatch must be caught without touching the fallback reader"
+        );
+    }
+
+    // #1324 compatibility boundary: a legacy/backfilled object whose decoded
+    // bytes exactly equal its declared content length must still serve cleanly.
+    // The strict contract keys off actual-vs-declared equality only, so it never
+    // flips a legitimate exact-length object into a hard failure — it only
+    // rejects genuine short/over-long/errored reads.
+    #[tokio::test]
+    async fn build_get_object_body_serves_exact_length_buffered_body() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            ..Default::default()
+        };
+
+        let _body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"hello")),
+            "test-bucket",
+            "exact-buffered-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await
+        .expect("an exact-length buffered body must serve without error");
+
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "an exact-length buffered body must not read from the fallback reader"
         );
     }
 
