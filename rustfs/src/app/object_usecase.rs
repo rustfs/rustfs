@@ -39,7 +39,7 @@ use super::storage_api::object_usecase::bucket::{
         objectlock_sys::{check_object_lock_for_deletion, is_retention_active},
     },
     predict_lifecycle_expiration,
-    quota::QuotaOperation,
+    quota::{QuotaCheckResult, QuotaError, QuotaOperation},
     replication::{
         REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType, check_replicate_delete,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
@@ -299,6 +299,51 @@ fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
                 end: -1,
             })
         }
+    }
+}
+
+/// Resolve the authoritative object length that bucket-quota admission (and downstream sizing) must use.
+///
+/// For an `aws-chunked` upload the request body is wrapped in chunk framing, so the wire `Content-Length` overcounts the actual object and must never be admitted; the decoded length (`x-amz-decoded-content-length`) is the only authoritative size and is therefore required — a chunked request without it is rejected rather than silently falling back to the framed wire length. For a non-chunked request the raw `Content-Length` is authoritative, with an explicit decoded length as the fallback when the S3 layer only surfaced the latter. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
+fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<i64> {
+    let decoded_content_length = decoded_content_length_from_headers(headers)?;
+    let size = match (request_uses_aws_chunked(headers), decoded_content_length, content_length) {
+        (true, Some(decoded), _) => decoded,
+        (true, None, _) => return Err(s3_error!(UnexpectedContent)),
+        (false, _, Some(raw)) => raw,
+        (false, Some(decoded), None) => decoded,
+        (false, None, None) => return Err(s3_error!(UnexpectedContent)),
+    };
+
+    if size < 0 {
+        return Err(s3_error!(UnexpectedContent));
+    }
+
+    Ok(size)
+}
+
+/// Map a bucket-quota checker outcome onto the S3 admission result.
+///
+/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
+fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<()> {
+    match outcome {
+        Ok(result) if !result.allowed => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                result.current_usage.unwrap_or(0),
+                result.quota_limit.unwrap_or(0)
+            ),
+        )),
+        Err(e) => {
+            counter!("rustfs_bucket_quota_check_failed_total").increment(1);
+            warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check failed closed");
+            Err(S3Error::with_message(
+                S3ErrorCode::ServiceUnavailable,
+                "Bucket quota check temporarily unavailable, please retry".to_string(),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -2665,21 +2710,7 @@ impl DefaultObjectUsecase {
             return Ok(());
         };
         let quota_checker = QuotaChecker::new(metadata_sys);
-        match quota_checker.check_quota(bucket, op, size).await {
-            Ok(result) if !result.allowed => Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!(
-                    "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                    result.current_usage.unwrap_or(0),
-                    result.quota_limit.unwrap_or(0)
-                ),
-            )),
-            Err(e) => {
-                warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check degraded to allow");
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await)
     }
 
     fn build_memory_bytes_blob(
@@ -3679,10 +3710,6 @@ impl DefaultObjectUsecase {
             req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
 
-        if let Some(size) = content_length {
-            self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
-        }
-
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         // Guard against a proxy/CDN that forwards a partial body then goes silent
@@ -3697,17 +3724,11 @@ impl DefaultObjectUsecase {
             guard_put_object_body_read_timeout(body, &bucket, &key, &request_id, content_length, put_object_body_read_timeout())
         };
 
-        let decoded_content_length = decoded_content_length_from_headers(&req.headers)?;
-        let mut size = match (request_uses_aws_chunked(&req.headers), decoded_content_length, content_length) {
-            (true, Some(decoded), _) => decoded,
-            (_, _, Some(c)) => c,
-            (_, Some(decoded), None) => decoded,
-            _ => return Err(s3_error!(UnexpectedContent)),
-        };
+        // Resolve the authoritative decoded/plain object length (rejecting negative/unknown) before anything else consumes it.
+        let mut size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
 
-        if size == -1 {
-            return Err(s3_error!(UnexpectedContent));
-        }
+        // Bucket-quota admission runs exactly once, and only now that the authoritative object length is known. `size` is the same basis the settle phase records via ObjectInfo.size (actual, pre-compression/pre-encryption logical size), NOT the aws-chunked wire Content-Length. When no quota is configured this stays a zero-extra-I/O fast path; once a hard quota is set, checker/config/usage faults fail closed with a retryable error.
+        self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
 
         let ingress_stage_start = std::time::Instant::now();
         let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
@@ -6589,7 +6610,7 @@ impl DefaultObjectUsecase {
                 }
             }
         };
-        if size == -1 {
+        if size < 0 {
             return Err(s3_error!(UnexpectedContent));
         }
         validate_object_key(&key, "PUT")?;
@@ -10574,5 +10595,123 @@ mod tests {
             let got = derive(range, size);
             assert_eq!(got, expected, "size={size} range={range:?}");
         }
+    }
+
+    // https://github.com/rustfs/backlog/issues/1311 — bucket-quota admission must run against the authoritative
+    // decoded/plain object length, never the aws-chunked wire Content-Length, and must reject negative/unknown lengths.
+    fn aws_chunked_headers(decoded_len: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
+        if let Some(decoded) = decoded_len {
+            headers.insert(
+                HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).unwrap(),
+                HeaderValue::from_str(decoded).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn authoritative_size_prefers_aws_chunked_decoded_over_wire_content_length() {
+        // Wire Content-Length (chunk framing) differs from the decoded object length; the decoded length wins.
+        let headers = aws_chunked_headers(Some("1000"));
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088)).expect("decoded length is authoritative");
+        assert_eq!(
+            size, 1000,
+            "aws-chunked admission must use the decoded object length, not the framed wire length"
+        );
+    }
+
+    #[test]
+    fn authoritative_size_rejects_aws_chunked_without_decoded_length() {
+        // A chunked upload without x-amz-decoded-content-length has no authoritative size; the wire length must NOT be a fallback.
+        let headers = aws_chunked_headers(None);
+        let err = resolve_put_object_authoritative_size(&headers, Some(1088))
+            .expect_err("chunked upload without decoded length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_plain_put_uses_content_length() {
+        let headers = HeaderMap::new();
+        let size = resolve_put_object_authoritative_size(&headers, Some(4096)).expect("plain PUT uses Content-Length");
+        assert_eq!(size, 4096);
+    }
+
+    #[test]
+    fn authoritative_size_plain_put_falls_back_to_decoded_length() {
+        // Non-chunked request that only surfaced an explicit decoded length.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).unwrap(),
+            HeaderValue::from_static("2048"),
+        );
+        let size = resolve_put_object_authoritative_size(&headers, None).expect("decoded length is the fallback");
+        assert_eq!(size, 2048);
+    }
+
+    #[test]
+    fn authoritative_size_rejects_unknown_length() {
+        let headers = HeaderMap::new();
+        let err = resolve_put_object_authoritative_size(&headers, None).expect_err("no length information must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_rejects_negative_length() {
+        // A negative decoded length would wrap to an enormous unsigned size for quota/buffer sizing; reject it.
+        let headers = aws_chunked_headers(Some("-1"));
+        let err =
+            resolve_put_object_authoritative_size(&headers, Some(64)).expect_err("negative decoded length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+
+        let plain = HeaderMap::new();
+        let err =
+            resolve_put_object_authoritative_size(&plain, Some(-100)).expect_err("negative Content-Length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_accepts_exact_and_rejects_negative_boundary() {
+        // Exact zero-length object is admissible (the over-by-1/exact-limit boundary is enforced by the quota checker on this value).
+        let headers = aws_chunked_headers(Some("0"));
+        assert_eq!(
+            resolve_put_object_authoritative_size(&headers, Some(87)).expect("zero-length decoded is valid"),
+            0
+        );
+    }
+
+    fn quota_result(allowed: bool) -> QuotaCheckResult {
+        QuotaCheckResult {
+            allowed,
+            current_usage: Some(1024),
+            quota_limit: Some(2048),
+            operation_size: 512,
+            remaining: Some(512),
+        }
+    }
+
+    #[test]
+    fn quota_admission_allows_within_limit() {
+        map_quota_check_outcome("bucket", Ok(quota_result(true))).expect("an allowed result admits the write");
+    }
+
+    #[test]
+    fn quota_admission_rejects_over_limit() {
+        let err = map_quota_check_outcome("bucket", Ok(quota_result(false))).expect_err("an over-limit result rejects the write");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn quota_admission_fails_closed_on_checker_error() {
+        // A configured hard quota must never be bypassed by an internal fault: a checker error becomes a retryable ServiceUnavailable, not a silent allow.
+        let err = map_quota_check_outcome(
+            "bucket",
+            Err(QuotaError::InvalidConfig {
+                reason: "corrupt quota config".to_string(),
+            }),
+        )
+        .expect_err("a checker fault must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
     }
 }
