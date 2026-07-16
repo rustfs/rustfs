@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM ubuntu:24.04 AS build
+FROM ubuntu:26.04 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -76,7 +76,7 @@ RUN set -eux; \
     chmod +x /build/rustfs; \
     rm -rf rustfs.zip /build/.tmp || true
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG RELEASE=latest
 ARG BUILD_DATE
