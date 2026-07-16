@@ -79,7 +79,7 @@ The comparison at the disk commit point is on the full composite; a lower
 
 Comparing the epoch at the `rename` commit point alone is insufficient. The
 authoritative commit sequence is `tmp sync → data-dir rename → xl.meta commit →
-directory sync` in `crates/ecstore/src/set_disk/core/local.rs`, and there are two
+directory sync` in `crates/ecstore/src/disk/local.rs`, and there are two
 further detachable disk-write points in
 `crates/ecstore/src/set_disk/core/io_primitives.rs`:
 
@@ -145,10 +145,7 @@ The on-disk persistence of generation must not perturb the file format:
   (`crates/filemeta/src/filemeta.rs:53-54`). Bumping either makes every new
   `xl.meta` unreadable by rolling-upgrade old RustFS nodes and by MinIO — a
   total read failure, not a graceful downgrade.
-- **Do not add generation as a `FileInfo` struct field.** `RenameDataRequest`
-  serializes `file_info_bin` with rmp_serde's default **array** encoding
-  (`crates/ecstore/src/cluster/rpc/remote_disk.rs`), so a new positional field
-  breaks deserialization in both directions across mixed-version nodes.
+- **Do not add generation as a `FileInfo` struct field.** The internode RPC layer serializes `FileInfo` with two different msgpack encoders depending on the call site: `encode_msgpack` uses rmp_serde's default **array** (positional) encoding for the `read_version` family, where a new positional field breaks decode across mixed-version nodes; `encode_msgpack_named` uses `.with_struct_map()` (named-map) encoding for `rename_data` (`crates/ecstore/src/cluster/rpc/remote_disk.rs`), which is more tolerant but still requires `#[serde(default)]` and MinIO-side agreement. Because a `FileInfo` field would have to be correct under *both* encoders and under the JSON compatibility twin (see "Wire-encoding migration" below), do not add one — use the metadata map, which rides through every encoder unchanged.
 - **Where it may live.** Only inside a version's internal metadata **map**
   (MinIO skips unknown internal keys and the map encoding is extensible) or in a
   per-disk sidecar outside `xl.meta`. If it goes in the metadata map, it must
@@ -158,6 +155,15 @@ The on-disk persistence of generation must not perturb the file format:
   regression (the fixture family around `crates/filemeta/src/filemeta.rs`):
   objects written by a new node must still be readable by old RustFS nodes and
   by MinIO, in both upgrade and downgrade directions.
+
+### Wire-encoding migration (JSON → msgpack) interaction
+
+The internode RPC layer is mid-migration from JSON to msgpack binary, and generation-bearing fields must respect that migration window — this is not optional context, it changes how epoch is transported.
+
+- **Dual-field transport.** Each dual-encoded RPC field exists twice in `crates/protos/src/node.proto`: a JSON `string` field and a msgpack `bytes _bin` field (e.g. `file_info` #4 alongside `file_info_bin` #7 on `RenameDataRequest`). Senders emit both; receivers `decode_msgpack_or_json` prefer the `_bin` form and fall back to the JSON string only when `_bin` is empty (`crates/ecstore/src/cluster/rpc/remote_disk.rs`).
+- **Capability flag, default off.** `rustfs_protos::internode_rpc_msgpack_only()` (env `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`, default **false**) gates dropping the redundant JSON copy. It may only be flipped after the `record_msgpack_json_fallback` metric reads zero fleet-wide and the convergence runbook is followed (`crates/protos/src/lib.rs:146`). **Reuse this exact capability + metric-reads-zero model as the mixed-version gate for generation** rather than inventing a parallel handshake; the section above ("Capability negotiation") is layered on top of it, not instead of it.
+- **Generation must ride both encodings during the window.** If epoch lives in the version's internal metadata map, that map is carried inside `FileInfo`, so it is present in both the msgpack `_bin` and JSON copies automatically — good. But any new *top-level* generation datum must be added to **both** the msgpack and JSON representations (and, for msgpack, be safe under both the array and named-map encoders). A field added to only one encoding is silently lost the moment a peer falls back to the other — exactly the failure the JSON-fallback metric exists to catch.
+- **Signature must bind a canonical form.** Because a field is transmitted as both JSON and msgpack and a peer may consume either, the body-digest binding in "RPC signature binding" above must be computed over a single canonical representation (the msgpack `_bin` bytes) — not over whichever copy happened to be decoded. Once the `generation` capability is negotiated for a request, a fenced / generation-bearing request must **reject the JSON fallback path** so a downgrade to the unsigned/loosely-bound JSON copy cannot bypass the epoch check.
 
 ### Proto evolution
 
