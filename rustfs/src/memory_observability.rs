@@ -17,6 +17,7 @@ use rustfs_io_metrics::{
     record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
+#[cfg(any(test, not(target_os = "windows")))]
 use serde_json::Value;
 use std::collections::HashMap;
 #[cfg(not(target_os = "windows"))]
@@ -213,6 +214,7 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn numeric_json_value(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number
@@ -223,6 +225,7 @@ fn numeric_json_value(value: &Value) -> Option<u64> {
     }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => fields
@@ -234,6 +237,7 @@ fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
     }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
     match value {
         Value::Object(fields) => {
@@ -250,10 +254,12 @@ fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> 
     }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
     mimalloc_stat_field(value, metric, "current")
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
     let observation = AllocatorMemoryObservation {

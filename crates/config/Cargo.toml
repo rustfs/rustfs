@@ -25,9 +25,9 @@ keywords = ["configuration", "settings", "management", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "config"]
 
 [dependencies]
-const-str = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+const-str = { workspace = true, optional = true, features = ["std", "proc"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true, features = ["raw_value"] }
 
 [lints]
 workspace = true

@@ -55,6 +55,11 @@ DATA_ROOT="/tmp/rustfs-hotpath-ab"
 OUT_DIR="${PROJECT_ROOT}/target/hotpath-ab/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)"
 DRY_RUN="false"
 SKIP_BUILD="false"
+# Free-form provenance lines appended to gate.md under a "Provenance" section
+# (repeatable --provenance-note). CI passes the baseline/candidate commit SHAs
+# and whether each binary came from the actions cache or a source build, so a
+# gate.md is self-describing about *what* it measured (perf-3, backlog#1152).
+PROVENANCE_NOTES=()
 EXTERNAL_ENDPOINT=""     # set -> external mode (warp targets this cluster)
 DEPLOY_HOOK=""           # external mode: command to deploy a phase's binary
 HEALTH_PATH="/health"
@@ -119,6 +124,9 @@ Common:
   --allow-regression      Pass the gate despite a FAIL (deliberate tradeoff).
   --exemption-reason <s>  Reason recorded with --allow-regression.
   --out-dir <path>        Output directory (default target/hotpath-ab/<ts>).
+  --provenance-note <s>   Extra line appended to gate.md's Provenance section
+                          (repeatable). CI records the baseline/candidate SHAs
+                          and their binary source (actions cache vs source build).
   --dry-run               Print the plan and commands without running them.
   -h, --help              Show this help.
 USAGE
@@ -144,6 +152,7 @@ while [[ $# -gt 0 ]]; do
     --exemption-reason) EXEMPTION_REASON="$2"; shift 2 ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD="true"; shift ;;
+    --provenance-note) PROVENANCE_NOTES+=("$2"); shift 2 ;;
     --dry-run) DRY_RUN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -358,6 +367,31 @@ for ds_spec in "${DRIVE_SYNC_MATRIX[@]}"; do
   tear_down
 done
 
+# Append a Provenance section to gate.md so a stored or attached gate result is
+# self-describing: which binaries were compared (SHA + source), on what runner,
+# with which warp version and matrix params. The baseline binary's origin SHA is
+# the perf-3 acceptance item; perf-5/perf-12 reuse this same contract for their
+# archived baselines.
+write_provenance() {
+  local md="$OUT_DIR/gate.md"
+  [[ -f "$md" ]] || return 0
+  {
+    echo
+    echo "## Provenance"
+    echo
+    echo "- generated: $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    echo "- runner: $(uname -srm 2>/dev/null || echo unknown)"
+    echo "- warp: $("$WARP_BIN" --version 2>/dev/null | head -n1 || echo unknown)"
+    echo "- matrix: duration=$DURATION rounds=$ROUNDS cooldown=${COOLDOWN_SECS:-driver-default} disks=$DISKS concurrency=$CONCURRENCY"
+    echo "- baseline binary: ${BASELINE_BIN:-<built from $BASELINE_REF>}"
+    echo "- candidate binary: ${CANDIDATE_BIN:-<built from worktree>}"
+    local note
+    for note in ${PROVENANCE_NOTES[@]+"${PROVENANCE_NOTES[@]}"}; do
+      echo "- $note"
+    done
+  } >>"$md"
+}
+
 # --- Gate -------------------------------------------------------------------
 gate_args=(--fail-pct "$FAIL_PCT" --warn-pct "$WARN_PCT" --markdown "$OUT_DIR/gate.md")
 for csv in "${COMPARE_CSVS[@]}"; do gate_args+=(--compare-csv "$csv"); done
@@ -370,7 +404,12 @@ if [[ "$DRY_RUN" == "true" ]]; then
 fi
 
 log "applying relative-budget gate"
+# Do not let a gate FAIL (exit 1) trip set -e before provenance is appended and
+# the status is returned; the gate's exit code is captured and re-emitted.
+set +e
 "$GATE" "${gate_args[@]}"
 gate_status=$?
+set -e
 log "gate result written to $OUT_DIR/gate.md (exit $gate_status)"
+write_provenance
 exit "$gate_status"

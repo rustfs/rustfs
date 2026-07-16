@@ -34,7 +34,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::{DiskError, EcstoreError, HealDiskExt as _, local_disk_map_read};
+use super::{DiskError, HealDiskExt as _, local_disk_map_read};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -565,9 +565,12 @@ fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(Hea
     if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
         return None;
     }
+    if task.has_batch_failure() {
+        return None;
+    }
 
     let error = err.to_string();
-    if !is_recoverable_heal_error(err, &error) {
+    if !err.is_recoverable_heal() {
         return None;
     }
 
@@ -580,54 +583,6 @@ fn recoverable_heal_retry_delay(retry_attempt: u32) -> Duration {
     let retry_attempt = retry_attempt.clamp(1, 5);
     let delay = Duration::from_secs(2_u64.saturating_pow(retry_attempt));
     delay.min(MAX_RECOVERABLE_HEAL_RETRY_DELAY)
-}
-
-fn is_recoverable_heal_error(err: &Error, error: &str) -> bool {
-    match err {
-        Error::TaskCancelled => false,
-        Error::TaskTimeout | Error::TransientSkip { .. } => true,
-        Error::Storage(err) => is_recoverable_storage_heal_error(err) || is_recoverable_heal_error_message(error),
-        Error::Disk(err) => is_recoverable_disk_heal_error(err) || is_recoverable_heal_error_message(error),
-        Error::TaskExecutionFailed { .. } | Error::Io(_) | Error::IO(_) | Error::Other(_) => {
-            is_recoverable_heal_error_message(error)
-        }
-        _ => false,
-    }
-}
-
-fn is_recoverable_storage_heal_error(err: &EcstoreError) -> bool {
-    err.is_quorum_error() || matches!(err, EcstoreError::SlowDown | EcstoreError::OperationCanceled | EcstoreError::Lock(_))
-}
-
-fn is_recoverable_disk_heal_error(err: &DiskError) -> bool {
-    matches!(
-        err,
-        DiskError::ErasureReadQuorum
-            | DiskError::ErasureWriteQuorum
-            | DiskError::Timeout
-            | DiskError::SourceStalled
-            | DiskError::FaultyRemoteDisk
-            | DiskError::FaultyDisk
-    )
-}
-
-fn is_recoverable_heal_error_message(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        "failed to acquire read lock",
-        "lock acquisition failed",
-        "lock acquisition timeout",
-        "remote lock rpc timed out",
-        "deadline has elapsed",
-        "timed out",
-        "transport error",
-        "network error",
-        "connection refused",
-        "operation canceled",
-        "quorum not reached",
-    ]
-    .iter()
-    .any(|pattern| error.contains(pattern))
 }
 
 /// Heal config
@@ -2917,8 +2872,9 @@ fn can_schedule_request(request: &HealRequest, running_per_set: &HashMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heal::EcstoreError;
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
-    use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
+    use crate::heal::task::{BatchHealFailure, HealOptions, HealPriority, HealRequest, HealTask, HealType};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_concurrency::{WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot};
     use rustfs_madmin::heal_commands::HealResultItem;
@@ -3674,6 +3630,24 @@ mod tests {
         let result = Err(Error::TaskExecutionFailed {
             message: "Remote lock RPC timed out".to_string(),
         });
+
+        assert!(retry_request_for_result(&task, &result).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_retry_request_does_not_rescan_batch_after_object_retries_exhausted() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(HealRequest::bucket("bucket".to_string()), storage);
+        let result = Err(task
+            .record_batch_failure(BatchHealFailure {
+                scope: "bucket:bucket".to_string(),
+                failed: 1,
+                retryable: 1,
+                permanent: 0,
+                first_object: "object".to_string(),
+                first_error: "Lock acquisition timeout".to_string(),
+            })
+            .await);
 
         assert!(retry_request_for_result(&task, &result).is_none());
     }

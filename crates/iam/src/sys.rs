@@ -1952,6 +1952,18 @@ mod tests {
         );
     }
 
+    /// GHSA-m77q-r63m-pj89 (STS JWTs signed with the shared root secret —
+    /// intentionally UNFIXED). This test characterizes the STS credential
+    /// lifecycle: a session token signed with the active token-signing key
+    /// decodes and authorizes through the STS path. It pins that the SAME key
+    /// both signs and verifies STS tokens.
+    ///
+    /// MUST UPDATE WHEN GHSA-m77q IS FIXED: the fix introduces a dedicated STS
+    /// signing key distinct from the root secret. The narrower pin that captures
+    /// the advisory's exact signature (signing key == root secret) is
+    /// `test_ghsa_m77q_sts_session_token_signed_with_root_secret`; keep both in
+    /// lockstep and flip them red -> green together.
+    /// Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-m77q-r63m-pj89>
     #[tokio::test]
     async fn test_created_sts_credentials_authorize_with_session_token_claims() {
         ensure_test_global_credentials();
@@ -2050,6 +2062,95 @@ mod tests {
         assert!(
             iam_sys.eval_prepared(&prepared, &args).await,
             "created STS credentials should inherit the parent user's group policy"
+        );
+    }
+
+    /// GHSA-m77q-r63m-pj89 flow-level pin (STS session tokens are signed with the
+    /// shared root secret — intentionally UNFIXED). Anyone holding the root secret
+    /// can forge STS session tokens because RustFS reuses the root secret as the
+    /// STS token-signing key. This test PINS that vulnerable-by-design behavior end
+    /// to end: (1) the token-signing key IS the root secret, (2) an AssumeRole-style
+    /// session token issued with that key decodes with the ROOT secret and NOT with
+    /// any other secret, and (3) it authorizes through the STS path.
+    ///
+    /// MUST UPDATE WHEN GHSA-m77q IS FIXED: the fix introduces a dedicated STS
+    /// signing key distinct from the root secret. That makes assertion (1) and the
+    /// "root secret decodes the token" assertion fail (red). Whoever fixes m77q must
+    /// replace this pin with a regression asserting the NEW behavior — the root
+    /// secret can no longer decode STS session tokens — i.e. red -> green.
+    /// Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-m77q-r63m-pj89>
+    #[tokio::test]
+    async fn test_ghsa_m77q_sts_session_token_signed_with_root_secret() {
+        ensure_test_global_credentials();
+
+        let root = crate::root_credentials::credentials().expect("global action (root) credentials should be initialized");
+        assert!(!root.secret_key.is_empty(), "root secret must be present for the STS signing-key pin");
+
+        // (1) m77q signature: the STS token-signing key IS the root secret. A fix
+        // that introduces a dedicated STS key makes this fail -> update red->green.
+        assert_eq!(
+            crate::root_credentials::token_signing_key().as_deref(),
+            Some(root.secret_key.as_str()),
+            "GHSA-m77q pin: STS tokens are signed with the root secret. If this fails, \
+             m77q may have been fixed (dedicated STS key) — update this test red->green."
+        );
+
+        // AssumeRole-style issuance: mint a session token with the active signing key.
+        // Use the mock store's registered STS parent (group `testgroup` -> readwrite)
+        // so authorization resolves through the STS path; the m77q pin is about the
+        // signing key, not the parent identity.
+        let parent_user = "sts-fallback-test-parent";
+        let signing_key = crate::root_credentials::token_signing_key().expect("STS token-signing key should be present");
+        let mut claims = HashMap::new();
+        claims.insert("parent".to_string(), Value::String(parent_user.to_string()));
+        claims.insert(
+            "exp".to_string(),
+            Value::Number(serde_json::Number::from(
+                (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp(),
+            )),
+        );
+        let mut cred = get_new_credentials_with_metadata(&claims, &signing_key).expect("STS credentials should be created");
+        cred.parent_user = parent_user.to_string();
+
+        // (2) The session token decodes with the ROOT secret specifically — the crux
+        // of m77q — and rejects any non-root secret (HMAC verification fails).
+        let decoded = get_claims_from_token_with_secret(&cred.session_token, &root.secret_key)
+            .expect("GHSA-m77q pin: STS session token must decode with the ROOT secret");
+        assert_eq!(decoded.get("parent").and_then(Value::as_str), Some(parent_user));
+        assert!(
+            get_claims_from_token_with_secret(&cred.session_token, "not-the-root-secret").is_err(),
+            "GHSA-m77q pin: STS session token must NOT decode with a non-root secret"
+        );
+
+        // (3) The root-secret-signed STS credentials authorize end to end.
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+        iam_sys
+            .set_temp_user(&cred.access_key, &cred, None)
+            .await
+            .expect("STS credentials should be persisted in the temp-user cache");
+
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: &cred.access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &decoded,
+            deny_only: false,
+        };
+        let prepared = iam_sys.prepare_auth(&args).await;
+        assert!(
+            matches!(prepared.mode, PreparedIamMode::Sts { .. }),
+            "root-secret-signed STS credentials must use the STS authorization path"
+        );
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "root-secret-signed STS credentials should authorize through the parent group policy (m77q)"
         );
     }
 

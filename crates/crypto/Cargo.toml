@@ -29,23 +29,23 @@ documentation = "https://docs.rs/rustfs-crypto/latest/rustfs_crypto/"
 workspace = true
 
 [dependencies]
-aes-gcm = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true, features = ["rand_core"] }
 argon2 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
-jsonwebtoken = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 base64-simd = { workspace = true }
 pbkdf2 = { workspace = true, optional = true }
-rand = { workspace = true }
+rand = { workspace = true, features = ["serde"] }
 rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 
 
 [dev-dependencies]
 test-case.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 
 [features]
 default = ["crypto", "fips"]

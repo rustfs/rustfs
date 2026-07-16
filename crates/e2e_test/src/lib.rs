@@ -195,6 +195,30 @@ mod stale_multipart_cleanup_cluster_test;
 #[cfg(test)]
 mod object_lambda_test;
 
+// S3 event-notification webhook delivery end-to-end (backlog#1154 peri-1):
+// configure webhook target -> PutBucketNotificationConfiguration -> object
+// operation -> event delivered, plus filter negatives and store-queue redelivery.
+#[cfg(test)]
+mod notification_webhook_test;
+
+// TLS certificate hot-reload live-listener e2e (backlog#1154 peri-5): swap
+// certificates without a restart, existing sessions survive, bad material is
+// fail-safe (old certificate keeps serving, failure is logged).
+#[cfg(test)]
+mod tls_hot_reload_test;
+
+// Console listener over-the-wire smoke (backlog#1154 peri-4): public console
+// endpoints answer without credentials or leaks, the SPA prefix never falls
+// through to the S3 API, and the protected surface stays authenticated.
+#[cfg(test)]
+mod console_smoke_test;
+
+// Admin IAM management CRUD e2e (backlog#1154 peri-2): user / canned-policy /
+// service-account lifecycle over signed HTTP with data-plane effect assertions,
+// plus non-admin 403 probes per endpoint (sec-4 pattern).
+#[cfg(test)]
+mod admin_iam_crud_test;
+
 // Replication extension end-to-end regression tests
 #[cfg(test)]
 mod replication_extension_test;

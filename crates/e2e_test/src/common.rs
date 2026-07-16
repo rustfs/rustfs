@@ -446,6 +446,13 @@ impl RustFSTestEnvironment {
         self.start_rustfs_server_inner(extra_args, &[], false).await
     }
 
+    pub async fn start_rustfs_server_without_cleanup_with_env(
+        &mut self,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_inner(vec![], extra_env, false).await
+    }
+
     /// Wait for RustFS server to be ready.
     ///
     /// A listening TCP port is not sufficient here: the process may accept
@@ -513,6 +520,30 @@ impl RustFSTestEnvironment {
                 info!("RustFS server stopped");
             }
         }
+    }
+
+    /// Restart this server in place, preserving its on-disk data directory,
+    /// listen address, and credentials.
+    ///
+    /// Failure-recovery tests (backlog#1147 repl-5) need the *same* instance to
+    /// come back up after a crash/stop with its persisted state intact:
+    /// per-object replication status in `xl.meta`, the MRF recovery file, and
+    /// resync metadata all live under `temp_dir`, which this method keeps. The
+    /// address is reused too (the server sets `SO_REUSEADDR`/`SO_REUSEPORT`), so
+    /// existing S3 clients keep working without reconfiguration.
+    ///
+    /// The previous process is stopped first. `cleanup_existing` is false so a
+    /// sibling server sharing the harness (e.g. a replication target on another
+    /// port) is left untouched — only this instance is recycled. Pass the same
+    /// `extra_args` / `extra_env` the instance was originally started with;
+    /// background tasks read their env once at startup.
+    pub async fn restart_server_preserving_data(
+        &mut self,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.stop_server();
+        self.start_rustfs_server_inner(extra_args, extra_env, false).await
     }
 }
 

@@ -21,6 +21,7 @@
 //! unchanged; method bodies are moved verbatim and runtime behavior is the same.
 
 use super::super::*;
+use crate::crash_inject::{self, CrashPoint};
 use std::future::Future;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -1420,6 +1421,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
+        // Crash-consistency injection: hard power loss after the upload is fully
+        // staged and locked but before the authoritative rename_data commit. No
+        // disk has moved the staged data, so a crash here must leave any prior
+        // committed version byte-for-byte intact (rustfs/backlog#864) and the
+        // upload fully retryable. Compiles to a no-op outside `#[cfg(test)]`.
+        if crash_inject::should_crash_at(CrashPoint::MultipartBeforeCommitRename, object) {
+            return Err(StorageError::Unexpected);
+        }
+
         // The trailing `_` drops the rename_data old-size backfill
         // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
         // `get_object_info` lookup, so the backfill has no consumer here yet.
@@ -1433,6 +1443,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             write_quorum,
         )
         .await?;
+
+        // Crash-consistency injection: hard power loss after the authoritative
+        // rename_data commit succeeded but before the stale part.N.meta cleanup.
+        // The new version is durably committed and visible, so a crash here must
+        // leave the object readable as the new version; the un-reclaimed staging
+        // parts are swept by a retried completion or upload GC (rustfs/backlog#946).
+        // Compiles to a no-op outside `#[cfg(test)]`.
+        if crash_inject::should_crash_at(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object) {
+            return Err(StorageError::Unexpected);
+        }
 
         // backlog#946: reclaim the stale per-part metadata (and any superfluous
         // part.N data files no longer in the completed set) only *after* the
@@ -2124,5 +2144,223 @@ mod tests {
 
         let paged: Vec<&str> = first.iter().chain(second.iter()).map(|u| u.upload_id.as_str()).collect();
         assert_eq!(paged, vec!["u0", "u1", "u2", "u3"]);
+    }
+
+    /// Crash-consistency for the two `complete_multipart_upload` commit windows.
+    ///
+    /// rustfs/backlog#864: a fault that interrupts a completion must never mutate
+    /// an already-committed object; the object must read back as the whole old
+    /// version or the whole new version, never a torn mix, and the upload must
+    /// stay recoverable.
+    ///
+    /// [`CrashPoint::MultipartBeforeCommitRename`] fires after the upload is fully
+    /// staged and locked but before the authoritative `rename_data` commit: a
+    /// prior committed version survives byte-for-byte and the upload is retryable.
+    /// [`CrashPoint::MultipartAfterCommitBeforePartsCleanup`] fires after the
+    /// commit lands but before the stale `part.N.meta` cleanup: the new version is
+    /// readable and the un-reclaimed staging is harmless and reclaimable.
+    mod crash_consistency {
+        use super::*;
+        use crate::crash_inject::{self, CrashPoint};
+        use crate::storage_api_contracts::object::ObjectIO as _;
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt as _;
+
+        /// 1 MiB keeps every object off the 128 KiB inline fast path, so the
+        /// commit moves real erasure shards through `rename_data`.
+        const PART_SIZE: usize = 1 << 20;
+
+        fn payload(fill: u8) -> Vec<u8> {
+            vec![fill; PART_SIZE]
+        }
+
+        async fn make_bucket_on_all(disks: &[DiskStore], bucket: &str) {
+            for disk in disks {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+        }
+
+        /// Stage a single-part multipart upload without completing it. A single
+        /// part is the last part, so the 5 MiB minimum-part-size gate does not
+        /// apply. Returns the upload id and the `CompletePart` list.
+        async fn stage_upload(
+            set_disks: &Arc<SetDisks>,
+            bucket: &str,
+            object: &str,
+            content: &[u8],
+        ) -> (String, Vec<CompletePart>) {
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+            let mut reader = PutObjReader::new(
+                HashReader::from_stream(
+                    Cursor::new(content.to_vec()),
+                    content.len() as i64,
+                    content.len() as i64,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("hash reader should be constructed"),
+            );
+            let part = set_disks
+                .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("uploading the part should succeed");
+            (
+                upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+            )
+        }
+
+        async fn complete(
+            set_disks: &Arc<SetDisks>,
+            bucket: &str,
+            object: &str,
+            upload_id: &str,
+            parts: Vec<CompletePart>,
+        ) -> Result<ObjectInfo> {
+            set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, upload_id, parts, &ObjectOptions::default())
+                .await
+        }
+
+        /// Read the whole committed object back; returns `(body, etag)`. The full
+        /// body read also proves the served length matches (never a torn/short body).
+        async fn read_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) -> (Vec<u8>, Option<String>) {
+            let mut reader = set_disks
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("object reader should open");
+            let etag = reader.object_info.etag.clone();
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("object should stream fully");
+            (body, etag)
+        }
+
+        async fn upload_is_listed(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, upload_id: &str) -> bool {
+            let page = set_disks
+                .list_multipart_uploads(bucket, object, None, None, None, 1000)
+                .await
+                .expect("listing multipart uploads should succeed");
+            page.uploads.iter().any(|u| u.upload_id == upload_id)
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn pre_commit_crash_keeps_committed_old_version() {
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-crash-pre";
+            let object = "crash-pre-object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            // Commit an OLD version through the multipart path.
+            let old = payload(0xA1);
+            let (u_old, parts_old) = stage_upload(&set_disks, bucket, object, &old).await;
+            complete(&set_disks, bucket, object, &u_old, parts_old)
+                .await
+                .expect("the old version should commit");
+            let (old_body, old_etag) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(old_body, old, "the old version must round-trip before the crash");
+
+            // Stage a replacement upload with NEW content, then crash before commit.
+            let new = payload(0xB2);
+            let (u_new, parts_new) = stage_upload(&set_disks, bucket, object, &new).await;
+            crash_inject::arm(CrashPoint::MultipartBeforeCommitRename, object);
+            let crashed = complete(&set_disks, bucket, object, &u_new, parts_new.clone()).await;
+            assert!(
+                matches!(crashed, Err(StorageError::Unexpected)),
+                "the armed pre-commit crash point must be the failure that surfaced, got {crashed:?}"
+            );
+
+            // rustfs/backlog#864: the committed old version is untouched, byte-for-byte.
+            let (after_body, after_etag) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(after_body, old, "the interrupted completion must not mutate the committed old version");
+            assert_eq!(after_etag, old_etag, "the old version's ETag must be unchanged");
+
+            // The staged upload survived intact (part.N.meta present on quorum), so
+            // a retried completion commits the new version cleanly (retryable).
+            assert!(
+                total_part1_meta(&temp_dirs).await > 0,
+                "the un-committed upload must keep its staging parts for retry"
+            );
+            crash_inject::disarm(CrashPoint::MultipartBeforeCommitRename, object);
+            complete(&set_disks, bucket, object, &u_new, parts_new)
+                .await
+                .expect("a retried completion must succeed");
+            let (retry_body, retry_etag) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(retry_body, new, "the retried completion must publish the whole new version");
+            assert_ne!(retry_etag, old_etag, "the new version must carry a distinct ETag");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn post_commit_crash_publishes_new_version_and_leaves_reclaimable_upload() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-crash-post";
+            let object = "crash-post-object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            // Stage an upload and crash AFTER the commit rename but BEFORE cleanup.
+            let new = payload(0xC3);
+            let (u_new, parts_new) = stage_upload(&set_disks, bucket, object, &new).await;
+            let parts_retry = parts_new.clone();
+            crash_inject::arm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+            let crashed = complete(&set_disks, bucket, object, &u_new, parts_new).await;
+            assert!(
+                matches!(crashed, Err(StorageError::Unexpected)),
+                "the armed post-commit crash point must be the failure that surfaced, got {crashed:?}"
+            );
+            crash_inject::disarm(CrashPoint::MultipartAfterCommitBeforePartsCleanup, object);
+
+            // The commit landed: the new version reads back whole and correct.
+            let (body, _etag) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(body, new, "a post-commit crash must leave the whole new version readable");
+
+            // The completion never reached its cleanup, so the upload's staging
+            // directory is still listable — leftover that must be reclaimable.
+            assert!(
+                upload_is_listed(&set_disks, bucket, object, &u_new).await,
+                "the post-commit crash must leave the upload listable for reclamation"
+            );
+
+            // A retried CompleteMultipartUpload is answered deterministically: the
+            // commit rename already consumed the upload's metadata, so the retry
+            // resolves to InvalidUploadID (NoSuchUpload to the S3 client, the
+            // standard answer for a completed-then-retried upload) — never a torn
+            // state, and the committed object is untouched by the retry.
+            let retried = complete(&set_disks, bucket, object, &u_new, parts_retry).await;
+            assert!(
+                matches!(retried, Err(StorageError::InvalidUploadID(..))),
+                "a retried complete after the commit landed must resolve to InvalidUploadID, got {retried:?}"
+            );
+            let (body_after_retry, _) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(body_after_retry, new, "the failed retry must not disturb the committed object");
+
+            // Reclaim the leftover exactly as the production tail does: delete_all
+            // on the upload path (abort_multipart_upload cannot — the upload's
+            // metadata is gone, so it too answers InvalidUploadID).
+            let upload_dir = SetDisks::get_upload_id_dir(bucket, object, &u_new);
+            set_disks
+                .delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_dir)
+                .await
+                .expect("sweeping the leftover upload staging should succeed");
+            assert!(
+                !upload_is_listed(&set_disks, bucket, object, &u_new).await,
+                "reclaiming the upload must drop it from the listing"
+            );
+            let (body_after, _) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(body_after, new, "reclaiming the leftover upload must not disturb the committed object");
+        }
     }
 }

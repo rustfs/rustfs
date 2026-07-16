@@ -36,7 +36,7 @@ use rustfs_policy::{
         action::{Action, AdminAction},
     },
 };
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration as StdDuration, Instant};
@@ -50,6 +50,16 @@ const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
 const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const WAREHOUSE_PROPERTY: &str = "warehouse";
+const PREFIX_PROPERTY: &str = "prefix";
+const ICEBERG_ERROR_ALREADY_EXISTS: &str = "AlreadyExistsException";
+const ICEBERG_ERROR_BAD_REQUEST: &str = "BadRequestException";
+const ICEBERG_ERROR_COMMIT_FAILED: &str = "CommitFailedException";
+const ICEBERG_ERROR_NAMESPACE_NOT_EMPTY: &str = "NamespaceNotEmptyException";
+const ICEBERG_ERROR_NO_SUCH_NAMESPACE: &str = "NoSuchNamespaceException";
+const ICEBERG_ERROR_NO_SUCH_RESOURCE: &str = "NoSuchResourceException";
+const ICEBERG_ERROR_NO_SUCH_TABLE: &str = "NoSuchTableException";
+const ICEBERG_ERROR_NO_SUCH_VIEW: &str = "NoSuchViewException";
+const ICEBERG_ERROR_REST: &str = "RESTException";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CATALOG_BACKING_CONFIG_KEY: &str = "rustfs.catalog-backing";
@@ -199,8 +209,8 @@ static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTab
 
 #[derive(Debug, Serialize)]
 struct CatalogConfigResponse {
-    defaults: BTreeMap<&'static str, &'static str>,
-    overrides: BTreeMap<&'static str, &'static str>,
+    defaults: BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
     endpoints: Vec<&'static str>,
     admin_discovery: CatalogAdminDiscovery,
 }
@@ -1031,20 +1041,30 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     Ok(())
 }
 
-fn catalog_config_response() -> S3Result<CatalogConfigResponse> {
+fn catalog_config_response(warehouse: Option<&str>) -> S3Result<CatalogConfigResponse> {
     let usecase = default_admin_usecase();
     let backing_mode = crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)?;
     let mut overrides = BTreeMap::new();
     if backing_mode != crate::table_catalog::TableCatalogBackingMode::ObjectBacked {
-        overrides.insert(CATALOG_BACKING_CONFIG_KEY, backing_mode.as_str());
+        overrides.insert(CATALOG_BACKING_CONFIG_KEY.to_string(), backing_mode.as_str().to_string());
+    }
+    let mut defaults = BTreeMap::from([
+        (WAREHOUSE_PROPERTY.to_string(), DEFAULT_WAREHOUSE_ID.to_string()),
+        (CATALOG_ENDPOINT_PREFIX_CONFIG_KEY.to_string(), TABLE_CATALOG_PREFIX.to_string()),
+        (
+            CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY.to_string(),
+            TABLE_CATALOG_COMPAT_PREFIX.to_string(),
+        ),
+        (
+            CATALOG_BACKING_CONFIG_KEY.to_string(),
+            crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT.to_string(),
+        ),
+    ]);
+    if let Some(warehouse) = warehouse {
+        defaults.insert(PREFIX_PROPERTY.to_string(), warehouse.to_string());
     }
     Ok(CatalogConfigResponse {
-        defaults: BTreeMap::from([
-            (WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID),
-            (CATALOG_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_PREFIX),
-            (CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_COMPAT_PREFIX),
-            (CATALOG_BACKING_CONFIG_KEY, crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
-        ]),
+        defaults,
         overrides,
         endpoints: TABLE_CATALOG_ENDPOINTS.to_vec(),
         admin_discovery: CatalogAdminDiscovery {
@@ -1270,6 +1290,26 @@ fn warehouse_from_params(params: &Params<'_, '_>) -> S3Result<String> {
         return Err(s3_error!(InvalidRequest, "warehouse is required"));
     }
     Ok(warehouse.to_string())
+}
+
+fn warehouse_from_config_query(uri: &http::Uri) -> S3Result<Option<String>> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    let mut warehouse = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key != WAREHOUSE_PROPERTY {
+            continue;
+        }
+        if warehouse.is_some() {
+            return Err(s3_error!(InvalidRequest, "warehouse query parameter must not be repeated"));
+        }
+        if value.is_empty() {
+            return Err(s3_error!(InvalidRequest, "warehouse query parameter must not be empty"));
+        }
+        warehouse = Some(value.into_owned());
+    }
+    Ok(warehouse)
 }
 
 fn namespace_from_params(params: &Params<'_, '_>) -> S3Result<crate::table_catalog::Namespace> {
@@ -1633,9 +1673,42 @@ fn storage_credential_from_issued(scope: TableCredentialScope, issued: IssuedTab
     }
 }
 
+fn table_metadata_location_for_client(table_bucket: &str, metadata_location: &str) -> String {
+    if crate::table_catalog::is_reserved_table_object_key(metadata_location) {
+        format!("s3://{table_bucket}/{metadata_location}")
+    } else {
+        metadata_location.to_string()
+    }
+}
+
+fn table_metadata_location_for_catalog(table_bucket: &str, metadata_location: &str) -> S3Result<String> {
+    crate::table_catalog::table_catalog_object_key_from_location(table_bucket, metadata_location)
+        .ok_or_else(|| s3_error!(InvalidRequest, "metadata location must be inside the table bucket"))
+}
+
+fn table_metadata_for_client(table_bucket: &str, mut metadata: serde_json::Value) -> serde_json::Value {
+    if let Some(metadata_log) = metadata.get_mut("metadata-log").and_then(serde_json::Value::as_array_mut) {
+        for entry in metadata_log {
+            let Some(metadata_file) = entry.get_mut("metadata-file") else {
+                continue;
+            };
+            let Some(metadata_location) = metadata_file.as_str() else {
+                continue;
+            };
+            if crate::table_catalog::is_reserved_table_object_key(metadata_location) {
+                *metadata_file = serde_json::Value::String(table_metadata_location_for_client(table_bucket, metadata_location));
+            }
+        }
+    }
+
+    metadata
+}
+
 fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metadata: serde_json::Value) -> RestLoadTableResponse {
     let mut config = BTreeMap::new();
     let warehouse_location = entry.warehouse_location.clone();
+    let metadata_location = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
+    let metadata = table_metadata_for_client(&entry.table_bucket, metadata);
     config.insert("warehouse-location".to_string(), warehouse_location.clone());
     config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_UNSUPPORTED.to_string());
     config.insert(
@@ -1647,7 +1720,7 @@ fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metad
     config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CLIENT_PROVIDED.to_string());
 
     RestLoadTableResponse {
-        metadata_location: entry.metadata_location,
+        metadata_location,
         metadata,
         config,
         storage_credentials: Vec::new(),
@@ -1734,8 +1807,10 @@ fn commit_table_response_from_result(
     result: crate::table_catalog::TableCommitResult,
     metadata: serde_json::Value,
 ) -> RestCommitTableResponse {
+    let metadata_location = table_metadata_location_for_client(&result.table.table_bucket, &result.table.metadata_location);
+    let metadata = table_metadata_for_client(&result.table.table_bucket, metadata);
     RestCommitTableResponse {
-        metadata_location: result.table.metadata_location,
+        metadata_location,
         metadata,
         version_token: result.table.version_token,
         generation: result.table.generation,
@@ -1744,8 +1819,9 @@ fn commit_table_response_from_result(
 }
 
 fn table_metadata_location_response_from_entry(entry: crate::table_catalog::TableEntry) -> TableMetadataLocationResponse {
+    let metadata_location = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
     TableMetadataLocationResponse {
-        metadata_location: entry.metadata_location,
+        metadata_location,
         version_token: entry.version_token,
         generation: entry.generation,
         warehouse_location: entry.warehouse_location,
@@ -1758,6 +1834,12 @@ fn table_commit_request_from_rest_request(
     table: &str,
     request: RestCommitTableRequest,
 ) -> S3Result<crate::table_catalog::TableCommitRequest> {
+    let expected_metadata_location = request
+        .expected_metadata_location
+        .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-metadata-location"))?;
+    let new_metadata_location = request
+        .new_metadata_location
+        .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires new-metadata-location"))?;
     Ok(crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -1768,12 +1850,8 @@ fn table_commit_request_from_rest_request(
         expected_version_token: request
             .expected_version_token
             .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-version-token"))?,
-        expected_metadata_location: request
-            .expected_metadata_location
-            .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-metadata-location"))?,
-        new_metadata_location: request
-            .new_metadata_location
-            .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires new-metadata-location"))?,
+        expected_metadata_location: table_metadata_location_for_catalog(bucket, &expected_metadata_location)?,
+        new_metadata_location: table_metadata_location_for_catalog(bucket, &new_metadata_location)?,
         requirements: request.requirements,
         writer: request.writer,
     })
@@ -1881,7 +1959,8 @@ fn table_entry_from_register_request(
     }
     let table = crate::table_catalog::IdentifierSegment::parse(request.name)
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &request.metadata_location) {
+    let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
 
@@ -1896,7 +1975,7 @@ fn table_entry_from_register_request(
         format: "ICEBERG".to_string(),
         format_version: 2,
         warehouse_location: format!("s3://{bucket}/tables/{table_id}"),
-        metadata_location: request.metadata_location,
+        metadata_location,
         version_token: format!("token-{}", Uuid::new_v4()),
         generation: 1,
         state: crate::table_catalog::TableCatalogEntryState::Active,
@@ -1914,7 +1993,8 @@ fn table_entry_from_import_request(
 ) -> S3Result<crate::table_catalog::TableEntry> {
     let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &request.metadata_location) {
+    let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
 
@@ -1929,7 +2009,7 @@ fn table_entry_from_import_request(
         format: "ICEBERG".to_string(),
         format_version: 2,
         warehouse_location: format!("s3://{bucket}/tables/{table_id}"),
-        metadata_location: request.metadata_location,
+        metadata_location,
         version_token: format!("token-{}", Uuid::new_v4()),
         generation: 1,
         state: crate::table_catalog::TableCatalogEntryState::Active,
@@ -2754,13 +2834,26 @@ fn snapshot_has_manifest_references(snapshot: &serde_json::Value) -> bool {
 
 #[derive(Default)]
 struct SnapshotLiveFiles {
-    data_files: BTreeSet<String>,
-    delete_files: BTreeSet<String>,
+    data_files: BTreeMap<String, SnapshotFileIdentity>,
+    delete_files: BTreeMap<String, SnapshotFileIdentity>,
+    manifest_files: BTreeMap<String, SnapshotManifestIdentity>,
 }
 
 impl SnapshotLiveFiles {
     fn contains(&self, location: &str) -> bool {
-        self.data_files.contains(location) || self.delete_files.contains(location)
+        self.data_files.contains_key(location) || self.delete_files.contains_key(location)
+    }
+
+    fn identity(
+        &self,
+        location: &str,
+        object_kind: &crate::table_catalog::TableMetadataMaintenanceObjectKind,
+    ) -> Option<&SnapshotFileIdentity> {
+        match object_kind {
+            crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile => self.data_files.get(location),
+            crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile => self.delete_files.get(location),
+            _ => None,
+        }
     }
 }
 
@@ -2786,10 +2879,22 @@ impl SnapshotFileChanges {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SnapshotChangeIdentity {
+struct SnapshotChangeContext<'a> {
+    current_live_files: &'a SnapshotLiveFiles,
     snapshot_id: i64,
     sequence_number: i64,
+}
+
+#[derive(PartialEq, Eq)]
+struct SnapshotManifestIdentity {
+    sequence_number: Option<i64>,
+    added_snapshot_id: Option<i64>,
+}
+
+#[derive(PartialEq, Eq)]
+struct SnapshotFileIdentity {
+    sequence_number: Option<i64>,
+    file_sequence_number: Option<i64>,
 }
 
 async fn validate_table_snapshot_commit_conflicts<B>(
@@ -2830,7 +2935,8 @@ where
         table,
         entry,
         snapshot,
-        SnapshotChangeIdentity {
+        SnapshotChangeContext {
+            current_live_files: &current_live_files,
             snapshot_id,
             sequence_number,
         },
@@ -2928,22 +3034,42 @@ where
         .ok_or_else(|| s3_error!(InvalidRequest, "current snapshot metadata is missing"))?;
 
     let mut live_files = SnapshotLiveFiles::default();
-    for reference in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
-        let status = reference
-            .entry_status
-            .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
-        match status {
-            0 | 1 => match reference.object_kind {
-                crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile => {
-                    live_files.data_files.insert(reference.location);
-                }
-                crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile => {
-                    live_files.delete_files.insert(reference.location);
-                }
-                _ => {}
+    for manifest in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
+        let SnapshotManifestLocation {
+            manifest_path,
+            sequence_number,
+            added_snapshot_id,
+        } = manifest.location;
+        live_files.manifest_files.insert(
+            manifest_path,
+            SnapshotManifestIdentity {
+                sequence_number,
+                added_snapshot_id,
             },
-            2 => {}
-            _ => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
+        );
+        for reference in manifest.references {
+            let status = reference
+                .entry_status
+                .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
+            match status {
+                0 | 1 => {
+                    let identity = SnapshotFileIdentity {
+                        sequence_number: reference.sequence_number,
+                        file_sequence_number: reference.file_sequence_number,
+                    };
+                    match reference.object_kind {
+                        crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile => {
+                            live_files.data_files.insert(reference.location, identity);
+                        }
+                        crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile => {
+                            live_files.delete_files.insert(reference.location, identity);
+                        }
+                        _ => {}
+                    }
+                }
+                2 => {}
+                _ => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
+            }
         }
     }
     Ok(live_files)
@@ -2956,44 +3082,107 @@ async fn load_snapshot_file_changes<B>(
     table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     snapshot: &serde_json::Value,
-    change_identity: SnapshotChangeIdentity,
+    context: SnapshotChangeContext<'_>,
 ) -> S3Result<SnapshotFileChanges>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let mut changes = SnapshotFileChanges::default();
-    for reference in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
-        let status = reference
-            .entry_status
-            .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
-        if matches!(status, 1 | 2)
-            && (reference.snapshot_id != Some(change_identity.snapshot_id)
-                || reference.sequence_number != Some(change_identity.sequence_number))
+    for manifest in read_snapshot_manifest_references(metadata_backend, bucket, namespace, table, entry, snapshot).await? {
+        let inherited_identity = context
+            .current_live_files
+            .manifest_files
+            .get(&manifest.location.manifest_path);
+        if let Some(inherited_identity) = inherited_identity {
+            let candidate_identity = SnapshotManifestIdentity {
+                sequence_number: manifest.location.sequence_number,
+                added_snapshot_id: manifest.location.added_snapshot_id,
+            };
+            if inherited_identity
+                .sequence_number
+                .is_some_and(|sequence_number| candidate_identity.sequence_number != Some(sequence_number))
+                || inherited_identity
+                    .added_snapshot_id
+                    .is_some_and(|snapshot_id| candidate_identity.added_snapshot_id != Some(snapshot_id))
+            {
+                return Err(s3_error!(InvalidRequest, "inherited manifest must preserve its manifest-list identity"));
+            }
+            continue;
+        }
+        if manifest
+            .location
+            .added_snapshot_id
+            .is_some_and(|added_snapshot_id| added_snapshot_id != context.snapshot_id)
         {
-            return Err(s3_error!(
-                InvalidRequest,
-                "manifest changed entries must belong to the committed snapshot"
-            ));
+            return Err(s3_error!(InvalidRequest, "new manifest must belong to the committed snapshot"));
+        }
+        if manifest
+            .location
+            .sequence_number
+            .is_some_and(|sequence_number| sequence_number != context.sequence_number)
+        {
+            return Err(s3_error!(InvalidRequest, "new manifest sequence must match the committed snapshot"));
         }
 
-        match (status, reference.object_kind) {
-            (0, _) => {}
-            (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
-                changes.added_data_files.insert(reference.location);
+        for reference in manifest.references {
+            let status = reference
+                .entry_status
+                .ok_or_else(|| s3_error!(InvalidRequest, "manifest entry status is required"))?;
+            if matches!(status, 1 | 2) && reference.snapshot_id != Some(context.snapshot_id) {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "manifest changed entries must belong to the committed snapshot"
+                ));
             }
-            (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile) => {
-                changes.added_delete_files.insert(reference.location);
+            if status == 1
+                && manifest.location.sequence_number.is_some_and(|sequence_number| {
+                    reference.sequence_number != Some(sequence_number) || reference.file_sequence_number != Some(sequence_number)
+                })
+            {
+                return Err(s3_error!(InvalidRequest, "added manifest entry sequence must match its manifest"));
             }
-            (2, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
-                changes.deleted_data_files.insert(reference.location);
+            if status == 2
+                && context
+                    .current_live_files
+                    .identity(&reference.location, &reference.object_kind)
+                    .is_some_and(|current_identity| {
+                        current_identity
+                            != &SnapshotFileIdentity {
+                                sequence_number: reference.sequence_number,
+                                file_sequence_number: reference.file_sequence_number,
+                            }
+                    })
+            {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "deleted manifest entry must preserve the current file sequence"
+                ));
             }
-            (2, crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile) => {
-                changes.deleted_delete_files.insert(reference.location);
+
+            match (status, reference.object_kind) {
+                (0, _) => {}
+                (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
+                    changes.added_data_files.insert(reference.location);
+                }
+                (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile) => {
+                    changes.added_delete_files.insert(reference.location);
+                }
+                (2, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
+                    changes.deleted_data_files.insert(reference.location);
+                }
+                (2, crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile) => {
+                    changes.deleted_delete_files.insert(reference.location);
+                }
+                _ => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
             }
-            _ => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
         }
     }
     Ok(changes)
+}
+
+struct SnapshotManifestReferences {
+    location: SnapshotManifestLocation,
+    references: Vec<crate::table_catalog::ManifestDataFileReference>,
 }
 
 async fn read_snapshot_manifest_references<B>(
@@ -3003,12 +3192,12 @@ async fn read_snapshot_manifest_references<B>(
     table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     snapshot: &serde_json::Value,
-) -> S3Result<Vec<crate::table_catalog::ManifestDataFileReference>>
+) -> S3Result<Vec<SnapshotManifestReferences>>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let manifest_locations = snapshot_manifest_locations(metadata_backend, bucket, namespace, table, entry, snapshot).await?;
-    let mut references = Vec::new();
+    let mut manifests = Vec::new();
     for manifest_location in manifest_locations {
         let manifest_key = table_commit_object_key(
             bucket,
@@ -3025,6 +3214,7 @@ where
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
         let file_references =
             crate::table_catalog::data_file_references_from_manifest_avro(&manifest_object.data).map_err(catalog_store_error)?;
+        let mut references = Vec::with_capacity(file_references.len());
         for mut reference in file_references {
             if reference.snapshot_id.is_none() {
                 reference.snapshot_id = manifest_location.added_snapshot_id;
@@ -3038,8 +3228,12 @@ where
             validate_manifest_data_file_reference(metadata_backend, bucket, namespace, table, entry, &reference).await?;
             references.push(reference);
         }
+        manifests.push(SnapshotManifestReferences {
+            location: manifest_location,
+            references,
+        });
     }
-    Ok(references)
+    Ok(manifests)
 }
 
 #[derive(Debug)]
@@ -3332,20 +3526,48 @@ fn namespace_entry_from_create_request(
     })
 }
 
-fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> s3s::S3Error {
+fn iceberg_rest_error(error_type: &str, status: StatusCode, message: impl Into<String>) -> S3Error {
+    let mut err = S3Error::with_message(S3ErrorCode::Custom(error_type.into()), message.into());
+    err.set_status_code(status);
+    err
+}
+
+fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
     match err {
         crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
-            s3_error!(InvalidRequest, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_RESOURCE, StatusCode::NOT_FOUND, message)
         }
         crate::table_catalog::TableCatalogStoreError::Conflict(message) => {
-            s3_error!(PreconditionFailed, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_COMMIT_FAILED, StatusCode::CONFLICT, message)
         }
         crate::table_catalog::TableCatalogStoreError::Invalid(message) => {
-            s3_error!(InvalidRequest, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_BAD_REQUEST, StatusCode::BAD_REQUEST, message)
         }
         crate::table_catalog::TableCatalogStoreError::Internal(message) => {
-            s3_error!(InternalError, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_REST, StatusCode::INTERNAL_SERVER_ERROR, message)
         }
+    }
+}
+
+fn catalog_store_conflict_error(err: crate::table_catalog::TableCatalogStoreError, conflict_type: &'static str) -> S3Error {
+    match err {
+        crate::table_catalog::TableCatalogStoreError::Conflict(message) => {
+            iceberg_rest_error(conflict_type, StatusCode::CONFLICT, message)
+        }
+        err => catalog_store_error(err),
+    }
+}
+
+fn catalog_store_already_exists_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
+    catalog_store_conflict_error(err, ICEBERG_ERROR_ALREADY_EXISTS)
+}
+
+fn catalog_store_namespace_drop_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
+    match err {
+        crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
+            iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_NAMESPACE, StatusCode::NOT_FOUND, message)
+        }
+        err => catalog_store_conflict_error(err, ICEBERG_ERROR_NAMESPACE_NOT_EMPTY),
     }
 }
 
@@ -3360,7 +3582,10 @@ where
 {
     let entry = namespace_entry_from_create_request(bucket, request)?;
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
-    store.create_namespace(entry.clone()).await.map_err(catalog_store_error)?;
+    store
+        .create_namespace(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     namespace_response_from_entry(entry)
 }
 
@@ -3385,7 +3610,11 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "namespace not found"));
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_NO_SUCH_NAMESPACE,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        ));
     };
     namespace_response_from_entry(entry)
 }
@@ -3406,7 +3635,10 @@ async fn drop_namespace_in_store<S>(store: &S, bucket: &str, namespace: &str) ->
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    store.drop_namespace(bucket, namespace).await.map_err(catalog_store_error)
+    store
+        .drop_namespace(bucket, namespace)
+        .await
+        .map_err(catalog_store_namespace_drop_error)
 }
 
 async fn register_table_response<S>(
@@ -3425,7 +3657,10 @@ where
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &metadata)?;
     adopt_registered_metadata_identity(&mut entry, &metadata)?;
-    store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+    store
+        .register_table(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     Ok(load_table_response_from_entry(entry, metadata))
 }
 
@@ -3452,8 +3687,11 @@ where
             crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
         )
         .await
-        .map_err(catalog_store_error)?;
-    store.create_table(entry.clone()).await.map_err(catalog_store_error)?;
+        .map_err(catalog_store_already_exists_error)?;
+    store
+        .create_table(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     Ok(load_table_response_from_entry(entry, metadata))
 }
 
@@ -3480,8 +3718,11 @@ where
             crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
         )
         .await
-        .map_err(catalog_store_error)?;
-    store.create_view(entry.clone()).await.map_err(catalog_store_error)?;
+        .map_err(catalog_store_already_exists_error)?;
+    store
+        .create_view(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     Ok(load_view_response_from_entry(entry, metadata))
 }
 
@@ -3535,7 +3776,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     Ok(load_table_response_from_entry(entry, metadata))
@@ -3571,7 +3812,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "view not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_VIEW, StatusCode::NOT_FOUND, "view not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     Ok(load_view_response_from_entry(entry, metadata))
@@ -3610,7 +3851,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "view not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_VIEW, StatusCode::NOT_FOUND, "view not found"));
     };
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_view_commit_requirements(&current_metadata, &request.requirements)?;
@@ -3700,7 +3941,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     load_credentials_response_from_entry(&entry, issuer, principal).await
 }
@@ -3719,7 +3960,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     Ok(table_metadata_location_response_from_entry(entry))
 }
@@ -3740,16 +3981,17 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+    let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
-    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
     let commit_request = crate::table_catalog::TableCommitRequest {
@@ -3761,7 +4003,7 @@ where
         operation: "update-metadata-location".to_string(),
         expected_version_token: request.version_token,
         expected_metadata_location: current.metadata_location,
-        new_metadata_location: request.metadata_location,
+        new_metadata_location: metadata_location,
         requirements: Vec::new(),
         writer: Some("rustfs-metadata-location-api".to_string()),
     };
@@ -3790,7 +4032,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
@@ -3822,14 +4064,15 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_table_commit_requirements(&current_metadata, &request.requirements)?;
     let expected_metadata = current_metadata.clone();
-    let next_metadata = apply_table_commit_updates(current_metadata, &request.updates, &current.metadata_location)?;
+    let previous_metadata_location = table_metadata_location_for_client(bucket, &current.metadata_location);
+    let next_metadata = apply_table_commit_updates(current_metadata, &request.updates, &previous_metadata_location)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     validate_table_snapshot_commit_conflicts(
@@ -4018,7 +4261,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     if report.table_id != current.table_id || report.current_metadata_location != current.metadata_location {
         return Err(s3_error!(PreconditionFailed, "snapshot expiration plan is stale"));
@@ -4041,7 +4284,8 @@ where
         "action": "remove-snapshots",
         "snapshot-ids": expired_snapshot_ids.clone()
     })];
-    let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &current.metadata_location)?;
+    let previous_metadata_location = table_metadata_location_for_client(bucket, &current.metadata_location);
+    let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &previous_metadata_location)?;
     validate_metadata_matches_current_metadata(&current_metadata, &next_metadata)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
@@ -4099,7 +4343,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     let current_snapshot_id = metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64);
@@ -4213,7 +4457,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     let reference = metadata
@@ -4410,7 +4654,11 @@ fn external_catalog_bridge_entry_from_request(
     let external_namespace = validate_external_catalog_field("external namespace", request.external_namespace)?;
     let external_table = validate_external_catalog_field("external table", request.external_table)?;
     let external_table_uuid = validate_external_catalog_optional_field("external table uuid", request.external_table_uuid)?;
-    if let Some(metadata_location) = request.metadata_location.as_deref() {
+    let metadata_location = request
+        .metadata_location
+        .map(|metadata_location| table_metadata_location_for_catalog(bucket, &metadata_location))
+        .transpose()?;
+    if let Some(metadata_location) = metadata_location.as_deref() {
         validate_external_catalog_metadata_location(namespace, table, metadata_location)?;
     }
     Ok(crate::table_catalog::ExternalCatalogBridgeEntry {
@@ -4423,7 +4671,7 @@ fn external_catalog_bridge_entry_from_request(
         external_namespace,
         external_table,
         external_table_uuid,
-        metadata_location: request.metadata_location,
+        metadata_location,
         external_version_token: validate_external_catalog_optional_field(
             "external version token",
             request.external_version_token,
@@ -4522,6 +4770,12 @@ async fn sync_external_catalog_bridge_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
+    let mut request = request;
+    request.metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    request.expected_metadata_location = request
+        .expected_metadata_location
+        .map(|metadata_location| table_metadata_location_for_catalog(bucket, &metadata_location))
+        .transpose()?;
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
     validate_external_catalog_metadata_location(namespace, table, &request.metadata_location)?;
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
@@ -4662,16 +4916,17 @@ where
             .await
             .map_err(catalog_store_error)?
         else {
-            return Err(s3_error!(InvalidRequest, "table not found"));
+            return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
         };
         let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
             .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-        if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+        let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+        if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &metadata_location) {
             return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
         }
         let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
-        let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+        let target_metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
         validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
         let commit_request = crate::table_catalog::TableCommitRequest {
@@ -4683,7 +4938,7 @@ where
             operation: "rollback".to_string(),
             expected_version_token: request.version_token,
             expected_metadata_location: current.metadata_location,
-            new_metadata_location: request.metadata_location,
+            new_metadata_location: metadata_location,
             requirements: Vec::new(),
             writer: Some("rustfs-catalog-rollback-api".to_string()),
         };
@@ -4701,7 +4956,8 @@ pub struct GetCatalogConfigHandler {}
 impl Operation for GetCatalogConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;
-        build_json_response(StatusCode::OK, &catalog_config_response()?)
+        let warehouse = warehouse_from_config_query(&req.uri)?;
+        build_json_response(StatusCode::OK, &catalog_config_response(warehouse.as_deref())?)
     }
 }
 
@@ -5587,19 +5843,27 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn catalog_config_response_lists_standard_rest_endpoints() {
-        let response = temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, catalog_config_response)
-            .expect("catalog config should build");
+        let response =
+            temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, || catalog_config_response(None))
+                .expect("catalog config should build");
 
-        assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY), Some(&DEFAULT_WAREHOUSE_ID));
-        assert_eq!(response.defaults.get(CATALOG_ENDPOINT_PREFIX_CONFIG_KEY), Some(&TABLE_CATALOG_PREFIX));
+        assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY).map(String::as_str), Some(DEFAULT_WAREHOUSE_ID));
         assert_eq!(
-            response.defaults.get(CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY),
-            Some(&TABLE_CATALOG_COMPAT_PREFIX)
+            response.defaults.get(CATALOG_ENDPOINT_PREFIX_CONFIG_KEY).map(String::as_str),
+            Some(TABLE_CATALOG_PREFIX)
         );
         assert_eq!(
-            response.defaults.get(CATALOG_BACKING_CONFIG_KEY),
-            Some(&crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT)
+            response
+                .defaults
+                .get(CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY)
+                .map(String::as_str),
+            Some(TABLE_CATALOG_COMPAT_PREFIX)
         );
+        assert_eq!(
+            response.defaults.get(CATALOG_BACKING_CONFIG_KEY).map(String::as_str),
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT)
+        );
+        assert!(!response.defaults.contains_key(PREFIX_PROPERTY));
         assert!(response.overrides.is_empty());
         assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
@@ -5710,14 +5974,58 @@ mod tests {
         let response = temp_env::with_var(
             crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
             Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG),
-            catalog_config_response,
+            || catalog_config_response(None),
         )
         .expect("catalog config should build");
 
         assert_eq!(
-            response.overrides.get(CATALOG_BACKING_CONFIG_KEY),
-            Some(&crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
+            response.overrides.get(CATALOG_BACKING_CONFIG_KEY).map(String::as_str),
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn catalog_config_response_uses_requested_warehouse_as_standard_prefix() {
+        let response = temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, || {
+            catalog_config_response(Some("analytics"))
+        })
+        .expect("catalog config should build");
+
+        assert_eq!(response.defaults.get(PREFIX_PROPERTY).map(String::as_str), Some("analytics"));
+    }
+
+    #[test]
+    fn warehouse_config_query_rejects_empty_and_repeated_values() {
+        let uri = "/iceberg/v1/config?warehouse=analytics".parse().expect("URI");
+        assert_eq!(warehouse_from_config_query(&uri).expect("warehouse query"), Some("analytics".to_string()));
+
+        let uri = "/iceberg/v1/config?warehouse=".parse().expect("URI");
+        assert!(warehouse_from_config_query(&uri).is_err());
+
+        let uri = "/iceberg/v1/config?warehouse=one&warehouse=two".parse().expect("URI");
+        assert!(warehouse_from_config_query(&uri).is_err());
+    }
+
+    #[test]
+    fn catalog_conflicts_use_operation_specific_iceberg_errors() {
+        let already_exists = catalog_store_already_exists_error(crate::table_catalog::TableCatalogStoreError::Conflict(
+            "table already exists".to_string(),
+        ));
+        assert_eq!(already_exists.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_ALREADY_EXISTS.into()));
+        assert_eq!(already_exists.status_code(), Some(StatusCode::CONFLICT));
+
+        let namespace_not_empty = catalog_store_namespace_drop_error(crate::table_catalog::TableCatalogStoreError::Conflict(
+            "namespace is not empty".to_string(),
+        ));
+        assert_eq!(namespace_not_empty.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NAMESPACE_NOT_EMPTY.into()));
+        assert_eq!(namespace_not_empty.status_code(), Some(StatusCode::CONFLICT));
+
+        let namespace_not_found = catalog_store_namespace_drop_error(crate::table_catalog::TableCatalogStoreError::NotFound(
+            "namespace not found".to_string(),
+        ));
+        assert_eq!(namespace_not_found.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
+        assert_eq!(namespace_not_found.status_code(), Some(StatusCode::NOT_FOUND));
     }
 
     #[test]
@@ -6445,7 +6753,7 @@ mod tests {
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
         let request: RegisterTableRequest = serde_json::from_value(serde_json::json!({
             "name": "events",
-            "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+            "metadata-location": "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
             "overwrite": false
         }))
         .expect("request should parse");
@@ -6584,7 +6892,7 @@ mod tests {
 
         assert_eq!(
             response.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
         );
         assert_eq!(response.metadata["format-version"], 2);
         assert_eq!(response.metadata["current-schema-id"], 0);
@@ -6602,7 +6910,7 @@ mod tests {
         assert_eq!(response.metadata["table-uuid"], entry.table_uuid);
         assert!(
             metadata_backend
-                .object_exists("warehouse", &response.metadata_location)
+                .object_exists("warehouse", &entry.metadata_location)
                 .await
                 .expect("metadata object lookup should succeed")
         );
@@ -6669,7 +6977,8 @@ mod tests {
             .await
             .expect("standard commit should succeed");
 
-        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_prefix =
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
         let metadata_file_suffix = ".metadata.json";
         let generated_commit_id = commit
             .metadata_location
@@ -6684,17 +6993,20 @@ mod tests {
         assert_eq!(commit.metadata["refs"]["main"]["snapshot-id"], 10);
         assert_eq!(
             commit.metadata["metadata-log"][0]["metadata-file"],
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
         );
         let committed = store
             .load_table("warehouse", "analytics", "events")
             .await
             .expect("committed table lookup should succeed")
             .expect("committed table should exist");
-        assert_eq!(committed.metadata_location, commit.metadata_location);
+        assert_eq!(
+            table_metadata_location_for_client("warehouse", &committed.metadata_location),
+            commit.metadata_location
+        );
         assert!(
             metadata_backend
-                .object_exists("warehouse", &commit.metadata_location)
+                .object_exists("warehouse", &committed.metadata_location)
                 .await
                 .expect("committed metadata lookup should succeed")
         );
@@ -6727,11 +7039,16 @@ mod tests {
         assert_eq!(commit.commit_id, commit_id);
         assert_eq!(
             commit.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-11111111-1111-4111-8111-111111111111.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-11111111-1111-4111-8111-111111111111.metadata.json"
         );
+        let committed = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("committed table lookup should succeed")
+            .expect("committed table should exist");
         assert!(
             metadata_backend
-                .object_exists("warehouse", &commit.metadata_location)
+                .object_exists("warehouse", &committed.metadata_location)
                 .await
                 .expect("committed metadata lookup should succeed")
         );
@@ -6760,7 +7077,8 @@ mod tests {
             .await
             .expect("standard commit should succeed");
 
-        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_prefix =
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
         let metadata_file_suffix = ".metadata.json";
         let metadata_file_token = commit
             .metadata_location
@@ -6809,7 +7127,7 @@ mod tests {
 
         assert_eq!(
             commit.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-22222222-2222-4222-8222-222222222222.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-22222222-2222-4222-8222-222222222222.metadata.json"
         );
         assert_eq!(commit.metadata["properties"]["owner"], "lakehouse");
     }
@@ -7024,7 +7342,7 @@ mod tests {
         .await
         .expect("legacy catalog uuid should not block metadata-location update");
 
-        assert_eq!(updated.metadata_location, next_location);
+        assert_eq!(updated.metadata_location, table_metadata_location_for_client("warehouse", next_location));
         assert_eq!(updated.generation, legacy_entry.generation + 1);
     }
 
@@ -7316,7 +7634,7 @@ mod tests {
         assert_eq!(snapshot_log.len(), 1);
         assert_eq!(
             committed_metadata["metadata-log"][0]["metadata-file"],
-            serde_json::Value::String(current.clone())
+            serde_json::Value::String(table_metadata_location_for_client(bucket, &current))
         );
         assert!(
             backend
@@ -7722,7 +8040,10 @@ mod tests {
         .expect("external sync should register missing table");
 
         assert_eq!(synced.action, "registered");
-        assert_eq!(synced.table.metadata_location, metadata_location);
+        assert_eq!(
+            synced.table.metadata_location,
+            table_metadata_location_for_client(bucket, &metadata_location)
+        );
         let bridge = synced.bridge.bridge.as_ref().expect("bridge state should be returned");
         assert_eq!(bridge.catalog, "glue");
         assert_eq!(bridge.last_sync_status.as_deref(), Some("synced"));
@@ -7784,10 +8105,10 @@ mod tests {
                 external_namespace: "sales".to_string(),
                 external_table: "orders".to_string(),
                 external_table_uuid: Some("table-uuid".to_string()),
-                metadata_location: next_location.clone(),
+                metadata_location: table_metadata_location_for_client(bucket, &next_location),
                 external_version_token: Some("hms-version-2".to_string()),
                 expected_version_token: Some("token-v1".to_string()),
-                expected_metadata_location: Some(current_location.clone()),
+                expected_metadata_location: Some(table_metadata_location_for_client(bucket, &current_location)),
                 commit_id: Some("external-sync-2".to_string()),
                 idempotency_key: Some("external-sync-idempotency-2".to_string()),
                 policy_mode: Some("rustfs-authoritative".to_string()),
@@ -7801,7 +8122,7 @@ mod tests {
         .expect("external sync should commit existing table");
 
         assert_eq!(synced.action, "committed");
-        assert_eq!(synced.table.metadata_location, next_location);
+        assert_eq!(synced.table.metadata_location, table_metadata_location_for_client(bucket, &next_location));
         let current = store
             .load_table(bucket, "analytics", "events")
             .await
@@ -8066,7 +8387,7 @@ mod tests {
             &[(&old_data_file, 0, 2, 11, 2), (&replacement_data_file, 0, 1, 11, 2)],
         )
         .await;
-        let overwrite_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+        let overwrite_request_json = serde_json::json!({
             "requirements": [
                 {
                     "type": "assert-current-snapshot-id",
@@ -8094,8 +8415,26 @@ mod tests {
                     "type": "branch"
                 }
             ]
-        }))
-        .expect("overwrite request should parse");
+        });
+        let stale_overwrite_request: RestCommitTableRequest =
+            serde_json::from_value(overwrite_request_json.clone()).expect("stale overwrite request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", stale_overwrite_request)
+            .await
+            .expect_err("deleted file sequence must not change");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+
+        seed_test_snapshot_manifest(
+            &metadata_backend,
+            "warehouse",
+            &overwrite_manifest_list,
+            11,
+            2,
+            &[(&old_data_file, 0, 2, 11, 1), (&replacement_data_file, 0, 1, 11, 2)],
+        )
+        .await;
+        let overwrite_request: RestCommitTableRequest =
+            serde_json::from_value(overwrite_request_json).expect("overwrite request should parse");
 
         let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", overwrite_request)
             .await
@@ -8126,7 +8465,7 @@ mod tests {
                         "sequence-number": 1,
                         "timestamp-ms": 1234,
                         "manifests": [
-                            manifest
+                            manifest.clone()
                         ],
                         "summary": {
                             "operation": "append"
@@ -8149,6 +8488,56 @@ mod tests {
 
         assert_eq!(commit.metadata["current-snapshot-id"], 10);
         assert_eq!(commit.metadata["last-sequence-number"], 1);
+
+        let second_manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let second_manifest = format!("{table_location}/metadata/manifest-11.avro");
+        let second_data_file = format!("{table_location}/data/part-11.parquet");
+        let second_manifest_list_key = test_snapshot_object_key("warehouse", &second_manifest_list);
+        metadata_backend
+            .put_bytes(
+                "warehouse",
+                &second_manifest_list_key,
+                test_manifest_list_avro_entries(&[(&manifest, 1, 10), (&second_manifest, 2, 11)]),
+            )
+            .await;
+        seed_test_manifest(&metadata_backend, "warehouse", &second_manifest, &[(&second_data_file, 0, 1, 11, 2)]).await;
+        let second_append: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": second_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 11,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("second append request should parse");
+
+        let upgraded = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_append)
+            .await
+            .expect("manifest-list snapshot should inherit a legacy manifest with unknown provenance");
+
+        assert_eq!(upgraded.metadata["current-snapshot-id"], 11);
+        assert_eq!(upgraded.metadata["last-sequence-number"], 2);
     }
 
     #[tokio::test]
@@ -8196,6 +8585,342 @@ mod tests {
 
         assert_eq!(commit.metadata["current-snapshot-id"], 10);
         assert_eq!(commit.metadata["last-sequence-number"], 1);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_allows_inherited_manifests_on_append() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let first_manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let first_manifest = format!("{table_location}/metadata/manifest-10.avro");
+        let first_data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &first_manifest_list, &[&first_manifest], 1, 10).await;
+        seed_test_manifest(&metadata_backend, "warehouse", &first_manifest, &[(&first_data_file, 0, 1, 10, 1)]).await;
+        let first_append: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": first_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("first append request should parse");
+        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", first_append)
+            .await
+            .expect("first append should commit");
+
+        let second_manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let second_manifest = format!("{table_location}/metadata/manifest-11.avro");
+        let second_data_file = format!("{table_location}/data/part-11.parquet");
+        let second_manifest_list_key = test_snapshot_object_key("warehouse", &second_manifest_list);
+        metadata_backend
+            .put_bytes(
+                "warehouse",
+                &second_manifest_list_key,
+                test_manifest_list_avro_entries(&[(&first_manifest, 1, 10), (&second_manifest, 2, 11)]),
+            )
+            .await;
+        seed_test_manifest(&metadata_backend, "warehouse", &second_manifest, &[(&second_data_file, 0, 1, 11, 2)]).await;
+        let second_append: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": second_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 11,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("second append request should parse");
+
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_append)
+            .await
+            .expect("append should preserve inherited manifests");
+
+        assert_eq!(commit.metadata["current-snapshot-id"], 11);
+        assert_eq!(commit.metadata["last-sequence-number"], 2);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let first_manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let first_manifest = format!("{table_location}/metadata/manifest-10.avro");
+        let first_data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &first_manifest_list, &[&first_manifest], 1, 10).await;
+        seed_test_manifest(&metadata_backend, "warehouse", &first_manifest, &[(&first_data_file, 0, 1, 10, 1)]).await;
+        let first_append: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": first_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("first append request should parse");
+        commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", first_append)
+            .await
+            .expect("first append should commit");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+
+        let second_manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &second_manifest_list, &[&first_manifest], 2, 10).await;
+        let second_append: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "requirements": [
+                {
+                    "type": "assert-current-snapshot-id",
+                    "snapshot-id": 10
+                }
+            ],
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "parent-snapshot-id": 10,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": second_manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("second append request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", second_append)
+            .await
+            .expect_err("inherited manifest identity must not change");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, current.metadata_location);
+        assert_eq!(unchanged.version_token, current.version_token);
+        assert_eq!(unchanged.generation, current.generation);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_stale_new_manifest_sequence() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let manifest = format!("{table_location}/metadata/manifest-11.avro");
+        let data_file = format!("{table_location}/data/part-11.parquet");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], 1, 11).await;
+        seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 11, 1)]).await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("append request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect_err("new manifest sequence must match the committed snapshot");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, current.metadata_location);
+        assert_eq!(unchanged.version_token, current.version_token);
+        assert_eq!(unchanged.generation, current.generation);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_stale_added_entry_sequence() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let manifest = format!("{table_location}/metadata/manifest-11.avro");
+        let data_file = format!("{table_location}/data/part-11.parquet");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], 2, 11).await;
+        seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 11, 1)]).await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("append request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect_err("added file sequence must match the new manifest");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, current.metadata_location);
+        assert_eq!(unchanged.version_token, current.version_token);
+        assert_eq!(unchanged.generation, current.generation);
+    }
+
+    #[tokio::test]
+    async fn row_level_conflict_rejects_historical_change_in_new_manifest() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let manifest_list = format!("{table_location}/metadata/snap-11.avro");
+        let manifest = format!("{table_location}/metadata/manifest-11.avro");
+        let data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], 2, 11).await;
+        seed_test_manifest(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 10, 1)]).await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 11,
+                        "sequence-number": 2,
+                        "timestamp-ms": 2234,
+                        "manifest-list": manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("append request should parse");
+
+        let error = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect_err("new manifest must not claim a historical changed entry");
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidRequest);
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("table should still exist");
+        assert_eq!(unchanged.metadata_location, current.metadata_location);
+        assert_eq!(unchanged.version_token, current.version_token);
+        assert_eq!(unchanged.generation, current.generation);
     }
 
     #[tokio::test]
@@ -9019,11 +9744,32 @@ mod tests {
         let metadata = serde_json::json!({
             "format-version": 2,
             "table-uuid": "table-uuid",
-            "location": "s3://warehouse/tables/table-id"
+            "location": "s3://warehouse/tables/table-id",
+            "metadata-log": [
+                {
+                    "timestamp-ms": 1,
+                    "metadata-file": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+                },
+                {
+                    "timestamp-ms": 2,
+                    "metadata-file": "s3://warehouse/external/metadata/00000.metadata.json"
+                }
+            ]
         });
-        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata.clone());
+        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata);
 
-        assert_eq!(response.metadata, metadata);
+        assert_eq!(
+            response.metadata_location,
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+        );
+        assert_eq!(
+            response.metadata["metadata-log"][0]["metadata-file"],
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+        );
+        assert_eq!(
+            response.metadata["metadata-log"][1]["metadata-file"],
+            "s3://warehouse/external/metadata/00000.metadata.json"
+        );
         assert!(response.storage_credentials.is_empty());
         assert_eq!(response.config.get("rustfs.credential-vending"), Some(&"unsupported".to_string()));
         assert_eq!(
@@ -9042,6 +9788,44 @@ mod tests {
         assert!(!response.config.contains_key("s3.access-key-id"));
         assert!(!response.config.contains_key("s3.secret-access-key"));
         assert!(!response.config.contains_key("s3.session-token"));
+    }
+
+    #[test]
+    fn load_table_response_preserves_format_v4_relative_metadata_log() {
+        let metadata = serde_json::json!({
+            "format-version": 4,
+            "table-uuid": "table-uuid",
+            "metadata-log": [
+                {
+                    "timestamp-ms": 1,
+                    "metadata-file": "metadata/00000.metadata.json"
+                },
+                {
+                    "timestamp-ms": 2,
+                    "metadata-file": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+                }
+            ]
+        });
+
+        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata);
+
+        assert_eq!(response.metadata["metadata-log"][0]["metadata-file"], "metadata/00000.metadata.json");
+        assert_eq!(
+            response.metadata["metadata-log"][1]["metadata-file"],
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+        );
+    }
+
+    #[test]
+    fn table_metadata_location_for_catalog_accepts_only_the_table_bucket() {
+        let object_key = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json";
+
+        assert_eq!(
+            table_metadata_location_for_catalog("warehouse", &format!("s3://warehouse/{object_key}"))
+                .expect("same-bucket metadata location should normalize"),
+            object_key
+        );
+        assert!(table_metadata_location_for_catalog("warehouse", &format!("s3://other/{object_key}")).is_err());
     }
 
     fn table_entry_for_credentials() -> crate::table_catalog::TableEntry {
@@ -9490,6 +10274,14 @@ mod tests {
     }
 
     fn test_manifest_list_avro_bytes(manifest_paths: &[&str], sequence_number: i64, snapshot_id: i64) -> Vec<u8> {
+        let manifests = manifest_paths
+            .iter()
+            .map(|manifest_path| (*manifest_path, sequence_number, snapshot_id))
+            .collect::<Vec<_>>();
+        test_manifest_list_avro_entries(&manifests)
+    }
+
+    fn test_manifest_list_avro_entries(manifests: &[(&str, i64, i64)]) -> Vec<u8> {
         let schema = apache_avro::Schema::parse_str(
             r#"
             {
@@ -9505,15 +10297,15 @@ mod tests {
         )
         .expect("manifest list avro schema should parse");
         let mut writer = apache_avro::Writer::new(&schema, Vec::new());
-        for manifest_path in manifest_paths {
+        for (manifest_path, sequence_number, snapshot_id) in manifests {
             writer
                 .append(apache_avro::types::Value::Record(vec![
                     (
                         "manifest_path".to_string(),
                         apache_avro::types::Value::String((*manifest_path).to_string()),
                     ),
-                    ("sequence_number".to_string(), apache_avro::types::Value::Long(sequence_number)),
-                    ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(snapshot_id)),
+                    ("sequence_number".to_string(), apache_avro::types::Value::Long(*sequence_number)),
+                    ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
                 ]))
                 .expect("manifest list record should append");
         }
@@ -10365,7 +11157,8 @@ mod tests {
         .await
         .expect("table should register");
 
-        assert_eq!(register.metadata_location, metadata_location);
+        let client_metadata_location = table_metadata_location_for_client("warehouse", metadata_location);
+        assert_eq!(register.metadata_location, client_metadata_location);
         assert_eq!(register.metadata["format-version"], 2);
 
         let list = list_tables_response(&store, "warehouse", &namespace)
@@ -10376,7 +11169,7 @@ mod tests {
         let load = load_table_response(&store, &metadata_backend, "warehouse", &namespace, "events")
             .await
             .expect("table should load");
-        assert_eq!(load.metadata_location, metadata_location);
+        assert_eq!(load.metadata_location, client_metadata_location);
         assert_eq!(load.metadata["table-uuid"], "table-uuid");
 
         let current = store
@@ -10409,8 +11202,8 @@ mod tests {
                 idempotency_key: Some("retry-1".to_string()),
                 operation: Some("append".to_string()),
                 expected_version_token: Some(current.version_token.clone()),
-                expected_metadata_location: Some(current.metadata_location.clone()),
-                new_metadata_location: Some(next_metadata_location.to_string()),
+                expected_metadata_location: Some(table_metadata_location_for_client("warehouse", &current.metadata_location)),
+                new_metadata_location: Some(table_metadata_location_for_client("warehouse", next_metadata_location)),
                 requirements: Vec::new(),
                 updates: Vec::new(),
                 _identifier: None,
@@ -10419,7 +11212,10 @@ mod tests {
         )
         .await
         .expect("table commit should succeed");
-        assert_eq!(commit.metadata_location, next_metadata_location);
+        assert_eq!(
+            commit.metadata_location,
+            table_metadata_location_for_client("warehouse", next_metadata_location)
+        );
         assert_eq!(commit.version_token, "token-committed");
         assert_eq!(commit.generation, current.generation + 1);
         assert_eq!(commit.commit_id, "commit-1");
@@ -10600,6 +11396,10 @@ mod tests {
         let current = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
             .await
             .expect("metadata location should load");
+        assert_eq!(
+            current.metadata_location,
+            table_metadata_location_for_client("warehouse", current_location)
+        );
         let next_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
         metadata_backend
             .put_json(
@@ -10620,7 +11420,7 @@ mod tests {
             &namespace,
             "events",
             UpdateTableMetadataLocationRequest {
-                metadata_location: next_location.to_string(),
+                metadata_location: table_metadata_location_for_client("warehouse", next_location),
                 version_token: current.version_token.clone(),
                 commit_id: Some("commit-1".to_string()),
                 idempotency_key: Some("retry-1".to_string()),
@@ -10629,7 +11429,7 @@ mod tests {
         .await
         .expect("metadata location should update");
 
-        assert_eq!(updated.metadata_location, next_location);
+        assert_eq!(updated.metadata_location, table_metadata_location_for_client("warehouse", next_location));
         assert_eq!(updated.generation, current.generation + 1);
         assert_ne!(updated.version_token, current.version_token);
     }
@@ -10705,7 +11505,10 @@ mod tests {
         let unchanged = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
             .await
             .expect("metadata location should still load");
-        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(
+            unchanged.metadata_location,
+            table_metadata_location_for_client("warehouse", current_location)
+        );
         assert_eq!(unchanged.generation, current.generation);
     }
 
@@ -10791,7 +11594,10 @@ mod tests {
         let unchanged = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
             .await
             .expect("metadata location should still load");
-        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(
+            unchanged.metadata_location,
+            table_metadata_location_for_client("warehouse", current_location)
+        );
         assert_eq!(unchanged.generation, current.generation);
     }
 
@@ -10836,14 +11642,14 @@ mod tests {
             &namespace,
             "events",
             CatalogImportRequest {
-                metadata_location: imported_location.clone(),
+                metadata_location: table_metadata_location_for_client(bucket, &imported_location),
                 properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
             },
             true,
         )
         .await
         .expect("catalog import should register table");
-        assert_eq!(imported.metadata_location, imported_location);
+        assert_eq!(imported.metadata_location, table_metadata_location_for_client(bucket, &imported_location));
         let current = store
             .load_table(bucket, "analytics", "events")
             .await
@@ -10865,7 +11671,10 @@ mod tests {
         )
         .await
         .expect("repeated catalog import should be idempotent");
-        assert_eq!(imported_again.metadata_location, imported_location);
+        assert_eq!(
+            imported_again.metadata_location,
+            table_metadata_location_for_client(bucket, &imported_location)
+        );
 
         let rollback_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
         backend
@@ -10887,7 +11696,7 @@ mod tests {
             &namespace,
             "events",
             RollbackTableRequest {
-                metadata_location: rollback_location.clone(),
+                metadata_location: table_metadata_location_for_client(bucket, &rollback_location),
                 version_token: current.version_token,
                 commit_id: Some("rollback-1".to_string()),
                 idempotency_key: None,
@@ -10896,7 +11705,7 @@ mod tests {
         .await
         .expect("rollback should commit selected metadata");
 
-        assert_eq!(rollback.metadata_location, rollback_location);
+        assert_eq!(rollback.metadata_location, table_metadata_location_for_client(bucket, &rollback_location));
         assert_eq!(rollback.commit_id, "rollback-1");
     }
 

@@ -23,8 +23,9 @@ use crate::server::{
     hybrid::hybrid,
     layer::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
-        HeadRequestBodyFixLayer, ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer,
-        RequestLoggingLayer, S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer,
+        RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer,
+        redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     tls_material::{
@@ -1226,14 +1227,15 @@ fn process_connection(
         // 14. CompressionLayer                       — response compression (whitelist, path-aware)
         // 15. PathCategoryInjectionLayer             — injects path category for compression predicate
         // 16. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 18. ConditionalCorsLayer                   — S3 API CORS
-        // 19. RedirectLayer                          — console redirect (conditional)
-        // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 21. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
-        // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
-        // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        // 17. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        // 18. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 19. ConditionalCorsLayer                   — S3 API CORS
+        // 20. RedirectLayer                          — console redirect (conditional)
+        // 21. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 22. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 23. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 24. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
+        // 25. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
         // ─────────────────────────────────────────────────────────────
         // Batch 1 intentionally keeps the external and internode stacks behaviorally
         // identical while giving each path family a named construction boundary.
@@ -1410,6 +1412,7 @@ fn process_connection(
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
                 .layer(PathCategoryInjectionLayer)
                 .layer(S3ErrorMessageCompatLayer)
+                .layer(IcebergRestErrorCompatLayer)
                 .layer(ObjectAttributesEtagFixLayer)
                 .layer(ConditionalCorsLayer::new())
                 .option_layer(if is_console { Some(RedirectLayer) } else { None })
@@ -1569,6 +1572,7 @@ fn process_connection(
                 .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
                 .layer(PathCategoryInjectionLayer)
                 .layer(S3ErrorMessageCompatLayer)
+                .layer(IcebergRestErrorCompatLayer)
                 .layer(ObjectAttributesEtagFixLayer)
                 .layer(ConditionalCorsLayer::new())
                 .option_layer(if is_console { Some(RedirectLayer) } else { None })

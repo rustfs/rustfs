@@ -209,7 +209,8 @@ pub struct ListObjectPartsResult {
     pub encoding_type: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
 pub struct InitiateMultipartUploadResult {
     pub bucket: String,
     pub key: String,
@@ -229,15 +230,28 @@ pub struct CompleteMultipartUploadResult {
     pub checksum_crc64nvme: String,
 }
 
+// Field renames drive the CompleteMultipartUpload XML body sent to the remote.
+// Without them quick-xml emits the Rust field names (<part_num>/<etag>), so the
+// remote parses zero <Part> elements and completes a 0-byte object while still
+// returning 200 — the multipart transition silently produces an empty object
+// (rustfs/rustfs#4811). Empty checksum fields are skipped so an MD5-only
+// transition does not emit blank <ChecksumCRC32/> elements.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct CompletePart {
     //api has
-    pub etag: String,
+    #[serde(rename = "PartNumber")]
     pub part_num: i64,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "ChecksumCRC32", skip_serializing_if = "String::is_empty")]
     pub checksum_crc32: String,
+    #[serde(rename = "ChecksumCRC32C", skip_serializing_if = "String::is_empty")]
     pub checksum_crc32c: String,
+    #[serde(rename = "ChecksumSHA1", skip_serializing_if = "String::is_empty")]
     pub checksum_sha1: String,
+    #[serde(rename = "ChecksumSHA256", skip_serializing_if = "String::is_empty")]
     pub checksum_sha256: String,
+    #[serde(rename = "ChecksumCRC64NVME", skip_serializing_if = "String::is_empty")]
     pub checksum_crc64nvme: String,
 }
 
@@ -272,7 +286,9 @@ pub struct CopyObjectPartResult {
 }
 
 #[derive(Debug, Default, serde::Serialize)]
+#[serde(rename = "CompleteMultipartUpload")]
 pub struct CompleteMultipartUpload {
+    #[serde(rename = "Part")]
     pub parts: Vec<CompletePart>,
 }
 

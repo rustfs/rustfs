@@ -26,14 +26,14 @@ categories = ["web-programming", "development-tools", "network-programming"]
 documentation = "https://docs.rs/rustfs-checksums/latest/rustfs_checksum/"
 
 [dependencies]
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
 crc-fast = { workspace = true }
 http = { workspace = true }
 base64-simd = { workspace = true }
 md-5 = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-xxhash-rust = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

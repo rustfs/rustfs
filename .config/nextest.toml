@@ -45,6 +45,15 @@ e2e-reliability = { max-threads = 1 }
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the multipart crash-consistency scenarios (dist-2, backlog#1150):
+# each spawns a 4-disk hermetic erasure set and drives full staged-upload +
+# commit + GET cycles — the same cross-disk-commit IO shape that made
+# concurrent_resend load-sensitive. Preventive serialization only, no retries.
+# The matching ci-profile override is after [profile.ci].
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the 4-disk reliability / degraded-read e2e tests (see the
 # e2e-reliability test-group note above). The matching ci-profile override is at
 # the end of the file, after [profile.ci] is declared.
@@ -109,6 +118,13 @@ retries = 2
 filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
 test-group = 'e2e-reliability'
 
+# Serialize the multipart crash-consistency scenarios under the ci profile too
+# (see the matching default-profile override near the top). Not a quarantine:
+# no retries, just serialized 4-disk cross-disk-commit IO.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
+test-group = 'ecstore-serial-flaky'
+
 # ---------------------------------------------------------------------------
 # e2e-smoke profile — PR smoke subset of the e2e_test crate (backlog#1149 ci-4)
 # ---------------------------------------------------------------------------
@@ -136,7 +152,7 @@ test-group = 'e2e-reliability'
 # the nightly profile derives its set as "the replication module MINUS this
 # allowlist", so any new replication test lands in nightly by default (never
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
-# regexes byte-identical. Count invariant: 20 here + 20 nightly = 40 total
+# regexes byte-identical. Count invariant: 20 here + 27 nightly = 47 total
 # (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
 # HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
 # (#4724) because they set a loopback (127.0.0.1) replication target that the
@@ -144,12 +160,38 @@ test-group = 'e2e-reliability'
 # the guard now honours an off-by-default opt-in and this suite's source servers
 # set it (RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET) — so the allowlist below is
 # restored.
+#
+# Security negative-auth subset (backlog#1151 sec-5): the three attacker-facing
+# S3 auth-rejection suites join the first clause above by module name —
+# presigned_negative (sec-2), negative_sigv4 (sec-1, header SigV4), and
+# admin_auth (sec-4, admin gate + root-credential lifecycle). All three use
+# RustFSTestEnvironment on a random port and are parallel-safe, so they meet the
+# smoke admission criteria unchanged. This is the wiring step that makes those
+# merged suites actually execute on every PR (they were dead until listed here).
+# A rename that drops any of them out of this filter would silently thin the
+# security gate with no CI signal, so scripts/check_security_smoke_count.sh owns
+# a count-floor guard over exactly this subset (infra-12 mechanism, floor in
+# .config/security-smoke-floor.txt), invoked from the e2e-tests job in ci.yml.
+# NOT here by topology: the GHSA-3p3x FTPS/WebDAV constant-time e2e
+# (protocols::test_protocol_core_suite) binds fixed ports and needs the
+# ftps,webdav features, so it cannot join this random-port, default-feature
+# profile; its GHSA-r5qv sibling is a unit test that already runs in the
+# test-and-lint `--all --exclude e2e_test` pass. See
+# docs/testing/security-regressions.md for the full CI-execution map.
+#
+# ILM tiering main path (backlog#1148 ilm-7): the `reliant::tiering::` clause
+# admits the hermetic transition e2e. Like the fast replication pair checks it
+# spawns a second independent single-node server (the cold RustFS tier), not a
+# cluster, so it keeps the lane's parallel-safe / no-external-dependency
+# properties. The RustFS warm backend has no loopback guard (that guard is
+# replication-only), so it needs no opt-in env for its 127.0.0.1 tier target.
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check|presigned_negative)_test::/)
+        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud)_test::/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
+        | test(/^reliant::tiering::/)
     )
 """
 fail-fast = false
@@ -160,10 +202,14 @@ fail-fast = false
 # backlog#1147 repl-1 (deps: ci-4). Runs the SLOW / cross-process replication
 # tests that are unfit for the per-PR e2e-smoke gate:
 #
-#   * 8 bucket-replication data-plane tests — they PUT/delete objects and poll
-#     until source and target converge; two replicate over HTTPS.
+#   * 2 remote-target TLS validation tests.
+#   * 12 bucket-replication data-plane/helper tests — they PUT/delete objects
+#     and poll until source and target converge; two replicate over HTTPS, two
+#     pin active SSE failure contracts, and one guards event/history observers.
+#     The SSE-S3 contract remains ignored under backlog#1291.
 #   * 11 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
 #     servers and drives the cross-process site-replication control plane.
+#   * 1 `_real_three_node` site-replication test.
 #   * 1 `_real_single_node` service-account round-trip test.
 #
 # The set is defined as "everything in replication_extension_test that is NOT
@@ -199,3 +245,79 @@ fail-fast = false
 # Emitted to target/nextest/e2e-repl-nightly/junit.xml; uploaded by the nightly
 # workflow as the failure-triage artifact.
 path = "junit.xml"
+
+# ---------------------------------------------------------------------------
+# e2e-full profile — merge-gate full single-node e2e lane (backlog#1149 ci-5)
+# ---------------------------------------------------------------------------
+# The merge gate (ci.yml `e2e-full` job: push main + merge_group +
+# workflow_dispatch). Runs the never-automated user-visible suites — KMS (40),
+# object_lock (33), multipart_auth (109), quota, checksum, encryption,
+# security-boundary, ... — that the fast PR `e2e-smoke` subset deliberately
+# skips. Budget <= 45 min; authority for the suite count is `cargo nextest list
+# --profile e2e-full` (see docs/testing/e2e-suite-inventory.md).
+#
+# The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
+#   * protocols:: — FTPS/SFTP/WebDAV, still pinned to --test-threads=1 by fixed
+#     ports; they join a scheduled lane once ci-6 randomises the ports (ci-7).
+#   * the 6 cluster suites that spin up a RustFSTestClusterEnvironment
+#     (cluster_concurrency, stale_multipart_cleanup_cluster,
+#     namespace_lock_quorum, heal_erasure_disk_rebuild, admin_timeout_regression,
+#     object_lambda) — too heavy for the merge budget; they run in ci-7's
+#     nightly 4-node lane.
+#   * replication_extension_test — repl-1 already splits it into the PR
+#     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (27 slow) lanes and reserves
+#     it for those, so e2e-full does not double-run it.
+#   * #[ignore]d tests — nextest skips them by default (no --run-ignored); the
+#     manual-localhost:9000 reliant/policy tests are ci-13's migration.
+#
+# Each e2e test spawns its own single-node rustfs server on a random port with
+# an isolated temp dir (crates/e2e_test/src/common.rs), so the set is
+# parallel-safe — the same property e2e-smoke relies on. The exception is the
+# 4-disk reliability / degraded-read fault-injection tests, serialized below
+# (identical to the ci profile) so several 4-disk servers never run at once.
+# KNOWN-FAILURE EXCLUSIONS (characterization run 29381309848, 2026-07-15:
+# 341 ran / 32 failed on the suites' first automated run ever). Deterministic
+# product failures cannot be quarantined away with retries, so each family is
+# excluded here with its tracking issue, under the same discipline as the
+# ci-profile quarantine (docs/testing/README.md): every entry MUST cite one
+# OPEN issue, and the fixing PR MUST delete the exclusion. The passing
+# negative-path siblings of each family stay in as regression guards.
+#   * rustfs#4842 — extract/snowball expand pipeline 500s (mtime=0
+#     OffsetDateTime deserialization + same-path failures).
+#   * rustfs#4843 — over-limit archive entry paths hard-reject the whole
+#     archive even under ignore-errors semantics.
+#   * rustfs#4844 — anonymous POST-object with SSE-S3 / bucket-default SSE
+#     returns 500.
+#   * rustfs#4845 — 403 on allowed anonymous POST object-lock fields and on
+#     the list metadata=true extension.
+#   * rustfs#4846 — distributed-lock quorum tests misclassify as timeout
+#     under parallel load (multi-node in-process clusters; natural home is
+#     ci-7's nightly cluster lane).
+[profile.e2e-full]
+default-filter = """
+    package(e2e_test)
+    & !test(/^protocols::/)
+    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & !test(/^replication_extension_test::/)
+    & !test(/^multipart_auth_test::test_signed_put_object_extract_(accepts_compat_header|expands_tar_entries_with_prefix_headers|expands_tar_gz_archive|expands_tbz2_archive|expands_tgz_archive|expands_txz_archive|expands_tzst_archive|normalizes_prefix_header_value|preserves_directory_markers_by_default|preserves_object_lock_legal_hold|preserves_object_lock_retention|preserves_pax_metadata_and_version_id|preserves_request_metadata_on_extracted_objects|preserves_sse_c|preserves_sse_s3_and_redirect|preserves_storage_class|uses_bucket_default_sse_s3)$/)
+    & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(prefers_exact_minio_prefix_over_suffix_fallback|supports_minio_prefix_and_directory_markers)$/)
+    & !test(/^multipart_auth_test::test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled$/)
+    & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(ignores_invalid_entries_when_requested|supports_standard_headers_with_combined_extract_options)$/)
+    & !test(/^multipart_auth_test::test_anonymous_post_object_(accepts_sse_s3|rejects_sse_s3_missing_from_policy_conditions|uses_bucket_default_sse_kms|uses_bucket_default_sse_s3)$/)
+    & !test(/^multipart_auth_test::test_anonymous_post_object_(accepts_object_lock_legal_hold_field|accepts_object_lock_retention_fields)$/)
+    & !test(/^list_object(s_v2|_versions)_metadata_extension_test::/)
+    & !test(/^reliant::lock::test_distributed_lock_(2_nodes_grpc_read_survives_failed_node|4_nodes_grpc_read_write_quorum_split_with_two_failed_nodes)$/)
+"""
+fail-fast = false
+
+[profile.e2e-full.junit]
+# Emitted to target/nextest/e2e-full/junit.xml; uploaded by the e2e-full job.
+path = "junit.xml"
+
+# Serialize the 4-disk reliability / degraded-read e2e tests under e2e-full too
+# (see the e2e-reliability test-group note near the top of this file). Not a
+# quarantine: no retries, just single-threaded so several 4-disk servers never
+# run concurrently.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+test-group = 'e2e-reliability'

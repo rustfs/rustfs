@@ -435,6 +435,16 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
+      # Guard the security negative-auth smoke subset (backlog#1151 sec-5)
+      # against a rename or deletion silently dropping it out of the e2e-smoke
+      # filter. The script lists what the profile selects and fails if the count
+      # of security auth-rejection tests falls below the committed floor in
+      # .config/security-smoke-floor.txt (infra-12 count-floor mechanism). Run
+      # before the smoke suite so a thinned gate fails fast; the `nextest list`
+      # here compiles the e2e_test binaries the run below reuses.
+      - name: Check security smoke subset count floor
+        run: ./scripts/check_security_smoke_count.sh check
+
       # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
       # profile.e2e-smoke default-filter in .config/nextest.toml is the single
       # wiring mechanism for e2e tests in CI — extend that filter instead of
@@ -468,6 +478,59 @@ jobs:
           path: ${{ runner.temp }}/rustfs-e2e-*/rustfs.log
           retention-days: 3
 
+  e2e-full:
+    name: End-to-End Tests (full merge gate)
+    # Merge gate only (backlog#1149 ci-5): the never-automated user-visible
+    # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
+    # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
+    # every PR, so it is gated to main pushes, the merge queue, and manual
+    # dispatch. protocols / the 6 cluster suites / replication / #[ignore] are
+    # owned by other lanes (see .config/nextest.toml profile.e2e-full).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: sm-standard-2
+    timeout-minutes: 55
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-e2e
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Download after the cache restore so the freshly built binary from the
+      # build job always wins over anything restored into target/debug.
+      - name: Download debug binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: rustfs-debug-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      # Full single-node e2e lane (backlog#1149 ci-5). The e2e-full
+      # default-filter in .config/nextest.toml is the single wiring mechanism —
+      # extend that filter, never add ad-hoc e2e jobs here. Reuses the downloaded
+      # debug binary; each test spawns its own rustfs server on a random port.
+      - name: Run e2e full suite
+        run: cargo nextest run --profile e2e-full -p e2e_test
+
+      - name: Upload junit
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-full-junit-${{ github.run_number }}
+          path: target/nextest/e2e-full/junit.xml
+          retention-days: 7
+
   e2e-tests-rio-v2:
     name: End-to-End Tests (rio-v2)
     needs: [ build-rustfs-debug-binary-rio-v2 ]
@@ -493,6 +556,14 @@ jobs:
 
       - name: Setup Rust toolchain for s3s-e2e installation
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # The sm-standard-* custom runner images (introduced in #4884) ship no C
+      # toolchain, unlike GitHub-hosted ubuntu-latest. Installing s3s-e2e below
+      # compiles it from source on a cache miss, and build scripts need cc.
+      - name: Install build tools for s3s-e2e compilation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libssl-dev
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
