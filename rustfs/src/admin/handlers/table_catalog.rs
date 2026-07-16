@@ -2034,7 +2034,8 @@ fn table_entry_from_create_table_request(
     let table_uuid = Uuid::new_v4().to_string();
     let warehouse_location = request.location.unwrap_or_else(|| format!("s3://{bucket}/tables/{table_id}"));
     validate_table_location_in_bucket(bucket, &warehouse_location)?;
-    let metadata_location = crate::table_catalog::default_table_metadata_file_path(namespace, &table, "00001.metadata.json");
+    let metadata_location =
+        crate::table_catalog::default_table_metadata_file_path(namespace, &table, &next_metadata_file_name(1, &table_id));
 
     let mut entry = crate::table_catalog::TableEntry {
         version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
@@ -6890,10 +6891,6 @@ mod tests {
             .await
             .expect("table should be created");
 
-        assert_eq!(
-            response.metadata_location,
-            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
-        );
         assert_eq!(response.metadata["format-version"], 2);
         assert_eq!(response.metadata["current-schema-id"], 0);
         assert_eq!(response.metadata["default-spec-id"], 0);
@@ -6907,6 +6904,13 @@ mod tests {
             .await
             .expect("table lookup should succeed")
             .expect("table should exist");
+        assert_eq!(
+            response.metadata_location,
+            format!(
+                "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001-{}.metadata.json",
+                entry.table_id
+            )
+        );
         assert_eq!(response.metadata["table-uuid"], entry.table_uuid);
         assert!(
             metadata_backend
@@ -6914,6 +6918,212 @@ mod tests {
                 .await
                 .expect("metadata object lookup should succeed")
         );
+    }
+
+    #[tokio::test]
+    async fn create_table_response_recreates_dropped_identifier_without_overwriting_retained_metadata() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let first_entry = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("first table lookup should succeed")
+            .expect("first table should exist");
+        let retained_initial = metadata_backend
+            .read_object("warehouse", &first_entry.metadata_location)
+            .await
+            .expect("first metadata lookup should succeed")
+            .expect("first metadata should exist");
+
+        let commit_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "set-properties",
+                    "updates": {
+                        "owner": "first-table"
+                    }
+                }
+            ]
+        }))
+        .expect("standard commit request should parse");
+        standard_commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", commit_request)
+            .await
+            .expect("first table metadata commit should succeed");
+        let first_committed_entry = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("committed table lookup should succeed")
+            .expect("committed table should exist");
+
+        drop_table_in_store(&store, "warehouse", &namespace, "events")
+            .await
+            .expect("first table should drop");
+        drop_namespace_in_store(&store, "warehouse", "analytics")
+            .await
+            .expect("first namespace should drop");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be recreated");
+
+        let create_request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {
+                        "id": 1,
+                        "name": "id",
+                        "required": true,
+                        "type": "long"
+                    }
+                ]
+            }
+        }))
+        .expect("recreate table request should parse");
+        let second = create_table_response(&store, &metadata_backend, "warehouse", &namespace, create_request, true)
+            .await
+            .expect("dropped table identifier should be reusable");
+        let second_entry = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("recreated table lookup should succeed")
+            .expect("recreated table should exist");
+
+        assert_ne!(first_entry.table_id, second_entry.table_id);
+        assert_ne!(first_entry.table_uuid, second_entry.table_uuid);
+        assert_ne!(first_entry.metadata_location, second_entry.metadata_location);
+        assert_ne!(first_committed_entry.metadata_location, second_entry.metadata_location);
+        assert_eq!(second.metadata["table-uuid"], second_entry.table_uuid);
+        assert_eq!(second.metadata["metadata-log"], serde_json::json!([]));
+        assert_eq!(
+            metadata_backend
+                .read_object("warehouse", &first_entry.metadata_location)
+                .await
+                .expect("retained metadata lookup should succeed")
+                .expect("retained metadata should still exist")
+                .data,
+            retained_initial.data
+        );
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &first_committed_entry.metadata_location)
+                .await
+                .expect("committed metadata lookup should succeed")
+        );
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &second_entry.metadata_location)
+                .await
+                .expect("recreated metadata lookup should succeed")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_table_responses_keep_one_catalog_winner_with_distinct_metadata() {
+        let catalog_backend = TestTableCatalogObjectBackend::default();
+        let store = crate::table_catalog::ObjectTableCatalogStore::new(catalog_backend);
+        let metadata_backend = TestTableCatalogObjectBackend {
+            objects: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            put_object_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        };
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let create_request = || {
+            serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+                "name": "events",
+                "schema": {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        {
+                            "id": 1,
+                            "name": "id",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            }))
+            .expect("concurrent create table request should parse")
+        };
+
+        let (first, second) = tokio::join!(
+            create_table_response(&store, &metadata_backend, "warehouse", &namespace, create_request(), true,),
+            create_table_response(&store, &metadata_backend, "warehouse", &namespace, create_request(), true,)
+        );
+        assert_ne!(first.is_ok(), second.is_ok(), "exactly one concurrent create should succeed");
+        let (winner, loser) = match (first, second) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            _ => unreachable!("success count was checked above"),
+        };
+        assert!(format!("{loser:?}").contains("AlreadyExistsException"));
+
+        let tables = store
+            .list_tables("warehouse", "analytics")
+            .await
+            .expect("table listing should succeed");
+        assert_eq!(tables.len(), 1);
+        let winner_entry = &tables[0];
+        assert_eq!(
+            winner.metadata_location,
+            table_metadata_location_for_client("warehouse", &winner_entry.metadata_location)
+        );
+        let metadata_prefix = winner_entry
+            .metadata_location
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/"))
+            .expect("metadata location should contain a file name");
+        let metadata_objects = metadata_backend
+            .list_objects("warehouse", &metadata_prefix)
+            .await
+            .expect("metadata listing should succeed");
+        assert_eq!(metadata_objects.len(), 2);
+        assert_ne!(metadata_objects[0], metadata_objects[1]);
+
+        let mut table_uuids = Vec::with_capacity(metadata_objects.len());
+        for metadata_object in metadata_objects {
+            let metadata = metadata_backend
+                .read_object("warehouse", &metadata_object)
+                .await
+                .expect("metadata lookup should succeed")
+                .expect("metadata object should exist");
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&metadata.data).expect("metadata object should contain JSON");
+            table_uuids.push(
+                metadata["table-uuid"]
+                    .as_str()
+                    .expect("metadata should contain table uuid")
+                    .to_string(),
+            );
+        }
+        table_uuids.sort();
+        table_uuids.dedup();
+        assert_eq!(table_uuids.len(), 2);
+        assert!(table_uuids.contains(&winner_entry.table_uuid));
     }
 
     #[tokio::test]
@@ -6991,10 +7201,7 @@ mod tests {
         assert_eq!(commit.metadata["current-snapshot-id"], 10);
         assert_eq!(commit.metadata["last-sequence-number"], 1);
         assert_eq!(commit.metadata["refs"]["main"]["snapshot-id"], 10);
-        assert_eq!(
-            commit.metadata["metadata-log"][0]["metadata-file"],
-            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
-        );
+        assert_eq!(commit.metadata["metadata-log"][0]["metadata-file"], created.metadata_location);
         let committed = store
             .load_table("warehouse", "analytics", "events")
             .await

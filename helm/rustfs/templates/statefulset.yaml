@@ -1,9 +1,13 @@
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
 {{- $poolsEnabled := and .Values.pools .Values.pools.enabled }}
+{{- if and .Values.mode.distributed.enabled (le (int .Values.replicaCount) 1) -}}
+{{- fail "Distributed mode requires replicaCount >= 2" -}}
+{{- end -}}
 
 {{- if .Values.mode.distributed.enabled }}
 {{- range $pool := include "rustfs.pools" . | fromJsonArray }}
+{{- $drivesPerNode := int $pool.drives }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -272,8 +276,11 @@ spec:
         name: logs
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
+        {{- $logAnn := (default (dict) $pool.storageclass.pvcAnnotations).logs | default (dict) -}}
+        {{- if gt (len $logAnn) 0 }}
         annotations:
-          {{- toYaml $pool.storageclass.pvcAnnotations.logs | nindent 10 }}
+          {{- toYaml $logAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $pool.storageclass.name }}
@@ -288,8 +295,11 @@ spec:
         name: data
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
+        {{- $dataAnn := (default (dict) $pool.storageclass.pvcAnnotations).data | default (dict) -}}
+        {{- if gt (len $dataAnn) 0 }}
         annotations:
-          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml $dataAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $pool.storageclass.name }}
@@ -304,8 +314,11 @@ spec:
         name: data-rustfs-{{ $i }}
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
+        {{- $dataAnn := (default (dict) $pool.storageclass.pvcAnnotations).data | default (dict) -}}
+        {{- if gt (len $dataAnn) 0 }}
         annotations:
-          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
+          {{- toYaml $dataAnn | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $pool.storageclass.name }}
