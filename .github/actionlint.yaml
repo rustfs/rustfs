@@ -4,5 +4,4 @@ self-hosted-runner:
   labels:
     - sm-standard-2
     - sm-standard-4
-    - ubicloud-standard-2
     - dind-sm-standard-2

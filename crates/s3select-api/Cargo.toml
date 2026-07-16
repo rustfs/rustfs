@@ -28,22 +28,22 @@ documentation = "https://docs.rs/rustfs-s3select-api/latest/rustfs_s3select_api/
 [dependencies]
 metrics = { workspace = true }
 async-trait.workspace = true
-bytes.workspace = true
-chrono.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 rustfs-common.workspace = true
-datafusion = { workspace = true, features = ["parquet", "recursive_protection", "sql"] }
+datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 rustfs-ecstore.workspace = true
 rustfs-storage-api.workspace = true
 futures = { workspace = true }
 futures-core = { workspace = true }
 http.workspace = true
 pin-project-lite.workspace = true
-s3s.workspace = true
-serde_json = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 parking_lot.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["io", "compat"] }
 tracing.workspace = true
 transform-stream.workspace = true
 url.workspace = true

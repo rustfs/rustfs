@@ -34,22 +34,22 @@ hotpath = { workspace = true, optional = true }
 crc-fast = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
-serde.workspace = true
-time.workspace = true
-uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
-tokio = { workspace = true, features = ["io-util", "macros", "sync"] }
-xxhash-rust = { workspace = true, features = ["xxh64"] }
-bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
+tokio = { workspace = true, features = ["io-util", "macros", "sync", "fs", "rt-multi-thread"] }
+xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
+bytes = { workspace = true, features = ["serde"] }
 rustfs-utils = { workspace = true, features = ["hash", "http"] }
 byteorder = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true
-s3s.workspace = true
+s3s = { workspace = true, features = ["minio"] }
 regex.workspace = true
 arc-swap.workspace = true
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 proptest = "1"
 

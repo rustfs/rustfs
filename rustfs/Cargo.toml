@@ -68,7 +68,7 @@ hotpath = { workspace = true, optional = true }
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "notify", "server-config-model"] }
+rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
@@ -104,7 +104,7 @@ rustfs-object-data-cache = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
-starshard = { workspace = true }
+starshard = { workspace = true, features = ["rayon", "async", "serde"] }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -112,53 +112,53 @@ axum.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-reqwest = { workspace = true }
-socket2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
-tokio-rustls = { workspace = true }
-aws-sdk-s3 = { workspace = true }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream"] }
+socket2 = { workspace = true, features = ["all"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "fs"] }
+tokio-rustls = { workspace = true, default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
+aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
-tokio-util.workspace = true
-tonic = { workspace = true }
-tower.workspace = true
+tokio-util = { workspace = true, features = ["io", "compat"] }
+tonic = { workspace = true, features = ["gzip", "deflate"] }
+tower = { workspace = true, features = ["timeout"] }
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
 
 # Serialization and Data Formats
 apache-avro = { workspace = true }
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 flatbuffers.workspace = true
 rmp-serde.workspace = true
 quick-xml.workspace = true
 rustfs-signer.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
 
 # Cryptography and Security
-rustls = { workspace = true }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
 subtle = { workspace = true }
-jiff = { workspace = true }
-time = { workspace = true, features = ["parsing", "formatting", "serde"] }
+jiff = { workspace = true, features = ["serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "serde", "macros"] }
 
 # Utilities and Tools
 astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
-async_zip = { workspace = true }
+async_zip = { workspace = true, default-features = false, features = ["tokio", "deflate"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 base64-simd.workspace = true
-clap = { workspace = true }
-const-str = { workspace = true }
-datafusion = { workspace = true, features = ["parquet", "recursive_protection", "sql"] }
+clap = { workspace = true, features = ["derive", "env"] }
+const-str = { workspace = true, features = ["std", "proc"] }
+datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 hex-simd.workspace = true
 matchit = { workspace = true }
 md5.workspace = true
@@ -167,18 +167,18 @@ percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 parking_lot = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
-s3s.workspace = true
-shadow-rs = { workspace = true, features = ["build", "metadata"] }
+s3s = { workspace = true, features = ["minio"] }
+shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
 tracing.workspace = true
 url = { workspace = true }
 urlencoding = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 zip = { workspace = true }
 libc = { workspace = true }
-rand = { workspace = true }
-aes-gcm = { workspace = true }
+rand = { workspace = true, features = ["serde"] }
+aes-gcm = { workspace = true, features = ["rand_core"] }
 chacha20poly1305 = { workspace = true }
 
 # Observability and Metrics
@@ -186,7 +186,7 @@ metrics = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # Data structures
-hashbrown = { workspace = true }
+hashbrown = { workspace = true, features = ["serde", "rayon"] }
 mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -196,17 +196,17 @@ libsystemd.workspace = true
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 [dev-dependencies]
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
-insta = { workspace = true }
+insta = { workspace = true, features = ["yaml", "json"] }
 proptest = "1"
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 temp-env = { workspace = true, features = ["async_closure"] }
-tracing-subscriber = { workspace = true }
-opentelemetry_sdk = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 rsa = { workspace = true }
 rcgen = { workspace = true }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
@@ -216,11 +216,12 @@ rustfs-ecstore = { workspace = true, features = ["test-util"] }
 [build-dependencies]
 http.workspace = true
 futures.workspace = true
-s3s = { workspace = true }
-clap = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
+clap = { workspace = true, features = ["derive", "env"] }
 hyper-util = { workspace = true, features = [
     "tokio",
     "server-auto",
     "server-graceful",
+    "tracing",
 ] }
-shadow-rs = { workspace = true, features = ["build"] }
+shadow-rs = { workspace = true, default-features = false, features = ["build"] }

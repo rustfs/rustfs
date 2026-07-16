@@ -28,14 +28,14 @@ categories = ["web-programming", "development-tools", "data-structures"]
 workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-tonic = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["gzip", "deflate"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
+chrono = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 rmp-serde = { workspace = true }
-s3s = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
 tracing = { workspace = true }
 
 [lib]
