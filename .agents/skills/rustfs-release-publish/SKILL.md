@@ -25,7 +25,40 @@ bump to <target>-preview.N -> merge -> tag preview -> CI green
   check with `git tag -l '<target>-preview.*'` after `git fetch --tags`).
 
 If the target version is missing or ambiguous, stop and ask before doing
-anything.
+anything (see the semver gate below).
+
+## Semver gate — confirm the target version before touching anything
+
+Versions follow SemVer 2.0.0. Precedence reminder:
+
+```
+1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-beta.2 < 1.0.0-beta.11 < 1.0.0-rc.1 < 1.0.0 < 1.0.1 < 1.1.0 < 2.0.0
+```
+
+Numeric prerelease identifiers compare numerically (`beta.9 < beta.10`),
+not lexically. Preview tags (`<target>-preview.N`) are internal validation
+tags layered on top of the target's prerelease channel — they are never
+themselves a deliverable version.
+
+Rules:
+
+- A request like "发个版" / "release the next version" without an exact
+  version string is ALWAYS ambiguous. Derive the current latest tag
+  (`git tag --sort=-v:refname | head`), then ask the user to choose via
+  AskUserQuestion with concrete candidates, e.g. from `1.0.0-beta.10`:
+  next prerelease `1.0.0-beta.11`, promote to `1.0.0-rc.1`, promote to
+  stable `1.0.0`. Never guess between these — they have very different
+  meanings (channel promotion vs. iteration) and different CI
+  classification consequences.
+- After a stable `X.Y.Z` exists, the next version must state which
+  component bumps: patch `X.Y.(Z+1)` for fixes only, minor `X.(Y+1).0`
+  for backward-compatible features, major `(X+1).0.0` for breaking
+  changes. If the user names a bump type but not a number, compute it
+  from the latest stable tag and echo the exact resulting version back
+  for confirmation.
+- Echo the final confirmed version string verbatim in your first status
+  report; every later phase must use exactly that string. If at any point
+  the user's wording and the confirmed version diverge, stop and re-confirm.
 
 ## Hard rules
 
