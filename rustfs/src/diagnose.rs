@@ -103,9 +103,12 @@ fn parse_time_arg(raw: &str) -> std::result::Result<DateTime<FixedOffset>, Strin
         return Ok(ts);
     }
     let (digits, unit) = raw.split_at(raw.len().saturating_sub(1));
-    let amount: i64 = digits
+    // u32 rejects a leading '-': relative times count back from now, so a
+    // negative one would silently mean "in the future".
+    let amount: u32 = digits
         .parse()
         .map_err(|_| format!("invalid time '{raw}' (RFC-3339 or relative like 30m/24h/7d)"))?;
+    let amount = i64::from(amount);
     let duration = match unit {
         "m" => chrono::Duration::minutes(amount),
         "h" => chrono::Duration::hours(amount),
@@ -129,5 +132,8 @@ mod tests {
         assert!(parse_time_arg("7x").is_err());
         assert!(parse_time_arg("").is_err());
         assert!(parse_time_arg("h").is_err());
+        // Negative relative times would mean "in the future" — rejected.
+        assert!(parse_time_arg("-1h").is_err());
+        assert!(parse_time_arg("-24h").is_err());
     }
 }
