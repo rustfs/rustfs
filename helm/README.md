@@ -1,13 +1,51 @@
 # RustFS Helm Mode
 
-RustFS helm chart supports **standalone and distributed mode**. For standalone mode, there is only one pod and one pvc; for distributed mode, there are two styles, 4 pods and 16 pvcs(each pod has 4 pvcs), 16 pods and 16 pvcs(each pod has 1 pvc). You should decide which mode and style suits for your situation. You can specify the parameters `mode` and `replicaCount` to install different mode and style.
+RustFS helm chart supports **standalone** and **distributed** mode.
 
-- **For standalone mode**: Only one pod and one pvc acts as single node single disk; Specify parameters `mode.standalone.enabled="true",mode.distributed.enabled="false"` to install.
-- **For distributed mode**(**default**): Multiple pods and multiple pvcs, acts as multiple nodes multiple disks, there are two styles:
-    - 4 pods and each pods has 4 pvcs(**default**)
-    - 16 pods and each pods has 1 pvc: Specify parameters `replicaCount` with `--set replicaCount="16"` to install.
+- **Standalone mode**: one pod with one PVC (single node, single disk).
+- **Distributed mode** (**default**): multiple pods with multiple PVCs (multiple nodes, multiple disks).
 
-**NOTE**: Please make sure which mode suits for you situation and specify the right parameter to install rustfs on kubernetes.
+## Distributed topology
+
+The distributed topology is defined by two parameters:
+
+- `replicaCount` — number of pods (nodes) in the StatefulSet.
+- `drivesPerNode` — number of data PVCs mounted on each pod.
+
+Total drives in the cluster = `replicaCount * drivesPerNode`.
+
+When `drivesPerNode` is left unset, the chart automatically infers a
+backward-compatible value from each pool's replica count (with pools
+disabled there is a single pool driven by the top-level `replicaCount`):
+
+| `replicaCount` | Inferred `drivesPerNode` | Legacy equivalent |
+|----------------|--------------------------|-------------------|
+| 4              | 4                        | old default 4×4   |
+| anything else  | 1                        | old 16×1, etc.    |
+
+You can override the inference by setting `drivesPerNode` explicitly, e.g.
+`--set drivesPerNode=2` for an 8×2 cluster.
+
+**IMPORTANT**: Kubernetes does **not** allow changes to
+`volumeClaimTemplates` in an existing StatefulSet. If you want to change
+`drivesPerNode` after installation you must delete the StatefulSet
+(with `--cascade=orphan` to keep pods and PVCs) and recreate it, or perform a
+full reinstall.
+
+---
+
+## Upgrade notes
+
+Upgrading from chart versions that did **not** have `drivesPerNode` is safe
+without manual intervention:
+
+- Existing 4×4 deployments (default `replicaCount=4`) continue to receive 4
+  drives per node because the chart infers `drivesPerNode=4`.
+- Existing 16×1 deployments (`replicaCount=16`) continue to receive 1 drive
+  per node because the chart infers `drivesPerNode=1`.
+
+If you previously set `replicaCount=16` and now want a different topology,
+set both `replicaCount` and `drivesPerNode` explicitly.
 
 ---
 
@@ -134,7 +172,7 @@ uer. `ClusterIssuer` or `Issuer`. |
 | pdb.minAvailable | string | `""` |  |
 | podAnnotations | object | `{}` |  |
 | pools.enabled | bool | `false` | Enable multiple server pools (capacity expansion, distributed mode only). |
-| pools.list | list | `[]` | One entry per pool; entries may set `replicaCount` (4 or 16) and `storageclass`, omitted fields inherit top-level values. Append-only. |
+| pools.list | list | `[]` | One entry per pool; entries may set `replicaCount` (>= 2) and `storageclass`, omitted fields inherit top-level values. Append-only. |
 | podLabels | object | `{}` |  |
 | podSecurityContext.fsGroup | int | `10001` |  |
 | podSecurityContext.runAsGroup | int | `10001` |  |
@@ -146,7 +184,8 @@ uer. `ClusterIssuer` or `Issuer`. |
 | readinessProbe.periodSeconds | int | `5` |  |
 | readinessProbe.successThreshold | int | `1` |  |
 | readinessProbe.timeoutSeconds | int | `3` |  |
-| replicaCount | int | `4` | Number of cluster nodes. |
+| replicaCount | int | `4` | Number of cluster nodes. Distributed mode requires >= 2. |
+| drivesPerNode | int | `null` | Number of data PVCs per pod. Inferred from replicaCount when unset (see Distributed topology above). |
 | resources.limits.cpu | string | `"200m"` |  |
 | resources.limits.memory | string | `"512Mi"` |  |
 | resources.requests.cpu | string | `"100m"` |  |
@@ -237,12 +276,12 @@ pools:
   list:
     - {}                  # pool 0: inherits top-level values and keeps the
                           # existing StatefulSet/pod/PVC names and data
-    - replicaCount: 4     # pool 1: new capacity (4 or 16)
+    - replicaCount: 4     # pool 1: new capacity
       storageclass:
         dataStorageSize: 10Gi
 ```
 
-Each entry may set `replicaCount` (4 or 16) and/or a `storageclass` block;
+Each entry may set `replicaCount` (>= 2) and/or a `storageclass` block;
 omitted fields inherit the top-level values. Additional pools render as
 `<fullname>-pool<N>` StatefulSets; all pools share the headless service,
 the main service, the configuration and the credentials.
