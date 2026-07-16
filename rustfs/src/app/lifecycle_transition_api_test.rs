@@ -1541,7 +1541,10 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     let backend = register_mock_tier(&tier_name).await;
 
     let bucket = format!("test-api-restore-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    let object = "restore/api-object.bin";
+    // The shared transition lifecycle rule only matches the `test/` prefix, so
+    // the object key must live under it or `enqueue_transition_for_existing_objects`
+    // finds nothing and `wait_for_transition` below times out.
+    let object = "test/restore/api-object.bin";
     let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
