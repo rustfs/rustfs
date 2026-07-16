@@ -88,7 +88,6 @@ checked_files=(
   "crates/protocols/src/swift/container.rs"
   "crates/protocols/src/swift/object.rs"
   "crates/protocols/src/swift/formpost.rs"
-  "crates/protocols/src/swift/ratelimit.rs"
   "crates/protocols/src/swift/expiration.rs"
   "crates/protocols/src/swift/cors.rs"
   "crates/protocols/src/swift/quota.rs"

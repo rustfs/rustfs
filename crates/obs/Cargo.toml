@@ -98,7 +98,7 @@ tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time", "macros"] }
 tokio-util = { workspace = true, features = ["io", "compat"] }
 dial9-tokio-telemetry = { workspace = true, optional = true }

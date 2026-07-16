@@ -103,7 +103,7 @@ hex-simd = { workspace = true }
 tempfile.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
-hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
+hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs"] }
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "signal", "fs", "rt-multi-thread"] }

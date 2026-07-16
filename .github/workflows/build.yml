@@ -583,9 +583,19 @@ jobs:
             exit 0
           fi
 
+          # The self-hosted Linux runners do not ship the aws CLI (GitHub-hosted
+          # images did). Install it on demand so R2 uploads survive a fresh runner
+          # instead of hard-failing here.
           if ! command -v aws >/dev/null 2>&1; then
-            echo "❌ aws CLI not found on runner; cannot upload to R2"
-            exit 1
+            echo "aws CLI not found on runner; installing..."
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y awscli
+            elif command -v brew >/dev/null 2>&1; then
+              brew install awscli
+            else
+              echo "❌ aws CLI missing and no apt-get/brew to install it; cannot upload to R2"
+              exit 1
+            fi
           fi
 
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
