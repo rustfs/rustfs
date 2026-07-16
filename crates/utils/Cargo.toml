@@ -50,7 +50,7 @@ convert_case = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["io-util", "macros", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, optional = true, features = ["io-util", "time"] }
 tracing = { workspace = true }
 transform-stream = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
@@ -58,7 +58,7 @@ zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 temp-env = { workspace = true }
 proptest = "1"
 
