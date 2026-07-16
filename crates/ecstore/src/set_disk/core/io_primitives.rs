@@ -2050,7 +2050,7 @@ impl SetDisks {
         let bucket = Arc::new(bucket.to_string());
         let object = Arc::new(object.to_string());
         let version_id = Arc::new(version_id.to_string());
-        let futures = disks.iter().map(|disk| {
+        let futures = disks.iter().enumerate().map(|(disk_index, disk)| {
             let disk = disk.clone();
             let opts = opts.clone();
             let org_bucket = org_bucket.clone();
@@ -2060,6 +2060,7 @@ impl SetDisks {
             tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
+                    Self::record_read_version_call(&object, disk_index);
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -2145,6 +2146,7 @@ impl SetDisks {
             join_set.spawn(async move {
                 let response_start = Instant::now();
                 let result = if let Some(disk) = disk {
+                    Self::record_read_version_call(&object, index);
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -2913,6 +2915,21 @@ impl SetDisks {
     fn cleanup_injected_error(_object: &str, _disk_index: usize) -> Option<DiskError> {
         None
     }
+
+    /// Test-only seam that records one per-disk `read_version` metadata RPC for
+    /// the call-counter registry (backlog#1325). In production this is inlined to
+    /// nothing and adds no behavior; only the `#[cfg(test)]` variant touches the
+    /// registry. Placed inside the fan-out spawn tasks so counts are observed
+    /// even though the increments run on arbitrary runtime worker threads.
+    #[cfg(test)]
+    #[inline]
+    fn record_read_version_call(object: &str, disk_index: usize) {
+        disk_call_counters::record(object, disk_call_counters::KIND_READ_VERSION, disk_index);
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn record_read_version_call(_object: &str, _disk_index: usize) {}
 
     /// Report a post-commit old-data-dir cleanup receipt: emit metrics, warn on
     /// residue/below-quorum, and — on residue — enqueue an object heal.
@@ -3909,6 +3926,104 @@ pub(in crate::set_disk) mod cleanup_fault_injection {
     }
 }
 
+/// Test-only per-disk call counters for the metadata fan-out (backlog#1325,
+/// serving the RPC-count assertions of #1309 / #1314 / #1315).
+///
+/// The metadata fan-out issues each per-disk `read_version` inside a
+/// `tokio::spawn` task, so the increments happen on arbitrary runtime worker
+/// threads. A thread-local `metrics::Recorder` (see `test_metrics.rs`) cannot
+/// observe those spawned increments; this registry is a process-global keyed by
+/// object name, so counts recorded inside spawned tasks are visible from the
+/// test thread that installed the observing scope.
+///
+/// The whole module is `#[cfg(test)]`, so it never compiles into production.
+/// Parallel tests stay isolated by observing distinct object names — an
+/// unobserved object records nothing, keeping the registry bounded, and each
+/// [`CallCounterScope`] clears only its own object's counts on drop.
+#[cfg(test)]
+pub(in crate::set_disk) mod disk_call_counters {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Kind label for the per-disk `read_version` metadata RPC.
+    pub const KIND_READ_VERSION: &str = "read_version";
+
+    /// Registry key: (object, kind, disk_index).
+    type CountKey = (String, String, usize);
+
+    #[derive(Default)]
+    struct Registry {
+        /// Object names with an active observing scope. Only these accumulate,
+        /// so unrelated concurrent tests never inflate one another's counts.
+        observed: HashSet<String>,
+        /// (object, kind, disk_index) -> call count.
+        counts: HashMap<CountKey, u64>,
+    }
+
+    fn registry() -> &'static Mutex<Registry> {
+        static REG: OnceLock<Mutex<Registry>> = OnceLock::new();
+        REG.get_or_init(|| Mutex::new(Registry::default()))
+    }
+
+    /// Record one call of `kind` against `object`'s `disk_index`. A no-op unless
+    /// an observing scope for `object` is currently installed.
+    pub(super) fn record(object: &str, kind: &str, disk_index: usize) {
+        let mut reg = registry().lock().expect("disk call-counter registry poisoned");
+        if !reg.observed.contains(object) {
+            return;
+        }
+        *reg.counts
+            .entry((object.to_string(), kind.to_string(), disk_index))
+            .or_insert(0) += 1;
+    }
+
+    /// RAII scope that observes call counts for a single `object`. Counts recorded
+    /// while the scope is alive — including those recorded inside spawned tasks —
+    /// are queryable; the scope clears its own counts on drop.
+    #[must_use]
+    pub struct CallCounterScope {
+        object: String,
+    }
+
+    /// Begin observing per-disk call counts for `object`.
+    pub fn observe(object: &str) -> CallCounterScope {
+        let mut reg = registry().lock().expect("disk call-counter registry poisoned");
+        reg.observed.insert(object.to_string());
+        CallCounterScope {
+            object: object.to_string(),
+        }
+    }
+
+    impl CallCounterScope {
+        /// Total number of `kind` calls across all disks for the observed object.
+        pub fn total(&self, kind: &str) -> u64 {
+            let reg = registry().lock().expect("disk call-counter registry poisoned");
+            reg.counts
+                .iter()
+                .filter(|((obj, k, _), _)| obj == &self.object && k == kind)
+                .map(|(_, count)| *count)
+                .sum()
+        }
+
+        /// Number of `kind` calls recorded against a specific `disk_index`.
+        pub fn for_disk(&self, kind: &str, disk_index: usize) -> u64 {
+            let reg = registry().lock().expect("disk call-counter registry poisoned");
+            reg.counts
+                .get(&(self.object.clone(), kind.to_string(), disk_index))
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for CallCounterScope {
+        fn drop(&mut self) {
+            let mut reg = registry().lock().expect("disk call-counter registry poisoned");
+            reg.observed.remove(&self.object);
+            reg.counts.retain(|(obj, _, _), _| obj != &self.object);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4041,6 +4156,95 @@ mod tests {
         temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, Some("0"), || {
             assert!(dangling_delete_grace().is_zero());
         });
+    }
+
+    /// Builds `count` empty local disks (each in its own tempdir) for the given
+    /// bucket. Returns the tempdir guards (which must outlive the disks) and the
+    /// disk slot vector expected by the metadata fan-out.
+    async fn call_counter_local_disks(bucket: &str, count: usize) -> (Vec<TempDir>, Vec<Option<DiskStore>>) {
+        let mut dirs = Vec::with_capacity(count);
+        let mut disks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        (dirs, disks)
+    }
+
+    /// Demo / regression guard for the backlog#1325 per-disk call counters.
+    ///
+    /// The metadata fan-out issues each `read_version` inside its own
+    /// `tokio::spawn` task; on a multi-thread runtime those tasks land on
+    /// arbitrary worker threads. This asserts the process-global registry still
+    /// observes every per-disk increment — the exact gap that makes the
+    /// thread-local `CapturingRecorder` unusable for #1309 / #1314 counting.
+    ///
+    /// Reverting `record_read_version_call` to a no-op drops both the total and
+    /// the per-disk counts to zero and fails this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_version_call_counter_observes_spawned_fanout() {
+        const DISKS: usize = 4;
+        let bucket = "counter-bucket";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+
+        let object = "counter-object";
+        let scope = disk_call_counters::observe(object);
+
+        // read_data=false, observe=false -> deterministic full-wait fan-out.
+        let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+
+        assert_eq!(
+            scope.total(disk_call_counters::KIND_READ_VERSION),
+            DISKS as u64,
+            "every online disk must record exactly one read_version, even from a spawned task"
+        );
+        for idx in 0..DISKS {
+            assert_eq!(
+                scope.for_disk(disk_call_counters::KIND_READ_VERSION, idx),
+                1,
+                "disk {idx} should record exactly one read_version"
+            );
+        }
+
+        // A second observed fan-out accumulates onto the same scope.
+        let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+        assert_eq!(scope.total(disk_call_counters::KIND_READ_VERSION), (DISKS * 2) as u64);
+
+        drop(dirs);
+    }
+
+    /// Isolation guard: unobserved objects record nothing (so parallel tests do
+    /// not inflate one another), and a scope clears its own counts on drop.
+    #[tokio::test]
+    async fn call_counter_isolates_unobserved_objects_and_clears_on_drop() {
+        let bucket = "counter-bucket-iso";
+        let (dirs, disks) = call_counter_local_disks(bucket, 1).await;
+        let object = "iso-object";
+
+        // No active scope: the fan-out records nothing.
+        let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+
+        {
+            let scope = disk_call_counters::observe(object);
+            assert_eq!(
+                scope.total(disk_call_counters::KIND_READ_VERSION),
+                0,
+                "reads before the scope existed must not be counted"
+            );
+            let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+            assert_eq!(scope.total(disk_call_counters::KIND_READ_VERSION), 1);
+        }
+
+        // Previous scope dropped -> counts cleared; a fresh scope starts at zero.
+        let scope = disk_call_counters::observe(object);
+        assert_eq!(
+            scope.total(disk_call_counters::KIND_READ_VERSION),
+            0,
+            "dropping a scope must clear its counts"
+        );
+
+        drop(dirs);
     }
 
     #[tokio::test]
