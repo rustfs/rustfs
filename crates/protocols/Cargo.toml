@@ -67,7 +67,7 @@ rustfs-storage-api = { workspace = true }
 rustfs-tls-runtime = { workspace = true, optional = true }
 
 # Async dependencies
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time", "rt-multi-thread"] }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 
@@ -75,20 +75,20 @@ futures-util = { workspace = true }
 thiserror = { workspace = true }
 
 # Serialization
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 # Utilities
 async-trait = { workspace = true }
-time = { workspace = true }
-bytes = { workspace = true }
+time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+bytes = { workspace = true, features = ["serde"] }
 
 # S3 API dependencies
-s3s = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
 
 # FTPS specific dependencies (optional)
-libunftp = { workspace = true, optional = true }
+libunftp = { workspace = true, optional = true, features = ["experimental"] }
 unftp-core = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, default-features = false, optional = true, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 
 # Swift specific dependencies (optional)
 rustfs-keystone = { workspace = true, optional = true }
@@ -96,15 +96,15 @@ rustfs-ecstore = { workspace = true, optional = true }
 rustfs-rio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-tower = { workspace = true, optional = true }
+tower = { workspace = true, optional = true, features = ["timeout"] }
 regex = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 futures = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true, features = ["rt"] }
-serde = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compat"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
 md5 = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true, features = ["serialize"] }
@@ -117,21 +117,21 @@ async-compression = { workspace = true, optional = true, features = ["tokio", "g
 
 # WebDAV specific dependencies (optional)
 dav-server = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["http2", "http1", "server"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+tokio-rustls = { workspace = true, default-features = false, optional = true, features = ["logging", "tls12", "aws-lc-rs"] }
 
 # SFTP specific dependencies (optional)
-russh = { workspace = true, optional = true }
+russh = { workspace = true, optional = true, features = ["serde"] }
 russh-sftp = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
-socket2 = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true, features = ["all"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = "1"
-tracing-subscriber = { workspace = true }
-tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt", "fs", "rt-multi-thread"] }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -31,29 +31,29 @@ workspace = true
 [dependencies]
 rustfs-credentials = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "server-config-model"] }
-tokio.workspace = true
-time = { workspace = true, features = ["serde-human-readable"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+time = { workspace = true, features = ["serde-human-readable", "std", "parsing", "formatting", "macros", "serde"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-policy.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 async-trait.workspace = true
 thiserror.workspace = true
 arc-swap = { workspace = true }
 rustfs-crypto = { workspace = true }
 futures.workspace = true
 base64-simd = { workspace = true }
-jsonwebtoken = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 tracing.workspace = true
 rustfs-madmin.workspace = true
 rustfs-utils = { workspace = true, features = ["path"] }
 rustfs-io-metrics.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io", "compat"] }
 pollster.workspace = true
-reqwest = { workspace = true }
-moka = { workspace = true }
-openidconnect = { workspace = true }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+moka = { workspace = true, features = ["future"] }
+openidconnect = { workspace = true, default-features = false, features = ["accept-rfc3339-timestamps"] }
 http = { workspace = true }
 url = { workspace = true }
 

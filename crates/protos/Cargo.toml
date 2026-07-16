@@ -40,10 +40,10 @@ rustfs-tls-runtime.workspace = true
 rustfs-utils.workspace = true
 flatbuffers = { workspace = true }
 prost = { workspace = true }
-tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-aws-lc"] }
+tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-aws-lc", "gzip", "deflate"] }
 tonic-prost = { workspace = true }
 tonic-prost-build = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
 
 [lib]

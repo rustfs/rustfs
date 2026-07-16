@@ -62,9 +62,9 @@ rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
 rustfs-object-capacity.workspace = true
 async-trait.workspace = true
-bytes.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 byteorder = { workspace = true }
-chrono.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 glob = { workspace = true }
 thiserror.workspace = true
 flatbuffers.workspace = true
@@ -72,22 +72,22 @@ futures.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
-serde.workspace = true
-time.workspace = true
+serde = { workspace = true, features = ["derive"] }
+time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
 bytesize.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
-s3s.workspace = true
+s3s = { workspace = true, features = ["minio"] }
 http.workspace = true
 opentelemetry.workspace = true
 http-body = { workspace = true }
 http-body-util.workspace = true
 url.workspace = true
-uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
-reed-solomon-erasure = { workspace = true }
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
+reed-solomon-erasure = { workspace = true, features = ["simd-accel"] }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
-moka = { workspace = true }
+moka = { workspace = true, features = ["future"] }
 rustfs-lock.workspace = true
 rustfs-io-metrics.workspace = true
 regex = { workspace = true }
@@ -101,38 +101,38 @@ sha1 = { workspace = true }
 sha2 = { workspace = true }
 hex-simd = { workspace = true }
 tempfile.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
-hyper-rustls.workspace = true
-rustls.workspace = true
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
-tonic.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "signal", "fs", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["gzip", "deflate"] }
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
-tower.workspace = true
+tower = { workspace = true, features = ["timeout"] }
 async-channel.workspace = true
 enumset = { workspace = true }
 num_cpus = { workspace = true }
-rand.workspace = true
+rand = { workspace = true, features = ["serde"] }
 pin-project-lite.workspace = true
 md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
 # "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
 # (backlog#1178); "fs" comes from the workspace default.
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "fs"] }
 rustfs-madmin.workspace = true
-reqwest = { workspace = true }
-aes-gcm.workspace = true
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+aes-gcm = { workspace = true, features = ["rand_core"] }
 chacha20poly1305.workspace = true
-aws-sdk-s3 = { workspace = true }
+aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 urlencoding = { workspace = true }
-smallvec = { workspace = true }
-shadow-rs.workspace = true
+smallvec = { workspace = true, features = ["serde"] }
+shadow-rs = { workspace = true, default-features = false }
 async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
-aws-smithy-runtime-api = { workspace = true }
+aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 parking_lot = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
@@ -141,7 +141,7 @@ google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
 faster-hex = { workspace = true }
 ratelimit = { workspace = true }
-aws-smithy-http-client.workspace = true
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rustls-aws-lc"] }
 
 # Observability and Metrics
 metrics = { workspace = true }
@@ -153,19 +153,19 @@ metrics = { workspace = true }
 rustfs-uring = "0.2.1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true, features = ["async_closure"] }
-tracing-subscriber = { workspace = true, features = ["json"] }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }
 serial_test = { workspace = true }
-opentelemetry_sdk = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 proptest = "1"
 rcgen.workspace = true
-insta = { workspace = true }
+insta = { workspace = true, features = ["yaml", "json"] }
 rustfs-crypto = { workspace = true }
 
 [build-dependencies]
-shadow-rs = { workspace = true, features = ["build", "metadata"] }
+shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 
 [[bench]]
 name = "erasure_benchmark"

@@ -31,21 +31,21 @@ workspace = true
 [dependencies]
 rustfs-credentials = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "opa"] }
-tokio = { workspace = true, features = ["full"] }
-time = { workspace = true, features = ["serde", "parsing", "formatting", "macros"] }
+tokio = { workspace = true, features = ["full", "fs", "rt-multi-thread"] }
+time = { workspace = true, features = ["serde", "parsing", "formatting", "macros", "std"] }
 serde = { workspace = true, features = ["derive", "rc"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 strum = { workspace = true, features = ["derive"] }
 rustfs-crypto = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
 base64-simd = { workspace = true }
-jsonwebtoken = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 regex = { workspace = true }
-reqwest.workspace = true
-chrono.workspace = true
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+chrono = { workspace = true, features = ["serde"] }
 tracing.workspace = true
-moka.workspace = true
+moka = { workspace = true, features = ["future"] }
 async-trait.workspace = true
 futures.workspace = true
 pollster.workspace = true

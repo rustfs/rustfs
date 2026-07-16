@@ -30,19 +30,19 @@ workspace = true
 [dependencies]
 # Core dependencies
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-uuid = { workspace = true, features = ["serde"] }
-jiff = { workspace = true }
+tokio = { workspace = true, features = ["full", "fs", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["serde", "v4", "fast-rng", "macro-diagnostics"] }
+jiff = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 # Cryptography
-aes-gcm = { workspace = true }
+aes-gcm = { workspace = true, features = ["rand_core"] }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
-rand = { workspace = true }
+rand = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 zeroize = { workspace = true, features = ["derive"] }
 
@@ -60,11 +60,11 @@ rustfs-utils = { workspace = true }
 rustfs-security-governance = { workspace = true }
 
 # HTTP client for Vault
-reqwest = { workspace = true }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
 vaultrs = { workspace = true }
 
 [dev-dependencies]
-insta = { workspace = true }
+insta = { workspace = true, features = ["yaml", "json"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
 
