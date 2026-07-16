@@ -351,10 +351,14 @@ jobs:
             rm -f console.zip console-release.json
             if [[ "$status" -eq 2 ]]; then
               echo "Console asset integrity verification failed" >&2
-              exit 1
             fi
-            echo "Warning: Failed to download verified console assets, continuing without them"
-            echo "// Static assets not available" > ./rustfs/static/empty.txt
+            echo "Failed to download verified console assets" >&2
+            exit 1
+          fi
+
+          if [[ ! -s ./rustfs/static/index.html ]]; then
+            echo "Console asset archive is missing static/index.html" >&2
+            exit 1
           fi
 
       - name: Build RustFS
@@ -557,6 +561,60 @@ jobs:
           fi
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
+
+      - name: Verify packaged console
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_free_port() {
+            python3 - <<'PY'
+          import socket
+
+          with socket.socket() as sock:
+              sock.bind(("127.0.0.1", 0))
+              print(sock.getsockname()[1])
+          PY
+          }
+
+          package_dir="$(mktemp -d)"
+          data_dir="$(mktemp -d)"
+          log_file="${RUNNER_TEMP}/rustfs-console-smoke.log"
+          server_pid=""
+          trap '
+            if [[ -n "${server_pid:-}" ]]; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+            rm -rf "$package_dir" "$data_dir"
+          ' EXIT
+
+          unzip -q "${{ steps.package.outputs.package_file }}" -d "$package_dir"
+          api_port="$(find_free_port)"
+          console_port="$(find_free_port)"
+          console_url="http://127.0.0.1:${console_port}/rustfs/console/"
+
+          "$package_dir/rustfs" server \
+            --address "127.0.0.1:${api_port}" \
+            --console-enable \
+            --console-address "127.0.0.1:${console_port}" \
+            --access-key console-smoke \
+            --secret-key console-smoke-secret \
+            "$data_dir" >"$log_file" 2>&1 &
+          server_pid=$!
+
+          for _ in {1..40}; do
+            response="$(curl --silent --output /dev/null --write-out '%{http_code} %{content_type}' "$console_url" || true)"
+            if [[ "$response" == 200\ text/html* ]]; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+
+          echo "Console endpoint did not return 200 text/html: $response" >&2
+          cat "$log_file"
+          exit 1
 
       - name: Upload to GitHub artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
