@@ -1530,9 +1530,18 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 /// copy-back completes the object reports `ongoing-request="false"` with a
 /// future expiry-date; and a full GET is then served from the local restored
 /// copy (the mock tier records no further `get` calls).
+///
+/// CURRENTLY EXCLUDED from the CI ILM Integration (serial) lane (see ci.yml):
+/// the RestoreObject copy-back holds the object write lock added in #4877
+/// (`handle_restore_transitioned_object`) across the whole tier read-back, so it
+/// never releases in time and the concurrent `get_object_info` below times out
+/// (`Lock(Timeout { .. timeout: 5s })`). The restore copy-back path must be
+/// fixed — or the #4877 lock scope revisited — before this is re-enabled; the
+/// `test/` object prefix and this contract are otherwise correct. Tracked with
+/// its sibling restore/transition tests under rustfs/backlog#1148.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there — restore copy-back deadlocks on the #4877 object write lock"]
 async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
