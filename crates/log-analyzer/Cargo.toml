@@ -33,7 +33,7 @@ name = "la-dump-anchors"
 path = "src/bin/la_dump_anchors.rs"
 
 [dependencies]
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 flate2 = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
