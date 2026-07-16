@@ -33,6 +33,11 @@ tokio-util = { workspace = true, features = ["io", "compat"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 
+[dev-dependencies]
+rustfs-data-usage = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
 

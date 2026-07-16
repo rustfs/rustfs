@@ -9955,8 +9955,11 @@ dependencies = [
 name = "rustfs-test-utils"
 version = "1.0.0-beta.10"
 dependencies = [
+ "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-storage-api",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing-subscriber",
