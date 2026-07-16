@@ -2524,11 +2524,57 @@ enum OrphanDirScan {
     Missing,
 }
 
-fn rename_data_versions_key(versions: &[u8]) -> Option<[u8; 8]> {
-    let prefix = versions.get(..8)?;
-    let mut key = [0; 8];
-    key.copy_from_slice(prefix);
-    Some(key)
+/// Outcome of a *post-quorum* `rename_data` commit, classifying whether the
+/// committed replicas converged so the caller can decide heal admission
+/// WITHOUT conflating "a version signature exists" with "this write needs
+/// heal" (rustfs/backlog#1321).
+///
+/// `rename_data` reaches this classification only once write quorum is met — a
+/// sub-quorum commit returns `Err` and never produces a convergence — so every
+/// variant describes an already-durable, already-ACKable write.
+///
+/// # Extension point for #1312 (commit fencing)
+///
+/// #1312 layers a per-object fencing epoch onto the SAME `rename_data` path.
+/// An epoch rejection is a *commit* failure surfaced through the existing
+/// `Result::Err` channel (the write never lands), which is orthogonal to this
+/// post-commit convergence signal (the write landed; do the replicas need
+/// heal). The two therefore compose: fencing gates whether we reach a
+/// convergence at all, and this enum classifies the convergence once reached.
+/// A future fence-aware variant, if ever needed, is an additive change here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::set_disk) enum RenameConvergence {
+    /// Every attempted disk committed and reported an identical, known version
+    /// signature. The committed replicas are already converged; no heal needed.
+    AllSuccessIdentical,
+    /// Write quorum was met but at least one attempted disk failed to commit
+    /// (error or offline). The committed set may be short a replica; the
+    /// laggard must be converged by heal.
+    PartialCommit,
+    /// Every attempted disk committed but their version signatures diverge (or
+    /// mix signed <=10-version disks with unsigned >10-version disks, itself a
+    /// version-count divergence). Heal must reconcile the committed replicas.
+    SignatureDivergent,
+    /// Every attempted disk committed but none produced a version signature
+    /// (all observed >10 versions, where the signature is deliberately
+    /// omitted). Divergence can neither be proven nor ruled out here, so any
+    /// latent divergence is left to the scanner backstop rather than enqueued
+    /// for heal.
+    Unknown,
+}
+
+impl RenameConvergence {
+    /// Whether this commit outcome must enqueue an object heal to converge the
+    /// committed replicas.
+    ///
+    /// `Unknown` and `AllSuccessIdentical` return `false`: the former is
+    /// scanner-backstopped (see the variant docs), the latter is already
+    /// converged. This is the single decision point that replaced the old
+    /// `Option<Vec<u8>>::is_some()` heuristic, under which a healthy MPU
+    /// (identical signatures on every disk) always looked like it needed heal.
+    pub(in crate::set_disk) fn needs_heal(&self) -> bool {
+        matches!(self, Self::PartialCommit | Self::SignatureDivergent)
+    }
 }
 
 impl SetDisks {
@@ -2557,7 +2603,7 @@ impl SetDisks {
         write_quorum: usize,
     ) -> disk::error::Result<(
         Vec<Option<DiskStore>>,
-        Option<Vec<u8>>,
+        RenameConvergence,
         Option<Uuid>,
         Vec<Option<DiskStore>>,
         Option<OldCurrentSize>,
@@ -2711,7 +2757,7 @@ impl SetDisks {
         }
 
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
-        let versions = Self::select_rename_data_versions(&disk_versions, &errs, write_quorum);
+        let convergence = Self::classify_rename_convergence(&disk_versions, &errs);
         let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
         let cleanup_disks = if let Some(data_dir) = data_dir {
@@ -2731,7 +2777,7 @@ impl SetDisks {
             vec![None; disks.len()]
         };
 
-        Ok((online_disks, versions, data_dir, cleanup_disks, old_current_size))
+        Ok((online_disks, convergence, data_dir, cleanup_disks, old_current_size))
     }
 
     /// rustfs/backlog#1009: reduce the per-disk observations of the
@@ -2762,61 +2808,62 @@ impl SetDisks {
         if max >= write_quorum { old_current_size } else { None }
     }
 
-    pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {
-        let mut versions_count = HashMap::new();
-
-        for versions in disk_versions.iter().flatten() {
-            if let Some(key) = rename_data_versions_key(versions) {
-                *versions_count.entry(key).or_insert(0usize) += 1;
-            }
-        }
-
-        let (common_versions, max_count) = versions_count
-            .into_iter()
-            .max_by_key(|(_, count)| *count)
-            .unwrap_or(([0; 8], 0));
-
-        if max_count < write_quorum {
-            return None;
-        }
-
-        disk_versions
-            .iter()
-            .flatten()
-            .find(|versions| rename_data_versions_key(versions).is_some_and(|key| key == common_versions))
-            .cloned()
-    }
-
-    pub(in crate::set_disk) fn select_rename_data_versions(
+    /// Classify a *post-quorum* `rename_data` commit into an explicit
+    /// convergence outcome (rustfs/backlog#1321). This runs only after the
+    /// write-quorum gate has already passed, so every returned variant
+    /// describes an already-durable, already-ACKable write; the decision here
+    /// is purely "do the committed replicas need heal to converge".
+    ///
+    /// The per-disk version signature (`disk_versions[i]`) is used only as
+    /// comparison material — it is deliberately NOT overloaded to also mean
+    /// "needs heal". A `Some(bytes)` signature carries the concatenated
+    /// version-id bytes of a disk that observed <=10 versions; a `None`
+    /// signature is a disk that committed but deliberately produced no
+    /// signature (>10 versions). A `None` entry for a *failed* disk never
+    /// reaches this point as a signature because failures are handled first.
+    pub(in crate::set_disk) fn classify_rename_convergence(
         disk_versions: &[Option<Vec<u8>>],
         errs: &[Option<DiskError>],
-        write_quorum: usize,
-    ) -> Option<Vec<u8>> {
-        let mut versions = Self::reduce_common_versions(disk_versions, write_quorum);
-        for (dversions, err) in disk_versions.iter().zip(errs.iter()) {
-            if err.is_some() {
-                continue;
-            }
-            let Some(dversions) = dversions.as_ref().filter(|versions| !versions.is_empty()) else {
+    ) -> RenameConvergence {
+        // Any failed / offline disk that got past the write-quorum gate means a
+        // committed replica is missing or stale: converge it via heal,
+        // regardless of what the surviving disks' signatures say.
+        if errs.iter().any(|err| err.is_some()) {
+            return RenameConvergence::PartialCommit;
+        }
+
+        // Every disk committed. Compare their reported version signatures.
+        let mut seen: Option<&Vec<u8>> = None;
+        let mut signed_count = 0usize;
+        let mut divergent = false;
+        for signature in disk_versions.iter() {
+            let Some(sig) = signature.as_ref() else {
                 continue;
             };
-
-            match versions.as_ref() {
-                Some(current_versions) if dversions != current_versions => {
-                    if dversions.len() > current_versions.len() {
-                        versions = Some(dversions.clone());
-                    }
-                    break;
-                }
+            signed_count += 1;
+            match seen {
+                None => seen = Some(sig),
+                Some(prev) if prev != sig => divergent = true,
                 Some(_) => {}
-                None => {
-                    versions = Some(dversions.clone());
-                    break;
-                }
             }
         }
 
-        versions
+        if divergent {
+            return RenameConvergence::SignatureDivergent;
+        }
+        if signed_count == 0 {
+            // No disk produced a signature (all observed >10 versions): a
+            // latent divergence cannot be proven or ruled out here, so it is
+            // left to the scanner backstop rather than enqueued for heal.
+            return RenameConvergence::Unknown;
+        }
+        if signed_count < disk_versions.len() {
+            // A mix of signed (<=10 versions) and unsigned (>10 versions) disks
+            // is itself a version-count divergence between committed replicas:
+            // reconcile it via heal.
+            return RenameConvergence::SignatureDivergent;
+        }
+        RenameConvergence::AllSuccessIdentical
     }
 
     /// Reclaim the old (now dereferenced) `object/<old_data_dir>` on the disks

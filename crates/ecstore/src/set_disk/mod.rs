@@ -6288,33 +6288,107 @@ mod tests {
         signature
     }
 
+    // backlog#1321: `classify_rename_convergence` is the single decision that
+    // replaced the old `Option<Vec<u8>>::is_some()` heal gate. These are the
+    // revert-fails white-box cases behind the issue acceptance matrix — if the
+    // decision regressed to "a signature exists => needs heal", the healthy
+    // 4/4 and 8/8 cases below would flip from `AllSuccessIdentical` to a
+    // heal-worthy variant and fail.
     #[test]
-    fn test_reduce_common_versions_requires_write_quorum() {
-        let common = rename_versions_signature(1, 1);
-        let other = rename_versions_signature(2, 1);
+    fn test_classify_rename_convergence_healthy_identical_needs_no_heal() {
+        use crate::set_disk::core::io_primitives::RenameConvergence;
+        let sig = rename_versions_signature(1, 3);
 
-        let disk_versions = vec![Some(common.clone()), Some(common.clone()), Some(other)];
-        let result = SetDisks::reduce_common_versions(&disk_versions, 2);
-        assert_eq!(result, Some(common));
+        // Healthy 4/4: every disk committed with an identical, known signature.
+        let disk_versions = vec![Some(sig.clone()), Some(sig.clone()), Some(sig.clone()), Some(sig.clone())];
+        let errs = vec![None, None, None, None];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::AllSuccessIdentical);
+        assert!(!convergence.needs_heal(), "a fully converged healthy MPU must not enqueue heal");
 
-        let split_versions = vec![
-            Some(rename_versions_signature(1, 1)),
-            Some(rename_versions_signature(2, 1)),
-            None,
-        ];
-        let result = SetDisks::reduce_common_versions(&split_versions, 2);
-        assert_eq!(result, None);
+        // Healthy 8/8: same property at a wider set width.
+        let disk_versions = vec![Some(sig); 8];
+        let errs = vec![None; 8];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::AllSuccessIdentical);
+        assert!(!convergence.needs_heal());
     }
 
     #[test]
-    fn test_select_rename_data_versions_keeps_longer_success_disparity() {
-        let common = rename_versions_signature(1, 1);
-        let longer = rename_versions_signature(2, 2);
-        let disk_versions = vec![Some(common.clone()), Some(common), Some(longer.clone())];
-        let errs = vec![None, None, None];
+    fn test_classify_rename_convergence_three_agree_one_diverges_heals() {
+        use crate::set_disk::core::io_primitives::RenameConvergence;
+        let common = rename_versions_signature(1, 2);
+        let odd = rename_versions_signature(2, 2);
 
-        let result = SetDisks::select_rename_data_versions(&disk_versions, &errs, 2);
-        assert_eq!(result, Some(longer));
+        // 3-same, 1-divergent, all committed: reconcile the odd replica.
+        let disk_versions = vec![Some(common.clone()), Some(common.clone()), Some(common), Some(odd)];
+        let errs = vec![None, None, None, None];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::SignatureDivergent);
+        assert!(convergence.needs_heal());
+    }
+
+    #[test]
+    fn test_classify_rename_convergence_failed_or_offline_disk_heals() {
+        use crate::set_disk::core::io_primitives::RenameConvergence;
+        let sig = rename_versions_signature(1, 2);
+
+        // 1 disk failed/offline while the rest committed identically: past the
+        // write-quorum gate this is a `PartialCommit` — a replica is missing.
+        let disk_versions = vec![Some(sig.clone()), Some(sig.clone()), Some(sig), None];
+        let errs = vec![None, None, None, Some(DiskError::DiskNotFound)];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::PartialCommit);
+        assert!(convergence.needs_heal());
+    }
+
+    #[test]
+    fn test_classify_rename_convergence_no_common_quorum_heals() {
+        use crate::set_disk::core::io_primitives::RenameConvergence;
+        // No signature holds a majority (2/2 split), every disk committed:
+        // divergence with no common quorum still reconciles via heal.
+        let a = rename_versions_signature(1, 1);
+        let b = rename_versions_signature(2, 1);
+        let disk_versions = vec![Some(a.clone()), Some(a), Some(b.clone()), Some(b)];
+        let errs = vec![None, None, None, None];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::SignatureDivergent);
+        assert!(convergence.needs_heal());
+    }
+
+    #[test]
+    fn test_classify_rename_convergence_over_ten_versions_by_success() {
+        use crate::set_disk::core::io_primitives::RenameConvergence;
+        // >10 versions: every disk deliberately omits the signature (`None`).
+        // All committed => `Unknown` => scanner-backstopped, no self-enqueue.
+        let disk_versions = vec![None, None, None, None];
+        let errs = vec![None, None, None, None];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::Unknown);
+        assert!(
+            !convergence.needs_heal(),
+            ">10-version healthy commit relies on the scanner, not self-enqueue"
+        );
+
+        // Same >10-version shape but with a failed disk: a failure is
+        // conservative-heal regardless of signatures being unavailable.
+        let errs = vec![None, None, None, Some(DiskError::FileCorrupt)];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::PartialCommit);
+        assert!(convergence.needs_heal());
+    }
+
+    #[test]
+    fn test_classify_rename_convergence_mixed_signed_unsigned_heals() {
+        use crate::set_disk::core::io_primitives::RenameConvergence;
+        // A committed replica with <=10 versions (signed) alongside one with
+        // >10 versions (unsigned) is itself a version-count divergence.
+        let sig = rename_versions_signature(1, 2);
+        let disk_versions = vec![Some(sig.clone()), Some(sig.clone()), Some(sig), None];
+        let errs = vec![None, None, None, None];
+        let convergence = SetDisks::classify_rename_convergence(&disk_versions, &errs);
+        assert_eq!(convergence, RenameConvergence::SignatureDivergent);
+        assert!(convergence.needs_heal());
     }
 
     #[test]
