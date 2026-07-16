@@ -848,12 +848,14 @@ jobs:
 
           echo "✅ All assets uploaded successfully"
 
-  # Update latest.json for stable releases only: prerelease tags (alpha/beta/
-  # rc) must never overwrite the stable version pointer.
+  # Update latest.json for every release tag (stable and prerelease): the
+  # project currently ships prerelease tags only, so gating this to stable
+  # left the version pointer permanently stale. release_type records whether
+  # the pointed-to version is a prerelease.
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type == 'release'
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
@@ -871,6 +873,12 @@ jobs:
 
           VERSION="${{ needs.build-check.outputs.version }}"
           TAG="${{ needs.build-check.outputs.version }}"
+
+          if [[ "${{ needs.build-check.outputs.build_type }}" == "prerelease" ]]; then
+            RELEASE_TYPE="prerelease"
+          else
+            RELEASE_TYPE="stable"
+          fi
 
           # Install ossutil
           OSSUTIL_VERSION="2.1.1"
@@ -892,7 +900,7 @@ jobs:
             "version": "${VERSION}",
             "tag": "${TAG}",
             "release_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "release_type": "stable",
+            "release_type": "${RELEASE_TYPE}",
             "download_url": "https://github.com/${{ github.repository }}/releases/tag/${TAG}"
           }
           EOF
@@ -900,7 +908,7 @@ jobs:
           # Upload to OSS
           "$OSSUTIL_BIN" cp latest.json oss://rustfs-version/latest.json --force
 
-          echo "✅ Updated latest.json for stable release $VERSION"
+          echo "✅ Updated latest.json for ${RELEASE_TYPE} release $VERSION"
 
   # Publish release (remove draft status)
   publish-release:
