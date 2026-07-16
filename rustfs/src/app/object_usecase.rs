@@ -254,6 +254,54 @@ fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i
     }
 }
 
+/// Losslessly convert an s3s [`Range`] into the internal [`HTTPRangeSpec`].
+///
+/// Shared by GET and HEAD so both apply identical range semantics. s3s parses
+/// `first`/`last` as `u64`, but its own parser already rejects any value greater
+/// than `i64::MAX`, so the int branch is a checked cast that never truncates.
+///
+/// The suffix length, however, is an unchecked `u64`. A naive `length as i64`
+/// truncates deterministically: `bytes=-18446744073709551615` wraps to `-1` and
+/// is then read as "last 1 byte", and `bytes=-0` yields a 0-length 206 instead
+/// of a 416. This function instead mirrors s3s [`Range::check`] semantics:
+///   * a zero-length suffix is rejected with `InvalidRange` (416), matching AWS
+///     S3 and MinIO;
+///   * a suffix larger than `i64::MAX` is clamped to `i64::MAX`. Object sizes in
+///     this system are bounded by `i64::MAX`, so such a suffix always covers the
+///     whole object, and [`HTTPRangeSpec::get_length`] clamps it to the real
+///     size once the object is known.
+fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
+    match range {
+        Range::Int { first, last } => {
+            let start = i64::try_from(first).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
+            let end = match last {
+                Some(last) => {
+                    i64::try_from(last).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?
+                }
+                None => -1,
+            };
+            Ok(HTTPRangeSpec {
+                is_suffix_length: false,
+                start,
+                end,
+            })
+        }
+        Range::Suffix { length } => {
+            if length == 0 {
+                return Err(s3_error!(InvalidRange, "The requested range is not satisfiable"));
+            }
+            // Clamp to i64::MAX: any suffix >= object size returns the whole
+            // object, and object sizes never exceed i64::MAX.
+            let start = i64::try_from(length).unwrap_or(i64::MAX);
+            Ok(HTTPRangeSpec {
+                is_suffix_length: true,
+                start,
+                end: -1,
+            })
+        }
+    }
+}
+
 fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
     let has_aws_chunked = |header_name: &str| {
         headers
@@ -2758,18 +2806,7 @@ impl DefaultObjectUsecase {
 
         let part_number = parse_part_number_i32_to_usize(part_number, "GET")?;
 
-        let rs = range.map(|v| match v {
-            Range::Int { first, last } => HTTPRangeSpec {
-                is_suffix_length: false,
-                start: first as i64,
-                end: if let Some(last) = last { last as i64 } else { -1 },
-            },
-            Range::Suffix { length } => HTTPRangeSpec {
-                is_suffix_length: true,
-                start: length as i64,
-                end: -1,
-            },
-        });
+        let rs = range.map(range_to_http_range_spec).transpose()?;
 
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
@@ -5842,18 +5879,7 @@ impl DefaultObjectUsecase {
         // Parse part number from Option<i32> to Option<usize> with validation
         let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
 
-        let rs = range.map(|v| match v {
-            Range::Int { first, last } => HTTPRangeSpec {
-                is_suffix_length: false,
-                start: first as i64,
-                end: if let Some(last) = last { last as i64 } else { -1 },
-            },
-            Range::Suffix { length } => HTTPRangeSpec {
-                is_suffix_length: true,
-                start: length as i64,
-                end: -1,
-            },
-        });
+        let rs = range.map(range_to_http_range_spec).transpose()?;
 
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
@@ -10007,5 +10033,133 @@ mod tests {
             should_use_existing_delete_replication_info(&opts),
             "true version-delete requests should keep using the pre-delete object info"
         );
+    }
+
+    // -- Range: u64 -> i64 lossless conversion (issue rustfs/backlog#1322) --
+
+    const I64_MAX_AS_U64: u64 = i64::MAX as u64;
+
+    /// The conversion itself: s3s `Range` (u64) -> internal `HTTPRangeSpec`
+    /// (i64). This directly guards the suffix truncation fix. Reverting to
+    /// `length as i64` regresses the zero-suffix, `i64::MAX + 1` and `u64::MAX`
+    /// rows below.
+    #[test]
+    fn range_to_http_range_spec_is_lossless() {
+        // Zero-length suffix (`bytes=-0`) is unsatisfiable -> InvalidRange (416),
+        // never a 0-length 206.
+        let zero_suffix = range_to_http_range_spec(Range::Suffix { length: 0 });
+        assert_eq!(
+            zero_suffix.as_ref().err().map(|e| e.code()),
+            Some(&S3ErrorCode::InvalidRange),
+            "bytes=-0 must map to InvalidRange (416)"
+        );
+
+        // Suffix conversions: positive `start` holds the suffix length; values
+        // above i64::MAX clamp to i64::MAX (they always cover the whole object).
+        let suffix_cases = [
+            (1_u64, 1_i64),
+            (I64_MAX_AS_U64, i64::MAX),
+            (I64_MAX_AS_U64 + 1, i64::MAX), // was i64::MIN under `as i64` -> checked_neg overflow
+            (u64::MAX, i64::MAX),           // was -1 under `as i64` -> read as "last 1 byte"
+        ];
+        for (length, expected_start) in suffix_cases {
+            let spec = range_to_http_range_spec(Range::Suffix { length })
+                .unwrap_or_else(|_| panic!("suffix {length} must convert losslessly"));
+            assert!(spec.is_suffix_length, "suffix {length} must stay a suffix spec");
+            assert_eq!(spec.start, expected_start, "suffix {length} start");
+            assert_eq!(spec.end, -1, "suffix {length} end");
+        }
+
+        // Int ranges: s3s already rejects first/last > i64::MAX, so the checked
+        // cast never truncates. first-last and open-ended must not regress.
+        let int_first_last = range_to_http_range_spec(Range::Int {
+            first: 10,
+            last: Some(20),
+        })
+        .expect("first-last converts");
+        assert!(!int_first_last.is_suffix_length);
+        assert_eq!((int_first_last.start, int_first_last.end), (10, 20));
+
+        let int_open = range_to_http_range_spec(Range::Int { first: 5, last: None }).expect("open-ended converts");
+        assert_eq!((int_open.start, int_open.end), (5, -1));
+
+        let int_max = range_to_http_range_spec(Range::Int {
+            first: I64_MAX_AS_U64,
+            last: Some(I64_MAX_AS_U64),
+        })
+        .expect("i64::MAX int converts");
+        assert_eq!((int_max.start, int_max.end), (i64::MAX, i64::MAX));
+    }
+
+    /// Observable end-to-end effect the GET/HEAD handlers derive from a range
+    /// spec: `HTTPRangeSpec::get_offset_length` yields the (offset, length)
+    /// that becomes `Content-Length` and `Content-Range`, or an error that
+    /// surfaces as 416. Covers empty / 1-byte / normal objects.
+    #[test]
+    fn range_suffix_offset_length_matches_s3_semantics() {
+        // Expected outcome for a satisfiable range, or `None` for 416.
+        #[derive(Debug, PartialEq)]
+        enum Outcome {
+            /// (offset, content_length, content_range)
+            Partial(usize, i64, String),
+            Unsatisfiable,
+        }
+
+        fn derive(range: Range, size: i64) -> Outcome {
+            let spec = match range_to_http_range_spec(range) {
+                Ok(spec) => spec,
+                Err(_) => return Outcome::Unsatisfiable,
+            };
+            match spec.get_offset_length(size) {
+                Ok((offset, len)) => {
+                    let content_range = format!("bytes {}-{}/{}", offset, offset as i64 + len - 1, size);
+                    Outcome::Partial(offset, len, content_range)
+                }
+                Err(_) => Outcome::Unsatisfiable,
+            }
+        }
+
+        let suffix = |length: u64| Range::Suffix { length };
+
+        // size, range, expected
+        let normal = 100_i64;
+        let cases = [
+            // Zero suffix is always 416, whatever the size.
+            (0_i64, suffix(0), Outcome::Unsatisfiable),
+            (1, suffix(0), Outcome::Unsatisfiable),
+            (normal, suffix(0), Outcome::Unsatisfiable),
+            // Suffix within the object returns the trailing bytes.
+            (normal, suffix(1), Outcome::Partial(99, 1, "bytes 99-99/100".into())),
+            (normal, suffix(normal as u64), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            // Suffix >= size returns the whole object (never a truncated tail).
+            (normal, suffix(normal as u64 + 1), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            (normal, suffix(I64_MAX_AS_U64), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            (normal, suffix(I64_MAX_AS_U64 + 1), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            (normal, suffix(u64::MAX), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            // 1-byte object: any non-zero suffix returns that single byte.
+            (1, suffix(1), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            (1, suffix(2), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            (1, suffix(I64_MAX_AS_U64 + 1), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            (1, suffix(u64::MAX), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            // Normal first-last and open-ended int ranges must not regress.
+            (
+                normal,
+                Range::Int {
+                    first: 10,
+                    last: Some(19),
+                },
+                Outcome::Partial(10, 10, "bytes 10-19/100".into()),
+            ),
+            (
+                normal,
+                Range::Int { first: 90, last: None },
+                Outcome::Partial(90, 10, "bytes 90-99/100".into()),
+            ),
+        ];
+
+        for (size, range, expected) in cases {
+            let got = derive(range, size);
+            assert_eq!(got, expected, "size={size} range={range:?}");
+        }
     }
 }
