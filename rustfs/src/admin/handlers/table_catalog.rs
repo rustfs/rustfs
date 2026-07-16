@@ -1673,9 +1673,42 @@ fn storage_credential_from_issued(scope: TableCredentialScope, issued: IssuedTab
     }
 }
 
+fn table_metadata_location_for_client(table_bucket: &str, metadata_location: &str) -> String {
+    if crate::table_catalog::is_reserved_table_object_key(metadata_location) {
+        format!("s3://{table_bucket}/{metadata_location}")
+    } else {
+        metadata_location.to_string()
+    }
+}
+
+fn table_metadata_location_for_catalog(table_bucket: &str, metadata_location: &str) -> S3Result<String> {
+    crate::table_catalog::table_catalog_object_key_from_location(table_bucket, metadata_location)
+        .ok_or_else(|| s3_error!(InvalidRequest, "metadata location must be inside the table bucket"))
+}
+
+fn table_metadata_for_client(table_bucket: &str, mut metadata: serde_json::Value) -> serde_json::Value {
+    if let Some(metadata_log) = metadata.get_mut("metadata-log").and_then(serde_json::Value::as_array_mut) {
+        for entry in metadata_log {
+            let Some(metadata_file) = entry.get_mut("metadata-file") else {
+                continue;
+            };
+            let Some(metadata_location) = metadata_file.as_str() else {
+                continue;
+            };
+            if crate::table_catalog::is_reserved_table_object_key(metadata_location) {
+                *metadata_file = serde_json::Value::String(table_metadata_location_for_client(table_bucket, metadata_location));
+            }
+        }
+    }
+
+    metadata
+}
+
 fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metadata: serde_json::Value) -> RestLoadTableResponse {
     let mut config = BTreeMap::new();
     let warehouse_location = entry.warehouse_location.clone();
+    let metadata_location = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
+    let metadata = table_metadata_for_client(&entry.table_bucket, metadata);
     config.insert("warehouse-location".to_string(), warehouse_location.clone());
     config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_UNSUPPORTED.to_string());
     config.insert(
@@ -1687,7 +1720,7 @@ fn load_table_response_from_entry(entry: crate::table_catalog::TableEntry, metad
     config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CLIENT_PROVIDED.to_string());
 
     RestLoadTableResponse {
-        metadata_location: entry.metadata_location,
+        metadata_location,
         metadata,
         config,
         storage_credentials: Vec::new(),
@@ -1774,8 +1807,10 @@ fn commit_table_response_from_result(
     result: crate::table_catalog::TableCommitResult,
     metadata: serde_json::Value,
 ) -> RestCommitTableResponse {
+    let metadata_location = table_metadata_location_for_client(&result.table.table_bucket, &result.table.metadata_location);
+    let metadata = table_metadata_for_client(&result.table.table_bucket, metadata);
     RestCommitTableResponse {
-        metadata_location: result.table.metadata_location,
+        metadata_location,
         metadata,
         version_token: result.table.version_token,
         generation: result.table.generation,
@@ -1784,8 +1819,9 @@ fn commit_table_response_from_result(
 }
 
 fn table_metadata_location_response_from_entry(entry: crate::table_catalog::TableEntry) -> TableMetadataLocationResponse {
+    let metadata_location = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
     TableMetadataLocationResponse {
-        metadata_location: entry.metadata_location,
+        metadata_location,
         version_token: entry.version_token,
         generation: entry.generation,
         warehouse_location: entry.warehouse_location,
@@ -1798,6 +1834,12 @@ fn table_commit_request_from_rest_request(
     table: &str,
     request: RestCommitTableRequest,
 ) -> S3Result<crate::table_catalog::TableCommitRequest> {
+    let expected_metadata_location = request
+        .expected_metadata_location
+        .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-metadata-location"))?;
+    let new_metadata_location = request
+        .new_metadata_location
+        .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires new-metadata-location"))?;
     Ok(crate::table_catalog::TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -1808,12 +1850,8 @@ fn table_commit_request_from_rest_request(
         expected_version_token: request
             .expected_version_token
             .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-version-token"))?,
-        expected_metadata_location: request
-            .expected_metadata_location
-            .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires expected-metadata-location"))?,
-        new_metadata_location: request
-            .new_metadata_location
-            .ok_or_else(|| s3_error!(InvalidRequest, "legacy commit requires new-metadata-location"))?,
+        expected_metadata_location: table_metadata_location_for_catalog(bucket, &expected_metadata_location)?,
+        new_metadata_location: table_metadata_location_for_catalog(bucket, &new_metadata_location)?,
         requirements: request.requirements,
         writer: request.writer,
     })
@@ -1921,7 +1959,8 @@ fn table_entry_from_register_request(
     }
     let table = crate::table_catalog::IdentifierSegment::parse(request.name)
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &request.metadata_location) {
+    let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
 
@@ -1936,7 +1975,7 @@ fn table_entry_from_register_request(
         format: "ICEBERG".to_string(),
         format_version: 2,
         warehouse_location: format!("s3://{bucket}/tables/{table_id}"),
-        metadata_location: request.metadata_location,
+        metadata_location,
         version_token: format!("token-{}", Uuid::new_v4()),
         generation: 1,
         state: crate::table_catalog::TableCatalogEntryState::Active,
@@ -1954,7 +1993,8 @@ fn table_entry_from_import_request(
 ) -> S3Result<crate::table_catalog::TableEntry> {
     let table = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &request.metadata_location) {
+    let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table, &metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
 
@@ -1969,7 +2009,7 @@ fn table_entry_from_import_request(
         format: "ICEBERG".to_string(),
         format_version: 2,
         warehouse_location: format!("s3://{bucket}/tables/{table_id}"),
-        metadata_location: request.metadata_location,
+        metadata_location,
         version_token: format!("token-{}", Uuid::new_v4()),
         generation: 1,
         state: crate::table_catalog::TableCatalogEntryState::Active,
@@ -3945,12 +3985,13 @@ where
     };
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+    let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &metadata_location) {
         return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
     }
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
-    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+    let target_metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
     validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
     let commit_request = crate::table_catalog::TableCommitRequest {
@@ -3962,7 +4003,7 @@ where
         operation: "update-metadata-location".to_string(),
         expected_version_token: request.version_token,
         expected_metadata_location: current.metadata_location,
-        new_metadata_location: request.metadata_location,
+        new_metadata_location: metadata_location,
         requirements: Vec::new(),
         writer: Some("rustfs-metadata-location-api".to_string()),
     };
@@ -4030,7 +4071,8 @@ where
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_table_commit_requirements(&current_metadata, &request.requirements)?;
     let expected_metadata = current_metadata.clone();
-    let next_metadata = apply_table_commit_updates(current_metadata, &request.updates, &current.metadata_location)?;
+    let previous_metadata_location = table_metadata_location_for_client(bucket, &current.metadata_location);
+    let next_metadata = apply_table_commit_updates(current_metadata, &request.updates, &previous_metadata_location)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     validate_metadata_matches_current_metadata(&expected_metadata, &next_metadata)?;
     validate_table_snapshot_commit_conflicts(
@@ -4242,7 +4284,8 @@ where
         "action": "remove-snapshots",
         "snapshot-ids": expired_snapshot_ids.clone()
     })];
-    let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &current.metadata_location)?;
+    let previous_metadata_location = table_metadata_location_for_client(bucket, &current.metadata_location);
+    let next_metadata = apply_table_commit_updates(current_metadata.clone(), &updates, &previous_metadata_location)?;
     validate_metadata_matches_current_metadata(&current_metadata, &next_metadata)?;
     validate_metadata_table_location_in_bucket(bucket, &next_metadata)?;
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
@@ -4611,7 +4654,11 @@ fn external_catalog_bridge_entry_from_request(
     let external_namespace = validate_external_catalog_field("external namespace", request.external_namespace)?;
     let external_table = validate_external_catalog_field("external table", request.external_table)?;
     let external_table_uuid = validate_external_catalog_optional_field("external table uuid", request.external_table_uuid)?;
-    if let Some(metadata_location) = request.metadata_location.as_deref() {
+    let metadata_location = request
+        .metadata_location
+        .map(|metadata_location| table_metadata_location_for_catalog(bucket, &metadata_location))
+        .transpose()?;
+    if let Some(metadata_location) = metadata_location.as_deref() {
         validate_external_catalog_metadata_location(namespace, table, metadata_location)?;
     }
     Ok(crate::table_catalog::ExternalCatalogBridgeEntry {
@@ -4624,7 +4671,7 @@ fn external_catalog_bridge_entry_from_request(
         external_namespace,
         external_table,
         external_table_uuid,
-        metadata_location: request.metadata_location,
+        metadata_location,
         external_version_token: validate_external_catalog_optional_field(
             "external version token",
             request.external_version_token,
@@ -4723,6 +4770,12 @@ async fn sync_external_catalog_bridge_response<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
+    let mut request = request;
+    request.metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+    request.expected_metadata_location = request
+        .expected_metadata_location
+        .map(|metadata_location| table_metadata_location_for_catalog(bucket, &metadata_location))
+        .transpose()?;
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
     validate_external_catalog_metadata_location(namespace, table, &request.metadata_location)?;
     let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
@@ -4867,12 +4920,13 @@ where
         };
         let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
             .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
-        if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &request.metadata_location) {
+        let metadata_location = table_metadata_location_for_catalog(bucket, &request.metadata_location)?;
+        if !crate::table_catalog::is_valid_table_metadata_location(namespace, &table_name, &metadata_location) {
             return Err(s3_error!(InvalidRequest, "metadata location must be inside the table metadata directory"));
         }
         let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &current_metadata)?;
-        let target_metadata = read_table_metadata_json(metadata_backend, bucket, &request.metadata_location).await?;
+        let target_metadata = read_table_metadata_json(metadata_backend, bucket, &metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &target_metadata)?;
         validate_metadata_matches_current_metadata(&current_metadata, &target_metadata)?;
         let commit_request = crate::table_catalog::TableCommitRequest {
@@ -4884,7 +4938,7 @@ where
             operation: "rollback".to_string(),
             expected_version_token: request.version_token,
             expected_metadata_location: current.metadata_location,
-            new_metadata_location: request.metadata_location,
+            new_metadata_location: metadata_location,
             requirements: Vec::new(),
             writer: Some("rustfs-catalog-rollback-api".to_string()),
         };
@@ -6699,7 +6753,7 @@ mod tests {
         let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
         let request: RegisterTableRequest = serde_json::from_value(serde_json::json!({
             "name": "events",
-            "metadata-location": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+            "metadata-location": "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
             "overwrite": false
         }))
         .expect("request should parse");
@@ -6838,7 +6892,7 @@ mod tests {
 
         assert_eq!(
             response.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
         );
         assert_eq!(response.metadata["format-version"], 2);
         assert_eq!(response.metadata["current-schema-id"], 0);
@@ -6856,7 +6910,7 @@ mod tests {
         assert_eq!(response.metadata["table-uuid"], entry.table_uuid);
         assert!(
             metadata_backend
-                .object_exists("warehouse", &response.metadata_location)
+                .object_exists("warehouse", &entry.metadata_location)
                 .await
                 .expect("metadata object lookup should succeed")
         );
@@ -6923,7 +6977,8 @@ mod tests {
             .await
             .expect("standard commit should succeed");
 
-        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_prefix =
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
         let metadata_file_suffix = ".metadata.json";
         let generated_commit_id = commit
             .metadata_location
@@ -6938,17 +6993,20 @@ mod tests {
         assert_eq!(commit.metadata["refs"]["main"]["snapshot-id"], 10);
         assert_eq!(
             commit.metadata["metadata-log"][0]["metadata-file"],
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
         );
         let committed = store
             .load_table("warehouse", "analytics", "events")
             .await
             .expect("committed table lookup should succeed")
             .expect("committed table should exist");
-        assert_eq!(committed.metadata_location, commit.metadata_location);
+        assert_eq!(
+            table_metadata_location_for_client("warehouse", &committed.metadata_location),
+            commit.metadata_location
+        );
         assert!(
             metadata_backend
-                .object_exists("warehouse", &commit.metadata_location)
+                .object_exists("warehouse", &committed.metadata_location)
                 .await
                 .expect("committed metadata lookup should succeed")
         );
@@ -6981,11 +7039,16 @@ mod tests {
         assert_eq!(commit.commit_id, commit_id);
         assert_eq!(
             commit.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-11111111-1111-4111-8111-111111111111.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-11111111-1111-4111-8111-111111111111.metadata.json"
         );
+        let committed = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("committed table lookup should succeed")
+            .expect("committed table should exist");
         assert!(
             metadata_backend
-                .object_exists("warehouse", &commit.metadata_location)
+                .object_exists("warehouse", &committed.metadata_location)
                 .await
                 .expect("committed metadata lookup should succeed")
         );
@@ -7014,7 +7077,8 @@ mod tests {
             .await
             .expect("standard commit should succeed");
 
-        let metadata_file_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
+        let metadata_file_prefix =
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-";
         let metadata_file_suffix = ".metadata.json";
         let metadata_file_token = commit
             .metadata_location
@@ -7063,7 +7127,7 @@ mod tests {
 
         assert_eq!(
             commit.metadata_location,
-            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-22222222-2222-4222-8222-222222222222.metadata.json"
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002-22222222-2222-4222-8222-222222222222.metadata.json"
         );
         assert_eq!(commit.metadata["properties"]["owner"], "lakehouse");
     }
@@ -7278,7 +7342,7 @@ mod tests {
         .await
         .expect("legacy catalog uuid should not block metadata-location update");
 
-        assert_eq!(updated.metadata_location, next_location);
+        assert_eq!(updated.metadata_location, table_metadata_location_for_client("warehouse", next_location));
         assert_eq!(updated.generation, legacy_entry.generation + 1);
     }
 
@@ -7570,7 +7634,7 @@ mod tests {
         assert_eq!(snapshot_log.len(), 1);
         assert_eq!(
             committed_metadata["metadata-log"][0]["metadata-file"],
-            serde_json::Value::String(current.clone())
+            serde_json::Value::String(table_metadata_location_for_client(bucket, &current))
         );
         assert!(
             backend
@@ -7976,7 +8040,10 @@ mod tests {
         .expect("external sync should register missing table");
 
         assert_eq!(synced.action, "registered");
-        assert_eq!(synced.table.metadata_location, metadata_location);
+        assert_eq!(
+            synced.table.metadata_location,
+            table_metadata_location_for_client(bucket, &metadata_location)
+        );
         let bridge = synced.bridge.bridge.as_ref().expect("bridge state should be returned");
         assert_eq!(bridge.catalog, "glue");
         assert_eq!(bridge.last_sync_status.as_deref(), Some("synced"));
@@ -8038,10 +8105,10 @@ mod tests {
                 external_namespace: "sales".to_string(),
                 external_table: "orders".to_string(),
                 external_table_uuid: Some("table-uuid".to_string()),
-                metadata_location: next_location.clone(),
+                metadata_location: table_metadata_location_for_client(bucket, &next_location),
                 external_version_token: Some("hms-version-2".to_string()),
                 expected_version_token: Some("token-v1".to_string()),
-                expected_metadata_location: Some(current_location.clone()),
+                expected_metadata_location: Some(table_metadata_location_for_client(bucket, &current_location)),
                 commit_id: Some("external-sync-2".to_string()),
                 idempotency_key: Some("external-sync-idempotency-2".to_string()),
                 policy_mode: Some("rustfs-authoritative".to_string()),
@@ -8055,7 +8122,7 @@ mod tests {
         .expect("external sync should commit existing table");
 
         assert_eq!(synced.action, "committed");
-        assert_eq!(synced.table.metadata_location, next_location);
+        assert_eq!(synced.table.metadata_location, table_metadata_location_for_client(bucket, &next_location));
         let current = store
             .load_table(bucket, "analytics", "events")
             .await
@@ -9677,11 +9744,32 @@ mod tests {
         let metadata = serde_json::json!({
             "format-version": 2,
             "table-uuid": "table-uuid",
-            "location": "s3://warehouse/tables/table-id"
+            "location": "s3://warehouse/tables/table-id",
+            "metadata-log": [
+                {
+                    "timestamp-ms": 1,
+                    "metadata-file": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+                },
+                {
+                    "timestamp-ms": 2,
+                    "metadata-file": "s3://warehouse/external/metadata/00000.metadata.json"
+                }
+            ]
         });
-        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata.clone());
+        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata);
 
-        assert_eq!(response.metadata, metadata);
+        assert_eq!(
+            response.metadata_location,
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+        );
+        assert_eq!(
+            response.metadata["metadata-log"][0]["metadata-file"],
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+        );
+        assert_eq!(
+            response.metadata["metadata-log"][1]["metadata-file"],
+            "s3://warehouse/external/metadata/00000.metadata.json"
+        );
         assert!(response.storage_credentials.is_empty());
         assert_eq!(response.config.get("rustfs.credential-vending"), Some(&"unsupported".to_string()));
         assert_eq!(
@@ -9700,6 +9788,44 @@ mod tests {
         assert!(!response.config.contains_key("s3.access-key-id"));
         assert!(!response.config.contains_key("s3.secret-access-key"));
         assert!(!response.config.contains_key("s3.session-token"));
+    }
+
+    #[test]
+    fn load_table_response_preserves_format_v4_relative_metadata_log() {
+        let metadata = serde_json::json!({
+            "format-version": 4,
+            "table-uuid": "table-uuid",
+            "metadata-log": [
+                {
+                    "timestamp-ms": 1,
+                    "metadata-file": "metadata/00000.metadata.json"
+                },
+                {
+                    "timestamp-ms": 2,
+                    "metadata-file": ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+                }
+            ]
+        });
+
+        let response = load_table_response_from_entry(table_entry_for_credentials(), metadata);
+
+        assert_eq!(response.metadata["metadata-log"][0]["metadata-file"], "metadata/00000.metadata.json");
+        assert_eq!(
+            response.metadata["metadata-log"][1]["metadata-file"],
+            "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00000.metadata.json"
+        );
+    }
+
+    #[test]
+    fn table_metadata_location_for_catalog_accepts_only_the_table_bucket() {
+        let object_key = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json";
+
+        assert_eq!(
+            table_metadata_location_for_catalog("warehouse", &format!("s3://warehouse/{object_key}"))
+                .expect("same-bucket metadata location should normalize"),
+            object_key
+        );
+        assert!(table_metadata_location_for_catalog("warehouse", &format!("s3://other/{object_key}")).is_err());
     }
 
     fn table_entry_for_credentials() -> crate::table_catalog::TableEntry {
@@ -11031,7 +11157,8 @@ mod tests {
         .await
         .expect("table should register");
 
-        assert_eq!(register.metadata_location, metadata_location);
+        let client_metadata_location = table_metadata_location_for_client("warehouse", metadata_location);
+        assert_eq!(register.metadata_location, client_metadata_location);
         assert_eq!(register.metadata["format-version"], 2);
 
         let list = list_tables_response(&store, "warehouse", &namespace)
@@ -11042,7 +11169,7 @@ mod tests {
         let load = load_table_response(&store, &metadata_backend, "warehouse", &namespace, "events")
             .await
             .expect("table should load");
-        assert_eq!(load.metadata_location, metadata_location);
+        assert_eq!(load.metadata_location, client_metadata_location);
         assert_eq!(load.metadata["table-uuid"], "table-uuid");
 
         let current = store
@@ -11075,8 +11202,8 @@ mod tests {
                 idempotency_key: Some("retry-1".to_string()),
                 operation: Some("append".to_string()),
                 expected_version_token: Some(current.version_token.clone()),
-                expected_metadata_location: Some(current.metadata_location.clone()),
-                new_metadata_location: Some(next_metadata_location.to_string()),
+                expected_metadata_location: Some(table_metadata_location_for_client("warehouse", &current.metadata_location)),
+                new_metadata_location: Some(table_metadata_location_for_client("warehouse", next_metadata_location)),
                 requirements: Vec::new(),
                 updates: Vec::new(),
                 _identifier: None,
@@ -11085,7 +11212,10 @@ mod tests {
         )
         .await
         .expect("table commit should succeed");
-        assert_eq!(commit.metadata_location, next_metadata_location);
+        assert_eq!(
+            commit.metadata_location,
+            table_metadata_location_for_client("warehouse", next_metadata_location)
+        );
         assert_eq!(commit.version_token, "token-committed");
         assert_eq!(commit.generation, current.generation + 1);
         assert_eq!(commit.commit_id, "commit-1");
@@ -11266,6 +11396,10 @@ mod tests {
         let current = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
             .await
             .expect("metadata location should load");
+        assert_eq!(
+            current.metadata_location,
+            table_metadata_location_for_client("warehouse", current_location)
+        );
         let next_location = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json";
         metadata_backend
             .put_json(
@@ -11286,7 +11420,7 @@ mod tests {
             &namespace,
             "events",
             UpdateTableMetadataLocationRequest {
-                metadata_location: next_location.to_string(),
+                metadata_location: table_metadata_location_for_client("warehouse", next_location),
                 version_token: current.version_token.clone(),
                 commit_id: Some("commit-1".to_string()),
                 idempotency_key: Some("retry-1".to_string()),
@@ -11295,7 +11429,7 @@ mod tests {
         .await
         .expect("metadata location should update");
 
-        assert_eq!(updated.metadata_location, next_location);
+        assert_eq!(updated.metadata_location, table_metadata_location_for_client("warehouse", next_location));
         assert_eq!(updated.generation, current.generation + 1);
         assert_ne!(updated.version_token, current.version_token);
     }
@@ -11371,7 +11505,10 @@ mod tests {
         let unchanged = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
             .await
             .expect("metadata location should still load");
-        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(
+            unchanged.metadata_location,
+            table_metadata_location_for_client("warehouse", current_location)
+        );
         assert_eq!(unchanged.generation, current.generation);
     }
 
@@ -11457,7 +11594,10 @@ mod tests {
         let unchanged = get_table_metadata_location_response(&store, "warehouse", &namespace, "events")
             .await
             .expect("metadata location should still load");
-        assert_eq!(unchanged.metadata_location, current_location);
+        assert_eq!(
+            unchanged.metadata_location,
+            table_metadata_location_for_client("warehouse", current_location)
+        );
         assert_eq!(unchanged.generation, current.generation);
     }
 
@@ -11502,14 +11642,14 @@ mod tests {
             &namespace,
             "events",
             CatalogImportRequest {
-                metadata_location: imported_location.clone(),
+                metadata_location: table_metadata_location_for_client(bucket, &imported_location),
                 properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
             },
             true,
         )
         .await
         .expect("catalog import should register table");
-        assert_eq!(imported.metadata_location, imported_location);
+        assert_eq!(imported.metadata_location, table_metadata_location_for_client(bucket, &imported_location));
         let current = store
             .load_table(bucket, "analytics", "events")
             .await
@@ -11531,7 +11671,10 @@ mod tests {
         )
         .await
         .expect("repeated catalog import should be idempotent");
-        assert_eq!(imported_again.metadata_location, imported_location);
+        assert_eq!(
+            imported_again.metadata_location,
+            table_metadata_location_for_client(bucket, &imported_location)
+        );
 
         let rollback_location = crate::table_catalog::default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
         backend
@@ -11553,7 +11696,7 @@ mod tests {
             &namespace,
             "events",
             RollbackTableRequest {
-                metadata_location: rollback_location.clone(),
+                metadata_location: table_metadata_location_for_client(bucket, &rollback_location),
                 version_token: current.version_token,
                 commit_id: Some("rollback-1".to_string()),
                 idempotency_key: None,
@@ -11562,7 +11705,7 @@ mod tests {
         .await
         .expect("rollback should commit selected metadata");
 
-        assert_eq!(rollback.metadata_location, rollback_location);
+        assert_eq!(rollback.metadata_location, table_metadata_location_for_client(bucket, &rollback_location));
         assert_eq!(rollback.commit_id, "rollback-1");
     }
 
