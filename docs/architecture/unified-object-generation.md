@@ -97,6 +97,27 @@ orphan an acceptable residue accounted for by GC metrics — the white-box
 acceptance "no background disk write after release" must be rewritten
 accordingly.
 
+### Post-commit convergence is orthogonal to the fence (#1321)
+
+The same `SetDisks::rename_data` path already returns a post-commit
+convergence classification (`RenameConvergence`, rustfs/backlog#1321) that
+tells the caller whether the *committed* replicas need heal to converge —
+`AllSuccessIdentical` (no heal), `PartialCommit` (a replica failed/offline),
+`SignatureDivergent` (committed replicas' version signatures differ), or
+`Unknown` (no signature was produced, e.g. >10 versions — scanner-backstopped).
+This replaced an earlier `Option<Vec<u8>>` heuristic under which any
+version signature looked like "needs heal", so every healthy multipart
+completion self-enqueued.
+
+Convergence is a *post-commit* signal (the write landed; do the replicas need
+reconciliation), whereas the #1312 fence is a *commit* gate (a stale epoch is
+rejected before the write lands, surfaced through the existing `Result::Err`
+channel). They compose on the one `rename_data` path rather than competing:
+the fence decides whether a convergence is produced at all, and
+`RenameConvergence` classifies it once produced. A future fence-aware
+convergence variant, if ever needed, is an additive change to that enum and
+does not disturb the epoch comparison at the disk-write points above.
+
 ## Transport and security contract
 
 Generation and all derived tokens (lease, reservation) cross node boundaries in

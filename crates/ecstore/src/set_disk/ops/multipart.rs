@@ -1433,7 +1433,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // The trailing `_` drops the rename_data old-size backfill
         // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
         // `get_object_info` lookup, so the backfill has no consumer here yet.
-        let (online_disks, versions, op_old_dir, cleanup_disks, _) = Self::rename_data(
+        let (online_disks, convergence, op_old_dir, cleanup_disks, _) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_MULTIPART_BUCKET,
             &upload_id_path,
@@ -1485,17 +1485,46 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         drop(object_lock_guard); // drop object lock guard to release the lock
 
-        if let Some(versions) = versions {
-            let _ =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                    bucket.to_string(),
-                    Some(object.to_string()),
-                    false,
-                    Some(HealChannelPriority::Normal),
-                    Some(self.pool_index),
-                    Some(self.set_index),
-                ))
+        // backlog#1321: enqueue heal only when the committed replicas actually
+        // need to converge — a partial commit (some disk failed/offline) or a
+        // signature divergence between committed replicas. A fully healthy MPU
+        // (identical signatures on every disk) is `AllSuccessIdentical` and
+        // submits nothing, which is the fix: the old `Option::is_some()` gate
+        // treated the mere existence of a version signature as "needs heal", so
+        // every healthy <=10-version completion self-enqueued.
+        //
+        // The submit is detached (`tokio::spawn`) so it stays off the ACK
+        // critical path AND survives cancellation of the completion future: the
+        // write is already durable and ACK-worthy, so the heal admission must
+        // not ride the client's request lifetime. The admission itself is
+        // bounded / deduplicated / observable (`send_heal_request` ->
+        // `HealAdmissionResult`), so this emits at most one submit per
+        // completion and coalesces with any in-flight heal for the same object.
+        //
+        // Scanner backstop (backlog#1321 patch): a `PartialCommit` whose
+        // completion is cancelled in the narrow window after the durable commit
+        // but before this spawn runs is not lost — the divergence it would have
+        // healed is exactly what the background scanner reconciles. `Unknown`
+        // (>10 versions, no signature produced) likewise relies on the scanner
+        // rather than self-enqueuing.
+        if convergence.needs_heal() {
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let pool_index = self.pool_index;
+            let set_index = self.set_index;
+            tokio::spawn(async move {
+                let _ = rustfs_common::heal_channel::send_heal_request(
+                    rustfs_common::heal_channel::create_heal_request_with_options(
+                        bucket,
+                        Some(object),
+                        false,
+                        Some(HealChannelPriority::Normal),
+                        Some(pool_index),
+                        Some(set_index),
+                    ),
+                )
                 .await;
+            });
         }
 
         let upload_id_path = upload_id_path.clone();
