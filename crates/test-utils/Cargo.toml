@@ -28,10 +28,10 @@ documentation = "https://docs.rs/rustfs-test-utils/latest/rustfs_test_utils/"
 [dependencies]
 rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
-tokio = { workspace = true, features = ["fs", "rt"] }
-tokio-util = { workspace = true }
-tracing-subscriber = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["io", "compat"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 
 [lints]
 workspace = true

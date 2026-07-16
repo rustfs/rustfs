@@ -26,7 +26,7 @@ categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-notify/latest/rustfs_notify/"
 
 [dependencies]
-rustfs-config = { workspace = true, features = ["notify", "constants", "server-config-model"] }
+rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-ecstore = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
@@ -36,14 +36,14 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 form_urlencoded = { workspace = true }
-hashbrown = { workspace = true }
+hashbrown = { workspace = true, features = ["serde", "rayon"] }
 percent-encoding = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
-serde = { workspace = true }
-starshard = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+starshard = { workspace = true, features = ["rayon", "async", "serde"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "fs"] }
 tracing = { workspace = true }
 url = { workspace = true }
 metrics = { workspace = true }
@@ -56,12 +56,12 @@ metrics = { workspace = true }
 quick-xml = { workspace = true, features = ["serialize", "serde-types", "encoding"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 axum = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path"] }
-serde_json = { workspace = true }
-criterion = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [lints]
 workspace = true

@@ -33,15 +33,15 @@ rustfs-io-metrics = { workspace = true }
 rustfs-utils = { workspace = true }
 async-trait.workspace = true
 futures.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-tonic.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["gzip", "deflate"] }
 tracing.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 thiserror.workspace = true
 parking_lot.workspace = true
-smallvec.workspace = true
+smallvec = { workspace = true, features = ["serde"] }
 smartstring.workspace = true
 crossbeam-queue = { workspace = true }
 

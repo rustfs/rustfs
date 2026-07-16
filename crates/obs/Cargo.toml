@@ -60,7 +60,7 @@ workspace = true
 [dependencies]
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "observability"] }
+rustfs-config = { workspace = true, features = ["observability"] }
 # NOTE: This dependency on rustfs-ecstore is a known architectural limitation.
 # The obs crate imports types from ecstore for metrics collection.
 # Breaking this dependency would require defining traits in obs and
@@ -75,10 +75,10 @@ rustfs-security-governance = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-utils = { workspace = true, features = ["ip"] }
 rustix = { workspace = true, features = ["fs", "stdio"] }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 flate2 = { workspace = true }
 glob = { workspace = true }
-jiff = { workspace = true }
+jiff = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 crossbeam-channel = { workspace = true }
 crossbeam-deque = { workspace = true }
@@ -86,21 +86,21 @@ crossbeam-utils = { workspace = true }
 futures-util = { workspace = true }
 num_cpus = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-appender-tracing = { workspace = true }
-opentelemetry_sdk = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true, features = ["experimental_span_attributes", "experimental_metadata_attributes"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-stdout = { workspace = true }
-opentelemetry-otlp = { workspace = true }
-opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry-otlp = { workspace = true, features = ["gzip-http", "reqwest-rustls"] }
+opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
 percent-encoding = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
-tokio-util = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time", "macros"] }
+tokio-util = { workspace = true, features = ["io", "compat"] }
 dial9-tokio-telemetry = { workspace = true, optional = true }
 thiserror = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
@@ -108,13 +108,12 @@ sysinfo = { workspace = true }
 nvml-wrapper = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
-pyroscope = { workspace = true, features = ["backend-pprof-rs"], optional = true }
+pyroscope = { workspace = true, optional = true, features = ["backend-pprof-rs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }

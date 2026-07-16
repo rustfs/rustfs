@@ -27,17 +27,17 @@ categories = ["web-programming", "development-tools", "asynchronous", "api-bindi
 
 [dependencies]
 rustfs-targets = { workspace = true }
-rustfs-config = { workspace = true, features = ["audit", "constants", "server-config-model"] }
+rustfs-config = { workspace = true, features = ["audit", "server-config-model"] }
 rustfs-s3-types = { workspace = true }
-chrono = { workspace = true }
-const-str = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+const-str = { workspace = true, features = ["std", "proc"] }
 futures = { workspace = true }
-hashbrown = { workspace = true }
+hashbrown = { workspace = true, features = ["serde", "rayon"] }
 metrics = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "time", "macros"] }
 tracing = { workspace = true, features = ["std", "attributes"] }
 
 [dev-dependencies]

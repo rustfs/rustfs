@@ -33,32 +33,32 @@ workspace = true
 rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
 rustfs-utils = { workspace = true }
-tokio = { workspace = true, features = ["fs","sync","rt","time","macros"] }
+tokio = { workspace = true, features = ["fs", "sync", "time", "macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-time = { workspace = true }
-chrono = { workspace = true }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
 rmp-serde = { workspace = true }
 rustfs-filemeta = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["io", "compat"] }
 rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
 http = { workspace = true }
-rand = { workspace = true }
-s3s = { workspace = true }
+rand = { workspace = true, features = ["serde"] }
+s3s = { workspace = true, features = ["minio"] }
 metrics = { workspace = true }
 rustfs-data-usage = { workspace = true }
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true }
-uuid = { workspace = true, features = ["v4", "serde"] }
-tokio = { workspace = true, features = ["test-util"] }
+uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
+tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
 # the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
 rustfs-ecstore = { workspace = true, features = ["test-util"] }

@@ -28,8 +28,8 @@ categories = ["data-structures"]
 workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 [lib]
 doctest = false
