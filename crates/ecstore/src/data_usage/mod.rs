@@ -147,18 +147,36 @@ lazy_static::lazy_static! {
     );
 }
 
+/// Decide whether an incoming usage snapshot must be skipped as stale, given the local
+/// wall clock `now`. Mirrors `stale_data_usage_update_reason` in
+/// `crates/scanner/src/scanner.rs` — keep the two consistent.
+///
+/// If the persisted `existing.last_update` is future-dated beyond
+/// [`rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE`] (clock step-back or a
+/// slower-clock scanner leader), it is untrustworthy: the save is allowed so usage
+/// stats cannot freeze forever.
+fn stale_data_usage_persist_reason(incoming: &DataUsageInfo, existing: &DataUsageInfo, now: SystemTime) -> Option<&'static str> {
+    match (incoming.last_update, existing.last_update) {
+        (Some(new_ts), Some(existing_ts))
+            if new_ts <= existing_ts && !rustfs_data_usage::usage_last_update_is_untrusted_future(existing_ts, now) =>
+        {
+            Some("older_or_equal_last_update")
+        }
+        _ => None,
+    }
+}
+
 /// Store data usage info to backend storage
 #[instrument(skip(store))]
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
     // Prevent older data from overwriting newer persisted stats
     if let Ok(buf) = read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await
         && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
-        && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
-        && new_ts <= existing_ts
+        && let Some(reason) = stale_data_usage_persist_reason(&data_usage_info, &existing, SystemTime::now())
     {
         info!(
-            "Skip persisting data usage: incoming last_update {:?} <= existing {:?}",
-            new_ts, existing_ts
+            "Skip persisting data usage ({reason}): incoming last_update {:?} <= existing {:?}",
+            data_usage_info.last_update, existing.last_update
         );
         return Ok(());
     }
@@ -1370,6 +1388,81 @@ mod tests {
         info.buckets_count = info.buckets_usage.len() as u64;
         info.calculate_totals();
         info
+    }
+
+    fn usage_with_last_update(last_update: Option<SystemTime>) -> DataUsageInfo {
+        DataUsageInfo {
+            last_update,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_allows_newer_incoming() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let incoming = usage_with_last_update(Some(now));
+        let existing = usage_with_last_update(Some(now - Duration::from_secs(60)));
+        assert_eq!(stale_data_usage_persist_reason(&incoming, &existing, now), None);
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_skips_older_or_equal_incoming() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let existing = usage_with_last_update(Some(now - Duration::from_secs(60)));
+
+        let older = usage_with_last_update(Some(now - Duration::from_secs(120)));
+        assert_eq!(
+            stale_data_usage_persist_reason(&older, &existing, now),
+            Some("older_or_equal_last_update")
+        );
+
+        let equal = usage_with_last_update(existing.last_update);
+        assert_eq!(
+            stale_data_usage_persist_reason(&equal, &existing, now),
+            Some("older_or_equal_last_update")
+        );
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_allows_save_when_existing_is_future_dated() {
+        // Existing snapshot timestamp beyond the clock tolerance is untrustworthy
+        // (clock step-back / slower-clock leader): the save must be allowed even
+        // though incoming <= existing, otherwise usage stats freeze forever.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let existing =
+            usage_with_last_update(Some(now + rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE + Duration::from_secs(1)));
+        let incoming = usage_with_last_update(Some(now));
+        assert_eq!(stale_data_usage_persist_reason(&incoming, &existing, now), None);
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_skips_at_exact_tolerance_boundary() {
+        // Exactly at now + tolerance is still within the trusted window.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let existing = usage_with_last_update(Some(now + rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE));
+        let incoming = usage_with_last_update(Some(now));
+        assert_eq!(
+            stale_data_usage_persist_reason(&incoming, &existing, now),
+            Some("older_or_equal_last_update")
+        );
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_preserves_none_handling() {
+        // This call site (unlike the scanner sibling) allows saves when either
+        // timestamp is missing — pin that behavior.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        let incoming_none = usage_with_last_update(None);
+        let existing_some = usage_with_last_update(Some(now - Duration::from_secs(60)));
+        assert_eq!(stale_data_usage_persist_reason(&incoming_none, &existing_some, now), None);
+
+        let incoming_some = usage_with_last_update(Some(now));
+        let existing_none = usage_with_last_update(None);
+        assert_eq!(stale_data_usage_persist_reason(&incoming_some, &existing_none, now), None);
+
+        let both_none = usage_with_last_update(None);
+        assert_eq!(stale_data_usage_persist_reason(&both_none, &usage_with_last_update(None), now), None);
     }
 
     #[tokio::test]
