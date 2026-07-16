@@ -221,6 +221,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # test_transition_and_restore_flows was re-enabled by rustfs/backlog#1303:
+      # its "missing xl.meta on disk2" was a test-util bug (open_disk hardcoded
+      # disk_index 0), not an EC metadata-distribution issue.
       # restore_object_usecase_reports_ongoing_conflict_and_completion was
       # re-enabled by backlog#1304 (restore accepts serialize on a short CAS
       # guard; the copy-back no longer holds the #4877 whole-copy-back lock,
@@ -230,9 +233,6 @@ jobs:
       # they keep #[ignore] with a backlog reference):
       #   - test_noncurrent_{expiry,transition}_still_works_after_immediate_compensation_transition:
       #     noncurrent transition/expiry after an immediate compensation transition.
-      #   - test_transition_and_restore_flows: transition metadata is missing on
-      #     one drive (assert_transition_meta_consistent: "missing xl.meta ... on
-      #     disk2") - an EC metadata-distribution issue, not the restore lock.
       #   - test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore:
       #     DeleteRestoredAction sets opts.transition.expire_restored, but no
       #     delete path reads that flag, so cleanup deletes the whole object
@@ -242,7 +242,7 @@ jobs:
         run: |
           cargo nextest run -j1 --run-ignored ignored-only \
             -p rustfs-scanner -p rustfs \
-            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition) or test(test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore))'
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition) or test(test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore))'
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
