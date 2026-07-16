@@ -16,6 +16,10 @@ use crate::admin::runtime_sources::{current_oidc_handle, default_admin_usecase};
 use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
+use crate::server::rate_limit::{
+    LABEL_RATE_LIMIT_SCOPE, METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL, RATE_LIMIT_SCOPE_CONSOLE, RateLimitDecision,
+    RateLimitQuota, RateLimiter, apply_throttle_headers, client_ip,
+};
 use crate::server::{
     CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX,
     RequestContextLayer, VERSION, build_health_response_parts, collect_probe_readiness,
@@ -36,7 +40,7 @@ use rust_embed::RustEmbed;
 use serde::Serialize;
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tower_http::catch_panic::CatchPanicLayer;
@@ -569,12 +573,38 @@ fn setup_console_middleware_stack(
         // Add request body limit (10MB for console uploads)
         .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024));
 
-    // Add rate limiting if enabled
+    // Per-client console rate limiting, sharing the S3 API limiter core
+    // (`server::rate_limit`). Added last so it is the outermost layer and
+    // over-limit requests are rejected before any other middleware runs.
+    // The client identity comes from validated request extensions only
+    // (trusted-proxy `ClientInfo`, then socket peer address); requests
+    // without one fail open rather than trusting spoofable headers.
     if rate_limit_enable {
-        info!("Console rate limiting enabled: {} requests per minute", rate_limit_rpm);
-        // Note: tower-http doesn't provide a built-in rate limiter, but we have the foundation
-        // For production, you would integrate with a rate limiting service like Redis
-        // For now, we log that it's configured and ready for integration
+        if let Some(quota) = RateLimitQuota::per_minute(rate_limit_rpm, 0) {
+            let limiter = Arc::new(RateLimiter::new(quota));
+            app = app.layer(middleware::from_fn(move |req: Request, next: middleware::Next| {
+                let limiter = limiter.clone();
+                async move {
+                    match client_ip(&req).map(|ip| limiter.check(ip)) {
+                        Some(RateLimitDecision::Limited(throttle)) => {
+                            metrics::counter!(
+                                METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL,
+                                LABEL_RATE_LIMIT_SCOPE => RATE_LIMIT_SCOPE_CONSOLE
+                            )
+                            .increment(1);
+                            debug!(retry_after_secs = throttle.retry_after_secs, "Console request rejected by rate limit");
+                            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+                            apply_throttle_headers(response.headers_mut(), limiter.quota().requests_per_minute, &throttle);
+                            response
+                        }
+                        _ => next.run(req).await,
+                    }
+                }
+            }));
+            info!("Console rate limiting enabled: {} requests per minute", rate_limit_rpm);
+        } else {
+            warn!("Console rate limiting enabled but RPM is 0; it stays inactive");
+        }
     }
 
     app
@@ -862,6 +892,39 @@ mod tests {
             response.headers().contains_key("x-request-id"),
             "console response should include propagated x-request-id header"
         );
+    }
+
+    // setup_console_middleware_stack reads ENV_HEALTH_ENDPOINT_ENABLE (see above).
+    #[tokio::test]
+    #[serial]
+    async fn console_rate_limit_rejects_over_limit_clients_with_429() {
+        let app = setup_console_middleware_stack(parse_cors_origins(None), true, 1, 30);
+
+        let request_for = |last_octet: u8| {
+            let mut request = Request::builder()
+                .uri(format!("{CONSOLE_PREFIX}/index.html"))
+                .body(Body::empty())
+                .expect("failed to build request");
+            request.extensions_mut().insert(crate::server::RemoteAddr(SocketAddr::new(
+                IpAddr::from([198, 51, 100, last_octet]),
+                50000,
+            )));
+            request
+        };
+
+        let first = app.clone().oneshot(request_for(7)).await.expect("request should succeed");
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let second = app.clone().oneshot(request_for(7)).await.expect("request should succeed");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            second.headers().contains_key(http::header::RETRY_AFTER),
+            "console 429 must carry Retry-After"
+        );
+
+        // A different client IP has its own budget.
+        let other = app.oneshot(request_for(8)).await.expect("request should succeed");
+        assert_ne!(other.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test(flavor = "current_thread")]

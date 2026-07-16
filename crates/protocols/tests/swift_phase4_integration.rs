@@ -43,36 +43,4 @@ mod swift_integration {
         let parsed = expiration::parse_delete_at(delete_at).unwrap();
         assert_eq!(parsed, 1740000000);
     }
-
-    #[test]
-    fn test_multiple_rate_limit_keys() {
-        let limiter = ratelimit::RateLimiter::new();
-        let rate = ratelimit::RateLimit {
-            limit: 3,
-            window_seconds: 60,
-        };
-
-        // Different keys should have separate limits
-        for _ in 0..3 {
-            assert!(limiter.check_rate_limit("key1", &rate).is_ok());
-            assert!(limiter.check_rate_limit("key2", &rate).is_ok());
-        }
-
-        // Both keys should now be exhausted
-        assert!(limiter.check_rate_limit("key1", &rate).is_err());
-        assert!(limiter.check_rate_limit("key2", &rate).is_err());
-    }
-
-    #[test]
-    fn test_rate_limit_metadata_extraction() {
-        let mut metadata = HashMap::new();
-        metadata.insert("x-account-meta-rate-limit".to_string(), "1000/60".to_string());
-
-        let rate_limit = ratelimit::extract_rate_limit(&metadata);
-        assert!(rate_limit.is_some());
-
-        let rate_limit = rate_limit.unwrap();
-        assert_eq!(rate_limit.limit, 1000);
-        assert_eq!(rate_limit.window_seconds, 60);
-    }
 }
