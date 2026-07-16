@@ -14,11 +14,11 @@
 
 //! Line parsing: raw customer log lines -> [`LogEvent`]s.
 //!
-//! Four channels, tried in order per line (see rustfs/backlog#1283):
+//! Four channels per line (see rustfs/backlog#1283): container-prefix
+//! stripping runs first so every later channel judges the payload, then
 //! 1. JSON (native RustFS application logs);
-//! 2. container-prefix stripping, then JSON again;
-//! 3. multi-line panic block folding;
-//! 4. plain-text fallback (never fails).
+//! 2. multi-line panic block folding;
+//! 3. plain-text fallback (never fails).
 
 mod json;
 mod panic_block;
@@ -54,7 +54,16 @@ impl LineParser {
     pub fn feed(&mut self, line: &str, line_no: u64) -> Vec<LogEvent> {
         self.stats.total_lines += 1;
 
-        if line.trim().is_empty() {
+        // Collector prefixes come off before anything else so every channel
+        // below judges the payload, not the wrapper: an open panic block's
+        // continuation lines would otherwise fail `absorbs` (and store the
+        // prefix in the payload), splitting containerized panics apart.
+        let (payload, prefixed) = match prefix::strip(line) {
+            Some(stripped) => (stripped, true),
+            None => (line, false),
+        };
+
+        if payload.trim().is_empty() {
             self.stats.empty_lines += 1;
             // A blank line terminates an open panic block.
             return self.flush_panic().into_iter().collect();
@@ -62,39 +71,31 @@ impl LineParser {
 
         let mut out = Vec::with_capacity(1);
         if let Some(pending) = self.pending_panic.as_mut() {
-            if pending.absorbs(line) {
-                pending.push(line);
+            if pending.absorbs(payload) {
+                pending.push(payload);
                 return out;
             }
             // Not absorbable: close the block, then treat this line normally.
             out.extend(self.flush_panic());
         }
 
-        if let Some(ev) = json::try_parse(line, &self.file, line_no, &self.node) {
-            self.stats.json_ok += 1;
+        if let Some(ev) = json::try_parse(payload, &self.file, line_no, &self.node) {
+            if prefixed {
+                self.stats.prefixed_json += 1;
+            } else {
+                self.stats.json_ok += 1;
+            }
             out.push(ev);
             return out;
         }
 
-        // After stripping, non-JSON content still goes through the panic and
-        // text channels (containers wrap stderr panics too).
-        let mut line = line;
-        if let Some(stripped) = prefix::strip(line) {
-            if let Some(ev) = json::try_parse(stripped, &self.file, line_no, &self.node) {
-                self.stats.prefixed_json += 1;
-                out.push(ev);
-                return out;
-            }
-            line = stripped;
-        }
-
-        if let Some(acc) = panic_block::starts(line, line_no) {
+        if let Some(acc) = panic_block::starts(payload, line_no) {
             self.pending_panic = Some(acc);
             return out;
         }
 
         self.stats.text_lines += 1;
-        out.push(self.text_event(line, line_no));
+        out.push(self.text_event(payload, line_no));
         out
     }
 
@@ -264,6 +265,32 @@ mod tests {
         assert!(full.contains("stack backtrace:"));
         assert!(full.contains("0: std::panicking::begin_panic"));
         assert!(full.contains("at /rustc/abc"));
+    }
+
+    #[test]
+    fn cri_prefixed_panic_block_folds_completely() {
+        let mut p = parser();
+        let pre = "2026-07-15T06:23:01.123456789Z stderr F";
+        let events = feed_all(
+            &mut p,
+            &[
+                &format!("{pre} thread 'tokio-runtime-worker' panicked at src/main.rs:3:5:"),
+                &format!("{pre} boom"),
+                &format!("{pre} note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"),
+                &format!("{pre} stack backtrace:"),
+                &format!("{pre}    0: std::panicking::begin_panic"),
+            ],
+        );
+        assert_eq!(events.len(), 1, "prefixed continuation lines must not split the block");
+        let panic = &events[0];
+        assert_eq!(panic.kind, EventKind::Panic);
+        assert_eq!(panic.message, "thread 'tokio-runtime-worker' panicked at src/main.rs:3:5: boom");
+        let full = panic.field_str("panic_full").expect("panic_full");
+        assert!(!full.contains("stderr F"), "payload must be stored without the CRI prefix");
+        assert!(full.contains("stack backtrace:"));
+        assert!(full.contains("0: std::panicking::begin_panic"));
+        assert_eq!(p.stats().panic_blocks, 1);
+        assert_eq!(p.stats().text_lines, 0);
     }
 
     #[test]
