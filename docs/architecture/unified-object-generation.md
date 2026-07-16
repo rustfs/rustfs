@@ -145,10 +145,7 @@ The on-disk persistence of generation must not perturb the file format:
   (`crates/filemeta/src/filemeta.rs:53-54`). Bumping either makes every new
   `xl.meta` unreadable by rolling-upgrade old RustFS nodes and by MinIO — a
   total read failure, not a graceful downgrade.
-- **Do not add generation as a `FileInfo` struct field.** `RenameDataRequest`
-  serializes `file_info_bin` with rmp_serde's default **array** encoding
-  (`crates/ecstore/src/cluster/rpc/remote_disk.rs`), so a new positional field
-  breaks deserialization in both directions across mixed-version nodes.
+- **Do not add generation as a `FileInfo` struct field.** The internode RPC layer serializes `FileInfo` with two different msgpack encoders depending on the call site: `encode_msgpack` uses rmp_serde's default **array** (positional) encoding for the `read_version` family, where a new positional field breaks decode across mixed-version nodes; `encode_msgpack_named` uses `.with_struct_map()` (named-map) encoding for `rename_data` (`crates/ecstore/src/cluster/rpc/remote_disk.rs`), which is more tolerant but still requires `#[serde(default)]` and MinIO-side agreement. Because a `FileInfo` field would have to be correct under *both* encoders and under the JSON compatibility twin (see "Wire-encoding migration" below), do not add one — use the metadata map, which rides through every encoder unchanged.
 - **Where it may live.** Only inside a version's internal metadata **map**
   (MinIO skips unknown internal keys and the map encoding is extensible) or in a
   per-disk sidecar outside `xl.meta`. If it goes in the metadata map, it must
@@ -158,6 +155,15 @@ The on-disk persistence of generation must not perturb the file format:
   regression (the fixture family around `crates/filemeta/src/filemeta.rs`):
   objects written by a new node must still be readable by old RustFS nodes and
   by MinIO, in both upgrade and downgrade directions.
+
+### Wire-encoding migration (JSON → msgpack) interaction
+
+The internode RPC layer is mid-migration from JSON to msgpack binary, and generation-bearing fields must respect that migration window — this is not optional context, it changes how epoch is transported.
+
+- **Dual-field transport.** Each dual-encoded RPC field exists twice in `crates/protos/src/node.proto`: a JSON `string` field and a msgpack `bytes _bin` field (e.g. `file_info` #4 alongside `file_info_bin` #7 on `RenameDataRequest`). Senders emit both; receivers `decode_msgpack_or_json` prefer the `_bin` form and fall back to the JSON string only when `_bin` is empty (`crates/ecstore/src/cluster/rpc/remote_disk.rs`).
+- **Capability flag, default off.** `rustfs_protos::internode_rpc_msgpack_only()` (env `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`, default **false**) gates dropping the redundant JSON copy. It may only be flipped after the `record_msgpack_json_fallback` metric reads zero fleet-wide and the convergence runbook is followed (`crates/protos/src/lib.rs:146`). **Reuse this exact capability + metric-reads-zero model as the mixed-version gate for generation** rather than inventing a parallel handshake; the section above ("Capability negotiation") is layered on top of it, not instead of it.
+- **Generation must ride both encodings during the window.** If epoch lives in the version's internal metadata map, that map is carried inside `FileInfo`, so it is present in both the msgpack `_bin` and JSON copies automatically — good. But any new *top-level* generation datum must be added to **both** the msgpack and JSON representations (and, for msgpack, be safe under both the array and named-map encoders). A field added to only one encoding is silently lost the moment a peer falls back to the other — exactly the failure the JSON-fallback metric exists to catch.
+- **Signature must bind a canonical form.** Because a field is transmitted as both JSON and msgpack and a peer may consume either, the body-digest binding in "RPC signature binding" above must be computed over a single canonical representation (the msgpack `_bin` bytes) — not over whichever copy happened to be decoded. Once the `generation` capability is negotiated for a request, a fenced / generation-bearing request must **reject the JSON fallback path** so a downgrade to the unsigned/loosely-bound JSON copy cannot bypass the epoch check.
 
 ### Proto evolution
 
@@ -209,6 +215,20 @@ probe:
    query otherwise.
 4. **#1318** (quota reservation) and **#1314** (prepared pool read) bind the
    epoch independently; both gate on the same capability handshake.
+
+## Open design decisions (pin before implementation)
+
+This document fixes the transport, encoding, proto, and gate constraints, but it is not yet a complete implementable algorithm. The following must be decided and written down before any of the five consumers is coded (per the #1307 maintainer re-review, issuecomment-4992956256):
+
+- **Epoch type and total order.** The concrete token type and its total-order rule — a term+counter tuple, its persistence, and overflow behavior. Whether monotonicity is global or strictly per-object.
+- **Never-regress on lock-service restart / minority recovery.** The epoch source must survive a lock-service restart or minority-quorum recovery without ever handing out an epoch lower than one already persisted on disk (an in-memory counter reset to zero is a fencing inversion). This is the same requirement as "Monotonicity persistence semantics" above, elevated to a hard, tested acceptance.
+- **Complete xl.meta-writer coverage.** Every code path that writes xl.meta (commit rename, rollback delete/metadata restore, old-dir cleanup, heal, transition) must be enumerated and shown to compare or carry the epoch. A single unfenced writer voids the guarantee.
+- **Rollback is an expected-generation CAS (#1312 B2).** The quorum-failure rollback at `io_primitives.rs:2646-2691` restores a metadata backup, not just a per-writer tmp delete, so a late rollback by writer A can overwrite writer B's committed xl.meta. Rollback must execute only when `stored_epoch == failed_writer_epoch`; a higher stored epoch must abort the rollback. Task panic / cancel / timeout at `io_primitives.rs:2602-2605` must be reaped into the coordinator's state machine, never bubble out via `?` and skip convergence.
+- **Sidecar is excluded unless proven atomic.** An epoch sidecar outside `xl.meta` is only admissible if it commits at the same atomic/CAS point as `xl.meta` with a defined recovery; otherwise it opens a crash gap and must be rejected in favor of the version-internal metadata map. The earlier "metadata map or sidecar" phrasing does not treat the two as equally safe.
+- **Read-lease and GC crash recovery.** Lease registry location (local vs cross-node), TTL reclamation, and crash recovery for both the lease holder and the GC executor.
+- **Quota reserve → commit → settle idempotency.** The cross-stage reconcile / idempotency story for #1318, including owner-crash reconciliation, so a reservation is neither lost nor double-counted.
+- **PreparedPoolRead is pool-local only.** A #1314 bundle's generation validates freshness only within the pool that produced it. It cannot order commits across different pools unless a cross-pool common authority exists; absent that, the multi-pool wait cannot be short-circuited.
+- **Hot-path cost is a blocking metric.** If per-PUT fencing grant, quota reserve, or cleanup journal adds a consensus write / fsync / centralized serialization point, it must be measured under 4KiB and high-concurrency hot-key / hot-bucket A/B as a blocking gate, not accepted by default.
 
 ## Acceptance for this contract
 
