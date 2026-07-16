@@ -46,7 +46,6 @@ pub mod formpost;
 pub mod handler;
 pub mod object;
 pub mod quota;
-pub mod ratelimit;
 pub mod router;
 pub mod slo;
 pub mod staticweb;

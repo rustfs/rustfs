@@ -67,6 +67,10 @@ mod bucket_policy_check_test;
 #[cfg(test)]
 mod security_boundary_test;
 
+// Opt-in per-client S3 API rate limiting (backlog#1191)
+#[cfg(test)]
+mod api_rate_limit_test;
+
 // Admin authorization gate: non-admin denial + root-credential lifecycle (backlog#1151 sec-4)
 #[cfg(test)]
 mod admin_auth_test;

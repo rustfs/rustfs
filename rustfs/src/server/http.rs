@@ -27,6 +27,7 @@ use crate::server::{
         RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer,
         redact_sensitive_uri_query,
     },
+    rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     tls_material::{
         TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
     },
@@ -111,6 +112,7 @@ const EVENT_HTTP_BIND_FAILED: &str = "http_bind_failed";
 const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
 const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
 const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
+const EVENT_API_RATE_LIMIT_STATE: &str = "api_rate_limit_state";
 const EVENT_HTTP_TRANSPORT_PARAMETERS: &str = "http_transport_parameters";
 const EVENT_HTTP_ACCEPT_LOOP_STATE: &str = "http_accept_loop_state";
 const EVENT_HTTP_CONNECTION_DRAIN: &str = "http_connection_drain";
@@ -700,6 +702,34 @@ pub async fn start_http_server(
         );
     }
 
+    // Per-client S3 API rate limiting (backlog#1191). Built once so every
+    // connection's stack shares the same limiter state; `None` (the default)
+    // leaves the request path unchanged.
+    let api_rate_limit_layer = api_rate_limit_layer_from_env();
+    match &api_rate_limit_layer {
+        Some(layer) => {
+            let quota = layer.quota();
+            info!(
+                event = EVENT_API_RATE_LIMIT_STATE,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                state = "enabled",
+                requests_per_minute = quota.requests_per_minute,
+                burst = quota.burst,
+                "API rate limit state changed"
+            );
+        }
+        None => {
+            debug!(
+                event = EVENT_API_RATE_LIMIT_STATE,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                state = "disabled",
+                "API rate limit state changed"
+            );
+        }
+    }
+
     let is_console = config.console_enable;
     let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
@@ -890,6 +920,7 @@ pub async fn start_http_server(
                 readiness: readiness.clone(),
                 keystone_auth: auth_keystone::get_keystone_auth(),
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
+                rate_limit_layer: api_rate_limit_layer.clone(),
             };
 
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher());
@@ -946,6 +977,9 @@ struct ConnectionContext {
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
     /// Pre-computed trusted proxy layer (avoids per-connection is_enabled() check).
     trusted_proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
+    /// Per-client API rate limit layer; `None` when disabled (the default).
+    /// All clones share one limiter, keeping budgets global across connections.
+    rate_limit_layer: Option<RateLimitLayer>,
 }
 
 #[derive(Clone)]
@@ -1130,6 +1164,7 @@ fn process_connection(
             readiness,
             keystone_auth,
             trusted_proxy_layer,
+            rate_limit_layer,
         } = context;
 
         // Build the hybrid service per-connection.
@@ -1183,23 +1218,24 @@ fn process_connection(
         //  5. RequestContextLayer                    — creates RequestContext in extensions
         //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
         //  7. CatchPanicLayer                        — panic → 500
-        //  8. ReadinessGateLayer                     — blocks until ready
-        //  9. KeystoneAuthLayer                      — X-Auth-Token validation
-        // 10. TraceLayer                             — request span creation + metrics
-        // 11. RequestLoggingLayer                    — single completion event per request
-        // 12. PropagateRequestIdLayer                — X-Request-ID → response
-        // 13. CompressionLayer                       — response compression (whitelist, path-aware)
-        // 14. PathCategoryInjectionLayer             — injects path category for compression predicate
-        // 15. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
-        // 16. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        // 17. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
-        // 18. ConditionalCorsLayer                   — S3 API CORS
-        // 19. RedirectLayer                          — console redirect (conditional)
-        // 20. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 21. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 22. PublicHealthEndpointLayer              — handles public health before s3s host parsing
-        // 23. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
-        // 24. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
+        //  8. RateLimitLayer                         — conditional (external stack only), per-client 429 throttling
+        //  9. ReadinessGateLayer                     — blocks until ready
+        // 10. KeystoneAuthLayer                      — X-Auth-Token validation
+        // 11. TraceLayer                             — request span creation + metrics
+        // 12. RequestLoggingLayer                    — single completion event per request
+        // 13. PropagateRequestIdLayer                — X-Request-ID → response
+        // 14. CompressionLayer                       — response compression (whitelist, path-aware)
+        // 15. PathCategoryInjectionLayer             — injects path category for compression predicate
+        // 16. S3ErrorMessageCompatLayer              — missing S3 error message compatibility
+        // 17. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
+        // 18. ObjectAttributesEtagFixLayer           — ETag fix for GetObjectAttributes
+        // 19. ConditionalCorsLayer                   — S3 API CORS
+        // 20. RedirectLayer                          — console redirect (conditional)
+        // 21. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
+        // 22. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 23. PublicHealthEndpointLayer              — handles public health before s3s host parsing
+        // 24. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
+        // 25. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
         // ─────────────────────────────────────────────────────────────
         // Batch 1 intentionally keeps the external and internode stacks behaviorally
         // identical while giving each path family a named construction boundary.
@@ -1223,6 +1259,12 @@ fn process_connection(
                 .layer(InternodeRequestContextLiteLayer)
                 .layer(EmptyBodyContentLengthCompatLayer)
                 .layer(CatchPanicLayer::new())
+                // Per-client API rate limit (backlog#1191): rejects over-limit
+                // requests with 429 before readiness/auth/tracing spend any
+                // work on them, but after the trusted-proxy layer has resolved
+                // a spoof-proof client IP. Absent (None) unless enabled via
+                // RUSTFS_API_RATE_LIMIT_ENABLE with a non-zero RPM.
+                .option_layer(rate_limit_layer.clone())
                 // CRITICAL: Insert ReadinessGateLayer before business logic
                 // This stops requests from hitting IAMAuth or Storage if they are not ready.
                 .layer(ReadinessGateLayer::new(readiness.clone()))

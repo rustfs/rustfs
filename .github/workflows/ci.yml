@@ -571,6 +571,14 @@ jobs:
       - name: Setup Rust toolchain for s3s-e2e installation
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
+      # The sm-standard-* custom runner images (introduced in #4884) ship no C
+      # toolchain, unlike GitHub-hosted ubuntu-latest. Installing s3s-e2e below
+      # compiles it from source on a cache miss, and build scripts need cc.
+      - name: Install build tools for s3s-e2e compilation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libssl-dev
+
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
         with:

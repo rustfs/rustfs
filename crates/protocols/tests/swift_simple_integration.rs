@@ -16,7 +16,7 @@
 
 #![cfg(feature = "swift")]
 
-use rustfs_protocols::swift::{quota, ratelimit, slo, symlink, sync, tempurl, versioning};
+use rustfs_protocols::swift::{quota, slo, symlink, sync, tempurl, versioning};
 use std::collections::HashMap;
 
 /// Test sync configuration parsing
@@ -90,14 +90,6 @@ fn test_symlink_detection() {
 
     // Just verify the function works - may require specific metadata format
     let _is_symlink = symlink::is_symlink(&metadata);
-}
-
-/// Test rate limit parsing
-#[test]
-fn test_rate_limit_parsing() {
-    let rl = ratelimit::RateLimit::parse("100/60").unwrap();
-    assert_eq!(rl.limit, 100);
-    assert_eq!(rl.window_seconds, 60);
 }
 
 /// Test quota structure
