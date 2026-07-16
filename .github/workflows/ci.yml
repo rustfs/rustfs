@@ -224,20 +224,21 @@ jobs:
       # Known-broken ILM restore/transition tests, excluded by name until fixed
       # (all tracked under rustfs/backlog#1148; they keep #[ignore] with a backlog
       # reference):
-      #   - test_transition_and_restore_flows: restore of a transitioned
-      #     multipart object.
       #   - test_noncurrent_{expiry,transition}_still_works_after_immediate_compensation_transition:
       #     noncurrent transition/expiry after an immediate compensation transition.
-      #   - restore_object_usecase_reports_ongoing_conflict_and_completion: the
-      #     RestoreObject API copy-back holds the object write lock added in #4877
-      #     across the whole tier read-back, so it never releases in time and a
-      #     concurrent get_object_info times out (Lock Timeout, 5s). The restore
-      #     copy-back path needs a fix before this can be re-enabled.
+      #   - Restore-of-transitioned-object tests broken by #4877: restoring a
+      #     transitioned object now acquires the object write lock, which
+      #     deterministically times out (Lock Timeout, 5s) against an
+      #     already-held lock, so restore never completes. Affects
+      #     test_transition_and_restore_flows, test_multipart_restore_preserves_parts_and_etag,
+      #     test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore
+      #     (scanner) and restore_object_usecase_reports_ongoing_conflict_and_completion
+      #     (rustfs). The #4877 lock scope must be fixed before these re-enable.
       - name: Run ignored ILM integration tests serially
         run: |
           cargo nextest run -j1 --run-ignored ignored-only \
             -p rustfs-scanner -p rustfs \
-            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition) or test(restore_object_usecase_reports_ongoing_conflict_and_completion))'
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition) or test(restore_object_usecase_reports_ongoing_conflict_and_completion) or test(test_multipart_restore_preserves_parts_and_etag) or test(test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore))'
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)

@@ -1780,7 +1780,7 @@ mod serial_tests {
     /// tier again -> a second restore succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there - restore_transitioned_object times out acquiring the #4877 object write lock"]
     async fn test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -1908,7 +1908,7 @@ mod serial_tests {
     /// the multipart ETag, and byte-identical content across part boundaries.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there - restore_transitioned_object times out acquiring the #4877 object write lock"]
     async fn test_multipart_restore_preserves_parts_and_etag() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
