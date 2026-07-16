@@ -128,6 +128,39 @@ pub const ENV_OBJECT_DISK_READ_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_READ_TIMEOUT"
 /// Default disk read timeout in seconds.
 pub const DEFAULT_OBJECT_DISK_READ_TIMEOUT: u64 = 10;
 
+/// Environment variable for the per-shard erasure write stall timeout (seconds).
+///
+/// A single shard write (or shard-writer shutdown) that makes no forward
+/// progress for longer than this budget is failed and its disk is dropped
+/// before commit, so a black-hole peer that accepts the connection but never
+/// drains the body cannot pin an otherwise-healthy write quorum forever
+/// (see `MultiWriter` in `erasure/coding/encode.rs`). The budget is re-armed on
+/// every shard write, so it bounds a *stall* rather than the total transfer
+/// time of a large object.
+///
+/// Unit: seconds (u64). `0` disables the stall deadline (previous behavior:
+/// wait indefinitely). Default: 30 seconds.
+pub const ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_WRITE_STALL_TIMEOUT";
+
+/// Default per-shard erasure write stall timeout in seconds.
+pub const DEFAULT_OBJECT_DISK_WRITE_STALL_TIMEOUT: u64 = 30;
+
+/// Environment variable for the absolute per-object erasure write cap (seconds).
+///
+/// Optional administrator backstop against a "slow-drip" peer that produces
+/// just enough forward progress to reset the per-shard stall timeout on every
+/// block while never converging. When set, the shard writers for one object are
+/// engaged for at most this long in aggregate before a stalled writer is failed
+/// and dropped. It is disabled by default because a legitimate large upload
+/// over a slow-but-honest link must not be killed on total time alone; the
+/// per-shard stall timeout is the primary guarantee.
+///
+/// Unit: seconds (u64). `0` (default) disables the absolute cap.
+pub const ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP: &str = "RUSTFS_OBJECT_DISK_WRITE_ABSOLUTE_CAP";
+
+/// Default absolute per-object erasure write cap in seconds (`0` = disabled).
+pub const DEFAULT_OBJECT_DISK_WRITE_ABSOLUTE_CAP: u64 = 0;
+
 /// Environment variable for minimum GetObject timeout in seconds.
 ///
 /// When dynamic timeout calculation is enabled, this is the minimum timeout
