@@ -79,7 +79,7 @@ The comparison at the disk commit point is on the full composite; a lower
 
 Comparing the epoch at the `rename` commit point alone is insufficient. The
 authoritative commit sequence is `tmp sync → data-dir rename → xl.meta commit →
-directory sync` in `crates/ecstore/src/set_disk/core/local.rs`, and there are two
+directory sync` in `crates/ecstore/src/set_disk/core/<local>.rs` (planned), and there are two
 further detachable disk-write points in
 `crates/ecstore/src/set_disk/core/io_primitives.rs`:
 
