@@ -51,7 +51,7 @@ rustfs-utils = { workspace = true, features = ["path"] }
 rustfs-io-metrics.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 pollster.workspace = true
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy"] }
 moka = { workspace = true, features = ["future"] }
 openidconnect = { workspace = true, default-features = false, features = ["accept-rfc3339-timestamps"] }
 http = { workspace = true }

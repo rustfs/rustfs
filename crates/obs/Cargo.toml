@@ -99,7 +99,7 @@ tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "time", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time", "macros"] }
 tokio-util = { workspace = true, features = ["io", "compat"] }
 dial9-tokio-telemetry = { workspace = true, optional = true }
 thiserror = { workspace = true }
@@ -115,6 +115,5 @@ libc = { workspace = true }
 
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }

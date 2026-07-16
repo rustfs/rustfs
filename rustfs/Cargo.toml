@@ -117,7 +117,7 @@ hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-gra
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream"] }
 socket2 = { workspace = true, features = ["all"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "fs"] }
 tokio-rustls = { workspace = true, default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
