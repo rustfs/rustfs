@@ -617,6 +617,8 @@ pub(crate) mod bucket {
         }
 
         pub(crate) type QuotaOperation = crate::storage::storage_api::ecstore_bucket::quota::QuotaOperation;
+        pub(crate) type QuotaCheckResult = crate::storage::storage_api::ecstore_bucket::quota::QuotaCheckResult;
+        pub(crate) type QuotaError = crate::storage::storage_api::ecstore_bucket::quota::QuotaError;
     }
 
     pub(crate) mod replication {
