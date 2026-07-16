@@ -67,7 +67,7 @@ rustfs-storage-api = { workspace = true }
 rustfs-tls-runtime = { workspace = true, optional = true }
 
 # Async dependencies
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 
@@ -131,7 +131,7 @@ socket2 = { workspace = true, optional = true, features = ["all"] }
 tempfile = { workspace = true }
 proptest = "1"
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
-tokio = { workspace = true, features = ["test-util", "macros", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["test-util", "macros", "fs"] }
 
 [package.metadata.docs.rs]
 all-features = true
