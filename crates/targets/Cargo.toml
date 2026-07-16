@@ -21,7 +21,7 @@ async-trait = { workspace = true }
 async-nats = { workspace = true }
 deadpool-postgres = { workspace = true }
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
-hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
+hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "tls12", "logging", "aws-lc-rs"] }
 lapin = { workspace = true, default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 libc = { workspace = true }
 pulsar = { workspace = true, default-features = false, features = ["tokio-rustls-runtime", "telemetry"] }
