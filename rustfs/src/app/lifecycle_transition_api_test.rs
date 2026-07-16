@@ -1532,17 +1532,18 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 /// copy (the mock tier records no further `get` calls).
 ///
 /// CURRENTLY EXCLUDED from the CI ILM Integration (serial) lane (see ci.yml):
-/// the RestoreObject copy-back holds the object write lock added in #4877
-/// (`handle_restore_transitioned_object`) across the whole tier read-back, so it
-/// does not release before the 5s lock timeout and the concurrent
-/// `get_object_info` below fails
-/// (`Lock(Timeout { .. timeout: 5s })`). The restore copy-back path must be
-/// fixed — or the #4877 lock scope revisited — before this is re-enabled; the
-/// `test/` object prefix and this contract are otherwise correct. Tracked with
-/// its sibling restore/transition tests under rustfs/backlog#1148.
+/// the #4877 restore self-deadlock is now fixed, so restore completes, but this
+/// test asserts a concurrent `get_object_info` observes `ongoing-request="true"`
+/// mid-restore. #4877 serializes reads against the restore write lock, so the
+/// concurrent read only returns once the copy-back has finished and already
+/// cleared the ongoing flag — it reads `false`, failing the assertion. Whether
+/// a concurrent restore should instead reject fast (`ErrObjectRestoreAlreadyInProgress`)
+/// while keeping HEAD non-blocking (backlog#1148 ilm-8 criterion 1) is an
+/// API-semantics decision, not a bug; revisit before re-enabling. The `test/`
+/// prefix and the rest of the contract are correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there — restore copy-back holds the #4877 object write lock past the 5s lock timeout"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there — asserts a concurrent ongoing-request=true read that #4877's read-vs-restore serialization rules out (API-semantics decision)"]
 async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::from_global();
