@@ -216,6 +216,20 @@ probe:
 4. **#1318** (quota reservation) and **#1314** (prepared pool read) bind the
    epoch independently; both gate on the same capability handshake.
 
+## Open design decisions (pin before implementation)
+
+This document fixes the transport, encoding, proto, and gate constraints, but it is not yet a complete implementable algorithm. The following must be decided and written down before any of the five consumers is coded (per the #1307 maintainer re-review, issuecomment-4992956256):
+
+- **Epoch type and total order.** The concrete token type and its total-order rule — a term+counter tuple, its persistence, and overflow behavior. Whether monotonicity is global or strictly per-object.
+- **Never-regress on lock-service restart / minority recovery.** The epoch source must survive a lock-service restart or minority-quorum recovery without ever handing out an epoch lower than one already persisted on disk (an in-memory counter reset to zero is a fencing inversion). This is the same requirement as "Monotonicity persistence semantics" above, elevated to a hard, tested acceptance.
+- **Complete xl.meta-writer coverage.** Every code path that writes xl.meta (commit rename, rollback delete/metadata restore, old-dir cleanup, heal, transition) must be enumerated and shown to compare or carry the epoch. A single unfenced writer voids the guarantee.
+- **Rollback is an expected-generation CAS (#1312 B2).** The quorum-failure rollback at `io_primitives.rs:2646-2691` restores a metadata backup, not just a per-writer tmp delete, so a late rollback by writer A can overwrite writer B's committed xl.meta. Rollback must execute only when `stored_epoch == failed_writer_epoch`; a higher stored epoch must abort the rollback. Task panic / cancel / timeout at `io_primitives.rs:2602-2605` must be reaped into the coordinator's state machine, never bubble out via `?` and skip convergence.
+- **Sidecar is excluded unless proven atomic.** An epoch sidecar outside `xl.meta` is only admissible if it commits at the same atomic/CAS point as `xl.meta` with a defined recovery; otherwise it opens a crash gap and must be rejected in favor of the version-internal metadata map. The earlier "metadata map or sidecar" phrasing does not treat the two as equally safe.
+- **Read-lease and GC crash recovery.** Lease registry location (local vs cross-node), TTL reclamation, and crash recovery for both the lease holder and the GC executor.
+- **Quota reserve → commit → settle idempotency.** The cross-stage reconcile / idempotency story for #1318, including owner-crash reconciliation, so a reservation is neither lost nor double-counted.
+- **PreparedPoolRead is pool-local only.** A #1314 bundle's generation validates freshness only within the pool that produced it. It cannot order commits across different pools unless a cross-pool common authority exists; absent that, the multi-pool wait cannot be short-circuited.
+- **Hot-path cost is a blocking metric.** If per-PUT fencing grant, quota reserve, or cleanup journal adds a consensus write / fsync / centralized serialization point, it must be measured under 4KiB and high-concurrency hot-key / hot-bucket A/B as a blocking gate, not accepted by default.
+
 ## Acceptance for this contract
 
 - #1312 / #1313 / #1314 / #1318 / #1323 bodies reference this unified
