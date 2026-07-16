@@ -3337,7 +3337,7 @@ impl DefaultObjectUsecase {
 
         if should_provide_seek_support {
             // Strict materialization (#1324): the previous implementation only
-            // WARNed on a length mismatch, and — most dangerously — on a read
+            // logged a warning on a length mismatch, and — most dangerously — on a read
             // error it fell through to streaming the *same* reader after
             // `read_to_end` had already drained K bytes, shipping a body missing
             // its prefix (prefix-misaligned data). Both are now hard errors: an
