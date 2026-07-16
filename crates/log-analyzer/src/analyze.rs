@@ -292,9 +292,11 @@ impl Analyzer {
         });
         entry.count += 1;
         entry.level = entry.level.max(level);
-        // Lexicographic min keeps the representative sample order-independent.
-        if sample < entry.sample {
+        // Lexicographic min on (sample, target) keeps the representative
+        // order-independent and the shown target from that same event.
+        if (sample.as_str(), &event.target) < (entry.sample.as_str(), &entry.target) {
             entry.sample = sample;
+            entry.target = event.target.clone();
         }
     }
 }
@@ -455,6 +457,34 @@ mod tests {
         assert_eq!(report.unmatched_top[0].count, 2);
         assert_eq!(report.unmatched_top[0].template, "failed to sync <path> after <n> retries");
         assert_eq!(report.summary.distinct_offsets, vec!["+08:00"]);
+    }
+
+    #[test]
+    fn unmatched_cluster_representative_is_order_independent() {
+        let mk = |msg: &str, target: &str| {
+            let mut ev = event(msg, Some(LogLevel::Error), None);
+            ev.target = Some(target.to_string());
+            ev
+        };
+        // Same template, different messages and targets.
+        let a = mk("failed to sync /data/a after 5 retries", "rustfs::sync::a");
+        let b = mk("failed to sync /data/b after 2 retries", "rustfs::sync::b");
+
+        let representative = |events: &[&LogEvent]| {
+            let mut an = analyzer(AnalyzeOptions::default());
+            for ev in events {
+                an.observe((*ev).clone());
+            }
+            let report = an.finalize(IngestReport::default());
+            let cluster = &report.unmatched_top[0];
+            (cluster.sample.clone(), cluster.target.clone())
+        };
+        let forward = representative(&[&a, &b]);
+        let reverse = representative(&[&b, &a]);
+        assert_eq!(forward, reverse);
+        // Sample and target must come from the same event.
+        assert_eq!(forward.0, "failed to sync /data/a after 5 retries");
+        assert_eq!(forward.1.as_deref(), Some("rustfs::sync::a"));
     }
 
     #[test]

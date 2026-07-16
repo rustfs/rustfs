@@ -229,6 +229,30 @@ mod tests {
     }
 
     #[test]
+    fn sample_ties_across_files_are_order_independent() {
+        let r = rule("q", Severity::P1Unavailable, Matcher::MessageContains("quorum".into()));
+        // Same timestamp and same line number in two different files: only
+        // the file name can break the tie deterministically.
+        let mk = |file: &str, msg: &str| {
+            let mut ev = event_at(msg, "2026-07-15T03:00:00+08:00", 1);
+            ev.source.file = Arc::from(file);
+            ev
+        };
+        let a = mk("node1/rustfs.log", "quorum from node1");
+        let b = mk("node2/rustfs.log", "quorum from node2");
+
+        let selected = |events: &[&LogEvent]| {
+            let mut collector = FindingsCollector::new(1);
+            for ev in events {
+                collector.observe(&r, 0, ev);
+            }
+            collector.into_findings()[0].samples[0].message.clone()
+        };
+        assert_eq!(selected(&[&a, &b]), selected(&[&b, &a]));
+        assert_eq!(selected(&[&a, &b]), "quorum from node1");
+    }
+
+    #[test]
     fn evidence_values_are_capped_with_overflow() {
         let mut r = rule("e", Severity::P2Degraded, Matcher::MessageContains("x".into()));
         r.evidence_fields = vec!["disk".to_string()];

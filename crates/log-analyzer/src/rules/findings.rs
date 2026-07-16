@@ -68,9 +68,10 @@ pub struct FindingsCollector {
 }
 
 /// Sort key for sample selection: earliest first, timestamp-less last,
-/// line number as the deterministic tiebreaker.
-fn sample_key(event: &LogEvent) -> (bool, Option<DateTime<FixedOffset>>, u64) {
-    (event.timestamp.is_none(), event.timestamp, event.source.line)
+/// (file, line) as the deterministic tiebreaker — line numbers alone are only
+/// unique within one file, so ties across inputs would be order-dependent.
+fn sample_key(event: &LogEvent) -> (bool, Option<DateTime<FixedOffset>>, &str, u64) {
+    (event.timestamp.is_none(), event.timestamp, &event.source.file, event.source.line)
 }
 
 impl FindingsCollector {
