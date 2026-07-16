@@ -82,6 +82,15 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
     }
     writeln!(w)?;
 
+    if !report.timeline_anomalies.is_empty() {
+        writeln!(w, "时间线异常(提示)")?;
+        writeln!(w, "{LIGHT_RULE}")?;
+        for anomaly in &report.timeline_anomalies {
+            writeln!(w, "[!] {}", anomaly.message)?;
+        }
+        writeln!(w)?;
+    }
+
     writeln!(w, "发现(按严重度)")?;
     writeln!(w, "{LIGHT_RULE}")?;
     if report.findings.is_empty() {

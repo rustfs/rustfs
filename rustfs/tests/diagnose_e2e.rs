@@ -176,7 +176,7 @@ fn json_format_has_a_stable_schema() {
     let mut out = Vec::new();
     render(&report, ReportFormat::Json, &mut out).expect("render");
     let value: serde_json::Value = serde_json::from_slice(&out).expect("parse");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert!(value["findings"].as_array().expect("findings").len() >= 2);
     assert!(value["summary"]["parse"]["json_ok"].as_u64().expect("json_ok") > 0);
 
@@ -229,5 +229,5 @@ fn binary_smoke_diagnose_json() {
         .expect("run rustfs diagnose");
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout JSON");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
 }
