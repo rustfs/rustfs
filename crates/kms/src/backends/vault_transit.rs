@@ -750,6 +750,88 @@ mod tests {
         DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, VaultAuthMethod, VaultTransitConfig,
     };
     use crate::types::KeyStatus;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    #[derive(Debug)]
+    struct CapturedVaultRequest {
+        request_line: String,
+        namespace_header: Option<String>,
+    }
+
+    fn request_path_has_namespace(request_line: &str, namespace: &str) -> bool {
+        let Some(path) = request_line.split_whitespace().nth(1) else {
+            return false;
+        };
+        let path = path.split('?').next().unwrap_or(path);
+        path.strip_prefix("/v1/")
+            .and_then(|path_after_api_prefix| path_after_api_prefix.split('/').next())
+            == Some(namespace)
+    }
+
+    async fn serve_one_vault_health_request() -> (String, oneshot::Receiver<CapturedVaultRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test listener");
+        let address = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (request_tx, request_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = vec![0; 8192];
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+            let request_line = request.lines().next().unwrap_or_default().to_string();
+            let namespace_header = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("X-Vault-Namespace")
+                    .then(|| value.trim().to_string())
+            });
+            let _ = request_tx.send(CapturedVaultRequest {
+                request_line,
+                namespace_header,
+            });
+
+            let body = r#"{"initialized":true,"sealed":false,"standby":false,"performance_standby":false,"replication_performance_mode":"disabled","replication_dr_mode":"disabled","server_time_utc":0,"version":"test","cluster_name":"test","cluster_id":"test"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write response");
+        });
+
+        (address, request_rx)
+    }
+
+    #[tokio::test]
+    async fn test_vault_transit_namespace_is_sent_to_request() {
+        let (address, request_rx) = serve_one_vault_health_request().await;
+        let config = VaultTransitConfig {
+            address,
+            auth_method: VaultAuthMethod::Token {
+                token: "vault-token".to_string(),
+            },
+            namespace: Some("tenant-a".to_string()),
+            mount_path: "transit".to_string(),
+            metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+            metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
+            tls: None,
+        };
+
+        let client = VaultTransitKmsClient::new(config).await.expect("client");
+        client.health_check().await.expect("health check");
+
+        let captured = request_rx.await.expect("request capture");
+        // Assert that the configured namespace is sent either as a Vault namespace header
+        // or as the namespace segment in the request path.
+        assert!(
+            captured.namespace_header.as_deref() == Some("tenant-a")
+                || request_path_has_namespace(&captured.request_line, "tenant-a"),
+            "Vault Transit requests must carry the namespace in X-Vault-Namespace or as the first path segment after /v1; got request line {:?}, header {:?}",
+            captured.request_line,
+            captured.namespace_header
+        );
+    }
 
     fn test_vault_transit_config() -> VaultTransitConfig {
         VaultTransitConfig {
