@@ -795,6 +795,16 @@ impl Operation for RuntimeCapabilitiesHandler {
     }
 }
 
+/// Authorization gate for GET datausageinfo: any-of the dedicated admin action
+/// OR the bucket listing action. Pinned by a unit test so the gate cannot
+/// silently narrow or widen (rustfs/backlog#1306).
+fn data_usage_info_gate_actions() -> Vec<Action> {
+    vec![
+        Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
+        Action::S3Action(S3Action::ListBucketAction),
+    ]
+}
+
 #[async_trait::async_trait]
 impl Operation for DataUsageInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -807,18 +817,7 @@ impl Operation for DataUsageInfoHandler {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![
-                Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
-                Action::S3Action(S3Action::ListBucketAction),
-            ],
-            remote_addr,
-        )
-        .await?;
+        validate_admin_request(&req.headers, &cred, owner, false, data_usage_info_gate_actions(), remote_addr).await?;
 
         let usecase = default_admin_usecase();
         let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
@@ -840,7 +839,8 @@ impl Operation for DataUsageInfoHandler {
 mod tests {
     use super::{
         OBSERVABILITY_SUMMARY_RESOLVED, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
-        build_runtime_capabilities_response, build_runtime_capabilities_summary, system_admin_discovery,
+        build_runtime_capabilities_response, build_runtime_capabilities_summary, data_usage_info_gate_actions,
+        system_admin_discovery,
     };
     use crate::admin::runtime_sources::DefaultAdminUsecase;
     use crate::admin::storage_api::cluster::{
@@ -849,6 +849,22 @@ mod tests {
     };
     use rustfs_concurrency::WorkloadClass;
     use rustfs_madmin::{InfoMessage, StorageInfo};
+    use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+
+    /// Authz regression pin (rustfs/backlog#1306): datausageinfo stays an
+    /// any-of gate over exactly DataUsageInfoAdminAction OR ListBucketAction.
+    /// The OR semantics of the multi-action loop are covered by the
+    /// `evaluate_admin_actions` tests in `crate::admin::auth`.
+    #[test]
+    fn data_usage_info_gate_keeps_dual_action_or_semantics() {
+        assert_eq!(
+            data_usage_info_gate_actions(),
+            vec![
+                Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
+                Action::S3Action(S3Action::ListBucketAction),
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn runtime_capabilities_response_reports_missing_topology_before_storage_init() {
