@@ -86,8 +86,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
         writeln!(w)?;
     }
     // Collapsed symptoms render inside their root's block, not flat.
-    let counts: std::collections::HashMap<&str, u64> =
-        report.findings.iter().map(|f| (f.rule_id.as_str(), f.count)).collect();
+    let counts: std::collections::HashMap<&str, u64> = report.findings.iter().map(|f| (f.rule_id.as_str(), f.count)).collect();
     for finding in report.findings.iter().filter(|f| f.collapsed_into.is_none()) {
         writeln!(
             w,

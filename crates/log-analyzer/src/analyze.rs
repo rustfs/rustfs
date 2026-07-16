@@ -128,6 +128,9 @@ pub struct AnalysisReport {
     pub skipped_inputs: Vec<(String, SkipReason)>,
 }
 
+/// (min ts, max ts, timestamped event count) for one node label.
+type NodeRange = (DateTime<FixedOffset>, DateTime<FixedOffset>, u64);
+
 #[derive(Default)]
 struct BucketCounts {
     error: u64,
@@ -156,7 +159,7 @@ pub struct Analyzer {
     offsets: BTreeSet<String>,
     /// node label -> (min ts, max ts, timestamped event count); feeds the
     /// disjoint-node-ranges heuristic.
-    node_ranges: BTreeMap<String, (DateTime<FixedOffset>, DateTime<FixedOffset>, u64)>,
+    node_ranges: BTreeMap<String, NodeRange>,
     /// unix-minute -> counts.
     minute_buckets: BTreeMap<i64, BucketCounts>,
     unmatched: HashMap<String, ClusterAcc>,
@@ -398,15 +401,19 @@ const SIGNATURE_RULE_IDS: [&str; 2] = ["client-signature-mismatch", "internode-s
 /// never a verdict.
 fn detect_timeline_anomalies(
     offsets: &BTreeSet<String>,
-    node_ranges: &BTreeMap<String, (DateTime<FixedOffset>, DateTime<FixedOffset>, u64)>,
+    node_ranges: &BTreeMap<String, NodeRange>,
     minute_buckets: &BTreeMap<i64, BucketCounts>,
     bucket_width_min: i64,
     findings: &[Finding],
     low_confidence: &[Finding],
 ) -> Vec<TimelineAnomaly> {
     let mut anomalies = Vec::new();
-    let has_finding =
-        |ids: &[&str]| findings.iter().chain(low_confidence).any(|f| ids.contains(&f.rule_id.as_str()));
+    let has_finding = |ids: &[&str]| {
+        findings
+            .iter()
+            .chain(low_confidence)
+            .any(|f| ids.contains(&f.rule_id.as_str()))
+    };
 
     // 1. Mixed UTC offsets: nodes disagree on timezone or clock source.
     if offsets.len() > 1 {
@@ -429,8 +436,7 @@ fn detect_timeline_anomalies(
 
     // 2. Per-node time ranges that do not overlap at all (both sides with a
     // meaningful sample size): clocks are wrong or collection windows differ.
-    let sizable: Vec<(&String, &(DateTime<FixedOffset>, DateTime<FixedOffset>, u64))> =
-        node_ranges.iter().filter(|(_, (_, _, count))| *count > 100).collect();
+    let sizable: Vec<(&String, &NodeRange)> = node_ranges.iter().filter(|(_, (_, _, count))| *count > 100).collect();
     for (i, (node_a, (min_a, max_a, _))) in sizable.iter().enumerate() {
         for (node_b, (min_b, max_b, _)) in sizable.iter().skip(i + 1) {
             if max_a < min_b || max_b < min_a {
@@ -474,7 +480,7 @@ fn detect_timeline_anomalies(
             run_len += 1;
             continue;
         }
-        if run_len >= 3 && delta - 1 >= threshold {
+        if run_len >= 3 && delta > threshold {
             let gap_start = DateTime::<Utc>::from_timestamp((prev + 1) * 60, 0).expect("valid timestamp");
             let gap_end = DateTime::<Utc>::from_timestamp(next * 60, 0).expect("valid timestamp");
             let restart = startup_after_gap(gap_end);
@@ -745,7 +751,11 @@ mod tests {
             }
         }
         let report = a.finalize(IngestReport::default());
-        let disjoint: Vec<_> = report.timeline_anomalies.iter().filter(|a| a.kind == "node_ranges_disjoint").collect();
+        let disjoint: Vec<_> = report
+            .timeline_anomalies
+            .iter()
+            .filter(|a| a.kind == "node_ranges_disjoint")
+            .collect();
         assert_eq!(disjoint.len(), 1, "{:?}", report.timeline_anomalies);
         assert_eq!(disjoint[0].nodes, vec!["node1".to_string(), "node2".to_string()]);
         assert!(disjoint[0].message.contains("完全不重叠"));
@@ -819,7 +829,11 @@ mod tests {
         a.observe(event("x", Some(LogLevel::Error), Some("2026-07-15T03:00:00+08:00")));
         a.observe(event("SignatureDoesNotMatch", Some(LogLevel::Error), Some("2026-07-15T03:00:00Z")));
         let report = a.finalize(IngestReport::default());
-        let mixed: Vec<_> = report.timeline_anomalies.iter().filter(|a| a.kind == "mixed_offsets").collect();
+        let mixed: Vec<_> = report
+            .timeline_anomalies
+            .iter()
+            .filter(|a| a.kind == "mixed_offsets")
+            .collect();
         assert_eq!(mixed.len(), 1);
         assert!(mixed[0].message.contains("+08:00"));
         assert!(mixed[0].message.contains("签名不匹配"), "signature note missing: {}", mixed[0].message);
@@ -845,9 +859,17 @@ mod tests {
         }
         let report = a.finalize(IngestReport::default());
 
-        let quorum = report.findings.iter().find(|f| f.rule_id == "ec-write-quorum").expect("quorum");
+        let quorum = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "ec-write-quorum")
+            .expect("quorum");
         assert_eq!(quorum.collapsed_into.as_deref(), Some("disk-marked-faulty"));
-        let disk = report.findings.iter().find(|f| f.rule_id == "disk-marked-faulty").expect("disk");
+        let disk = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "disk-marked-faulty")
+            .expect("disk");
         assert_eq!(disk.caused, vec!["ec-write-quorum".to_string()]);
         // The P2 root is promoted to the collapsed P1 symptom's position.
         assert_eq!(report.findings[0].rule_id, "disk-marked-faulty");
@@ -877,7 +899,11 @@ mod tests {
             Some("2026-07-15T05:00:00+08:00"),
         ));
         let report = a.finalize(IngestReport::default());
-        let quorum = report.findings.iter().find(|f| f.rule_id == "ec-write-quorum").expect("quorum");
+        let quorum = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "ec-write-quorum")
+            .expect("quorum");
         assert_eq!(quorum.collapsed_into, None);
         assert!(report.findings.iter().all(|f| f.caused.is_empty()));
     }
@@ -895,7 +921,11 @@ mod tests {
         a.observe(panic_ev);
 
         let report = a.finalize(IngestReport::default());
-        let poisoned = report.findings.iter().find(|f| f.rule_id == "rwlock-poisoned").expect("poisoned");
+        let poisoned = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "rwlock-poisoned")
+            .expect("poisoned");
         assert_eq!(poisoned.collapsed_into.as_deref(), Some("process-panic"));
         let panic = report.findings.iter().find(|f| f.rule_id == "process-panic").expect("panic");
         assert_eq!(panic.caused, vec!["rwlock-poisoned".to_string()]);

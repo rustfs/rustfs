@@ -156,6 +156,10 @@ pub struct DiagnoseOpts {
     #[arg(long)]
     pub redact: bool,
 
+    /// Extra rules file (JSON; same-id rules override built-ins)
+    #[arg(long)]
+    pub rules: Option<std::path::PathBuf>,
+
     /// Max unmatched error patterns to list
     #[arg(long, default_value_t = 20)]
     pub top: usize,

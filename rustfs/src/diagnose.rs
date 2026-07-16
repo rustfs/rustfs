@@ -25,8 +25,8 @@
 use crate::config::{DiagnoseFormat, DiagnoseOpts};
 use chrono::{DateTime, FixedOffset, Local};
 use rustfs_log_analyzer::{
-    AnalyzeOptions, Analyzer, IngestOptions, IngestReport, LogLevel, ReportFormat, RuleEngine, ingest_path, ingest_reader,
-    render, seed_rule_set,
+    AnalyzeOptions, Analyzer, IngestOptions, IngestReport, LogLevel, ReportFormat, RuleEngine, RuleSet, ingest_path,
+    ingest_reader, render, seed_rule_set, seed_rules_with_external,
 };
 use std::io::Result;
 use std::path::Path;
@@ -39,8 +39,17 @@ pub fn execute_diagnose(opts: &DiagnoseOpts) -> Result<()> {
             std::process::exit(2);
         }
     };
+    let rule_set = match load_rule_set(opts) {
+        Ok(set) => set,
+        Err(message) => {
+            // Fail fast: never analyze with a half-broken rule set. The
+            // message lists every problem at once (RuleSetError::Multiple).
+            eprintln!("diagnose: {message}");
+            std::process::exit(2);
+        }
+    };
 
-    let mut analyzer = Analyzer::new(RuleEngine::new(seed_rule_set()), analyze_opts);
+    let mut analyzer = Analyzer::new(RuleEngine::new(rule_set), analyze_opts);
     let ingest_opts = IngestOptions::default();
     let mut merged = IngestReport::default();
     let mut readable_inputs = 0usize;
@@ -69,6 +78,17 @@ pub fn execute_diagnose(opts: &DiagnoseOpts) -> Result<()> {
     let report = analyzer.finalize(merged);
     let stdout = std::io::stdout();
     render(&report, report_format(opts.format), &mut stdout.lock())
+}
+
+/// Built-in seed rules, optionally merged with `--rules <file.json>`
+/// (rustfs/backlog#1290 sub-item C): same-id external rules override
+/// built-ins; the merged set validates as a whole.
+fn load_rule_set(opts: &DiagnoseOpts) -> std::result::Result<RuleSet, String> {
+    let Some(path) = &opts.rules else {
+        return Ok(seed_rule_set());
+    };
+    let json = std::fs::read_to_string(path).map_err(|err| format!("cannot read rules file '{}': {err}", path.display()))?;
+    seed_rules_with_external(&json).map_err(|err| format!("invalid rules file '{}': {err}", path.display()))
 }
 
 fn report_format(format: DiagnoseFormat) -> ReportFormat {

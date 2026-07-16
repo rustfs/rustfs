@@ -97,8 +97,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
         writeln!(w, "未发现已知故障模式;请查看下方「未识别的高频错误」是否有线索。")?;
     }
     // Collapsed symptoms render inside their root's block, not flat.
-    let counts: std::collections::HashMap<&str, u64> =
-        report.findings.iter().map(|f| (f.rule_id.as_str(), f.count)).collect();
+    let counts: std::collections::HashMap<&str, u64> = report.findings.iter().map(|f| (f.rule_id.as_str(), f.count)).collect();
     for finding in report.findings.iter().filter(|f| f.collapsed_into.is_none()) {
         render_finding(finding, &counts, w)?;
     }

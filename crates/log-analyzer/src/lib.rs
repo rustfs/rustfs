@@ -28,11 +28,12 @@ mod redact;
 pub mod report;
 pub mod rules;
 
-pub use analyze::{AnalysisReport, AnalyzeOptions, Analyzer, Summary, TimeBucket, UnmatchedCluster};
+pub use analyze::{AnalysisReport, AnalyzeOptions, Analyzer, Summary, TimeBucket, TimelineAnomaly, UnmatchedCluster};
 pub use ingest::{IngestOptions, IngestReport, SkipReason, ingest_path, ingest_reader};
 pub use model::{EventKind, LogEvent, LogLevel, ParseStats, SourceRef};
 pub use parse::LineParser;
 pub use report::{ReportFormat, render};
 pub use rules::{
-    Finding, FindingsCollector, Matcher, Rule, RuleEngine, RuleSet, RuleSetError, Severity, seed_rule_set, seed_rules,
+    EXTERNAL_RULES_SCHEMA_VERSION, ExternalRulesError, Finding, FindingsCollector, Matcher, Rule, RuleEngine, RuleSet,
+    RuleSetError, Severity, seed_rule_set, seed_rules, seed_rules_with_external,
 };
