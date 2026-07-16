@@ -640,6 +640,16 @@ pub(crate) mod bucket {
         #[cfg(test)]
         pub(crate) use replication_contracts::replication_statuses_map;
 
+        /// Test-only counter of `must_replicate_object` invocations.
+        ///
+        /// Used by white-box regression tests to assert that a single PUT
+        /// computes the replication decision exactly once (see
+        /// https://github.com/rustfs/backlog/issues/1320). A revert that
+        /// re-introduces a second computation makes the count observe 2 and
+        /// fails the test.
+        #[cfg(test)]
+        pub(crate) static MUST_REPLICATE_OBJECT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
         pub(crate) async fn check_replicate_delete(
             bucket: &str,
             dobj: &super::super::storage_contracts::ObjectToDelete,
@@ -669,6 +679,8 @@ pub(crate) mod bucket {
             status: ReplicationStatusType,
             opts: crate::storage::storage_api::StorageObjectOptions,
         ) -> ReplicateDecision {
+            #[cfg(test)]
+            MUST_REPLICATE_OBJECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mopts = ReplicationObjectBridge::must_replicate_options(
                 user_defined,
                 user_tags,

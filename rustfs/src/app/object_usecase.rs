@@ -4054,6 +4054,11 @@ impl DefaultObjectUsecase {
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
 
+        // Compute the replication decision exactly once per PUT. The same
+        // immutable `dsc` drives both the pending metadata written below and the
+        // post-commit schedule (see the reuse site further down), so a
+        // replication-config hot update can no longer split the two phases
+        // (https://github.com/rustfs/backlog/issues/1320).
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
                 .await;
@@ -4193,9 +4198,15 @@ impl DefaultObjectUsecase {
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
-        let dsc = must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts).await;
         let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
 
+        // Reuse the single replication decision computed before commit (see `dsc`
+        // above) so the pending metadata persisted with the object and the
+        // post-commit schedule always derive from the same immutable decision.
+        // Recomputing here would repeat the versioning/config/target traversal and,
+        // worse, allow a replication-config hot update between the two phases to
+        // produce a pending-without-schedule or schedule-without-pending divergence
+        // (https://github.com/rustfs/backlog/issues/1320).
         if dsc.replicate_any() {
             schedule_object_replication(obj_info.clone(), store, dsc).await;
         }
