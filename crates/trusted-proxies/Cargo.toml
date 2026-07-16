@@ -31,19 +31,19 @@ http = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 moka = { workspace = true, features = ["future", "sync"] }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "json"] }
 rustfs-config = { workspace = true }
 rustfs-utils = { workspace = true, features = ["net"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tower = { workspace = true, features = ["timeout"] }
 tracing = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full", "test-util", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { workspace = true, features = ["util", "timeout"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true }

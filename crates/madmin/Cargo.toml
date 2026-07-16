@@ -35,7 +35,7 @@ hyper = { workspace = true, features = ["http2", "http1", "server"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 sysinfo.workspace = true
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 
 [lib]
 doctest = false

@@ -33,14 +33,14 @@ workspace = true
 rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
 rustfs-utils = { workspace = true }
-tokio = { workspace = true, features = ["fs", "sync", "rt", "time", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "sync", "time", "macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 rmp-serde = { workspace = true }
 rustfs-filemeta = { workspace = true }

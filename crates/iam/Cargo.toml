@@ -30,9 +30,9 @@ workspace = true
 
 [dependencies]
 rustfs-credentials = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "server-config-model"] }
+rustfs-config = { workspace = true, features = ["server-config-model"] }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
-time = { workspace = true, features = ["serde-human-readable", "std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["serde-human-readable", "macros"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
@@ -51,7 +51,7 @@ rustfs-utils = { workspace = true, features = ["path"] }
 rustfs-io-metrics.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 pollster.workspace = true
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy"] }
 moka = { workspace = true, features = ["future"] }
 openidconnect = { workspace = true, default-features = false, features = ["accept-rfc3339-timestamps"] }
 http = { workspace = true }
