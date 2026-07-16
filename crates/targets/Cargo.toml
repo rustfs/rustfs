@@ -19,45 +19,45 @@ rustfs-s3-types = { workspace = true }
 rustfs-utils = { workspace = true, features = ["egress"] }
 async-trait = { workspace = true }
 async-nats = { workspace = true }
-deadpool-postgres = { workspace = true }
-hyper = { workspace = true }
-hyper-rustls = { workspace = true }
-lapin = { workspace = true }
+deadpool-postgres = { workspace = true, features = ["rt_tokio_1"] }
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
+hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs", "webpki-roots"] }
+lapin = { workspace = true, default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 libc = { workspace = true }
-pulsar = { workspace = true }
+pulsar = { workspace = true, default-features = false, features = ["tokio-rustls-runtime", "telemetry"] }
 regex = { workspace = true }
-reqwest = { workspace = true }
-rumqttc = { workspace = true }
-redis = { workspace = true }
-rustls = { workspace = true }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+rumqttc = { workspace = true, features = ["websocket"] }
+redis = { workspace = true, features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-native-certs = { workspace = true }
-s3s = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
-tokio-postgres = { workspace = true }
+tokio-postgres = { workspace = true, default-features = false, features = ["runtime", "with-serde_json-1"] }
 tokio-postgres-rustls = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
-uuid = { workspace = true, features = ["v4", "v7", "serde"] }
+uuid = { workspace = true, features = ["v4", "v7", "serde", "fast-rng", "macro-diagnostics"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 rustfs-kafka-async = { workspace = true }
-mysql_async = { workspace = true }
-chrono = { workspace = true }
+mysql_async = { workspace = true, default-features = false, features = ["default-rustls", "tracing"] }
+chrono = { workspace = true, features = ["serde"] }
 parking_lot = { workspace = true }
-hashbrown = { workspace = true }
+hashbrown = { workspace = true, features = ["serde", "rayon"] }
 arc-swap = { workspace = true }
 metrics = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 rcgen = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 
 [[bench]]
 name = "queue_store_benchmark"
