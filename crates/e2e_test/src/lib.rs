@@ -23,6 +23,10 @@ pub mod common;
 #[cfg(test)]
 pub mod chaos;
 
+// Programmable S3 target for replication failure-path tests (backlog#1147 repl-8).
+#[cfg(test)]
+pub mod fake_s3_target;
+
 // Reliability tests built on the fault-injection harness
 #[cfg(test)]
 mod reliability_disk_fault_test;
