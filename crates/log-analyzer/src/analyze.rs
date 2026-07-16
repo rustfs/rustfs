@@ -19,8 +19,8 @@
 use crate::ingest::{IngestReport, SkipReason};
 use crate::model::{EventKind, LogEvent, LogLevel, ParseStats};
 use crate::redact;
-use crate::rules::{Finding, FindingsCollector, RuleEngine};
-use chrono::{DateTime, FixedOffset, Utc};
+use crate::rules::{Finding, FindingsCollector, RuleEngine, Severity};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -221,6 +221,7 @@ impl Analyzer {
                 findings.push(finding);
             }
         }
+        collapse_findings(&mut findings);
 
         let mut unmatched_top: Vec<UnmatchedCluster> = self
             .unmatched
@@ -341,6 +342,103 @@ fn merge_timeline(minute_buckets: &BTreeMap<i64, BucketCounts>) -> Vec<TimeBucke
         .collect()
 }
 
+/// Causal folding (rustfs/backlog#1290 sub-item A): a symptom finding
+/// collapses under a root-cause finding named by its rule's
+/// `implies_root_cause` edges when the root plausibly precedes it
+/// (`root.first_seen <= symptom.first_seen + 5min`) and is not a
+/// long-finished historical episode (`root.last_seen >= symptom.first_seen -
+/// 30min`). A timestamp-less side (pure stderr panics) associates by
+/// existence. Only confirmed findings participate — folding real symptoms
+/// under a low-confidence root would hide them behind shaky evidence.
+///
+/// Findings are then re-sorted so a root block is promoted to the most
+/// severe position among itself and its collapsed symptoms, weighted by the
+/// block's combined count: the report top keeps answering "the most likely
+/// cause" even when the root itself is a lower-severity finding.
+fn collapse_findings(findings: &mut [Finding]) {
+    let index_of: HashMap<String, usize> = findings.iter().enumerate().map(|(i, f)| (f.rule_id.clone(), i)).collect();
+    // Among several qualifying roots pick the earliest first_seen;
+    // timestamp-less roots come last, rule id breaks remaining ties.
+    let root_key = |f: &Finding| (f.first_seen.is_none(), f.first_seen, f.rule_id.clone());
+
+    let mut chosen: Vec<Option<usize>> = vec![None; findings.len()];
+    for (i, symptom) in findings.iter().enumerate() {
+        for root_id in &symptom.implies_root_cause {
+            let Some(&r) = index_of.get(root_id) else { continue };
+            if r == i {
+                continue;
+            }
+            let root = &findings[r];
+            let qualifies = match (root.first_seen, symptom.first_seen) {
+                (Some(root_first), Some(symptom_first)) => {
+                    root_first <= symptom_first + Duration::minutes(5)
+                        && root.last_seen.unwrap_or(root_first) >= symptom_first - Duration::minutes(30)
+                }
+                _ => true,
+            };
+            if qualifies && chosen[i].is_none_or(|cur| root_key(&findings[r]) < root_key(&findings[cur])) {
+                chosen[i] = Some(r);
+            }
+        }
+    }
+
+    // Follow chains so a symptom never points at a root that is itself
+    // collapsed (external rules may build A -> B -> C edges); the visited
+    // guard stops on adversarial cycles.
+    let resolve = |mut r: usize| {
+        let mut seen = vec![false; chosen.len()];
+        while let Some(next) = chosen[r] {
+            if seen[r] {
+                break;
+            }
+            seen[r] = true;
+            r = next;
+        }
+        r
+    };
+
+    let mut caused: Vec<Vec<String>> = vec![Vec::new(); findings.len()];
+    for i in 0..findings.len() {
+        let Some(first) = chosen[i] else { continue };
+        let root = resolve(first);
+        if root == i {
+            continue;
+        }
+        let root_id = findings[root].rule_id.clone();
+        findings[i].collapsed_into = Some(root_id);
+        caused[root].push(findings[i].rule_id.clone());
+    }
+    for (i, mut list) in caused.into_iter().enumerate() {
+        list.sort();
+        findings[i].caused = list;
+    }
+    // A cycle can leave a "root" both collapsed and carrying symptoms; keep
+    // it visible rather than folding every participant out of the report.
+    for finding in findings.iter_mut() {
+        if !finding.caused.is_empty() {
+            finding.collapsed_into = None;
+        }
+    }
+
+    let mut effective: HashMap<String, (Severity, u64)> =
+        findings.iter().map(|f| (f.rule_id.clone(), (f.severity, f.count))).collect();
+    for finding in findings.iter() {
+        if let Some(root) = &finding.collapsed_into {
+            let entry = effective.get_mut(root).expect("collapse target exists");
+            entry.0 = entry.0.min(finding.severity);
+            entry.1 += finding.count;
+        }
+    }
+    findings.sort_by(|a, b| {
+        let (severity_a, count_a) = effective[&a.rule_id];
+        let (severity_b, count_b) = effective[&b.rule_id];
+        severity_a
+            .cmp(&severity_b)
+            .then(count_b.cmp(&count_a))
+            .then(a.rule_id.cmp(&b.rule_id))
+    });
+}
+
 fn redact_report(report: &mut AnalysisReport) {
     for finding in report.findings.iter_mut().chain(report.low_confidence.iter_mut()) {
         for sample in &mut finding.samples {
@@ -457,6 +555,106 @@ mod tests {
         assert_eq!(report.unmatched_top[0].count, 2);
         assert_eq!(report.unmatched_top[0].template, "failed to sync <path> after <n> retries");
         assert_eq!(report.summary.distinct_offsets, vec!["+08:00"]);
+    }
+
+    #[test]
+    fn causal_collapse_folds_quorum_under_disk_faulty() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        // Root: disk faulty at t0 (P2). Symptom: write quorum at t0+2min (P1).
+        for minute in [0, 1] {
+            a.observe(event(
+                "Disk health check marked disk faulty",
+                Some(LogLevel::Error),
+                Some(&format!("2026-07-15T03:0{minute}:00+08:00")),
+            ));
+        }
+        for second in 0..3 {
+            a.observe(event(
+                "erasure write quorum (required=8, achieved=5)",
+                Some(LogLevel::Error),
+                Some(&format!("2026-07-15T03:02:0{second}+08:00")),
+            ));
+        }
+        let report = a.finalize(IngestReport::default());
+
+        let quorum = report.findings.iter().find(|f| f.rule_id == "ec-write-quorum").expect("quorum");
+        assert_eq!(quorum.collapsed_into.as_deref(), Some("disk-marked-faulty"));
+        let disk = report.findings.iter().find(|f| f.rule_id == "disk-marked-faulty").expect("disk");
+        assert_eq!(disk.caused, vec!["ec-write-quorum".to_string()]);
+        // The P2 root is promoted to the collapsed P1 symptom's position.
+        assert_eq!(report.findings[0].rule_id, "disk-marked-faulty");
+
+        let mut out = Vec::new();
+        crate::report::render(&report, crate::report::ReportFormat::Text, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("级联症状: ec-write-quorum ×3"), "missing cascade line:\n{text}");
+        assert!(
+            !text.contains("[P1 服务不可用] ec-write-quorum"),
+            "collapsed symptom must not render flat:\n{text}"
+        );
+    }
+
+    #[test]
+    fn causal_collapse_respects_the_time_window() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        // Root appears 2h AFTER the symptom: outside the 5min precedence window.
+        a.observe(event(
+            "erasure write quorum (required=8, achieved=5)",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:00:00+08:00"),
+        ));
+        a.observe(event(
+            "Disk health check marked disk faulty",
+            Some(LogLevel::Error),
+            Some("2026-07-15T05:00:00+08:00"),
+        ));
+        let report = a.finalize(IngestReport::default());
+        let quorum = report.findings.iter().find(|f| f.rule_id == "ec-write-quorum").expect("quorum");
+        assert_eq!(quorum.collapsed_into, None);
+        assert!(report.findings.iter().all(|f| f.caused.is_empty()));
+    }
+
+    #[test]
+    fn causal_collapse_uses_existence_for_timestamp_less_roots() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        a.observe(event(
+            "rwlock IAM cache poisoned, recovering",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:00:00+08:00"),
+        ));
+        let mut panic_ev = event("thread 'main' panicked at src/main.rs:1:1: boom", Some(LogLevel::Error), None);
+        panic_ev.kind = EventKind::Panic;
+        a.observe(panic_ev);
+
+        let report = a.finalize(IngestReport::default());
+        let poisoned = report.findings.iter().find(|f| f.rule_id == "rwlock-poisoned").expect("poisoned");
+        assert_eq!(poisoned.collapsed_into.as_deref(), Some("process-panic"));
+        let panic = report.findings.iter().find(|f| f.rule_id == "process-panic").expect("panic");
+        assert_eq!(panic.caused, vec!["rwlock-poisoned".to_string()]);
+    }
+
+    #[test]
+    fn json_keeps_collapsed_findings_with_relation_fields() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        a.observe(event(
+            "Disk health check marked disk faulty",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:00:00+08:00"),
+        ));
+        a.observe(event(
+            "erasure write quorum (required=8, achieved=5)",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:02:00+08:00"),
+        ));
+        let report = a.finalize(IngestReport::default());
+        let value = serde_json::to_value(&report).expect("json");
+        let findings = value["findings"].as_array().expect("array");
+        let ids: Vec<&str> = findings.iter().map(|f| f["rule_id"].as_str().expect("id")).collect();
+        assert!(ids.contains(&"ec-write-quorum"), "collapsed finding stays in JSON: {ids:?}");
+        let quorum = findings.iter().find(|f| f["rule_id"] == "ec-write-quorum").expect("quorum");
+        assert_eq!(quorum["collapsed_into"], "disk-marked-faulty");
+        let disk = findings.iter().find(|f| f["rule_id"] == "disk-marked-faulty").expect("disk");
+        assert_eq!(disk["caused"][0], "ec-write-quorum");
     }
 
     #[test]
