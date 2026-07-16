@@ -223,6 +223,7 @@ LABEL name="RustFS (dev-local)" \
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
+    apt-get upgrade -y; \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \

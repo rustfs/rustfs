@@ -93,7 +93,10 @@ LABEL name="RustFS" \
       url="https://rustfs.com" \
       license="Apache-2.0"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Upgrade base-image packages so published images pick up security fixes
+# (e.g. tar/gzip/perl CVEs) without waiting for a new Ubuntu point release.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*

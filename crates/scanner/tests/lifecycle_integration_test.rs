@@ -1780,7 +1780,7 @@ mod serial_tests {
     /// tier again -> a second restore succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there - DeleteRestoredAction/expire_restored delete semantics are unimplemented, so cleanup removes the whole object"]
     async fn test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -1788,7 +1788,10 @@ mod serial_tests {
         let backend = register_mock_tier(&tier_name).await;
 
         let bucket_name = format!("test-restore-chain-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let object_name = "restore/report.bin";
+        // Must live under the `test/` prefix: `set_bucket_lifecycle_transition_with_tier`
+        // installs a transition rule filtered on `test/`, so any other key never
+        // transitions and `wait_for_transition` below times out.
+        let object_name = "test/restore/report.bin";
         // Position-dependent payload so a misaligned read is caught.
         let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
 
@@ -1913,7 +1916,10 @@ mod serial_tests {
         let _backend = register_mock_tier(&tier_name).await;
 
         let bucket_name = format!("test-restore-mpu3-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let object_name = "restore/multipart.bin";
+        // Must live under the `test/` prefix (see the transition rule filter in
+        // `set_bucket_lifecycle_transition_with_tier`) or the object never
+        // transitions and `wait_for_transition` below times out.
+        let object_name = "test/restore/multipart.bin";
         // Three parts: 5 MiB + 5 MiB + small tail, with position-dependent
         // bytes so any part-boundary mixup is caught.
         let part_sizes = [5 * 1024 * 1024usize, 5 * 1024 * 1024, 4096];
