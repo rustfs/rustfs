@@ -1,12 +1,13 @@
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
-{{- $drivesPerNode := int (include "rustfs.drivesPerNode" .) -}}
+{{- $poolsEnabled := and .Values.pools .Values.pools.enabled }}
 {{- if and .Values.mode.distributed.enabled (le (int .Values.replicaCount) 1) -}}
 {{- fail "Distributed mode requires replicaCount >= 2" -}}
 {{- end -}}
 
 {{- if .Values.mode.distributed.enabled }}
 {{- range $pool := include "rustfs.pools" . | fromJsonArray }}
+{{- $drivesPerNode := int $pool.drives }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -118,7 +119,7 @@ spec:
           image: "{{ $.Values.image.initImage.repository }}:{{ $.Values.image.initImage.tag }}"
           imagePullPolicy: {{ $.Values.image.initImage.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
           env:
             - name: DRIVES_PER_NODE
               value: {{ $drivesPerNode | quote }}
@@ -248,8 +249,8 @@ spec:
       metadata:
         name: logs
         labels:
-          {{- toYaml .Values.commonLabels | nindent 10 }}
-        {{- $logAnn := .Values.storageclass.pvcAnnotations.logs | default (dict) -}}
+          {{- toYaml $.Values.commonLabels | nindent 10 }}
+        {{- $logAnn := (default (dict) $pool.storageclass.pvcAnnotations).logs | default (dict) -}}
         {{- if gt (len $logAnn) 0 }}
         annotations:
           {{- toYaml $logAnn | nindent 10 }}
@@ -269,7 +270,7 @@ spec:
         name: data-rustfs-{{ $i }}
         labels:
           {{- toYaml $.Values.commonLabels | nindent 10 }}
-        {{- $dataAnn := $.Values.storageclass.pvcAnnotations.data | default (dict) -}}
+        {{- $dataAnn := (default (dict) $pool.storageclass.pvcAnnotations).data | default (dict) -}}
         {{- if gt (len $dataAnn) 0 }}
         annotations:
           {{- toYaml $dataAnn | nindent 10 }}
@@ -287,8 +288,8 @@ spec:
       metadata:
         name: data
         labels:
-          {{- toYaml .Values.commonLabels | nindent 10 }}
-        {{- $dataAnn := .Values.storageclass.pvcAnnotations.data | default (dict) -}}
+          {{- toYaml $.Values.commonLabels | nindent 10 }}
+        {{- $dataAnn := (default (dict) $pool.storageclass.pvcAnnotations).data | default (dict) -}}
         {{- if gt (len $dataAnn) 0 }}
         annotations:
           {{- toYaml $dataAnn | nindent 10 }}

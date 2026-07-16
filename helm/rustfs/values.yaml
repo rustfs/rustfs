@@ -12,7 +12,8 @@ replicaCount: 4
 # - drivesPerNode > 1: each pod gets N volumes mounted at /data/rustfs0.../data/rustfsN-1
 # - drivesPerNode = 1: each pod gets a single volume mounted at /data
 #
-# When left unset (null) the chart infers a backward-compatible value:
+# When left unset (null) the chart infers a backward-compatible value per
+# pool from that pool's replica count:
 #   replicaCount = 4  -> drivesPerNode = 4  (legacy default)
 #   replicaCount != 4 -> drivesPerNode = 1  (legacy 16x1 and any other topology)
 #
@@ -21,6 +22,13 @@ replicaCount: 4
 # drive count you must delete the StatefulSet (with --cascade=orphan to keep
 # pods/PVCs) and recreate it, or perform a full reinstall.
 drivesPerNode: null
+
+# Kubernetes cluster DNS domain used to build in-cluster FQDNs for
+# RUSTFS_VOLUMES (distributed mode) and mTLS server certificate SANs.
+# Override this only if your cluster does not use the default `cluster.local`
+# (for example, on-premise clusters configured with a custom domain).
+# Provide the DNS root only, without a `svc.` prefix or leading/trailing dots.
+clusterDomain: cluster.local
 
 # This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
 image:
@@ -70,7 +78,7 @@ mode:
 # With pools.enabled=true, one StatefulSet is rendered per entry of
 # pools.list and RUSTFS_VOLUMES contains every pool's volume expression
 # (space separated), which is how the server discovers multiple pools.
-# Each entry may set replicaCount (4 or 16) and/or a storageclass block;
+# Each entry may set replicaCount (>= 2) and/or a storageclass block;
 # omitted fields inherit the top-level values.
 #
 # IMPORTANT:
@@ -121,18 +129,19 @@ config:
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
     ec:
-      # Total drives = replicaCount * drivesPerNode.
-      # If you change replicaCount or drivesPerNode, adjust parity accordingly:
+      # Erasure-coding parity for the STANDARD storage class, e.g. "EC:4".
+      # Left empty by default: the server then picks a parity suited to the
+      # drive count. If you set it, it must be valid for the total drive
+      # count (total drives = replicaCount * drivesPerNode):
       #
-      # | replicaCount | drivesPerNode | Total drives | Valid parity | Default |
-      # | ------------ | ------------- | ------------ | ------------ | ------- |
-      # | 1            | 1             | 1            | 0            | 0       |
-      # | 4            | 1             | 4            | 0–2          | 2       |
-      # | 4            | 2             | 8            | 0–4          | 4       |
-      # | 4            | 4             | 16           | 0–8          | *4*     |
-      # | 8            | 1             | 8            | 0–4          | 4       |
-      # | 16           | 1             | 16           | 0–8          | 4       |
-      storage_class_standard: "EC:4" # Storage class for standard storage class in erasure coding mode, default is "STANDARD"
+      # | replicaCount | drivesPerNode | Total drives | Valid parity |
+      # | ------------ | ------------- | ------------ | ------------ |
+      # | 4            | 1             | 4            | 0-2          |
+      # | 4            | 2             | 8            | 0-4          |
+      # | 4            | 4             | 16           | 0-8          |
+      # | 8            | 1             | 8            | 0-4          |
+      # | 16           | 1             | 16           | 0-8          |
+      storage_class_standard: ""
     scanner:
       # Scanner speed preset: fastest|fast|default|slow|slowest
       speed: ""
@@ -185,7 +194,7 @@ config:
     obs_endpoint:
       enabled: false # If true, rustfs will export metrics, traces, logs and profiling data to the specified OTLP endpoints. If false, the individual settings for metrics, traces, logs and profiling endpoints will be ignored and all data will not be exported.
       base_endpoint: "" #Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318
-      use_stdout: true # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
+      use_stdout: false # If true, rustfs will also export logs to stdout in addition to the OTLP logs endpoint.
       metrics:
         enabled: false
         endpoint: "" # If specified, rustfs will export metrics to this OTLP endpoint. e.g. "http://localhost:4318/v1/metrics"

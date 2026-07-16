@@ -15,7 +15,8 @@ The distributed topology is defined by two parameters:
 Total drives in the cluster = `replicaCount * drivesPerNode`.
 
 When `drivesPerNode` is left unset, the chart automatically infers a
-backward-compatible value:
+backward-compatible value from each pool's replica count (with pools
+disabled there is a single pool driven by the top-level `replicaCount`):
 
 | `replicaCount` | Inferred `drivesPerNode` | Legacy equivalent |
 |----------------|--------------------------|-------------------|
@@ -171,7 +172,7 @@ uer. `ClusterIssuer` or `Issuer`. |
 | pdb.minAvailable | string | `""` |  |
 | podAnnotations | object | `{}` |  |
 | pools.enabled | bool | `false` | Enable multiple server pools (capacity expansion, distributed mode only). |
-| pools.list | list | `[]` | One entry per pool; entries may set `replicaCount` (4 or 16) and `storageclass`, omitted fields inherit top-level values. Append-only. |
+| pools.list | list | `[]` | One entry per pool; entries may set `replicaCount` (>= 2) and `storageclass`, omitted fields inherit top-level values. Append-only. |
 | podLabels | object | `{}` |  |
 | podSecurityContext.fsGroup | int | `10001` |  |
 | podSecurityContext.runAsGroup | int | `10001` |  |
@@ -275,12 +276,12 @@ pools:
   list:
     - {}                  # pool 0: inherits top-level values and keeps the
                           # existing StatefulSet/pod/PVC names and data
-    - replicaCount: 4     # pool 1: new capacity (4 or 16)
+    - replicaCount: 4     # pool 1: new capacity
       storageclass:
         dataStorageSize: 10Gi
 ```
 
-Each entry may set `replicaCount` (4 or 16) and/or a `storageclass` block;
+Each entry may set `replicaCount` (>= 2) and/or a `storageclass` block;
 omitted fields inherit the top-level values. Additional pools render as
 `<fullname>-pool<N>` StatefulSets; all pools share the headless service,
 the main service, the configuration and the credentials.

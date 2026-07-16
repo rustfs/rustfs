@@ -253,6 +253,57 @@ assert_extra_volumes_wired "$distributed_extra_output" "distributed StatefulSet"
 distributed_default_output=$(render_distributed_statefulset)
 assert_extra_volumes_absent "$distributed_default_output" "distributed StatefulSet"
 
+# clusterDomain (issue #3857): a custom Kubernetes cluster domain must flow into
+# the RUSTFS_VOLUMES FQDN and mTLS server cert SANs, defaulting to cluster.local.
+volumes_default=$(render_distributed_configmap | grep 'RUSTFS_VOLUMES:' || true)
+if ! grep -q 'svc\.cluster\.local' <<<"$volumes_default"; then
+  echo "Default RUSTFS_VOLUMES must use svc.cluster.local" >&2
+  exit 1
+fi
+
+volumes_custom=$(render_distributed_configmap --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:' || true)
+if ! grep -q 'svc\.cluster\.internal' <<<"$volumes_custom"; then
+  echo "Custom clusterDomain must appear in the RUSTFS_VOLUMES FQDN" >&2
+  exit 1
+fi
+if grep -q 'cluster\.local' <<<"$volumes_custom"; then
+  echo "Custom clusterDomain must fully replace cluster.local in RUSTFS_VOLUMES" >&2
+  exit 1
+fi
+
+# An explicit config.rustfs.volumes stays authoritative regardless of clusterDomain.
+volumes_explicit=$(render_distributed_configmap \
+  --set config.rustfs.volumes=http://example.test/data \
+  --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:' || true)
+if ! grep -q 'RUSTFS_VOLUMES: "http://example.test/data"' <<<"$volumes_explicit"; then
+  echo "Explicit config.rustfs.volumes must remain authoritative regardless of clusterDomain" >&2
+  exit 1
+fi
+
+# A dot-only clusterDomain must fall back to cluster.local instead of an empty domain.
+volumes_dots=$(render_distributed_configmap --set clusterDomain=. | grep 'RUSTFS_VOLUMES:' || true)
+if ! grep -q 'svc\.cluster\.local' <<<"$volumes_dots"; then
+  echo "Dot-only clusterDomain must fall back to cluster.local in RUSTFS_VOLUMES" >&2
+  exit 1
+fi
+
+# mTLS server certificate SANs must honor clusterDomain too.
+cert_default=$(render_server_cert)
+if ! grep -q 'svc\.cluster\.local"' <<<"$cert_default"; then
+  echo "Default mTLS server cert SANs must use svc.cluster.local" >&2
+  exit 1
+fi
+
+cert_custom=$(render_server_cert --set clusterDomain=cluster.internal)
+if ! grep -q 'svc\.cluster\.internal"' <<<"$cert_custom"; then
+  echo "Custom clusterDomain must appear in mTLS server cert SANs" >&2
+  exit 1
+fi
+if grep -q 'svc\.cluster\.local"' <<<"$cert_custom"; then
+  echo "Custom clusterDomain must fully replace cluster.local in mTLS server cert SANs" >&2
+  exit 1
+fi
+
 # Legacy topology compatibility: default replicaCount=4 (no drivesPerNode set)
 # must render the old 4x4 PVC names (data-rustfs-0 .. data-rustfs-3).
 legacy_four_by_four=$(render_distributed_statefulset)
