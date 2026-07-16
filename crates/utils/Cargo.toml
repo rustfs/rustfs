@@ -28,7 +28,7 @@ categories = ["web-programming", "development-tools", "cryptography"]
 base64-simd = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true, features = ["serde"] }
 crc-fast = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
@@ -36,21 +36,21 @@ hex-simd = { workspace = true, optional = true }
 highway = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["http2", "http1", "server"] }
 local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
-rustix = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true, features = ["fs"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 convert_case = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
+tokio = { workspace = true, optional = true, features = ["io-util", "macros", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
 transform-stream = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
@@ -58,7 +58,7 @@ zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 temp-env = { workspace = true }
 proptest = "1"
 

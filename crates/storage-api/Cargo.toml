@@ -32,14 +32,14 @@ async-trait.workspace = true
 # Storage-facing replication contracts are isolated in src/replication.rs until
 # the underlying wire types can move without creating a replication/storage-api cycle.
 rustfs-filemeta.workspace = true
-serde.workspace = true
-time.workspace = true
-uuid.workspace = true
+serde = { workspace = true, features = ["derive"] }
+time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 
 [dev-dependencies]
-insta = { workspace = true }
-serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+insta = { workspace = true, features = ["yaml", "json"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+tokio = { workspace = true, features = ["macros", "rt", "fs", "rt-multi-thread"] }
 
 [lints]
 workspace = true

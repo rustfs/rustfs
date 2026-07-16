@@ -38,47 +38,47 @@ futures.workspace = true
 rustfs-lock.workspace = true
 rustfs-protos.workspace = true
 rmp-serde.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tonic = { workspace = true }
-tokio = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+tonic = { workspace = true, features = ["gzip", "deflate"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tokio-stream = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-filemeta.workspace = true
-bytes.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 serial_test = { workspace = true }
-aws-sdk-s3.workspace = true
+aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
-aws-smithy-http-client.workspace = true
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rustls-aws-lc"] }
 async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
-reqwest = { workspace = true }
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
 rustfs-signer.workspace = true
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-uuid = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 urlencoding.workspace = true
 walkdir.workspace = true
 base64 = { workspace = true }
-rand = { workspace = true }
-chrono = { workspace = true }
+rand = { workspace = true, features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 md5 = { workspace = true }
 sha2 = { workspace = true }
 astral-tokio-tar = { workspace = true }
-s3s = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
 zstd.workspace = true
-time.workspace = true
-suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs"] }
+time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs", "tokio-rustls-aws-lc-rs"] }
 rcgen.workspace = true
 local-ip-address.workspace = true
 anyhow.workspace = true
-rustls.workspace = true
-russh = { workspace = true }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+russh = { workspace = true, features = ["serde"] }
 russh-sftp = { workspace = true }
 zip.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }

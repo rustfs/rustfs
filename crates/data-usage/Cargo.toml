@@ -28,7 +28,7 @@ categories = ["data-structures", "filesystem"]
 workspace = true
 
 [dependencies]
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 path-clean = { workspace = true }
 rmp-serde = { workspace = true }
 async-trait = { workspace = true }

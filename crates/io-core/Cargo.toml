@@ -28,15 +28,15 @@ categories = ["development-tools", "filesystem"]
 workspace = true
 
 [dependencies]
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync", "rt-multi-thread"] }
 memmap2 = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 
 [lib]
 doctest = false
