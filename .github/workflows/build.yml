@@ -289,6 +289,7 @@ jobs:
             local console_url
             local console_sha256
             local curl_auth_args=()
+            console_tag=""
 
             if [[ "${{ matrix.platform }}" == "windows" ]]; then
               curl_bin="curl.exe"
@@ -311,13 +312,15 @@ jobs:
             "$curl_bin" "${curl_auth_args[@]}" --fail -L "$console_api" \
               -o "$console_json" --retry 3 --retry-delay 5 --max-time 300 || return 1
 
-            read -r console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
+            read -r console_tag console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
           import json
           import re
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as handle:
               release = json.load(handle)
+
+          tag = release.get("tag_name", "") or "unknown"
 
           for asset in release.get("assets", []):
               name = asset.get("name", "")
@@ -327,7 +330,7 @@ jobs:
                   sha256 = digest.split(":", 1)[1]
                   if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
                       raise SystemExit(f"console zip asset has invalid sha256 digest: {sha256}")
-                  sys.stdout.buffer.write(f"{url} {sha256}\n".encode("utf-8"))
+                  sys.stdout.buffer.write(f"{tag} {url} {sha256}\n".encode("utf-8"))
                   break
           else:
               raise SystemExit("no console zip asset with sha256 digest found")
@@ -339,6 +342,8 @@ jobs:
               return 1
             fi
 
+            echo "Console release: ${console_tag}"
+            echo "Downloading console asset: ${console_url}"
             "$curl_bin" --fail -L "$console_url" -o console.zip --retry 3 --retry-delay 5 --max-time 300 || return 1
             verify_sha256 "$console_sha256" console.zip || return 2
             unzip -o console.zip -d ./rustfs/static || return 2
@@ -360,6 +365,9 @@ jobs:
             echo "Console asset archive is missing static/index.html" >&2
             exit 1
           fi
+
+          asset_count=$(find ./rustfs/static -type f | wc -l | tr -d '[:space:]')
+          echo "Console assets ready: version=${console_tag:-unknown}, ${asset_count} files extracted to ./rustfs/static"
 
       - name: Build RustFS
         shell: bash
