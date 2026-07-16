@@ -9,22 +9,26 @@
 > (`.config/nextest.toml`); admission criteria: `crates/e2e_test/README.md`.
 > 🌙 marks tests in the scheduled `e2e-repl-nightly` profile (backlog#1147
 > repl-1): `replication_extension_test` splits 20 fast tests into the PR smoke
-> lane and 23 slow / `_real_dual_node` / `_real_single_node` tests into the
+> lane and 27 slow / `_real_dual_node` / `_real_three_node` / `_real_single_node` tests into the
 > nightly lane (`.github/workflows/e2e-replication-nightly.yml`).
 > Note: counts exclude `#[ignore]`d tests (nextest lists them separately).
+> The SSE-S3 replication contract is ignored under backlog#1291 until its
+> plaintext downgrade is fixed.
 
 | module | tests | PR smoke |
 |---|---|---|
-| admin_auth_test | 3 |  |
+| admin_auth_test | 3 | ✅ |
+| admin_iam_crud_test | 2 | ✅ |
 | admin_timeout_regression_test | 1 |  |
 | anonymous_access_test | 3 | ✅ |
 | archive_download_integrity_test | 13 |  |
 | bucket_logging_test | 3 |  |
 | bucket_policy_check_test | 1 | ✅ |
-| checksum_upload_test | 6 |  |
+| checksum_upload_test | 7 |  |
 | cluster_concurrency_test | 2 |  |
 | common | 3 |  |
 | compression_test | 1 |  |
+| console_smoke_test | 1 | ✅ |
 | content_encoding_test | 3 | ✅ |
 | copy_object_metadata_test | 1 | ✅ |
 | copy_object_version_restore_test | 1 |  |
@@ -50,7 +54,8 @@
 | mc_mirror_small_bucket_test | 1 |  |
 | multipart_auth_test | 109 |  |
 | namespace_lock_quorum_test | 2 |  |
-| negative_sigv4_test | 6 |  |
+| negative_sigv4_test | 6 | ✅ |
+| notification_webhook_test | 1 | ✅ |
 | object_lambda_test | 16 |  |
 | object_lock | 33 |  |
 | overwrite_cleanup_regression_test | 1 |  |
@@ -58,14 +63,15 @@
 | protocols | 16 |  |
 | quota_test | 13 |  |
 | reliability_disk_fault_test | 3 |  |
-| reliant | 9 | 3 ✅ |
-| replication_extension_test | 43 | 20 ✅ +23 🌙 |
+| reliant | 10 | 4 ✅ |
+| replication_extension_test | 47 | 20 ✅ +27 🌙 |
 | security_boundary_test | 4 |  |
 | server_startup_failfast_test | 1 |  |
 | snowball_auto_extract_test | 6 |  |
 | special_chars_test | 14 | ✅ |
 | stale_multipart_cleanup_cluster_test | 1 |  |
 | tls_gen | 3 |  |
+| tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 424 tests across 52 modules · PR smoke subset: 93 tests / 20 modules** (18 full modules + 3 `reliant::lifecycle` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 23 tests** · generated 2026-07-15.
+**Total listed: 435 tests across 56 modules · PR smoke subset: 108 tests / 26 modules** (24 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-15.

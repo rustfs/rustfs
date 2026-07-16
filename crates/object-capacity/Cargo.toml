@@ -39,14 +39,14 @@ rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics = { workspace = true }
 rustfs-utils = { workspace = true, features = ["os"] }
 futures = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 walkdir = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tokio = { workspace = true, features = ["test-util", "macros", "fs", "rt-multi-thread"] }

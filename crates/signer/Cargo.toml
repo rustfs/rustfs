@@ -27,13 +27,13 @@ documentation = "https://docs.rs/rustfs-signer/latest/rustfs_signer/"
 
 [dependencies]
 tracing.workspace = true
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
 http.workspace = true
-time.workspace = true
-hyper.workspace = true
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
 serde_urlencoded.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
-s3s.workspace = true
+s3s = { workspace = true, features = ["minio"] }
 base64-simd.workspace = true
 thiserror.workspace = true
 

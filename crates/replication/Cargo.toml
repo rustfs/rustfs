@@ -26,17 +26,17 @@ categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-replication/latest/rustfs_replication/"
 
 [dependencies]
-bytes.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 byteorder.workspace = true
 regex.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
-s3s.workspace = true
-serde.workspace = true
-time.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+s3s = { workspace = true, features = ["minio"] }
+serde = { workspace = true, features = ["derive"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 url.workspace = true
-uuid = { workspace = true, features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 
 [lints]
 workspace = true

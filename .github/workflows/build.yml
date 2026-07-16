@@ -223,7 +223,7 @@ jobs:
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       # Release binaries ship without dial9 telemetry and therefore do not need
@@ -439,11 +439,11 @@ jobs:
             # Release/Prerelease build: rustfs-${platform}-${arch}-${variant}-v${version}.zip
             PACKAGE_NAME="${PACKAGE_BASENAME}-v${PACKAGE_VERSION}"
           fi
-
+          
           # Create zip packages for all platforms
           # Ensure zip is available
           if ! command -v zip &> /dev/null; then
-            if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            if [[ "${{ matrix.os }}" == "ubuntu-latest" || "${{ matrix.platform }}" == "linux" ]]; then
               sudo apt-get update && sudo apt-get install -y zip
             fi
           fi

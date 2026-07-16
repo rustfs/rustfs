@@ -446,6 +446,13 @@ impl RustFSTestEnvironment {
         self.start_rustfs_server_inner(extra_args, &[], false).await
     }
 
+    pub async fn start_rustfs_server_without_cleanup_with_env(
+        &mut self,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_inner(vec![], extra_env, false).await
+    }
+
     /// Wait for RustFS server to be ready.
     ///
     /// A listening TCP port is not sufficient here: the process may accept

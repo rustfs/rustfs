@@ -29,20 +29,20 @@ documentation = "https://docs.rs/rustfs-rio-v2/latest/rustfs_rio_v2/"
 workspace = true
 
 [dependencies]
-aes-gcm.workspace = true
-bytes.workspace = true
+aes-gcm = { workspace = true, features = ["rand_core"] }
+bytes = { workspace = true, features = ["serde"] }
 chacha20poly1305.workspace = true
 hex.workspace = true
 hmac.workspace = true
 minlz.workspace = true
 pin-project-lite.workspace = true
-rand.workspace = true
+rand = { workspace = true, features = ["serde"] }
 rustfs-rio.workspace = true
 rustfs-utils.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 
 [dev-dependencies]
 rustfs-filemeta.workspace = true
