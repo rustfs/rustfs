@@ -1553,6 +1553,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![1],
                 drives_per_set: vec![1],
                 ..Default::default()
             },
@@ -1573,6 +1574,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![1],
                 drives_per_set: vec![1],
                 ..Default::default()
             },
@@ -1605,6 +1607,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![2],
+                total_sets: vec![1],
                 drives_per_set: vec![4],
                 ..Default::default()
             },
@@ -1629,8 +1632,9 @@ mod tests {
         };
         let info = StorageInfo {
             backend: BackendInfo {
-                standard_sc_data: vec![2],
-                drives_per_set: vec![4],
+                standard_sc_data: vec![1],
+                total_sets: vec![1],
+                drives_per_set: vec![2],
                 ..Default::default()
             },
             disks: vec![duplicate_disk.clone(), duplicate_disk],
@@ -1654,6 +1658,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![2],
                 drives_per_set: vec![2],
                 ..Default::default()
             },
@@ -1669,7 +1674,17 @@ mod tests {
                     ..Default::default()
                 },
                 Disk {
-                    endpoint: "127.0.0.1:9000".to_string(),
+                    endpoint: "127.0.0.1:9001".to_string(),
+                    drive_path: "/set0d1".to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 1,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                },
+                Disk {
+                    endpoint: "127.0.0.1:9002".to_string(),
                     drive_path: "/set1d0".to_string(),
                     pool_index: 0,
                     set_index: 1,

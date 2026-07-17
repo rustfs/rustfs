@@ -1203,13 +1203,12 @@ mod tests {
 
     #[test]
     fn cluster_config_stats_reject_parity_larger_than_u32() {
-        match usize::try_from(u64::from(u32::MAX) + 1) {
-            Ok(overflow) => {
-                assert!(cluster_config_stats_from_backend_parities(Some(overflow), Some(2)).is_none());
-                assert!(cluster_config_stats_from_backend_parities(Some(1), Some(overflow)).is_none());
-            }
-            Err(_) => assert!(usize::BITS <= u32::BITS, "overflow input is unreachable only on narrow targets"),
-        }
+        let Ok(overflow) = usize::try_from(u64::from(u32::MAX) + 1) else {
+            return;
+        };
+
+        assert!(cluster_config_stats_from_backend_parities(Some(overflow), Some(2)).is_none());
+        assert!(cluster_config_stats_from_backend_parities(Some(1), Some(overflow)).is_none());
     }
 
     #[test]
