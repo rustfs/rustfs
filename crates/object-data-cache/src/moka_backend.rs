@@ -14,7 +14,7 @@
 
 use crate::cache::{ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup};
 use crate::config::ObjectDataCacheConfig;
-use crate::entry::ObjectDataCacheEntry;
+use crate::entry::{ObjectDataCacheEntry, projected_weight};
 use crate::index::{ObjectDataCacheIdentityIndex, ObjectDataCacheIndexInsertResult, ObjectDataCacheKeyToken};
 use crate::key::{ObjectDataCacheIdentity, ObjectDataCacheKey};
 use crate::memory::ObjectDataCacheMemoryGate;
@@ -173,6 +173,10 @@ impl MokaBackend {
         self.cache.weighted_size()
     }
 
+    pub(crate) const fn max_capacity(&self) -> u64 {
+        self.max_capacity
+    }
+
     /// Looks up a cached body for the supplied plan.
     pub async fn lookup_body(&self, plan: &ObjectDataCacheGetPlan) -> ObjectDataCacheLookup {
         let ObjectDataCacheGetPlan::Cacheable { key } = plan else {
@@ -190,6 +194,10 @@ impl MokaBackend {
         let ObjectDataCacheGetPlan::Cacheable { key } = plan else {
             return ObjectDataCacheFillResult::SkippedNotCacheable;
         };
+        let body_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if projected_weight(key, body_bytes) > self.max_capacity {
+            return ObjectDataCacheFillResult::SkippedNotCacheable;
+        }
 
         // The caller already owns the body, so a non-leader gains nothing by
         // waiting for another request's leader — it just skips its own fill.
@@ -215,10 +223,7 @@ impl MokaBackend {
         // and falsely skip fills (backlog#1212). weighted_size() is moka's
         // lazily-maintained approximation, which is all this bound needs.
         let cache_growth_headroom = self.max_capacity.saturating_sub(self.cache.weighted_size());
-        if !self
-            .memory_gate
-            .allows_fill(u64::try_from(bytes.len()).unwrap_or(u64::MAX), cache_growth_headroom)
-        {
+        if !self.memory_gate.allows_fill(body_bytes, cache_growth_headroom) {
             return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure);
         }
 
@@ -423,8 +428,12 @@ mod tests {
     }
 
     fn cacheable_plan(object: &str, etag: &str) -> ObjectDataCacheGetPlan {
+        cacheable_plan_with_size(object, etag, 5)
+    }
+
+    fn cacheable_plan_with_size(object: &str, etag: &str, size: u64) -> ObjectDataCacheGetPlan {
         ObjectDataCacheGetPlan::Cacheable {
-            key: ObjectDataCacheKey::new("bucket", object, None, etag, 5, ObjectDataCacheBodyVariant::FullObjectPlainV1),
+            key: ObjectDataCacheKey::new("bucket", object, None, etag, size, ObjectDataCacheBodyVariant::FullObjectPlainV1),
         }
     }
 
@@ -445,6 +454,44 @@ mod tests {
 
         assert!(matches!(fill, ObjectDataCacheFillResult::Inserted));
         assert!(matches!(lookup, ObjectDataCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"hello"));
+    }
+
+    #[tokio::test]
+    async fn moka_backend_never_reports_inserted_for_overweight_entry() {
+        let mut config = enabled_config();
+        config.max_bytes = 8 * 1024;
+        config.max_entry_bytes = 4 * 1024;
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        // Projected weight is 8193 bytes, one byte over max_capacity.
+        let object = "o".repeat(4022);
+        let plan = cacheable_plan_with_size(&object, "e", 4 * 1024);
+        let body = Bytes::from(vec![0_u8; 4 * 1024]);
+
+        let fill = backend.fill_body(&plan, body).await;
+        backend.cache.run_pending_tasks().await;
+
+        assert_eq!(fill, ObjectDataCacheFillResult::SkippedNotCacheable);
+        assert!(matches!(backend.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+    }
+
+    #[tokio::test]
+    async fn accepted_boundary_entry_remains_hit_after_pending_maintenance() {
+        let mut config = enabled_config();
+        config.max_bytes = 8 * 1024;
+        config.max_entry_bytes = 4 * 1024;
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        // Projected weight is exactly max_capacity: 4096 + 6 + 4021 + 4 + 1 + 64.
+        let object = "o".repeat(4021);
+        let plan = cacheable_plan_with_size(&object, "e", 4 * 1024);
+        let body = Bytes::from(vec![0_u8; 4 * 1024]);
+
+        let fill = backend.fill_body(&plan, body).await;
+        backend.cache.run_pending_tasks().await;
+        let lookup = backend.lookup_body(&plan).await;
+
+        assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
+        assert_eq!(backend.weighted_size(), config.max_bytes, "Moka must charge the exact projected weight");
+        assert!(matches!(lookup, ObjectDataCacheLookup::Hit(ref bytes) if bytes.len() == 4 * 1024));
     }
 
     #[tokio::test]

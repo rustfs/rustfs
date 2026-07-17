@@ -14,6 +14,7 @@
 
 use crate::backend::ObjectDataCacheBackendKind;
 use crate::config::ObjectDataCacheConfig;
+use crate::entry::projected_weight;
 use crate::error::ObjectDataCacheConfigError;
 use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheIdentity, ObjectDataCacheKey};
 use crate::metrics::{
@@ -45,6 +46,9 @@ pub struct ObjectDataCache {
     backend: ObjectDataCacheBackendKind,
     config: Arc<ObjectDataCacheConfig>,
     stats: Arc<ObjectDataCacheStats>,
+    /// Resolved Moka weighted capacity used by the planner's exact key-aware
+    /// admission check. Zero for the disabled backend.
+    max_capacity: u64,
     /// Effective fill ceiling in bytes: a body larger than this is planned
     /// `SkipTooLarge` even when it fits `max_entry_bytes`. The app layer sets it
     /// to `min(max_entry_bytes, seek-support threshold, 64 MiB buffer cap)` so a
@@ -72,6 +76,7 @@ impl ObjectDataCache {
             backend: ObjectDataCacheBackendKind::Noop(NoopBackend),
             config,
             stats,
+            max_capacity: 0,
             fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
@@ -83,16 +88,19 @@ impl ObjectDataCache {
         describe_metrics_once();
         config.validate()?;
         let stats = Arc::new(ObjectDataCacheStats::default());
-        let backend = if config.is_disabled() {
-            ObjectDataCacheBackendKind::Noop(NoopBackend)
+        let (backend, max_capacity) = if config.is_disabled() {
+            (ObjectDataCacheBackendKind::Noop(NoopBackend), 0)
         } else {
-            ObjectDataCacheBackendKind::Moka(Box::new(MokaBackend::new(&config, Arc::clone(&stats))?))
+            let backend = MokaBackend::new(&config, Arc::clone(&stats))?;
+            let max_capacity = backend.max_capacity();
+            (ObjectDataCacheBackendKind::Moka(Box::new(backend)), max_capacity)
         };
 
         Ok(Self {
             backend,
             config: Arc::new(config),
             stats,
+            max_capacity,
             fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
@@ -141,20 +149,24 @@ impl ObjectDataCache {
             return ObjectDataCacheGetPlan::SkipTooLarge;
         }
 
+        let key = ObjectDataCacheKey::with_write_anchors(
+            request.bucket,
+            request.object,
+            request.version_id.as_deref(),
+            request.etag,
+            request.size,
+            request.data_dir_u128,
+            request.mod_time_unix_nanos,
+            request.body_variant,
+        );
+        if projected_weight(&key, request.size) > self.max_capacity {
+            record_plan_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
+            return ObjectDataCacheGetPlan::SkipTooLarge;
+        }
+
         record_plan_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
 
-        ObjectDataCacheGetPlan::Cacheable {
-            key: ObjectDataCacheKey::with_write_anchors(
-                request.bucket,
-                request.object,
-                request.version_id.as_deref(),
-                request.etag,
-                request.size,
-                request.data_dir_u128,
-                request.mod_time_unix_nanos,
-                request.body_variant,
-            ),
-        }
+        ObjectDataCacheGetPlan::Cacheable { key }
     }
 
     /// Looks up an object body from the configured backend.
@@ -891,6 +903,34 @@ mod tests {
         );
         assert_eq!(
             cache.plan_get(plain_request("bucket", "object", "etag", 16 * 1024 * 1024)),
+            ObjectDataCacheGetPlan::SkipTooLarge
+        );
+    }
+
+    #[test]
+    fn planner_rejects_key_whose_projected_weight_exceeds_capacity() {
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 8 * 1024,
+            max_memory_percent: 0,
+            max_entry_bytes: 4 * 1024,
+            ..ObjectDataCacheConfig::default()
+        };
+        let cache = ObjectDataCache::new(config).expect("capacity test config should initialize");
+        // Body (4096) + fixed fields (bucket=1, version=null=4, etag=1) +
+        // object (4026) + entry overhead (64) = 8192, exactly capacity.
+        let boundary_object = "o".repeat(4026);
+        assert!(matches!(
+            cache.plan_get(plain_request("b", &boundary_object, "e", 4 * 1024)),
+            ObjectDataCacheGetPlan::Cacheable { .. }
+        ));
+
+        // Body (4096) + fixed fields (bucket=1, version=null=4, etag=1) +
+        // object (4027) + entry overhead (64) = 8193, one byte over capacity.
+        let overweight_object = "o".repeat(4027);
+
+        assert_eq!(
+            cache.plan_get(plain_request("b", &overweight_object, "e", 4 * 1024)),
             ObjectDataCacheGetPlan::SkipTooLarge
         );
     }

@@ -13,11 +13,25 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use std::cmp;
 
 use crate::key::ObjectDataCacheKey;
 
-const ENTRY_OVERHEAD_BYTES: usize = 64;
+const ENTRY_OVERHEAD_BYTES: u64 = 64;
+
+/// Estimates the weighted capacity charged for a key and planned body.
+pub(crate) fn projected_weight(key: &ObjectDataCacheKey, body_bytes: u64) -> u64 {
+    let key_bytes = key
+        .bucket
+        .len()
+        .saturating_add(key.object.len())
+        .saturating_add(key.version_id.len())
+        .saturating_add(key.etag.len());
+
+    u64::try_from(key_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(body_bytes)
+        .saturating_add(ENTRY_OVERHEAD_BYTES)
+}
 
 /// Cached object body entry.
 ///
@@ -44,12 +58,8 @@ impl ObjectDataCacheEntry {
 
     /// Returns the estimated weighted size for capacity accounting.
     pub fn estimated_weight(&self, key: &ObjectDataCacheKey) -> u32 {
-        let key_bytes = key.bucket.len() + key.object.len() + key.version_id.len() + key.etag.len();
-        let body_bytes = self.bytes.len();
-        let total = key_bytes.saturating_add(body_bytes).saturating_add(ENTRY_OVERHEAD_BYTES);
-        let clamped = cmp::min(total, u32::MAX as usize);
-
-        u32::try_from(clamped).unwrap_or(u32::MAX)
+        let body_bytes = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
+        u32::try_from(projected_weight(key, body_bytes)).unwrap_or(u32::MAX)
     }
 }
 
