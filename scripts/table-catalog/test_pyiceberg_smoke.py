@@ -864,7 +864,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIn("single-active-writer-ha", capabilities)
         self.assertIn("scale-validation-matrix", capabilities)
         strong_backing = next(entry for entry in inventory if entry["capability"] == "strong-catalog-backing")
-        self.assertEqual(strong_backing["status"], "migration-contract-supported")
+        self.assertEqual(strong_backing["status"], "state-transfer-supported")
         for entry in inventory:
             self.assertIn("status", entry)
             self.assertIn("validation", entry)

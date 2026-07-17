@@ -114,11 +114,12 @@ catalog extension.
 | Idempotent retry | Supported | Repeated commit IDs can return the already finalized result or surface recoverable finalization gaps. |
 | Post-CAS finalization recovery | Supported | Diagnostics and recovery can repair stale or missing idempotency indexes without changing the current table pointer. |
 | Catalog export | Supported | Exposes table state, commit recovery state, and backing migration information for operator inspection. |
-| Strong backing migration contract | Supported as a contract | Diagnostics publish object-backed manifest state, recoverable commit-log WAL state, target backing type, replay requirements, and blockers. |
-| Durable backing migration dry-run | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, commit recovery blockers, idempotency indexes, warehouse prefix index readiness, recommended actions, and rollback configuration without mutating catalog state. |
+| Strong backing state transfer | Supported | Object-backed table bucket, namespace, table, view, commit-log, and idempotency state can be materialized into the durable strong snapshot. The transfer is deterministic, ETag-CAS protected, and idempotent after an interrupted finalization. |
+| Durable backing migration preflight | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, recovery blockers, warehouse prefix index readiness, persistent write-fence state, target snapshot agreement, and whether every table bucket is ready for cutover. |
+| Durable backing migration execution | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/migration` fences table-bucket registry changes, acquires a persistent per-bucket write fence, drains in-flight catalog mutations, materializes the target snapshot, and reports `ready_to_enable_durable_strong`. `DELETE` safely releases the bucket fence only while its target state has not advanced, and releases the registry fence after the last bucket is cancelled. Both mutations require `admin:MigrateTableCatalog`. |
 | Disaster recovery rehearsal | Manual/live harness | `failure_coverage.py --print-disaster-recovery-rehearsal` generates an operator runbook covering catalog export, diagnostics, safe recovery repair, rollback/import, durable backing migration dry-run, post-recovery loadTable, and table data-plane policy probes. |
 | Scale and fault rehearsal | Manual/live harness | `failure_coverage.py --print-scale-fault-rehearsal` generates an opt-in runbook for concurrent writer stress, maintenance scheduler lease recovery, durable backing cutover preflight, recovery/rollback/import under load, and post-run evidence capture. |
-| Strong KV/WAL backing cutover | Preview / controlled | Operators can explicitly select durable strong backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong`. Run the migration dry-run first and keep the object-backed catalog available for rollback. Object-only advanced operations fail closed in durable strong mode. |
+| Strong KV/WAL backing cutover | Preview / controlled | Operators can select durable strong backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong` only after every table bucket reports `SNAPSHOT_MATERIALIZED` and `ready_to_enable_durable_strong: true`. Object-only advanced operations fail closed in durable strong mode. |
 | Single active writer region | Supported policy | Diagnostics publish single-active-writer semantics and read-only replica limits. |
 | Active-active multi-region writes | Not claimed | A table must not accept independent concurrent writers in multiple active regions. |
 
@@ -127,20 +128,29 @@ catalog extension.
 Use the migration dry-run before changing the table catalog backing for a
 warehouse:
 
-1. Run `GET /iceberg/v1/{warehouse}/catalog/migration` with a principal that has
-   `GetTableCatalogAction` on the table bucket.
-2. Treat any `blockers` entry as fail-closed. Run catalog recovery first when
-   commit recovery or idempotency repair is required, and backfill the warehouse
-   prefix index before switching backing modes.
-3. Take an object-backed catalog snapshot or backup before setting
-   `RUSTFS_TABLE_CATALOG_BACKING=durable-strong`.
-4. Restart with durable strong backing enabled, then verify catalog config,
-   table load, commit recovery diagnostics, and table data-plane policy
-   resolution for representative tables.
-5. To roll back, restore `RUSTFS_TABLE_CATALOG_BACKING=object-backed` and restart
-   while preserving the object-backed catalog objects. Do not delete object-backed
-   catalog state until durable strong backing has passed the operator's retention
-   window.
+1. Take an object-backed catalog backup and record the current metadata pointer
+   and version token for representative tables.
+2. Run `GET /iceberg/v1/{warehouse}/catalog/migration` with a principal that has
+   `GetTableCatalogAction` on each table bucket. Treat every `blockers` entry as
+   fail-closed; repair commit recovery state and backfill the warehouse prefix
+   index before continuing.
+3. Run `POST /iceberg/v1/{warehouse}/catalog/migration` with
+   `admin:MigrateTableCatalog`. This persists the source write fence before it
+   drains in-flight mutations and copies the catalog state.
+4. Repeat the preflight and materialization for every table bucket. Do not set
+   `RUSTFS_TABLE_CATALOG_BACKING=durable-strong` until the preflight reports
+   `SNAPSHOT_MATERIALIZED`, no blockers, and
+   `ready_to_enable_durable_strong: true`.
+5. Restart with durable strong backing enabled, then verify catalog config,
+   table and view loads, commit idempotency, and table data-plane policy
+   resolution before admitting writers.
+6. Before restarting into durable-strong mode, `DELETE` on the migration
+   endpoint can remove a migration-created target bucket snapshot and release
+   the source fence. After the durable-strong state advances, cancellation
+   fails closed; recovery requires an operator-selected restore or reverse
+   migration instead of restarting against the stale object-backed pointer.
+7. Preserve the object-backed catalog backup until durable strong backing has
+   passed the operator's retention window.
 
 ## Production Failure Coverage
 
