@@ -18,10 +18,7 @@ use crate::admin::runtime_sources::{current_action_credentials, object_store_fro
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
-use crate::admin::storage_api::data_usage::{
-    apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
-    replace_bucket_usage_memory_from_info,
-};
+use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend_cached};
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -38,7 +35,6 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error}
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::debug;
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
@@ -66,14 +62,16 @@ fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, c
 }
 
 fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAccessInfo, usage: Option<&BucketUsageInfo>) {
+    // No snapshot coverage for this bucket: leave the stats absent so clients
+    // render "unknown" instead of confirmed zeros (rustfs/backlog#1306).
     let Some(usage) = usage else {
         return;
     };
 
-    bucket_info.size = usage.size;
-    bucket_info.objects = usage.objects_count;
-    bucket_info.object_sizes_histogram = usage.object_size_histogram.clone();
-    bucket_info.object_versions_histogram = usage.object_versions_histogram.clone();
+    bucket_info.size = Some(usage.size);
+    bucket_info.objects = Some(usage.objects_count);
+    bucket_info.object_sizes_histogram = Some(usage.object_size_histogram.clone());
+    bucket_info.object_versions_histogram = Some(usage.object_versions_histogram.clone());
 }
 
 fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
@@ -255,10 +253,12 @@ impl Operation for AccountInfoHandler {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let mut data_usage_info = load_data_usage_from_backend(store.clone())
+        // Serve the last persisted scanner snapshot plus the in-memory overlay.
+        // This request path must never trigger a live full-version listing
+        // (rustfs/backlog#1306); freshness is owned by the scanner.
+        let mut data_usage_info = load_data_usage_from_backend_cached(store.clone())
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-        replace_bucket_usage_memory_from_info(&data_usage_info).await;
         apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
 
         for bucket in buckets.iter() {
@@ -277,15 +277,6 @@ impl Operation for AccountInfoHandler {
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
                     ..Default::default()
                 };
-                // AccountInfo backs Console bucket stats, so prefer object-layer usage over potentially cold scanner snapshots.
-                if let Err(err) = refresh_bucket_usage_from_object_layer(store.clone(), &mut data_usage_info, &bucket.name).await
-                {
-                    debug!(
-                        bucket = %bucket.name,
-                        error = %err,
-                        "failed to refresh account info bucket usage from object layer"
-                    );
-                }
                 apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
                 account_info.buckets.push(bucket_info);
             }
@@ -356,25 +347,28 @@ mod tests {
 
         apply_usage_to_bucket_access_info(&mut bucket_info, Some(&usage));
 
-        assert_eq!(bucket_info.size, usage.size);
-        assert_eq!(bucket_info.objects, usage.objects_count);
-        assert_eq!(bucket_info.object_sizes_histogram, usage.object_size_histogram);
-        assert_eq!(bucket_info.object_versions_histogram, usage.object_versions_histogram);
+        assert_eq!(bucket_info.size, Some(usage.size));
+        assert_eq!(bucket_info.objects, Some(usage.objects_count));
+        assert_eq!(bucket_info.object_sizes_histogram.as_ref(), Some(&usage.object_size_histogram));
+        assert_eq!(bucket_info.object_versions_histogram.as_ref(), Some(&usage.object_versions_histogram));
     }
 
+    /// Buckets without snapshot coverage keep their stats absent so the wire
+    /// omits the fields instead of reporting confirmed zeros
+    /// (rustfs/backlog#1306 contract decision, option A).
     #[test]
-    fn accountinfo_bucket_access_info_ignores_missing_usage() {
+    fn accountinfo_bucket_access_info_leaves_stats_absent_without_usage() {
         let mut bucket_info = rustfs_madmin::BucketAccessInfo {
             name: "agent".to_string(),
-            size: 5,
-            objects: 2,
             ..Default::default()
         };
 
         apply_usage_to_bucket_access_info(&mut bucket_info, None);
 
-        assert_eq!(bucket_info.size, 5);
-        assert_eq!(bucket_info.objects, 2);
+        assert_eq!(bucket_info.size, None);
+        assert_eq!(bucket_info.objects, None);
+        assert_eq!(bucket_info.object_sizes_histogram, None);
+        assert_eq!(bucket_info.object_versions_histogram, None);
     }
 
     #[test]

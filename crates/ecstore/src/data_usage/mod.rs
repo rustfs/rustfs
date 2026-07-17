@@ -41,7 +41,10 @@ use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     future::Future,
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use tokio::fs;
@@ -75,6 +78,28 @@ type LiveBucketUsageCache = moka::future::Cache<String, BucketUsageInfo>;
 static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
 static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
 static LIVE_BUCKET_USAGE_CACHE: OnceLock<LiveBucketUsageCache> = OnceLock::new();
+
+/// Cached copy of the last persisted data usage snapshot, served to admin
+/// endpoints for up to `DATA_USAGE_CACHE_TTL_SECS` between backend reads.
+#[derive(Debug, Clone)]
+struct CachedDataUsageSnapshot {
+    info: DataUsageInfo,
+    loaded_at: SystemTime,
+}
+
+type DataUsageSnapshotCache = Arc<RwLock<Option<CachedDataUsageSnapshot>>>;
+
+static DATA_USAGE_SNAPSHOT_CACHE: OnceLock<DataUsageSnapshotCache> = OnceLock::new();
+
+// Always-on revert detector for rustfs/backlog#1306: one relaxed increment per
+// full-bucket version listing is negligible and lets tests prove that admin
+// request paths never trigger live listings.
+static LIVE_BUCKET_USAGE_COMPUTATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of live full-bucket usage computations performed by this process.
+pub fn live_bucket_usage_computations() -> u64 {
+    LIVE_BUCKET_USAGE_COMPUTATIONS.load(Ordering::Relaxed)
+}
 
 /// Deferred persist thresholds for compression totals: persist after this many
 /// operations recorded, but no more often than the min interval.
@@ -113,6 +138,10 @@ fn memory_cache() -> &'static UsageMemoryCache {
 
 fn cache_updating() -> &'static CacheUpdating {
     USAGE_CACHE_UPDATING.get_or_init(|| Arc::new(RwLock::new(false)))
+}
+
+fn data_usage_snapshot_cache() -> &'static DataUsageSnapshotCache {
+    DATA_USAGE_SNAPSHOT_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
 fn live_bucket_usage_cache() -> &'static LiveBucketUsageCache {
@@ -192,6 +221,12 @@ async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<E
     crate::config::com::save_config(store, &DATA_USAGE_OBJ_NAME_PATH, data)
         .await
         .map_err(Error::other)?;
+
+    // Invalidate the cached snapshot so readers observe the new save on their
+    // next request instead of waiting out the remaining TTL. The next cached
+    // read reloads through `load_data_usage_from_backend`, keeping its
+    // backward-compatibility post-processing.
+    *data_usage_snapshot_cache().write().await = None;
 
     Ok(())
 }
@@ -344,6 +379,41 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
     }
 
     Ok(data_usage_info)
+}
+
+/// Load the persisted data usage snapshot through a small in-process cache.
+///
+/// Admin read endpoints call this on every request; the cache bounds backend
+/// reads (and the associated JSON parse and INFO log) to once per
+/// `DATA_USAGE_CACHE_TTL_SECS` per process. `save_data_usage_in_backend`
+/// invalidates the cache so a fresh scanner save is visible immediately.
+pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+
+    {
+        let cache = data_usage_snapshot_cache().read().await;
+        if let Some(cached) = cache.as_ref()
+            && SystemTime::now().duration_since(cached.loaded_at).unwrap_or_default() < ttl
+        {
+            return Ok(cached.info.clone());
+        }
+    }
+
+    // Re-check under the write lock so concurrent expirations trigger a single
+    // backend read instead of a stampede.
+    let mut cache = data_usage_snapshot_cache().write().await;
+    if let Some(cached) = cache.as_ref()
+        && SystemTime::now().duration_since(cached.loaded_at).unwrap_or_default() < ttl
+    {
+        return Ok(cached.info.clone());
+    }
+
+    let info = load_data_usage_from_backend(store).await?;
+    *cache = Some(CachedDataUsageSnapshot {
+        info: info.clone(),
+        loaded_at: SystemTime::now(),
+    });
+    Ok(info)
 }
 
 /// Aggregate usage information from local disk snapshots.
@@ -548,6 +618,7 @@ impl BucketUsageAccumulator {
 type UsageVersionPage = StorageListObjectVersionsInfo<ObjectInfo>;
 
 pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Result<BucketUsageInfo, Error> {
+    LIVE_BUCKET_USAGE_COMPUTATIONS.fetch_add(1, Ordering::Relaxed);
     let bucket = bucket_name.to_string();
     compute_bucket_usage_with_pages(bucket_name, move |marker, version_marker| {
         let store = Arc::clone(&store);

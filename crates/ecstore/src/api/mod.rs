@@ -258,12 +258,14 @@ pub mod config {
 
 pub mod data_usage {
     pub use crate::data_usage::{
-        DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend,
-        load_compression_total_from_memory, load_data_usage_from_backend, record_bucket_delete_marker_memory,
+        DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
+        init_compression_total_memory_from_backend, live_bucket_usage_computations, load_compression_total_from_memory,
+        load_data_usage_from_backend, load_data_usage_from_backend_cached, record_bucket_delete_marker_memory,
         record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
+        store_data_usage_in_backend,
     };
 }
 
