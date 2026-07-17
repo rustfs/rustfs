@@ -2662,7 +2662,11 @@ impl SetDisks {
             // until the fanout below. Validate the shared metadata shape once,
             // using an online slot because shuffled offline slots contain the
             // default placeholder, then validate each assigned geometry in its task.
-            file_info.validate_for_erasure_write()?;
+            if file_info.is_canonical_delete_marker() {
+                file_info.validate_for_metadata_read()?;
+            } else {
+                file_info.validate_for_erasure_write()?;
+            }
         }
         let mut futures = Vec::with_capacity(disks.len());
 
@@ -2691,11 +2695,12 @@ impl SetDisks {
                     return Err(DiskError::DiskNotFound);
                 };
 
+                let is_delete_marker = file_info.is_canonical_delete_marker();
                 if file_info.erasure.index == 0 {
                     file_info.erasure.index = i + 1;
                 }
 
-                if !file_info.has_valid_erasure_geometry() {
+                if !is_delete_marker && !file_info.has_valid_erasure_geometry() {
                     return Err(DiskError::FileCorrupt);
                 }
 
@@ -4693,6 +4698,131 @@ mod tests {
         .expect_err("the missing staged source must fail after metadata validation");
 
         assert_ne!(err, DiskError::FileCorrupt);
+    }
+
+    #[tokio::test]
+    async fn rename_data_accepts_canonical_delete_marker() {
+        let bucket = "rename-delete-marker-bucket";
+        let object = "object";
+        let (_dirs, mut online_disks) = call_counter_local_disks(bucket, 1).await;
+        let online_disk = online_disks.pop().expect("one test disk slot should be present");
+        let disk = online_disk.as_ref().expect("test disk should be online");
+        match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("temporary metadata volume should be available: {err:?}"),
+        }
+        let version_id = Uuid::new_v4();
+        let mut marker = metadata_test_delete_marker(object, version_id, OffsetDateTime::now_utc());
+        marker
+            .metadata
+            .insert("x-rustfs-internal-purgestatus".to_string(), "pending".to_string());
+
+        SetDisks::rename_data(
+            &[None, online_disk.clone()],
+            RUSTFS_META_TMP_BUCKET,
+            "source",
+            &[FileInfo::default(), marker],
+            bucket,
+            object,
+            1,
+        )
+        .await
+        .expect("canonical delete marker should commit without erasure payload");
+
+        let stored = disk
+            .read_version("", bucket, object, &version_id.to_string(), &ReadOptions::default())
+            .await
+            .expect("committed delete marker should be readable");
+
+        assert!(stored.deleted);
+        assert_eq!(stored.version_id, Some(version_id));
+        assert_eq!(stored.erasure.index, 0);
+        assert_eq!(stored.metadata.get("x-rustfs-internal-purgestatus").map(String::as_str), Some("pending"));
+    }
+
+    #[tokio::test]
+    async fn rename_data_preserves_null_delete_marker_type() {
+        let bucket = "rename-null-marker-bucket";
+        let object = "object";
+        let (_dirs, mut online_disks) = call_counter_local_disks(bucket, 1).await;
+        let online_disk = online_disks.pop().expect("one test disk slot should be present");
+        let disk = online_disk.as_ref().expect("test disk should be online");
+        match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("temporary metadata volume should be available: {err:?}"),
+        }
+        let marker = metadata_test_delete_marker(object, Uuid::new_v4(), OffsetDateTime::now_utc());
+        let marker = FileInfo {
+            version_id: None,
+            ..marker
+        };
+
+        SetDisks::rename_data(
+            std::slice::from_ref(&online_disk),
+            RUSTFS_META_TMP_BUCKET,
+            "source",
+            &[marker],
+            bucket,
+            object,
+            1,
+        )
+        .await
+        .expect("null delete marker should commit");
+
+        let stored = disk
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("null delete marker should remain readable");
+        assert!(stored.deleted);
+        assert_eq!(stored.version_id, None);
+        assert!(stored.is_canonical_delete_marker());
+    }
+
+    #[tokio::test]
+    async fn rename_delete_marker_quorum_failure_restores_existing_metadata() {
+        let bucket = "rename-marker-quorum-bucket";
+        let object = "object";
+        let (_dirs, mut online_disks) = call_counter_local_disks(bucket, 1).await;
+        let online_disk = online_disks.pop().expect("one test disk slot should be present");
+        let disk = online_disk.as_ref().expect("test disk should be online");
+        match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("temporary metadata volume should be available: {err:?}"),
+        }
+        let old_version_id = Uuid::new_v4();
+        let mut old = metadata_test_fileinfo(object);
+        old.version_id = Some(old_version_id);
+        old.mod_time = Some(OffsetDateTime::now_utc());
+        disk.write_metadata(bucket, bucket, object, old)
+            .await
+            .expect("old metadata should be written");
+        let marker_version_id = Uuid::new_v4();
+        let marker = metadata_test_delete_marker(object, marker_version_id, OffsetDateTime::now_utc());
+
+        let err = SetDisks::rename_data(
+            &[online_disk.clone(), None],
+            RUSTFS_META_TMP_BUCKET,
+            "source",
+            &[marker, FileInfo::default()],
+            bucket,
+            object,
+            2,
+        )
+        .await
+        .expect_err("quorum-minus-one marker commit should fail");
+
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
+        let restored = disk
+            .read_version("", bucket, object, &old_version_id.to_string(), &ReadOptions::default())
+            .await
+            .expect("old metadata should remain after rollback");
+        assert!(!restored.deleted);
+        assert_eq!(restored.version_id, Some(old_version_id));
+        assert!(matches!(
+            disk.read_version("", bucket, object, &marker_version_id.to_string(), &ReadOptions::default())
+                .await,
+            Err(DiskError::FileVersionNotFound)
+        ));
     }
 
     /// Demo / regression guard for the backlog#1325 rename fan-out pause barrier

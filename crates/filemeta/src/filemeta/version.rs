@@ -29,9 +29,10 @@ use super::*;
 use crate::ChecksumInfo;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
-    SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
-    contains_key_bytes, get_bytes, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
+    RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID,
+    SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME,
+    SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes, has_internal_suffix, insert_bytes, is_internal_key,
+    remove_bytes, strip_internal_prefix,
 };
 
 const MSGPACK_EXT8: u8 = 0xc7;
@@ -806,7 +807,7 @@ impl TryFrom<LegacyMetaV2Version> for FileMetaVersion {
 
 impl From<FileInfo> for FileMetaVersion {
     fn from(value: FileInfo) -> Self {
-        if value.deleted {
+        if value.is_storage_delete_marker() {
             FileMetaVersion {
                 version_type: VersionType::Delete,
                 legacy_object: None,
@@ -2360,9 +2361,15 @@ impl MetaObject {
         let transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
-        let transition_version_id = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
-            .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
-            .filter(|u| !u.is_nil());
+        let transition_version_id = match get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) {
+            None => None,
+            Some(value) if value.is_empty() => None,
+            Some(value) => match Uuid::from_slice(value.as_slice()) {
+                Ok(version_id) if version_id.is_nil() => None,
+                Ok(version_id) => Some(version_id),
+                Err(_) => return Err(Error::FileCorrupt),
+            },
+        };
         let transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
@@ -2657,9 +2664,19 @@ impl MetaDeleteMarker {
                 .map(|v| String::from_utf8_lossy(&v).to_string())
                 .unwrap_or_default();
 
-            fi.transition_version_id = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
-                .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
-                .filter(|u| !u.is_nil());
+            fi.transition_version_id = match get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) {
+                None => None,
+                Some(value) if value.is_empty() => None,
+                Some(value) => match Uuid::from_slice(value.as_slice()) {
+                    Ok(version_id) if version_id.is_nil() => None,
+                    Ok(version_id) => Some(version_id),
+                    // `MetaDeleteMarker::into_fileinfo` predates fallible
+                    // conversion. Preserve corruption as the nil sentinel so
+                    // metadata-boundary validation rejects it instead of
+                    // treating a malformed remote version as unversioned.
+                    Err(_) => Some(Uuid::nil()),
+                },
+            };
         }
 
         fi
@@ -2774,10 +2791,54 @@ impl MetaDeleteMarker {
 
 impl From<FileInfo> for MetaDeleteMarker {
     fn from(value: FileInfo) -> Self {
+        let mut meta_sys = HashMap::new();
+        let mut durable_metadata: HashMap<String, (&str, bool)> = HashMap::new();
+        for (key, metadata_value) in &value.metadata {
+            if !is_internal_key(key) || is_skip_meta_key(key) {
+                continue;
+            }
+            let Some(suffix) = strip_internal_prefix(key) else {
+                continue;
+            };
+            let rustfs_preferred = key
+                .get(..RUSTFS_INTERNAL_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RUSTFS_INTERNAL_PREFIX));
+            match durable_metadata.entry(suffix) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((metadata_value, rustfs_preferred));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) if rustfs_preferred && !entry.get().1 => {
+                    entry.insert((metadata_value, true));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+        for (suffix, (metadata_value, _)) in durable_metadata {
+            insert_bytes(&mut meta_sys, &suffix, metadata_value.as_bytes().to_vec());
+        }
+        if value.tier_free_version() {
+            insert_bytes(&mut meta_sys, SUFFIX_FREE_VERSION, vec![]);
+        }
+        if !value.transition_status.is_empty() {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_STATUS, value.transition_status.as_bytes().to_vec());
+        }
+        if !value.transitioned_objname.is_empty() {
+            insert_bytes(
+                &mut meta_sys,
+                SUFFIX_TRANSITIONED_OBJECTNAME,
+                value.transitioned_objname.as_bytes().to_vec(),
+            );
+        }
+        if let Some(version_id) = value.transition_version_id {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, version_id.as_bytes().to_vec());
+        }
+        if !value.transition_tier.is_empty() {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
+        }
         Self {
             version_id: value.version_id,
             mod_time: value.mod_time,
-            meta_sys: HashMap::new(),
+            meta_sys,
         }
     }
 }
@@ -3309,6 +3370,31 @@ pub fn read_xl_meta_no_data_sync<R: std::io::Read>(reader: &mut R, size: usize) 
 mod tests {
     use super::*;
     use serde::Serialize;
+
+    #[test]
+    fn delete_marker_conversion_preserves_only_durable_internal_metadata() {
+        let mut marker = FileInfo::default();
+        marker
+            .metadata
+            .insert("x-minio-internal-purgestatus".to_string(), "pending".to_string());
+        marker
+            .metadata
+            .insert("x-rustfs-internal-healing".to_string(), "true".to_string());
+        marker.metadata.insert("content-type".to_string(), "text/plain".to_string());
+        let remote_version_id = Uuid::new_v4();
+        marker.transition_version_id = Some(remote_version_id);
+
+        let converted = MetaDeleteMarker::from(marker);
+
+        assert_eq!(converted.meta_sys.get("x-rustfs-internal-purgestatus"), Some(&b"pending".to_vec()));
+        assert_eq!(converted.meta_sys.get("x-minio-internal-purgestatus"), Some(&b"pending".to_vec()));
+        assert_eq!(
+            get_bytes(&converted.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID),
+            Some(remote_version_id.as_bytes().to_vec())
+        );
+        assert!(!converted.meta_sys.contains_key("x-rustfs-internal-healing"));
+        assert!(!converted.meta_sys.contains_key("content-type"));
+    }
 
     #[derive(Serialize)]
     enum LegacyDeleteVersionTypeFixture {
@@ -3984,6 +4070,16 @@ mod tests {
     }
 
     #[test]
+    fn meta_object_transition_version_id_malformed_is_corrupt() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
+        let err = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect_err("malformed transition version UUID must be rejected");
+        assert!(matches!(err, Error::FileCorrupt));
+    }
+
+    #[test]
     fn delete_marker_free_version_transition_version_id_nil_uuid_yields_none() {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
@@ -4010,6 +4106,23 @@ mod tests {
         }
         .into_fileinfo("b", "k", false);
         assert_eq!(fi.transition_version_id, Some(id));
+    }
+
+    #[test]
+    fn delete_marker_free_version_transition_version_id_malformed_is_corrupt() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_TIER, b"WARM".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_OBJECTNAME, b"remote-object".to_vec());
+        let fi = MetaDeleteMarker {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
+
+        assert!(matches!(fi.validate_for_metadata_read(), Err(Error::FileCorrupt)));
     }
 
     #[test]

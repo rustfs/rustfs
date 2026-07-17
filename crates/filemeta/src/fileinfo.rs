@@ -17,8 +17,8 @@ use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
-    SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, has_internal_suffix, insert_str,
+    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_FREE_VERSION, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID,
+    SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, has_internal_suffix, insert_str,
 };
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
@@ -453,11 +453,14 @@ impl FileInfo {
         Ok(())
     }
 
-    fn validate_delete_marker_shape(&self) -> Result<()> {
+    fn validate_delete_marker_shape(&self, expected_index: usize, allow_nil_version_id: bool) -> Result<()> {
+        if !self.deleted {
+            return Err(Error::FileCorrupt);
+        }
         let erasure = &self.erasure;
-        if !self.deleted
-            || self.mod_time.is_none_or(|mod_time| mod_time <= OffsetDateTime::UNIX_EPOCH)
-            || self.version_id.is_some_and(|version_id| version_id.is_nil())
+        let stored_free_version = contains_key_str(&self.metadata, SUFFIX_FREE_VERSION);
+        if self.mod_time.is_none_or(|mod_time| mod_time <= OffsetDateTime::UNIX_EPOCH)
+            || (!allow_nil_version_id && self.version_id.is_some_and(|version_id| version_id.is_nil()))
             || self.transition_version_id.is_some_and(|version_id| version_id.is_nil())
             || self.size != 0
             || self.data_dir.is_some()
@@ -470,9 +473,11 @@ impl FileInfo {
             || erasure.data_blocks != 0
             || erasure.parity_blocks != 0
             || erasure.block_size != 0
-            || erasure.index != 0
+            || erasure.index != expected_index
             || !erasure.distribution.is_empty()
             || !erasure.checksums.is_empty()
+            || stored_free_version != self.tier_free_version()
+            || (stored_free_version && (self.transition_tier.is_empty() || self.transitioned_objname.is_empty()))
         {
             return Err(Error::FileCorrupt);
         }
@@ -536,7 +541,7 @@ impl FileInfo {
         let erasure_layout = match mode {
             ValidationMode::RequireErasure => Some(self.validate_erasure_geometry()?),
             ValidationMode::DeleteOnly => {
-                self.validate_delete_marker_shape()?;
+                self.validate_delete_marker_shape(0, false)?;
                 None
             }
         };
@@ -570,7 +575,22 @@ impl FileInfo {
     /// Returns whether this is a canonical delete marker rather than an
     /// erasure-backed object version in a purge-pending state.
     pub fn is_canonical_delete_marker(&self) -> bool {
-        self.validate_delete_marker_shape().is_ok()
+        self.validate_delete_marker_shape(0, false).is_ok()
+    }
+
+    /// Storage-only marker classification after an absent version ID has been
+    /// normalized to the internal nil UUID. Network and disk boundaries must
+    /// continue to use [`Self::is_canonical_delete_marker`].
+    pub(crate) fn is_storage_delete_marker(&self) -> bool {
+        self.validate_delete_marker_shape(0, true).is_ok()
+    }
+
+    /// Whether this is a canonical delete marker carrying only the per-disk
+    /// index assigned by an older rename coordinator.
+    pub fn is_legacy_indexed_delete_marker(&self) -> bool {
+        self.erasure.index > 0
+            && self.erasure.index <= MAX_ERASURE_SHARDS
+            && self.validate_delete_marker_shape(self.erasure.index, false).is_ok()
     }
 
     /// Validates complete metadata before a write fanout assigns its per-disk
@@ -1354,6 +1374,51 @@ mod tests {
             .validate_for_metadata_read()
             .expect("erasure-backed purge-pending objects remain valid payload metadata");
         assert!(!purge_pending.is_canonical_delete_marker());
+    }
+
+    #[test]
+    fn rename_validation_accepts_only_legacy_assigned_delete_marker_index() {
+        let marker = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let mut legacy_marker = marker.clone();
+        legacy_marker.erasure.index = 2;
+        assert_eq!(legacy_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
+        assert!(legacy_marker.is_legacy_indexed_delete_marker());
+        legacy_marker.erasure.index = 0;
+        legacy_marker
+            .validate_for_metadata_read()
+            .expect("normalized legacy marker should pass strict metadata validation");
+
+        let mut malformed_marker = legacy_marker;
+        malformed_marker.erasure.index = 2;
+        malformed_marker.erasure.data_blocks = 1;
+        assert!(!malformed_marker.is_legacy_indexed_delete_marker());
+        assert_eq!(malformed_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
+
+        let mut forged_free_marker = marker.clone();
+        insert_str(&mut forged_free_marker.metadata, SUFFIX_FREE_VERSION, String::new());
+        assert_eq!(forged_free_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
+
+        let mut free_marker = marker.clone();
+        insert_str(&mut free_marker.metadata, SUFFIX_FREE_VERSION, String::new());
+        free_marker.set_tier_free_version();
+        free_marker.transition_tier = "WARM".to_string();
+        free_marker.transitioned_objname = "remote/object".to_string();
+        free_marker
+            .validate_for_metadata_read()
+            .expect("complete tier free-version marker should remain valid");
+
+        let mut out_of_range_marker = marker;
+        out_of_range_marker.erasure.index = MAX_ERASURE_SHARDS + 1;
+        assert!(!out_of_range_marker.is_legacy_indexed_delete_marker());
+        assert_eq!(out_of_range_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
     }
 
     #[test]
