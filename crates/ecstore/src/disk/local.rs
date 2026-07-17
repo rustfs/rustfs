@@ -39,7 +39,7 @@ use metrics::gauge;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
-    get_file_info, read_xl_meta_no_data_sync,
+    ValidationMode, get_file_info, read_xl_meta_no_data_sync,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
@@ -5945,6 +5945,7 @@ impl DiskAPI for LocalDisk {
             fi.uses_legacy_checksum,
         )
         .map_err(DiskError::from)?;
+        fi.validate(ValidationMode::RequireErasure)?;
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -6071,6 +6072,8 @@ impl DiskAPI for LocalDisk {
     }
     #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
+        let validated = fi.validate(ValidationMode::RequireErasure)?;
+        let layout = validated.erasure_layout().ok_or(DiskError::FileCorrupt)?;
         let volume_dir = self.get_bucket_path(volume)?;
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -6105,7 +6108,9 @@ impl DiskAPI for LocalDisk {
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                         continue;
                     }
-                    if (st.len() as i64) < fi.erasure.shard_file_size(part.size as i64) {
+                    let expected_size = layout.shard_file_size(part.size).ok_or(DiskError::FileCorrupt)?;
+                    let expected_size = u64::try_from(expected_size).map_err(|_| DiskError::FileCorrupt)?;
+                    if st.len() < expected_size {
                         resp.results[i] = CHECK_PART_FILE_CORRUPT;
                         continue;
                     }
@@ -6571,6 +6576,7 @@ impl DiskAPI for LocalDisk {
         dst_path: &str,
     ) -> Result<RenameDataResp> {
         crate::hp_guard!("LocalDisk::rename_data");
+        fi.validate(ValidationMode::RequireErasure)?;
         // Snapshot the destination part paths before `fi` is consumed below. These
         // are the descriptors a reader may hold for the version this call is about
         // to replace (backlog#1145); readers build the identical string in
@@ -7325,6 +7331,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_metadata");
+        fi.validate_for_metadata_read()?;
         let p = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
         let mut meta = FileMeta::new();
@@ -7396,6 +7403,11 @@ impl DiskAPI for LocalDisk {
                 include_free_versions: opts.incl_free_versions,
             },
         )?;
+
+        fi.validate_for_metadata_read()?;
+        if fi.is_canonical_delete_marker() {
+            return Ok(fi);
+        }
 
         if opts.read_data {
             if fi.data.as_ref().is_some_and(|d| !d.is_empty()) || fi.size == 0 {
@@ -7945,15 +7957,15 @@ mod test {
             .as_ref()
             .map(|data| i64::try_from(data.len()).expect("test data length should fit i64"))
             .unwrap_or(1);
-        FileInfo {
-            name: name.to_string(),
-            version_id: Some(version_id),
-            data_dir,
-            data,
-            size,
-            mod_time: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        }
+        let mut file_info = FileInfo::new(name, 1, 0);
+        file_info.erasure.index = 1;
+        file_info.name = name.to_string();
+        file_info.version_id = Some(version_id);
+        file_info.data_dir = data_dir;
+        file_info.data = data;
+        file_info.size = size;
+        file_info.mod_time = Some(OffsetDateTime::now_utc());
+        file_info
     }
 
     fn test_meta(fi: FileInfo) -> Vec<u8> {
@@ -7982,6 +7994,156 @@ mod test {
             Ok(()) | Err(DiskError::VolumeExists) => {}
             Err(err) => panic!("test volume should be available: {err:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_version_rejects_zero_data_geometry_before_inline_shard_math() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "invalid-erasure";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        let mut file_info = test_file_info(object, Uuid::new_v4(), Some(Uuid::new_v4()), None);
+        file_info.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        file_info.erasure.data_blocks = 0;
+        file_info.erasure.parity_blocks = 2;
+        file_info.erasure.block_size = 1;
+        file_info.erasure.index = 1;
+        file_info.erasure.distribution = vec![1, 2];
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(file_info))
+            .await
+            .expect("invalid metadata should be written for the read regression");
+
+        let err = disk
+            .read_version(
+                "",
+                bucket,
+                object,
+                "",
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("invalid erasure geometry must fail before shard size calculation");
+
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[tokio::test]
+    async fn read_version_delete_marker_never_enters_inline_shard_math() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "delete-marker";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        let file_info = FileInfo {
+            name: object.to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(file_info))
+            .await
+            .expect("delete marker metadata should be written");
+
+        let file_info = disk
+            .read_version(
+                "",
+                bucket,
+                object,
+                "",
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete marker must return before payload shard math");
+
+        assert!(file_info.deleted);
+        assert_eq!(file_info.erasure.data_blocks, 0);
+    }
+
+    #[tokio::test]
+    async fn read_version_purge_pending_payload_still_loads_inline_candidate_data() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        let object = "purge-pending-object";
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let payload = b"purge-pending payload";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        let part_dir = object_dir.join(data_dir.to_string());
+        fs::create_dir_all(&part_dir)
+            .await
+            .expect("object data dir should be created");
+        fs::write(part_dir.join("part.1"), payload)
+            .await
+            .expect("payload part should be written");
+
+        let mut file_info = test_file_info(object, version_id, Some(data_dir), None);
+        file_info.size = payload.len() as i64;
+        file_info.add_object_part(
+            1,
+            "part-etag".to_string(),
+            payload.len(),
+            file_info.mod_time,
+            payload.len() as i64,
+            None,
+            None,
+        );
+        rustfs_utils::http::insert_str(
+            &mut file_info.metadata,
+            rustfs_utils::http::SUFFIX_PURGESTATUS,
+            "target=PENDING;".to_string(),
+        );
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(file_info))
+            .await
+            .expect("purge-pending object metadata should be written");
+
+        let file_info = disk
+            .read_version(
+                "",
+                bucket,
+                object,
+                "",
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("purge-pending object remains an erasure payload at the disk boundary");
+
+        assert!(file_info.deleted, "version purge state should retain its logical deleted flag");
+        assert!(!file_info.is_canonical_delete_marker());
+        assert_eq!(file_info.data.as_deref(), Some(payload.as_slice()));
     }
 
     /// Regression coverage for the disk-layer delete/rename fixes:
@@ -8578,6 +8740,25 @@ mod test {
     }
 
     #[tokio::test]
+    async fn write_metadata_rejects_default_like_delete_marker() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let forged = FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+
+        let err = disk
+            .write_metadata("bucket", "bucket", "object", forged)
+            .await
+            .expect_err("default-like delete marker must be rejected before persistence");
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[tokio::test]
     async fn write_metadata_replaces_corrupt_existing_xl_meta_without_losing_new_version() {
         use tempfile::tempdir;
 
@@ -8630,6 +8811,7 @@ mod test {
                 data_blocks: 2,
                 parity_blocks: 2,
                 block_size: 4,
+                index: 1,
                 distribution: vec![1, 2, 3, 4],
                 ..Default::default()
             },
@@ -13557,6 +13739,49 @@ mod test {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<ErasureConstructionError>());
+    }
+
+    #[tokio::test]
+    async fn local_disk_check_parts_rejects_zero_data_geometry_before_shard_math() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "check-parts-volume";
+        let object = "object.bin";
+        let data_dir = Uuid::new_v4();
+        ensure_test_volume(&disk, volume).await;
+
+        let part_path = path_join_buf(&[object, &data_dir.to_string(), "part.1"]);
+        disk.write_all(volume, &part_path, Bytes::from_static(b"shard"))
+            .await
+            .expect("test shard should be written");
+        let file_info = FileInfo {
+            data_dir: Some(data_dir),
+            parts: vec![ObjectPartInfo {
+                number: 1,
+                size: 1,
+                actual_size: 1,
+                ..Default::default()
+            }],
+            erasure: ErasureInfo {
+                data_blocks: 0,
+                parity_blocks: 2,
+                block_size: 1,
+                index: 1,
+                distribution: vec![1, 2],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = disk
+            .check_parts(volume, object, &file_info)
+            .await
+            .expect_err("invalid erasure metadata must fail before shard size calculation");
+
+        assert_eq!(err, DiskError::FileCorrupt);
     }
 
     #[tokio::test]

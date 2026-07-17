@@ -376,15 +376,21 @@ pub(crate) mod versioning_sys {
 }
 
 pub(crate) mod storageclass {
+    pub(crate) const CLASS_STANDARD: &str = super::ecstore_config::storageclass::CLASS_STANDARD;
     pub(crate) const INLINE_BLOCK_ENV: &str = super::ecstore_config::storageclass::INLINE_BLOCK_ENV;
     pub(crate) const OPTIMIZE_ENV: &str = super::ecstore_config::storageclass::OPTIMIZE_ENV;
+    pub(crate) const RRS: &str = super::ecstore_config::storageclass::RRS;
     pub(crate) const RRS_ENV: &str = super::ecstore_config::storageclass::RRS_ENV;
+    pub(crate) const STANDARD: &str = super::ecstore_config::storageclass::STANDARD;
     pub(crate) const STANDARD_ENV: &str = super::ecstore_config::storageclass::STANDARD_ENV;
 
     pub(crate) type Config = super::ecstore_config::storageclass::Config;
 
-    pub(crate) fn lookup_config(kvs: &rustfs_config::server_config::KVS, set_drive_count: usize) -> super::Result<Config> {
-        super::ecstore_config::storageclass::lookup_config(kvs, set_drive_count)
+    pub(crate) fn lookup_config_for_pools(
+        kvs: &rustfs_config::server_config::KVS,
+        set_drive_counts: &[usize],
+    ) -> super::Result<Config> {
+        super::ecstore_config::storageclass::lookup_config_for_pools(kvs, set_drive_counts)
     }
 }
 

@@ -104,7 +104,7 @@ pub fn set_global_storage_class(cfg: storageclass::Config) {
 }
 
 #[cfg(test)]
-mod tests {
+mod storage_class_publish_tests {
     use super::publish_storage_class_config;
     use crate::config::storageclass::{self, CLASS_STANDARD, STANDARD, lookup_config_for_pools_without_env};
     use arc_swap::ArcSwap;

@@ -18,8 +18,8 @@ use crate::admin::runtime_sources::{
     current_app_context, current_object_store_handle_for_context, current_server_config_for_context, publish_server_config,
 };
 use crate::admin::service::config::{
-    PreparedRuntimeConfig, apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, prepare_server_config,
-    signal_config_snapshot_reload, signal_dynamic_config_reload,
+    FULL_CONFIG_WORKER_SUBSYSTEMS, PreparedRuntimeConfig, apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem,
+    prepare_server_config, signal_config_snapshot_reload, signal_dynamic_config_reload,
 };
 use crate::admin::storage_api::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
 use crate::admin::storage_api::config::{
@@ -83,6 +83,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::future::Future;
 use time::OffsetDateTime;
+use tracing::warn;
 use uuid::Uuid;
 
 const REDACTED_VALUE: &str = "*redacted*";
@@ -95,6 +96,9 @@ const CONFIG_APPLIED_HEADER: &str = "x-rustfs-config-applied";
 const CONFIG_APPLIED_COMPAT_HEADER: &str = "x-minio-config-applied";
 const CONFIG_APPLIED_TRUE: &str = "true";
 const DEFAULT_COMMENT_DESCRIPTION: &str = "optionally add a comment to this setting";
+const EVENT_CONFIG_WORKER_RELOAD_FAILED: &str = "config_worker_reload_failed";
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_CONFIG: &str = "config";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigEntry {
@@ -1559,14 +1563,21 @@ async fn commit_prepared_config(
     publish(config, prepared)
 }
 
-/// Re-apply all dynamic subsystems from the given config and signal peers to reload.
-/// Used after full-config operations (restore, set-config) where the leader replaces
-/// the entire config and must ensure runtime state (e.g. GLOBAL_STORAGE_CLASS) is
-/// refreshed on both the leader and all peers.
-async fn apply_and_signal_dynamic_subsystems(config: &ServerConfig) {
-    for sub_system in [AUDIT_WEBHOOK_SUB_SYS, AUDIT_MQTT_SUB_SYS, SCANNER_SUB_SYS, HEAL_SUB_SYS] {
-        if apply_dynamic_config_for_subsystem(config, sub_system).await.unwrap_or(false) {
-            signal_dynamic_config_reload(sub_system).await;
+/// Re-apply local mutable worker families after a full-config replacement.
+/// Peers receive one full-snapshot signal after this returns; signaling each
+/// family here as well would recreate audit/scanner targets twice per peer.
+async fn apply_dynamic_subsystems(config: &ServerConfig) {
+    for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
+        if let Err(err) = apply_dynamic_config_for_subsystem(config, sub_system).await {
+            warn!(
+                event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_subsystem = sub_system,
+                state = "best_effort_reload_failed",
+                error = %err,
+                "Published server config but failed to reload a local worker subsystem"
+            );
         }
     }
 }
@@ -1775,7 +1786,8 @@ impl Operation for RestoreConfigHistoryKVHandler {
             publish_prepared_config_snapshots,
         )
         .await?;
-        apply_and_signal_dynamic_subsystems(&config).await;
+        signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
+        apply_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 
         success_response(false)
@@ -1819,7 +1831,8 @@ impl Operation for SetConfigHandler {
             publish_prepared_config_snapshots,
         )
         .await?;
-        apply_and_signal_dynamic_subsystems(&config).await;
+        signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
+        apply_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 
         success_response(false)
@@ -1881,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_config_write_handlers_use_the_atomic_commit_workflow() {
+    fn storage_config_write_handlers_persist_before_publishing() {
         const SOURCE: &str = include_str!("config_admin.rs");
 
         for (handler, next_handler, follow_up) in [
@@ -1898,9 +1911,13 @@ mod tests {
             (
                 "RestoreConfigHistoryKVHandler",
                 "GetConfigHandler",
-                "apply_and_signal_dynamic_subsystems(&config).await",
+                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
             ),
-            ("SetConfigHandler", "#[cfg(test)]", "apply_and_signal_dynamic_subsystems(&config).await"),
+            (
+                "SetConfigHandler",
+                "#[cfg(test)]",
+                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
+            ),
         ] {
             let start_marker = format!("impl Operation for {handler}");
             let start = SOURCE
@@ -1911,7 +1928,7 @@ mod tests {
                 .find(next_handler)
                 .unwrap_or_else(|| panic!("missing {next_handler} after {handler}"));
             let implementation = &tail[..end];
-            let atomic_path = if matches!(handler, "SetConfigKVHandler" | "DelConfigKVHandler") {
+            let prepared_commit_path = if matches!(handler, "SetConfigKVHandler" | "DelConfigKVHandler") {
                 let branch_start = implementation
                     .find("if sub_system == Some(STORAGE_CLASS_SUB_SYS)")
                     .unwrap_or_else(|| panic!("missing storage-class branch in {handler}"));
@@ -1924,24 +1941,40 @@ mod tests {
                 implementation
             };
 
-            assert_eq!(atomic_path.matches("commit_prepared_config(").count(), 1, "{handler}");
-            let commit_start = atomic_path.find("commit_prepared_config(").expect("commit call");
-            let commit_end = atomic_path[commit_start..].find(';').expect("commit terminator") + commit_start;
-            let commit_statement = &atomic_path[commit_start..=commit_end];
+            assert_eq!(prepared_commit_path.matches("commit_prepared_config(").count(), 1, "{handler}");
+            let commit_start = prepared_commit_path.find("commit_prepared_config(").expect("commit call");
+            let commit_end = prepared_commit_path[commit_start..].find(';').expect("commit terminator") + commit_start;
+            let commit_statement = &prepared_commit_path[commit_start..=commit_end];
             assert!(commit_statement.contains(".await?;"), "{handler} must propagate commit failure");
 
-            let follow_up_start = atomic_path
+            let follow_up_start = prepared_commit_path
                 .find(follow_up)
                 .unwrap_or_else(|| panic!("missing follow-up in {handler}"));
             assert!(follow_up_start > commit_end, "{handler} must run follow-up only after commit");
-            assert!(!atomic_path.contains("publish_server_config("), "{handler} must not publish directly");
-            assert!(!atomic_path.contains(".publish_storage_class("), "{handler} must not publish directly");
+            assert!(
+                !prepared_commit_path.contains("publish_server_config("),
+                "{handler} must not publish directly"
+            );
+            assert!(
+                !prepared_commit_path.contains(".publish_storage_class("),
+                "{handler} must not publish directly"
+            );
 
             if matches!(handler, "RestoreConfigHistoryKVHandler" | "SetConfigHandler") {
-                let signal_start = atomic_path
+                let worker_start = prepared_commit_path
+                    .find("apply_dynamic_subsystems(&config).await")
+                    .unwrap_or_else(|| panic!("missing local worker apply in {handler}"));
+                let signal_start = prepared_commit_path
                     .find("signal_config_snapshot_reload().await")
                     .unwrap_or_else(|| panic!("missing snapshot signal in {handler}"));
-                assert!(signal_start > follow_up_start, "{handler} must signal peers after local dynamic apply");
+                assert!(
+                    worker_start > follow_up_start,
+                    "{handler} must converge peer parity before local worker apply"
+                );
+                assert!(
+                    signal_start > worker_start,
+                    "{handler} must signal the full snapshot after local worker apply"
+                );
             }
         }
     }

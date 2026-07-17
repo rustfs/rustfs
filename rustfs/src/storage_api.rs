@@ -231,6 +231,11 @@ pub(crate) mod startup {
             init_local_disks_with_instance_ctx, init_lock_clients, new_instance_ctx, prewarm_local_disk_id_map_with_instance_ctx,
             try_migrate_server_config,
         };
+
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{
+            INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV,
+        };
     }
 }
 

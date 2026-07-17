@@ -164,7 +164,7 @@ pub(in crate::set_disk) struct MetadataFanoutObservation {
 
 impl MetadataFanoutObservation {
     pub(in crate::set_disk) fn from_file_info(file_info: &FileInfo, elapsed: Duration) -> Self {
-        if file_info.is_valid() {
+        if file_info_is_valid_for_metadata(file_info) {
             Self {
                 outcome: GET_METADATA_RESPONSE_VALID,
                 elapsed,
@@ -301,6 +301,7 @@ pub(in crate::set_disk) struct MetadataQuorumAccumulator {
     pub(in crate::set_disk) candidate_votes: usize,
     pub(in crate::set_disk) conflicting_metadata: bool,
     pub(in crate::set_disk) delete_marker_seen: bool,
+    pub(in crate::set_disk) delete_marker_candidates: Vec<(FileInfo, usize)>,
     pub(in crate::set_disk) delete_marker_votes: usize,
     pub(in crate::set_disk) requested_version_id: String,
     pub(in crate::set_disk) matching_version_votes: usize,
@@ -321,6 +322,7 @@ impl MetadataQuorumAccumulator {
             candidate_votes: 0,
             conflicting_metadata: false,
             delete_marker_seen: false,
+            delete_marker_candidates: Vec::new(),
             delete_marker_votes: 0,
             requested_version_id: String::new(),
             matching_version_votes: 0,
@@ -333,7 +335,7 @@ impl MetadataQuorumAccumulator {
     }
 
     pub(in crate::set_disk) fn observe_file_info(&mut self, file_info: &FileInfo) {
-        if !file_info.is_valid() {
+        if !file_info_is_valid_for_metadata(file_info) {
             self.hard_errors = self.hard_errors.saturating_add(1);
             return;
         }
@@ -348,9 +350,24 @@ impl MetadataQuorumAccumulator {
             self.matching_version_votes = self.matching_version_votes.saturating_add(1);
         }
 
-        if file_info.deleted {
-            self.delete_marker_votes = self.delete_marker_votes.saturating_add(1);
+        if file_info.is_canonical_delete_marker() {
             self.delete_marker_seen = true;
+            if let Some((_, votes)) = self
+                .delete_marker_candidates
+                .iter_mut()
+                .find(|(candidate, _)| metadata_early_stop_candidate_matches(candidate, file_info))
+            {
+                *votes = votes.saturating_add(1);
+            } else {
+                self.delete_marker_candidates.push((file_info.clone(), 1));
+            }
+            self.delete_marker_votes = self
+                .delete_marker_candidates
+                .iter()
+                .map(|(_, votes)| *votes)
+                .max()
+                .unwrap_or_default();
+            self.conflicting_metadata |= self.delete_marker_candidates.len() > 1;
             return;
         }
 
@@ -477,10 +494,15 @@ impl MetadataQuorumAccumulator {
         if self.default_parity_count == 0 {
             return Some(self.total_disks);
         }
-        if candidate.deleted || candidate.size == 0 || candidate.erasure.parity_blocks >= self.total_disks {
+        if candidate.is_canonical_delete_marker() || candidate.size == 0 || candidate.erasure.parity_blocks >= self.total_disks {
             return None;
         }
-        Some(candidate.write_quorum(self.default_write_quorum()))
+        let data_blocks = candidate.erasure.data_blocks;
+        Some(if data_blocks == candidate.erasure.parity_blocks {
+            data_blocks.saturating_add(1)
+        } else {
+            data_blocks
+        })
     }
 
     pub(in crate::set_disk) fn default_write_quorum(&self) -> usize {
@@ -518,13 +540,22 @@ pub(in crate::set_disk) fn metadata_early_stop_candidate_matches(left: &FileInfo
         && left.is_latest == right.is_latest
         && left.deleted == right.deleted
         && left.mark_deleted == right.mark_deleted
+        && left.transition_status == right.transition_status
+        && left.transitioned_objname == right.transitioned_objname
+        && left.transition_tier == right.transition_tier
+        && left.transition_version_id == right.transition_version_id
+        && left.expire_restored == right.expire_restored
         && left.size == right.size
         && left.mod_time == right.mod_time
         && left.mode == right.mode
+        && left.written_by_version == right.written_by_version
         && left.metadata == right.metadata
+        && left.replication_state_internal == right.replication_state_internal
         && left.parts == right.parts
         && left.checksum == right.checksum
         && left.versioned == right.versioned
+        && left.num_versions == right.num_versions
+        && left.successor_mod_time == right.successor_mod_time
         && left.data_dir == right.data_dir
         && left.erasure.algorithm == right.erasure.algorithm
         && left.erasure.data_blocks == right.erasure.data_blocks
@@ -2257,13 +2288,24 @@ impl SetDisks {
             )));
         }
 
-        FileMeta {
+        let file_info_versions = FileMeta {
             versions,
             ..Default::default()
         }
         .get_all_file_info_versions(bucket, object, true)
-        .map(Some)
-        .map_err(|err| Error::other(format!("exact object versions decode failed for {bucket}/{object}: {err}")))
+        .map_err(|err| Error::other(format!("exact object versions decode failed for {bucket}/{object}: {err}")))?;
+
+        for file_info in file_info_versions
+            .versions
+            .iter()
+            .chain(file_info_versions.free_versions.iter())
+        {
+            file_info
+                .validate_for_metadata_read()
+                .map_err(|err| Error::other(format!("exact object versions validation failed for {bucket}/{object}: {err}")))?;
+        }
+
+        Ok(Some(file_info_versions))
     }
 
     pub(in crate::set_disk) async fn read_all_raw_file_info(
@@ -2375,7 +2417,7 @@ impl SetDisks {
         // `into_fileinfo` with an empty version_id selects the first non-free version
         // (see FileMeta::into_fileinfo); replicate that selection from the header here.
         let vid = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
-            Ok(finfo) if finfo.is_valid() => finfo.version_id.unwrap_or(Uuid::nil()),
+            Ok(finfo) if file_info_is_valid_for_metadata(&finfo) => finfo.version_id.unwrap_or(Uuid::nil()),
             _ => match meta
                 .versions
                 .iter()
@@ -2398,7 +2440,10 @@ impl SetDisks {
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
                 match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, incl_free_vers, true) {
-                    Ok(res) => meta_file_infos[idx] = res,
+                    Ok(res) => match res.validate_for_metadata_read() {
+                        Ok(_) => meta_file_infos[idx] = res,
+                        Err(err) => errs[idx] = Some(err.into()),
+                    },
                     Err(err) => errs[idx] = Some(err.into()),
                 }
             }
@@ -2608,6 +2653,17 @@ impl SetDisks {
         Vec<Option<DiskStore>>,
         Option<OldCurrentSize>,
     )> {
+        if let Some(file_info) = disks
+            .iter()
+            .zip(file_infos.iter())
+            .find_map(|(disk, file_info)| disk.as_ref().map(|_| file_info))
+        {
+            // Newly encoded metadata does not acquire its per-disk shard index
+            // until the fanout below. Validate the shared metadata shape once,
+            // using an online slot because shuffled offline slots contain the
+            // default placeholder, then validate each assigned geometry in its task.
+            file_info.validate_for_erasure_write()?;
+        }
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -2631,11 +2687,15 @@ impl SetDisks {
                 #[allow(clippy::let_unit_value)]
                 let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
 
+                let Some(disk) = disk else {
+                    return Err(DiskError::DiskNotFound);
+                };
+
                 if file_info.erasure.index == 0 {
                     file_info.erasure.index = i + 1;
                 }
 
-                if !file_info.is_valid() {
+                if !file_info.has_valid_erasure_geometry() {
                     return Err(DiskError::FileCorrupt);
                 }
 
@@ -2643,12 +2703,8 @@ impl SetDisks {
                 // A no-op immediately-ready future in production.
                 Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
-                if let Some(disk) = disk {
-                    disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
-                        .await
-                } else {
-                    Err(DiskError::DiskNotFound)
-                }
+                disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
+                    .await
             }));
         }
 
@@ -3391,7 +3447,7 @@ impl SetDisks {
         // that were never made durable), and deleting the surviving shards right away
         // turns a partial loss into a total one. Skip deletion and leave the object
         // for a later heal/scanner pass to re-evaluate.
-        if m.is_valid()
+        if file_info_is_valid_for_metadata(&m)
             && let Some(mod_time) = m.mod_time
         {
             let grace = dangling_delete_grace();
@@ -3412,7 +3468,7 @@ impl SetDisks {
         tags.insert("pool".to_string(), self.pool_index.to_string());
         tags.insert("merrs".to_string(), join_errs(errs));
         tags.insert("derrs".to_string(), format!("{data_errs_by_part:?}"));
-        if m.is_valid() {
+        if file_info_is_valid_for_metadata(&m) {
             tags.insert("sz".to_string(), m.size.to_string());
             tags.insert(
                 "mt".to_string(),
@@ -3502,7 +3558,7 @@ impl SetDisks {
             }
         }
 
-        let write_quorum = if m.is_valid() {
+        let write_quorum = if file_info_is_valid_for_metadata(&m) {
             m.write_quorum(self.default_write_quorum())
         } else {
             self.default_write_quorum()
@@ -4375,6 +4431,17 @@ mod tests {
         fi
     }
 
+    fn metadata_test_delete_marker(object: &str, version_id: Uuid, mod_time: OffsetDateTime) -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(version_id),
+            deleted: true,
+            mod_time: Some(mod_time),
+            ..Default::default()
+        }
+    }
+
     fn read_part_test_part(number: usize, etag: &str) -> ObjectPartInfo {
         ObjectPartInfo {
             number,
@@ -4432,6 +4499,21 @@ mod tests {
             Vec::new(),
         )
         .await
+    }
+
+    async fn write_raw_file_meta_unchecked(disk: &DiskStore, bucket: &str, object: &str, metadata: FileMeta) {
+        let encoded = metadata.marshal_msg().expect("raw regression metadata should serialize");
+        disk.write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::from(encoded))
+            .await
+            .expect("raw regression metadata should be installed");
+    }
+
+    async fn write_raw_file_info_unchecked(disk: &DiskStore, bucket: &str, object: &str, file_info: FileInfo) {
+        let mut metadata = FileMeta::new();
+        metadata
+            .add_version(file_info)
+            .expect("raw regression metadata should encode");
+        write_raw_file_meta_unchecked(disk, bucket, object, metadata).await;
     }
 
     fn failed_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
@@ -4589,6 +4671,28 @@ mod tests {
 
     fn rename_barrier_fileinfos(object: &str, count: usize) -> Vec<FileInfo> {
         (0..count).map(|_| metadata_test_fileinfo(object)).collect()
+    }
+
+    #[tokio::test]
+    async fn rename_data_skips_offline_placeholder_when_validating_new_metadata() {
+        let (_dirs, mut online_disks) = call_counter_local_disks("rename-validation-bucket", 1).await;
+        let online_disk = online_disks.pop().expect("one test disk should be present");
+        let mut file_info = metadata_test_fileinfo("rename-unassigned-index");
+        file_info.erasure.index = 0;
+
+        let err = SetDisks::rename_data(
+            &[None, online_disk],
+            RUSTFS_META_TMP_BUCKET,
+            "source",
+            &[FileInfo::default(), file_info],
+            "bucket",
+            "object",
+            1,
+        )
+        .await
+        .expect_err("the missing staged source must fail after metadata validation");
+
+        assert_ne!(err, DiskError::FileCorrupt);
     }
 
     /// Demo / regression guard for the backlog#1325 rename fan-out pause barrier
@@ -4794,6 +4898,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_quorum_accumulator_early_stops_on_one_delete_marker_majority() {
+        let marker = metadata_test_delete_marker("object", Uuid::new_v4(), OffsetDateTime::now_utc());
+        let mut accumulator = MetadataQuorumAccumulator::new(6, 3, true);
+
+        for _ in 0..4 {
+            accumulator.observe_file_info(&marker);
+        }
+
+        assert_eq!(accumulator.default_write_quorum(), 4);
+        assert_eq!(accumulator.delete_marker_votes, 4);
+        assert_eq!(
+            accumulator.early_stop_decision(),
+            Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_does_not_combine_distinct_delete_markers() {
+        let now = OffsetDateTime::now_utc();
+        let first = metadata_test_delete_marker("object", Uuid::new_v4(), now);
+        let second = metadata_test_delete_marker("object", Uuid::new_v4(), now + time::Duration::seconds(1));
+        let third = metadata_test_delete_marker("object", Uuid::new_v4(), now + time::Duration::seconds(2));
+        let mut accumulator = MetadataQuorumAccumulator::new(4, 2, true);
+
+        accumulator.observe_file_info(&first);
+        accumulator.observe_file_info(&second);
+        accumulator.observe_file_info(&third);
+
+        assert_eq!(accumulator.delete_marker_votes, 1);
+        assert_eq!(accumulator.delete_marker_candidates.len(), 3);
+        assert_eq!(accumulator.early_stop_decision(), None);
+
+        accumulator.observe_file_info(&second);
+        accumulator.observe_file_info(&second);
+        assert_eq!(accumulator.delete_marker_votes, 3);
+        assert!(accumulator.early_stop_decision().is_some());
+    }
+
+    #[test]
     fn metadata_quorum_accumulator_candidate_latest_quorum_handles_zero_parity_and_invalid_candidates() {
         let accumulator = MetadataQuorumAccumulator::new(4, 0, true);
         let candidate = metadata_test_fileinfo("object");
@@ -4803,7 +4948,10 @@ mod tests {
         let accumulator = MetadataQuorumAccumulator::new(4, 2, true);
         let mut deleted = candidate.clone();
         deleted.deleted = true;
-        assert_eq!(accumulator.candidate_latest_quorum(&deleted), None);
+        assert_eq!(accumulator.candidate_latest_quorum(&deleted), Some(3));
+
+        let marker = metadata_test_delete_marker("object", Uuid::new_v4(), OffsetDateTime::now_utc());
+        assert_eq!(accumulator.candidate_latest_quorum(&marker), None);
 
         let mut empty = candidate.clone();
         empty.size = 0;
@@ -5050,6 +5198,59 @@ mod tests {
         assert_eq!(versions.versions.len(), 1);
         assert_eq!(versions.versions[0].version_id, fi.version_id);
         assert_eq!(versions.versions[0].name, object);
+    }
+
+    #[tokio::test]
+    async fn load_file_info_versions_exact_rejects_transitioned_duplicate_parts() {
+        let bucket = "exact-versions-bucket";
+        let object = "poisoned-transitioned-object";
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+        let mut file_info = metadata_test_fileinfo(object);
+        file_info.version_id = Some(Uuid::new_v4());
+        file_info.mod_time = Some(OffsetDateTime::now_utc());
+        file_info.transition_status = TRANSITION_COMPLETE.to_string();
+        file_info.transitioned_objname = "remote/object".to_string();
+        file_info.transition_tier = "WARM".to_string();
+        file_info.parts.push(file_info.parts[0].clone());
+        write_raw_file_info_unchecked(&disk, bucket, object, file_info).await;
+        let set = io_primitives_test_set(vec![Some(disk)], 0).await;
+
+        let err = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect_err("exact loader must reject metadata that would poison decommission");
+
+        assert!(err.to_string().contains("validation failed"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn load_file_info_versions_exact_rejects_default_like_delete_marker() {
+        let bucket = "exact-versions-bucket";
+        let object = "forged-delete-marker";
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+        let forged_version = rustfs_filemeta::FileMetaVersion {
+            version_type: rustfs_filemeta::VersionType::Delete,
+            delete_marker: Some(rustfs_filemeta::MetaDeleteMarker {
+                version_id: Some(Uuid::new_v4()),
+                mod_time: None,
+                ..Default::default()
+            }),
+            write_version: 1,
+            ..Default::default()
+        };
+        let mut forged_meta = FileMeta::new();
+        forged_meta
+            .versions
+            .push(FileMetaShallowVersion::try_from(forged_version).expect("forged marker body should encode"));
+        write_raw_file_meta_unchecked(&disk, bucket, object, forged_meta).await;
+        let set = io_primitives_test_set(vec![Some(disk)], 0).await;
+
+        let err = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect_err("default-like delete marker must be rejected at the exact loader boundary");
+
+        assert!(err.to_string().contains("exact object versions decode failed"), "unexpected error: {err}");
     }
 
     #[tokio::test]

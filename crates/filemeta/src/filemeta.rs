@@ -14,7 +14,7 @@
 
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
-    ReplicationState, ReplicationStatusType, Result, ValidationMode, VersionPurgeStatusType, is_restored_object_on_disk,
+    ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk,
     replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
@@ -395,9 +395,24 @@ impl FileMeta {
     // delete_version deletes version, returns data_dir
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
-        fi.validate(ValidationMode::DeleteOnly)?;
+        fi.validate_for_delete_operation()?;
 
         let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
+        if fi.deleted && fi.tier_free_version() {
+            let Some(index) = self.versions.iter().position(|version| {
+                version.header.version_id == vid
+                    && version.header.version_type == VersionType::Delete
+                    && version.header.free_version()
+                    && version
+                        .parse_version_meta()
+                        .is_ok_and(|decoded| decoded.free_version() && decoded.header().version_id == vid)
+            }) else {
+                return Err(Error::FileVersionNotFound);
+            };
+            self.versions.remove(index);
+            return Ok(None);
+        }
+
         let target_is_delete_marker = self
             .versions
             .iter()
@@ -2073,7 +2088,6 @@ mod test {
             name: "object".to_string(),
             version_id: Some(free_version_id),
             deleted: true,
-            mod_time: Some(OffsetDateTime::now_utc()),
             ..Default::default()
         };
         free_version_delete.set_tier_free_version();
@@ -2088,7 +2102,7 @@ mod test {
     }
 
     #[test]
-    fn delete_version_validates_non_deleted_requests_before_mutation() {
+    fn delete_version_validates_requests_before_mutation() {
         let version_id = Uuid::new_v4();
         let mut fm = FileMeta::new();
         fm.add_version(FileInfo {
@@ -2118,6 +2132,56 @@ mod test {
 
         assert_eq!(err, Error::FileCorrupt);
         assert_eq!(fm, original, "failed validation must happen before metadata mutation");
+
+        let err = fm
+            .delete_version(&FileInfo {
+                version_id: Some(version_id),
+                deleted: true,
+                mod_time: None,
+                ..Default::default()
+            })
+            .expect_err("malformed delete markers must fail before removing the existing object version");
+
+        assert_eq!(err, Error::FileCorrupt);
+        assert_eq!(fm, original, "malformed delete-marker validation must precede metadata mutation");
+
+        let mut free_version_delete = FileInfo {
+            version_id: Some(version_id),
+            deleted: true,
+            ..Default::default()
+        };
+        free_version_delete.set_tier_free_version();
+        let err = fm
+            .delete_version(&free_version_delete)
+            .expect_err("tier free-version cleanup must not remove an ordinary object version");
+
+        assert_eq!(err, Error::FileVersionNotFound);
+        assert_eq!(fm, original, "missing free-version cleanup must not mutate ordinary metadata");
+
+        let mut poisoned_object_header = fm.clone();
+        poisoned_object_header.versions[0].header.flags |= XL_FLAG_FREE_VERSION;
+        let poisoned_original = poisoned_object_header.clone();
+        let err = poisoned_object_header
+            .delete_version(&free_version_delete)
+            .expect_err("a free-version flag on an Object header must not authorize cleanup deletion");
+        assert_eq!(err, Error::FileVersionNotFound);
+        assert_eq!(
+            poisoned_object_header, poisoned_original,
+            "a poisoned Object header must remain unchanged after rejected cleanup"
+        );
+
+        let mut mismatched_delete_header = fm.clone();
+        mismatched_delete_header.versions[0].header.flags |= XL_FLAG_FREE_VERSION;
+        mismatched_delete_header.versions[0].header.version_type = VersionType::Delete;
+        let mismatched_original = mismatched_delete_header.clone();
+        let err = mismatched_delete_header
+            .delete_version(&free_version_delete)
+            .expect_err("a Delete/free header over an Object body must fail closed");
+        assert_eq!(err, Error::FileVersionNotFound);
+        assert_eq!(
+            mismatched_delete_header, mismatched_original,
+            "header/body mismatch must not mutate metadata"
+        );
     }
 
     #[test]

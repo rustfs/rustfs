@@ -238,14 +238,6 @@ pub(crate) fn ensure_test_rpc_secret() {
     let _ = rustfs_credentials::set_global_rpc_secret(TEST_RPC_SECRET.to_owned());
 }
 
-pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
-    get_global_storage_class_snapshot().get_parity_for_sc(storage_class.unwrap_or_default())
-}
-
-pub(crate) fn storage_class_should_inline(shard_size: i64, versioned: bool) -> bool {
-    get_global_storage_class_snapshot().should_inline(shard_size, versioned)
-}
-
 pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
     base64_simd::URL_SAFE_NO_PAD
         .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes())

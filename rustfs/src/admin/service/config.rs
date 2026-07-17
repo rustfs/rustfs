@@ -44,6 +44,8 @@ pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
     )
 }
 
+pub(crate) const FULL_CONFIG_WORKER_SUBSYSTEMS: [&str; 2] = [AUDIT_WEBHOOK_SUB_SYS, SCANNER_SUB_SYS];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DynamicConfigWorkerMutation {
     None,
@@ -422,24 +424,39 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
     reload_dynamic_config_runtime_state_for_context(context.as_deref(), sub_system).await
 }
 
-async fn reload_runtime_config_snapshot_with<ReadFuture, Prepare, PrepareFuture, ApplyWorkers, ApplyWorkersFuture, Publish>(
+async fn reload_runtime_config_snapshot_with<ReadFuture, Prepare, PrepareFuture, Publish, ApplyWorkers, ApplyWorkersFuture>(
     read: ReadFuture,
     prepare: Prepare,
-    apply_workers: ApplyWorkers,
     publish: Publish,
+    apply_workers: ApplyWorkers,
 ) -> S3Result<()>
 where
     ReadFuture: Future<Output = S3Result<ServerConfig>>,
     Prepare: FnOnce(ServerConfig) -> PrepareFuture,
     PrepareFuture: Future<Output = S3Result<(ServerConfig, PreparedRuntimeConfig)>>,
-    ApplyWorkers: FnOnce(ServerConfig, PreparedRuntimeConfig) -> ApplyWorkersFuture,
-    ApplyWorkersFuture: Future<Output = S3Result<(ServerConfig, PreparedRuntimeConfig)>>,
-    Publish: FnOnce(ServerConfig, PreparedRuntimeConfig) -> S3Result<()>,
+    Publish: FnOnce(&ServerConfig, PreparedRuntimeConfig) -> S3Result<()>,
+    ApplyWorkers: FnOnce(ServerConfig) -> ApplyWorkersFuture,
+    ApplyWorkersFuture: Future<Output = S3Result<()>>,
 {
     let config = read.await?;
     let (config, prepared) = prepare(config).await?;
-    let (config, prepared) = apply_workers(config, prepared).await?;
-    publish(config, prepared)
+    publish(&config, prepared)?;
+
+    // Worker reloads mutate live state and have no rollback contract. They are
+    // therefore best-effort after the validated storage/server snapshots are
+    // published; a transient worker failure must not leave this peer on stale
+    // erasure geometry.
+    if let Err(err) = apply_workers(config).await {
+        warn!(
+            event = "config_worker_reload_failed",
+            component = "admin",
+            subsystem = "config",
+            state = "best_effort",
+            error = ?err,
+            "Runtime config snapshot was published but a worker reload failed"
+        );
+    }
+    Ok(())
 }
 
 pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppContext>) -> S3Result<()> {
@@ -453,30 +470,31 @@ pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppCont
             })
         },
         |config| async move {
-            let prepared = prepare_server_config_for_context(context, &config, None)
-                .await
-                .map_err(|err| {
-                    warn!("peer reload_runtime_config_snapshot: failed to prepare server config: {err}");
-                    err
-                })?;
-            Ok((config, prepared))
-        },
-        |config, prepared| async move {
-            // Re-apply mutable worker state before publishing either immutable
-            // snapshot. A failure leaves the previous storage/server pair visible.
-            for sub_system in [AUDIT_WEBHOOK_SUB_SYS, AUDIT_MQTT_SUB_SYS, SCANNER_SUB_SYS, HEAL_SUB_SYS] {
-                apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
-                    .await
-                    .map_err(|err| {
-                        warn!("peer reload_runtime_config_snapshot: failed to apply {sub_system}: {err}");
-                        err
-                    })?;
-            }
+            let prepared = prepare_server_config_for_context(context, &config, None).await.map_err(|_| {
+                warn!("peer reload_runtime_config_snapshot: failed to prepare server config");
+                internal_error("failed to prepare server config")
+            })?;
             Ok((config, prepared))
         },
         |config, prepared| {
             prepared.publish_storage_class_for_context(context)?;
-            publish_server_config_for_context(context, config);
+            publish_server_config_for_context(context, config.clone());
+            Ok(())
+        },
+        |config| async move {
+            for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
+                if let Err(err) = apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system).await {
+                    warn!(
+                        event = "config_worker_reload_failed",
+                        component = "admin",
+                        subsystem = "config",
+                        config_subsystem = sub_system,
+                        state = "best_effort",
+                        error = ?err,
+                        "Peer runtime config snapshot was published but a subsystem worker reload failed"
+                    );
+                }
+            }
             Ok(())
         },
     )
@@ -529,15 +547,11 @@ pub async fn signal_config_snapshot_reload() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::storage_api::{
-        bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG},
-        config::save_admin_server_config,
-    };
-    use crate::app::context::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
-    use crate::storage_api::{
-        cluster::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints},
-        server::storage::{init_local_disks_with_instance_ctx, new_instance_ctx},
-    };
+    use crate::admin::runtime_sources::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
+    use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+    use crate::admin::storage_api::config::save_admin_server_config;
+    use crate::storage_api::cluster::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::storage_api::startup::storage::{init_local_disks_with_instance_ctx, new_instance_ctx};
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
@@ -684,7 +698,7 @@ mod tests {
             });
         }
 
-        let endpoint_pools = EndpointServerPools(pools);
+        let endpoint_pools = EndpointServerPools::from(pools);
         let instance_ctx = new_instance_ctx();
         init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
@@ -764,10 +778,48 @@ mod tests {
                     .await
                     .expect_err("later pool parity must reject peer dynamic reload");
 
-                let message = err.to_string();
-                assert!(message.contains("pool 1"), "unexpected error: {message}");
-                assert!(message.contains("2 drives"), "unexpected error: {message}");
+                assert!(
+                    err.message()
+                        .is_some_and(|message| message.contains("storage class validation failed for pool 1")),
+                    "unexpected dynamic reload error: {err:?}"
+                );
                 fixture.assert_snapshots_unchanged();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn peer_dynamic_reload_publishes_valid_per_pool_storage_snapshot() {
+        temp_env::async_with_vars(
+            [
+                (storageclass::STANDARD_ENV, None::<&str>),
+                (storageclass::RRS_ENV, None::<&str>),
+                (storageclass::OPTIMIZE_ENV, None::<&str>),
+                (storageclass::INLINE_BLOCK_ENV, None::<&str>),
+            ],
+            async {
+                let fixture = runtime_config_reload_fixture().await;
+                let candidate = storage_class_server_config("");
+                save_admin_server_config(fixture.context.object_store(), &candidate)
+                    .await
+                    .expect("persist valid automatic storage class config");
+
+                reload_dynamic_config_runtime_state_for_context(Some(&fixture.context), STORAGE_CLASS_SUB_SYS)
+                    .await
+                    .expect("valid peer dynamic reload must publish its prepared storage snapshot");
+
+                assert_eq!(fixture.server_set_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.storage_class_set_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    *fixture.server_snapshot.lock().expect("server config result lock"),
+                    Some(fixture.baseline_server.clone()),
+                    "dynamic reload must not replace the server-config snapshot"
+                );
+                let storage_class = fixture.storage_class_snapshot.lock().expect("storage class result lock");
+                assert_eq!(storage_class.parities_for_sc(storageclass::STANDARD), Some(vec![2, 1]));
+                assert_eq!(storage_class.parities_for_sc(storageclass::RRS), Some(vec![1, 1]));
             },
         )
         .await;
@@ -789,13 +841,40 @@ mod tests {
                     .await
                     .expect_err("later pool parity must reject peer full reload");
 
-                let message = err.to_string();
-                assert!(message.contains("pool 1"), "unexpected error: {message}");
-                assert!(message.contains("2 drives"), "unexpected error: {message}");
+                assert_eq!(err.message(), Some("failed to prepare server config"));
                 fixture.assert_snapshots_unchanged();
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn full_reload_publishes_snapshots_before_best_effort_worker_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let publish_events = events.clone();
+        let worker_events = events.clone();
+
+        reload_runtime_config_snapshot_with(
+            async { Ok(ServerConfig::new()) },
+            |config| async { Ok((config, PreparedRuntimeConfig::default())) },
+            move |_config, _prepared| {
+                publish_events.lock().expect("reload event lock").push("publish");
+                Ok(())
+            },
+            move |_config| async move {
+                let mut events = worker_events.lock().expect("reload event lock");
+                events.push("worker-1-applied");
+                events.push("worker-2-failed");
+                Err(internal_error("injected worker reload failure"))
+            },
+        )
+        .await
+        .expect("worker failure must not roll back validated storage/server snapshots");
+
+        assert_eq!(
+            *events.lock().expect("reload result lock"),
+            ["publish", "worker-1-applied", "worker-2-failed"]
+        );
     }
 
     #[test]
@@ -807,6 +886,11 @@ mod tests {
         assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
         assert!(!is_dynamic_config_subsystem("notify_webhook"));
+    }
+
+    #[test]
+    fn full_config_worker_reload_uses_one_representative_per_worker_family() {
+        assert_eq!(FULL_CONFIG_WORKER_SUBSYSTEMS, [AUDIT_WEBHOOK_SUB_SYS, SCANNER_SUB_SYS]);
     }
 
     #[test]

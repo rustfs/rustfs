@@ -771,7 +771,7 @@ impl SetDisks {
         // A surviving valid, non-deleted, non-remote data FileInfo to rebuild from.
         let Some(surviving) = parts_metadata
             .iter()
-            .find(|fi| fi.is_valid() && !fi.deleted && !fi.is_remote())
+            .find(|fi| fi.has_valid_erasure_geometry() && !fi.deleted && !fi.is_remote())
             .cloned()
         else {
             return Ok(false);
