@@ -171,19 +171,90 @@ fn quorum_dominant_error_metric_label(summary: &WriteQuorumFailureSummary) -> &'
     dominant_error_summary_label(summary)
 }
 
+/// Progress deadlines that bound how long shard writers may stall.
+///
+/// A single shard write (or writer shutdown) is a unit of forward progress: for
+/// a remote shard the underlying `HttpWriter` buffers the bytes and hands them
+/// to a background HTTP task, so a peer that accepts the connection but never
+/// drains the body eventually wedges the write once the bounded buffers fill.
+/// Without a deadline that stalled writer is awaited forever and pins an
+/// otherwise-healthy write quorum (rustfs/backlog#1319).
+///
+/// * `stall_timeout` is re-armed on every shard write, so it bounds a stall, not
+///   the total transfer time of a large object — a slow-but-honest writer that
+///   keeps completing shards is never killed.
+/// * `absolute_cap` is an optional administrator backstop: the shard writers for
+///   one object are engaged for at most this long in aggregate. It defends
+///   against a "slow-drip" peer that produces just enough progress to reset the
+///   per-shard timeout on every block while never converging. Disabled by
+///   default so a legitimate large upload over a slow link is not killed on
+///   total time alone.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WriteProgressPolicy {
+    stall_timeout: Option<std::time::Duration>,
+    absolute_cap: Option<std::time::Duration>,
+}
+
+impl WriteProgressPolicy {
+    /// Build a policy, mapping a zero duration to "disabled" for both knobs.
+    pub(crate) fn new(stall_timeout: std::time::Duration, absolute_cap: std::time::Duration) -> Self {
+        Self {
+            stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
+            absolute_cap: (!absolute_cap.is_zero()).then_some(absolute_cap),
+        }
+    }
+}
+
+impl Default for WriteProgressPolicy {
+    fn default() -> Self {
+        Self::new(
+            crate::disk::disk_store::get_object_disk_write_stall_timeout(),
+            crate::disk::disk_store::get_object_disk_write_absolute_cap(),
+        )
+    }
+}
+
 pub(crate) struct MultiWriter<'a> {
     writers: &'a mut [Option<BitrotWriterWrapper>],
     write_quorum: usize,
     errs: Vec<Option<Error>>,
+    policy: WriteProgressPolicy,
+    /// Absolute deadline for the whole object, armed lazily on the first
+    /// progress-bounded operation when `policy.absolute_cap` is set.
+    absolute_deadline: Option<tokio::time::Instant>,
 }
 
 impl<'a> MultiWriter<'a> {
     pub fn new(writers: &'a mut [Option<BitrotWriterWrapper>], write_quorum: usize) -> Self {
+        Self::with_policy(writers, write_quorum, WriteProgressPolicy::default())
+    }
+
+    pub fn with_policy(writers: &'a mut [Option<BitrotWriterWrapper>], write_quorum: usize, policy: WriteProgressPolicy) -> Self {
         let length = writers.len();
         MultiWriter {
             writers,
             write_quorum,
             errs: vec![None; length],
+            policy,
+            absolute_deadline: None,
+        }
+    }
+
+    /// Effective budget for one shard operation: the smaller of the per-shard
+    /// stall timeout and the time remaining until the object's absolute cap.
+    /// Returns `None` when neither deadline is configured (wait indefinitely).
+    fn next_progress_budget(&mut self) -> Option<std::time::Duration> {
+        if let Some(cap) = self.policy.absolute_cap {
+            let deadline = *self
+                .absolute_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + cap);
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.policy.stall_timeout {
+                Some(stall) => Some(stall.min(remaining)),
+                None => Some(remaining),
+            }
+        } else {
+            self.policy.stall_timeout
         }
     }
 
@@ -214,13 +285,30 @@ impl<'a> MultiWriter<'a> {
     pub async fn write(&mut self, data: Vec<Bytes>) -> std::io::Result<()> {
         assert_eq!(data.len(), self.writers.len());
 
+        let budget = self.next_progress_budget();
         {
             let mut futures = FuturesUnordered::new();
             for ((writer_opt, err), shard) in self.writers.iter_mut().zip(self.errs.iter_mut()).zip(data.iter()) {
                 if err.is_some() {
                     continue; // Skip if we already have an error for this writer
                 }
-                futures.push(Self::write_shard(writer_opt, err, shard));
+                // A shard write that makes no forward progress within `budget` is
+                // failed and its disk dropped, so a stalled peer cannot pin an
+                // otherwise-healthy write quorum (rustfs/backlog#1319). `budget`
+                // is recomputed per block, so it bounds a stall — not the total
+                // transfer time — and a slow-but-honest writer is never killed.
+                futures.push(async move {
+                    match budget {
+                        Some(budget) => match tokio::time::timeout(budget, Self::write_shard(writer_opt, err, shard)).await {
+                            Ok(()) => {}
+                            Err(_elapsed) => {
+                                *err = Some(Error::Timeout);
+                                *writer_opt = None;
+                            }
+                        },
+                        None => Self::write_shard(writer_opt, err, shard).await,
+                    }
+                });
             }
             while let Some(()) = futures.next().await {}
         }
@@ -269,13 +357,30 @@ impl<'a> MultiWriter<'a> {
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         crate::hp_guard!("MultiWriter::shutdown");
+        let budget = self.next_progress_budget();
         {
             let mut futures = FuturesUnordered::new();
             for (writer_opt, err) in self.writers.iter_mut().zip(self.errs.iter_mut()) {
                 if err.is_some() {
                     continue;
                 }
-                futures.push(Self::shutdown_writer(writer_opt, err));
+                // Shutdown flushes the tail and waits for the remote to finish the
+                // HTTP request; a black-hole peer that never responds would hang
+                // here forever for a small object whose bytes were fully buffered
+                // (so `write` never blocked). Bound it with the same progress
+                // budget and drop the stalled writer before the quorum check.
+                futures.push(async move {
+                    match budget {
+                        Some(budget) => match tokio::time::timeout(budget, Self::shutdown_writer(writer_opt, err)).await {
+                            Ok(()) => {}
+                            Err(_elapsed) => {
+                                *err = Some(Error::Timeout);
+                                *writer_opt = None;
+                            }
+                        },
+                        None => Self::shutdown_writer(writer_opt, err).await,
+                    }
+                });
             }
             while let Some(()) = futures.next().await {}
         }
@@ -728,10 +833,12 @@ mod tests {
     use crate::erasure::coding::{BitrotWriterWrapper, CustomWriter};
     use rustfs_rio::HardLimitReader;
     use rustfs_utils::HashAlgorithm;
+    use std::future::Future;
     use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
+    use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     #[derive(Clone, Default)]
@@ -821,11 +928,116 @@ mod tests {
         }
     }
 
+    /// A writer that models a "black-hole" peer: it accepts up to `stall_after`
+    /// bytes and then parks every subsequent `poll_write` forever (never
+    /// registering a waker), the way a remote `HttpWriter` wedges once its
+    /// bounded buffers fill and the peer never drains the body. With
+    /// `stall_after = 0` it stalls on the very first byte. `poll_shutdown`
+    /// completes only when `stall_shutdown` is false.
+    #[derive(Clone)]
+    struct StallingWriter {
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+        stall_after: usize,
+        stall_shutdown: bool,
+    }
+
+    impl StallingWriter {
+        fn stalls_on_write(stall_after: usize) -> Self {
+            Self {
+                accepted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                stall_after,
+                stall_shutdown: false,
+            }
+        }
+
+        fn stalls_on_shutdown() -> Self {
+            Self {
+                accepted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                stall_after: usize::MAX,
+                stall_shutdown: true,
+            }
+        }
+    }
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            use std::sync::atomic::Ordering;
+            let already = self.accepted.load(Ordering::SeqCst);
+            if already >= self.stall_after {
+                // Black hole: no forward progress, no waker registered.
+                return Poll::Pending;
+            }
+            let take = buf.len().min(self.stall_after - already);
+            self.accepted.fetch_add(take, Ordering::SeqCst);
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.stall_shutdown {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    /// A writer that always makes forward progress but each `poll_write` first
+    /// waits `delay` (on the runtime timer). Under a paused virtual clock this
+    /// deterministically models a slow-but-honest peer: it must never be killed
+    /// by the per-shard stall deadline as long as `delay < stall_timeout`, yet an
+    /// absolute cap can still bound its aggregate engagement.
+    struct SlowWriter {
+        delay: std::time::Duration,
+        timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl SlowWriter {
+        fn new(delay: std::time::Duration) -> Self {
+            Self { delay, timer: None }
+        }
+    }
+
+    impl AsyncWrite for SlowWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            let delay = self.delay;
+            let timer = self.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+            match timer.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.timer = None;
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     fn bitrot_writer<W>(writer: W, shard_size: usize) -> BitrotWriterWrapper
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
         BitrotWriterWrapper::new(CustomWriter::new_tokio_writer(writer), shard_size, HashAlgorithm::HighwayHash256S)
+    }
+
+    /// Like `bitrot_writer` but with no interleaved hash, so one shard write
+    /// issues a single `poll_write` to the underlying fake. Used by the paused
+    /// virtual-clock stall tests so each block maps to exactly one modeled delay.
+    fn bitrot_writer_plain<W>(writer: W, shard_size: usize) -> BitrotWriterWrapper
+    where
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        BitrotWriterWrapper::new(CustomWriter::new_tokio_writer(writer), shard_size, HashAlgorithm::None)
     }
 
     #[tokio::test]
@@ -920,6 +1132,194 @@ mod tests {
         assert!(shutdown_err.contains("Failed to shutdown writers"));
         assert!(shutdown_err.contains("required=2"));
         assert!(shutdown_err.contains("erasure write quorum"));
+    }
+
+    // The production wiring (`MultiWriter::new`) must arm a real deadline by
+    // default, and honor `0` as "disabled". This guards against the fix silently
+    // regressing to wait-forever behavior on the default PUT path.
+    #[test]
+    fn default_write_progress_policy_is_armed_and_configurable() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT, || {
+            temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP, || {
+                let policy = WriteProgressPolicy::default();
+                assert_eq!(
+                    policy.stall_timeout,
+                    Some(Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DISK_WRITE_STALL_TIMEOUT)),
+                    "the default PUT path must be protected by a stall deadline"
+                );
+                assert_eq!(policy.absolute_cap, None, "the absolute cap is disabled by default");
+            });
+        });
+
+        temp_env::with_var(rustfs_config::ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT, Some("0"), || {
+            let policy = WriteProgressPolicy::default();
+            assert_eq!(policy.stall_timeout, None, "0 disables the stall deadline (wait indefinitely)");
+        });
+    }
+
+    fn four_shards() -> Vec<Bytes> {
+        vec![
+            Bytes::from_static(b"shard-0"),
+            Bytes::from_static(b"shard-1"),
+            Bytes::from_static(b"shard-2"),
+            Bytes::from_static(b"shard-3"),
+        ]
+    }
+
+    /// Four full-`shard_size` shards. A shard shorter than `shard_size` marks the
+    /// bitrot writer `finished`, so multi-block tests must send full shards to
+    /// keep writing across iterations.
+    fn four_full_shards(shard_size: usize) -> Vec<Bytes> {
+        (0..4).map(|i| Bytes::from(vec![0x40 + i as u8; shard_size])).collect()
+    }
+
+    // rustfs/backlog#1319: a single black-hole writer that never accepts a byte
+    // must be failed within the stall budget so the remaining 3/4 writers still
+    // meet a write quorum of 3 — the write must not wait forever.
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_write_stall_fails_black_hole_but_meets_quorum() {
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers = vec![
+            Some(bitrot_writer_plain(StallingWriter::stalls_on_write(0), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[0].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[1].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[2].clone()), 64)),
+        ];
+
+        {
+            let policy = WriteProgressPolicy::new(Duration::from_secs(5), Duration::ZERO);
+            let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+            mw.write(four_shards())
+                .await
+                .expect("one stalled writer must still satisfy a 3/4 write quorum without hanging");
+        }
+
+        assert!(writers[0].is_none(), "the black-hole writer must be failed and dropped before commit");
+        assert!(writers[1].is_some() && writers[2].is_some() && writers[3].is_some());
+    }
+
+    // Two black-hole writers drop the healthy count to 2/4, below the quorum of
+    // 3, so the write must fail cleanly (not hang).
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_write_stall_two_black_holes_fail_quorum() {
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers = vec![
+            Some(bitrot_writer_plain(StallingWriter::stalls_on_write(0), 64)),
+            Some(bitrot_writer_plain(StallingWriter::stalls_on_write(0), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[0].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[1].clone()), 64)),
+        ];
+
+        let policy = WriteProgressPolicy::new(Duration::from_secs(5), Duration::ZERO);
+        let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+        let err = mw
+            .write(four_shards())
+            .await
+            .expect_err("two stalled writers must fail the write quorum instead of hanging");
+        assert!(err.to_string().contains("Failed to write data"));
+    }
+
+    // A small object whose bytes were fully buffered leaves `write` succeeding
+    // for a black-hole peer; the stall must then be caught during shutdown so it
+    // cannot pin the quorum there either.
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_shutdown_stall_fails_black_hole_but_meets_quorum() {
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers = vec![
+            Some(bitrot_writer_plain(StallingWriter::stalls_on_shutdown(), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[0].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[1].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[2].clone()), 64)),
+        ];
+
+        {
+            let policy = WriteProgressPolicy::new(Duration::from_secs(5), Duration::ZERO);
+            let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+            mw.write(four_shards()).await.expect("all writers accept the buffered shard");
+            mw.shutdown()
+                .await
+                .expect("a single shutdown stall must still satisfy a 3/4 quorum without hanging");
+        }
+
+        assert!(writers[0].is_none(), "the writer that stalled shutdown must be failed and dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_shutdown_stall_two_black_holes_fail_quorum() {
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..2).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers = vec![
+            Some(bitrot_writer_plain(StallingWriter::stalls_on_shutdown(), 64)),
+            Some(bitrot_writer_plain(StallingWriter::stalls_on_shutdown(), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[0].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[1].clone()), 64)),
+        ];
+
+        let policy = WriteProgressPolicy::new(Duration::from_secs(5), Duration::ZERO);
+        let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+        mw.write(four_shards()).await.expect("all writers accept the buffered shard");
+        let err = mw
+            .shutdown()
+            .await
+            .expect_err("two shutdown stalls must fail the shutdown quorum instead of hanging");
+        assert!(err.to_string().contains("Failed to shutdown writers"));
+    }
+
+    // A slow-but-honest writer that keeps completing shards (delay < stall
+    // budget) must never be killed, even across many blocks, when no absolute cap
+    // is configured.
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_slow_but_progressing_writer_is_not_killed() {
+        let mut writers = vec![
+            Some(bitrot_writer_plain(SlowWriter::new(Duration::from_secs(1)), 64)),
+            Some(bitrot_writer_plain(SlowWriter::new(Duration::from_secs(1)), 64)),
+            Some(bitrot_writer_plain(SlowWriter::new(Duration::from_secs(1)), 64)),
+            Some(bitrot_writer_plain(SlowWriter::new(Duration::from_secs(1)), 64)),
+        ];
+
+        {
+            let policy = WriteProgressPolicy::new(Duration::from_secs(5), Duration::ZERO);
+            let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+            for _ in 0..8 {
+                mw.write(four_full_shards(64))
+                    .await
+                    .expect("a writer that keeps making progress within the stall budget must not be failed");
+            }
+        }
+
+        assert!(writers.iter().all(Option::is_some), "no slow-but-honest writer should be dropped");
+    }
+
+    // Slow-drip defense: the per-shard stall timer resets on every block, so a
+    // peer that dribbles just enough progress each block is not caught by the
+    // stall timeout alone. The optional absolute cap bounds its aggregate
+    // engagement and fails it within a finite budget, while the healthy writers
+    // still meet quorum.
+    #[tokio::test(start_paused = true)]
+    async fn multi_writer_absolute_cap_bounds_slow_drip_writer() {
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers = vec![
+            Some(bitrot_writer_plain(SlowWriter::new(Duration::from_secs(8)), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[0].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[1].clone()), 64)),
+            Some(bitrot_writer_plain(DeferredCommitWriter::new(committed[2].clone()), 64)),
+        ];
+
+        {
+            // stall (10s) never fires for an 8s-per-block writer, but the 15s
+            // absolute cap does once its aggregate engagement crosses the cap.
+            let policy = WriteProgressPolicy::new(Duration::from_secs(10), Duration::from_secs(15));
+            let mut mw = MultiWriter::with_policy(&mut writers, 3, policy);
+            for _ in 0..4 {
+                mw.write(four_full_shards(64))
+                    .await
+                    .expect("healthy writers keep the 3/4 quorum while the drip writer is bounded");
+            }
+        }
+
+        assert!(
+            writers[0].is_none(),
+            "the slow-drip writer must be failed within the absolute cap, not held forever"
+        );
     }
 
     #[tokio::test]
