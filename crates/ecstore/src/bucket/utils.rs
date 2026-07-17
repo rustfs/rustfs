@@ -183,6 +183,16 @@ pub fn is_valid_object_name(object: &str) -> bool {
     is_valid_object_prefix(object)
 }
 
+/// Client-facing reason attached to rejections of object keys that Win32/NTFS
+/// cannot represent as file paths (issue #3299). Deployments on Linux/macOS
+/// accept the full S3 key character set.
+pub const WINDOWS_RESERVED_CHARACTERS_REASON: &str =
+    "object key contains characters unsupported on Windows hosts (one of ':', '*', '?', '\"', '|', '<', '>')";
+
+/// Client-facing reason for path segments Windows can store but not address
+/// afterwards (issue #3449): trailing dot/space or reserved DOS device names.
+pub const WINDOWS_RESERVED_SEGMENT_REASON: &str = "object key contains a path segment unsupported on Windows hosts (trailing dot or space, or a reserved device name such as NUL/CON/COM1)";
+
 /// Reserved DOS device names that shadow regular files on Windows, even when
 /// an extension is appended (e.g. `NUL.txt` resolves to the `NUL` device).
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
@@ -226,13 +236,21 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
             || object.contains('>')
         // || object.contains('\\')
         {
-            return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                object.to_owned(),
+                WINDOWS_RESERVED_CHARACTERS_REASON.to_owned(),
+            ));
         }
 
         // Reject names that NTFS would happily create but the Win32 path
         // layer cannot read back (os error 3), e.g. `baddir.` or `NUL.txt`.
         if object_name_has_windows_incompatible_segment(object) {
-            return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                object.to_owned(),
+                WINDOWS_RESERVED_SEGMENT_REASON.to_owned(),
+            ));
         }
     }
 
@@ -537,8 +555,8 @@ mod tests {
             let result = check_object_name_for_length_and_slash("test-bucket", object);
             if cfg!(target_os = "windows") {
                 assert!(
-                    matches!(result, Err(StorageError::ObjectNameInvalid(..))),
-                    "object name must be rejected on Windows: {object:?}"
+                    matches!(&result, Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_RESERVED_SEGMENT_REASON),
+                    "object name must be rejected on Windows with a descriptive reason: {object:?}, got {result:?}"
                 );
             } else {
                 assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
@@ -551,6 +569,23 @@ mod tests {
                 check_object_name_for_length_and_slash("test-bucket", object).is_ok(),
                 "object name must be valid on all platforms: {object:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_check_object_name_windows_reserved_characters() {
+        // Keys containing Win32-reserved characters are rejected on Windows
+        // with a descriptive reason (issue #3299); valid elsewhere.
+        for object in ["path/*sUt*mykey", "a:b", "what?", "pipe|name", "quote\"d", "lt<gt>"] {
+            let result = check_object_name_for_length_and_slash("test-bucket", object);
+            if cfg!(target_os = "windows") {
+                assert!(
+                    matches!(&result, Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_RESERVED_CHARACTERS_REASON),
+                    "object name must be rejected on Windows with a descriptive reason: {object:?}, got {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
+            }
         }
     }
 

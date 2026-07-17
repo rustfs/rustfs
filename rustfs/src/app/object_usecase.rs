@@ -133,13 +133,13 @@ use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
-        AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
-        AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
-        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS,
-        AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX,
-        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
-        AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS,
-        AMZ_TAG_COUNT,
+        AMZ_CONTENT_SHA256, AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
+        AMZ_MINIO_SNOWBALL_PREFIX, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
+        AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS,
+        AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX, AMZ_SERVER_SIDE_ENCRYPTION,
+        AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT,
+        AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -304,11 +304,16 @@ fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
 
 /// Resolve the authoritative object length that bucket-quota admission (and downstream sizing) must use.
 ///
-/// For an `aws-chunked` upload the request body is wrapped in chunk framing, so the wire `Content-Length` overcounts the actual object and must never be admitted; the decoded length (`x-amz-decoded-content-length`) is the only authoritative size and is therefore required — a chunked request without it is rejected rather than silently falling back to the framed wire length. For a non-chunked request the raw `Content-Length` is authoritative, with an explicit decoded length as the fallback when the S3 layer only surfaced the latter. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
+/// `Content-Encoding: aws-chunked` alone only *declares* the encoding; whether the body actually arrived chunk-framed is signalled by a `STREAMING-*` `x-amz-content-sha256`, and the S3 auth layer both requires `x-amz-decoded-content-length` for those requests and hands the body down already de-framed. So when a decoded length is present it is authoritative (the wire `Content-Length` counts chunk framing and would overcount); a framed body without a decoded length is rejected rather than falling back to the framed wire length. A declared-only aws-chunked request (issue #1857 clients) carries an unframed body, so its wire `Content-Length` is the authoritative size, exactly as for a plain PUT. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
 fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<i64> {
     let decoded_content_length = decoded_content_length_from_headers(headers)?;
-    let size = match (request_uses_aws_chunked(headers), decoded_content_length, content_length) {
+    let aws_chunked = request_uses_aws_chunked(headers) || request_body_is_aws_chunked_framed(headers);
+    let size = match (aws_chunked, decoded_content_length, content_length) {
         (true, Some(decoded), _) => decoded,
+        // Declared aws-chunked without a streaming payload: the body is not framed (the auth
+        // layer only de-frames STREAMING-* payloads, which always carry a decoded length), so
+        // the wire Content-Length is the real object size.
+        (true, None, Some(raw)) if !request_body_is_aws_chunked_framed(headers) => raw,
         (true, None, _) => return Err(s3_error!(UnexpectedContent)),
         (false, _, Some(raw)) => raw,
         (false, Some(decoded), None) => decoded,
@@ -320,6 +325,17 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
     }
 
     Ok(size)
+}
+
+/// True when the request body actually arrived chunk-framed on the wire, i.e. the payload was
+/// signed as a SigV4 streaming upload (`x-amz-content-sha256: STREAMING-*`). This is the only
+/// case in which the auth layer de-frames the body; `Content-Encoding: aws-chunked` without a
+/// streaming payload is just a declared encoding over an unframed body.
+fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
+    headers
+        .get(AMZ_CONTENT_SHA256)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.len() >= 10 && value[..10].eq_ignore_ascii_case("STREAMING-"))
 }
 
 /// Map a bucket-quota checker outcome onto the S3 admission result.
@@ -6353,9 +6369,35 @@ impl DefaultObjectUsecase {
         };
 
         let version_id_str = version_id.clone().unwrap_or_default();
-        let opts = post_restore_opts(&version_id_str, &bucket, &object)
+        let mut opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
             .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
+
+        // SELECT-type restores skip both the ongoing check and the metadata
+        // write below, so the accept guard would protect nothing for them —
+        // they keep the plain (read-locked) accept path.
+        let is_select = rreq.type_.as_ref().is_some_and(|t| t.as_str() == "SELECT");
+
+        // Hold the restore-accept guard across the restore-status read, the
+        // ongoing/already-restored decision, and the metadata write below, so
+        // two concurrent (non-SELECT) POST ?restore cannot both observe
+        // ongoing=false and both start a copy-back (backlog#1304). Reads and
+        // writes inside this scope run with no_lock; the guard is dropped
+        // before the copy-back is spawned so it never blocks readers.
+        // Contention on the accept guard (e.g. a concurrent accept or an
+        // in-flight commit on the same object) is transient — answer 503
+        // SlowDown so SDK clients back off and retry instead of treating it
+        // as a hard failure.
+        let accept_guard = if is_select {
+            None
+        } else {
+            let guard = store
+                .acquire_restore_accept_guard(&bucket, &object)
+                .await
+                .map_err(|_| S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."))?;
+            opts.no_lock = true;
+            Some(guard)
+        };
 
         let mut obj_info = store
             .get_object_info(&bucket, &object, &opts)
@@ -6378,11 +6420,13 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        // Check if restore is already in progress
-        if obj_info.restore_ongoing && (rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT")) {
+        // Check if restore is already in progress. AWS answers this with
+        // 409 RestoreAlreadyInProgress; a Custom code would serialize as a
+        // retryable 500 and make SDK clients retry the conflict (backlog#1304).
+        if obj_info.restore_ongoing && !is_select {
             return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()),
-                "restore object failed.",
+                S3ErrorCode::RestoreAlreadyInProgress,
+                "Object restore is already in progress.",
             ));
         }
 
@@ -6401,7 +6445,7 @@ impl DefaultObjectUsecase {
 
         let event_object_info = obj_info.clone();
         let obj_info_ = obj_info.clone();
-        if rreq.type_.as_ref().is_none_or(|t| t.as_str() != "SELECT") {
+        if !is_select {
             obj_info.metadata_only = true;
             metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap_or(1).to_string());
             let request_date = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
@@ -6429,6 +6473,14 @@ impl DefaultObjectUsecase {
             }
             obj_info.user_defined = Arc::new(metadata);
 
+            // Fence the compare-and-set write: if the accept guard was lost
+            // (lock-service degradation), another node may have concurrently
+            // accepted this restore — back off instead of committing a second
+            // ongoing flag and double-starting the copy-back.
+            if accept_guard.as_ref().is_some_and(|g| g.is_lock_lost()) {
+                return Err(S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."));
+            }
+
             store
                 .clone()
                 .copy_object(
@@ -6439,11 +6491,14 @@ impl DefaultObjectUsecase {
                     &mut obj_info,
                     &ObjectOptions {
                         version_id: obj_info_.version_id.map(|v| v.to_string()),
+                        // Inside the accept-guard critical section (see above).
+                        no_lock: true,
                         ..Default::default()
                     },
                     &ObjectOptions {
                         version_id: obj_info_.version_id.map(|v| v.to_string()),
                         mod_time: obj_info_.mod_time,
+                        no_lock: true,
                         ..Default::default()
                     },
                 )
@@ -6466,6 +6521,10 @@ impl DefaultObjectUsecase {
             }
         }
 
+        // The accept decision is committed; release the object write lock so
+        // the background copy-back and concurrent reads are never blocked on it.
+        drop(accept_guard);
+
         // Handle output location for SELECT requests
         if let Some(output_location) = &rreq.output_location
             && let Some(s3) = &output_location.s3
@@ -6477,12 +6536,17 @@ impl DefaultObjectUsecase {
             }
         }
 
-        // Spawn restoration task in the background
+        // Spawn restoration task in the background. Pin the copy-back to the
+        // version the accept resolved and flagged: with a versionless request
+        // on a versioned bucket, a PUT landing between the accept and the
+        // copy-back would otherwise re-resolve "latest" to the new version,
+        // fail (not transitioned), and strand the flagged version at
+        // ongoing=true forever (backlog#1304).
         let store_clone = store.clone();
         let bucket_clone = bucket.clone();
         let object_clone = object.clone();
         let rreq_clone = rreq.clone();
-        let version_id_clone = version_id.clone();
+        let version_id_clone = obj_info_.version_id.map(|v| v.to_string());
 
         spawn_traced(async move {
             let opts = ObjectOptions {
@@ -6808,10 +6872,14 @@ impl DefaultObjectUsecase {
             }
             let mut size =
                 i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))?;
+            // mtime 0 means "unset" in tar headers, and xl.meta cannot represent an
+            // epoch mod_time anyway (0 nanos decodes as no-mod_time, making the version
+            // unreadable — rustfs#4842), so fall back to the upload time instead.
             let archive_entry_mod_time = f
                 .header()
                 .mtime()
                 .ok()
+                .filter(|&modified_at_secs| modified_at_secs > 0)
                 .and_then(|modified_at_secs| OffsetDateTime::from_unix_timestamp(modified_at_secs as i64).ok());
             let mut metadata = HashMap::new();
             let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
@@ -10625,6 +10693,8 @@ mod tests {
 
     // https://github.com/rustfs/backlog/issues/1311 — bucket-quota admission must run against the authoritative
     // decoded/plain object length, never the aws-chunked wire Content-Length, and must reject negative/unknown lengths.
+    // https://github.com/rustfs/backlog/issues/1336 — but Content-Encoding: aws-chunked alone is only a declared
+    // encoding: without a STREAMING-* payload the body is unframed and the wire Content-Length is authoritative.
     fn aws_chunked_headers(decoded_len: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
@@ -10637,23 +10707,86 @@ mod tests {
         headers
     }
 
+    fn streaming_headers(decoded_len: Option<&str>) -> HeaderMap {
+        let mut headers = aws_chunked_headers(decoded_len);
+        headers.insert(
+            HeaderName::from_bytes(AMZ_CONTENT_SHA256.as_bytes()).unwrap(),
+            HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+        );
+        headers
+    }
+
     #[test]
     fn authoritative_size_prefers_aws_chunked_decoded_over_wire_content_length() {
         // Wire Content-Length (chunk framing) differs from the decoded object length; the decoded length wins.
-        let headers = aws_chunked_headers(Some("1000"));
+        let headers = streaming_headers(Some("1000"));
         let size = resolve_put_object_authoritative_size(&headers, Some(1088)).expect("decoded length is authoritative");
         assert_eq!(
             size, 1000,
             "aws-chunked admission must use the decoded object length, not the framed wire length"
         );
+
+        // A declared-only aws-chunked request that still carries a decoded length behaves the same.
+        let headers = aws_chunked_headers(Some("1000"));
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088)).expect("decoded length is authoritative");
+        assert_eq!(size, 1000);
     }
 
     #[test]
-    fn authoritative_size_rejects_aws_chunked_without_decoded_length() {
-        // A chunked upload without x-amz-decoded-content-length has no authoritative size; the wire length must NOT be a fallback.
-        let headers = aws_chunked_headers(None);
+    fn authoritative_size_streaming_without_content_encoding_uses_decoded_length() {
+        // A streaming payload signals framing via x-amz-content-sha256 alone; Content-Encoding is optional.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(AMZ_CONTENT_SHA256.as_bytes()).unwrap(),
+            HeaderValue::from_static("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        );
+        headers.insert(
+            HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).unwrap(),
+            HeaderValue::from_static("1000"),
+        );
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088)).expect("decoded length is authoritative");
+        assert_eq!(
+            size, 1000,
+            "a streaming payload without Content-Encoding must still use the decoded length"
+        );
+    }
+
+    #[test]
+    fn authoritative_size_rejects_framed_body_without_decoded_length() {
+        // A genuinely framed upload without x-amz-decoded-content-length has no authoritative size;
+        // the framed wire length must NOT be a fallback.
+        let headers = streaming_headers(None);
         let err = resolve_put_object_authoritative_size(&headers, Some(1088))
-            .expect_err("chunked upload without decoded length must be rejected");
+            .expect_err("framed upload without decoded length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+
+        // ... even when the wire Content-Length is also absent.
+        let err =
+            resolve_put_object_authoritative_size(&headers, None).expect_err("framed upload without any length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_declared_aws_chunked_without_streaming_uses_wire_content_length() {
+        // backlog#1336: an SDK PUT that merely declares Content-Encoding: aws-chunked (issue #1857
+        // clients) has an unframed body and no decoded length; the wire Content-Length is the real
+        // object size and the request must be admitted, not rejected with UnexpectedContent.
+        let headers = aws_chunked_headers(None);
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088))
+            .expect("declared-only aws-chunked must fall back to the wire Content-Length");
+        assert_eq!(size, 1088);
+
+        // Same for a combined declared encoding (aws-chunked,gzip).
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked,gzip"));
+        let size = resolve_put_object_authoritative_size(&headers, Some(2048))
+            .expect("declared-only aws-chunked,gzip must fall back to the wire Content-Length");
+        assert_eq!(size, 2048);
+
+        // Without any length information it is still rejected.
+        let headers = aws_chunked_headers(None);
+        let err = resolve_put_object_authoritative_size(&headers, None)
+            .expect_err("declared-only aws-chunked with no length at all must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
     }
 

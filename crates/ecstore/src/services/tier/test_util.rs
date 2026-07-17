@@ -67,7 +67,8 @@ use uuid::Uuid;
 
 use crate::client::transition_api::{ReadCloser, ReaderImpl};
 use crate::disk::endpoint::Endpoint;
-use crate::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, new_disk};
+use crate::disk::format::FormatV3;
+use crate::disk::{DiskAPI, DiskOption, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, new_disk};
 use crate::services::tier::tier::TierConfigMgr;
 use crate::services::tier::tier_config::{TierConfig, TierMinIO, TierType};
 use crate::services::tier::warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options};
@@ -498,10 +499,19 @@ pub struct TransitionMeta {
 }
 
 async fn open_disk(disk_path: &Path) -> Option<crate::disk::DiskStore> {
+    // `LocalDisk::new` rejects an endpoint whose (set_idx, disk_idx) disagrees
+    // with the position recorded in the disk's own format.json, so derive the
+    // real indices instead of assuming slot 0 (rustfs/backlog#1303).
+    let format_data = tokio::fs::read(disk_path.join(RUSTFS_META_BUCKET).join(FORMAT_CONFIG_FILE))
+        .await
+        .ok()?;
+    let format = FormatV3::try_from(format_data.as_slice()).ok()?;
+    let (set_idx, disk_idx) = format.find_disk_index_by_disk_id(format.erasure.this).ok()?;
+
     let mut endpoint = Endpoint::try_from(disk_path.to_str()?).ok()?;
     endpoint.set_pool_index(0);
-    endpoint.set_set_index(0);
-    endpoint.set_disk_index(0);
+    endpoint.set_set_index(set_idx);
+    endpoint.set_disk_index(disk_idx);
     new_disk(
         &endpoint,
         &DiskOption {

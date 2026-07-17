@@ -148,11 +148,15 @@ fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &Has
             .get_all(k)
             .iter()
             .map(|e| {
-                e.to_str()
-                    .map(|v| v.to_string())
-                    .map_err(|_| SignV4Error::InvalidHeaderValue {
+                let value = std::str::from_utf8(e.as_bytes()).map_err(|_| SignV4Error::InvalidHeaderValue {
+                    name: k.as_str().to_lowercase(),
+                })?;
+                if value.chars().any(|ch| !ch.is_ascii() && ch.is_whitespace()) {
+                    return Err(SignV4Error::InvalidHeaderValue {
                         name: k.as_str().to_lowercase(),
-                    })
+                    });
+                }
+                Ok(value.to_string())
             })
             .collect::<SignResult<Vec<String>>>()?;
         vals.insert(k.as_str().to_lowercase(), vv);
@@ -1126,6 +1130,51 @@ mod tests {
         assert!(matches!(
             err,
             SignV4Error::InvalidHeaderValue { name } if name == "x-amz-meta-invalid"
+        ));
+    }
+
+    #[test]
+    fn try_sign_v4_accepts_utf8_header_value() {
+        let mut req = request::Request::builder()
+            .method(http::Method::PUT)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(UNSIGNED_PAYLOAD));
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("20260715/鲁A12345/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        let signed =
+            try_sign_v4(req, 0, "rustfsadmin", "rustfsadmin", "", "us-east-1").expect("valid utf8 metadata should be signed");
+
+        assert!(signed.headers().contains_key(http::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn try_sign_v4_rejects_non_ascii_whitespace_header_value() {
+        let mut req = request::Request::builder()
+            .method(http::Method::PUT)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(UNSIGNED_PAYLOAD));
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("tier/a\u{00a0}b/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        let err = try_sign_v4(req, 0, "rustfsadmin", "rustfsadmin", "", "us-east-1")
+            .expect_err("non-ascii whitespace must not be normalized differently from the wire value");
+
+        assert!(matches!(
+            err,
+            SignV4Error::InvalidHeaderValue { name } if name == "x-amz-meta-name"
         ));
     }
 
