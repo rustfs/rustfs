@@ -34,7 +34,8 @@ pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 const MAX_ERASURE_SHARDS: usize = 16;
 const MAX_FILEINFO_PARTS: usize = 10_000;
 const MAX_FILEINFO_CHECKSUMS: usize = 10_000;
-const FILEINFO_PART_BITMAP_WORDS: usize = MAX_FILEINFO_PARTS.div_ceil(u64::BITS as usize);
+const FILEINFO_PART_BITMAP_WORD_BITS: usize = std::mem::size_of::<u64>() * 8;
+const FILEINFO_PART_BITMAP_WORDS: usize = MAX_FILEINFO_PARTS.div_ceil(FILEINFO_PART_BITMAP_WORD_BITS);
 
 // Additional constants from Go version
 pub const NULL_VERSION_ID: &str = "null";
@@ -272,38 +273,11 @@ pub enum ValidationMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedErasureLayout {
     data_blocks: usize,
-    parity_blocks: usize,
-    total_blocks: usize,
     block_size: usize,
     shard_size: usize,
-    index: usize,
 }
 
 impl ValidatedErasureLayout {
-    pub const fn data_blocks(&self) -> usize {
-        self.data_blocks
-    }
-
-    pub const fn parity_blocks(&self) -> usize {
-        self.parity_blocks
-    }
-
-    pub const fn total_blocks(&self) -> usize {
-        self.total_blocks
-    }
-
-    pub const fn block_size(&self) -> usize {
-        self.block_size
-    }
-
-    pub const fn shard_size(&self) -> usize {
-        self.shard_size
-    }
-
-    pub const fn index(&self) -> usize {
-        self.index
-    }
-
     /// Calculates a shard file size without overflowing the metadata's integer format.
     pub fn shard_file_size(&self, total_length: usize) -> Option<i64> {
         let full_blocks = total_length / self.block_size;
@@ -317,31 +291,13 @@ impl ValidatedErasureLayout {
 /// A [`FileInfo`] together with the invariants established at its operation boundary.
 #[derive(Debug)]
 pub struct ValidatedFileInfo<'a> {
-    file_info: &'a FileInfo,
-    mode: ValidationMode,
+    _file_info: &'a FileInfo,
     erasure_layout: Option<ValidatedErasureLayout>,
 }
 
 impl<'a> ValidatedFileInfo<'a> {
-    pub const fn file_info(&self) -> &'a FileInfo {
-        self.file_info
-    }
-
-    pub const fn mode(&self) -> ValidationMode {
-        self.mode
-    }
-
     pub const fn erasure_layout(&self) -> Option<&ValidatedErasureLayout> {
         self.erasure_layout.as_ref()
-    }
-
-    /// Returns a checksum whose association with `part_number` was validated.
-    pub fn checksum_info(&self, part_number: usize) -> Option<&ChecksumInfo> {
-        self.file_info
-            .erasure
-            .checksums
-            .iter()
-            .find(|checksum| checksum.part_number == part_number)
     }
 }
 
@@ -349,8 +305,8 @@ fn mark_fileinfo_part(bitmap: &mut [u64; FILEINFO_PART_BITMAP_WORDS], part_numbe
     let Some(index) = part_number.checked_sub(1).filter(|&index| index < MAX_FILEINFO_PARTS) else {
         return false;
     };
-    let word = index / u64::BITS as usize;
-    let mask = 1u64 << (index % u64::BITS as usize);
+    let word = index / FILEINFO_PART_BITMAP_WORD_BITS;
+    let mask = 1u64 << (index % FILEINFO_PART_BITMAP_WORD_BITS);
     let was_absent = bitmap[word] & mask == 0;
     bitmap[word] |= mask;
     was_absent
@@ -360,7 +316,7 @@ fn has_fileinfo_part(bitmap: &[u64; FILEINFO_PART_BITMAP_WORDS], part_number: us
     let Some(index) = part_number.checked_sub(1).filter(|&index| index < MAX_FILEINFO_PARTS) else {
         return false;
     };
-    bitmap[index / u64::BITS as usize] & (1u64 << (index % u64::BITS as usize)) != 0
+    bitmap[index / FILEINFO_PART_BITMAP_WORD_BITS] & (1u64 << (index % FILEINFO_PART_BITMAP_WORD_BITS)) != 0
 }
 
 /// Validates that an erasure `distribution` is a permutation of `1..=n`.
@@ -449,11 +405,8 @@ impl FileInfo {
 
         let layout = ValidatedErasureLayout {
             data_blocks: erasure.data_blocks,
-            parity_blocks: erasure.parity_blocks,
-            total_blocks,
             block_size: erasure.block_size,
             shard_size,
-            index,
         };
         let object_size = usize::try_from(self.size).map_err(|_| Error::FileCorrupt)?;
         layout.shard_file_size(object_size).ok_or(Error::FileCorrupt)?;
@@ -590,8 +543,7 @@ impl FileInfo {
         self.validate_collection_contents(erasure_layout.as_ref())?;
 
         Ok(ValidatedFileInfo {
-            file_info: self,
-            mode,
+            _file_info: self,
             erasure_layout,
         })
     }
@@ -601,12 +553,12 @@ impl FileInfo {
     /// purge-pending object versions whose replication state sets `deleted`.
     /// Only entries that are not valid payloads may fall back to the canonical
     /// delete-marker shape, so `deleted` cannot bypass payload validation.
-    pub fn validate_for_metadata_read(&self) -> Result<ValidatedFileInfo<'_>> {
-        if let Ok(payload) = self.validate(ValidationMode::RequireErasure) {
-            return Ok(payload);
+    pub fn validate_for_metadata_read(&self) -> Result<()> {
+        if self.validate(ValidationMode::RequireErasure).is_ok() {
+            return Ok(());
         }
 
-        self.validate(ValidationMode::DeleteOnly)
+        self.validate(ValidationMode::DeleteOnly).map(|_| ())
     }
 
     /// Cheap shape check for metadata that already passed
@@ -1194,43 +1146,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_require_erasure_returns_checked_layout_and_checksum_index() {
+    fn validate_require_erasure_returns_checked_layout() {
         let fi = validation_test_fileinfo();
         let validated = fi
             .validate(ValidationMode::RequireErasure)
             .expect("well-formed erasure metadata must validate");
 
-        assert_eq!(validated.file_info(), &fi);
-        assert_eq!(validated.mode(), ValidationMode::RequireErasure);
         let layout = validated
             .erasure_layout()
             .expect("strict validation must return an erasure layout");
-        assert_eq!(layout.data_blocks(), 4);
-        assert_eq!(layout.parity_blocks(), 2);
-        assert_eq!(layout.total_blocks(), 6);
-        assert_eq!(layout.block_size(), BLOCK_SIZE_V2);
-        assert_eq!(layout.shard_size(), calc_shard_size(BLOCK_SIZE_V2, 4));
-        assert_eq!(layout.index(), 1);
-        let shard_size = i64::try_from(layout.shard_size()).expect("validated shard size must fit i64");
+        assert_eq!(layout.data_blocks, 4);
+        assert_eq!(layout.block_size, BLOCK_SIZE_V2);
+        assert_eq!(layout.shard_size, calc_shard_size(BLOCK_SIZE_V2, 4));
+        let shard_size = i64::try_from(layout.shard_size).expect("validated shard size must fit i64");
         assert_eq!(layout.shard_file_size(0), Some(0));
         assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2 - 1), Some(shard_size));
         assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2), Some(shard_size));
         assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2 + 1), Some(shard_size + 2));
-
-        let first_checksum = validated
-            .checksum_info(1)
-            .expect("the first validated checksum association must be indexed");
-        assert_eq!(first_checksum.part_number, 1);
-        assert_eq!(first_checksum.algorithm, HashAlgorithm::HighwayHash256S);
-        assert_eq!(first_checksum.hash, Bytes::from_static(b"checksum-one"));
-
-        let second_checksum = validated
-            .checksum_info(2)
-            .expect("the second validated checksum association must be indexed");
-        assert_eq!(second_checksum.part_number, 2);
-        assert_eq!(second_checksum.algorithm, HashAlgorithm::SHA256);
-        assert_eq!(second_checksum.hash, Bytes::from_static(b"checksum-two"));
-        assert_eq!(validated.checksum_info(3), None, "an absent part must not alias either checksum index");
     }
 
     #[test]
@@ -1241,13 +1173,7 @@ mod tests {
         let validated = fi
             .validate(ValidationMode::RequireErasure)
             .expect("zero parity is a valid storage layout");
-        assert_eq!(
-            validated
-                .erasure_layout()
-                .expect("strict layout must be present")
-                .total_blocks(),
-            16
-        );
+        assert_eq!(validated.erasure_layout().expect("strict layout must be present").data_blocks, 16);
     }
 
     #[test]
@@ -1399,11 +1325,9 @@ mod tests {
             mod_time: Some(OffsetDateTime::now_utc()),
             ..Default::default()
         };
-        let validated = marker
+        marker
             .validate_for_metadata_read()
             .expect("canonical delete marker should validate");
-        assert_eq!(validated.mode(), ValidationMode::DeleteOnly);
-        assert!(validated.erasure_layout().is_none());
 
         let mut missing_time = marker.clone();
         missing_time.mod_time = None;
@@ -1426,11 +1350,9 @@ mod tests {
 
         let mut purge_pending = validation_test_fileinfo();
         purge_pending.deleted = true;
-        let validated = purge_pending
+        purge_pending
             .validate_for_metadata_read()
             .expect("erasure-backed purge-pending objects remain valid payload metadata");
-        assert_eq!(validated.mode(), ValidationMode::RequireErasure);
-        assert!(validated.erasure_layout().is_some());
         assert!(!purge_pending.is_canonical_delete_marker());
     }
 
@@ -1507,10 +1429,8 @@ mod tests {
             })
             .collect();
 
-        let validated = fi
-            .validate(ValidationMode::RequireErasure)
+        fi.validate(ValidationMode::RequireErasure)
             .expect("exact collection limits must remain valid");
-        assert!(validated.checksum_info(10_000).is_some());
         fi.validate_for_delete_operation()
             .expect("non-marker delete requests must accept exact collection limits");
     }

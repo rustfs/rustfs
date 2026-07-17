@@ -69,6 +69,8 @@ pub const MIN_PARITY_DRIVES: usize = 0;
 
 // Default RRS parity is always minimum parity.
 pub const DEFAULT_RRS_PARITY: usize = 1;
+const DEFAULT_RRS_STORAGE_CLASS: &str = "EC:1";
+const ZERO_SET_DRIVE_COUNT_ERROR: &str = "set drive count must be greater than zero";
 
 pub static DEFAULT_INLINE_BLOCK: usize = 128 * 1024;
 
@@ -81,7 +83,7 @@ pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
         },
         KV {
             key: CLASS_RRS.to_owned(),
-            value: "EC:1".to_owned(),
+            value: DEFAULT_RRS_STORAGE_CLASS.to_owned(),
             hidden_if_empty: false,
         },
         KV {
@@ -109,7 +111,6 @@ pub struct StorageClass {
 struct PoolParity {
     drives_per_set: usize,
     parity: usize,
-    automatic: bool,
 }
 
 // Config storage class configuration
@@ -124,6 +125,8 @@ pub struct Config {
     standard_parities: Vec<PoolParity>,
     #[serde(skip)]
     rrs_parities: Vec<PoolParity>,
+    #[serde(skip)]
+    standard_automatic: bool,
 }
 
 impl Config {
@@ -200,7 +203,7 @@ impl Config {
         self.standard_parities
             .iter()
             .enumerate()
-            .filter(|(_, pool)| pool.automatic && pool.parity == 0)
+            .filter(|(_, pool)| self.standard_automatic && pool.parity == 0)
             .map(|(pool_index, pool)| (pool_index, pool.drives_per_set))
     }
 
@@ -315,7 +318,7 @@ fn rrs_policy(kvs: &KVS, value: Option<String>) -> Result<ParityPolicy> {
         Some(value) => Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity)),
         None => {
             let value = kvs.get(CLASS_RRS);
-            if value.is_empty() || value == "EC:1" {
+            if value.is_empty() || value == DEFAULT_RRS_STORAGE_CLASS {
                 Ok(ParityPolicy::LegacyRrs)
             } else {
                 Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity))
@@ -339,6 +342,7 @@ fn lookup_config_for_pools_with_env(
 
     let standard_policy = standard_policy(kvs, overrides.standard)?;
     let rrs_policy = rrs_policy(kvs, overrides.rrs)?;
+    let standard_automatic = matches!(standard_policy, ParityPolicy::AutomaticStandard);
     let mut standard_parities = Vec::with_capacity(set_drive_counts.len());
     let mut rrs_parities = Vec::with_capacity(set_drive_counts.len());
 
@@ -353,12 +357,10 @@ fn lookup_config_for_pools_with_env(
         standard_parities.push(PoolParity {
             drives_per_set,
             parity: standard_parity,
-            automatic: matches!(standard_policy, ParityPolicy::AutomaticStandard),
         });
         rrs_parities.push(PoolParity {
             drives_per_set,
             parity: rrs_parity,
-            automatic: matches!(rrs_policy, ParityPolicy::LegacyRrs),
         });
     }
 
@@ -397,6 +399,7 @@ fn lookup_config_for_pools_with_env(
         initialized: true,
         standard_parities,
         rrs_parities,
+        standard_automatic,
     })
 }
 
@@ -443,7 +446,7 @@ pub fn validate_parity(ss_parity: usize, set_drive_count: usize) -> Result<()> {
     // }
 
     if set_drive_count == 0 {
-        return Err(Error::other("set drive count must be greater than zero"));
+        return Err(Error::other(ZERO_SET_DRIVE_COUNT_ERROR));
     }
 
     if ss_parity > set_drive_count / 2 {
@@ -476,7 +479,7 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
     // }
 
     if set_drive_count == 0 {
-        return Err(Error::other("set drive count must be greater than zero"));
+        return Err(Error::other(ZERO_SET_DRIVE_COUNT_ERROR));
     }
 
     if ss_parity > set_drive_count / 2 {

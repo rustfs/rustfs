@@ -1156,7 +1156,7 @@ fn decode_batch_read_version_response_items(
 }
 
 fn validate_decoded_file_info(file_info: &FileInfo) -> Result<()> {
-    file_info.validate_for_metadata_read().map(|_| ()).map_err(Into::into)
+    file_info.validate_for_metadata_read().map_err(Into::into)
 }
 
 #[async_trait::async_trait]
@@ -3064,7 +3064,6 @@ mod tests {
             } else {
                 "file version not found".to_string()
             },
-            ..Default::default()
         }
     }
 

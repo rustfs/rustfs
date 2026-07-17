@@ -157,7 +157,6 @@ fn build_backend_info(
         rr_sc_parity: storage_class_info.rr_sc_parity,
         total_sets: total_sets.to_vec(),
         drives_per_set: drives_per_set.to_vec(),
-        ..Default::default()
     }
 }
 

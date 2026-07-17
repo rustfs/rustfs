@@ -2835,7 +2835,9 @@ mod tests {
 
     #[test]
     fn metadata_quorum_accumulator_rejects_semantic_field_splits() {
-        let mutations: &[(&str, fn(&mut FileInfo))] = &[
+        type FileInfoMutation = fn(&mut FileInfo);
+
+        let mutations: &[(&str, FileInfoMutation)] = &[
             ("transition_status", |fi| fi.transition_status = "complete".to_string()),
             ("transitioned_objname", |fi| fi.transitioned_objname = "remote-object".to_string()),
             ("transition_tier", |fi| fi.transition_tier = "WARM".to_string()),

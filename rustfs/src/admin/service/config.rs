@@ -45,6 +45,10 @@ pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
 }
 
 pub(crate) const FULL_CONFIG_WORKER_SUBSYSTEMS: [&str; 2] = [AUDIT_WEBHOOK_SUB_SYS, SCANNER_SUB_SYS];
+pub(crate) const EVENT_CONFIG_WORKER_RELOAD_FAILED: &str = "config_worker_reload_failed";
+pub(crate) const LOG_COMPONENT_ADMIN: &str = "admin";
+pub(crate) const LOG_SUBSYSTEM_CONFIG: &str = "config";
+pub(crate) const CONFIG_WORKER_RELOAD_FAILURE_STATE: &str = "best_effort_reload_failed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DynamicConfigWorkerMutation {
@@ -382,41 +386,23 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
     apply_dynamic_config_for_subsystem_for_context(context.as_deref(), config, sub_system).await
 }
 
-async fn reload_dynamic_config_with<ReadFuture, Apply, ApplyFuture>(read: ReadFuture, apply: Apply) -> S3Result<()>
-where
-    ReadFuture: Future<Output = S3Result<ServerConfig>>,
-    Apply: FnOnce(ServerConfig) -> ApplyFuture,
-    ApplyFuture: Future<Output = S3Result<()>>,
-{
-    let config = read.await?;
-    apply(config).await
-}
-
 pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
     if !is_dynamic_config_subsystem(sub_system) {
         return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
     }
 
     let store = resolve_runtime_config_store_for_context(context)?;
-
-    reload_dynamic_config_with(
-        async move {
-            read_admin_config_without_migrate(store).await.map_err(|err| {
-                warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
-                internal_error(format!("failed to load server config: {err}"))
-            })
-        },
-        |config| async move {
-            apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
-                .await
-                .map_err(|err| {
-                    warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
-                    err
-                })?;
-            Ok(())
-        },
-    )
-    .await
+    let config = read_admin_config_without_migrate(store).await.map_err(|err| {
+        warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
+        internal_error(format!("failed to load server config: {err}"))
+    })?;
+    apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
+        .await
+        .map_err(|err| {
+            warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
+            err
+        })?;
+    Ok(())
 }
 
 pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<()> {
@@ -448,10 +434,10 @@ where
     // erasure geometry.
     if let Err(err) = apply_workers(config).await {
         warn!(
-            event = "config_worker_reload_failed",
-            component = "admin",
-            subsystem = "config",
-            state = "best_effort",
+            event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
             error = ?err,
             "Runtime config snapshot was published but a worker reload failed"
         );
@@ -485,11 +471,11 @@ pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppCont
             for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
                 if let Err(err) = apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system).await {
                     warn!(
-                        event = "config_worker_reload_failed",
-                        component = "admin",
-                        subsystem = "config",
+                        event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_CONFIG,
                         config_subsystem = sub_system,
-                        state = "best_effort",
+                        state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
                         error = ?err,
                         "Peer runtime config snapshot was published but a subsystem worker reload failed"
                     );

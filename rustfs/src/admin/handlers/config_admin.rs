@@ -18,7 +18,8 @@ use crate::admin::runtime_sources::{
     current_app_context, current_object_store_handle_for_context, current_server_config_for_context, publish_server_config,
 };
 use crate::admin::service::config::{
-    FULL_CONFIG_WORKER_SUBSYSTEMS, PreparedRuntimeConfig, apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem,
+    CONFIG_WORKER_RELOAD_FAILURE_STATE, EVENT_CONFIG_WORKER_RELOAD_FAILED, FULL_CONFIG_WORKER_SUBSYSTEMS, LOG_COMPONENT_ADMIN,
+    LOG_SUBSYSTEM_CONFIG, PreparedRuntimeConfig, apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem,
     prepare_server_config, signal_config_snapshot_reload, signal_dynamic_config_reload,
 };
 use crate::admin::storage_api::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
@@ -96,10 +97,6 @@ const CONFIG_APPLIED_HEADER: &str = "x-rustfs-config-applied";
 const CONFIG_APPLIED_COMPAT_HEADER: &str = "x-minio-config-applied";
 const CONFIG_APPLIED_TRUE: &str = "true";
 const DEFAULT_COMMENT_DESCRIPTION: &str = "optionally add a comment to this setting";
-const EVENT_CONFIG_WORKER_RELOAD_FAILED: &str = "config_worker_reload_failed";
-const LOG_COMPONENT_ADMIN: &str = "admin";
-const LOG_SUBSYSTEM_CONFIG: &str = "config";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigEntry {
     key: String,
@@ -1574,7 +1571,7 @@ async fn apply_dynamic_subsystems(config: &ServerConfig) {
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_CONFIG,
                 config_subsystem = sub_system,
-                state = "best_effort_reload_failed",
+                state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
                 error = %err,
                 "Published server config but failed to reload a local worker subsystem"
             );

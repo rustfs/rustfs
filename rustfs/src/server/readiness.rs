@@ -554,8 +554,8 @@ fn pool_read_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize)
 fn configured_readiness_topology(info: &StorageInfo) -> Option<(&[usize], &[usize])> {
     if info.backend.total_sets.is_empty()
         || info.backend.total_sets.len() != info.backend.drives_per_set.len()
-        || info.backend.total_sets.iter().any(|&set_count| set_count == 0)
-        || info.backend.drives_per_set.iter().any(|&drive_count| drive_count == 0)
+        || info.backend.total_sets.contains(&0)
+        || info.backend.drives_per_set.contains(&0)
     {
         return None;
     }

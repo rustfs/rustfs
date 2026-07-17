@@ -128,7 +128,7 @@ use rustfs_common::heal_channel::{
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, ValidatedErasureLayout, ValidationMode, file_info_from_raw, merge_file_meta_versions,
+    RawFileInfo, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
