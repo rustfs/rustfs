@@ -46,6 +46,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
+pub(crate) mod heal;
+
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_RPC: &str = "rpc";
 const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
@@ -984,7 +986,26 @@ impl Node for NodeService {
         &self,
         _request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
-        Err(unimplemented_rpc("background_heal_status"))
+        if self.resolve_object_store().is_none() {
+            return Ok(Response::new(BackgroundHealStatusResponse {
+                success: false,
+                bg_heal_state: Bytes::new(),
+                error_info: Some("storage layer not initialized".to_string()),
+            }));
+        }
+        let snapshot = heal::capture_node_heal_status(rustfs_scanner::scanner::BackgroundHealInfo::default()).await;
+        match heal::encode_node_heal_status(&snapshot) {
+            Ok(bg_heal_state) => Ok(Response::new(BackgroundHealStatusResponse {
+                success: true,
+                bg_heal_state: bg_heal_state.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(BackgroundHealStatusResponse {
+                success: false,
+                bg_heal_state: Bytes::new(),
+                error_info: Some(err),
+            })),
+        }
     }
 
     async fn get_metacache_listing(
@@ -2938,12 +2959,13 @@ mod tests {
                 .await,
             "get_all_bucket_stats",
         );
-        assert_unimplemented_status(
-            service
-                .background_heal_status(Request::new(BackgroundHealStatusRequest::default()))
-                .await,
-            "background_heal_status",
-        );
+        let heal_status = service
+            .background_heal_status(Request::new(BackgroundHealStatusRequest::default()))
+            .await
+            .expect("implemented heal status RPC should return a response")
+            .into_inner();
+        assert!(!heal_status.success);
+        assert_eq!(heal_status.error_info.as_deref(), Some("storage layer not initialized"));
         assert_unimplemented_status(
             service
                 .get_metacache_listing(Request::new(GetMetacacheListingRequest::default()))

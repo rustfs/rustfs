@@ -70,6 +70,13 @@ pub(crate) fn object_store_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<EC
     object_store_from_extensions(&req.extensions)
 }
 
+pub(crate) fn app_context_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<AppContext>> {
+    req.extensions
+        .get::<Arc<ServerContextSlot>>()
+        .and_then(|slot| slot.app_context())
+        .or_else(current_app_context)
+}
+
 /// Field-borrow form of [`object_store_from_req`] for handlers that have
 /// already moved other request fields (body, credentials) out of the request.
 pub(crate) fn object_store_from_extensions(extensions: &http::Extensions) -> Option<Arc<ECStore>> {

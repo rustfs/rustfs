@@ -29,11 +29,11 @@ use rustfs_madmin::{
 };
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::{
-    CancelDecommissionRequest, ClearDecommissionRequest, DeleteBucketMetadataRequest, DeletePolicyRequest,
-    DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest, GetMetricsRequest,
-    GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest,
-    GetSysErrorsRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
-    LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
+    BackgroundHealStatusRequest, CancelDecommissionRequest, ClearDecommissionRequest, DeleteBucketMetadataRequest,
+    DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest,
+    GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
+    GetSysConfigRequest, GetSysErrorsRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest,
+    LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
     LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ServerInfoRequest,
     SignalServiceRequest, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
     node_service_client::NodeServiceClient,
@@ -60,6 +60,7 @@ pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
 pub const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = 1;
 pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
+const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -637,6 +638,38 @@ impl PeerRestClient {
     pub async fn get_all_bucket_stats(&self) -> Result<()> {
         warn!("get_all_bucket_stats is not implemented in PeerRestClient");
         Err(Error::NotImplemented)
+    }
+
+    pub async fn background_heal_status(&self) -> Result<Option<Vec<u8>>> {
+        self.finalize_result(
+            async {
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE);
+                let response = match client
+                    .background_heal_status(Request::new(BackgroundHealStatusRequest::default()))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        // RUSTFS_COMPAT_TODO(heal-status-rpc-v1): accept old peers without node heal snapshots. Remove after the minimum supported RustFS peer version implements BackgroundHealStatus.
+                        return Ok(None);
+                    }
+                    Err(status) => return Err(status.into()),
+                };
+                if !response.success {
+                    return Err(Error::other(
+                        response
+                            .error_info
+                            .unwrap_or_else(|| "peer background heal status failed without an error".to_string()),
+                    ));
+                }
+                Ok(Some(response.bg_heal_state.to_vec()))
+            }
+            .await,
+        )
+        .await
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
