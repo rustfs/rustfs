@@ -28,7 +28,10 @@ pub(crate) use background_monitor::spawn_background_monitor;
 pub use client::{
     TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
 };
-pub use http_auth::{TONIC_RPC_PREFIX, build_auth_headers, gen_signature_headers, verify_rpc_signature};
+pub use http_auth::{
+    TONIC_RPC_PREFIX, build_auth_headers, gen_signature_headers, gen_tonic_signature_headers, normalize_tonic_rpc_audience,
+    set_tonic_canonical_body_digest, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
+};
 #[cfg(test)]
 pub(crate) use internode_data_transport::TcpHttpInternodeDataTransport;
 pub use internode_data_transport::build_internode_data_transport_from_env;

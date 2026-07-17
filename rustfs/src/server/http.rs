@@ -36,9 +36,11 @@ use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 use crate::storage_api::server::http::tonic_service::make_server;
-use crate::storage_api::server::http::{ServerContextSlot, TONIC_RPC_PREFIX, verify_rpc_signature};
+use crate::storage_api::server::http::{
+    ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
+};
 use bytes::Bytes;
-use http::{HeaderMap, Method, Request as HttpRequest, Response};
+use http::{HeaderMap, Method, Request as HttpRequest, Response, Uri};
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -121,6 +123,45 @@ const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verificatio
 const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+struct RpcRequestTarget {
+    uri: Uri,
+    method: Method,
+}
+
+#[derive(Clone)]
+struct RpcRequestPathService<S> {
+    inner: S,
+}
+
+impl<S> RpcRequestPathService<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S, B> Service<HttpRequest<B>> for RpcRequestPathService<S>
+where
+    S: Service<HttpRequest<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let target = RpcRequestTarget {
+            uri: req.uri().clone(),
+            method: req.method().clone(),
+        };
+        req.extensions_mut().insert(target);
+        self.inner.call(req)
+    }
+}
 
 #[inline]
 fn request_method_label(method: &Method) -> &'static str {
@@ -1185,12 +1226,12 @@ fn process_connection(
         // service in the auth interceptor (which returns an `InterceptedService` without those
         // methods).
         let rpc_max_message_size = rustfs_protos::internode_rpc_max_message_size();
-        let rpc_service = InterceptedService::new(
+        let rpc_service = RpcRequestPathService::new(InterceptedService::new(
             NodeServiceServer::new(make_server())
                 .max_decoding_message_size(rpc_max_message_size)
                 .max_encoding_message_size(rpc_max_message_size),
             check_auth,
-        );
+        ));
 
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(true, None, s3_service);
@@ -1712,7 +1753,26 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
+    let local_node_name =
+        storage::try_current_local_node_name().ok_or_else(|| Status::unavailable("RPC identity unavailable"))?;
+    let audience =
+        normalize_tonic_rpc_audience(&local_node_name).map_err(|_| Status::unavailable("Invalid local RPC identity"))?;
+    let target = req
+        .extensions()
+        .get::<RpcRequestTarget>()
+        .ok_or_else(|| Status::unauthenticated("Missing RPC request target"))?;
+    if target.method != Method::POST {
+        return Err(Status::unauthenticated("Invalid RPC request method"));
+    }
+    let rpc_method = target
+        .uri
+        .path()
+        .strip_prefix(TONIC_RPC_PREFIX)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .filter(|method| !method.is_empty() && !method.contains('/'))
+        .ok_or_else(|| Status::unauthenticated("Invalid RPC request path"))?;
+    debug_assert!(!rpc_method.is_empty());
+    verify_tonic_rpc_signature(&audience, target.uri.path(), req.metadata().as_ref()).map_err(|e| {
         error!(
             event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
             component = LOG_COMPONENT_SERVER,
@@ -2048,6 +2108,93 @@ mod tests {
         fn call(&mut self, _req: HttpRequest<ReqBody>) -> Self::Future {
             std::future::ready(Ok(Response::new(Empty::new())))
         }
+    }
+
+    #[derive(Clone, Copy)]
+    struct RpcPathObserver;
+
+    impl<ReqBody> Service<HttpRequest<ReqBody>> for RpcPathObserver {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<std::result::Result<Response<Empty<Bytes>>, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
+            let mut response = Response::new(Empty::new());
+            if let Some(target) = req.extensions().get::<RpcRequestTarget>() {
+                response.extensions_mut().insert(target.clone());
+            }
+            std::future::ready(Ok(response))
+        }
+    }
+
+    #[test]
+    fn rpc_request_path_service_preserves_exact_http_target() {
+        let expected_path = "/node_service.NodeService/BackgroundHealStatus";
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(format!("http://node-a:9000{expected_path}"))
+            .body(())
+            .expect("request");
+        let mut service = RpcRequestPathService::new(RpcPathObserver);
+
+        let response = futures::executor::block_on(service.call(request)).expect("response");
+        let captured = response
+            .extensions()
+            .get::<RpcRequestTarget>()
+            .expect("inner gRPC service should receive the exact request URI");
+        assert_eq!(captured.uri.path(), expected_path);
+        assert_eq!(captured.uri.authority().map(|authority| authority.as_str()), Some("node-a:9000"));
+        assert_eq!(captured.method, Method::POST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_binds_post_method_authority_and_exact_path() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name("127.0.0.1:9000").await;
+        let headers =
+            storage::gen_tonic_signature_headers("127.0.0.1:9000", "node_service.NodeService", "BackgroundHealStatus", None)
+                .expect("v2 auth headers should build");
+        let uri: Uri = "http://127.0.0.1:9000/node_service.NodeService/BackgroundHealStatus"
+            .parse()
+            .expect("test RPC URI should parse");
+
+        let mut request = Request::new(());
+        request.metadata_mut().as_mut().extend(headers.clone());
+        request.extensions_mut().insert(RpcRequestTarget {
+            uri: uri.clone(),
+            method: Method::POST,
+        });
+        assert!(check_auth(request).is_ok(), "matching trusted node audience should authenticate");
+
+        rustfs_common::set_global_local_node_name("127.0.0.1:9001").await;
+        let mut replay_to_other_node = Request::new(());
+        replay_to_other_node.metadata_mut().as_mut().extend(headers.clone());
+        replay_to_other_node.extensions_mut().insert(RpcRequestTarget {
+            uri: uri.clone(),
+            method: Method::POST,
+        });
+        assert!(
+            check_auth(replay_to_other_node).is_err(),
+            "same-host request must not replay across node ports"
+        );
+
+        rustfs_common::set_global_local_node_name("127.0.0.1:9000").await;
+        let mut get_request = Request::new(());
+        get_request.metadata_mut().as_mut().extend(headers);
+        get_request.extensions_mut().insert(RpcRequestTarget {
+            uri,
+            method: Method::GET,
+        });
+        let error = check_auth(get_request).expect_err("wire GET must not reuse a POST gRPC signature");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "Invalid RPC request method");
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
     #[derive(Clone)]
