@@ -280,6 +280,7 @@ pub struct BucketTargetSys {
     pub hc_client: Arc<HttpClient>,
     pub a_mutex: Arc<Mutex<HashMap<String, ArnErrs>>>,
     pub arn_errs_map: Arc<RwLock<HashMap<String, ArnErrs>>>,
+    heartbeat_started: OnceLock<()>,
 }
 
 impl BucketTargetSys {
@@ -295,7 +296,18 @@ impl BucketTargetSys {
             hc_client: Arc::new(HttpClient::new()),
             a_mutex: Arc::new(Mutex::new(HashMap::new())),
             arn_errs_map: Arc::new(RwLock::new(HashMap::new())),
+            heartbeat_started: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn start_heartbeat(&'static self) {
+        if self.heartbeat_started.set(()).is_err() {
+            return;
+        }
+
+        tokio::spawn(async move {
+            self.heartbeat().await;
+        });
     }
 
     pub async fn is_offline(&self, url: &Url) -> bool {
@@ -367,7 +379,7 @@ impl BucketTargetSys {
     async fn check_endpoint_health(&self, endpoint: &str, scheme: &str) -> bool {
         let scheme = if scheme.is_empty() { "https" } else { scheme };
         let url = format!("{scheme}://{endpoint}/");
-        match self.hc_client.head(url).timeout(Duration::from_secs(3)).send().await {
+        match self.hc_client.get(url).timeout(Duration::from_secs(3)).send().await {
             Ok(response) => response.status().as_u16() < 500,
             Err(_) => false,
         }
