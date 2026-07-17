@@ -1930,6 +1930,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             check_object_lock_delete(bucket, object, &goi, &opts).await?;
         }
 
+        if opts.transition.expire_restored {
+            // Restore-expiry (DeleteRestoredAction / DeleteRestoredVersionAction)
+            // must only drop the local restored copy and strip the x-amz-restore
+            // headers; the version itself stays transitioned (status=complete)
+            // and keeps serving GETs from the tier. Route it before delete-marker
+            // resolution and replication dispatch: a delete marker would hide the
+            // version, a replicated delete would remove it on the target, and a
+            // free-version record would schedule remote tier cleanup.
+            if !version_found {
+                return Err(gerr.unwrap_or_else(|| StorageError::ObjectNotFound(bucket.to_string(), object.to_string())));
+            }
+            let dfi = FileInfo {
+                name: object.to_string(),
+                version_id: goi.version_id,
+                mod_time: Some(opts.mod_time.unwrap_or_else(OffsetDateTime::now_utc)),
+                expire_restored: true,
+                ..Default::default()
+            };
+            self.delete_object_version(bucket, object, &dfi, false)
+                .await
+                .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+            return Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended));
+        }
+
         let otd = ObjectToDelete {
             object_name: object.to_string(),
             version_id: opts

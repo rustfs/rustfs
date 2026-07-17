@@ -230,11 +230,6 @@ jobs:
       #   - test_transition_and_restore_flows: transition metadata is missing on
       #     one drive (assert_transition_meta_consistent: "missing xl.meta ... on
       #     disk2") - an EC metadata-distribution issue, not the restore lock.
-      #   - test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore:
-      #     DeleteRestoredAction sets opts.transition.expire_restored, but no
-      #     delete path reads that flag, so cleanup deletes the whole object
-      #     instead of only the local restored copy (ObjectNotFound afterwards).
-      #     The expire_restored delete semantics are unimplemented.
       #   - restore_object_usecase_reports_ongoing_conflict_and_completion: asserts
       #     a concurrent get_object_info observes ongoing-request=true mid-restore,
       #     which #4877's read-vs-restore serialization rules out (see backlog#1148
@@ -243,7 +238,7 @@ jobs:
         run: |
           cargo nextest run -j1 --run-ignored ignored-only \
             -p rustfs-scanner -p rustfs \
-            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition) or test(restore_object_usecase_reports_ongoing_conflict_and_completion) or test(test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore))'
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition) or test(restore_object_usecase_reports_ongoing_conflict_and_completion))'
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
