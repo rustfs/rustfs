@@ -73,6 +73,20 @@ pub(crate) async fn init_startup_storage_foundation(
             );
         })
         .map_err(Error::other)?;
+    ECStore::validate_startup_storage_class(&endpoint_pools)
+        .inspect_err(|err| {
+            error!(
+                target: "rustfs::main::run",
+                event = EVENT_STARTUP_STORAGE_STAGE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                stage = "storage_class_validation",
+                state = "failed",
+                error = %err,
+                "Storage-class validation failed"
+            );
+        })
+        .map_err(Error::other)?;
     enforce_unsupported_fs_policy(&endpoint_pools)?;
 
     instance_ctx.set_endpoints(endpoint_pools.clone());
@@ -118,6 +132,7 @@ pub(crate) async fn init_embedded_startup_storage_foundation(
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address, volumes.to_vec())
         .await
         .map_err(|err| Error::other(format!("endpoints: {err}")))?;
+    ECStore::validate_startup_storage_class(&endpoint_pools).map_err(|err| Error::other(format!("storage class: {err}")))?;
     enforce_unsupported_fs_policy(&endpoint_pools).map_err(|err| Error::other(format!("unsupported fs guard: {err}")))?;
 
     instance_ctx.set_endpoints(endpoint_pools.clone());
@@ -332,8 +347,13 @@ fn global_config_retry_exhausted(retry_count: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{global_config_retry_exhausted, init_embedded_startup_storage_foundation, storage_pool_has_host_failure_risk};
+    use super::{
+        global_config_retry_exhausted, init_embedded_startup_storage_foundation, init_startup_storage_foundation,
+        storage_pool_has_host_failure_risk,
+    };
+    use crate::storage::storage_api::ecstore_config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
     use crate::storage_api::startup::storage::{InstanceContext, bootstrap_instance_ctx};
+    use rustfs_config::ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT;
     use std::sync::Arc;
 
     #[test]
@@ -349,6 +369,7 @@ mod tests {
     // seam a future second embedded server needs to avoid the write-once
     // panics on shared startup state.
     #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn embedded_foundation_writes_land_on_passed_instance_ctx() {
         let temp_dir = tempfile::tempdir().expect("create temp volume");
         let volume = temp_dir.path().display().to_string();
@@ -380,6 +401,65 @@ mod tests {
             !bootstrap.is_erasure_sd().await,
             "the bootstrap context must not absorb the erasure kind written to an explicit context"
         );
+    }
+
+    fn heterogeneous_volume_args(temp_dir: &tempfile::TempDir) -> Vec<String> {
+        let root = temp_dir.path().display();
+        vec![format!("{root}/pool-a/disk{{1...4}}"), format!("{root}/pool-b/disk{{1...2}}")]
+    }
+
+    async fn assert_invalid_storage_class_fails_before_foundation_mutation(embedded: bool) {
+        let temp_dir = tempfile::tempdir().expect("create topology root");
+        let volumes = heterogeneous_volume_args(&temp_dir);
+        let instance_ctx = Arc::new(InstanceContext::new());
+
+        let result = if embedded {
+            init_embedded_startup_storage_foundation("127.0.0.1:29124", &volumes, &instance_ctx).await
+        } else {
+            init_startup_storage_foundation("127.0.0.1:29125", &volumes, &instance_ctx).await
+        };
+
+        let err = result.expect_err("EC:2 must be rejected by the two-drive pool before disk initialization");
+        assert!(
+            err.to_string().contains("pool 1") && err.to_string().contains("2 drives"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            instance_ctx.endpoints().is_none(),
+            "invalid storage-class configuration must fail before mutating the instance topology"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn startup_foundation_validates_all_pools_before_mutation() {
+        temp_env::async_with_vars(
+            [
+                (STANDARD_ENV, Some("EC:2")),
+                (RRS_ENV, None),
+                (OPTIMIZE_ENV, None),
+                (INLINE_BLOCK_ENV, None),
+                (ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, None),
+            ],
+            assert_invalid_storage_class_fails_before_foundation_mutation(false),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn embedded_foundation_validates_all_pools_before_mutation() {
+        temp_env::async_with_vars(
+            [
+                (STANDARD_ENV, Some("EC:2")),
+                (RRS_ENV, None),
+                (OPTIMIZE_ENV, None),
+                (INLINE_BLOCK_ENV, None),
+                (ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, None),
+            ],
+            assert_invalid_storage_class_fails_before_foundation_mutation(true),
+        )
+        .await;
     }
 
     #[test]
