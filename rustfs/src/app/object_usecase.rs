@@ -6872,10 +6872,14 @@ impl DefaultObjectUsecase {
             }
             let mut size =
                 i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))?;
+            // mtime 0 means "unset" in tar headers, and xl.meta cannot represent an
+            // epoch mod_time anyway (0 nanos decodes as no-mod_time, making the version
+            // unreadable — rustfs#4842), so fall back to the upload time instead.
             let archive_entry_mod_time = f
                 .header()
                 .mtime()
                 .ok()
+                .filter(|&modified_at_secs| modified_at_secs > 0)
                 .and_then(|modified_at_secs| OffsetDateTime::from_unix_timestamp(modified_at_secs as i64).ok());
             let mut metadata = HashMap::new();
             let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
