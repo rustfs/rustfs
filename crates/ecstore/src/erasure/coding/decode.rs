@@ -40,6 +40,10 @@ use tracing::{error, warn};
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
 
+/// One stripe's worth of shard buffers plus the per-shard read errors, as
+/// returned by `ParallelReader::read` / `read_stripe_timed`.
+type StripeReadOutput = (Vec<Option<Vec<u8>>>, Vec<Option<Error>>);
+
 const ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING: &str = "RUSTFS_SHARD_LOCALITY_SCHEDULING";
 const ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE: &str = "RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE";
 const SHARD_LOCALITY_SCHEDULING_OFF: &str = "off";
@@ -1770,29 +1774,78 @@ impl Erasure {
 
                     if idx + 1 < blocks.len() {
                         // Overlap: read stripe idx+1 while reconstructing/emitting idx.
-                        let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
-                        let emit_fut = self.emit_decoded_stripe(
-                            writer,
-                            &mut shards,
-                            &errs,
-                            block_offset,
-                            block_length,
-                            &mut written,
-                            &mut ret_err,
-                            stage_metrics_enabled,
-                        );
-                        let (next, flow) = tokio::join!(read_fut, emit_fut);
+                        //
+                        // Cancel-safety (https://github.com/rustfs/backlog/issues/1310):
+                        // the prefetch read and the emit run concurrently, but if emit
+                        // terminates the loop — client disconnect or any emit error —
+                        // we must NOT keep waiting for the speculative next-stripe read.
+                        // A plain `tokio::join!` did exactly that: it drove both futures
+                        // to completion, so a `Stop` still blocked on the prefetch read,
+                        // which could stall for a whole shard-read deadline on a slow or
+                        // wedged remote shard before the GET could fail. Instead, drive
+                        // both with a biased `select!` and, the moment emit reports
+                        // `Stop`, drop the in-flight read future.
+                        //
+                        // Dropping the future is a real cancellation, not a detach: the
+                        // entire read pipeline is structured async (a `FuturesUnordered`
+                        // of `read_shard` futures inside `ParallelReader::read`, with no
+                        // `tokio::spawn`), so dropping `read_fut` drops every in-flight
+                        // shard read and propagates cancellation down to the
+                        // RemoteDisk / HTTP reader — no background read is left behind.
+                        //
+                        // The default path (`legacy_stripe_prefetch_enabled() == false`)
+                        // never reaches this branch, so this changes nothing for the
+                        // strictly-serial read → reconstruct → emit default.
+                        //
+                        // The `select!` is scoped so that both pinned futures are
+                        // dropped at the end of this inner block — before `reader` and
+                        // `shards` are borrowed again below. In the `Stop` case that
+                        // drop is what cancels the still-in-flight prefetch read.
+                        let (flow, next): (Option<StripeFlow>, Option<StripeReadOutput>) = {
+                            let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
+                            let emit_fut = self.emit_decoded_stripe(
+                                writer,
+                                &mut shards,
+                                &errs,
+                                block_offset,
+                                block_length,
+                                &mut written,
+                                &mut ret_err,
+                                stage_metrics_enabled,
+                            );
+                            tokio::pin!(read_fut);
+                            tokio::pin!(emit_fut);
+
+                            let mut next: Option<StripeReadOutput> = None;
+                            let mut flow: Option<StripeFlow> = None;
+                            // Poll until emit finishes. Once it has, only keep waiting for
+                            // the prefetch read when emit said `Continue` (that stripe is
+                            // still needed). On `Stop` the loop condition is false
+                            // immediately and we break; the pinned read future is then
+                            // dropped at the end of this block, cancelling the in-flight
+                            // read. `biased` polls emit first so a ready `Stop` cancels the
+                            // read at the earliest opportunity.
+                            while flow.is_none() || (matches!(flow, Some(StripeFlow::Continue)) && next.is_none()) {
+                                tokio::select! {
+                                    biased;
+                                    f = &mut emit_fut, if flow.is_none() => flow = Some(f),
+                                    n = &mut read_fut, if next.is_none() => next = Some(n),
+                                }
+                            }
+                            (flow, next)
+                        };
+
                         match flow {
-                            StripeFlow::Continue => {
+                            // `next` is guaranteed `Some` here: the loop only exits with
+                            // `Continue` once the read has also completed.
+                            Some(StripeFlow::Continue) => {
                                 reader.recycle_shards(&mut shards);
-                                current = Some(next);
+                                current = next;
                             }
-                            StripeFlow::Stop => {
-                                // `next` is speculative; drop it without surfacing
-                                // its errors against the stripe that stopped.
-                                drop(next);
-                                break;
-                            }
+                            // Emit stopped the loop. The speculative read is cancelled by
+                            // dropping `read_fut` (it goes out of scope on `break`); its
+                            // errors never surface against the stripe that stopped.
+                            _ => break,
                         }
                     } else {
                         // Final stripe: nothing left to prefetch.
@@ -1974,6 +2027,16 @@ mod tests {
             emitted: bool,
         },
         TimedOut,
+        /// Serves `cursor` (typically the first stripe's bytes) normally, then
+        /// once it is exhausted parks on a long `sleep` instead of returning EOF —
+        /// modelling a shard whose *next*-stripe read never completes (a wedged or
+        /// very slow remote shard). Used by the prefetch cancel-safety test: the
+        /// speculative next-stripe read must be cancelled, not waited out.
+        PrefixThenSlow {
+            cursor: Cursor<Vec<u8>>,
+            stall: Duration,
+            sleep: Option<Pin<Box<Sleep>>>,
+        },
     }
 
     impl crate::erasure::coding::ShardSource for TestShardReader {}
@@ -2007,6 +2070,24 @@ mod tests {
                     Poll::Ready(Ok(()))
                 }
                 TestShardReader::TimedOut => Poll::Ready(Err(io::Error::new(ErrorKind::TimedOut, "test shard read timed out"))),
+                TestShardReader::PrefixThenSlow { cursor, stall, sleep } => {
+                    let before = buf.filled().len();
+                    match Pin::new(cursor).poll_read(cx, buf) {
+                        // Cursor still has bytes for the current stripe: serve them.
+                        Poll::Ready(Ok(())) if buf.filled().len() != before => Poll::Ready(Ok(())),
+                        // Cursor exhausted (would-be EOF): stall on a long sleep rather
+                        // than signalling EOF, so the next-stripe read hangs. This parks
+                        // the task cleanly (no busy `wake_by_ref` spin), letting the
+                        // `#[tokio::test(start_paused = true)]` clock auto-advance.
+                        Poll::Ready(Ok(())) => {
+                            let stall = *stall;
+                            let sleeper = sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+                            let _ = sleeper.as_mut().poll(cx);
+                            Poll::Pending
+                        }
+                        other => other,
+                    }
+                }
             }
         }
     }
@@ -2786,6 +2867,77 @@ mod tests {
         temp_env::with_vars([(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("1"))], || {
             assert!(!legacy_stripe_prefetch_enabled(), "count == 1 must stay serial");
         });
+    }
+
+    /// Cancel-safety (https://github.com/rustfs/backlog/issues/1310): when the
+    /// current stripe's emit fails (client disconnect / broken pipe), the
+    /// speculatively prefetched next-stripe read must be *cancelled*, not waited
+    /// out. Each shard serves the first stripe and then stalls for `STALL` on the
+    /// next-stripe read (a wedged remote shard); the per-shard read timeout is
+    /// pinned far above the assertion window. Under the paused clock the correct
+    /// path returns at virtual t≈0 (read future dropped); a `tokio::join!`
+    /// regression would block until the shard read timeout, so this test fails
+    /// closed if cancel-safety is reverted.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_legacy_prefetch_cancels_next_read_on_emit_failure() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        // Two full stripes: stripe 0 emits (and fails), stripe 1 is the prefetch
+        // that must be cancelled.
+        let total_data: Vec<u8> = (0..(2 * BLOCK_SIZE) as u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let hash_size = hash_algo.size();
+        let shard_bufs = encode_prefetch_object(&erasure, &total_data, &hash_algo).await;
+        let first_block_len = hash_size + shard_size;
+
+        // Shard read timeout and next-stripe stall both far exceed the assertion
+        // window, so a regression cannot "pass" by timing out inside the window.
+        const READ_TIMEOUT_SECS: &str = "600";
+        const STALL: Duration = Duration::from_secs(3600);
+        const ASSERT_WINDOW: Duration = Duration::from_secs(5);
+
+        // Overlap on (bitrot-decode overlap switch) so the prefetch branch runs.
+        let vars = [
+            (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("true")),
+            (rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some(READ_TIMEOUT_SECS)),
+        ];
+        temp_env::async_with_vars(vars, async {
+            let readers: Vec<Option<BitrotReader<TestShardReader>>> = shard_bufs
+                .iter()
+                .map(|buf| {
+                    // Serve only the first stripe's bytes, then stall the next read.
+                    let prefix = buf[..first_block_len.min(buf.len())].to_vec();
+                    let reader = TestShardReader::PrefixThenSlow {
+                        cursor: Cursor::new(prefix),
+                        stall: STALL,
+                        sleep: None,
+                    };
+                    Some(BitrotReader::new(reader, shard_size, hash_algo.clone(), false))
+                })
+                .collect();
+
+            let mut writer = FailingEmitWriter;
+            let start = TokioInstant::now();
+            let (written, err) = erasure.decode(&mut writer, readers, 0, total_len, total_len).await;
+            let elapsed = start.elapsed();
+
+            // Emit failed on stripe 0, so the GET fails with no bytes emitted.
+            assert!(err.is_some(), "emit failure must surface as an error");
+            assert_eq!(written, 0, "the failing writer accepts no bytes");
+            // The decisive assertion: the prefetch read was cancelled rather than
+            // awaited. Without cancel-safety this would take READ_TIMEOUT_SECS.
+            assert!(
+                elapsed < ASSERT_WINDOW,
+                "prefetch next-stripe read was not cancelled on emit failure: took {elapsed:?} \
+                 (>= {ASSERT_WINDOW:?}); a tokio::join! regression waits out the shard read timeout"
+            );
+        })
+        .await;
     }
 
     /// Decode a healthy 2+2 multi-stripe object through the lockstep GET path

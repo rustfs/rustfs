@@ -682,7 +682,7 @@ impl SetDisks {
                             ));
                         }
 
-                        record_capacity_scope_if_needed(None, &out_dated_disks);
+                        self.record_healed_capacity_scope(&out_dated_disks);
 
                         // The object is healthy here; sweep any data dirs left behind
                         // by pre-#3510 unversioned overwrites, which the dangling paths
