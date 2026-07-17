@@ -209,6 +209,10 @@ impl DefaultAdminUsecase {
         Self::app_error(code, message)
     }
 
+    fn map_data_usage_load_result<E>(result: Result<DataUsageInfo, E>) -> AdminUsecaseResult<DataUsageInfo> {
+        result.map_err(|_| Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed"))
+    }
+
     async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
         store.refresh_rebalance_status_meta().await.map_err(|err| {
             error!("refresh rebalance metadata for pool status failed: {:?}", err);
@@ -248,10 +252,7 @@ impl DefaultAdminUsecase {
     /// This request path must never trigger a live full-version listing
     /// (rustfs/backlog#1306); freshness is owned by the scanner.
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
-        let mut info = load_data_usage_from_backend_cached(store.clone()).await.map_err(|e| {
-            error!("load_data_usage_from_backend failed {:?}", e);
-            Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed")
-        })?;
+        let mut info = Self::map_data_usage_load_result(load_data_usage_from_backend_cached(store.clone()).await)?;
         apply_bucket_usage_memory_overlay(&mut info).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
@@ -617,6 +618,30 @@ mod tests {
     use super::super::storage_api::admin_usecase::capacity::{PoolDecommissionInfo, PoolStatus};
     use super::*;
     use time::OffsetDateTime;
+    use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
+
+    struct RejectEvents;
+
+    impl<S> Layer<S> for RejectEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            panic!("data usage error mapping must not emit a duplicate event");
+        }
+    }
+
+    #[test]
+    fn data_usage_load_error_is_generic_and_not_logged_again() {
+        let subscriber = Registry::default().with(RejectEvents);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let err = DefaultAdminUsecase::map_data_usage_load_result::<&str>(Err("sensitive disk path"))
+                .expect_err("load failure must reach the response");
+            assert_eq!(err.code, S3ErrorCode::InternalError);
+            assert_eq!(err.message, "load_data_usage_from_backend failed");
+        });
+    }
 
     #[tokio::test]
     async fn execute_query_storage_info_returns_internal_error_when_store_uninitialized() {

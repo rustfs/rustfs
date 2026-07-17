@@ -25,7 +25,7 @@ use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_data_usage::BucketUsageInfo;
+use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
@@ -35,6 +35,12 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error}
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+const DATA_USAGE_LOAD_ERROR_MESSAGE: &str = "failed to load data usage";
+
+fn map_data_usage_result<E>(result: Result<DataUsageInfo, E>) -> S3Result<DataUsageInfo> {
+    result.map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, DATA_USAGE_LOAD_ERROR_MESSAGE))
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
@@ -256,9 +262,7 @@ impl Operation for AccountInfoHandler {
         // Serve the last persisted scanner snapshot plus the in-memory overlay.
         // This request path must never trigger a live full-version listing
         // (rustfs/backlog#1306); freshness is owned by the scanner.
-        let mut data_usage_info = load_data_usage_from_backend_cached(store.clone())
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+        let mut data_usage_info = map_data_usage_result(load_data_usage_from_backend_cached(store.clone()).await)?;
         apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
 
         for bucket in buckets.iter() {
@@ -369,6 +373,14 @@ mod tests {
         assert_eq!(bucket_info.objects, None);
         assert_eq!(bucket_info.object_sizes_histogram, None);
         assert_eq!(bucket_info.object_versions_histogram, None);
+    }
+
+    #[test]
+    fn accountinfo_data_usage_error_message_is_generic() {
+        let err = map_data_usage_result::<&str>(Err("sensitive disk path")).expect_err("load failure must reach the response");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("failed to load data usage"));
     }
 
     #[test]
