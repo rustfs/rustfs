@@ -20,11 +20,12 @@ use std::hint::spin_loop;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_TELEMETRY_STALENESS: Duration = Duration::from_secs(15);
 // Each writer holds the sequence for only a few atomic loads/stores. Eight
 // attempts cover brief overlap without prolonged spinning on a Tokio worker;
 // exhaustion safely skips only the cache fill.
@@ -126,35 +127,89 @@ struct MemorySnapshotCell {
     sequence: AtomicU64,
     total_bytes: AtomicU64,
     available_bytes: AtomicU64,
-    /// Bytes admitted by the gate since the last snapshot refresh. The snapshot
-    /// is sampled at most every 5 s, so a burst that begins while it still reads
-    /// high could all pass a plain check-then-act gate and over-allocate before
-    /// the next refresh. Subtracting this running total from `available_bytes`
-    /// shrinks the effective budget as the burst proceeds, bounding cumulative
-    /// admission to the real headroom; the refresh resets it because the fresh
-    /// reading already reflects those allocations (backlog#1107).
-    admitted_since_refresh: AtomicU64,
+    /// Monotonic ordering only; unlike the reservation counters this never
+    /// decreases or resets at a telemetry boundary.
+    issued_sequence: AtomicU64,
+    /// Token-bound claims. A refresh never changes this value, so a token from
+    /// an old epoch cannot subtract a newer epoch's claim when it is dropped.
+    live_reserved: AtomicU64,
+    /// Releases that collided with the bounded state writer. Both the releasing
+    /// thread and the active writer attempt a bounded drain, so Drop never waits
+    /// indefinitely and a release cannot be lost when a writer is preempted.
+    pending_release: AtomicU64,
+    /// Permanently fails admission closed if release accounting violates its
+    /// internal bounds instead of risking an under-count.
+    release_accounting_failed: AtomicBool,
+    /// Already-materialized buffered allocations without an attachable owner.
+    /// A sample absorbs only the baseline captured before its blocking read.
+    sampled_reserved: AtomicU64,
+    clock_origin: Instant,
+    last_refresh_millis: AtomicU64,
+    #[cfg(test)]
+    test_now_millis: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemorySampleBaseline {
+    issued_sequence: u64,
+    sampled_reserved: u64,
 }
 
 impl MemorySnapshotCell {
     fn new(snapshot: ObjectDataCacheMemorySnapshot) -> Self {
+        let available_bytes = snapshot.available_bytes.min(snapshot.total_bytes);
         Self {
             sequence: AtomicU64::new(0),
             total_bytes: AtomicU64::new(snapshot.total_bytes),
-            available_bytes: AtomicU64::new(snapshot.available_bytes),
-            admitted_since_refresh: AtomicU64::new(0),
+            available_bytes: AtomicU64::new(available_bytes),
+            issued_sequence: AtomicU64::new(0),
+            live_reserved: AtomicU64::new(0),
+            pending_release: AtomicU64::new(0),
+            release_accounting_failed: AtomicBool::new(false),
+            sampled_reserved: AtomicU64::new(0),
+            clock_origin: Instant::now(),
+            last_refresh_millis: AtomicU64::new(1),
+            #[cfg(test)]
+            test_now_millis: AtomicU64::new(0),
         }
     }
 
-    /// Stores a fresh snapshot and resets the admitted-bytes counter: the new
-    /// reading already accounts for whatever was admitted since the last one.
+    #[cfg(test)]
     fn store(&self, snapshot: ObjectDataCacheMemorySnapshot) {
-        let Some(_writer) = self.try_write() else {
+        let Some(baseline) = self.begin_sample() else {
+            return;
+        };
+        self.publish_sample(baseline, snapshot);
+    }
+
+    fn begin_sample(&self) -> Option<MemorySampleBaseline> {
+        let writer = self.try_write()?;
+        let baseline = MemorySampleBaseline {
+            issued_sequence: self.issued_sequence.load(Ordering::Relaxed),
+            sampled_reserved: self.sampled_reserved.load(Ordering::Relaxed),
+        };
+        writer.commit();
+        Some(baseline)
+    }
+
+    fn publish_sample(&self, baseline: MemorySampleBaseline, snapshot: ObjectDataCacheMemorySnapshot) {
+        let Some(writer) = self.try_write() else {
+            return;
+        };
+        let issued_sequence = self.issued_sequence.load(Ordering::Relaxed);
+        if issued_sequence < baseline.issued_sequence {
+            return;
+        }
+        let sampled_reserved = self.sampled_reserved.load(Ordering::Relaxed);
+        let Some(sampled_after) = sampled_reserved.checked_sub(baseline.sampled_reserved) else {
             return;
         };
         self.total_bytes.store(snapshot.total_bytes, Ordering::Relaxed);
-        self.available_bytes.store(snapshot.available_bytes, Ordering::Relaxed);
-        self.admitted_since_refresh.store(0, Ordering::Relaxed);
+        self.available_bytes
+            .store(snapshot.available_bytes.min(snapshot.total_bytes), Ordering::Relaxed);
+        self.sampled_reserved.store(sampled_after, Ordering::Relaxed);
+        self.last_refresh_millis.store(self.now_millis(), Ordering::Relaxed);
+        writer.commit();
     }
 
     fn load(&self) -> Option<ObjectDataCacheMemorySnapshot> {
@@ -177,31 +232,129 @@ impl MemorySnapshotCell {
         None
     }
 
+    #[cfg(test)]
     fn admitted(&self) -> u64 {
-        self.admitted_since_refresh.load(Ordering::Relaxed)
+        if self.release_accounting_failed.load(Ordering::Acquire) {
+            return u64::MAX;
+        }
+        self.live_reserved
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.pending_release.load(Ordering::Acquire))
+            .saturating_add(self.sampled_reserved.load(Ordering::Relaxed))
     }
 
+    #[cfg(test)]
     fn reserve(&self, bytes: u64) {
-        let Some(_writer) = self.try_write() else {
+        let Some(writer) = self.try_write() else {
             return;
         };
-        let claimed = self.admitted_since_refresh.load(Ordering::Relaxed);
-        self.admitted_since_refresh
-            .store(claimed.saturating_add(bytes), Ordering::Relaxed);
+        let claimed = self.sampled_reserved.load(Ordering::Relaxed);
+        self.sampled_reserved.store(claimed.saturating_add(bytes), Ordering::Relaxed);
+        writer.commit();
     }
 
     fn release(&self, bytes: u64) {
-        let Some(_writer) = self.try_write() else {
-            // Keeping an over-count is fail-closed: it can only skip future
-            // cache fills, never allow an unsafe allocation.
+        if bytes == 0 {
+            return;
+        }
+        if self
+            .pending_release
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_add(bytes))
+            .is_err()
+        {
+            self.release_accounting_failed.store(true, Ordering::Release);
+            return;
+        }
+        self.try_settle_pending_releases();
+    }
+
+    fn try_settle_pending_releases(&self) {
+        if self.pending_release.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Some(writer) = self.try_write_inner(false) else {
             return;
         };
-        let claimed = self.admitted_since_refresh.load(Ordering::Relaxed);
-        self.admitted_since_refresh
-            .store(claimed.saturating_sub(bytes), Ordering::Relaxed);
+        writer.commit();
+    }
+
+    fn settle_pending_releases_locked(&self) {
+        let pending = self.pending_release.swap(0, Ordering::AcqRel);
+        if pending == 0 {
+            return;
+        }
+        let claimed = self.live_reserved.load(Ordering::Relaxed);
+        if let Some(remaining) = claimed.checked_sub(pending) {
+            self.live_reserved.store(remaining, Ordering::Relaxed);
+        } else {
+            self.live_reserved.store(u64::MAX, Ordering::Relaxed);
+            self.release_accounting_failed.store(true, Ordering::Release);
+        }
+    }
+
+    fn materialize_without_owner(&self, bytes: u64) -> bool {
+        let Some(writer) = self.try_write() else {
+            return false;
+        };
+        let live = self.live_reserved.load(Ordering::Relaxed);
+        let sampled = self.sampled_reserved.load(Ordering::Relaxed);
+        let Some(live_after) = live.checked_sub(bytes) else {
+            return false;
+        };
+        let Some(sampled_after) = sampled.checked_add(bytes) else {
+            return false;
+        };
+        self.live_reserved.store(live_after, Ordering::Relaxed);
+        self.sampled_reserved.store(sampled_after, Ordering::Relaxed);
+        writer.commit();
+        true
+    }
+
+    fn telemetry_age(&self) -> Option<Duration> {
+        let refreshed = self.last_refresh_millis.load(Ordering::Acquire);
+        if refreshed == 0 {
+            return None;
+        }
+        Some(Duration::from_millis(self.now_millis().saturating_sub(refreshed)))
+    }
+
+    fn now_millis(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let now = self.test_now_millis.load(Ordering::Relaxed);
+            if now != 0 {
+                return now;
+            }
+        }
+        u64::try_from(self.clock_origin.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+    }
+
+    #[cfg(test)]
+    fn set_test_now(&self, now: Duration) {
+        self.test_now_millis
+            .store(u64::try_from(now.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn store_with_hook(&self, snapshot: ObjectDataCacheMemorySnapshot, after_total: impl FnOnce()) {
+        let Some(writer) = self.try_write() else {
+            return;
+        };
+        self.total_bytes.store(snapshot.total_bytes, Ordering::Relaxed);
+        after_total();
+        self.available_bytes
+            .store(snapshot.available_bytes.min(snapshot.total_bytes), Ordering::Relaxed);
+        self.last_refresh_millis.store(self.now_millis(), Ordering::Relaxed);
+        writer.commit();
     }
 
     fn try_write(&self) -> Option<MemoryStateWriteGuard<'_>> {
+        self.try_write_inner(true)
+    }
+
+    fn try_write_inner(&self, settle_pending_on_drop: bool) -> Option<MemoryStateWriteGuard<'_>> {
         for _ in 0..MAX_STATE_RETRIES {
             let sequence = self.sequence.load(Ordering::Acquire);
             if sequence & 1 == 1 {
@@ -214,9 +367,21 @@ impl MemorySnapshotCell {
                 .compare_exchange_weak(sequence, sequence + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                self.settle_pending_releases_locked();
+                let previous = MemoryState {
+                    total_bytes: self.total_bytes.load(Ordering::Relaxed),
+                    available_bytes: self.available_bytes.load(Ordering::Relaxed),
+                    issued_sequence: self.issued_sequence.load(Ordering::Relaxed),
+                    live_reserved: self.live_reserved.load(Ordering::Relaxed),
+                    sampled_reserved: self.sampled_reserved.load(Ordering::Relaxed),
+                    last_refresh_millis: self.last_refresh_millis.load(Ordering::Relaxed),
+                };
                 return Some(MemoryStateWriteGuard {
                     cell: self,
                     next_sequence,
+                    previous,
+                    committed: false,
+                    settle_pending_on_drop,
                 });
             }
         }
@@ -225,14 +390,51 @@ impl MemorySnapshotCell {
     }
 }
 
+struct MemoryState {
+    total_bytes: u64,
+    available_bytes: u64,
+    issued_sequence: u64,
+    live_reserved: u64,
+    sampled_reserved: u64,
+    last_refresh_millis: u64,
+}
+
 struct MemoryStateWriteGuard<'a> {
     cell: &'a MemorySnapshotCell,
     next_sequence: u64,
+    previous: MemoryState,
+    committed: bool,
+    settle_pending_on_drop: bool,
+}
+
+impl MemoryStateWriteGuard<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
 }
 
 impl Drop for MemoryStateWriteGuard<'_> {
     fn drop(&mut self) {
+        if !self.committed {
+            self.cell.total_bytes.store(self.previous.total_bytes, Ordering::Relaxed);
+            self.cell
+                .available_bytes
+                .store(self.previous.available_bytes, Ordering::Relaxed);
+            self.cell
+                .issued_sequence
+                .store(self.previous.issued_sequence, Ordering::Relaxed);
+            self.cell.live_reserved.store(self.previous.live_reserved, Ordering::Relaxed);
+            self.cell
+                .sampled_reserved
+                .store(self.previous.sampled_reserved, Ordering::Relaxed);
+            self.cell
+                .last_refresh_millis
+                .store(self.previous.last_refresh_millis, Ordering::Relaxed);
+        }
         self.cell.sequence.store(self.next_sequence, Ordering::Release);
+        if self.settle_pending_on_drop {
+            self.cell.try_settle_pending_releases();
+        }
     }
 }
 
@@ -263,8 +465,15 @@ impl ObjectDataCacheMemoryReservation {
         })
     }
 
-    pub(crate) fn until_refresh(mut self) {
+    pub(crate) fn until_refresh(mut self) -> bool {
+        let Some(snapshot) = &self.snapshot else {
+            return true;
+        };
+        if !snapshot.materialize_without_owner(self.bytes) {
+            return false;
+        }
         self.snapshot = None;
+        true
     }
 }
 
@@ -358,14 +567,20 @@ impl ObjectDataCacheMemoryGate {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                let Some(baseline) = snapshot.begin_sample() else {
+                    continue;
+                };
                 // Run the blocking /proc/meminfo read off the async worker. A
                 // join error only happens if the runtime is shutting down; keep
                 // the last snapshot rather than clobbering it in that case.
                 if let Ok(effective) = tokio::task::spawn_blocking(resolve_effective_memory).await {
-                    snapshot.store(ObjectDataCacheMemorySnapshot {
-                        total_bytes: effective.total_bytes,
-                        available_bytes: effective.available_bytes,
-                    });
+                    snapshot.publish_sample(
+                        baseline,
+                        ObjectDataCacheMemorySnapshot {
+                            total_bytes: effective.total_bytes,
+                            available_bytes: effective.available_bytes,
+                        },
+                    );
                 }
             }
         });
@@ -382,6 +597,11 @@ impl ObjectDataCacheMemoryGate {
         }
 
         self.snapshot.load().unwrap_or_default()
+    }
+
+    /// Returns the age of the last successfully published telemetry sample.
+    pub fn telemetry_age(&self) -> Option<Duration> {
+        self.snapshot.telemetry_age()
     }
 
     /// Atomically claims memory for one cache allocation.
@@ -407,10 +627,24 @@ impl ObjectDataCacheMemoryGate {
         }
 
         before_claim();
-        let Some(_writer) = self.snapshot.try_write() else {
+        let Some(writer) = self.snapshot.try_write() else {
             record_memory_pressure(&self.stats, "moka");
             return None;
         };
+        if self.snapshot.release_accounting_failed.load(Ordering::Acquire) {
+            writer.commit();
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        }
+        if self
+            .snapshot
+            .telemetry_age()
+            .is_none_or(|age| age > DEFAULT_TELEMETRY_STALENESS)
+        {
+            writer.commit();
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        }
         let snapshot = {
             #[cfg(test)]
             if let Some(snapshot) = *lock_or_recover(&self.test_override) {
@@ -428,17 +662,24 @@ impl ObjectDataCacheMemoryGate {
             }
         };
         if snapshot.total_bytes == 0 {
-            return Some(ObjectDataCacheMemoryReservation {
-                snapshot: None,
-                bytes: 0,
-            });
+            writer.commit();
+            record_memory_pressure(&self.stats, "moka");
+            return None;
         }
-        let claimed = self.snapshot.admitted_since_refresh.load(Ordering::Relaxed);
+        let live_reserved = self.snapshot.live_reserved.load(Ordering::Relaxed);
+        let sampled_reserved = self.snapshot.sampled_reserved.load(Ordering::Relaxed);
+        let Some(claimed) = live_reserved.checked_add(sampled_reserved) else {
+            writer.commit();
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        };
         let Some(claimed_after) = claimed.checked_add(required_bytes) else {
+            writer.commit();
             record_memory_pressure(&self.stats, "moka");
             return None;
         };
         let Some(available_after) = snapshot.available_bytes.checked_sub(claimed_after) else {
+            writer.commit();
             record_memory_pressure(&self.stats, "moka");
             return None;
         };
@@ -446,11 +687,25 @@ impl ObjectDataCacheMemoryGate {
         let has_percent_budget = u128::from(available_after) * 100 >= u128::from(snapshot.total_bytes) * u128::from(min_free);
 
         if !has_percent_budget {
+            writer.commit();
             record_memory_pressure(&self.stats, "moka");
             return None;
         }
 
-        self.snapshot.admitted_since_refresh.store(claimed_after, Ordering::Relaxed);
+        let Some(live_after) = live_reserved.checked_add(required_bytes) else {
+            writer.commit();
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        };
+        let issued_sequence = self.snapshot.issued_sequence.load(Ordering::Relaxed);
+        let Some(next_issued_sequence) = issued_sequence.checked_add(1) else {
+            writer.commit();
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        };
+        self.snapshot.live_reserved.store(live_after, Ordering::Relaxed);
+        self.snapshot.issued_sequence.store(next_issued_sequence, Ordering::Relaxed);
+        writer.commit();
         Some(ObjectDataCacheMemoryReservation {
             snapshot: Some(Arc::clone(&self.snapshot)),
             bytes: required_bytes,
@@ -459,18 +714,26 @@ impl ObjectDataCacheMemoryGate {
 
     /// Returns true when the fill path may proceed under current memory pressure.
     ///
-    /// This is lock-free and does no blocking sysinfo read: it only reads the
-    /// atomic snapshot maintained by the periodic refresher.
+    /// This does no blocking sysinfo read: it uses the atomic snapshot and a
+    /// bounded reservation update maintained by the periodic refresher.
     ///
     /// `cache_growth_headroom` remains for source compatibility. Reservations
     /// now follow live allocations, so cache capacity cannot cap the peak memory
     /// held by an evicted entry whose response body is still alive.
     pub fn allows_fill(&self, required_bytes: u64, cache_growth_headroom: u64) -> bool {
+        self.try_claim_buffered(required_bytes, cache_growth_headroom)
+    }
+
+    pub(crate) fn try_claim_buffered(&self, required_bytes: u64, cache_growth_headroom: u64) -> bool {
         let Some(reservation) = self.try_claim(required_bytes, cache_growth_headroom) else {
             return false;
         };
-        reservation.until_refresh();
-        true
+        if reservation.until_refresh() {
+            true
+        } else {
+            record_memory_pressure(&self.stats, "moka");
+            false
+        }
     }
 
     #[cfg(test)]
@@ -505,6 +768,23 @@ impl ObjectDataCacheMemoryGate {
     pub(crate) fn claimed_bytes_for_test(&self) -> u64 {
         self.snapshot.admitted()
     }
+
+    #[cfg(test)]
+    fn begin_sample_for_test(&self) -> MemorySampleBaseline {
+        self.snapshot
+            .begin_sample()
+            .expect("test sample should acquire the state writer")
+    }
+
+    #[cfg(test)]
+    fn publish_sample_for_test(&self, baseline: MemorySampleBaseline, snapshot: ObjectDataCacheMemorySnapshot) {
+        self.snapshot.publish_sample(baseline, snapshot);
+    }
+
+    #[cfg(test)]
+    fn set_test_now(&self, now: Duration) {
+        self.snapshot.set_test_now(now);
+    }
 }
 
 #[cfg(test)]
@@ -517,12 +797,17 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryBasis, ObjectDataCacheMemoryGate, ObjectDataCacheMemorySnapshot, select_effective_memory};
+    use super::{
+        DEFAULT_TELEMETRY_STALENESS, MemoryBasis, ObjectDataCacheMemoryGate, ObjectDataCacheMemorySnapshot,
+        select_effective_memory,
+    };
     use crate::config::ObjectDataCacheConfig;
     use crate::stats::ObjectDataCacheStats;
     use bytes::Bytes;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
     use std::sync::Barrier;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
 
@@ -541,17 +826,16 @@ mod tests {
         }));
         let ready = Arc::new(Barrier::new(CLAIMERS));
 
-        let handles: Vec<_> = (0..CLAIMERS)
-            .map(|_| {
-                let gate = Arc::clone(&gate);
-                let ready = Arc::clone(&ready);
-                thread::spawn(move || {
-                    gate.try_claim_with_hook(300, u64::MAX, || {
-                        ready.wait();
-                    })
+        let mut handles = Vec::with_capacity(CLAIMERS);
+        for _ in 0..CLAIMERS {
+            let gate = Arc::clone(&gate);
+            let ready = Arc::clone(&ready);
+            handles.push(thread::spawn(move || {
+                gate.try_claim_with_hook(300, u64::MAX, || {
+                    ready.wait();
                 })
-            })
-            .collect();
+            }));
+        }
         let claims: Vec<_> = handles
             .into_iter()
             .filter_map(|handle| handle.join().expect("claim thread should not panic"))
@@ -580,6 +864,61 @@ mod tests {
     }
 
     #[test]
+    fn memory_release_debt_settles_after_active_writer_exits() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+        let claim = gate
+            .try_claim(300, 0)
+            .expect("the initial claim should fit at the memory floor");
+        let writer = gate.snapshot.try_write().expect("the test must hold the memory epoch writer");
+
+        drop(claim);
+        assert_eq!(gate.snapshot.live_reserved.load(Ordering::Relaxed), 300);
+        assert_eq!(gate.snapshot.pending_release.load(Ordering::Acquire), 300);
+        assert_eq!(gate.claimed_bytes_for_test(), 0, "release debt must immediately offset the dead claim");
+
+        drop(writer);
+        assert_eq!(gate.claimed_bytes_for_test(), 0, "writer exit must settle the deferred release");
+        assert_eq!(gate.snapshot.pending_release.load(Ordering::Acquire), 0);
+        assert!(gate.try_claim(300, 0).is_some(), "settled release debt must restore admission");
+    }
+
+    #[test]
+    fn memory_release_debt_overflow_fails_admission_closed() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+        gate.snapshot.pending_release.store(u64::MAX, Ordering::Release);
+
+        gate.snapshot.release(1);
+
+        assert!(gate.snapshot.release_accounting_failed.load(Ordering::Acquire));
+        assert!(gate.try_claim(1, 0).is_none(), "overflowed release accounting must reject future fills");
+    }
+
+    #[test]
+    fn memory_release_debt_exceeding_live_claim_fails_admission_closed() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+        gate.snapshot.live_reserved.store(1, Ordering::Relaxed);
+        gate.snapshot.pending_release.store(2, Ordering::Release);
+
+        gate.snapshot.try_settle_pending_releases();
+
+        assert!(gate.snapshot.release_accounting_failed.load(Ordering::Acquire));
+        assert_eq!(gate.snapshot.live_reserved.load(Ordering::Relaxed), u64::MAX);
+        assert!(gate.try_claim(1, 0).is_none(), "underflowed release accounting must reject future fills");
+    }
+
+    #[test]
     fn memory_gate_claimed_bytes_never_exceed_epoch_budget() {
         const CLAIMERS: usize = 32;
         let gate = Arc::new(ObjectDataCacheMemoryGate::new(
@@ -592,17 +931,16 @@ mod tests {
         }));
         let ready = Arc::new(Barrier::new(CLAIMERS));
 
-        let handles: Vec<_> = (0..CLAIMERS)
-            .map(|_| {
-                let gate = Arc::clone(&gate);
-                let ready = Arc::clone(&ready);
-                thread::spawn(move || {
-                    gate.try_claim_with_hook(100, u64::MAX, || {
-                        ready.wait();
-                    })
+        let mut handles = Vec::with_capacity(CLAIMERS);
+        for _ in 0..CLAIMERS {
+            let gate = Arc::clone(&gate);
+            let ready = Arc::clone(&ready);
+            handles.push(thread::spawn(move || {
+                gate.try_claim_with_hook(100, u64::MAX, || {
+                    ready.wait();
                 })
-            })
-            .collect();
+            }));
+        }
         let claims: Vec<_> = handles
             .into_iter()
             .filter_map(|handle| handle.join().expect("claim thread should not panic"))
@@ -613,21 +951,228 @@ mod tests {
     }
 
     #[test]
-    fn memory_gate_claim_retries_after_epoch_change() {
+    fn memory_claim_recomputes_when_epoch_changes() {
         let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
-        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+        gate.set_test_snapshot(None);
+        gate.store_raw_snapshot_for_test(ObjectDataCacheMemorySnapshot {
             total_bytes: 1_000,
             available_bytes: 100,
-        }));
+        });
 
         let claim = gate.try_claim_with_hook(100, u64::MAX, || {
-            gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            gate.store_raw_snapshot_for_test(ObjectDataCacheMemorySnapshot {
                 total_bytes: 1_000,
                 available_bytes: 500,
-            }));
+            });
         });
 
         assert!(claim.is_some(), "claim must use the epoch published before linearization");
+    }
+
+    #[test]
+    fn memory_snapshot_publish_preserves_post_sample_claim() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.store_raw_snapshot_for_test(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        });
+        let sample = gate.begin_sample_for_test();
+        let claim = gate.try_claim(100, 0).expect("post-sample claim should fit");
+        assert!(claim.until_refresh(), "materialized claim should enter the telemetry ledger");
+
+        gate.publish_sample_for_test(
+            sample,
+            ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 500,
+            },
+        );
+
+        assert_eq!(gate.claimed_bytes_for_test(), 100, "post-sample claim must carry into the new epoch");
+    }
+
+    #[test]
+    fn memory_snapshot_carries_pre_sample_unmaterialized_claim() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+        let claim = gate.try_claim(100, 0).expect("pre-sample claim should fit");
+        let sample = gate.begin_sample_for_test();
+
+        gate.publish_sample_for_test(
+            sample,
+            ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 400,
+            },
+        );
+
+        assert_eq!(
+            gate.claimed_bytes_for_test(),
+            100,
+            "unmaterialized claim cannot be absorbed by the sample"
+        );
+        drop(claim);
+        assert_eq!(gate.claimed_bytes_for_test(), 0);
+    }
+
+    #[test]
+    fn memory_gate_telemetry_expiry_degrades_and_recovers() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(None);
+        gate.set_test_now(Duration::from_secs(1));
+        gate.store_raw_snapshot_for_test(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        });
+        assert!(gate.try_claim(100, 0).is_some());
+
+        gate.set_test_now(DEFAULT_TELEMETRY_STALENESS + Duration::from_secs(2));
+        assert!(gate.try_claim(100, 0).is_none(), "expired telemetry must fail closed for cache fills");
+
+        gate.store_raw_snapshot_for_test(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        });
+        assert!(gate.try_claim(100, 0).is_some(), "a valid refresh must recover admission");
+    }
+
+    #[test]
+    fn memory_snapshot_reader_never_observes_mixed_epoch() {
+        let gate = Arc::new(ObjectDataCacheMemoryGate::new(
+            &ObjectDataCacheConfig::default(),
+            Arc::new(ObjectDataCacheStats::default()),
+        ));
+        gate.set_test_snapshot(None);
+        gate.store_raw_snapshot_for_test(ObjectDataCacheMemorySnapshot {
+            total_bytes: 64 * GIB,
+            available_bytes: 40 * GIB,
+        });
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let writer = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                gate.snapshot.store_with_hook(
+                    ObjectDataCacheMemorySnapshot {
+                        total_bytes: 2 * GIB,
+                        available_bytes: 100 * 1024 * 1024,
+                    },
+                    || {
+                        entered.wait();
+                        release.wait();
+                    },
+                );
+            })
+        };
+
+        entered.wait();
+        assert_eq!(
+            gate.raw_snapshot_for_test(),
+            ObjectDataCacheMemorySnapshot::default(),
+            "a bounded reader must fail closed while an epoch is incomplete"
+        );
+        release.wait();
+        writer.join().expect("snapshot writer should not panic");
+
+        assert_eq!(
+            gate.raw_snapshot_for_test(),
+            ObjectDataCacheMemorySnapshot {
+                total_bytes: 2 * GIB,
+                available_bytes: 100 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_interrupted_writer_rolls_back_partial_epoch() {
+        let initial = ObjectDataCacheMemorySnapshot {
+            total_bytes: 64 * GIB,
+            available_bytes: 40 * GIB,
+        };
+        let snapshot = super::MemorySnapshotCell::new(initial);
+
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            snapshot.store_with_hook(
+                ObjectDataCacheMemorySnapshot {
+                    total_bytes: 2 * GIB,
+                    available_bytes: 100 * 1024 * 1024,
+                },
+                || panic!("interrupt writer before tuple publication"),
+            );
+        }));
+
+        assert!(interrupted.is_err());
+        assert_eq!(snapshot.load(), Some(initial));
+    }
+
+    #[test]
+    fn memory_claim_sequence_overflow_fails_closed() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+        gate.snapshot.issued_sequence.store(u64::MAX, Ordering::Relaxed);
+
+        assert!(gate.try_claim(100, 0).is_none());
+        assert_eq!(gate.claimed_bytes_for_test(), 0);
+    }
+
+    #[test]
+    fn memory_live_reserved_overflow_fails_closed() {
+        let gate = ObjectDataCacheMemoryGate::new(
+            &ObjectDataCacheConfig {
+                min_free_memory_percent: 1,
+                ..ObjectDataCacheConfig::default()
+            },
+            Arc::new(ObjectDataCacheStats::default()),
+        );
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: u64::MAX,
+            available_bytes: u64::MAX,
+        }));
+        gate.snapshot.live_reserved.store(u64::MAX - 1, Ordering::Relaxed);
+
+        assert!(gate.try_claim(2, 0).is_none());
+        assert_eq!(gate.claimed_bytes_for_test(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn memory_old_epoch_release_preserves_new_epoch_claim() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(None);
+        gate.store_raw_snapshot_for_test(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        });
+        let old_epoch = gate.try_claim(100, 0).expect("old epoch claim should fit");
+        let sample = gate.begin_sample_for_test();
+        gate.publish_sample_for_test(
+            sample,
+            ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 400,
+            },
+        );
+        let new_epoch = gate.try_claim(100, 0).expect("new epoch claim should fit");
+
+        drop(old_epoch);
+        assert_eq!(gate.claimed_bytes_for_test(), 100, "old token must not subtract the new epoch claim");
+        drop(new_epoch);
+        assert_eq!(gate.claimed_bytes_for_test(), 0);
+    }
+
+    #[test]
+    fn memory_gate_zero_telemetry_fails_closed_when_enabled() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot::default()));
+
+        assert!(gate.try_claim(1, 0).is_none());
     }
 
     #[test]

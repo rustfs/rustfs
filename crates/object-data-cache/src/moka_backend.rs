@@ -176,9 +176,9 @@ pub struct MokaBackend {
     index: Arc<ObjectDataCacheIdentityIndex>,
     singleflight: ObjectDataCacheSingleflight,
     memory_gate: ObjectDataCacheMemoryGate,
-    /// Cache capacity in weighted bytes. Used to derive how much the cache can
-    /// still grow (`max_capacity - weighted_size()`), which caps the memory
-    /// gate's in-window reservation deduction (backlog#1212).
+    /// Cache capacity in weighted bytes. The derived growth headroom remains an
+    /// input to the compatible memory-gate API, although live allocation claims
+    /// are no longer capped by cache residency (backlog#1331).
     max_capacity: u64,
     /// Bounds the number of concurrent distinct-key fills. Singleflight only
     /// dedups per key, so without this limiter distinct-key fills are unbounded.
@@ -498,19 +498,13 @@ impl MokaBackend {
             Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedFillConcurrency),
         };
 
-        // How much the cache can still grow before it is at capacity. This caps
-        // the gate's in-window reservation so sustained gross churn (net size
-        // flat, far below capacity) cannot be mistaken for real memory growth
-        // and falsely skip fills (backlog#1212). weighted_size() is moka's
-        // lazily-maintained approximation, which is all this bound needs.
+        // Keep passing cache growth headroom for compatibility with the public
+        // gate API. Allocation-scoped reservations deliberately do not cap by
+        // this value because an evicted entry can still have live body clones.
         let cache_growth_headroom = self.max_capacity.saturating_sub(self.cache.weighted_size());
-        let Some(reservation) = self
-            .memory_gate
-            .try_claim(body_bytes, cache_growth_headroom)
-        else {
+        if !self.memory_gate.try_claim_buffered(body_bytes, cache_growth_headroom) {
             return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure);
-        };
-        reservation.until_refresh();
+        }
 
         let identity = ObjectDataCacheIdentity::new(Arc::clone(&key.bucket), Arc::clone(&key.object));
         // Keep keys that are still cached or still mid-fill: another in-flight
