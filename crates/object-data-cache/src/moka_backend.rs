@@ -24,9 +24,150 @@ use bytes::Bytes;
 use moka::future::{Cache, FutureExt};
 use moka::ops::compute;
 use std::future::ready;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Semaphore;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{Notify, Semaphore, watch};
+
+#[derive(Debug)]
+struct ClearFence {
+    state: Mutex<ClearFenceState>,
+    quiesced: Notify,
+}
+
+#[derive(Debug)]
+struct ClearFenceState {
+    /// `None` permanently rejects fills after an impossible counter failure.
+    generation: Option<u64>,
+    active_fills: usize,
+    clear: Option<Arc<ClearOperation>>,
+}
+
+#[derive(Debug)]
+struct ClearOperation {
+    completion: watch::Sender<Option<ObjectDataCacheInvalidationResult>>,
+}
+
+#[derive(Debug)]
+struct FillGenerationGuard {
+    fence: Arc<ClearFence>,
+    generation: u64,
+}
+
+impl ClearFence {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ClearFenceState {
+                generation: Some(0),
+                active_fills: 0,
+                clear: None,
+            }),
+            quiesced: Notify::new(),
+        }
+    }
+
+    fn try_register_fill(self: &Arc<Self>) -> Option<FillGenerationGuard> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.clear.is_some() {
+            return None;
+        }
+        let generation = state.generation?;
+        let Some(active_fills) = state.active_fills.checked_add(1) else {
+            state.generation = None;
+            return None;
+        };
+        state.active_fills = active_fills;
+        Some(FillGenerationGuard {
+            fence: Arc::clone(self),
+            generation,
+        })
+    }
+
+    fn begin_clear(&self) -> (Arc<ClearOperation>, bool) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(operation) = &state.clear {
+            return (Arc::clone(operation), false);
+        }
+
+        let operation = Arc::new(ClearOperation::new());
+        state.clear = Some(Arc::clone(&operation));
+        state.generation = state.generation.and_then(|generation| generation.checked_add(1));
+        (operation, true)
+    }
+
+    async fn wait_for_active_fills(&self) {
+        loop {
+            let notified = self.quiesced.notified();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active_fills
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn finish_clear(&self, operation: &Arc<ClearOperation>, result: ObjectDataCacheInvalidationResult) {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.clear.as_ref().is_some_and(|current| Arc::ptr_eq(current, operation)) {
+            return;
+        }
+
+        let next_generation = state.generation.and_then(|generation| generation.checked_add(1));
+        state.generation = next_generation;
+        operation.complete(result);
+        if next_generation.is_some() {
+            state.clear = None;
+        }
+    }
+}
+
+impl ClearOperation {
+    fn new() -> Self {
+        let (completion, _) = watch::channel(None);
+        Self { completion }
+    }
+
+    async fn wait(&self) -> ObjectDataCacheInvalidationResult {
+        let mut completion = self.completion.subscribe();
+        loop {
+            if let Some(result) = *completion.borrow_and_update() {
+                return result;
+            }
+            let _ = completion.changed().await;
+        }
+    }
+
+    fn complete(&self, result: ObjectDataCacheInvalidationResult) {
+        self.completion.send_replace(Some(result));
+    }
+}
+
+impl FillGenerationGuard {
+    fn is_current(&self) -> bool {
+        let state = self.fence.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.clear.is_none() && state.generation == Some(self.generation)
+    }
+}
+
+impl Drop for FillGenerationGuard {
+    fn drop(&mut self) {
+        let mut state = self.fence.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(active_fills) = state.active_fills.checked_sub(1) else {
+            state.generation = None;
+            return;
+        };
+        state.active_fills = active_fills;
+        if state.active_fills == 0 {
+            // There is exactly one owned clear drain. `notify_one` retains a
+            // permit if it reaches zero between the state check and `.await`.
+            self.fence.quiesced.notify_one();
+        }
+    }
+}
 
 /// Weighted Moka backend for reusable object bodies.
 #[derive(Debug)]
@@ -43,6 +184,8 @@ pub struct MokaBackend {
     /// dedups per key, so without this limiter distinct-key fills are unbounded.
     fill_semaphore: Arc<Semaphore>,
     next_generation: AtomicU64,
+    /// Serializes global clears and fences fill publication by generation.
+    clear_fence: Arc<ClearFence>,
     /// Test-only barrier that pauses a fill between the index insert and the
     /// cache insert so the fill-vs-invalidation race can be driven deterministically.
     #[cfg(test)]
@@ -54,6 +197,12 @@ pub struct MokaBackend {
     /// Test-only blocking rendezvous inside the conditional compute closure.
     #[cfg(test)]
     identity_compute_barrier: std::sync::Mutex<Option<Arc<ComputeBarrier>>>,
+    #[cfg(test)]
+    fill_before_index_barrier: std::sync::Mutex<Option<Arc<FillBarrier>>>,
+    #[cfg(test)]
+    clear_barrier: std::sync::Mutex<Option<Arc<FillBarrier>>>,
+    #[cfg(test)]
+    clear_joined: Arc<Semaphore>,
 }
 
 /// Test-only rendezvous that pauses a fill between the index insert and the
@@ -211,12 +360,19 @@ impl MokaBackend {
             max_capacity,
             fill_semaphore: Arc::new(Semaphore::new(fill_permits)),
             next_generation: AtomicU64::new(0),
+            clear_fence: Arc::new(ClearFence::new()),
             #[cfg(test)]
             fill_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             identity_eviction_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             identity_compute_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fill_before_index_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            clear_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            clear_joined: Arc::new(Semaphore::new(0)),
         })
     }
 
@@ -242,6 +398,29 @@ impl MokaBackend {
         barrier
     }
 
+    #[cfg(test)]
+    fn install_fill_before_index_barrier(&self) -> Arc<FillBarrier> {
+        let barrier = Arc::new(FillBarrier::new());
+        *self
+            .fill_before_index_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    #[cfg(test)]
+    fn install_clear_barrier(&self) -> Arc<FillBarrier> {
+        let barrier = Arc::new(FillBarrier::new());
+        *self.clear_barrier.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    #[cfg(test)]
+    async fn wait_until_clear_joined(&self) {
+        if let Ok(permit) = self.clear_joined.acquire().await {
+            permit.forget();
+        }
+    }
     /// Returns the current cache entry count.
     pub fn entry_count(&self) -> u64 {
         self.cache.entry_count()
@@ -287,6 +466,29 @@ impl MokaBackend {
         let ObjectDataCacheSingleflightAcquire::Leader(leader) = self.singleflight.try_acquire(key.clone()) else {
             return ObjectDataCacheFillResult::JoinedInflightFill;
         };
+
+        // Registration and the clear transition share one short state lock,
+        // closing the check/register race without holding a lock across body
+        // processing or cache/index I/O. Only the singleflight leader can
+        // publish, so duplicate fills stay off this global hot-path lock.
+        let Some(fill_generation) = self.clear_fence.try_register_fill() else {
+            return leader.finish(ObjectDataCacheFillResult::SkippedInvalidationRace);
+        };
+
+        #[cfg(test)]
+        let fill_before_index_barrier = self
+            .fill_before_index_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        #[cfg(test)]
+        if let Some(barrier) = fill_before_index_barrier {
+            barrier.wait().await;
+        }
+
+        if !fill_generation.is_current() {
+            return leader.finish(ObjectDataCacheFillResult::SkippedInvalidationRace);
+        }
 
         // Bound distinct-key fill concurrency after winning leadership and
         // before the memory-gate check. Reject rather than queue: queuing would
@@ -358,6 +560,13 @@ impl MokaBackend {
             // Hold the fill-concurrency permit until the register/insert/undo
             // sequence completes, then release it on task exit.
             let _permit = permit;
+            // Keep the generation registered through the complete
+            // register/publish/recheck/undo sequence. If the outer caller is
+            // cancelled, this owned task still acknowledges the clear fence.
+            let fill_generation = fill_generation;
+            if !fill_generation.is_current() {
+                return ObjectDataCacheFillResult::SkippedInvalidationRace;
+            }
             // Register the key in the identity index BEFORE the entry becomes
             // visible in the cache, so a concurrent invalidation always finds it.
             match index
@@ -400,6 +609,13 @@ impl MokaBackend {
                 barrier.wait().await;
             }
 
+            if !fill_generation.is_current() {
+                // Leave the registered key for the owned clear drain. Besides
+                // making the acknowledgement visible to clear, this preserves
+                // the pre-existing invalidation outcome count for admin stats.
+                return ObjectDataCacheFillResult::SkippedInvalidationRace;
+            }
+
             let _ = cache
                 .entry(fill_key.clone())
                 .and_compute_with(move |_| ready(compute::Op::Put(entry)))
@@ -408,10 +624,14 @@ impl MokaBackend {
             // An invalidation may have raced between the index and cache
             // inserts; re-check the index and undo the fill so the stale
             // body cannot outlive the invalidation.
-            if index.contains_key(&fill_identity, &fill_key).await {
+            let indexed = index.contains_key(&fill_identity, &fill_key).await;
+            if fill_generation.is_current() && indexed {
                 ObjectDataCacheFillResult::Inserted
             } else {
                 cache.remove(&fill_key).await;
+                if fill_generation.is_current() {
+                    index.remove_generation(&fill_identity, &fill_key, generation).await;
+                }
                 ObjectDataCacheFillResult::SkippedInvalidationRace
             }
         });
@@ -469,15 +689,52 @@ impl MokaBackend {
         Self::invalidation_result(removed)
     }
 
-    /// Drops every cached body and resets the identity index. The index scan
-    /// yields the tracked key count for the outcome label, then the cache is
-    /// drained explicitly so even a body that is no longer tracked by the
-    /// index cannot survive the clear path. Rare admin `clear()` path only.
+    /// Drops every cached body and resets the identity index. Concurrent clear
+    /// callers join one owned drain, so cancelling a caller cannot cancel the
+    /// operation or reopen its fill generation. Lookups remain lock-free and
+    /// may observe entries until the drain removes them; fills started while
+    /// the clear is active skip publication.
     pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
-        let keys_to_remove = self.index.remove_matching(|_| true).await;
+        let (operation, should_start) = self.clear_fence.begin_clear();
+        #[cfg(test)]
+        if !should_start {
+            self.clear_joined.add_permits(1);
+        }
+        if should_start {
+            let cache = self.cache.clone();
+            let index = Arc::clone(&self.index);
+            let clear_fence = Arc::clone(&self.clear_fence);
+            let owned_operation = Arc::clone(&operation);
+            #[cfg(test)]
+            let clear_barrier = self
+                .clear_barrier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+
+            tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(barrier) = clear_barrier {
+                    barrier.wait().await;
+                }
+
+                clear_fence.wait_for_active_fills().await;
+                let result = Self::drain_all(cache, index).await;
+                clear_fence.finish_clear(&owned_operation, result);
+            });
+        }
+
+        operation.wait().await
+    }
+
+    async fn drain_all(
+        cache: Cache<ObjectDataCacheKey, Arc<ObjectDataCacheEntry>>,
+        index: Arc<ObjectDataCacheIdentityIndex>,
+    ) -> ObjectDataCacheInvalidationResult {
+        let keys_to_remove = index.remove_matching(|_| true).await;
         let removed = keys_to_remove.len();
         for key in keys_to_remove {
-            self.cache.remove(&key).await;
+            cache.remove(&key).await;
         }
 
         // Moka maintenance is still needed to retire queued removals, but clear
@@ -487,16 +744,16 @@ impl MokaBackend {
         // entries visible to iteration and a fallback invalidate_all fence so
         // delayed internal writes cannot strand a counted entry.
         for _ in 0..256 {
-            self.cache.run_pending_tasks().await;
-            let lingering_keys: Vec<_> = self.cache.iter().map(|(key, _)| key.as_ref().clone()).collect();
+            cache.run_pending_tasks().await;
+            let lingering_keys: Vec<_> = cache.iter().map(|(key, _)| key.as_ref().clone()).collect();
             for key in lingering_keys {
-                self.cache.remove(&key).await;
+                cache.remove(&key).await;
             }
 
-            self.cache.invalidate_all();
-            self.cache.run_pending_tasks().await;
+            cache.invalidate_all();
+            cache.run_pending_tasks().await;
 
-            if self.cache.entry_count() == 0 {
+            if cache.entry_count() == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -515,7 +772,7 @@ impl MokaBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::MokaBackend;
+    use super::{ClearFence, FillGenerationGuard, MokaBackend};
     use crate::cache::{
         ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup,
     };
@@ -771,6 +1028,230 @@ mod tests {
             MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
 
         assert_eq!(backend.clear().await, ObjectDataCacheInvalidationResult::NoOp);
+    }
+
+    #[tokio::test]
+    async fn clear_fences_fill_started_before_index_registration() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
+        let fill_barrier = backend.install_fill_before_index_barrier();
+        let clear_barrier = backend.install_clear_barrier();
+        let plan = cacheable_plan("object", "etag-a");
+
+        let fill_backend = Arc::clone(&backend);
+        let fill_plan = plan.clone();
+        let fill = tokio::spawn(async move { fill_backend.fill_body(&fill_plan, Bytes::from_static(b"hello")).await });
+        fill_barrier.wait_until_reached().await;
+
+        let clear_backend = Arc::clone(&backend);
+        let clear = tokio::spawn(async move { clear_backend.clear().await });
+        clear_barrier.wait_until_reached().await;
+        clear_barrier.release();
+        assert!(
+            !clear.is_finished(),
+            "clear must wait for a pre-registration fill to acknowledge the fence"
+        );
+
+        fill_barrier.release();
+        assert_eq!(
+            fill.await.expect("fill task should finish"),
+            ObjectDataCacheFillResult::SkippedInvalidationRace
+        );
+        assert_eq!(clear.await.expect("clear task should finish"), ObjectDataCacheInvalidationResult::NoOp);
+        assert!(matches!(backend.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        assert_eq!(backend.index.identity_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_fences_fill_registered_before_cache_publish() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
+        let fill_barrier = backend.install_fill_barrier();
+        let clear_barrier = backend.install_clear_barrier();
+        let plan = cacheable_plan("object", "etag-a");
+
+        let fill_backend = Arc::clone(&backend);
+        let fill_plan = plan.clone();
+        let fill = tokio::spawn(async move { fill_backend.fill_body(&fill_plan, Bytes::from_static(b"hello")).await });
+        fill_barrier.wait_until_reached().await;
+
+        let clear_backend = Arc::clone(&backend);
+        let clear = tokio::spawn(async move { clear_backend.clear().await });
+        clear_barrier.wait_until_reached().await;
+        clear_barrier.release();
+        assert!(!clear.is_finished(), "clear must wait for a registered fill to acknowledge the fence");
+
+        fill_barrier.release();
+        assert_eq!(
+            fill.await.expect("fill task should finish"),
+            ObjectDataCacheFillResult::SkippedInvalidationRace
+        );
+        assert_eq!(
+            clear.await.expect("clear task should finish"),
+            ObjectDataCacheInvalidationResult::Removed { keys: 1 }
+        );
+        assert!(matches!(backend.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        assert_eq!(backend.index.identity_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn fill_started_during_clear_skips_without_waiting() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
+        let clear_barrier = backend.install_clear_barrier();
+        let clear_backend = Arc::clone(&backend);
+        let clear = tokio::spawn(async move { clear_backend.clear().await });
+        clear_barrier.wait_until_reached().await;
+
+        assert_eq!(
+            backend
+                .fill_body(&cacheable_plan("object", "etag-a"), Bytes::from_static(b"hello"))
+                .await,
+            ObjectDataCacheFillResult::SkippedInvalidationRace
+        );
+
+        clear_barrier.release();
+        assert_eq!(clear.await.expect("clear task should finish"), ObjectDataCacheInvalidationResult::NoOp);
+    }
+
+    #[tokio::test]
+    async fn concurrent_clear_joins_same_operation() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
+        let _ = backend
+            .fill_body(&cacheable_plan("object", "etag-a"), Bytes::from_static(b"hello"))
+            .await;
+        let clear_barrier = backend.install_clear_barrier();
+
+        let first_backend = Arc::clone(&backend);
+        let first = tokio::spawn(async move { first_backend.clear().await });
+        clear_barrier.wait_until_reached().await;
+        let second_backend = Arc::clone(&backend);
+        let second = tokio::spawn(async move { second_backend.clear().await });
+        backend.wait_until_clear_joined().await;
+        assert!(!second.is_finished(), "a concurrent clear must join the active drain");
+
+        clear_barrier.release();
+        let expected = ObjectDataCacheInvalidationResult::Removed { keys: 1 };
+        assert_eq!(first.await.expect("first clear should finish"), expected);
+        assert_eq!(second.await.expect("second clear should finish"), expected);
+    }
+
+    #[tokio::test]
+    async fn cancelled_clear_does_not_reopen_old_generation() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
+        let clear_barrier = backend.install_clear_barrier();
+        let first_backend = Arc::clone(&backend);
+        let first = tokio::spawn(async move { first_backend.clear().await });
+        clear_barrier.wait_until_reached().await;
+        first.abort();
+
+        assert_eq!(
+            backend
+                .fill_body(&cacheable_plan("during-clear", "etag-a"), Bytes::from_static(b"hello"))
+                .await,
+            ObjectDataCacheFillResult::SkippedInvalidationRace
+        );
+
+        let second_backend = Arc::clone(&backend);
+        let second = tokio::spawn(async move { second_backend.clear().await });
+        backend.wait_until_clear_joined().await;
+        second.abort();
+        clear_barrier.release();
+        assert_eq!(backend.clear().await, ObjectDataCacheInvalidationResult::NoOp);
+        assert_eq!(
+            backend
+                .fill_body(&cacheable_plan("after-clear", "etag-b"), Bytes::from_static(b"hello"))
+                .await,
+            ObjectDataCacheFillResult::Inserted
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_completion_reopens_generation_atomically() {
+        let fence = Arc::new(ClearFence::new());
+        let (operation, should_start) = fence.begin_clear();
+        assert!(should_start);
+
+        fence.finish_clear(&operation, ObjectDataCacheInvalidationResult::NoOp);
+
+        assert_eq!(operation.wait().await, ObjectDataCacheInvalidationResult::NoOp);
+        assert!(fence.try_register_fill().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_fill_acknowledges_clear_fence() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
+        let fill_barrier = backend.install_fill_barrier();
+        let plan = cacheable_plan("object", "etag-a");
+        let fill_backend = Arc::clone(&backend);
+        let fill_plan = plan.clone();
+        let fill = tokio::spawn(async move { fill_backend.fill_body(&fill_plan, Bytes::from_static(b"hello")).await });
+        fill_barrier.wait_until_reached().await;
+        fill.abort();
+        let _ = fill.await;
+        assert_eq!(
+            backend.clear_fence.state.lock().unwrap().active_fills,
+            1,
+            "the detached publish task must retain its active-fill acknowledgement"
+        );
+
+        let clear_barrier = backend.install_clear_barrier();
+        let clear_backend = Arc::clone(&backend);
+        let clear = tokio::spawn(async move { clear_backend.clear().await });
+        clear_barrier.wait_until_reached().await;
+        clear_barrier.release();
+        assert!(!clear.is_finished(), "clear must wait for the detached publish task");
+
+        fill_barrier.release();
+        assert_eq!(
+            clear.await.expect("clear task should finish"),
+            ObjectDataCacheInvalidationResult::Removed { keys: 1 }
+        );
+        assert!(matches!(backend.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        assert_eq!(backend.index.identity_count().await, 0);
+    }
+
+    #[test]
+    fn clear_fence_generation_overflow_is_fail_closed() {
+        for generation in [u64::MAX, u64::MAX - 1] {
+            let fence = Arc::new(ClearFence::new());
+            fence.state.lock().unwrap().generation = Some(generation);
+
+            let (operation, should_start) = fence.begin_clear();
+            assert!(should_start);
+            fence.finish_clear(&operation, ObjectDataCacheInvalidationResult::NoOp);
+
+            assert!(fence.try_register_fill().is_none());
+            assert!(fence.state.lock().unwrap().generation.is_none());
+            let (joined, should_start) = fence.begin_clear();
+            assert!(!should_start, "a failed generation must retain the permanent clear fence");
+            assert!(Arc::ptr_eq(&operation, &joined));
+        }
+    }
+
+    #[test]
+    fn clear_fence_active_counter_failure_is_fail_closed() {
+        let overflow = Arc::new(ClearFence::new());
+        overflow.state.lock().unwrap().active_fills = usize::MAX;
+        assert!(overflow.try_register_fill().is_none());
+        assert!(overflow.state.lock().unwrap().generation.is_none());
+
+        let underflow = Arc::new(ClearFence::new());
+        drop(FillGenerationGuard {
+            fence: Arc::clone(&underflow),
+            generation: 0,
+        });
+        assert!(underflow.state.lock().unwrap().generation.is_none());
+        assert!(underflow.try_register_fill().is_none());
     }
 
     #[tokio::test]
