@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -65,8 +66,8 @@ const EVENT_SCANNER_PERSIST_STATE: &str = "scanner_persist_state";
 const EVENT_SCANNER_RUNTIME_CONFIG: &str = "scanner_runtime_config";
 const EVENT_SCANNER_BACKGROUND_HEAL_STATE: &str = "scanner_background_heal_state";
 const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total";
-const SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const SINGLE_DISK_CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
+const CLEAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAINTENANCE_FEATURE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_FEATURE_INSPECTION_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -218,6 +219,9 @@ fn cap_clean_idle_cycle_delay(delay: Duration, max_interval: Duration, enabled: 
 enum ScannerCycleWakeReason {
     Timer,
     DirtyUsage,
+    ClusterActivity,
+    ClusterMaintenance,
+    ClusterActivityUnavailable,
     RuntimeConfig,
     MaintenanceConfig,
     LeaderLockLost,
@@ -289,7 +293,7 @@ impl ScannerCleanIdleBackoff {
 
         let max_interval = max_interval.max(base_interval.max(Duration::from_secs(1)));
         if self.effective_interval(base_interval, max_interval, true) < max_interval {
-            self.interval_multiplier = self.interval_multiplier.saturating_mul(SINGLE_DISK_CLEAN_IDLE_BACKOFF_FACTOR);
+            self.interval_multiplier = self.interval_multiplier.saturating_mul(CLEAN_IDLE_BACKOFF_FACTOR);
         }
     }
 }
@@ -358,6 +362,33 @@ struct ScannerCycleWaitPlan {
     delay: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScannerCycleObservedGenerations {
+    dirty_usage: u64,
+    runtime_config: u64,
+    maintenance: u64,
+}
+
+const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScannerNodeActivity {
+    instance_id: String,
+    namespace_generation: u64,
+    maintenance_generation: u64,
+}
+
+type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerActivityObservation {
+    NotRequired,
+    Unchanged,
+    Changed,
+    MaintenanceChanged,
+    Unverified,
+}
+
 fn scanner_cycle_wait_plan(
     runtime_config: &ScannerRuntimeConfig,
     clean_idle_backoff: ScannerCleanIdleBackoff,
@@ -401,7 +432,7 @@ fn scanner_clean_idle_backoff_configured(runtime_config: &ScannerRuntimeConfig) 
 }
 
 fn scanner_clean_idle_max_interval(base_interval: Duration, runtime_config: &ScannerRuntimeConfig) -> Duration {
-    let policy_max = SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL.max(base_interval);
+    let policy_max = CLEAN_IDLE_MAX_INTERVAL.max(base_interval);
     let Some(bitrot_cycle) = runtime_config.bitrot_cycle else {
         return policy_max;
     };
@@ -422,11 +453,44 @@ fn scanner_clean_idle_max_interval(base_interval: Duration, runtime_config: &Sca
 }
 
 fn scanner_clean_idle_backoff_enabled(
-    single_disk: bool,
+    topology_supported: bool,
+    cluster_activity_ready: bool,
     features: ScannerMaintenanceFeatures,
     runtime_config: &ScannerRuntimeConfig,
 ) -> bool {
-    single_disk && !features.needs_regular_cycle() && scanner_clean_idle_backoff_configured(runtime_config)
+    topology_supported
+        && cluster_activity_ready
+        && !features.needs_regular_cycle()
+        && scanner_clean_idle_backoff_configured(runtime_config)
+}
+
+fn scanner_activity_probe_required(
+    topology_supported: bool,
+    backoff_blocked: bool,
+    features: ScannerMaintenanceFeatures,
+    runtime_config: &ScannerRuntimeConfig,
+) -> bool {
+    topology_supported
+        && !backoff_blocked
+        && !features.needs_regular_cycle()
+        && scanner_clean_idle_backoff_configured(runtime_config)
+}
+
+fn scanner_activity_observed_work(observation: ScannerActivityObservation) -> bool {
+    matches!(
+        observation,
+        ScannerActivityObservation::Changed
+            | ScannerActivityObservation::MaintenanceChanged
+            | ScannerActivityObservation::Unverified
+    )
+}
+
+fn scanner_activity_backoff_blocked_after_wake(currently_blocked: bool, wake_reason: ScannerCycleWakeReason) -> bool {
+    match wake_reason {
+        ScannerCycleWakeReason::ClusterMaintenance => true,
+        ScannerCycleWakeReason::MaintenanceConfig => false,
+        _ => currently_blocked,
+    }
 }
 
 async fn wait_for_next_scanner_cycle<F>(
@@ -491,6 +555,196 @@ where
             }
         }
     }
+}
+
+async fn wait_for_next_scanner_cycle_with_activity<F, Probe, ProbeFuture>(
+    ctx: &CancellationToken,
+    delay: Duration,
+    activity_poll_interval: Option<Duration>,
+    activity_seen: &mut Option<ScannerActivitySnapshot>,
+    generations: ScannerCycleObservedGenerations,
+    is_lock_lost: F,
+    mut probe_activity: Probe,
+) -> ScannerCycleWakeReason
+where
+    F: Fn() -> bool,
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: Future<Output = Result<ScannerActivitySnapshot, String>>,
+{
+    let deadline = Instant::now() + delay;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return ScannerCycleWakeReason::Timer;
+        }
+        let wait_slice = activity_poll_interval
+            .map(|interval| interval.max(Duration::from_secs(1)).min(remaining))
+            .unwrap_or(remaining);
+        let wake_reason = wait_for_next_scanner_cycle(
+            ctx,
+            wait_slice,
+            generations.dirty_usage,
+            generations.runtime_config,
+            generations.maintenance,
+            &is_lock_lost,
+        )
+        .await;
+        if wake_reason != ScannerCycleWakeReason::Timer || Instant::now() >= deadline {
+            return wake_reason;
+        }
+
+        let Some(_) = activity_poll_interval else {
+            return ScannerCycleWakeReason::Timer;
+        };
+        if is_lock_lost() {
+            return ScannerCycleWakeReason::LeaderLockLost;
+        }
+
+        let probe = probe_activity();
+        tokio::pin!(probe);
+        let lock_lost = async {
+            loop {
+                tokio::time::sleep(SCANNER_LEADER_LOCK_POLL_INTERVAL).await;
+                if is_lock_lost() {
+                    break;
+                }
+            }
+        };
+        tokio::pin!(lock_lost);
+        let probe_result = tokio::select! {
+            result = &mut probe => result,
+            _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
+            _ = &mut lock_lost => return ScannerCycleWakeReason::LeaderLockLost,
+        };
+
+        let had_baseline = activity_seen.is_some();
+        let (observation, probe_error) = apply_scanner_activity_probe_result(activity_seen, probe_result);
+        if let Some(err) = probe_error {
+            log_scanner_activity_probe_error(had_baseline, &err);
+        }
+        match observation {
+            ScannerActivityObservation::Unchanged | ScannerActivityObservation::NotRequired => {}
+            ScannerActivityObservation::Changed => return ScannerCycleWakeReason::ClusterActivity,
+            ScannerActivityObservation::MaintenanceChanged => return ScannerCycleWakeReason::ClusterMaintenance,
+            ScannerActivityObservation::Unverified => return ScannerCycleWakeReason::ClusterActivityUnavailable,
+        }
+    }
+}
+
+fn log_scanner_activity_probe_error(had_baseline: bool, err: &str) {
+    if had_baseline {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "cluster_activity_probe_failed",
+            error = %err,
+            "Scanner cluster activity probe failed; preserving the base cycle"
+        );
+    } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "cluster_activity_probe_unavailable",
+            error = %err,
+            "Scanner cluster activity probe remains unavailable"
+        );
+    }
+}
+
+fn compare_scanner_activity(previous: &ScannerActivitySnapshot, current: &ScannerActivitySnapshot) -> ScannerActivityObservation {
+    if previous == current {
+        return ScannerActivityObservation::Unchanged;
+    }
+
+    for (host, current_activity) in current {
+        let Some(previous_activity) = previous.get(host) else {
+            continue;
+        };
+        if host != LOCAL_SCANNER_ACTIVITY_NODE
+            && previous_activity.instance_id == current_activity.instance_id
+            && previous_activity.maintenance_generation != current_activity.maintenance_generation
+        {
+            return ScannerActivityObservation::MaintenanceChanged;
+        }
+    }
+
+    ScannerActivityObservation::Changed
+}
+
+fn apply_scanner_activity_probe_result(
+    activity_seen: &mut Option<ScannerActivitySnapshot>,
+    result: Result<ScannerActivitySnapshot, String>,
+) -> (ScannerActivityObservation, Option<String>) {
+    match result {
+        Ok(current) => {
+            let observation = match activity_seen.as_ref() {
+                Some(previous) => compare_scanner_activity(previous, &current),
+                None => ScannerActivityObservation::Unverified,
+            };
+            *activity_seen = Some(current);
+            (observation, None)
+        }
+        Err(err) => {
+            *activity_seen = None;
+            (ScannerActivityObservation::Unverified, Some(err))
+        }
+    }
+}
+
+async fn observe_scanner_activity(
+    storeapi: &Arc<ECStore>,
+    distributed: bool,
+    activity_seen: &mut Option<ScannerActivitySnapshot>,
+) -> ScannerActivityObservation {
+    let had_baseline = activity_seen.is_some();
+    let (observation, probe_error) =
+        apply_scanner_activity_probe_result(activity_seen, probe_scanner_activity(storeapi, distributed).await);
+    if let Some(err) = probe_error {
+        log_scanner_activity_probe_error(had_baseline, &err);
+    }
+    observation
+}
+
+async fn probe_scanner_activity(storeapi: &Arc<ECStore>, distributed: bool) -> Result<ScannerActivitySnapshot, String> {
+    let mut snapshot = ScannerActivitySnapshot::from([(
+        LOCAL_SCANNER_ACTIVITY_NODE.to_string(),
+        ScannerNodeActivity {
+            instance_id: crate::scanner_io::scanner_activity_epoch().to_string(),
+            namespace_generation: storeapi.scanner_namespace_mutation_generation(),
+            maintenance_generation: scanner_maintenance_generation(),
+        },
+    )]);
+    if !distributed {
+        return Ok(snapshot);
+    }
+
+    let notification_system = storeapi
+        .notification_system()
+        .ok_or_else(|| "notification system is not initialized".to_string())?;
+    let peers = notification_system
+        .scanner_activity_snapshots()
+        .await
+        .map_err(|err| err.to_string())?;
+    for (host, activity) in peers {
+        if snapshot
+            .insert(
+                host.clone(),
+                ScannerNodeActivity {
+                    instance_id: activity.instance_id,
+                    namespace_generation: activity.namespace_generation,
+                    maintenance_generation: activity.maintenance_generation,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!("duplicate scanner activity peer: {host}"));
+        }
+    }
+    Ok(snapshot)
 }
 
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
@@ -1586,10 +1840,35 @@ async fn run_data_scanner_with_maintenance_state(
         }
     };
     let single_disk = storeapi.setup_is_erasure_sd().await;
+    let erasure = storeapi.setup_is_erasure().await;
+    let distributed = storeapi.setup_is_dist_erasure().await;
+    let clean_idle_topology_supported = single_disk || erasure;
     let mut dirty_usage_generation_seen = dirty_usage_generation();
     let mut runtime_config_generation_seen = scanner_runtime_config_generation();
     let mut clean_idle_backoff = ScannerCleanIdleBackoff::default();
+    let initial_runtime_config = resolve_scanner_runtime_config();
+    if clean_idle_topology_supported
+        && scanner_clean_idle_backoff_configured(&initial_runtime_config)
+        && maintenance_generation_seen.is_none()
+    {
+        let Some((features, generation)) = detect_stable_scanner_maintenance_features(&ctx, &storeapi).await else {
+            global_metrics().set_cycle(None).await;
+            return Ok(());
+        };
+        maintenance_features = features;
+        maintenance_generation_seen = Some(generation);
+    }
     let mut maintenance_inspection_retry = ScannerMaintenanceInspectionRetry::from_features(maintenance_features, Instant::now());
+    let mut scanner_activity_seen = None;
+    let mut scanner_activity_backoff_blocked = false;
+    if scanner_activity_probe_required(
+        clean_idle_topology_supported,
+        scanner_activity_backoff_blocked,
+        maintenance_features,
+        &initial_runtime_config,
+    ) {
+        observe_scanner_activity(&storeapi, distributed, &mut scanner_activity_seen).await;
+    }
 
     let mut cycle_info = CurrentCycle::default();
     let buf = read_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
@@ -1631,7 +1910,27 @@ async fn run_data_scanner_with_maintenance_state(
             return Ok(());
         }
         let runtime_config = resolve_scanner_runtime_config();
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(single_disk, maintenance_features, &runtime_config);
+        let scanner_activity_observation = if scanner_activity_probe_required(
+            clean_idle_topology_supported,
+            scanner_activity_backoff_blocked,
+            maintenance_features,
+            &runtime_config,
+        ) {
+            observe_scanner_activity(&storeapi, distributed, &mut scanner_activity_seen).await
+        } else {
+            scanner_activity_seen = None;
+            ScannerActivityObservation::NotRequired
+        };
+        if scanner_activity_observation == ScannerActivityObservation::MaintenanceChanged {
+            scanner_activity_backoff_blocked = true;
+        }
+        let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
+        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+            clean_idle_topology_supported,
+            scanner_activity_ready,
+            maintenance_features,
+            &runtime_config,
+        );
         record_scanner_cycle_result(
             &mut clean_idle_backoff,
             &runtime_config,
@@ -1642,7 +1941,8 @@ async fn run_data_scanner_with_maintenance_state(
                 dirty_usage_pending_before_cycle,
                 dirty_generation_before_cycle,
                 dirty_usage_generation(),
-            ) || maintenance_generation_before_cycle != scanner_maintenance_generation(),
+            ) || maintenance_generation_before_cycle != scanner_maintenance_generation()
+                || scanner_activity_observed_work(scanner_activity_observation),
         );
         runtime_config_generation_seen = scanner_runtime_config_generation();
     }
@@ -1653,9 +1953,14 @@ async fn run_data_scanner_with_maintenance_state(
         }
 
         let runtime_config = resolve_scanner_runtime_config();
-        if single_disk && scanner_clean_idle_backoff_configured(&runtime_config) {
+        if clean_idle_topology_supported && scanner_clean_idle_backoff_configured(&runtime_config) {
             let current_generation = scanner_maintenance_generation();
             if maintenance_generation_seen != Some(current_generation) {
+                scanner_activity_seen = None;
+                scanner_activity_backoff_blocked = scanner_activity_backoff_blocked_after_wake(
+                    scanner_activity_backoff_blocked,
+                    ScannerCycleWakeReason::MaintenanceConfig,
+                );
                 let Some((features, generation)) = detect_stable_scanner_maintenance_features(&ctx, &storeapi).await else {
                     break;
                 };
@@ -1664,7 +1969,21 @@ async fn run_data_scanner_with_maintenance_state(
                 maintenance_inspection_retry.record_inspection(features, Instant::now());
             }
         }
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(single_disk, maintenance_features, &runtime_config);
+        if !scanner_activity_probe_required(
+            clean_idle_topology_supported,
+            scanner_activity_backoff_blocked,
+            maintenance_features,
+            &runtime_config,
+        ) {
+            scanner_activity_seen = None;
+        }
+        let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
+        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+            clean_idle_topology_supported,
+            scanner_activity_ready,
+            maintenance_features,
+            &runtime_config,
+        );
         let wait_plan = scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
         let dirty_generation_before_wait = dirty_usage_generation();
         let dirty_usage_pending_before_wait = dirty_usage_buckets_pending();
@@ -1692,15 +2011,23 @@ async fn run_data_scanner_with_maintenance_state(
             "Scanner cycle wait scheduled"
         );
 
-        let wake_reason = wait_for_next_scanner_cycle(
+        let activity_poll_interval = backoff_enabled.then_some(runtime_config.cycle_interval.max(Duration::from_secs(1)));
+        let wake_reason = wait_for_next_scanner_cycle_with_activity(
             &ctx,
             wait_plan.delay,
-            dirty_usage_generation_seen,
-            runtime_config_generation_seen,
-            maintenance_generation_before_wait,
+            activity_poll_interval,
+            &mut scanner_activity_seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: dirty_usage_generation_seen,
+                runtime_config: runtime_config_generation_seen,
+                maintenance: maintenance_generation_before_wait,
+            },
             || guard.is_lock_lost(),
+            || probe_scanner_activity(&storeapi, distributed),
         )
         .await;
+        scanner_activity_backoff_blocked =
+            scanner_activity_backoff_blocked_after_wake(scanner_activity_backoff_blocked, wake_reason);
         match wake_reason {
             ScannerCycleWakeReason::Cancelled => break,
             ScannerCycleWakeReason::LeaderLockLost => {
@@ -1710,15 +2037,23 @@ async fn run_data_scanner_with_maintenance_state(
             ScannerCycleWakeReason::RuntimeConfig => {
                 runtime_config_generation_seen = scanner_runtime_config_generation();
                 maintenance_generation_seen = None;
+                scanner_activity_seen = None;
                 clean_idle_backoff.reset();
                 continue;
             }
             ScannerCycleWakeReason::MaintenanceConfig => {
                 maintenance_generation_seen = None;
+                scanner_activity_seen = None;
                 clean_idle_backoff.reset();
                 continue;
             }
-            ScannerCycleWakeReason::Timer | ScannerCycleWakeReason::DirtyUsage => {}
+            ScannerCycleWakeReason::ClusterMaintenance => {
+                clean_idle_backoff.reset();
+            }
+            ScannerCycleWakeReason::Timer
+            | ScannerCycleWakeReason::DirtyUsage
+            | ScannerCycleWakeReason::ClusterActivity
+            | ScannerCycleWakeReason::ClusterActivityUnavailable => {}
         }
 
         if wake_reason == ScannerCycleWakeReason::DirtyUsage {
@@ -1729,6 +2064,23 @@ async fn run_data_scanner_with_maintenance_state(
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
                 state = "dirty_usage_wakeup",
                 "Scanner cycle woke for dirty usage work"
+            );
+        }
+        if matches!(
+            wake_reason,
+            ScannerCycleWakeReason::ClusterActivity
+                | ScannerCycleWakeReason::ClusterMaintenance
+                | ScannerCycleWakeReason::ClusterActivityUnavailable
+        ) {
+            let cluster_activity_verified = wake_reason == ScannerCycleWakeReason::ClusterActivity;
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "cluster_activity_wakeup",
+                cluster_activity_verified,
+                "Scanner cycle woke for cluster activity"
             );
         }
 
@@ -1756,7 +2108,7 @@ async fn run_data_scanner_with_maintenance_state(
         let maintenance_config_changed =
             maintenance_generation_seen.is_some_and(|generation| generation != current_maintenance_generation);
         let retry_failed_inspection = maintenance_inspection_retry.retry_due(maintenance_features, wake_reason, Instant::now());
-        if single_disk
+        if clean_idle_topology_supported
             && scanner_clean_idle_backoff_configured(&runtime_config)
             && (maintenance_config_changed || retry_failed_inspection)
         {
@@ -1773,11 +2125,36 @@ async fn run_data_scanner_with_maintenance_state(
             continue;
         }
         if maintenance_config_changed {
+            scanner_activity_seen = None;
+            scanner_activity_backoff_blocked = scanner_activity_backoff_blocked_after_wake(
+                scanner_activity_backoff_blocked,
+                ScannerCycleWakeReason::MaintenanceConfig,
+            );
             clean_idle_backoff.reset();
             continue;
         }
 
-        let backoff_enabled = scanner_clean_idle_backoff_enabled(single_disk, maintenance_features, &runtime_config);
+        let scanner_activity_observation = if scanner_activity_probe_required(
+            clean_idle_topology_supported,
+            scanner_activity_backoff_blocked,
+            maintenance_features,
+            &runtime_config,
+        ) {
+            observe_scanner_activity(&storeapi, distributed, &mut scanner_activity_seen).await
+        } else {
+            scanner_activity_seen = None;
+            ScannerActivityObservation::NotRequired
+        };
+        if scanner_activity_observation == ScannerActivityObservation::MaintenanceChanged {
+            scanner_activity_backoff_blocked = true;
+        }
+        let scanner_activity_ready = !scanner_activity_backoff_blocked && scanner_activity_seen.is_some();
+        let backoff_enabled = scanner_clean_idle_backoff_enabled(
+            clean_idle_topology_supported,
+            scanner_activity_ready,
+            maintenance_features,
+            &runtime_config,
+        );
         record_scanner_cycle_result(
             &mut clean_idle_backoff,
             &runtime_config,
@@ -1788,7 +2165,7 @@ async fn run_data_scanner_with_maintenance_state(
                 dirty_usage_pending_before_wait,
                 dirty_generation_before_wait,
                 dirty_usage_generation(),
-            ),
+            ) || scanner_activity_observed_work(scanner_activity_observation),
         );
     }
 
@@ -2751,7 +3128,12 @@ mod tests {
 
         assert!(features.inspection_failed);
         assert_eq!(generation, scanner_maintenance_generation());
-        assert!(!scanner_clean_idle_backoff_enabled(true, features, &ScannerRuntimeConfig::default()));
+        assert!(!scanner_clean_idle_backoff_enabled(
+            true,
+            true,
+            features,
+            &ScannerRuntimeConfig::default()
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2876,9 +3258,9 @@ mod tests {
     }
 
     #[test]
-    fn test_single_disk_clean_idle_backoff_grows_to_cap() {
+    fn clean_idle_backoff_grows_to_cap() {
         let base_interval = Duration::from_secs(60);
-        let max_interval = SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL;
+        let max_interval = CLEAN_IDLE_MAX_INTERVAL;
         let mut backoff = ScannerCleanIdleBackoff::default();
 
         assert_eq!(backoff.effective_interval(base_interval, max_interval, true), Duration::from_secs(60));
@@ -2966,12 +3348,11 @@ mod tests {
             );
         }
         let plan = scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, true, |interval| interval.mul_f64(1.1));
-        assert_eq!(plan.effective_interval, SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL);
-        assert!(plan.delay < SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL);
+        assert_eq!(plan.effective_interval, CLEAN_IDLE_MAX_INTERVAL);
+        assert!(plan.delay < CLEAN_IDLE_MAX_INTERVAL);
         assert_eq!(
             plan.delay,
-            SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL
-                .saturating_sub(SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL.mul_f64(1.1) - SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL)
+            CLEAN_IDLE_MAX_INTERVAL.saturating_sub(CLEAN_IDLE_MAX_INTERVAL.mul_f64(1.1) - CLEAN_IDLE_MAX_INTERVAL)
         );
     }
 
@@ -2994,9 +3375,9 @@ mod tests {
     }
 
     #[test]
-    fn test_single_disk_clean_idle_backoff_resets_for_non_idle_work() {
+    fn clean_idle_backoff_resets_for_non_idle_work() {
         let base_interval = Duration::from_secs(60);
-        let max_interval = SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL;
+        let max_interval = CLEAN_IDLE_MAX_INTERVAL;
         let mut backoff = ScannerCleanIdleBackoff::default();
 
         backoff.record_cycle(
@@ -3108,29 +3489,26 @@ mod tests {
     }
 
     #[test]
-    fn test_single_disk_clean_idle_backoff_never_shortens_base_interval() {
+    fn clean_idle_backoff_never_shortens_base_interval() {
         let base_interval = Duration::from_secs(48 * 60 * 60);
         let mut backoff = ScannerCleanIdleBackoff::default();
 
         backoff.record_cycle(
             base_interval,
-            SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL,
+            CLEAN_IDLE_MAX_INTERVAL,
             true,
             ScannerCycleWakeReason::Timer,
             ScannerCycleOutcome::Completed,
             false,
         );
 
-        assert_eq!(
-            backoff.effective_interval(base_interval, SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL, true),
-            base_interval
-        );
+        assert_eq!(backoff.effective_interval(base_interval, CLEAN_IDLE_MAX_INTERVAL, true), base_interval);
     }
 
     #[test]
-    fn test_single_disk_clean_idle_backoff_resets_while_disabled() {
+    fn clean_idle_backoff_resets_while_disabled() {
         let base_interval = Duration::from_secs(60);
-        let max_interval = SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL;
+        let max_interval = CLEAN_IDLE_MAX_INTERVAL;
         let mut backoff = ScannerCleanIdleBackoff::default();
 
         backoff.record_cycle(
@@ -3165,16 +3543,17 @@ mod tests {
     }
 
     #[test]
-    fn test_single_disk_clean_idle_backoff_policy_preserves_explicit_and_maintenance_cycles() {
+    fn clean_idle_backoff_policy_preserves_explicit_and_maintenance_cycles() {
         let no_features = ScannerMaintenanceFeatures::default();
         let default_config = ScannerRuntimeConfig::default();
-        assert!(scanner_clean_idle_backoff_enabled(true, no_features, &default_config));
-        assert!(!scanner_clean_idle_backoff_enabled(false, no_features, &default_config));
+        assert!(scanner_clean_idle_backoff_enabled(true, true, no_features, &default_config));
+        assert!(!scanner_clean_idle_backoff_enabled(false, true, no_features, &default_config));
+        assert!(!scanner_clean_idle_backoff_enabled(true, false, no_features, &default_config));
 
         for source in [ScannerRuntimeConfigSource::Env, ScannerRuntimeConfigSource::Config] {
             let mut config = default_config.clone();
             config.cycle_interval_source = source;
-            assert!(!scanner_clean_idle_backoff_enabled(true, no_features, &config));
+            assert!(!scanner_clean_idle_backoff_enabled(true, true, no_features, &config));
         }
 
         for source in [
@@ -3185,10 +3564,10 @@ mod tests {
             let mut explicit_bitrot_config = default_config.clone();
             explicit_bitrot_config.bitrot_cycle = Some(Duration::from_secs(60 * 60));
             explicit_bitrot_config.bitrot_cycle_source = source;
-            assert!(!scanner_clean_idle_backoff_enabled(true, no_features, &explicit_bitrot_config));
+            assert!(!scanner_clean_idle_backoff_enabled(true, true, no_features, &explicit_bitrot_config));
 
             explicit_bitrot_config.bitrot_cycle = None;
-            assert!(scanner_clean_idle_backoff_enabled(true, no_features, &explicit_bitrot_config));
+            assert!(scanner_clean_idle_backoff_enabled(true, true, no_features, &explicit_bitrot_config));
         }
 
         for features in [
@@ -3205,13 +3584,32 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(!scanner_clean_idle_backoff_enabled(true, features, &default_config));
+            assert!(!scanner_clean_idle_backoff_enabled(true, true, features, &default_config));
         }
     }
 
     #[test]
+    fn clean_idle_backoff_requires_activity_probes() {
+        let default_config = ScannerRuntimeConfig::default();
+        let no_features = ScannerMaintenanceFeatures::default();
+        assert!(scanner_activity_probe_required(true, false, no_features, &default_config));
+        assert!(!scanner_activity_probe_required(false, false, no_features, &default_config));
+        assert!(!scanner_activity_probe_required(true, true, no_features, &default_config));
+
+        let mut explicit_cycle = default_config.clone();
+        explicit_cycle.cycle_interval_source = ScannerRuntimeConfigSource::Env;
+        assert!(!scanner_activity_probe_required(true, false, no_features, &explicit_cycle));
+
+        let lifecycle = ScannerMaintenanceFeatures {
+            lifecycle: true,
+            ..Default::default()
+        };
+        assert!(!scanner_activity_probe_required(true, false, lifecycle, &default_config));
+    }
+
+    #[test]
     #[serial]
-    fn single_disk_clean_idle_cap_preserves_default_bitrot_coverage_window() {
+    fn clean_idle_cap_preserves_default_bitrot_coverage_window() {
         let config = ScannerRuntimeConfig {
             bitrot_cycle: Some(Duration::from_secs(30 * 24 * 60 * 60)),
             bitrot_cycle_source: ScannerRuntimeConfigSource::Default,
@@ -3231,21 +3629,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn single_disk_clean_idle_cap_allows_policy_max_when_bitrot_is_disabled() {
+    fn clean_idle_cap_allows_policy_max_when_bitrot_is_disabled() {
         let config = ScannerRuntimeConfig {
             bitrot_cycle: None,
             ..Default::default()
         };
 
-        assert_eq!(
-            scanner_clean_idle_max_interval(Duration::from_secs(60), &config),
-            SINGLE_DISK_CLEAN_IDLE_MAX_INTERVAL
-        );
+        assert_eq!(scanner_clean_idle_max_interval(Duration::from_secs(60), &config), CLEAN_IDLE_MAX_INTERVAL);
     }
 
     #[test]
     #[serial]
-    fn single_disk_clean_idle_cap_never_shortens_the_base_cycle() {
+    fn clean_idle_cap_never_shortens_the_base_cycle() {
         let config = ScannerRuntimeConfig {
             bitrot_cycle: Some(Duration::from_secs(60)),
             bitrot_cycle_source: ScannerRuntimeConfigSource::Default,
@@ -3516,6 +3911,271 @@ mod tests {
             crate::runtime_config::scanner_runtime_config_generation(),
             crate::scanner_io::scanner_maintenance_generation(),
             || true,
+        )
+        .await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::LeaderLockLost);
+    }
+
+    fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_generation: u64) -> ScannerNodeActivity {
+        ScannerNodeActivity {
+            instance_id: epoch.to_string(),
+            namespace_generation,
+            maintenance_generation,
+        }
+    }
+
+    #[test]
+    fn scanner_activity_observation_requires_a_complete_baseline() {
+        let mut seen = None;
+        let first = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+
+        let (observation, error) = apply_scanner_activity_probe_result(&mut seen, Ok(first.clone()));
+        assert_eq!(observation, ScannerActivityObservation::Unverified);
+        assert!(error.is_none());
+
+        let (observation, error) = apply_scanner_activity_probe_result(&mut seen, Ok(first));
+        assert_eq!(observation, ScannerActivityObservation::Unchanged);
+        assert!(error.is_none());
+
+        let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
+        let (observation, error) = apply_scanner_activity_probe_result(&mut seen, Ok(changed));
+        assert_eq!(observation, ScannerActivityObservation::Changed);
+        assert!(error.is_none());
+
+        let restarted = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-b", 8, 0))]);
+        let (observation, error) = apply_scanner_activity_probe_result(&mut seen, Ok(restarted));
+        assert_eq!(observation, ScannerActivityObservation::Changed);
+        assert!(error.is_none());
+
+        let (observation, error) =
+            apply_scanner_activity_probe_result(&mut seen, Err("peer does not support activity probes".to_string()));
+        assert_eq!(observation, ScannerActivityObservation::Unverified);
+        assert_eq!(error.as_deref(), Some("peer does not support activity probes"));
+        assert!(seen.is_none());
+    }
+
+    #[test]
+    fn remote_maintenance_change_is_distinct_from_namespace_activity() {
+        let previous = BTreeMap::from([
+            (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+            ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+        ]);
+        let remote_maintenance_changed = BTreeMap::from([
+            (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+            ("node-2".to_string(), scanner_node_activity("remote", 7, 4)),
+        ]);
+        assert_eq!(
+            compare_scanner_activity(&previous, &remote_maintenance_changed),
+            ScannerActivityObservation::MaintenanceChanged
+        );
+
+        let local_maintenance_changed = BTreeMap::from([
+            (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 3)),
+            ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+        ]);
+        assert_eq!(
+            compare_scanner_activity(&previous, &local_maintenance_changed),
+            ScannerActivityObservation::Changed
+        );
+    }
+
+    #[test]
+    fn local_maintenance_wakeup_releases_a_remote_maintenance_block() {
+        let blocked = scanner_activity_backoff_blocked_after_wake(false, ScannerCycleWakeReason::ClusterMaintenance);
+        assert!(blocked);
+
+        let unblocked = scanner_activity_backoff_blocked_after_wake(blocked, ScannerCycleWakeReason::MaintenanceConfig);
+        assert!(!unblocked);
+        assert!(scanner_activity_backoff_blocked_after_wake(
+            blocked,
+            ScannerCycleWakeReason::ClusterActivity
+        ));
+    }
+
+    #[test]
+    fn scanner_activity_after_a_cycle_restores_the_base_interval() {
+        let runtime_config = ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let mut backoff = ScannerCleanIdleBackoff { interval_multiplier: 8 };
+
+        record_scanner_cycle_result(
+            &mut backoff,
+            &runtime_config,
+            true,
+            ScannerCycleWakeReason::Timer,
+            ScannerCycleOutcome::Completed,
+            scanner_activity_observed_work(ScannerActivityObservation::Changed),
+        );
+
+        let plan = scanner_cycle_wait_plan(&runtime_config, backoff, true, std::convert::identity);
+        assert_eq!(plan.effective_interval, Duration::from_secs(60));
+        assert_eq!(plan.delay, Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn distributed_clean_idle_wait_wakes_at_base_interval_for_remote_activity() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+        let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
+
+        let reason = wait_for_next_scanner_cycle_with_activity(
+            &ctx,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+            &mut seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+                maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            },
+            || false,
+            || std::future::ready(Ok(changed.clone())),
+        )
+        .await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::ClusterActivity);
+        assert_eq!(seen, Some(changed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn distributed_clean_idle_wait_blocks_backoff_for_unpropagated_maintenance() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+        let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 4))]);
+
+        let reason = wait_for_next_scanner_cycle_with_activity(
+            &ctx,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+            &mut seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+                maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            },
+            || false,
+            || std::future::ready(Ok(changed.clone())),
+        )
+        .await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::ClusterMaintenance);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn distributed_clean_idle_wait_fails_closed_when_a_peer_is_unverifiable() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+
+        let reason = wait_for_next_scanner_cycle_with_activity(
+            &ctx,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+            &mut seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+                maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            },
+            || false,
+            || std::future::ready(Err("node-2 is unreachable".to_string())),
+        )
+        .await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::ClusterActivityUnavailable);
+        assert!(seen.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn distributed_clean_idle_wait_keeps_the_extended_deadline_when_peers_are_clean() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let expected = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+        let mut seen = Some(expected.clone());
+
+        let reason = wait_for_next_scanner_cycle_with_activity(
+            &ctx,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+            &mut seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+                maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            },
+            || false,
+            || std::future::ready(Ok(expected.clone())),
+        )
+        .await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::Timer);
+        assert_eq!(seen, Some(expected));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn scanner_activity_probe_wait_is_cancellation_aware() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let cancel = ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            cancel.cancel();
+        });
+        let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+
+        let reason = wait_for_next_scanner_cycle_with_activity(
+            &ctx,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+            &mut seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+                maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            },
+            || false,
+            std::future::pending::<Result<ScannerActivitySnapshot, String>>,
+        )
+        .await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::Cancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn scanner_activity_probe_wait_stops_after_leader_lock_loss() {
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        let ctx = CancellationToken::new();
+        let lock_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lose_lock = Arc::clone(&lock_lost);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            lose_lock.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+
+        let reason = wait_for_next_scanner_cycle_with_activity(
+            &ctx,
+            Duration::from_secs(120),
+            Some(Duration::from_secs(60)),
+            &mut seen,
+            ScannerCycleObservedGenerations {
+                dirty_usage: crate::scanner_io::dirty_usage_generation(),
+                runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+                maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            },
+            || lock_lost.load(std::sync::atomic::Ordering::Acquire),
+            std::future::pending::<Result<ScannerActivitySnapshot, String>>,
         )
         .await;
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::PeerRestClient;
+use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity};
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
@@ -41,6 +41,7 @@ const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
 const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
+const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -91,7 +92,6 @@ pub fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
 
 pub struct NotificationSys {
     pub peer_clients: Vec<Option<PeerRestClient>>,
-    #[allow(dead_code)]
     pub all_peer_clients: Vec<Option<PeerRestClient>>,
     peer_admin_caches: Vec<Mutex<PeerAdminCache>>,
 }
@@ -756,6 +756,14 @@ impl NotificationSys {
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
+        self.load_bucket_metadata_with_scanner_maintenance(bucket, false).await
+    }
+
+    pub async fn load_bucket_metadata_for_scanner_maintenance(&self, bucket: &str) -> Result<()> {
+        self.load_bucket_metadata_with_scanner_maintenance(bucket, true).await
+    }
+
+    async fn load_bucket_metadata_with_scanner_maintenance(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
         let operation = format!("load_bucket_metadata({bucket})");
         let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
@@ -763,7 +771,12 @@ impl NotificationSys {
             if let Some(client) = client {
                 let host = client.host.to_string();
                 let b = bucket.to_string();
-                futures.push(async move { client.load_bucket_metadata(&b).await.map_err(|err| (host, err)) });
+                futures.push(async move {
+                    client
+                        .load_bucket_metadata(&b, scanner_maintenance_change)
+                        .await
+                        .map_err(|err| (host, err))
+                });
             } else {
                 failures.push(format!("peer[{idx}] {operation} failed: peer is not reachable"));
             }
@@ -976,6 +989,36 @@ impl NotificationSys {
         join_all(futures).await
     }
 
+    pub async fn scanner_activity_snapshots(&self) -> Result<Vec<(String, ScannerPeerActivity)>> {
+        if self.peer_clients.is_empty() {
+            return Err(Error::other("scanner activity probe has no remote peers"));
+        }
+        if self.all_peer_clients.len() != self.peer_clients.len() + 1 {
+            return Err(Error::other(format!(
+                "scanner activity peer topology is incomplete: {} remote peers for {} cluster members",
+                self.peer_clients.len(),
+                self.all_peer_clients.len()
+            )));
+        }
+
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for (idx, client) in self.peer_clients.iter().cloned().enumerate() {
+            futures.push(async move {
+                let client = client.ok_or_else(|| Error::other(format!("scanner activity peer[{idx}] is unreachable")))?;
+                let host = client.grid_host.clone();
+                scanner_activity_with_timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, &host, client.scanner_activity())
+                    .await
+                    .map(|activity| (host, activity))
+            });
+        }
+
+        let mut generations = Vec::with_capacity(futures.len());
+        for result in join_all(futures).await {
+            generations.push(result?);
+        }
+        Ok(generations)
+    }
+
     pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter() {
@@ -1027,6 +1070,15 @@ impl NotificationSys {
         }
         join_all(futures).await
     }
+}
+
+async fn scanner_activity_with_timeout<F>(timeout_duration: Duration, host: &str, activity: F) -> Result<ScannerPeerActivity>
+where
+    F: Future<Output = Result<ScannerPeerActivity>>,
+{
+    timeout(timeout_duration, activity)
+        .await
+        .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
 }
 
 async fn call_peer_with_timeout<F, Fut>(
@@ -1566,6 +1618,72 @@ mod tests {
         assert!(msg.contains("reload_pool_meta"));
         assert!(msg.contains("1 failure(s)"));
         assert!(msg.contains("peer[0]"));
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_probe_reports_unreachable_peers() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+        };
+
+        let err = sys
+            .scanner_activity_snapshots()
+            .await
+            .expect_err("unreachable peers must disable scanner idle backoff");
+
+        assert!(err.to_string().contains("scanner activity peer[0] is unreachable"));
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_probe_rejects_an_empty_peer_set() {
+        let sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_admin_caches: Vec::new(),
+        };
+
+        let err = sys
+            .scanner_activity_snapshots()
+            .await
+            .expect_err("a missing peer set must disable scanner idle backoff");
+
+        assert!(err.to_string().contains("no remote peers"));
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_probe_rejects_an_incomplete_peer_topology() {
+        let client = PeerRestClient::new(
+            "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
+            "http://127.0.0.1:9000".to_string(),
+        );
+        let sys = NotificationSys {
+            peer_clients: vec![Some(client)],
+            all_peer_clients: vec![None],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+        };
+
+        let err = sys
+            .scanner_activity_snapshots()
+            .await
+            .expect_err("an incomplete peer topology must disable scanner idle backoff");
+
+        assert!(err.to_string().contains("peer topology is incomplete"));
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_probe_times_out() {
+        let err = scanner_activity_with_timeout(
+            Duration::from_millis(5),
+            "peer-1",
+            std::future::pending::<Result<ScannerPeerActivity>>(),
+        )
+        .await
+        .expect_err("a stalled peer must not block scanner scheduling");
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(err.to_string().contains("peer-1"));
     }
 
     #[tokio::test]

@@ -144,6 +144,7 @@ impl ScannerBucketScanPlan {
 static DIRTY_USAGE_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
 static SCANNER_MAINTENANCE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SCANNER_MAINTENANCE_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
@@ -180,12 +181,16 @@ pub fn record_scanner_maintenance_change(bucket: &str) {
     record_dirty_usage_bucket(bucket);
 }
 
-pub(crate) fn scanner_maintenance_generation() -> u64 {
+pub fn scanner_maintenance_generation() -> u64 {
     SCANNER_MAINTENANCE_GENERATION.load(Ordering::Acquire)
 }
 
 pub(crate) async fn scanner_maintenance_changed() {
     SCANNER_MAINTENANCE_NOTIFY.notified().await;
+}
+
+pub fn scanner_activity_epoch() -> &'static str {
+    SCANNER_ACTIVITY_EPOCH.as_str()
 }
 
 pub(crate) fn dirty_usage_generation() -> u64 {
