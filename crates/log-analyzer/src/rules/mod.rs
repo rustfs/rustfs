@@ -17,12 +17,14 @@
 //! (rustfs/backlog#1286).
 
 mod engine;
+mod external;
 mod findings;
 mod model;
 mod rule_set;
 mod seed;
 
 pub use engine::RuleEngine;
+pub use external::{EXTERNAL_RULES_SCHEMA_VERSION, ExternalRulesError, seed_rules_with_external};
 pub use findings::{EvidenceValues, Finding, FindingsCollector};
 pub use model::{Matcher, Rule, Severity};
 pub use rule_set::{RuleSet, RuleSetError};

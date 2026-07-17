@@ -30,8 +30,14 @@ rustfs diagnose logs.tar.gz --since 24h --format md > report.md
 ## 报告解读
 
 - **发现(按严重度)**:P0 数据风险 → P1 服务不可用 → P2 降级 → P3 客户端侧
-  → P4 提示。每条带诊断结论、建议动作、证据字段与样本行。quorum 类发现
-  通常是级联症状,优先处理同时段的 disk/peer 类 P2 发现。
+  → P4 提示。每条带诊断结论、建议动作、证据字段与样本行。
+- **因果折叠**:当症状类发现(如 quorum 刷屏)在时间上跟随其已知根因
+  (如盘 faulty)出现时,报告把症状折叠进根因块的"级联症状"行,根因块
+  提升到两者中更高的严重度位置——报告首块直接回答"最可能的原因"。
+  JSON 输出保留全部 findings(`collapsed_into` / `caused` 字段标注关系)。
+- **时间线异常(提示)**:三个确定性启发,均为提示不定罪——混合 UTC 偏移
+  (伴签名错误时点名时钟偏移)、节点时间范围完全不重叠、时间线断档
+  (断档后紧跟 startup 类发现时升级为"重启证据")。
 - **低频提示**:命中数低于规则阈值的匹配(如零星的签名错误),仅供参考。
 - **未识别的高频错误**:规则库未覆盖的 WARN/ERROR 消息模板聚类。这一节是
   规则库迭代的输入——反复出现的新模板请提给维护者补规则
@@ -44,6 +50,44 @@ rustfs diagnose logs.tar.gz --since 24h --format md > report.md
 
 把 bucket/object/AK/IP 等客户标识替换为稳定哈希(同值同哈希,保持可关联),
 规则 id、诊断文本与 panic 源码位置保留。适合把报告转发到工单系统或群聊。
+
+## 自定义规则(`--rules <file.json>`)
+
+支持团队可以在不等发版的情况下补规则,或热修一条误报的内置规则:
+
+```bash
+rustfs diagnose customer.zip --rules extra-rules.json
+```
+
+文件格式(`Rule` 的 JSON 表示与内置规则完全一致):
+
+```json
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "id": "custom-oom-killer",
+      "severity": "p1_unavailable",
+      "category": "process",
+      "title": "内核 OOM killer 终止了进程",
+      "matcher": { "message_contains": "Out of memory: Killed process" },
+      "diagnosis": "内核因内存不足杀掉了 rustfs 进程。",
+      "suggestion": "检查内存限制与其他驻留进程;考虑调大内存或加节点。"
+    }
+  ]
+}
+```
+
+- `severity`:`p0_data_risk | p1_unavailable | p2_degraded | p3_client_side | p4_info`;
+- `matcher`:`message_prefix` / `message_contains` / `message_regex` /
+  `field_equals {name, value}` / `target_prefix` / `is_panic` / `min_level` /
+  `all [..]` / `any [..]`,与内置规则同一套类型;
+- 可选字段:`evidence_fields`、`min_count`(默认 1)、`implies_root_cause`
+  (参与因果折叠)、`anchors`;
+- **同 id 覆盖内置规则**(用于热修误报);合并后的规则集整体校验,任何错误
+  (坏 regex、重复 id、空 matcher 组)会逐条打印并以退出码 2 失败——不会
+  带着半坏的规则集分析;
+- 外部规则的 `anchors` 不受 CI 锚点守卫约束,质量由文件作者自担。
 
 ## 已知边界
 

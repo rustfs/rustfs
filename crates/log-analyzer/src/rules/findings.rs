@@ -54,6 +54,15 @@ pub struct Finding {
     pub evidence: BTreeMap<String, EvidenceValues>,
     /// `count < rule.min_count`: the report demotes this to low-confidence.
     pub below_min_count: bool,
+    /// Causal folding (rustfs/backlog#1290): the root-cause finding this one
+    /// collapsed into. Renderers fold it under that root instead of listing
+    /// it flat; JSON keeps the full finding either way.
+    pub collapsed_into: Option<String>,
+    /// The symptom finding ids collapsed under this root (other direction).
+    pub caused: Vec<String>,
+    /// The rule's causal edges, carried for `finalize` — not report data.
+    #[serde(skip)]
+    pub implies_root_cause: Vec<String>,
 }
 
 struct FindingAcc {
@@ -98,6 +107,9 @@ impl FindingsCollector {
                 samples: Vec::new(),
                 evidence: BTreeMap::new(),
                 below_min_count: false,
+                collapsed_into: None,
+                caused: Vec::new(),
+                implies_root_cause: rule.implies_root_cause.clone(),
             },
             min_count: rule.min_count,
             evidence_fields: rule.evidence_fields.clone(),

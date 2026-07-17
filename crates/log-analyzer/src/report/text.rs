@@ -82,13 +82,24 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
     }
     writeln!(w)?;
 
+    if !report.timeline_anomalies.is_empty() {
+        writeln!(w, "时间线异常(提示)")?;
+        writeln!(w, "{LIGHT_RULE}")?;
+        for anomaly in &report.timeline_anomalies {
+            writeln!(w, "[!] {}", anomaly.message)?;
+        }
+        writeln!(w)?;
+    }
+
     writeln!(w, "发现(按严重度)")?;
     writeln!(w, "{LIGHT_RULE}")?;
     if report.findings.is_empty() {
         writeln!(w, "未发现已知故障模式;请查看下方「未识别的高频错误」是否有线索。")?;
     }
-    for finding in &report.findings {
-        render_finding(finding, w)?;
+    // Collapsed symptoms render inside their root's block, not flat.
+    let counts: std::collections::HashMap<&str, u64> = report.findings.iter().map(|f| (f.rule_id.as_str(), f.count)).collect();
+    for finding in report.findings.iter().filter(|f| f.collapsed_into.is_none()) {
+        render_finding(finding, &counts, w)?;
     }
 
     if !report.low_confidence.is_empty() {
@@ -135,7 +146,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
     Ok(())
 }
 
-fn render_finding(finding: &Finding, w: &mut dyn io::Write) -> io::Result<()> {
+fn render_finding(finding: &Finding, counts: &std::collections::HashMap<&str, u64>, w: &mut dyn io::Write) -> io::Result<()> {
     let nodes = finding.nodes.iter().cloned().collect::<Vec<_>>().join(", ");
     writeln!(
         w,
@@ -148,6 +159,14 @@ fn render_finding(finding: &Finding, w: &mut dyn io::Write) -> io::Result<()> {
     )?;
     if let (Some(first), Some(last)) = (finding.first_seen, finding.last_seen) {
         writeln!(w, "    首次 {}   末次 {}", first.to_rfc3339(), last.to_rfc3339())?;
+    }
+    if !finding.caused.is_empty() {
+        let items: Vec<String> = finding
+            .caused
+            .iter()
+            .map(|id| format!("{id} ×{}", counts.get(id.as_str()).copied().unwrap_or(0)))
+            .collect();
+        writeln!(w, "    级联症状: {}", items.join("、"))?;
     }
     writeln!(w, "    诊断: {}", finding.diagnosis)?;
     writeln!(w, "    建议: {}", finding.suggestion)?;

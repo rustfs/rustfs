@@ -19,8 +19,8 @@
 use crate::ingest::{IngestReport, SkipReason};
 use crate::model::{EventKind, LogEvent, LogLevel, ParseStats};
 use crate::redact;
-use crate::rules::{Finding, FindingsCollector, RuleEngine};
-use chrono::{DateTime, FixedOffset, Utc};
+use crate::rules::{Finding, FindingsCollector, RuleEngine, Severity};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -94,6 +94,23 @@ pub struct TimeBucket {
     pub other: u64,
 }
 
+/// One deterministic timeline heuristic hit (rustfs/backlog#1290 sub-item
+/// B). All three kinds are hints, not verdicts.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineAnomaly {
+    /// "mixed_offsets" | "node_ranges_disjoint" | "log_gap".
+    pub kind: String,
+    /// Operator-facing description.
+    pub message: String,
+    /// Involved node labels (node_ranges_disjoint); empty otherwise.
+    pub nodes: Vec<String>,
+    /// Gap boundaries in UTC (log_gap); null otherwise.
+    pub gap_start: Option<DateTime<Utc>>,
+    pub gap_end: Option<DateTime<Utc>>,
+    /// log_gap only: a startup-class finding begins within 5min after the gap.
+    pub restart_evidence: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AnalysisReport {
     /// Stability contract for JSON consumers.
@@ -105,9 +122,14 @@ pub struct AnalysisReport {
     pub low_confidence: Vec<Finding>,
     pub unmatched_top: Vec<UnmatchedCluster>,
     pub timeline: Vec<TimeBucket>,
+    /// Timeline/clock heuristics (schema v2, rustfs/backlog#1290).
+    pub timeline_anomalies: Vec<TimelineAnomaly>,
     /// Pass-through of every skipped input (no silent caps).
     pub skipped_inputs: Vec<(String, SkipReason)>,
 }
+
+/// (min ts, max ts, timestamped event count) for one node label.
+type NodeRange = (DateTime<FixedOffset>, DateTime<FixedOffset>, u64);
 
 #[derive(Default)]
 struct BucketCounts {
@@ -135,6 +157,9 @@ pub struct Analyzer {
     time_range: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
     nodes: BTreeSet<String>,
     offsets: BTreeSet<String>,
+    /// node label -> (min ts, max ts, timestamped event count); feeds the
+    /// disjoint-node-ranges heuristic.
+    node_ranges: BTreeMap<String, NodeRange>,
     /// unix-minute -> counts.
     minute_buckets: BTreeMap<i64, BucketCounts>,
     unmatched: HashMap<String, ClusterAcc>,
@@ -153,6 +178,7 @@ impl Analyzer {
             time_range: None,
             nodes: BTreeSet::new(),
             offsets: BTreeSet::new(),
+            node_ranges: BTreeMap::new(),
             minute_buckets: BTreeMap::new(),
             unmatched: HashMap::new(),
             unmatched_overflow: 0,
@@ -188,6 +214,16 @@ impl Analyzer {
                 Some((first, last)) => (first.min(ts), last.max(ts)),
             });
             self.offsets.insert(format_offset(&ts));
+            if let Some(node) = event.node.as_deref() {
+                self.node_ranges
+                    .entry(node.to_string())
+                    .and_modify(|(min, max, count)| {
+                        *min = (*min).min(ts);
+                        *max = (*max).max(ts);
+                        *count += 1;
+                    })
+                    .or_insert((ts, ts, 1));
+            }
             let bucket = self.minute_buckets.entry(ts.timestamp().div_euclid(60)).or_default();
             match event.level {
                 Some(LogLevel::Error) => bucket.error += 1,
@@ -221,6 +257,7 @@ impl Analyzer {
                 findings.push(finding);
             }
         }
+        collapse_findings(&mut findings);
 
         let mut unmatched_top: Vec<UnmatchedCluster> = self
             .unmatched
@@ -245,10 +282,18 @@ impl Analyzer {
         unmatched_top.sort_by(|a, b| b.count.cmp(&a.count).then(a.template.cmp(&b.template)));
         unmatched_top.truncate(self.opts.top_unmatched);
 
-        let timeline = merge_timeline(&self.minute_buckets);
+        let (timeline, bucket_width_min) = merge_timeline(&self.minute_buckets);
+        let timeline_anomalies = detect_timeline_anomalies(
+            &self.offsets,
+            &self.node_ranges,
+            &self.minute_buckets,
+            bucket_width_min,
+            &findings,
+            &low_confidence,
+        );
 
         let mut report = AnalysisReport {
-            schema_version: 1,
+            schema_version: 2,
             summary: Summary {
                 events_total: self.events_total,
                 events_after_filter: self.events_after_filter,
@@ -264,6 +309,7 @@ impl Analyzer {
             low_confidence,
             unmatched_top,
             timeline,
+            timeline_anomalies,
             skipped_inputs: ingest.skipped,
         };
 
@@ -311,9 +357,11 @@ fn format_offset(ts: &DateTime<FixedOffset>) -> String {
     format!("{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60)
 }
 
-fn merge_timeline(minute_buckets: &BTreeMap<i64, BucketCounts>) -> Vec<TimeBucket> {
+/// Returns the merged display buckets and the chosen bucket width (minutes);
+/// the width also parameterizes the log-gap heuristic threshold.
+fn merge_timeline(minute_buckets: &BTreeMap<i64, BucketCounts>) -> (Vec<TimeBucket>, i64) {
     let (Some((&first, _)), Some((&last, _))) = (minute_buckets.first_key_value(), minute_buckets.last_key_value()) else {
-        return Vec::new();
+        return (Vec::new(), 1);
     };
     let span = last - first + 1;
     let width = BUCKET_WIDTHS_MIN
@@ -330,7 +378,7 @@ fn merge_timeline(minute_buckets: &BTreeMap<i64, BucketCounts>) -> Vec<TimeBucke
         slot.warn += counts.warn;
         slot.other += counts.other;
     }
-    merged
+    let buckets = merged
         .into_iter()
         .map(|(slot, counts)| TimeBucket {
             start: DateTime::<Utc>::from_timestamp(slot * width * 60, 0).expect("valid timestamp"),
@@ -338,7 +386,234 @@ fn merge_timeline(minute_buckets: &BTreeMap<i64, BucketCounts>) -> Vec<TimeBucke
             warn: counts.warn,
             other: counts.other,
         })
-        .collect()
+        .collect();
+    (buckets, width)
+}
+
+/// Finding ids whose presence right after a log gap upgrades it to restart
+/// evidence, and ids that make mixed offsets a likely signature root cause.
+const STARTUP_RULE_IDS: [&str; 3] = ["startup-fatal", "runtime-failed", "endpoint-resolve-failed"];
+const SIGNATURE_RULE_IDS: [&str; 2] = ["client-signature-mismatch", "internode-signature-mismatch"];
+
+/// Timeline/clock heuristics (rustfs/backlog#1290 sub-item B). Three
+/// deterministic hints — mixed UTC offsets, disjoint per-node time ranges,
+/// and gaps in an otherwise continuous timeline — each phrased as a hint,
+/// never a verdict.
+fn detect_timeline_anomalies(
+    offsets: &BTreeSet<String>,
+    node_ranges: &BTreeMap<String, NodeRange>,
+    minute_buckets: &BTreeMap<i64, BucketCounts>,
+    bucket_width_min: i64,
+    findings: &[Finding],
+    low_confidence: &[Finding],
+) -> Vec<TimelineAnomaly> {
+    let mut anomalies = Vec::new();
+    let has_finding = |ids: &[&str]| {
+        findings
+            .iter()
+            .chain(low_confidence)
+            .any(|f| ids.contains(&f.rule_id.as_str()))
+    };
+
+    // 1. Mixed UTC offsets: nodes disagree on timezone or clock source.
+    if offsets.len() > 1 {
+        let mut message = format!(
+            "日志包含多个 UTC 偏移({}):节点时区/时钟源可能不一致,跨节点排序前先归一到 UTC。",
+            offsets.iter().cloned().collect::<Vec<_>>().join(" / ")
+        );
+        if has_finding(&SIGNATURE_RULE_IDS) {
+            message.push_str("同时检测到签名不匹配类 finding,时钟偏移是其高概率根因。");
+        }
+        anomalies.push(TimelineAnomaly {
+            kind: "mixed_offsets".to_string(),
+            message,
+            nodes: Vec::new(),
+            gap_start: None,
+            gap_end: None,
+            restart_evidence: false,
+        });
+    }
+
+    // 2. Per-node time ranges that do not overlap at all (both sides with a
+    // meaningful sample size): clocks are wrong or collection windows differ.
+    let sizable: Vec<(&String, &NodeRange)> = node_ranges.iter().filter(|(_, (_, _, count))| *count > 100).collect();
+    for (i, (node_a, (min_a, max_a, _))) in sizable.iter().enumerate() {
+        for (node_b, (min_b, max_b, _)) in sizable.iter().skip(i + 1) {
+            if max_a < min_b || max_b < min_a {
+                anomalies.push(TimelineAnomaly {
+                    kind: "node_ranges_disjoint".to_string(),
+                    message: format!(
+                        "节点 {node_a} 与 {node_b} 的日志时间范围完全不重叠({node_a}: {} → {},{node_b}: {} → {}):时钟错乱或采集不同期。",
+                        min_a.to_rfc3339(),
+                        max_a.to_rfc3339(),
+                        min_b.to_rfc3339(),
+                        max_b.to_rfc3339(),
+                    ),
+                    nodes: vec![(*node_a).clone(), (*node_b).clone()],
+                    gap_start: None,
+                    gap_end: None,
+                    restart_evidence: false,
+                });
+            }
+        }
+    }
+
+    // 3. Log gaps: >= 3 consecutive non-empty minutes, then a zero-event
+    // span of at least max(15min, 3x display bucket width), then activity
+    // again — the shape of a process restart or hang.
+    let threshold = (3 * bucket_width_min).max(15);
+    let startup_after_gap = |gap_end: DateTime<Utc>| {
+        findings.iter().chain(low_confidence).find_map(|f| {
+            if !STARTUP_RULE_IDS.contains(&f.rule_id.as_str()) {
+                return None;
+            }
+            let first = f.first_seen?.with_timezone(&Utc);
+            (first >= gap_end && first <= gap_end + Duration::minutes(5)).then(|| f.rule_id.clone())
+        })
+    };
+    let minutes: Vec<i64> = minute_buckets.keys().copied().collect();
+    let mut run_len = 1i64;
+    for window in minutes.windows(2) {
+        let (prev, next) = (window[0], window[1]);
+        let delta = next - prev;
+        if delta == 1 {
+            run_len += 1;
+            continue;
+        }
+        if run_len >= 3 && delta > threshold {
+            let gap_start = DateTime::<Utc>::from_timestamp((prev + 1) * 60, 0).expect("valid timestamp");
+            let gap_end = DateTime::<Utc>::from_timestamp(next * 60, 0).expect("valid timestamp");
+            let restart = startup_after_gap(gap_end);
+            let span = human_duration_minutes(delta - 1);
+            let message = match &restart {
+                Some(rule_id) => format!(
+                    "时间线断档 {} → {}(约 {span}),断档后 5 分钟内出现 {rule_id}:重启证据。",
+                    gap_start.to_rfc3339(),
+                    gap_end.to_rfc3339(),
+                ),
+                None => format!(
+                    "时间线断档 {} → {}(约 {span}),此前有连续活动:疑似进程重启或挂起区间。",
+                    gap_start.to_rfc3339(),
+                    gap_end.to_rfc3339(),
+                ),
+            };
+            anomalies.push(TimelineAnomaly {
+                kind: "log_gap".to_string(),
+                message,
+                nodes: Vec::new(),
+                gap_start: Some(gap_start),
+                gap_end: Some(gap_end),
+                restart_evidence: restart.is_some(),
+            });
+        }
+        run_len = 1;
+    }
+    anomalies
+}
+
+fn human_duration_minutes(minutes: i64) -> String {
+    if minutes >= 60 {
+        format!("{:.1}h", minutes as f64 / 60.0)
+    } else {
+        format!("{minutes}min")
+    }
+}
+
+/// Causal folding (rustfs/backlog#1290 sub-item A): a symptom finding
+/// collapses under a root-cause finding named by its rule's
+/// `implies_root_cause` edges when the root plausibly precedes it
+/// (`root.first_seen <= symptom.first_seen + 5min`) and is not a
+/// long-finished historical episode (`root.last_seen >= symptom.first_seen -
+/// 30min`). A timestamp-less side (pure stderr panics) associates by
+/// existence. Only confirmed findings participate — folding real symptoms
+/// under a low-confidence root would hide them behind shaky evidence.
+///
+/// Findings are then re-sorted so a root block is promoted to the most
+/// severe position among itself and its collapsed symptoms, weighted by the
+/// block's combined count: the report top keeps answering "the most likely
+/// cause" even when the root itself is a lower-severity finding.
+fn collapse_findings(findings: &mut [Finding]) {
+    let index_of: HashMap<String, usize> = findings.iter().enumerate().map(|(i, f)| (f.rule_id.clone(), i)).collect();
+    // Among several qualifying roots pick the earliest first_seen;
+    // timestamp-less roots come last, rule id breaks remaining ties.
+    let root_key = |f: &Finding| (f.first_seen.is_none(), f.first_seen, f.rule_id.clone());
+
+    let mut chosen: Vec<Option<usize>> = vec![None; findings.len()];
+    for (i, symptom) in findings.iter().enumerate() {
+        for root_id in &symptom.implies_root_cause {
+            let Some(&r) = index_of.get(root_id) else { continue };
+            if r == i {
+                continue;
+            }
+            let root = &findings[r];
+            let qualifies = match (root.first_seen, symptom.first_seen) {
+                (Some(root_first), Some(symptom_first)) => {
+                    root_first <= symptom_first + Duration::minutes(5)
+                        && root.last_seen.unwrap_or(root_first) >= symptom_first - Duration::minutes(30)
+                }
+                _ => true,
+            };
+            if qualifies && chosen[i].is_none_or(|cur| root_key(&findings[r]) < root_key(&findings[cur])) {
+                chosen[i] = Some(r);
+            }
+        }
+    }
+
+    // Follow chains so a symptom never points at a root that is itself
+    // collapsed (external rules may build A -> B -> C edges); the visited
+    // guard stops on adversarial cycles.
+    let resolve = |mut r: usize| {
+        let mut seen = vec![false; chosen.len()];
+        while let Some(next) = chosen[r] {
+            if seen[r] {
+                break;
+            }
+            seen[r] = true;
+            r = next;
+        }
+        r
+    };
+
+    let mut caused: Vec<Vec<String>> = vec![Vec::new(); findings.len()];
+    for i in 0..findings.len() {
+        let Some(first) = chosen[i] else { continue };
+        let root = resolve(first);
+        if root == i {
+            continue;
+        }
+        let root_id = findings[root].rule_id.clone();
+        findings[i].collapsed_into = Some(root_id);
+        caused[root].push(findings[i].rule_id.clone());
+    }
+    for (i, mut list) in caused.into_iter().enumerate() {
+        list.sort();
+        findings[i].caused = list;
+    }
+    // A cycle can leave a "root" both collapsed and carrying symptoms; keep
+    // it visible rather than folding every participant out of the report.
+    for finding in findings.iter_mut() {
+        if !finding.caused.is_empty() {
+            finding.collapsed_into = None;
+        }
+    }
+
+    let mut effective: HashMap<String, (Severity, u64)> =
+        findings.iter().map(|f| (f.rule_id.clone(), (f.severity, f.count))).collect();
+    for finding in findings.iter() {
+        if let Some(root) = &finding.collapsed_into {
+            let entry = effective.get_mut(root).expect("collapse target exists");
+            entry.0 = entry.0.min(finding.severity);
+            entry.1 += finding.count;
+        }
+    }
+    findings.sort_by(|a, b| {
+        let (severity_a, count_a) = effective[&a.rule_id];
+        let (severity_b, count_b) = effective[&b.rule_id];
+        severity_a
+            .cmp(&severity_b)
+            .then(count_b.cmp(&count_a))
+            .then(a.rule_id.cmp(&b.rule_id))
+    });
 }
 
 fn redact_report(report: &mut AnalysisReport) {
@@ -457,6 +732,227 @@ mod tests {
         assert_eq!(report.unmatched_top[0].count, 2);
         assert_eq!(report.unmatched_top[0].template, "failed to sync <path> after <n> retries");
         assert_eq!(report.summary.distinct_offsets, vec!["+08:00"]);
+    }
+
+    #[test]
+    fn disjoint_node_ranges_are_flagged() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        // node1: 101 events across 00:00-01:40; node2: 101 events across
+        // 03:00-04:40 — completely disjoint windows, both sizable.
+        for (node, base_hour) in [("node1", 0), ("node2", 3)] {
+            for i in 0..101 {
+                let mut ev = event(
+                    "request ok",
+                    Some(LogLevel::Info),
+                    Some(&format!("2026-07-15T{:02}:{:02}:00Z", base_hour + i / 60, i % 60)),
+                );
+                ev.node = Some(Arc::from(node));
+                a.observe(ev);
+            }
+        }
+        let report = a.finalize(IngestReport::default());
+        let disjoint: Vec<_> = report
+            .timeline_anomalies
+            .iter()
+            .filter(|a| a.kind == "node_ranges_disjoint")
+            .collect();
+        assert_eq!(disjoint.len(), 1, "{:?}", report.timeline_anomalies);
+        assert_eq!(disjoint[0].nodes, vec!["node1".to_string(), "node2".to_string()]);
+        assert!(disjoint[0].message.contains("完全不重叠"));
+
+        // Below the >100-events bar the heuristic stays quiet.
+        let mut a = analyzer(AnalyzeOptions::default());
+        for (node, hour) in [("node1", 0), ("node2", 3)] {
+            for i in 0..5 {
+                let mut ev = event("request ok", Some(LogLevel::Info), Some(&format!("2026-07-15T0{hour}:0{i}:00Z")));
+                ev.node = Some(Arc::from(node));
+                a.observe(ev);
+            }
+        }
+        let report = a.finalize(IngestReport::default());
+        assert!(report.timeline_anomalies.iter().all(|a| a.kind != "node_ranges_disjoint"));
+    }
+
+    #[test]
+    fn log_gap_is_flagged_and_upgrades_on_startup_finding() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        // 4 consecutive active minutes, a 40min hole, then activity again.
+        for minute in 0..4 {
+            a.observe(event("x", Some(LogLevel::Error), Some(&format!("2026-07-15T03:0{minute}:00Z"))));
+        }
+        a.observe(event(
+            "[FATAL] Observability initialization failed: collector unavailable",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:44:30Z"),
+        ));
+        let report = a.finalize(IngestReport::default());
+        let gaps: Vec<_> = report.timeline_anomalies.iter().filter(|a| a.kind == "log_gap").collect();
+        assert_eq!(gaps.len(), 1, "{:?}", report.timeline_anomalies);
+        assert!(gaps[0].restart_evidence, "startup-fatal right after the gap: {:?}", gaps[0]);
+        assert!(gaps[0].message.contains("重启证据"));
+        assert_eq!(gaps[0].gap_start.expect("start").to_rfc3339(), "2026-07-15T03:04:00+00:00");
+        assert_eq!(gaps[0].gap_end.expect("end").to_rfc3339(), "2026-07-15T03:44:00+00:00");
+
+        // Same hole but no startup finding afterwards: still a gap, no upgrade.
+        let mut a = analyzer(AnalyzeOptions::default());
+        for minute in 0..4 {
+            a.observe(event("x", Some(LogLevel::Error), Some(&format!("2026-07-15T03:0{minute}:00Z"))));
+        }
+        a.observe(event("x", Some(LogLevel::Error), Some("2026-07-15T03:44:30Z")));
+        let report = a.finalize(IngestReport::default());
+        let gaps: Vec<_> = report.timeline_anomalies.iter().filter(|a| a.kind == "log_gap").collect();
+        assert_eq!(gaps.len(), 1);
+        assert!(!gaps[0].restart_evidence);
+        assert!(gaps[0].message.contains("疑似进程重启或挂起"));
+
+        // A short 3-minute lull is not a gap.
+        let mut a = analyzer(AnalyzeOptions::default());
+        for minute in 0..4 {
+            a.observe(event("x", Some(LogLevel::Error), Some(&format!("2026-07-15T03:0{minute}:00Z"))));
+        }
+        a.observe(event("x", Some(LogLevel::Error), Some("2026-07-15T03:07:00Z")));
+        let report = a.finalize(IngestReport::default());
+        assert!(report.timeline_anomalies.iter().all(|a| a.kind != "log_gap"));
+    }
+
+    #[test]
+    fn mixed_offsets_anomaly_requires_multiple_offsets() {
+        // Single offset: quiet.
+        let mut a = analyzer(AnalyzeOptions::default());
+        a.observe(event("x", Some(LogLevel::Error), Some("2026-07-15T03:00:00+08:00")));
+        a.observe(event("x", Some(LogLevel::Error), Some("2026-07-15T04:00:00+08:00")));
+        let report = a.finalize(IngestReport::default());
+        assert!(report.timeline_anomalies.iter().all(|a| a.kind != "mixed_offsets"));
+
+        // Mixed offsets plus a signature finding: flagged with the clock note.
+        let mut a = analyzer(AnalyzeOptions::default());
+        a.observe(event("x", Some(LogLevel::Error), Some("2026-07-15T03:00:00+08:00")));
+        a.observe(event("SignatureDoesNotMatch", Some(LogLevel::Error), Some("2026-07-15T03:00:00Z")));
+        let report = a.finalize(IngestReport::default());
+        let mixed: Vec<_> = report
+            .timeline_anomalies
+            .iter()
+            .filter(|a| a.kind == "mixed_offsets")
+            .collect();
+        assert_eq!(mixed.len(), 1);
+        assert!(mixed[0].message.contains("+08:00"));
+        assert!(mixed[0].message.contains("签名不匹配"), "signature note missing: {}", mixed[0].message);
+    }
+
+    #[test]
+    fn causal_collapse_folds_quorum_under_disk_faulty() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        // Root: disk faulty at t0 (P2). Symptom: write quorum at t0+2min (P1).
+        for minute in [0, 1] {
+            a.observe(event(
+                "Disk health check marked disk faulty",
+                Some(LogLevel::Error),
+                Some(&format!("2026-07-15T03:0{minute}:00+08:00")),
+            ));
+        }
+        for second in 0..3 {
+            a.observe(event(
+                "erasure write quorum (required=8, achieved=5)",
+                Some(LogLevel::Error),
+                Some(&format!("2026-07-15T03:02:0{second}+08:00")),
+            ));
+        }
+        let report = a.finalize(IngestReport::default());
+
+        let quorum = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "ec-write-quorum")
+            .expect("quorum");
+        assert_eq!(quorum.collapsed_into.as_deref(), Some("disk-marked-faulty"));
+        let disk = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "disk-marked-faulty")
+            .expect("disk");
+        assert_eq!(disk.caused, vec!["ec-write-quorum".to_string()]);
+        // The P2 root is promoted to the collapsed P1 symptom's position.
+        assert_eq!(report.findings[0].rule_id, "disk-marked-faulty");
+
+        let mut out = Vec::new();
+        crate::report::render(&report, crate::report::ReportFormat::Text, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("级联症状: ec-write-quorum ×3"), "missing cascade line:\n{text}");
+        assert!(
+            !text.contains("[P1 服务不可用] ec-write-quorum"),
+            "collapsed symptom must not render flat:\n{text}"
+        );
+    }
+
+    #[test]
+    fn causal_collapse_respects_the_time_window() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        // Root appears 2h AFTER the symptom: outside the 5min precedence window.
+        a.observe(event(
+            "erasure write quorum (required=8, achieved=5)",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:00:00+08:00"),
+        ));
+        a.observe(event(
+            "Disk health check marked disk faulty",
+            Some(LogLevel::Error),
+            Some("2026-07-15T05:00:00+08:00"),
+        ));
+        let report = a.finalize(IngestReport::default());
+        let quorum = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "ec-write-quorum")
+            .expect("quorum");
+        assert_eq!(quorum.collapsed_into, None);
+        assert!(report.findings.iter().all(|f| f.caused.is_empty()));
+    }
+
+    #[test]
+    fn causal_collapse_uses_existence_for_timestamp_less_roots() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        a.observe(event(
+            "rwlock IAM cache poisoned, recovering",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:00:00+08:00"),
+        ));
+        let mut panic_ev = event("thread 'main' panicked at src/main.rs:1:1: boom", Some(LogLevel::Error), None);
+        panic_ev.kind = EventKind::Panic;
+        a.observe(panic_ev);
+
+        let report = a.finalize(IngestReport::default());
+        let poisoned = report
+            .findings
+            .iter()
+            .find(|f| f.rule_id == "rwlock-poisoned")
+            .expect("poisoned");
+        assert_eq!(poisoned.collapsed_into.as_deref(), Some("process-panic"));
+        let panic = report.findings.iter().find(|f| f.rule_id == "process-panic").expect("panic");
+        assert_eq!(panic.caused, vec!["rwlock-poisoned".to_string()]);
+    }
+
+    #[test]
+    fn json_keeps_collapsed_findings_with_relation_fields() {
+        let mut a = analyzer(AnalyzeOptions::default());
+        a.observe(event(
+            "Disk health check marked disk faulty",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:00:00+08:00"),
+        ));
+        a.observe(event(
+            "erasure write quorum (required=8, achieved=5)",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:02:00+08:00"),
+        ));
+        let report = a.finalize(IngestReport::default());
+        let value = serde_json::to_value(&report).expect("json");
+        let findings = value["findings"].as_array().expect("array");
+        let ids: Vec<&str> = findings.iter().map(|f| f["rule_id"].as_str().expect("id")).collect();
+        assert!(ids.contains(&"ec-write-quorum"), "collapsed finding stays in JSON: {ids:?}");
+        let quorum = findings.iter().find(|f| f["rule_id"] == "ec-write-quorum").expect("quorum");
+        assert_eq!(quorum["collapsed_into"], "disk-marked-faulty");
+        let disk = findings.iter().find(|f| f["rule_id"] == "disk-marked-faulty").expect("disk");
+        assert_eq!(disk["caused"][0], "ec-write-quorum");
     }
 
     #[test]

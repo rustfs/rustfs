@@ -176,7 +176,7 @@ fn json_format_has_a_stable_schema() {
     let mut out = Vec::new();
     render(&report, ReportFormat::Json, &mut out).expect("render");
     let value: serde_json::Value = serde_json::from_slice(&out).expect("parse");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert!(value["findings"].as_array().expect("findings").len() >= 2);
     assert!(value["summary"]["parse"]["json_ok"].as_u64().expect("json_ok") > 0);
 
@@ -198,6 +198,8 @@ fn cli_parses_diagnose_and_keeps_legacy_server_routing() {
         "--since".to_string(),
         "24h".to_string(),
         "--redact".to_string(),
+        "--rules".to_string(),
+        "/tmp/extra-rules.json".to_string(),
     ])
     .expect("parse");
     let CommandResult::Diagnose(opts) = parsed else {
@@ -206,6 +208,7 @@ fn cli_parses_diagnose_and_keeps_legacy_server_routing() {
     assert_eq!(opts.paths, vec!["/tmp/customer-logs"]);
     assert!(opts.redact);
     assert_eq!(opts.since.as_deref(), Some("24h"));
+    assert_eq!(opts.rules.as_deref(), Some(std::path::Path::new("/tmp/extra-rules.json")));
 
     // Legacy preprocessor regression: a bare volume still means `server`.
     let legacy = Opt::parse_command(vec!["rustfs".to_string(), "/data".to_string()]);
@@ -229,5 +232,5 @@ fn binary_smoke_diagnose_json() {
         .expect("run rustfs diagnose");
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout JSON");
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
 }

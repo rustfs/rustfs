@@ -159,7 +159,8 @@ mod tests {
         let mut out = Vec::new();
         render(&report, ReportFormat::Json, &mut out).expect("render");
         let value: serde_json::Value = serde_json::from_slice(&out).expect("parse");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
+        assert!(value["timeline_anomalies"].is_array());
         assert_eq!(value["findings"][0]["rule_id"], "ec-write-quorum");
         assert_eq!(value["findings"][0]["count"], 2);
         assert_eq!(value["summary"]["files_parsed"], 2);
