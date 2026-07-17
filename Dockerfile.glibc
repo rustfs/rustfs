@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM ubuntu:24.04 AS build
+FROM ubuntu:26.04 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -76,7 +76,7 @@ RUN set -eux; \
     chmod +x /build/rustfs; \
     rm -rf rustfs.zip /build/.tmp || true
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG RELEASE=latest
 ARG BUILD_DATE
@@ -93,7 +93,10 @@ LABEL name="RustFS" \
       url="https://rustfs.com" \
       license="Apache-2.0"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Upgrade base-image packages so published images pick up security fixes
+# (e.g. tar/gzip/perl CVEs) without waiting for a new Ubuntu point release.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*

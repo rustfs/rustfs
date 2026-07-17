@@ -289,6 +289,7 @@ jobs:
             local console_url
             local console_sha256
             local curl_auth_args=()
+            console_tag=""
 
             if [[ "${{ matrix.platform }}" == "windows" ]]; then
               curl_bin="curl.exe"
@@ -311,13 +312,15 @@ jobs:
             "$curl_bin" "${curl_auth_args[@]}" --fail -L "$console_api" \
               -o "$console_json" --retry 3 --retry-delay 5 --max-time 300 || return 1
 
-            read -r console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
+            read -r console_tag console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
           import json
           import re
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as handle:
               release = json.load(handle)
+
+          tag = release.get("tag_name", "") or "unknown"
 
           for asset in release.get("assets", []):
               name = asset.get("name", "")
@@ -327,7 +330,7 @@ jobs:
                   sha256 = digest.split(":", 1)[1]
                   if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
                       raise SystemExit(f"console zip asset has invalid sha256 digest: {sha256}")
-                  sys.stdout.buffer.write(f"{url} {sha256}\n".encode("utf-8"))
+                  sys.stdout.buffer.write(f"{tag} {url} {sha256}\n".encode("utf-8"))
                   break
           else:
               raise SystemExit("no console zip asset with sha256 digest found")
@@ -339,6 +342,8 @@ jobs:
               return 1
             fi
 
+            echo "Console release: ${console_tag}"
+            echo "Downloading console asset: ${console_url}"
             "$curl_bin" --fail -L "$console_url" -o console.zip --retry 3 --retry-delay 5 --max-time 300 || return 1
             verify_sha256 "$console_sha256" console.zip || return 2
             unzip -o console.zip -d ./rustfs/static || return 2
@@ -351,11 +356,18 @@ jobs:
             rm -f console.zip console-release.json
             if [[ "$status" -eq 2 ]]; then
               echo "Console asset integrity verification failed" >&2
-              exit 1
             fi
-            echo "Warning: Failed to download verified console assets, continuing without them"
-            echo "// Static assets not available" > ./rustfs/static/empty.txt
+            echo "Failed to download verified console assets" >&2
+            exit 1
           fi
+
+          if [[ ! -s ./rustfs/static/index.html ]]; then
+            echo "Console asset archive is missing static/index.html" >&2
+            exit 1
+          fi
+
+          asset_count=$(find ./rustfs/static -type f | wc -l | tr -d '[:space:]')
+          echo "Console assets ready: version=${console_tag:-unknown}, ${asset_count} files extracted to ./rustfs/static"
 
       - name: Build RustFS
         shell: bash
@@ -557,6 +569,60 @@ jobs:
           fi
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
+
+      - name: Verify packaged console
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_free_port() {
+            python3 - <<'PY'
+          import socket
+
+          with socket.socket() as sock:
+              sock.bind(("127.0.0.1", 0))
+              print(sock.getsockname()[1])
+          PY
+          }
+
+          package_dir="$(mktemp -d)"
+          data_dir="$(mktemp -d)"
+          log_file="${RUNNER_TEMP}/rustfs-console-smoke.log"
+          server_pid=""
+          trap '
+            if [[ -n "${server_pid:-}" ]]; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+            rm -rf "$package_dir" "$data_dir"
+          ' EXIT
+
+          unzip -q "${{ steps.package.outputs.package_file }}" -d "$package_dir"
+          api_port="$(find_free_port)"
+          console_port="$(find_free_port)"
+          console_url="http://127.0.0.1:${console_port}/rustfs/console/"
+
+          "$package_dir/rustfs" server \
+            --address "127.0.0.1:${api_port}" \
+            --console-enable \
+            --console-address "127.0.0.1:${console_port}" \
+            --access-key console-smoke \
+            --secret-key console-smoke-secret \
+            "$data_dir" >"$log_file" 2>&1 &
+          server_pid=$!
+
+          for _ in {1..40}; do
+            response="$(curl --silent --output /dev/null --write-out '%{http_code} %{content_type}' "$console_url" || true)"
+            if [[ "$response" == 200\ text/html* ]]; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+
+          echo "Console endpoint did not return 200 text/html: $response" >&2
+          cat "$log_file"
+          exit 1
 
       - name: Upload to GitHub artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -848,12 +914,14 @@ jobs:
 
           echo "✅ All assets uploaded successfully"
 
-  # Update latest.json for stable releases only: prerelease tags (alpha/beta/
-  # rc) must never overwrite the stable version pointer.
+  # Update latest.json for every release tag (stable and prerelease): the
+  # project currently ships prerelease tags only, so gating this to stable
+  # left the version pointer permanently stale. release_type records whether
+  # the pointed-to version is a prerelease.
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type == 'release'
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
@@ -871,6 +939,12 @@ jobs:
 
           VERSION="${{ needs.build-check.outputs.version }}"
           TAG="${{ needs.build-check.outputs.version }}"
+
+          if [[ "${{ needs.build-check.outputs.build_type }}" == "prerelease" ]]; then
+            RELEASE_TYPE="prerelease"
+          else
+            RELEASE_TYPE="stable"
+          fi
 
           # Install ossutil
           OSSUTIL_VERSION="2.1.1"
@@ -892,7 +966,7 @@ jobs:
             "version": "${VERSION}",
             "tag": "${TAG}",
             "release_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "release_type": "stable",
+            "release_type": "${RELEASE_TYPE}",
             "download_url": "https://github.com/${{ github.repository }}/releases/tag/${TAG}"
           }
           EOF
@@ -900,7 +974,7 @@ jobs:
           # Upload to OSS
           "$OSSUTIL_BIN" cp latest.json oss://rustfs-version/latest.json --force
 
-          echo "✅ Updated latest.json for stable release $VERSION"
+          echo "✅ Updated latest.json for ${RELEASE_TYPE} release $VERSION"
 
   # Publish release (remove draft status)
   publish-release:

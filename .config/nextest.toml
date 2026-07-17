@@ -138,6 +138,10 @@ test-group = 'ecstore-serial-flaky'
 # Each e2e test spawns its own rustfs server on a random port with an isolated
 # temp dir (crates/e2e_test/src/common.rs), so the subset is parallel-safe.
 #
+# Replication failure harness (backlog#1147 repl-8): the first clause admits
+# its four in-process fake-target self-tests. They bind random loopback ports,
+# use no external service, and finish in under a second.
+#
 # Replication PR subset (backlog#1147 repl-1): the second clause admits the 20
 # FAST bucket-replication tests from replication_extension_test — the
 # target-registration / replication-check / list / remove / delete admin paths
@@ -188,7 +192,7 @@ test-group = 'ecstore-serial-flaky'
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud)_test::/)
+        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud)_test::|^fake_s3_target::/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^reliant::tiering::/)
@@ -259,8 +263,8 @@ path = "junit.xml"
 # The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
 #   * protocols:: — FTPS/SFTP/WebDAV, still pinned to --test-threads=1 by fixed
 #     ports; they join a scheduled lane once ci-6 randomises the ports (ci-7).
-#   * the 6 cluster suites that spin up a RustFSTestClusterEnvironment
-#     (cluster_concurrency, stale_multipart_cleanup_cluster,
+#   * the 7 cluster suites that spin up a RustFSTestClusterEnvironment
+#     (cluster_concurrency, cluster_multidrive_pool, stale_multipart_cleanup_cluster,
 #     namespace_lock_quorum, heal_erasure_disk_rebuild, admin_timeout_regression,
 #     object_lambda) — too heavy for the merge budget; they run in ci-7's
 #     nightly 4-node lane.
@@ -295,7 +299,7 @@ path = "junit.xml"
 default-filter = """
     package(e2e_test)
     & !test(/^protocols::/)
-    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
     & !test(/^multipart_auth_test::test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled$/)
     & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(ignores_invalid_entries_when_requested|supports_standard_headers_with_combined_extract_options)$/)

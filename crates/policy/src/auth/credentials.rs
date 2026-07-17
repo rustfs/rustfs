@@ -123,7 +123,7 @@ pub fn create_new_credentials_with_metadata(
     }
 
     if sk.len() < SECRET_KEY_MIN_LEN || sk.len() > SECRET_KEY_MAX_LEN {
-        return Err(Error::InvalidAccessKeyLength);
+        return Err(Error::InvalidSecretKeyLength);
     }
 
     if token_secret.is_empty() {
@@ -420,7 +420,8 @@ impl TryFrom<CredentialsBuilder> for Credentials {
 
 #[cfg(test)]
 mod reserved_chars_tests {
-    use super::contains_reserved_chars;
+    use super::{contains_reserved_chars, create_new_credentials_with_metadata};
+    use std::collections::HashMap;
 
     #[test]
     fn detects_any_reserved_char_not_just_the_substring() {
@@ -439,5 +440,14 @@ mod reserved_chars_tests {
         assert!(!contains_reserved_chars(""));
         assert!(!contains_reserved_chars("AKIAIOSFODNN7EXAMPLE"));
         assert!(!contains_reserved_chars("group-name_1"));
+    }
+
+    #[test]
+    fn credential_creation_reports_secret_key_length_errors() {
+        let err =
+            create_new_credentials_with_metadata("AKIAIOSFODNN7EXAMPLE", "short", &HashMap::new(), "token-secret-for-tests")
+                .expect_err("short secret key should fail");
+
+        assert!(matches!(err, crate::error::Error::InvalidSecretKeyLength));
     }
 }

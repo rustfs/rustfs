@@ -134,7 +134,7 @@ pub mod bucket {
     }
 
     pub mod quota {
-        pub use crate::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
+        pub use crate::bucket::quota::{BucketQuota, QuotaCheckResult, QuotaError, QuotaOperation};
 
         pub mod checker {
             pub use crate::bucket::quota::checker::QuotaChecker;

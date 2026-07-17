@@ -277,6 +277,64 @@ mod integration_tests {
         Ok(())
     }
 
+    /// backlog#1336 regression: a PUT that merely declares `Content-Encoding: aws-chunked`
+    /// (no SigV4 streaming payload, so no `x-amz-decoded-content-length`) carries an unframed
+    /// body whose wire Content-Length is the real object size. Quota admission must use that
+    /// length — with and without a hard quota configured — instead of rejecting the request
+    /// with 400 UnexpectedContent, and an over-quota aws-chunked PUT must still get the quota
+    /// rejection.
+    #[tokio::test]
+    #[serial]
+    async fn test_quota_admission_aws_chunked_declared_encoding() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        init_logging();
+        if skip_without_awscurl() {
+            return Ok(());
+        }
+        let env = QuotaTestEnv::new().await?;
+        env.create_bucket().await?;
+
+        let put_aws_chunked = |key: &'static str, size_bytes: usize| {
+            env.client
+                .put_object()
+                .bucket(&env.bucket_name)
+                .key(key)
+                .content_encoding("aws-chunked")
+                .body(aws_sdk_s3::primitives::ByteStream::from(vec![0u8; size_bytes]))
+                .send()
+        };
+
+        // No quota configured: the declared aws-chunked PUT must be admitted.
+        put_aws_chunked("no-quota.bin", 512)
+            .await
+            .expect("declared aws-chunked PUT without quota must succeed");
+        assert!(env.object_exists("no-quota.bin").await?);
+
+        // Hard quota configured: a within-quota declared aws-chunked PUT is admitted
+        // against its wire Content-Length.
+        env.set_bucket_quota(4 * 1024).await?;
+        put_aws_chunked("within-quota.bin", 1024)
+            .await
+            .expect("declared aws-chunked PUT within quota must succeed");
+        assert!(env.object_exists("within-quota.bin").await?);
+
+        // An over-quota declared aws-chunked PUT is rejected by quota admission —
+        // not with UnexpectedContent.
+        let err = put_aws_chunked("over-quota.bin", 16 * 1024)
+            .await
+            .expect_err("declared aws-chunked PUT over quota must be rejected");
+        let err_debug = format!("{err:?}");
+        assert!(
+            !err_debug.contains("UnexpectedContent"),
+            "over-quota rejection must be the quota error, not UnexpectedContent: {err_debug}"
+        );
+        assert!(!env.object_exists("over-quota.bin").await?);
+
+        env.clear_bucket_quota().await?;
+        env.cleanup_bucket().await?;
+
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_quota_update_and_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
