@@ -2626,6 +2626,11 @@ impl SetDisks {
             let dst_bucket = dst_bucket.clone();
 
             futures.push(tokio::spawn(async move {
+                // Test-only introspection guard: counts this task as in-flight for
+                // the whole body. Compiles to `()` in production (no behavior).
+                #[allow(clippy::let_unit_value)]
+                let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
+
                 if file_info.erasure.index == 0 {
                     file_info.erasure.index = i + 1;
                 }
@@ -2633,6 +2638,10 @@ impl SetDisks {
                 if !file_info.is_valid() {
                     return Err(DiskError::FileCorrupt);
                 }
+
+                // Test-only awaitable pause point right before the disk rename.
+                // A no-op immediately-ready future in production.
+                Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
                 if let Some(disk) = disk {
                     disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
@@ -2923,6 +2932,12 @@ impl SetDisks {
             let disk = disk.clone();
             let object_for_fault = object_for_fault.clone();
             tokio::spawn(async move {
+                // Test-only introspection guard + awaitable pause point for the
+                // old-data-dir cleanup fan-out. Both compile away in production.
+                #[allow(clippy::let_unit_value)]
+                let _fanout_task_guard = Self::rename_fanout_task_guard(&object_for_fault);
+                Self::rename_fanout_barrier(&object_for_fault, idx, rename_fanout_barrier_phase::CLEANUP).await;
+
                 if let Some(err) = Self::cleanup_injected_error(&object_for_fault, idx) {
                     return Some(err);
                 }
@@ -2977,6 +2992,41 @@ impl SetDisks {
     #[cfg(not(test))]
     #[inline(always)]
     fn record_read_version_call(_object: &str, _disk_index: usize) {}
+
+    /// Test-only awaitable pause point for the rename/commit fan-out (backlog#1325,
+    /// serving the barrier-style acceptances of #1312 / #1319 / #1313). `phase` is
+    /// [`rename_fanout_barrier::PHASE_RENAME`] or `PHASE_CLEANUP`. When a test has
+    /// armed a barrier for `object` at this `(disk_index, phase)`, the spawned
+    /// fan-out task blocks here until the test releases it, so the test can await
+    /// the pause point and then introspect in-flight background disk work. In
+    /// production this awaits an immediately-ready no-op future — no yield, no
+    /// registry access, no behavior change.
+    #[cfg(test)]
+    #[inline]
+    async fn rename_fanout_barrier(object: &str, disk_index: usize, phase: &'static str) {
+        rename_fanout_barrier::checkpoint(object, disk_index, phase).await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    #[allow(clippy::unused_async)]
+    async fn rename_fanout_barrier(_object: &str, _disk_index: usize, _phase: &'static str) {}
+
+    /// Test-only RAII counter for one in-flight rename/commit fan-out task
+    /// (backlog#1325). Held for the whole spawned task body so a test observing
+    /// `object` can assert "background disk writes are still running" while the
+    /// fan-out is paused and "no background disk writes remain" once it drains —
+    /// the exact signal #1312 needs after a lock release. In production this
+    /// returns `()` and touches no registry.
+    #[cfg(test)]
+    #[inline]
+    fn rename_fanout_task_guard(object: &str) -> rename_fanout_barrier::TaskGuard {
+        rename_fanout_barrier::task_guard(object)
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn rename_fanout_task_guard(_object: &str) {}
 
     /// Report a post-commit old-data-dir cleanup receipt: emit metrics, warn on
     /// residue/below-quorum, and — on residue — enqueue an object heal.
@@ -4071,6 +4121,242 @@ pub(in crate::set_disk) mod disk_call_counters {
     }
 }
 
+/// Fan-out phase labels for the rename/commit barrier seam (backlog#1325).
+///
+/// These are referenced from the production fan-out call sites (as inert string
+/// literals passed to a no-op seam), so — unlike the `#[cfg(test)]` barrier
+/// registry itself — they are defined unconditionally. In production builds the
+/// seam ignores them entirely.
+pub(in crate::set_disk) mod rename_fanout_barrier_phase {
+    /// The per-disk `rename_data` phase of the write-commit fan-out.
+    pub const RENAME: &str = "rename";
+    /// The per-disk old-data-dir cleanup phase of the commit fan-out.
+    pub const CLEANUP: &str = "cleanup";
+}
+
+/// Test-only awaitable pause barrier + background-task introspection for the
+/// rename/commit fan-out (backlog#1325, the second facility block after the
+/// per-disk call counters). Serves the barrier-style white-box acceptances of
+/// #1312 (commit fencing: "abort at the first-disk rename barrier, assert the
+/// coordinator still holds the lock, assert no background disk write remains
+/// after release"), #1319, and #1313.
+///
+/// Two independent, object-keyed mechanisms share one process-global registry:
+///
+/// 1. **Awaitable pause barrier.** A test [`arm`]s a barrier for `(object,
+///    disk_index, phase)`. The matching spawned fan-out task blocks at its
+///    [`checkpoint`] until the test releases it. The test awaits the pause via
+///    [`BarrierHandle::wait_until_paused`] (a deterministic `Notify` handshake —
+///    no sleeps) and resumes it via [`BarrierHandle::release`]. At most one
+///    barrier is armed per object at a time, matching the single-scope style of
+///    `disk_call_counters`.
+///
+/// 2. **Background-task introspection.** A test [`observe_tasks`] for `object`;
+///    each instrumented fan-out task then holds a [`TaskGuard`] for its whole
+///    body, so [`TaskTrackerScope::running`] reports how many rename/cleanup
+///    background disk tasks are still in flight. This is the concrete "is there
+///    still a background disk write?" signal #1312 asserts after a lock release.
+///
+/// Both are keyed by object and only accumulate for armed/observed objects, so
+/// concurrent tests using distinct object names stay fully isolated. The whole
+/// module is `#[cfg(test)]` and never compiles into production; the fan-out call
+/// sites reach it only through the `#[cfg(not(test))]` no-op seams on `SetDisks`.
+///
+/// Scope of this block (white-box, in-process only): coordinator lock-holding is
+/// asserted by the test at the store/coordinator layer via the guard it already
+/// holds — `io_primitives` has no handle to that namespace lock, and fabricating
+/// a lock-state registry here would be a look-alike rather than the real lock.
+/// Cross-process/black-box fault injection (toxiproxy, blackhole peers, 2-pool)
+/// is a later cluster-harness block, not this one.
+#[cfg(test)]
+pub(in crate::set_disk) mod rename_fanout_barrier {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+
+    pub use super::rename_fanout_barrier_phase::{CLEANUP as PHASE_CLEANUP, RENAME as PHASE_RENAME};
+
+    /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
+    struct Armed {
+        disk_index: usize,
+        phase: &'static str,
+        /// Signalled (task -> test) when the target task reaches the checkpoint.
+        arrived: Arc<Notify>,
+        /// Signalled (test -> task) to release the paused task.
+        release: Arc<Notify>,
+        /// Set once the target task is parked at the checkpoint.
+        paused: Arc<AtomicBool>,
+    }
+
+    #[derive(Default)]
+    struct Registry {
+        /// object -> armed barrier (at most one per object).
+        armed: HashMap<String, Armed>,
+        /// object -> live in-flight fan-out task count, only for observed objects.
+        observed: HashMap<String, Arc<AtomicUsize>>,
+    }
+
+    fn registry() -> &'static Mutex<Registry> {
+        static REG: OnceLock<Mutex<Registry>> = OnceLock::new();
+        REG.get_or_init(|| Mutex::new(Registry::default()))
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, Registry> {
+        registry().lock().expect("rename fan-out barrier registry poisoned")
+    }
+
+    /// RAII handle for one armed barrier. Dropping it disarms the barrier and
+    /// releases any still-parked task, so a panicking or forgetful test can never
+    /// leave a spawned fan-out task wedged.
+    #[must_use]
+    pub struct BarrierHandle {
+        object: String,
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+        paused: Arc<AtomicBool>,
+    }
+
+    /// Arm a barrier: the fan-out task for `object` at `(disk_index, phase)` will
+    /// pause at its checkpoint until the returned handle is released or dropped.
+    pub fn arm(object: &str, disk_index: usize, phase: &'static str) -> BarrierHandle {
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let paused = Arc::new(AtomicBool::new(false));
+        lock().armed.insert(
+            object.to_string(),
+            Armed {
+                disk_index,
+                phase,
+                arrived: arrived.clone(),
+                release: release.clone(),
+                paused: paused.clone(),
+            },
+        );
+        BarrierHandle {
+            object: object.to_string(),
+            arrived,
+            release,
+            paused,
+        }
+    }
+
+    impl BarrierHandle {
+        /// Await until the armed fan-out task has parked at the checkpoint. Uses a
+        /// stored-permit `Notify`, so this is race-free regardless of whether the
+        /// task reaches the checkpoint before or after this call — no sleeps.
+        pub async fn wait_until_paused(&self) {
+            if self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            self.arrived.notified().await;
+        }
+
+        /// Whether the target task is currently parked at the checkpoint.
+        pub fn is_paused(&self) -> bool {
+            self.paused.load(Ordering::SeqCst)
+        }
+
+        /// Release the parked task so the fan-out can proceed.
+        pub fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl Drop for BarrierHandle {
+        fn drop(&mut self) {
+            // Unblock any task still parked at the checkpoint before disarming, so
+            // a dropped handle can never wedge a spawned fan-out task.
+            self.release.notify_one();
+            lock().armed.remove(&self.object);
+        }
+    }
+
+    /// Seam entry point invoked from inside each spawned fan-out task. A no-op
+    /// unless a barrier is armed for exactly this `(object, disk_index, phase)`.
+    /// The registry mutex is released before awaiting, so it is never held across
+    /// the pause.
+    pub(in crate::set_disk) async fn checkpoint(object: &str, disk_index: usize, phase: &'static str) {
+        let hooks = {
+            let reg = lock();
+            match reg.armed.get(object) {
+                Some(a) if a.disk_index == disk_index && a.phase == phase => {
+                    Some((a.arrived.clone(), a.release.clone(), a.paused.clone()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((arrived, release, paused)) = hooks {
+            paused.store(true, Ordering::SeqCst);
+            arrived.notify_one();
+            release.notified().await;
+        }
+    }
+
+    /// RAII scope that observes in-flight fan-out task counts for a single
+    /// `object`. Counts accrue only while the scope is alive; it clears its own
+    /// entry on drop.
+    #[must_use]
+    pub struct TaskTrackerScope {
+        object: String,
+    }
+
+    /// Begin observing in-flight rename/cleanup fan-out task counts for `object`.
+    pub fn observe_tasks(object: &str) -> TaskTrackerScope {
+        lock()
+            .observed
+            .entry(object.to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+        TaskTrackerScope {
+            object: object.to_string(),
+        }
+    }
+
+    impl TaskTrackerScope {
+        /// Number of instrumented fan-out tasks for the observed object that are
+        /// currently in flight (task body entered, guard not yet dropped).
+        pub fn running(&self) -> usize {
+            lock()
+                .observed
+                .get(&self.object)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for TaskTrackerScope {
+        fn drop(&mut self) {
+            lock().observed.remove(&self.object);
+        }
+    }
+
+    /// RAII guard held for the lifetime of one spawned fan-out task. Increments
+    /// the observed counter on creation (if the object is observed) and decrements
+    /// it on drop. Holding the `Arc` keeps the decrement sound even if the scope
+    /// is dropped while a task is still draining.
+    #[must_use]
+    pub struct TaskGuard {
+        counter: Option<Arc<AtomicUsize>>,
+    }
+
+    /// Create a task guard for `object`. A no-op guard unless `object` is observed.
+    pub(in crate::set_disk) fn task_guard(object: &str) -> TaskGuard {
+        let counter = lock().observed.get(object).cloned();
+        if let Some(c) = &counter {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+        TaskGuard { counter }
+    }
+
+    impl Drop for TaskGuard {
+        fn drop(&mut self) {
+            if let Some(c) = &self.counter {
+                c.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4289,6 +4575,137 @@ mod tests {
             scope.total(disk_call_counters::KIND_READ_VERSION),
             0,
             "dropping a scope must clear its counts"
+        );
+
+        drop(dirs);
+    }
+
+    /// Bound for the pause handshake. This is a hang-guard, not a timing
+    /// dependency: under a working barrier `wait_until_paused` returns via the
+    /// `Notify` handshake far below this bound regardless of IO pressure, so the
+    /// assertions never depend on the value. It only turns a neutralized-barrier
+    /// hang into a deterministic failure instead of an infinite wait.
+    const BARRIER_PAUSE_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn rename_barrier_fileinfos(object: &str, count: usize) -> Vec<FileInfo> {
+        (0..count).map(|_| metadata_test_fileinfo(object)).collect()
+    }
+
+    /// Demo / regression guard for the backlog#1325 rename fan-out pause barrier
+    /// and background-task introspection. Serves the barrier-style acceptance of
+    /// #1312 ("assert no background disk write remains after release").
+    ///
+    /// It drives the real `SetDisks::rename_data` fan-out: a barrier is armed at
+    /// the first disk's `rename` phase, and the test awaits that pause point,
+    /// asserts a background disk task is still in flight, releases it, and then
+    /// asserts the in-flight count drains to zero once the fan-out completes.
+    ///
+    /// Neutralizing the barrier seam (`rename_fanout_barrier` -> immediate no-op)
+    /// makes `wait_until_paused` never wake, so the guarded await elapses and the
+    /// test fails. Neutralizing the task guard (`rename_fanout_task_guard` ->
+    /// `()`) pins `running()` at zero, so the "still in flight" assertion fails.
+    #[tokio::test]
+    async fn rename_fanout_barrier_pauses_and_reports_running_background_tasks() {
+        const DISKS: usize = 4;
+        let bucket = "rename-barrier-bucket";
+        let object = "rename-barrier-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        let file_infos = rename_barrier_fileinfos(object, DISKS);
+
+        let tracker = rename_fanout_barrier::observe_tasks(object);
+        assert_eq!(tracker.running(), 0, "no fan-out tasks before rename starts");
+
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+        // Run the real rename fan-out concurrently with the control flow so we can
+        // introspect while it is parked at the first disk's rename checkpoint.
+        let rename_fut = SetDisks::rename_data(&disks, bucket, object, &file_infos, bucket, object, DISKS - 1);
+        let control_fut = async {
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                .await
+                .expect("fan-out must reach the armed rename barrier");
+            assert!(barrier.is_paused(), "target task must be parked at the checkpoint");
+            assert!(tracker.running() >= 1, "a background rename task must still be in flight while paused");
+            barrier.release();
+        };
+        let (_rename_res, ()) = tokio::join!(rename_fut, control_fut);
+
+        // The fan-out has fully joined -> every task guard has dropped.
+        assert_eq!(tracker.running(), 0, "no background rename task may remain once the fan-out has drained");
+
+        drop(dirs);
+    }
+
+    /// Demo / regression guard for the barrier on the commit (old-data-dir)
+    /// cleanup fan-out. Serves the same #1312/#1319 "no background disk write
+    /// after release" shape, on the reclamation path that runs *after* a write is
+    /// ACKed — the classic detached background delete #1312 fences against.
+    ///
+    /// It stages a real `object/<old_data_dir>` on two disks and drives the real
+    /// `commit_rename_data_dir` fan-out, pausing the first disk's cleanup delete.
+    #[tokio::test]
+    async fn commit_cleanup_fanout_barrier_pauses_background_deletes() {
+        let bucket = "cleanup-barrier-bucket";
+        let object = "cleanup-barrier-object";
+        let old_data_dir = "11111111-1111-1111-1111-111111111111";
+        let committed_data_dir = "22222222-2222-2222-2222-222222222222";
+        let path = format!("{object}/{old_data_dir}/part.1");
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[(&path, b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[(&path, b"two".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone())], 1).await;
+        let disks = [Some(disk1.clone()), Some(disk2.clone())];
+
+        let tracker = rename_fanout_barrier::observe_tasks(object);
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+
+        let cleanup_fut = set.commit_rename_data_dir(&disks, bucket, object, old_data_dir, committed_data_dir, 2);
+        let control_fut = async {
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                .await
+                .expect("cleanup fan-out must reach the armed cleanup barrier");
+            assert!(tracker.running() >= 1, "a background cleanup delete must still be in flight while paused");
+            barrier.release();
+        };
+        let (cleanup, ()) = tokio::join!(cleanup_fut, control_fut);
+
+        assert_eq!(tracker.running(), 0, "no background cleanup task may remain after drain");
+        assert_eq!(cleanup.attempted, 2);
+        assert_eq!(cleanup.reclaimed, 2, "the real old-data-dir must still be reclaimed after release");
+
+        drop((disk1, disk2));
+    }
+
+    /// Isolation guard: an armed barrier / observed object only affects its own
+    /// object. A fan-out for a different (unobserved, unarmed) object must not be
+    /// paused and must not accrue any tracked task count — so concurrent tests
+    /// using distinct object names never interfere.
+    #[tokio::test]
+    async fn barrier_and_task_tracker_isolate_by_object() {
+        const DISKS: usize = 3;
+        let bucket = "barrier-iso-bucket";
+        let observed_object = "iso-observed-object";
+        let other_object = "iso-other-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+
+        // Observe + arm one object, then run the fan-out for a *different* object.
+        let tracker = rename_fanout_barrier::observe_tasks(observed_object);
+        let _barrier = rename_fanout_barrier::arm(observed_object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+        let file_infos = rename_barrier_fileinfos(other_object, DISKS);
+        // This must run to completion without ever pausing (no barrier for it) and
+        // must not touch the observed object's counter. A hang here (e.g. if the
+        // barrier ignored the object key) would surface as a timeout.
+        let _ = tokio::time::timeout(
+            BARRIER_PAUSE_GUARD,
+            SetDisks::rename_data(&disks, bucket, other_object, &file_infos, bucket, other_object, DISKS - 1),
+        )
+        .await
+        .expect("fan-out for an unarmed object must not pause");
+
+        assert_eq!(
+            tracker.running(),
+            0,
+            "another object's fan-out must not accrue tracked tasks for the observed object"
         );
 
         drop(dirs);
