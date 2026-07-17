@@ -304,11 +304,16 @@ fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
 
 /// Resolve the authoritative object length that bucket-quota admission (and downstream sizing) must use.
 ///
-/// For an `aws-chunked` upload the request body is wrapped in chunk framing, so the wire `Content-Length` overcounts the actual object and must never be admitted; the decoded length (`x-amz-decoded-content-length`) is the only authoritative size and is therefore required — a chunked request without it is rejected rather than silently falling back to the framed wire length. For a non-chunked request the raw `Content-Length` is authoritative, with an explicit decoded length as the fallback when the S3 layer only surfaced the latter. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
+/// For an `aws-chunked` upload the request body is wrapped in chunk framing, so the wire `Content-Length` overcounts the actual object and must never be admitted; the decoded length (`x-amz-decoded-content-length`) is the only authoritative size and is therefore required — a genuinely framed request without it is rejected rather than silently falling back to the framed wire length.
+///
+/// Whether the body is *actually* chunk-framed is signalled by the SigV4 streaming payload hash (`x-amz-content-sha256: STREAMING-*`), not by the `Content-Encoding` header alone: clients like those in issue #1857 declare `Content-Encoding: aws-chunked` on a plain signed payload with no framing and no decoded-length header, and for those the wire `Content-Length` is the authoritative object size. For a non-chunked request the raw `Content-Length` is authoritative, with an explicit decoded length as the fallback when the S3 layer only surfaced the latter. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
 fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<i64> {
     let decoded_content_length = decoded_content_length_from_headers(headers)?;
     let size = match (request_uses_aws_chunked(headers), decoded_content_length, content_length) {
         (true, Some(decoded), _) => decoded,
+        // aws-chunked declared but the payload is not actually streaming-framed (no STREAMING-* content sha):
+        // the body is a plain signed payload, so the wire Content-Length is the authoritative object size.
+        (true, None, Some(raw)) if !request_body_is_streaming_framed(headers) => raw,
         (true, None, _) => return Err(s3_error!(UnexpectedContent)),
         (false, _, Some(raw)) => raw,
         (false, Some(decoded), None) => decoded,
@@ -356,6 +361,18 @@ fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
     };
 
     has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
+}
+
+/// True when the request body is genuinely wrapped in SigV4 streaming chunk framing.
+///
+/// Every aws-chunked framing variant (signed, signed-with-trailer, unsigned-with-trailer) is signalled by a
+/// `STREAMING-*` value in `x-amz-content-sha256`; a request whose payload hash is a plain digest or
+/// `UNSIGNED-PAYLOAD` carries an unframed body even if its `Content-Encoding` declares `aws-chunked`.
+fn request_body_is_streaming_framed(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-amz-content-sha256")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("STREAMING-"))
 }
 
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
@@ -10649,11 +10666,46 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_size_rejects_aws_chunked_without_decoded_length() {
-        // A chunked upload without x-amz-decoded-content-length has no authoritative size; the wire length must NOT be a fallback.
+    fn authoritative_size_rejects_streaming_framed_without_decoded_length() {
+        // A genuinely framed upload (STREAMING-* payload hash) without x-amz-decoded-content-length has no
+        // authoritative size; the framed wire length must NOT be a fallback.
+        for sha in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ] {
+            let mut headers = aws_chunked_headers(None);
+            headers.insert("x-amz-content-sha256", HeaderValue::from_static(sha));
+            let err = resolve_put_object_authoritative_size(&headers, Some(1088))
+                .expect_err("framed upload without decoded length must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent, "sha={sha}");
+        }
+    }
+
+    #[test]
+    fn authoritative_size_declared_aws_chunked_plain_payload_uses_wire_content_length() {
+        // Issue #1857-style client: Content-Encoding declares aws-chunked but the payload is a plain signed
+        // body (digest sha, no decoded-length header). The wire Content-Length is the authoritative size and
+        // the PUT must be admitted, not rejected with UnexpectedContent.
+        let mut headers = aws_chunked_headers(None);
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("0a327ea24bb84d70b6a07204485c26856b1827b81f4ab41ce4b3ce62e0b6a4a3"),
+        );
+        let size = resolve_put_object_authoritative_size(&headers, Some(21))
+            .expect("declared-only aws-chunked with a plain payload must fall back to the wire length");
+        assert_eq!(size, 21);
+
+        // Same client without any payload-hash header at all (e.g. presigned/anonymous paths).
         let headers = aws_chunked_headers(None);
-        let err = resolve_put_object_authoritative_size(&headers, Some(1088))
-            .expect_err("chunked upload without decoded length must be rejected");
+        let size = resolve_put_object_authoritative_size(&headers, Some(21))
+            .expect("declared-only aws-chunked without a payload hash must fall back to the wire length");
+        assert_eq!(size, 21);
+
+        // But with no wire length either, there is still no authoritative size.
+        let headers = aws_chunked_headers(None);
+        let err = resolve_put_object_authoritative_size(&headers, None)
+            .expect_err("no decoded length and no wire length must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
     }
 
