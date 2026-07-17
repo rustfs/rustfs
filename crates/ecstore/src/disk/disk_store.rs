@@ -217,6 +217,27 @@ pub fn get_object_disk_read_timeout() -> Duration {
     )
 }
 
+/// Per-shard erasure write stall budget: a shard write (or shutdown) that makes
+/// no forward progress for this long is failed and its disk dropped before
+/// commit. Re-armed on every shard write, so it bounds a stall rather than the
+/// whole transfer. `0` disables the deadline (wait indefinitely).
+pub fn get_object_disk_write_stall_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT,
+        rustfs_config::DEFAULT_OBJECT_DISK_WRITE_STALL_TIMEOUT,
+    ))
+}
+
+/// Optional absolute per-object erasure write cap (administrator slow-drip
+/// backstop). `0` (default) disables the cap; the per-shard stall timeout is the
+/// primary guarantee.
+pub fn get_object_disk_write_absolute_cap() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP,
+        rustfs_config::DEFAULT_OBJECT_DISK_WRITE_ABSOLUTE_CAP,
+    ))
+}
+
 pub fn get_drive_active_check_interval() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS,
@@ -1650,6 +1671,32 @@ mod tests {
             temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
                 assert_eq!(get_drive_walkdir_stall_timeout(), Duration::from_secs(13));
             });
+        });
+    }
+
+    #[test]
+    fn object_disk_write_stall_timeout_default_and_override() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT, || {
+            assert_eq!(
+                get_object_disk_write_stall_timeout(),
+                Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DISK_WRITE_STALL_TIMEOUT)
+            );
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT, Some("9"), || {
+            assert_eq!(get_object_disk_write_stall_timeout(), Duration::from_secs(9));
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT, Some("0"), || {
+            assert!(get_object_disk_write_stall_timeout().is_zero(), "0 disables the stall deadline");
+        });
+    }
+
+    #[test]
+    fn object_disk_write_absolute_cap_defaults_disabled() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP, || {
+            assert!(get_object_disk_write_absolute_cap().is_zero(), "absolute cap is disabled by default");
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP, Some("120"), || {
+            assert_eq!(get_object_disk_write_absolute_cap(), Duration::from_secs(120));
         });
     }
 

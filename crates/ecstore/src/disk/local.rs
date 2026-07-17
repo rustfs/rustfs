@@ -26,10 +26,7 @@ use crate::disk::{
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
-    fs::{
-        O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, access_std, lstat, lstat_std, remove, remove_all_std,
-        remove_std, rename,
-    },
+    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     os,
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
@@ -101,7 +98,7 @@ fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
 fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -109,7 +106,7 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -121,7 +118,7 @@ fn rollback_committed_rename_std(
 ) -> std::io::Result<()> {
     if let Some(old_data_dir) = rollback_data_dir {
         let Some(dst_parent) = dst_file_path.parent() else {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing object metadata parent"));
+            return Err(std::io::Error::new(ErrorKind::InvalidInput, "missing object metadata parent"));
         };
         let backup_path = dst_parent.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
         std::fs::rename(backup_path, dst_file_path)?;
@@ -591,7 +588,7 @@ impl DurabilityMode {
             "strict" => Some(Self::Strict),
             "relaxed" => Some(Self::Relaxed),
             "none" => Some(Self::None),
-            _ => Option::None,
+            _ => None,
         }
     }
 
@@ -799,7 +796,7 @@ pub(crate) mod bucket_durability {
 /// configured durability mode: their contents commit into user buckets and
 /// are exactly the writes the relaxed tiers exist for.
 fn is_scratch_volume(volume: &str) -> bool {
-    for scratch in [super::RUSTFS_META_TMP_BUCKET, super::RUSTFS_META_MULTIPART_BUCKET] {
+    for scratch in [RUSTFS_META_TMP_BUCKET, super::RUSTFS_META_MULTIPART_BUCKET] {
         if volume == scratch || volume.strip_prefix(scratch).is_some_and(|rest| rest.starts_with('/')) {
             return true;
         }
@@ -816,7 +813,7 @@ fn is_system_critical_volume(volume: &str) -> bool {
     if is_scratch_volume(volume) {
         return false;
     }
-    for meta in [super::RUSTFS_META_BUCKET, super::MIGRATING_META_BUCKET] {
+    for meta in [RUSTFS_META_BUCKET, super::MIGRATING_META_BUCKET] {
         if volume == meta || volume.strip_prefix(meta).is_some_and(|rest| rest.starts_with('/')) {
             return true;
         }
@@ -935,12 +932,12 @@ struct AlignedBuf {
 impl AlignedBuf {
     fn new(len: usize, align: usize) -> std::io::Result<Self> {
         debug_assert!(len > 0, "AlignedBuf must not be zero-sized");
-        let layout = std::alloc::Layout::from_size_align(len, align)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let layout =
+            std::alloc::Layout::from_size_align(len, align).map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
         // SAFETY: `layout` has non-zero size (callers guarantee len > 0) and a
         // valid power-of-two alignment enforced by Layout::from_size_align.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        let ptr = std::ptr::NonNull::new(ptr).ok_or(std::io::ErrorKind::OutOfMemory)?;
+        let ptr = std::ptr::NonNull::new(ptr).ok_or(ErrorKind::OutOfMemory)?;
         Ok(Self { ptr, len, layout })
     }
 
@@ -994,10 +991,9 @@ fn pread_direct_aligned(file_path: &Path, offset: u64, length: usize, state: &Di
     let align_u64 = align as u64;
 
     let aligned_offset = offset - (offset % align_u64);
-    let logical_start =
-        usize::try_from(offset - aligned_offset).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let logical_end = logical_start.checked_add(length).ok_or(std::io::ErrorKind::InvalidInput)?;
-    let aligned_len = logical_end.checked_add(align - 1).ok_or(std::io::ErrorKind::InvalidInput)? / align * align;
+    let logical_start = usize::try_from(offset - aligned_offset).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
+    let logical_end = logical_start.checked_add(length).ok_or(ErrorKind::InvalidInput)?;
+    let aligned_len = logical_end.checked_add(align - 1).ok_or(ErrorKind::InvalidInput)? / align * align;
 
     let mut buf = AlignedBuf::new(aligned_len, align)?;
 
@@ -1012,7 +1008,7 @@ fn pread_direct_aligned(file_path: &Path, offset: u64, length: usize, state: &Di
         filled += n;
     }
     if filled < logical_end {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short O_DIRECT read"));
+        return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "short O_DIRECT read"));
     }
 
     Ok(Bytes::copy_from_slice(&buf.as_slice()[logical_start..logical_end]))
@@ -1094,10 +1090,7 @@ fn pwrite_all(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io:
     while !buf.is_empty() {
         let n = file.write_at(buf, offset)?;
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "O_DIRECT positioned write wrote 0 bytes",
-            ));
+            return Err(std::io::Error::new(ErrorKind::WriteZero, "O_DIRECT positioned write wrote 0 bytes"));
         }
         buf = &buf[n..];
         offset += n as u64;
@@ -2128,7 +2121,8 @@ impl LocalIoBackend for StdBackend {
                 let access_check_start = metrics_enabled.then(StdInstant::now);
                 let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
                 if !skip_access_checks(&volume_owned) {
-                    access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+                    crate::disk::fs::access_std(&volume_dir)
+                        .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
                 }
                 let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
@@ -2948,7 +2942,8 @@ fn is_io_uring_unsupported(err: &std::io::Error) -> bool {
 fn resolve_uring_object_path(root: &Path, volume: &str, path: &str) -> Result<PathBuf> {
     let volume_dir = local_disk_bucket_path(root, volume)?;
     if !skip_access_checks(volume) {
-        access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+        crate::disk::fs::access_std(&volume_dir)
+            .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
     }
     let file_path = local_disk_object_path(root, volume, path)?;
     check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -3797,10 +3792,9 @@ impl LocalDisk {
                         // rebuilding (see rustfs-heal); surface it so scanner
                         // coordination, lock selection and admin/metrics see
                         // the rebuild. Refreshed with this cache (~1s).
-                        let healing =
-                            tokio::fs::try_exists(root.join(super::RUSTFS_META_BUCKET).join(super::HEALING_MARKER_PATH))
-                                .await
-                                .unwrap_or(false);
+                        let healing = tokio::fs::try_exists(root.join(RUSTFS_META_BUCKET).join(super::HEALING_MARKER_PATH))
+                            .await
+                            .unwrap_or(false);
                         let disk_info = DiskInfo {
                             total: info.total,
                             free: info.free,
@@ -4780,8 +4774,8 @@ impl LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let tmp_volume_dir = self.get_bucket_path(super::RUSTFS_META_TMP_BUCKET)?;
-        let tmp_file_path = self.get_object_path(super::RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        let tmp_volume_dir = self.get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
+        let tmp_file_path = self.get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
         let durability = effective_durability(volume);
 
@@ -5641,7 +5635,7 @@ async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
 fn skip_access_checks(p: impl AsRef<str>) -> bool {
     let vols = [
         RUSTFS_META_TMP_DELETED_BUCKET,
-        super::RUSTFS_META_TMP_BUCKET,
+        RUSTFS_META_TMP_BUCKET,
         super::RUSTFS_META_MULTIPART_BUCKET,
         RUSTFS_META_BUCKET,
     ];
@@ -5952,12 +5946,11 @@ impl DiskAPI for LocalDisk {
         );
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
-            let checksum_algo =
-                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                } else {
-                    checksum_info.algorithm
-                };
+            let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+                HashAlgorithm::HighwayHash256SLegacy
+            } else {
+                checksum_info.algorithm
+            };
             let part_path = self.get_object_path(
                 volume,
                 path_join_buf(&[
@@ -6985,7 +6978,7 @@ impl DiskAPI for LocalDisk {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) if e.kind() == ErrorKind::NotFound => None,
                     Err(e) => return Err(to_file_error(e)),
                 };
 
@@ -7077,8 +7070,8 @@ impl DiskAPI for LocalDisk {
 
                 match std::fs::rename(&src, &dst) {
                     Ok(()) => Ok(()),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    Err(err) if err.kind() == ErrorKind::NotFound && !src.exists() => Ok(()),
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
                         if let Some(parent) = dst.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
@@ -7126,7 +7119,7 @@ impl DiskAPI for LocalDisk {
                     }
                 }
 
-                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>, Option<OldCurrentSize>), std::io::Error>((
+                Ok::<(Option<Uuid>, Option<Vec<u8>>, Option<OldCurrentSize>), std::io::Error>((
                     rollback_data_dir,
                     version_signature,
                     old_current_size,
@@ -8110,7 +8103,7 @@ mod test {
 
     /// Crash-consistency harness for the rename_data commit sequence
     /// (rustfs/backlog#935 HP-14, test plan rustfs/backlog#896; hard rule from
-    /// rustfs/backlog#878: "partial commit 后对象只能是旧版本或新版本,不能混合").
+    /// rustfs/backlog#878: "After partial commit, the object can only be an old or new version; it cannot be mixed").
     ///
     /// For every pre-commit crash point × durability tier, it seeds a committed
     /// object, stages a replacement, injects a hard power loss (no in-process
@@ -8449,7 +8442,7 @@ mod test {
     /// Backdate a path's mtime so zero-expiry cleanup tests classify it as
     /// stale deterministically, instead of sleeping and hoping the filesystem
     /// timestamp granularity (or a backward wall-clock step) cooperates.
-    fn backdate_mtime(path: &std::path::Path, age: Duration) {
+    fn backdate_mtime(path: &Path, age: Duration) {
         use std::fs::{File, FileTimes};
         let mtime = std::time::SystemTime::now() - age;
         File::open(path)
@@ -8858,17 +8851,13 @@ mod test {
     async fn blocking_scan_writer_keeps_flush_and_shutdown_pending() {
         let mut flush_writer = BlockingScanWriter { entered_tx: None };
         assert!(
-            tokio::time::timeout(Duration::from_millis(10), flush_writer.flush())
-                .await
-                .is_err(),
+            timeout(Duration::from_millis(10), flush_writer.flush()).await.is_err(),
             "blocking scan writer flush should stay pending"
         );
 
         let mut shutdown_writer = BlockingScanWriter { entered_tx: None };
         assert!(
-            tokio::time::timeout(Duration::from_millis(10), shutdown_writer.shutdown())
-                .await
-                .is_err(),
+            timeout(Duration::from_millis(10), shutdown_writer.shutdown()).await.is_err(),
             "blocking scan writer shutdown should stay pending"
         );
     }
@@ -8877,15 +8866,11 @@ mod test {
     /// consumer (quorum merge, a lagging peer drive).
     struct SlowWriter {
         delay: Duration,
-        sleep: Option<std::pin::Pin<Box<Sleep>>>,
+        sleep: Option<Pin<Box<Sleep>>>,
     }
 
     impl AsyncWrite for SlowWriter {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
             if self.sleep.is_none() {
                 let delay = self.delay;
                 self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
@@ -8893,23 +8878,20 @@ mod test {
 
             let sleep = self.sleep.as_mut().expect("sleep was just installed");
             match sleep.as_mut().poll(cx) {
-                std::task::Poll::Ready(()) => {
+                Poll::Ready(()) => {
                     self.sleep = None;
-                    std::task::Poll::Ready(Ok(buf.len()))
+                    Poll::Ready(Ok(buf.len()))
                 }
-                std::task::Poll::Pending => std::task::Poll::Pending,
+                Poll::Pending => Poll::Pending,
             }
         }
 
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -9605,14 +9587,14 @@ mod test {
         bucket_durability::set(super::super::RUSTFS_META_MULTIPART_BUCKET, Some(DurabilityMode::Relaxed));
         bucket_durability::set("", Some(DurabilityMode::Relaxed));
 
-        assert_eq!(bucket_durability::lookup(RUSTFS_META_BUCKET), Option::None);
-        assert_eq!(bucket_durability::lookup(RUSTFS_META_TMP_BUCKET), Option::None);
+        assert_eq!(bucket_durability::lookup(RUSTFS_META_BUCKET), None);
+        assert_eq!(bucket_durability::lookup(RUSTFS_META_TMP_BUCKET), None);
         assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
 
         // The legacy full-off tier is process-wide only: registering it per
         // bucket is dropped, not stored.
         bucket_durability::set("hp5b-legacy-refused", Some(DurabilityMode::LegacyOff));
-        assert_eq!(bucket_durability::lookup("hp5b-legacy-refused"), Option::None);
+        assert_eq!(bucket_durability::lookup("hp5b-legacy-refused"), None);
     }
 
     #[test]
@@ -11071,7 +11053,7 @@ mod test {
 
         let vols = [
             RUSTFS_META_TMP_DELETED_BUCKET,
-            super::super::RUSTFS_META_TMP_BUCKET,
+            RUSTFS_META_TMP_BUCKET,
             super::super::RUSTFS_META_MULTIPART_BUCKET,
             RUSTFS_META_BUCKET,
         ];
@@ -11110,7 +11092,7 @@ mod test {
         let mut reader = StallTimeoutReader::new(PendingTestReader, Duration::ZERO);
         let mut buf = [0; 1];
 
-        let result = tokio::time::timeout(Duration::from_millis(10), reader.read(&mut buf)).await;
+        let result = timeout(Duration::from_millis(10), reader.read(&mut buf)).await;
 
         assert!(result.is_err(), "zero timeout must leave stalled reads pending instead of failing");
     }
@@ -11240,10 +11222,10 @@ mod test {
 
     #[tokio::test(start_paused = true)]
     async fn cleanup_loop_interval_does_not_tick_immediately() {
-        let start_at = tokio::time::Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
         let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
 
-        assert!(tokio::time::timeout(Duration::from_secs(1), interval.tick()).await.is_err());
+        assert!(timeout(Duration::from_secs(1), interval.tick()).await.is_err());
 
         tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL).await;
         interval.tick().await;
@@ -11291,26 +11273,16 @@ mod test {
         struct BrokenPipeWriter;
 
         impl AsyncWrite for BrokenPipeWriter {
-            fn poll_write(
-                self: std::pin::Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-                _buf: &[u8],
-            ) -> std::task::Poll<std::io::Result<usize>> {
-                std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed")))
+            fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "closed")))
             }
 
-            fn poll_flush(
-                self: std::pin::Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<std::io::Result<()>> {
-                std::task::Poll::Ready(Ok(()))
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
             }
 
-            fn poll_shutdown(
-                self: std::pin::Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<std::io::Result<()>> {
-                std::task::Poll::Ready(Ok(()))
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
             }
         }
 
@@ -12442,7 +12414,7 @@ mod test {
         fs::set_permissions(&meta_path, Permissions::from_mode(0o000))
             .await
             .expect("operation should succeed");
-        if fs::File::open(&meta_path).await.is_ok() {
+        if File::open(&meta_path).await.is_ok() {
             fs::set_permissions(&meta_path, original_permissions)
                 .await
                 .expect("operation should succeed");
@@ -12977,7 +12949,7 @@ mod test {
         // It only checks length and platform-specific special characters
         // System volume names are valid according to the current implementation
         assert!(LocalDisk::is_valid_volname(RUSTFS_META_BUCKET));
-        assert!(LocalDisk::is_valid_volname(super::super::RUSTFS_META_TMP_BUCKET));
+        assert!(LocalDisk::is_valid_volname(RUSTFS_META_TMP_BUCKET));
 
         // Testing platform-specific behavior for special characters
         #[cfg(windows)]
@@ -13321,24 +13293,20 @@ mod test {
 
         #[cfg(unix)]
         {
-            for (kind, expected) in [("minor", 1), ("major", 2)] {
+            for (kind, expected) in [("minor", 1), ("major", 2)].iter().copied() {
+                let labels = [("path", "local_test"), ("stage", "mmap_map"), ("kind", kind)];
                 assert_eq!(
-                    recorder.counter_value(
-                        METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL,
-                        &[("path", "local_test"), ("stage", "mmap_map"), ("kind", kind)]
-                    ),
+                    recorder.counter_value(METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL, &labels),
                     expected,
-                    "zero deltas must not emit and positive {kind} deltas must accumulate exactly"
+                    "zero deltas must not emit and positive mmap page fault deltas must accumulate exactly"
                 );
             }
-            for (kind, expected) in [("minor", 3), ("major", 4)] {
+            for (kind, expected) in [("minor", 3), ("major", 4)].iter().copied() {
+                let labels = [("path", "local_test"), ("stage", "direct_read_copy"), ("kind", kind)];
                 assert_eq!(
-                    recorder.counter_value(
-                        METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL,
-                        &[("path", "local_test"), ("stage", "direct_read_copy"), ("kind", kind)]
-                    ),
+                    recorder.counter_value(METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL, &labels),
                     expected,
-                    "zero deltas must not emit and positive {kind} deltas must accumulate exactly"
+                    "zero deltas must not emit and positive direct-read page fault deltas must accumulate exactly"
                 );
             }
         }
@@ -13553,15 +13521,15 @@ mod test {
 
     #[test]
     fn test_is_bitrot_size_mismatch_error_only_matches_target_message() {
-        assert!(is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot shard file size mismatch")));
-        assert!(!is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot hash mismatch")));
+        assert!(is_bitrot_size_mismatch_error(&io::Error::other("bitrot shard file size mismatch")));
+        assert!(!is_bitrot_size_mismatch_error(&io::Error::other("bitrot hash mismatch")));
     }
 
     #[test]
     fn test_is_bitrot_verification_error_matches_hash_and_size_mismatch() {
-        assert!(is_bitrot_verification_error(&std::io::Error::other("bitrot shard file size mismatch")));
-        assert!(is_bitrot_verification_error(&std::io::Error::other("bitrot hash mismatch")));
-        assert!(!is_bitrot_verification_error(&std::io::Error::other("unrelated io failure")));
+        assert!(is_bitrot_verification_error(&io::Error::other("bitrot shard file size mismatch")));
+        assert!(is_bitrot_verification_error(&io::Error::other("bitrot hash mismatch")));
+        assert!(!is_bitrot_verification_error(&io::Error::other("unrelated io failure")));
     }
 
     #[tokio::test]
@@ -13600,7 +13568,7 @@ mod test {
             ..Default::default()
         }];
 
-        let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::new()), file_info.erasure.shard_size(), checksum_algo);
+        let mut writer = BitrotWriter::new(io::Cursor::new(Vec::new()), file_info.erasure.shard_size(), checksum_algo);
         writer
             .write(&payload)
             .await
@@ -13667,7 +13635,7 @@ mod test {
             } else {
                 HashAlgorithm::HighwayHash256S
             };
-            let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::new()), codec_erasure.shard_size(), checksum_algo);
+            let mut writer = BitrotWriter::new(io::Cursor::new(Vec::new()), codec_erasure.shard_size(), checksum_algo);
             writer.write(&payload[..8]).await.expect("first shard block should encode");
             writer.write(&payload[8..]).await.expect("final shard block should encode");
             writer.shutdown().await.expect("bitrot writer should flush test payload");
@@ -14524,7 +14492,7 @@ mod test {
         // SAFETY: `map.as_ptr()` is page-aligned and `len` bytes long; `vec` has
         // one byte per page of that range, which is what mincore writes.
         let rc = unsafe { libc::mincore(map.as_ptr() as *mut libc::c_void, len, vec.as_mut_ptr()) };
-        assert_eq!(rc, 0, "mincore failed: {}", std::io::Error::last_os_error());
+        assert_eq!(rc, 0, "mincore failed: {}", io::Error::last_os_error());
         vec.iter().filter(|b| *b & 1 == 1).count()
     }
 
