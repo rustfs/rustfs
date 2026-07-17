@@ -103,6 +103,7 @@ use crate::app::runtime_sources::{
     AppContext, current_app_context, current_expiry_state_handle, current_notify_interface_for_context,
     current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
+use crate::auth::{AuthType, get_request_auth_type};
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
@@ -304,7 +305,7 @@ fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
 
 /// Resolve the authoritative object length that bucket-quota admission (and downstream sizing) must use.
 ///
-/// For an `aws-chunked` upload the request body is wrapped in chunk framing, so the wire `Content-Length` overcounts the actual object and must never be admitted; the decoded length (`x-amz-decoded-content-length`) is the only authoritative size and is therefore required — a chunked request without it is rejected rather than silently falling back to the framed wire length. For a non-chunked request the raw `Content-Length` is authoritative, with an explicit decoded length as the fallback when the S3 layer only surfaced the latter. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
+/// For a SigV4 streaming upload the request body is wrapped in chunk framing, so the wire `Content-Length` overcounts the actual object and must never be admitted; the decoded length (`x-amz-decoded-content-length`) is the only authoritative size and is therefore required. A plain request may still include `aws-chunked` in `Content-Encoding` for S3 compatibility, so that token alone does not make the request streaming. For a non-streaming request the raw `Content-Length` is authoritative, with an explicit decoded length as the fallback when the S3 layer only surfaced the latter. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
 fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<i64> {
     let decoded_content_length = decoded_content_length_from_headers(headers)?;
     let size = match (request_uses_aws_chunked(headers), decoded_content_length, content_length) {
@@ -348,14 +349,10 @@ fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, Quota
 }
 
 fn request_uses_aws_chunked(headers: &HeaderMap) -> bool {
-    let has_aws_chunked = |header_name: &str| {
-        headers
-            .get(header_name)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.split(',').any(|part| part.trim().eq_ignore_ascii_case("aws-chunked")))
-    };
-
-    has_aws_chunked("content-encoding") || has_aws_chunked("transfer-encoding")
+    matches!(
+        get_request_auth_type(headers),
+        AuthType::StreamingSigned | AuthType::StreamingSignedTrailer | AuthType::StreamingUnsignedTrailer
+    )
 }
 
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
@@ -7037,6 +7034,7 @@ fn previous_current_size_from_backfill(backfill: Option<OldCurrentSize>) -> Opti
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
+    use rustfs_utils::http::AMZ_CONTENT_SHA256;
     use s3s::dto::{
         Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
         ExistingObjectReplicationStatus, ObjectIdentifier, ReplicaModifications, ReplicaModificationsStatus,
@@ -7398,9 +7396,7 @@ mod tests {
 
     #[test]
     fn aws_chunked_put_prefers_decoded_content_length() {
-        let mut headers = HeaderMap::new();
-        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
-        headers.insert(AMZ_DECODED_CONTENT_LENGTH, HeaderValue::from_static("71680"));
+        let headers = aws_chunked_headers(Some("71680"));
 
         let decoded = decoded_content_length_from_headers(&headers).expect("decoded content length should parse");
         assert!(request_uses_aws_chunked(&headers));
@@ -10628,10 +10624,14 @@ mod tests {
     fn aws_chunked_headers(decoded_len: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
+        headers.insert(
+            HeaderName::from_bytes(AMZ_CONTENT_SHA256.as_bytes()).expect("valid content SHA256 header"),
+            HeaderValue::from_static(crate::auth::STREAMING_CONTENT_SHA256),
+        );
         if let Some(decoded) = decoded_len {
             headers.insert(
-                HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).unwrap(),
-                HeaderValue::from_str(decoded).unwrap(),
+                HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).expect("valid decoded content length header"),
+                HeaderValue::from_str(decoded).expect("valid decoded content length value"),
             );
         }
         headers
@@ -10655,6 +10655,21 @@ mod tests {
         let err = resolve_put_object_authoritative_size(&headers, Some(1088))
             .expect_err("chunked upload without decoded length must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_plain_aws_chunked_metadata_uses_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("gzip, aws-chunked"));
+        headers.insert(
+            HeaderName::from_bytes(AMZ_CONTENT_SHA256.as_bytes()).expect("valid content SHA256 header"),
+            HeaderValue::from_static(crate::auth::UNSIGNED_PAYLOAD),
+        );
+
+        assert!(!request_uses_aws_chunked(&headers));
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088))
+            .expect("plain PUT with aws-chunked metadata uses Content-Length");
+        assert_eq!(size, 1088);
     }
 
     #[test]
