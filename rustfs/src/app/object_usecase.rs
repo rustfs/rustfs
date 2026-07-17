@@ -53,8 +53,8 @@ use super::storage_api::object_usecase::bucket::{
 };
 use super::storage_api::object_usecase::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::object_usecase::concurrency::{
-    self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
-    get_put_concurrency_aware_buffer_size,
+    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size,
+    get_concurrency_manager, get_put_concurrency_aware_buffer_size,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
@@ -2871,29 +2871,44 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectIoPlanning> {
         let permit_wait_start = std::time::Instant::now();
         let permit_wait_timeout = Self::disk_permit_wait_timeout();
-        // Permits are held for the whole body transfer, so slow clients can
-        // pin all of them while disks are idle. Bound the wait and degrade to
-        // a permit-less read instead of stalling into the request timeout.
-        let disk_permit = if permit_wait_timeout.is_zero() {
-            Some(
-                manager
-                    .acquire_owned_disk_read_permit()
-                    .await
-                    .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?,
-            )
-        } else {
-            match tokio::time::timeout(permit_wait_timeout, manager.acquire_owned_disk_read_permit()).await {
-                Ok(permit) => Some(permit.map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?),
-                Err(_) => {
-                    metrics::counter!("rustfs.get_object.disk_permit.bypass.total").increment(1);
-                    warn!(
-                        bucket = %bucket,
-                        key = %key,
-                        wait_ms = permit_wait_start.elapsed().as_millis() as u64,
-                        "GetObject proceeding without disk read permit after bounded wait"
-                    );
-                    None
-                }
+        // Permits are held for the whole body transfer, so slow clients can pin
+        // all of them while disks are idle. Bound the wait on the primary pool
+        // and, on timeout, admit from a bounded degraded overflow lane. Total
+        // concurrent disk-active GETs are hard-capped at
+        // `primary_cap + degraded_cap`; once that cap is reached we reject with
+        // `SlowDown` instead of reading without any admission token. Never
+        // proceed permit-less.
+        let disk_permit = match manager
+            .admit_disk_read(permit_wait_timeout)
+            .await
+            .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?
+        {
+            DiskReadAdmission::Primary(permit) => Some(permit),
+            // Throttling disabled by config (primary cap 0): proceed without an
+            // admission token. Not a saturation bypass.
+            DiskReadAdmission::Unbounded => None,
+            DiskReadAdmission::Degraded(permit) => {
+                metrics::counter!("rustfs.get_object.disk_permit.degraded.total").increment(1);
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    wait_ms = permit_wait_start.elapsed().as_millis() as u64,
+                    "GetObject admitted into bounded degraded disk-read lane after primary pool saturation"
+                );
+                Some(permit)
+            }
+            DiskReadAdmission::Rejected => {
+                metrics::counter!("rustfs.get_object.disk_permit.hard_reject.total").increment(1);
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    wait_ms = permit_wait_start.elapsed().as_millis() as u64,
+                    "GetObject rejected: disk-read hard concurrency cap reached"
+                );
+                return Err(s3_error!(
+                    SlowDown,
+                    "disk read concurrency limit reached, please reduce your request rate"
+                ));
             }
         };
         let permit_wait_duration = permit_wait_start.elapsed();
