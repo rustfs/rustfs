@@ -15,14 +15,17 @@
 use crate::cache::{ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup};
 use crate::config::ObjectDataCacheConfig;
 use crate::entry::{ObjectDataCacheEntry, projected_weight};
-use crate::index::{ObjectDataCacheIdentityIndex, ObjectDataCacheIndexInsertResult, ObjectDataCacheKeyToken};
+use crate::index::{ObjectDataCacheGenerationalInsertResult, ObjectDataCacheIdentityIndex};
 use crate::key::{ObjectDataCacheIdentity, ObjectDataCacheKey};
 use crate::memory::ObjectDataCacheMemoryGate;
 use crate::singleflight::{ObjectDataCacheSingleflight, ObjectDataCacheSingleflightAcquire};
 use crate::stats::ObjectDataCacheStats;
 use bytes::Bytes;
 use moka::future::{Cache, FutureExt};
+use moka::ops::compute;
+use std::future::ready;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Semaphore;
 
 /// Weighted Moka backend for reusable object bodies.
@@ -39,10 +42,18 @@ pub struct MokaBackend {
     /// Bounds the number of concurrent distinct-key fills. Singleflight only
     /// dedups per key, so without this limiter distinct-key fills are unbounded.
     fill_semaphore: Arc<Semaphore>,
+    next_generation: AtomicU64,
     /// Test-only barrier that pauses a fill between the index insert and the
     /// cache insert so the fill-vs-invalidation race can be driven deterministically.
     #[cfg(test)]
     fill_barrier: std::sync::Mutex<Option<Arc<FillBarrier>>>,
+    /// Test-only barrier that pauses identity-budget eviction after the index
+    /// selects a victim and before the cache removal starts.
+    #[cfg(test)]
+    identity_eviction_barrier: std::sync::Mutex<Option<Arc<FillBarrier>>>,
+    /// Test-only blocking rendezvous inside the conditional compute closure.
+    #[cfg(test)]
+    identity_compute_barrier: std::sync::Mutex<Option<Arc<ComputeBarrier>>>,
 }
 
 /// Test-only rendezvous that pauses a fill between the index insert and the
@@ -53,6 +64,45 @@ pub struct MokaBackend {
 struct FillBarrier {
     reached: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
+    completed: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ComputeBarrier {
+    reached: tokio::sync::Semaphore,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ComputeBarrier {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        self.reached.add_permits(1);
+        let mut released = self.released.lock().unwrap_or_else(|p| p.into_inner());
+        while !*released {
+            released = self.release.wait(released).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    async fn wait_until_reached(&self) {
+        if let Ok(permit) = self.reached.acquire().await {
+            permit.forget();
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.release.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +111,7 @@ impl FillBarrier {
         Self {
             reached: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
+            completed: tokio::sync::Semaphore::new(0),
         }
     }
 
@@ -82,6 +133,16 @@ impl FillBarrier {
     /// Called from the test: let the paused fill proceed.
     fn release(&self) {
         self.release.add_permits(1);
+    }
+
+    fn complete(&self) {
+        self.completed.add_permits(1);
+    }
+
+    async fn wait_until_completed(&self) {
+        if let Ok(permit) = self.completed.acquire().await {
+            permit.forget();
+        }
     }
 }
 
@@ -136,8 +197,7 @@ impl MokaBackend {
                     // still the one it tracks. An inline `Expired` upsert or a
                     // deferred `Size` notification for a superseded generation
                     // then cannot remove the key a fresh refill just registered.
-                    let token = Arc::as_ptr(&value) as ObjectDataCacheKeyToken;
-                    index.remove_evicted_key(&identity, &key, token).await;
+                    index.remove_generation(&identity, &key, value.generation()).await;
                 }
                 .boxed()
             })
@@ -150,8 +210,13 @@ impl MokaBackend {
             memory_gate: ObjectDataCacheMemoryGate::new(config, stats),
             max_capacity,
             fill_semaphore: Arc::new(Semaphore::new(fill_permits)),
+            next_generation: AtomicU64::new(0),
             #[cfg(test)]
             fill_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            identity_eviction_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            identity_compute_barrier: std::sync::Mutex::new(None),
         })
     }
 
@@ -160,6 +225,20 @@ impl MokaBackend {
     fn install_fill_barrier(&self) -> Arc<FillBarrier> {
         let barrier = Arc::new(FillBarrier::new());
         *self.fill_barrier.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    #[cfg(test)]
+    fn install_identity_eviction_barrier(&self) -> Arc<FillBarrier> {
+        let barrier = Arc::new(FillBarrier::new());
+        *self.identity_eviction_barrier.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    #[cfg(test)]
+    fn install_identity_compute_barrier(&self) -> Arc<ComputeBarrier> {
+        let barrier = Arc::new(ComputeBarrier::new());
+        *self.identity_compute_barrier.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&barrier));
         barrier
     }
 
@@ -237,10 +316,16 @@ impl MokaBackend {
             })
             .await;
 
-        // Build the entry up front so its Arc pointer can serve as the
-        // generation token registered in the index alongside the key.
-        let entry = Arc::new(ObjectDataCacheEntry::new(bytes));
-        let token = Arc::as_ptr(&entry) as ObjectDataCacheKeyToken;
+        // The counter supplies uniqueness only; cache/index publication provides
+        // the synchronization, so relaxed ordering is sufficient here.
+        let generation = match self
+            .next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+        {
+            Ok(previous) => previous + 1,
+            Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedIdentityOverflow),
+        };
+        let entry = Arc::new(ObjectDataCacheEntry::with_generation(bytes, generation));
 
         // Run the register/insert/recheck/undo sequence in a spawned task and
         // await its handle. The GET path already detaches the whole fill from
@@ -256,6 +341,18 @@ impl MokaBackend {
         let fill_identity = identity.clone();
         #[cfg(test)]
         let fill_barrier = self.fill_barrier.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        #[cfg(test)]
+        let identity_eviction_barrier = self
+            .identity_eviction_barrier
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        #[cfg(test)]
+        let identity_compute_barrier = self
+            .identity_compute_barrier
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
 
         let handle = tokio::spawn(async move {
             // Hold the fill-concurrency permit until the register/insert/undo
@@ -263,13 +360,39 @@ impl MokaBackend {
             let _permit = permit;
             // Register the key in the identity index BEFORE the entry becomes
             // visible in the cache, so a concurrent invalidation always finds it.
-            match index.insert(fill_identity.clone(), fill_key.clone(), token).await {
-                ObjectDataCacheIndexInsertResult::Inserted { evicted_keys } => {
-                    for evicted in evicted_keys {
-                        cache.remove(&evicted).await;
+            match index
+                .insert_generation(fill_identity.clone(), fill_key.clone(), generation)
+                .await
+            {
+                ObjectDataCacheGenerationalInsertResult::Inserted { evicted } => {
+                    for evicted in evicted {
+                        #[cfg(test)]
+                        if let Some(barrier) = &identity_eviction_barrier {
+                            barrier.wait().await;
+                        }
+                        let expected_generation = evicted.generation;
+                        #[cfg(test)]
+                        let compute_barrier = identity_compute_barrier.clone();
+                        let _ = cache
+                            .entry(evicted.key)
+                            .and_compute_with(move |current| {
+                                let remove = current
+                                    .as_ref()
+                                    .is_some_and(|entry| entry.value().generation() == expected_generation);
+                                #[cfg(test)]
+                                if let Some(barrier) = compute_barrier {
+                                    barrier.wait();
+                                }
+                                ready(if remove { compute::Op::Remove } else { compute::Op::Nop })
+                            })
+                            .await;
+                        #[cfg(test)]
+                        if let Some(barrier) = &identity_eviction_barrier {
+                            barrier.complete();
+                        }
                     }
                 }
-                ObjectDataCacheIndexInsertResult::Duplicate => {}
+                ObjectDataCacheGenerationalInsertResult::Duplicate => {}
             }
 
             #[cfg(test)]
@@ -277,7 +400,10 @@ impl MokaBackend {
                 barrier.wait().await;
             }
 
-            cache.insert(fill_key.clone(), entry).await;
+            let _ = cache
+                .entry(fill_key.clone())
+                .and_compute_with(move |_| ready(compute::Op::Put(entry)))
+                .await;
 
             // An invalidation may have raced between the index and cache
             // inserts; re-check the index and undo the fill so the stale
@@ -441,6 +567,19 @@ mod tests {
         ObjectDataCacheGetPlan::Cacheable {
             key: ObjectDataCacheKey::new("bucket", object, Some(version), etag, 5, ObjectDataCacheBodyVariant::FullObjectPlainV1),
         }
+    }
+
+    fn identity_budget_fixture() -> (Arc<MokaBackend>, ObjectDataCacheGetPlan, ObjectDataCacheGetPlan, ObjectDataCacheGetPlan) {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        config.identity_keys_max = 2;
+        (
+            Arc::new(MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build")),
+            versioned_plan("object", "v1", "etag-1"),
+            versioned_plan("object", "v2", "etag-2"),
+            versioned_plan("object", "v3", "etag-3"),
+        )
     }
 
     #[tokio::test]
@@ -855,15 +994,7 @@ mod tests {
     // and still caches the newest body, instead of clearing the whole identity.
     #[tokio::test]
     async fn moka_backend_identity_budget_evicts_oldest_and_caches_newest() {
-        let mut config = enabled_config();
-        config.ttl = Duration::from_secs(30);
-        config.time_to_idle = Duration::from_secs(30);
-        config.identity_keys_max = 2;
-        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
-
-        let plan_v1 = versioned_plan("object", "v1", "etag-1");
-        let plan_v2 = versioned_plan("object", "v2", "etag-2");
-        let plan_v3 = versioned_plan("object", "v3", "etag-3");
+        let (backend, plan_v1, plan_v2, plan_v3) = identity_budget_fixture();
 
         assert_eq!(
             backend.fill_body(&plan_v1, Bytes::from_static(b"aaaaa")).await,
@@ -888,6 +1019,216 @@ mod tests {
             matches!(backend.lookup_body(&plan_v3).await, ObjectDataCacheLookup::Hit(_)),
             "newest body must be cached"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_budget_eviction_preserves_refill_before_conditional_delete() {
+        let (backend, plan_v1, plan_v2, plan_v3) = identity_budget_fixture();
+
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"old-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert_eq!(
+            backend.fill_body(&plan_v2, Bytes::from_static(b"body-b")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+
+        let barrier = backend.install_identity_eviction_barrier();
+        let fill_v3 = {
+            let backend = Arc::clone(&backend);
+            let plan_v3 = plan_v3.clone();
+            tokio::spawn(async move { backend.fill_body(&plan_v3, Bytes::from_static(b"body-c")).await })
+        };
+
+        barrier.wait_until_reached().await;
+        *backend.identity_eviction_barrier.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"new-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert!(matches!(
+            backend.lookup_body(&plan_v1).await,
+            ObjectDataCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"new-a"
+        ));
+
+        barrier.release();
+        assert_eq!(fill_v3.await.expect("v3 fill task should complete"), ObjectDataCacheFillResult::Inserted);
+        assert!(matches!(
+            backend.lookup_body(&plan_v1).await,
+            ObjectDataCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"new-a"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn identity_budget_conditional_delete_is_atomic_with_refill() {
+        let (backend, plan_v1, plan_v2, plan_v3) = identity_budget_fixture();
+
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"old-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert_eq!(
+            backend.fill_body(&plan_v2, Bytes::from_static(b"body-b")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+
+        let compute_barrier = backend.install_identity_compute_barrier();
+        let fill_v3 = {
+            let backend = Arc::clone(&backend);
+            let plan_v3 = plan_v3.clone();
+            tokio::spawn(async move { backend.fill_body(&plan_v3, Bytes::from_static(b"body-c")).await })
+        };
+        compute_barrier.wait_until_reached().await;
+        *backend.identity_compute_barrier.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+        let fill_barrier = backend.install_fill_barrier();
+        let refill_v1 = {
+            let backend = Arc::clone(&backend);
+            let plan_v1 = plan_v1.clone();
+            tokio::spawn(async move { backend.fill_body(&plan_v1, Bytes::from_static(b"new-a")).await })
+        };
+        fill_barrier.wait_until_reached().await;
+        fill_barrier.release();
+        tokio::task::yield_now().await;
+        assert!(!refill_v1.is_finished(), "the refill must serialize behind the same-key compute");
+
+        compute_barrier.release();
+        assert_eq!(fill_v3.await.expect("v3 fill task should complete"), ObjectDataCacheFillResult::Inserted);
+        assert_eq!(
+            refill_v1.await.expect("v1 refill task should complete"),
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert!(matches!(
+            backend.lookup_body(&plan_v1).await,
+            ObjectDataCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"new-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn identity_budget_eviction_keeps_index_and_cache_generation_consistent() {
+        let (backend, plan_v1, plan_v2, plan_v3) = identity_budget_fixture();
+
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"body-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert_eq!(
+            backend.fill_body(&plan_v2, Bytes::from_static(b"body-b")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert_eq!(
+            backend.fill_body(&plan_v3, Bytes::from_static(b"body-c")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+
+        let ObjectDataCacheGetPlan::Cacheable { key: key_v1 } = &plan_v1 else {
+            panic!("versioned plan should be cacheable");
+        };
+        let ObjectDataCacheGetPlan::Cacheable { key: key_v2 } = &plan_v2 else {
+            panic!("versioned plan should be cacheable");
+        };
+        let ObjectDataCacheGetPlan::Cacheable { key: key_v3 } = &plan_v3 else {
+            panic!("versioned plan should be cacheable");
+        };
+        let identity = ObjectDataCacheIdentity::new("bucket", "object");
+        let entry_v2 = backend.cache.get(key_v2).await.expect("v2 should remain cached");
+        let entry_v3 = backend.cache.get(key_v3).await.expect("v3 should remain cached");
+
+        assert!(backend.cache.get(key_v1).await.is_none(), "evicted v1 must not remain cached");
+        assert!(!backend.index.contains_key(&identity, key_v1).await, "evicted v1 must not remain indexed");
+        assert!(
+            backend
+                .index
+                .contains_generation(&identity, key_v2, entry_v2.generation())
+                .await,
+            "v2 index generation must match its cache entry"
+        );
+        assert!(
+            backend
+                .index
+                .contains_generation(&identity, key_v3, entry_v3.generation())
+                .await,
+            "v3 index generation must match its cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_generation_is_monotonic_across_clear_and_overflow_fails_closed() {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let plan_v1 = versioned_plan("object", "v1", "etag-1");
+        let plan_v2 = versioned_plan("object", "v2", "etag-2");
+        let ObjectDataCacheGetPlan::Cacheable { key: key_v1 } = &plan_v1 else {
+            panic!("versioned plan should be cacheable");
+        };
+
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"old-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        let first_generation = backend
+            .cache
+            .get(key_v1)
+            .await
+            .expect("first generation should be cached")
+            .generation();
+        assert_eq!(backend.clear().await, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"new-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        let second_generation = backend
+            .cache
+            .get(key_v1)
+            .await
+            .expect("second generation should be cached")
+            .generation();
+        assert!(second_generation > first_generation, "clear must not reset the generation counter");
+
+        backend.next_generation.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            backend.fill_body(&plan_v2, Bytes::from_static(b"body-b")).await,
+            ObjectDataCacheFillResult::SkippedIdentityOverflow
+        );
+        assert!(matches!(backend.lookup_body(&plan_v2).await, ObjectDataCacheLookup::Miss));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_budget_eviction_preserves_refill_after_caller_cancellation() {
+        let (backend, plan_v1, plan_v2, plan_v3) = identity_budget_fixture();
+
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"old-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert_eq!(
+            backend.fill_body(&plan_v2, Bytes::from_static(b"body-b")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+
+        let barrier = backend.install_identity_eviction_barrier();
+        let fill_v3 = {
+            let backend = Arc::clone(&backend);
+            let plan_v3 = plan_v3.clone();
+            tokio::spawn(async move { backend.fill_body(&plan_v3, Bytes::from_static(b"body-c")).await })
+        };
+        barrier.wait_until_reached().await;
+        fill_v3.abort();
+        *backend.identity_eviction_barrier.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        assert_eq!(
+            backend.fill_body(&plan_v1, Bytes::from_static(b"new-a")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+
+        barrier.release();
+        barrier.wait_until_completed().await;
+        assert!(matches!(
+            backend.lookup_body(&plan_v1).await,
+            ObjectDataCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"new-a"
+        ));
     }
 
     // ODC-31: the fill-vs-invalidation recheck. Pause the fill between the index

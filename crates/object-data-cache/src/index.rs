@@ -15,13 +15,24 @@
 use crate::key::ObjectDataCacheKey;
 use crate::starshard_index::StarshardIdentityIndex;
 
-/// Per-entry generation token used to tell a freshly refilled body apart from a
-/// superseded one under the same key. The token is the cache entry's `Arc`
-/// pointer captured at fill time: the eviction listener receives the evicted
-/// value and can compare its pointer against the token currently tracked, so a
-/// deferred or inline eviction of an old generation cannot remove the index key
-/// registered for the current generation.
+/// Legacy public identity-index token type.
+///
+/// The backend uses an internal monotonic `u64` generation instead; keeping this
+/// alias preserves the existing public `StarshardIdentityIndex` method shapes.
 pub(crate) type ObjectDataCacheKeyToken = usize;
+pub(crate) type ObjectDataCacheGeneration = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectDataCacheEvictedGeneration {
+    pub(crate) key: ObjectDataCacheKey,
+    pub(crate) generation: ObjectDataCacheGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObjectDataCacheGenerationalInsertResult {
+    Inserted { evicted: Vec<ObjectDataCacheEvictedGeneration> },
+    Duplicate,
+}
 
 /// Result of inserting a cache key into the identity index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +52,7 @@ pub enum ObjectDataCacheIndexInsertResult {
 #[derive(Debug, Clone)]
 struct TrackedKey {
     key: ObjectDataCacheKey,
-    token: ObjectDataCacheKeyToken,
+    generation: ObjectDataCacheGeneration,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -50,37 +61,41 @@ pub(crate) struct ObjectDataCacheKeySet {
 }
 
 impl ObjectDataCacheKeySet {
-    pub(crate) fn insert(
+    pub(crate) fn insert_generation(
         &mut self,
         key: ObjectDataCacheKey,
-        token: ObjectDataCacheKeyToken,
+        generation: ObjectDataCacheGeneration,
         max_keys: usize,
-    ) -> ObjectDataCacheIndexInsertResult {
+    ) -> ObjectDataCacheGenerationalInsertResult {
         if let Some(existing) = self.keys.iter_mut().find(|existing| existing.key == key) {
-            // Refresh the generation token so a later eviction of the superseded
+            // Refresh the generation so a later eviction of the superseded
             // body cannot remove the key registered for this new body.
-            existing.token = token;
-            return ObjectDataCacheIndexInsertResult::Duplicate;
+            existing.generation = generation;
+            return ObjectDataCacheGenerationalInsertResult::Duplicate;
         }
 
         // Bounded eviction: the Vec preserves insertion order, so evicting from
         // the front drops the oldest keys and keeps hot (recently filled) ones,
         // rather than clearing the whole identity and rejecting the new key.
-        let mut evicted_keys = Vec::new();
+        let mut evicted = Vec::new();
         while self.keys.len() >= max_keys {
-            evicted_keys.push(self.keys.remove(0).key);
+            let tracked = self.keys.remove(0);
+            evicted.push(ObjectDataCacheEvictedGeneration {
+                key: tracked.key,
+                generation: tracked.generation,
+            });
         }
 
-        self.keys.push(TrackedKey { key, token });
-        ObjectDataCacheIndexInsertResult::Inserted { evicted_keys }
+        self.keys.push(TrackedKey { key, generation });
+        ObjectDataCacheGenerationalInsertResult::Inserted { evicted }
     }
 
     /// Removes the key only when its tracked generation token matches, so an
     /// eviction notification for an old generation leaves a refreshed key intact.
-    pub(crate) fn remove_evicted_key(&mut self, key: &ObjectDataCacheKey, token: ObjectDataCacheKeyToken) -> bool {
+    pub(crate) fn remove_generation(&mut self, key: &ObjectDataCacheKey, generation: ObjectDataCacheGeneration) -> bool {
         let original_len = self.keys.len();
         self.keys
-            .retain(|existing| !(existing.key == *key && existing.token == token));
+            .retain(|existing| !(existing.key == *key && existing.generation == generation));
         original_len != self.keys.len()
     }
 
@@ -100,6 +115,13 @@ impl ObjectDataCacheKeySet {
     }
 
     #[cfg(test)]
+    pub(crate) fn contains_generation(&self, key: &ObjectDataCacheKey, generation: ObjectDataCacheGeneration) -> bool {
+        self.keys
+            .iter()
+            .any(|existing| &existing.key == key && existing.generation == generation)
+    }
+
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.keys.len()
     }
@@ -114,7 +136,7 @@ pub type ObjectDataCacheIdentityIndex = StarshardIdentityIndex;
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectDataCacheIndexInsertResult, ObjectDataCacheKeySet};
+    use super::{ObjectDataCacheGenerationalInsertResult, ObjectDataCacheKeySet};
     use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheKey};
 
     fn make_key(id: &str) -> ObjectDataCacheKey {
@@ -126,16 +148,11 @@ mod tests {
         let mut set = ObjectDataCacheKeySet::default();
         let key = make_key("v1");
 
-        let first = set.insert(key.clone(), 1, 4);
-        let second = set.insert(key, 2, 4);
+        let first = set.insert_generation(key.clone(), 1, 4);
+        let second = set.insert_generation(key, 2, 4);
 
-        assert_eq!(
-            first,
-            ObjectDataCacheIndexInsertResult::Inserted {
-                evicted_keys: Vec::new()
-            }
-        );
-        assert_eq!(second, ObjectDataCacheIndexInsertResult::Duplicate);
+        assert_eq!(first, ObjectDataCacheGenerationalInsertResult::Inserted { evicted: Vec::new() });
+        assert_eq!(second, ObjectDataCacheGenerationalInsertResult::Duplicate);
         assert_eq!(set.len(), 1);
     }
 
@@ -145,12 +162,13 @@ mod tests {
         let key_a = make_key("v1");
         let key_b = make_key("v2");
 
-        let _ = set.insert(key_a.clone(), 1, 1);
-        let result = set.insert(key_b.clone(), 2, 1);
+        let _ = set.insert_generation(key_a.clone(), 1, 1);
+        let result = set.insert_generation(key_b.clone(), 2, 1);
 
         assert!(matches!(
             result,
-            ObjectDataCacheIndexInsertResult::Inserted { evicted_keys } if evicted_keys == vec![key_a]
+            ObjectDataCacheGenerationalInsertResult::Inserted { evicted }
+                if evicted.len() == 1 && evicted[0].key == key_a && evicted[0].generation == 1
         ));
         // The new key replaces the evicted one instead of the identity being cleared.
         assert!(set.contains(&key_b));
@@ -162,14 +180,14 @@ mod tests {
         let mut set = ObjectDataCacheKeySet::default();
         let key = make_key("v1");
 
-        let _ = set.insert(key.clone(), 1, 4);
+        let _ = set.insert_generation(key.clone(), 1, 4);
 
         // A stale eviction notification carrying the old token must not remove the key.
-        assert!(!set.remove_evicted_key(&key, 2));
+        assert!(!set.remove_generation(&key, 2));
         assert!(set.contains(&key));
 
         // The matching token removes the key.
-        assert!(set.remove_evicted_key(&key, 1));
+        assert!(set.remove_generation(&key, 1));
         assert!(!set.contains(&key));
     }
 
@@ -178,11 +196,11 @@ mod tests {
         let mut set = ObjectDataCacheKeySet::default();
         let key = make_key("v1");
 
-        let _ = set.insert(key.clone(), 1, 4);
-        let _ = set.insert(key.clone(), 2, 4);
+        let _ = set.insert_generation(key.clone(), 1, 4);
+        let _ = set.insert_generation(key.clone(), 2, 4);
 
         // After the refresh the old token no longer matches.
-        assert!(!set.remove_evicted_key(&key, 1));
-        assert!(set.remove_evicted_key(&key, 2));
+        assert!(!set.remove_generation(&key, 1));
+        assert!(set.remove_generation(&key, 2));
     }
 }

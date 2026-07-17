@@ -14,6 +14,7 @@
 
 use bytes::Bytes;
 
+use crate::index::ObjectDataCacheGeneration;
 use crate::key::ObjectDataCacheKey;
 
 const ENTRY_OVERHEAD_BYTES: u64 = 64;
@@ -43,17 +44,26 @@ pub(crate) fn projected_weight(key: &ObjectDataCacheKey, body_bytes: u64) -> u64
 #[derive(Debug, Clone)]
 pub struct ObjectDataCacheEntry {
     bytes: Bytes,
+    generation: ObjectDataCacheGeneration,
 }
 
 impl ObjectDataCacheEntry {
     /// Creates a new cached entry.
     pub fn new(bytes: Bytes) -> Self {
-        Self { bytes }
+        Self { bytes, generation: 0 }
+    }
+
+    pub(crate) fn with_generation(bytes: Bytes, generation: ObjectDataCacheGeneration) -> Self {
+        Self { bytes, generation }
     }
 
     /// Returns a clone of the cached body bytes.
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
+    }
+
+    pub(crate) const fn generation(&self) -> ObjectDataCacheGeneration {
+        self.generation
     }
 
     /// Returns the estimated weighted size for capacity accounting.
