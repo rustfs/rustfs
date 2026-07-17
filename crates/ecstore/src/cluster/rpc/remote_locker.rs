@@ -15,8 +15,9 @@
 use crate::cluster::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use rustfs_lock::{
-    LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
+    LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, MAX_DELETE_LIST, Result,
     types::{LockId, LockMetadata, LockPriority},
 };
 use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, GenerallyLockRequest, PingRequest};
@@ -24,12 +25,28 @@ use rustfs_protos::{
     ConnectionEvictionLogLevel, evict_failed_connection_with_log_level, models::PingBodyBuilder,
     proto_gen::node_service::node_service_client::NodeServiceClient,
 };
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 use tokio::time::timeout;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
+
+const REFRESH_UNARY_FALLBACK_CONCURRENCY: usize = 32;
+
+async fn run_refresh_fallback_bounded<Fut, T>(futures: impl IntoIterator<Item = Fut>) -> Vec<T>
+where
+    Fut: Future<Output = T>,
+{
+    stream::iter(futures)
+        .buffered(REFRESH_UNARY_FALLBACK_CONCURRENCY)
+        .collect()
+        .await
+}
+
+fn refresh_batch_chunks<T>(items: &[T]) -> impl Iterator<Item = &[T]> {
+    items.chunks(MAX_DELETE_LIST)
+}
 
 /// Remote lock client implementation
 #[derive(Debug, Clone)]
@@ -43,7 +60,7 @@ impl RemoteClient {
     }
 
     pub fn from_url(url: url::Url) -> Self {
-        Self { addr: url.to_string() }
+        Self::new(url.to_string())
     }
 
     fn build_ping_request() -> PingRequest {
@@ -305,6 +322,76 @@ impl RemoteClient {
             wait_start_time: None,
         }
     }
+
+    async fn refresh_locks_chunk(&self, lock_ids: &[LockId]) -> Vec<Result<bool>> {
+        let refresh_requests = lock_ids.iter().map(Self::create_unlock_request).collect::<Vec<_>>();
+        let resource_summary = Self::summarize_resources(&refresh_requests);
+        let args = match refresh_requests
+            .iter()
+            .map(|request| {
+                serde_json::to_string(request).map_err(|err| LockError::internal(format!("Failed to serialize request: {err}")))
+            })
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(args) => args,
+            Err(err) => {
+                return lock_ids.iter().map(|_| Err(LockError::internal(err.to_string()))).collect();
+            }
+        };
+        let request = BatchGenerallyLockRequest { args };
+
+        let mut client = match self.get_client().await {
+            Ok(client) => client,
+            Err(err) => {
+                return lock_ids.iter().map(|_| Err(LockError::internal(err.to_string()))).collect();
+            }
+        };
+        match timeout(Self::rpc_timeout(), client.refresh_batch(Request::new(request))).await {
+            Ok(Ok(response)) => {
+                let response = response.into_inner();
+                lock_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| match response.results.get(index) {
+                        Some(result) if result.error_info.is_none() => Ok(result.success),
+                        Some(result) => Err(LockError::internal(result.error_info.clone().unwrap_or_default())),
+                        None => Err(LockError::internal("refresh batch response index out of range")),
+                    })
+                    .collect()
+            }
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                // RUSTFS_COMPAT_TODO(RPC-4300-LOCK-REFRESH): unary fallback supports rolling upgrades. Remove after every supported predecessor implements RefreshBatch.
+                // Do not cache negative capability evidence: a peer may be
+                // upgraded in place while this long-lived client remains.
+                // Re-probing once per heartbeat lets the batch path recover
+                // automatically without weakening the bounded unary fallback.
+                run_refresh_fallback_bounded(lock_ids.iter().cloned().map(|lock_id| {
+                    let client = self.clone();
+                    async move { client.refresh(&lock_id).await }
+                }))
+                .await
+            }
+            Ok(Err(status)) => {
+                let reason = status.to_string();
+                if Self::is_transport_failure(&status) {
+                    self.evict_connection("refresh_batch", &reason, &resource_summary).await;
+                }
+                lock_ids
+                    .iter()
+                    .map(|_| Err(LockError::internal(format!("refresh_batch RPC failed: {reason}"))))
+                    .collect()
+            }
+            Err(_) => {
+                let timeout = Self::rpc_timeout();
+                self.evict_connection("refresh_batch", "RPC timed out", &resource_summary)
+                    .await;
+                lock_ids
+                    .iter()
+                    .map(|_| Err(LockError::timeout("remote refresh batch", timeout)))
+                    .collect()
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -436,7 +523,7 @@ impl LockClient for RemoteClient {
     }
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
-        info!("remote refresh for {}", lock_id);
+        debug!("remote refresh for {}", lock_id);
         let refresh_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
         let resource_summary = refresh_request.resource.to_string();
@@ -452,6 +539,18 @@ impl LockClient for RemoteClient {
             return Err(LockError::internal(error_info));
         }
         Ok(resp.success)
+    }
+
+    async fn refresh_locks_batch(&self, lock_ids: &[LockId]) -> Vec<Result<bool>> {
+        if lock_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = Vec::with_capacity(lock_ids.len());
+        for chunk in refresh_batch_chunks(lock_ids) {
+            results.extend(self.refresh_locks_chunk(chunk).await);
+        }
+        results
     }
 
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
@@ -570,9 +669,49 @@ mod tests {
     use super::*;
     use crate::runtime::sources as runtime_sources;
     use rustfs_lock::{ObjectKey, types::LockPriority};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tonic::transport::Endpoint as TonicEndpoint;
+
+    #[tokio::test]
+    async fn refresh_fallback_is_bounded_and_preserves_order() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let futures = (0..100).map(|index| {
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            async move {
+                let current = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, AtomicOrdering::SeqCst);
+                tokio::time::sleep(Duration::from_millis((5 - index % 5) as u64)).await;
+                in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                index
+            }
+        });
+
+        let results = run_refresh_fallback_bounded(futures).await;
+
+        assert_eq!(results, (0..100).collect::<Vec<_>>());
+        assert!(max_in_flight.load(AtomicOrdering::SeqCst) > 1);
+        assert!(max_in_flight.load(AtomicOrdering::SeqCst) <= REFRESH_UNARY_FALLBACK_CONCURRENCY);
+    }
+
+    #[test]
+    fn refresh_batches_are_capped_and_preserve_order() {
+        let items = (0..(MAX_DELETE_LIST * 2 + 17)).collect::<Vec<_>>();
+        let chunks = refresh_batch_chunks(&items).collect::<Vec<_>>();
+
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+            [MAX_DELETE_LIST, MAX_DELETE_LIST, 17]
+        );
+        assert!(chunks.iter().all(|chunk| chunk.len() <= MAX_DELETE_LIST));
+        assert_eq!(chunks.into_iter().flatten().copied().collect::<Vec<_>>(), items);
+    }
 
     async fn spawn_hanging_listener() -> Option<(String, JoinHandle<()>)> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {

@@ -17,7 +17,8 @@ use crate::disk::error::{DiskError, Error as DiskErrorType};
 use crate::runtime::sources as runtime_sources;
 use http::Method;
 use rustfs_protos::{
-    ChannelClass, create_new_channel, get_channel_for_class, proto_gen::node_service::node_service_client::NodeServiceClient,
+    ChannelClass, create_new_channel, get_channel_for_class, get_transaction_channel,
+    proto_gen::node_service::node_service_client::NodeServiceClient,
 };
 use std::{error::Error, io::ErrorKind};
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
@@ -69,6 +70,20 @@ pub async fn node_service_time_out_client_no_auth(
     addr: &String,
 ) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
     node_service_time_out_client(addr, TonicInterceptor::NoOp(NoOpInterceptor)).await
+}
+
+/// Build a client on the dedicated transaction channel. Connection and
+/// keepalive timeouts still apply, but no per-RPC deadline can make the caller
+/// abandon a server-side protected mutation before its final response.
+pub async fn node_service_transaction_client(
+    addr: &str,
+    interceptor: TonicInterceptor,
+) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
+    let channel = get_transaction_channel(addr).await?;
+    let max_message_size = rustfs_protos::internode_rpc_max_message_size();
+    Ok(NodeServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size))
 }
 
 pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {

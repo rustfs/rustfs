@@ -15,7 +15,8 @@
 use super::NodeService;
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
+    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, decode_delete_options_payload,
+    decode_rename_data_payload, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
@@ -26,13 +27,50 @@ use rustfs_io_metrics::internode_metrics::{
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
-use std::io::Cursor;
+use std::{
+    future::Future,
+    io::Cursor,
+    sync::{Arc, LazyLock},
+};
+use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
 /// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
 /// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
 const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+const MAX_PROTECTED_DISK_MUTATIONS: usize = 256;
+static PROTECTED_DISK_MUTATIONS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_PROTECTED_DISK_MUTATIONS)));
+
+fn validate_delete_versions_result_count(expected: usize, actual: usize) -> std::result::Result<(), DiskError> {
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(DiskError::other(format!(
+        "delete versions returned {actual} result(s) for {expected} request(s)"
+    )))
+}
+
+async fn run_protected_disk_mutation<T, F>(operation: &'static str, future: F) -> std::result::Result<T, DiskError>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    // Admission must not await in the request task: tonic may cancel that task
+    // before a rollback is handed to the supervisor. Reject saturation before
+    // mutation instead, then immediately detach every admitted operation.
+    let permit = Arc::clone(&PROTECTED_DISK_MUTATIONS)
+        .try_acquire_owned()
+        .map_err(|err| DiskError::other(format!("{operation} supervisor saturated: {err}")))?;
+    tokio::spawn(async move {
+        let _permit = permit;
+        future.await
+    })
+    .await
+    .map_err(|err| DiskError::other(format!("{operation} task failed: {err}")))
+}
 
 fn decode_msgpack_or_json<T: DeserializeOwned>(
     binary: &[u8],
@@ -327,7 +365,7 @@ impl NodeService {
                     }
                 };
             }
-            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
+            let opts = match decode_delete_options_payload(&request.opts_bin, &request.opts) {
                 Ok(opts) => opts,
                 Err(err) => {
                     return Ok(Response::new(DeleteVersionsResponse {
@@ -337,10 +375,37 @@ impl NodeService {
                     }));
                 }
             };
+            let expected_result_count = versions.len();
 
-            let errors = disk
-                .delete_versions(&request.volume, versions, opts)
+            let volume = request.volume;
+            let protect_from_rpc_cancellation =
+                opts.old_data_dir.is_some() || opts.undo_write || opts.undo_delete || opts.rename_rollback_token.is_some();
+            let errors = if protect_from_rpc_cancellation {
+                match run_protected_disk_mutation("delete versions", async move {
+                    disk.delete_versions(&volume, versions, opts).await
+                })
                 .await
+                {
+                    Ok(errors) => errors,
+                    Err(err) => {
+                        return Ok(Response::new(DeleteVersionsResponse {
+                            success: false,
+                            errors: Vec::new(),
+                            error: Some(err.into()),
+                        }));
+                    }
+                }
+            } else {
+                disk.delete_versions(&volume, versions, opts).await
+            };
+            if let Err(err) = validate_delete_versions_result_count(expected_result_count, errors.len()) {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(err.into()),
+                }));
+            }
+            let errors = errors
                 .into_iter()
                 .map(|error| match error {
                     Some(e) => e.to_string(),
@@ -378,7 +443,7 @@ impl NodeService {
                     }));
                 }
             };
-            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
+            let opts = match decode_delete_options_payload(&request.opts_bin, &request.opts) {
                 Ok(opts) => opts,
                 Err(err) => {
                     return Ok(Response::new(DeleteVersionResponse {
@@ -388,10 +453,30 @@ impl NodeService {
                     }));
                 }
             };
-            match disk
-                .delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
+            let volume = request.volume;
+            let path = request.path;
+            let force_del_marker = request.force_del_marker;
+            let protect_from_rpc_cancellation =
+                opts.old_data_dir.is_some() || opts.undo_write || opts.undo_delete || opts.rename_rollback_token.is_some();
+            let result = if protect_from_rpc_cancellation {
+                match run_protected_disk_mutation("delete version", async move {
+                    disk.delete_version(&volume, &path, file_info, force_del_marker, opts).await
+                })
                 .await
-            {
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return Ok(Response::new(DeleteVersionResponse {
+                            success: false,
+                            raw_file_info: String::new(),
+                            error: Some(err.into()),
+                        }));
+                    }
+                }
+            } else {
+                disk.delete_version(&volume, &path, file_info, force_del_marker, opts).await
+            };
+            match result {
                 Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
                     Ok(raw_file_info) => Ok(Response::new(DeleteVersionResponse {
                         success: true,
@@ -775,8 +860,11 @@ impl NodeService {
     ) -> Result<Response<RenameDataResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
-                Ok(file_info) => file_info,
+            if request.file_info_bin.is_empty() {
+                global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
+            }
+            let payload = match decode_rename_data_payload(&request.file_info_bin, &request.file_info) {
+                Ok(payload) => payload,
                 Err(err) => {
                     return Ok(Response::new(RenameDataResponse {
                         success: false,
@@ -786,10 +874,51 @@ impl NodeService {
                     }));
                 }
             };
-            match disk
-                .rename_data(&request.src_volume, &request.src_path, file_info, &request.dst_volume, &request.dst_path)
-                .await
-            {
+            let src_volume = request.src_volume;
+            let src_path = request.src_path;
+            let dst_volume = request.dst_volume;
+            let dst_path = request.dst_path;
+            let protect_from_rpc_cancellation = payload.rollback_token.is_some();
+            let operation = async move {
+                if let Some(rollback_token) = payload.rollback_token {
+                    crate::storage::storage_api::rpc_consumer::node_service::StorageDiskRpcExt::rename_data_with_rollback(
+                        disk.as_ref(),
+                        &src_volume,
+                        &src_path,
+                        payload.file_info,
+                        &dst_volume,
+                        &dst_path,
+                        rollback_token,
+                    )
+                    .await
+                } else {
+                    crate::storage::storage_api::rpc_consumer::node_service::StorageDiskRpcExt::rename_data(
+                        disk.as_ref(),
+                        &src_volume,
+                        &src_path,
+                        payload.file_info,
+                        &dst_volume,
+                        &dst_path,
+                    )
+                    .await
+                }
+            };
+            let result = if protect_from_rpc_cancellation {
+                match run_protected_disk_mutation("rename data", operation).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return Ok(Response::new(RenameDataResponse {
+                            success: false,
+                            rename_data_resp: String::new(),
+                            rename_data_resp_bin: Vec::new().into(),
+                            error: Some(err.into()),
+                        }));
+                    }
+                }
+            } else {
+                operation.await
+            };
+            match result {
                 Ok(rename_data_resp) => {
                     let rename_data_resp_json = compat_response_json(&rename_data_resp);
                     let rename_data_resp_bin = encode_msgpack_named(&rename_data_resp, "RenameDataResp");
@@ -1176,16 +1305,29 @@ impl NodeService {
 mod tests {
     use super::{
         decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
-        encode_read_multiple_response_payloads,
+        encode_read_multiple_response_payloads, run_protected_disk_mutation, validate_delete_versions_result_count,
     };
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
     use serde::{Deserialize, Serialize};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::sync::Notify;
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn delete_versions_result_count_must_match_request_count() {
+        assert!(validate_delete_versions_result_count(0, 0).is_ok());
+        assert!(validate_delete_versions_result_count(3, 3).is_ok());
+        assert!(validate_delete_versions_result_count(3, 2).is_err());
+        assert!(validate_delete_versions_result_count(3, 4).is_err());
     }
 
     #[test]
@@ -1213,6 +1355,36 @@ mod tests {
                 count: 7,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn protected_disk_mutation_survives_parent_cancellation() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task_completed = Arc::clone(&completed);
+
+        let parent = tokio::spawn(async move {
+            run_protected_disk_mutation("test mutation", async move {
+                task_entered.notify_one();
+                task_release.notified().await;
+                task_completed.store(true, Ordering::Release);
+            })
+            .await
+        });
+        entered.notified().await;
+        parent.abort();
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !completed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("protected mutation should finish after its parent is cancelled");
     }
 
     #[test]

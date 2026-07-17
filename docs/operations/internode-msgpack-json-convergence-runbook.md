@@ -84,16 +84,22 @@ first**. The following mapping is verified against the current code.
 ### `_bin` support added THIS release — converge after their own window
 
 The `DeleteVersion`/`DeleteVersions` protos had **no `_bin` fields**. They gained additive
-`*_bin` fields plus bin-first server decoders in this release, and the client now dual-writes
-them. They are **kept out** of the msgpack-only set (always dual-write) until their own
-fallback counter has read zero across a window with the new decoders fully deployed.
+`*_bin` fields plus bin-first server decoders in this release. Legacy-safe requests keep
+dual-writing until their own fallback counter has read zero across a window with the new
+decoders fully deployed. Delete rollback requests are the exception: they send a versioned
+MessagePack envelope and an empty JSON field so every predecessor rejects the request before
+mutation instead of decoding a shifted tuple layout. This fail-closed rejection is not visible
+in the JSON fallback counter. On a decode-boundary rejection only, the client retries the
+five-field compact layout supported by the #4300 predecessor; older four-field peers reject that
+layout at the fourth field before mutation. This retry is forbidden for rename compensation because
+the five-field layout cannot carry its transaction token. The discovered per-peer capability is cached.
 
 | Direction | Message / field | Status |
 |---|---|---|
 | request | `DeleteVersion.file_info` (`FileInfo`) | `_bin` added; dual-write; converge after window |
-| request | `DeleteVersion.opts` (`DeleteOptions`) | `_bin` added; dual-write; converge after window |
+| request | `DeleteVersion.opts` (`DeleteOptions`) | `_bin` added; dual-write unless delete rollback requires fail-closed compatibility |
 | request | `DeleteVersions.versions` (`FileInfoVersions`) | `_bin` added; dual-write; converge after window |
-| request | `DeleteVersions.opts` (`DeleteOptions`) | `_bin` added; dual-write; converge after window |
+| request | `DeleteVersions.opts` (`DeleteOptions`) | `_bin` added; dual-write unless delete rollback requires fail-closed compatibility |
 
 > Any `*_bin` proto field not in the tables above must be mapped to a confirmed `_bin`-first
 > peer decoder before it is added to the convergence set.

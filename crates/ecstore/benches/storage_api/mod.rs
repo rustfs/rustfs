@@ -26,6 +26,10 @@ pub(crate) mod erasure {
     pub(crate) use super::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
 }
 
+pub(crate) mod rename_transaction {
+    pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, Endpoint, LocalDisk, RUSTFS_META_TMP_BUCKET, STORAGE_FORMAT_FILE};
+}
+
 pub(crate) mod single_block_non_inline {
     pub(crate) use super::{BitrotWriterWrapper, CustomWriter, Erasure};
 }

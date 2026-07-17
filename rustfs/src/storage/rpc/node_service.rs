@@ -536,6 +536,13 @@ impl Node for NodeService {
         self.handle_refresh(request).await
     }
 
+    async fn refresh_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        self.handle_refresh_batch(request).await
+    }
+
     async fn lock_batch(
         &self,
         request: Request<BatchGenerallyLockRequest>,

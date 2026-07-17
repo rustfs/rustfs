@@ -27,6 +27,7 @@ use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use std::future::Future;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 use std::{
@@ -37,7 +38,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::RwLock, time};
+use tokio::{
+    sync::{RwLock, Semaphore},
+    time,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -50,11 +54,66 @@ const LOG_SUBSYSTEM_DISK: &str = "disk";
 const EVENT_DISK_HEALTH_CHECK_FAILED: &str = "disk_health_check_failed";
 const EVENT_DISK_RECOVERY_PROBE_STATE: &str = "disk_recovery_probe_state";
 const EVENT_DISK_TIMEOUT_POLICY_FALLBACK: &str = "disk_timeout_policy_fallback";
+const MAX_PROTECTED_LOCAL_MUTATIONS: usize = 256;
+static PROTECTED_LOCAL_MUTATIONS: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_PROTECTED_LOCAL_MUTATIONS)));
+
+async fn run_protected_local_mutation<T, F>(operation: &'static str, future: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let permit = Arc::clone(&PROTECTED_LOCAL_MUTATIONS)
+        .acquire_owned()
+        .await
+        .map_err(|err| DiskError::other(format!("{operation} supervisor unavailable: {err}")))?;
+    tokio::spawn(async move {
+        let _permit = permit;
+        future.await
+    })
+    .await
+    .map_err(|err| DiskError::other(format!("{operation} task failed: {err}")))
+}
+
+async fn delete_versions_tracked(
+    wrapper: &LocalDiskWrapper,
+    volume: &str,
+    versions: Vec<FileInfoVersions>,
+    opts: DeleteOptions,
+) -> Vec<Option<Error>> {
+    if wrapper.health.is_faulty() {
+        return vec![Some(DiskError::FaultyDisk); versions.len()];
+    }
+    if let Err(err) = wrapper.check_disk_stale().await {
+        return vec![Some(err); versions.len()];
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    wrapper.health.last_started.store(now, Ordering::Relaxed);
+    wrapper.health.increment_waiting();
+    let result = wrapper.disk.delete_versions(volume, versions, opts).await;
+    wrapper.health.decrement_waiting();
+    if result.iter().all(Option::is_none) {
+        wrapper
+            .health
+            .record_operation_success(&wrapper.endpoint(), "operation_success");
+    }
+    result
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimeoutHealthAction {
     MarkFailure,
     IgnoreFailure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeoutCompletionAction {
+    Cancel,
+    WaitForCompletion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -862,6 +921,7 @@ impl LocalDiskWrapper {
                     undo_write: false,
                     undo_delete: false,
                     old_data_dir: None,
+                    rename_rollback_token: None,
                 },
             )
             .await?;
@@ -1049,8 +1109,14 @@ impl LocalDiskWrapper {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        self.track_disk_health_with_op_and_timeout_action(op, operation, timeout_duration, TimeoutHealthAction::MarkFailure)
-            .await
+        self.track_disk_health_with_op_and_timeout_actions(
+            op,
+            operation,
+            timeout_duration,
+            TimeoutHealthAction::MarkFailure,
+            TimeoutCompletionAction::Cancel,
+        )
+        .await
     }
 
     async fn track_disk_health_with_op_and_timeout_action<T, F, Fut>(
@@ -1059,6 +1125,48 @@ impl LocalDiskWrapper {
         operation: F,
         timeout_duration: Duration,
         timeout_health_action: TimeoutHealthAction,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.track_disk_health_with_op_and_timeout_actions(
+            op,
+            operation,
+            timeout_duration,
+            timeout_health_action,
+            TimeoutCompletionAction::Cancel,
+        )
+        .await
+    }
+
+    async fn track_disk_health_with_op_until_complete<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.track_disk_health_with_op_and_timeout_actions(
+            op,
+            operation,
+            timeout_duration,
+            TimeoutHealthAction::MarkFailure,
+            TimeoutCompletionAction::WaitForCompletion,
+        )
+        .await
+    }
+
+    async fn track_disk_health_with_op_and_timeout_actions<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        timeout_health_action: TimeoutHealthAction,
+        timeout_completion_action: TimeoutCompletionAction,
     ) -> Result<T>
     where
         F: FnOnce() -> Fut,
@@ -1083,7 +1191,7 @@ impl LocalDiskWrapper {
         // Record operation start
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos() as i64;
         self.health.last_started.store(now, Ordering::Relaxed);
         let _waiting_guard = self.health.waiting_guard();
@@ -1095,8 +1203,11 @@ impl LocalDiskWrapper {
             }
             return result;
         }
-        // Execute the operation with timeout
-        let result = tokio::time::timeout(timeout_duration, operation()).await;
+        // Keep ownership of protected mutations after the timeout so a
+        // non-cancellable spawn_blocking section cannot commit after this call
+        // has returned and compensation has started.
+        let mut operation = Box::pin(operation());
+        let result = tokio::time::timeout(timeout_duration, operation.as_mut()).await;
 
         match result {
             Ok(operation_result) => {
@@ -1129,6 +1240,9 @@ impl LocalDiskWrapper {
                     reason = "operation_timeout",
                     "Disk operation timed out"
                 );
+                if timeout_completion_action == TimeoutCompletionAction::WaitForCompletion {
+                    let _ = operation.await;
+                }
                 Err(DiskError::Timeout)
             }
         }
@@ -1288,6 +1402,22 @@ impl DiskAPI for LocalDiskWrapper {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
+        let protect_from_cancellation = opts.requires_delete_rollback_protocol();
+        if protect_from_cancellation {
+            let wrapper = self.clone();
+            let volume = volume.to_string();
+            let path = path.to_string();
+            return run_protected_local_mutation("delete version", async move {
+                wrapper
+                    .track_disk_health_with_op_until_complete(
+                        "delete_version",
+                        || async { wrapper.disk.delete_version(&volume, &path, fi, force_del_marker, opts).await },
+                        get_max_timeout_duration(),
+                    )
+                    .await
+            })
+            .await?;
+        }
         self.track_disk_health(
             || async { self.disk.delete_version(volume, path, fi, force_del_marker, opts).await },
             get_max_timeout_duration(),
@@ -1296,35 +1426,21 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
-        // Check if disk is faulty before proceeding
-        if self.health.is_faulty() {
-            return vec![Some(DiskError::FaultyDisk); versions.len()];
+        let result_len = versions.len();
+        let protect_from_cancellation = opts.requires_delete_rollback_protocol();
+        if protect_from_cancellation {
+            let wrapper = self.clone();
+            let volume = volume.to_string();
+            return match run_protected_local_mutation("delete versions", async move {
+                delete_versions_tracked(&wrapper, &volume, versions, opts).await
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => vec![Some(err); result_len],
+            };
         }
-
-        // Check if disk is stale
-        if let Err(e) = self.check_disk_stale().await {
-            return vec![Some(e); versions.len()];
-        }
-
-        // Record operation start
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        self.health.last_started.store(now, Ordering::Relaxed);
-        self.health.increment_waiting();
-
-        // Execute the operation
-        let result = self.disk.delete_versions(volume, versions, opts).await;
-
-        self.health.decrement_waiting();
-        let has_err = result.iter().any(|e| e.is_some());
-        if !has_err {
-            // Log success and decrement waiting counter
-            self.health.record_operation_success(&self.endpoint(), "operation_success");
-        }
-
-        result
+        delete_versions_tracked(self, volume, versions, opts).await
     }
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
@@ -1382,6 +1498,40 @@ impl DiskAPI for LocalDiskWrapper {
             get_max_timeout_duration(),
         )
         .await
+    }
+
+    async fn rename_data_with_rollback(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        rollback_token: Uuid,
+    ) -> Result<RenameDataResp> {
+        if rollback_token.is_nil() {
+            return Err(DiskError::other("rename rollback token must not be nil"));
+        }
+        let wrapper = self.clone();
+        let src_volume = src_volume.to_string();
+        let src_path = src_path.to_string();
+        let dst_volume = dst_volume.to_string();
+        let dst_path = dst_path.to_string();
+        run_protected_local_mutation("rename data", async move {
+            wrapper
+                .track_disk_health_with_op_until_complete(
+                    "rename_data",
+                    || async {
+                        wrapper
+                            .disk
+                            .rename_data_with_rollback(&src_volume, &src_path, fi, &dst_volume, &dst_path, rollback_token)
+                            .await
+                    },
+                    get_max_timeout_duration(),
+                )
+                .await
+        })
+        .await?
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
@@ -1548,6 +1698,38 @@ mod tests {
         let _ = task.await;
 
         assert_eq!(wrapper.health.waiting_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn protected_local_mutation_outlives_caller_cancellation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task_completed = Arc::clone(&completed);
+
+        let caller = tokio::spawn(async move {
+            run_protected_local_mutation("test mutation", async move {
+                task_entered.notify_one();
+                task_release.notified().await;
+                task_completed.store(true, Ordering::Release);
+                Ok::<(), DiskError>(())
+            })
+            .await
+        });
+        entered.notified().await;
+        caller.abort();
+        assert!(caller.await.expect_err("caller task should be cancelled").is_cancelled());
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !completed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("protected mutation should continue after caller cancellation");
     }
 
     impl AsyncWrite for PendingWriter {
@@ -1853,6 +2035,56 @@ mod tests {
         assert_eq!(result.expect_err("operation should time out"), DiskError::Timeout);
         assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
         assert!(!wrapper.health.is_faulty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protected_timeout_waits_for_mutation_terminal_state() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = LocalDiskWrapper::new(disk, false);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task_completed = Arc::clone(&completed);
+
+        let mutation = tokio::spawn(async move {
+            wrapper
+                .track_disk_health_with_op_until_complete(
+                    "rename_data",
+                    || async move {
+                        task_entered.notify_one();
+                        task_release.notified().await;
+                        task_completed.store(true, Ordering::Release);
+                        Ok(())
+                    },
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+        entered.notified().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(!mutation.is_finished(), "a timed-out protected mutation must remain supervised");
+        assert!(
+            !completed.load(Ordering::Acquire),
+            "the mutation must still be pending at the health timeout"
+        );
+
+        release.notify_one();
+        let err = mutation
+            .await
+            .expect("protected mutation task should join")
+            .expect_err("elapsed health deadline should remain visible to the caller");
+        assert_eq!(err, DiskError::Timeout);
+        assert!(
+            completed.load(Ordering::Acquire),
+            "the mutation must reach terminal state before timeout is returned"
+        );
     }
 
     #[tokio::test]

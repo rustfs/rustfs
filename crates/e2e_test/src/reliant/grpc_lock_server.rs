@@ -230,6 +230,44 @@ impl NodeService for MinimalLockNodeService {
         }
     }
 
+    async fn refresh_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut lock_ids = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<LockRequest>(arg) {
+                Ok(args) => {
+                    lock_ids.push(args.lock_id);
+                    valid_indices.push(idx);
+                }
+                Err(err) => {
+                    results[idx] = lock_result_from_error(format!("can not decode args, err: {err}"));
+                }
+            }
+        }
+
+        for (result_idx, result) in self.lock_client.refresh_locks_batch(&lock_ids).await.into_iter().enumerate() {
+            let Some(request_idx) = valid_indices.get(result_idx) else {
+                break;
+            };
+            results[*request_idx] = match result {
+                Ok(success) => GenerallyLockResult {
+                    success,
+                    error_info: None,
+                    lock_info: None,
+                },
+                Err(err) => lock_result_from_error(format!("can not refresh, err: {err}")),
+            };
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse { results }))
+    }
+
     async fn lock_batch(
         &self,
         request: Request<BatchGenerallyLockRequest>,

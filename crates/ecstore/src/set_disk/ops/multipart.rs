@@ -1435,12 +1435,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // `get_object_info` lookup, so the backfill has no consumer here yet.
         let (online_disks, convergence, op_old_dir, cleanup_disks, _) = Self::rename_data(
             &shuffle_disks,
-            RUSTFS_META_MULTIPART_BUCKET,
-            &upload_id_path,
+            (RUSTFS_META_MULTIPART_BUCKET, &upload_id_path),
             &parts_metadatas,
-            bucket,
-            object,
+            (bucket, object),
             write_quorum,
+            object_lock_guard.take(),
         )
         .await?;
 

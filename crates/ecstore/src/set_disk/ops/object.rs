@@ -72,6 +72,251 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
     Some(object_info.size)
 }
 
+#[cfg(test)]
+static AMBIGUOUS_DELETE_FAILURES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, usize)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+const BATCH_DELETE_SCALE_TEST_PREFIX: &str = "aggregation-scale-";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchDeleteTestPhase {
+    Forward,
+    Rollback,
+    Cleanup,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BatchDeleteTestCall {
+    phase: BatchDeleteTestPhase,
+    disk_index: usize,
+    item_count: usize,
+}
+
+#[cfg(test)]
+static BATCH_DELETE_TEST_CALLS: std::sync::LazyLock<std::sync::Mutex<Vec<BatchDeleteTestCall>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn record_batch_delete_test_call(
+    phase: BatchDeleteTestPhase,
+    disk_index: usize,
+    item_count: usize,
+    contains_scale_test_item: bool,
+) {
+    if contains_scale_test_item {
+        BATCH_DELETE_TEST_CALLS
+            .lock()
+            .expect("batch delete test call lock should not be poisoned")
+            .push(BatchDeleteTestCall {
+                phase,
+                disk_index,
+                item_count,
+            });
+    }
+}
+
+#[cfg(test)]
+fn clear_batch_delete_test_calls() {
+    BATCH_DELETE_TEST_CALLS
+        .lock()
+        .expect("batch delete test call lock should not be poisoned")
+        .clear();
+}
+
+#[cfg(test)]
+fn batch_delete_test_calls() -> Vec<BatchDeleteTestCall> {
+    BATCH_DELETE_TEST_CALLS
+        .lock()
+        .expect("batch delete test call lock should not be poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+fn inject_ambiguous_delete_failure(object: &str, disk_index: usize) {
+    AMBIGUOUS_DELETE_FAILURES
+        .lock()
+        .expect("ambiguous delete failpoint lock should not be poisoned")
+        .insert((object.to_string(), disk_index));
+}
+
+#[cfg(test)]
+fn take_ambiguous_delete_failure(object: &str, disk_index: usize) -> bool {
+    AMBIGUOUS_DELETE_FAILURES
+        .lock()
+        .expect("ambiguous delete failpoint lock should not be poisoned")
+        .remove(&(object.to_string(), disk_index))
+}
+
+#[cfg(test)]
+fn inject_single_delete_result(object: &str, disk_index: usize, result: disk::error::Result<()>) -> disk::error::Result<()> {
+    if result.is_ok() && take_ambiguous_delete_failure(object, disk_index) {
+        Err(DiskError::Unexpected)
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+fn inject_batch_delete_results(
+    disk_index: usize,
+    versions: &[FileInfoVersions],
+    mut results: Vec<Option<DiskError>>,
+) -> Vec<Option<DiskError>> {
+    for (index, version) in versions.iter().enumerate() {
+        if take_ambiguous_delete_failure(&version.name, disk_index) {
+            results[index] = Some(DiskError::Unexpected);
+        }
+    }
+    results
+}
+
+/// Normalize one disk's `DeleteVersions` response to the request cardinality.
+/// A short response is a protocol/implementation failure for every omitted
+/// entry, not permission to index past the returned vector or assume success.
+fn normalize_delete_versions_results(results: Vec<Option<DiskError>>, expected_len: usize) -> Vec<Option<DiskError>> {
+    if results.len() == expected_len {
+        return results;
+    }
+
+    (0..expected_len).map(|_| Some(DiskError::Unexpected)).collect()
+}
+
+async fn delete_object_version_with_guard(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+    fi: &FileInfo,
+    force_del_marker: bool,
+    object_lock_guard: Option<&ObjectLockDiagGuard>,
+) -> Result<()> {
+    let disks = set.disk_inventory().await;
+    let write_quorum = disks.len() / 2 + 1;
+    let rollback_dir = Uuid::new_v4();
+
+    let mut futures = Vec::with_capacity(disks.len());
+    let mut errs = Vec::with_capacity(disks.len());
+
+    for (disk_index, disk) in disks.iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = disk_index;
+        futures.push(async move {
+            if let Some(disk) = disk {
+                let result = disk
+                    .delete_version(
+                        bucket,
+                        object,
+                        fi.clone(),
+                        force_del_marker,
+                        DeleteOptions {
+                            old_data_dir: Some(rollback_dir),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                #[cfg(test)]
+                let result = inject_single_delete_result(object, disk_index, result);
+                result
+            } else {
+                Err(DiskError::DiskNotFound)
+            }
+        });
+    }
+
+    let results = join_all(futures).await;
+    for result in results {
+        match result {
+            Ok(_) => errs.push(None),
+            Err(err) => errs.push(Some(err)),
+        }
+    }
+
+    // The lease may be lost while the delete fan-out is in flight. Even if
+    // write quorum replied successfully, this coordinator can no longer ACK:
+    // another writer may own the namespace. Preserve rollback state and use
+    // the token-conditional undo on every possible committer.
+    let lock_lost = object_lock_guard.is_some_and(ObjectLockDiagGuard::is_lock_lost);
+    let quorum_result = if lock_lost {
+        Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "delete_object_commit",
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        })
+    } else {
+        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+    };
+
+    if quorum_result.is_err() {
+        let mut rollback_futures = Vec::new();
+        for disk in &disks {
+            let Some(disk) = disk.as_ref() else {
+                continue;
+            };
+
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let fi = fi.clone();
+            rollback_futures.push(async move {
+                if let Err(err) = disk
+                    .delete_version(
+                        &bucket,
+                        &object,
+                        fi,
+                        force_del_marker,
+                        DeleteOptions {
+                            undo_write: true,
+                            undo_delete: true,
+                            old_data_dir: Some(rollback_dir),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        bucket = %bucket,
+                        object = %object,
+                        rollback_dir = %rollback_dir,
+                        error = ?err,
+                        "failed to roll back delete after write quorum failure"
+                    );
+                }
+            });
+        }
+
+        join_all(rollback_futures).await;
+    } else {
+        let mut cleanup_futures = Vec::new();
+        for disk in disks.iter().flatten() {
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            cleanup_futures.push(async move {
+                let rollback_path = format!("{object}/{rollback_dir}");
+                if let Err(err) = disk.delete_paths(&bucket, &[rollback_path]).await
+                    && err != DiskError::FileNotFound
+                    && err != DiskError::VolumeNotFound
+                {
+                    warn!(
+                        bucket = %bucket,
+                        object = %object,
+                        rollback_dir = %rollback_dir,
+                        error = ?err,
+                        "failed to clean delete rollback state after quorum success"
+                    );
+                }
+            });
+        }
+        join_all(cleanup_futures).await;
+    }
+
+    quorum_result
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type Error = Error;
@@ -1001,12 +1246,11 @@ impl SetDisks {
             let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
                 &shuffle_disks,
-                RUSTFS_META_TMP_BUCKET,
-                tmp_dir.as_str(),
+                (RUSTFS_META_TMP_BUCKET, tmp_dir.as_str()),
                 &parts_metadatas,
-                bucket,
-                object,
+                (bucket, object),
                 write_quorum,
+                object_lock_guard.take(),
             )
             .await?;
             let rename_stage_ms = rename_stage_start.elapsed().as_millis() as u64;
@@ -1398,128 +1642,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        let disks = self.disk_inventory().await;
-        let write_quorum = disks.len() / 2 + 1;
-        let rollback_dir = Uuid::new_v4();
-
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errs = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    match disk
-                        .delete_version(
-                            bucket,
-                            object,
-                            fi.clone(),
-                            force_del_marker,
-                            DeleteOptions {
-                                old_data_dir: Some(rollback_dir),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                    {
-                        Ok(r) => Ok(r),
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Err(DiskError::DiskNotFound)
-                }
-            });
-        }
-
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(_) => {
-                    errs.push(None);
-                }
-                Err(e) => {
-                    errs.push(Some(e));
-                }
-            }
-        }
-
-        let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
-        let should_rollback = quorum_result.is_err();
-        let mut rollback_futures = Vec::new();
-        for (index, err) in errs.iter().enumerate() {
-            // backlog#1158: when rolling back, fan the idempotent undo out to every
-            // online disk (each self-decides from its staged backup: restore if the
-            // rollback dir is present, no-op otherwise). This covers a disk that
-            // staged + applied the delete and *then* errored, which the plain
-            // `err.is_some()` skip would leave deleted while its peers were restored.
-            // On success only the successful disks' backup dirs need cleaning; errored
-            // disks' residue is reclaimed by heal/scanner.
-            if !should_rollback && err.is_some() {
-                continue;
-            }
-
-            let Some(disk) = disks[index].as_ref() else {
-                continue;
-            };
-
-            let disk = disk.clone();
-            let bucket = bucket.to_string();
-            let object = object.to_string();
-            let fi = fi.clone();
-            rollback_futures.push(async move {
-                if should_rollback {
-                    if let Err(err) = disk
-                        .delete_version(
-                            &bucket,
-                            &object,
-                            fi,
-                            force_del_marker,
-                            DeleteOptions {
-                                undo_write: true,
-                                undo_delete: true,
-                                old_data_dir: Some(rollback_dir),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                    {
-                        warn!(
-                            bucket = %bucket,
-                            object = %object,
-                            rollback_dir = %rollback_dir,
-                            error = ?err,
-                            "failed to roll back delete after write quorum failure"
-                        );
-                    }
-                } else {
-                    let rollback_path = format!("{object}/{rollback_dir}");
-                    if let Err(err) = disk
-                        .delete(
-                            &bucket,
-                            &rollback_path,
-                            DeleteOptions {
-                                recursive: true,
-                                immediate: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        && err != DiskError::FileNotFound
-                        && err != DiskError::VolumeNotFound
-                    {
-                        warn!(
-                            bucket = %bucket,
-                            object = %object,
-                            rollback_dir = %rollback_dir,
-                            error = ?err,
-                            "failed to clean delete rollback state after quorum success"
-                        );
-                    }
-                }
-            });
-        }
-
-        join_all(rollback_futures).await;
-        quorum_result
+        delete_object_version_with_guard(self, bucket, object, fi, force_del_marker, None).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -1529,307 +1652,370 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        for object in &objects {
-            self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
-        }
-
-        // Default return value
-        let mut del_objects = vec![DeletedObject::default(); objects.len()];
-
-        let mut del_errs = Vec::with_capacity(objects.len());
-
-        for _ in 0..objects.len() {
-            del_errs.push(None)
-        }
-
-        // Acquire locks in batch mode (best effort, matching previous behavior)
-        let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
-        let mut unique_objects: HashSet<String> = HashSet::new();
-        for dobj in &objects {
-            if unique_objects.insert(dobj.object_name.clone()) {
-                batch = batch.add_write_lock(ObjectKey::new(bucket, dobj.object_name.clone()));
-            }
-        }
-        let unique_lock_count = batch.requests.len();
-
-        let mut failed_map = HashMap::new();
-        let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
-        let mut locked_objects = HashSet::new();
-
-        let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
-        let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
-
-        if opts.no_lock {
-            locked_objects = unique_objects;
-        } else if dist_erasure {
-            (failed_map, locked_objects, dist_batch_lock_ids) = self.acquire_dist_delete_object_locks_batch(&batch).await;
-        } else {
-            let batch_result = self.local_lock_manager.acquire_locks_batch(batch).await;
-            _local_batch_guards = batch_result.guards;
-
-            for key in batch_result.successful_locks {
-                locked_objects.insert(key.object.as_ref().to_string());
+        let set = self.clone();
+        let bucket = bucket.to_string();
+        cancellation_shield(async move {
+            let bucket = bucket.as_str();
+            for object in &objects {
+                set.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
             }
 
-            for (key, err) in batch_result.failed_locks {
-                failed_map.insert((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), format!("{err:?}"));
-            }
-        }
+            // Default return value
+            let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
-        if issue3031_diag_enabled() {
-            let failed_lock_count = failed_map.len();
-            let locked_object_count = locked_objects.len();
-            let dist_lock_id_count = dist_batch_lock_ids.iter().map(Vec::len).sum::<usize>();
-            warn!(
-                target: "rustfs_ecstore::set_disk",
-                bucket = %bucket,
-                requested_object_count = objects.len(),
-                unique_lock_count,
-                locked_object_count,
-                failed_lock_count,
-                dist_erasure,
-                dist_lock_id_count,
-                failed_objects = ?failed_map.keys().collect::<Vec<_>>(),
-                "issue3031_delete_objects_lock_batch_context"
-            );
-        }
+            let mut del_errs = Vec::with_capacity(objects.len());
 
-        // Mark failures for objects that could not be locked
-        for (i, dobj) in objects.iter().enumerate() {
-            if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
-                del_errs[i] = Some(Error::other(err.to_string()));
-            }
-        }
-
-        let ver_cfg = BucketVersioningSys::get(bucket).await.unwrap_or_default();
-
-        // backlog#929 (HP-8): the per-object stat below exists solely to feed
-        // check_object_lock_delete (#4297). Resolve the bucket lock
-        // configuration once (in-memory cache) and skip the whole stat fanout
-        // for buckets without Object Lock; unknown metadata fails closed and
-        // keeps the stat, so the #4297 protection is preserved verbatim for
-        // every object-lock-enabled bucket.
-        let object_lock_checks_required = object_lock_delete_check_required(metadata_sys::get(bucket).await.ok().as_deref());
-
-        let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
-
-        for (i, dobj) in objects.iter().enumerate() {
-            if del_errs[i].is_some() {
-                continue;
+            for _ in 0..objects.len() {
+                del_errs.push(None)
             }
 
-            let explicit_null_version = is_explicit_null_version(dobj.version_id);
-            let version_id = delete_file_info_version_id(dobj.version_id);
-            if object_lock_checks_required {
-                let check_opts = ObjectOptions {
-                    version_id: version_id.map(|version_id| version_id.to_string()),
-                    versioned: ver_cfg.prefix_enabled(dobj.object_name.as_str()),
-                    version_suspended: ver_cfg.suspended(),
-                    object_lock_delete: opts.object_lock_delete.clone(),
-                    no_lock: true,
-                    ..Default::default()
-                };
-                let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
-                if gerr.is_none()
-                    && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
-                {
-                    del_errs[i] = Some(err);
+            // Acquire locks in batch mode (best effort, matching previous behavior)
+            let mut batch = rustfs_lock::BatchLockRequest::new(set.locker_owner.as_str()).with_all_or_nothing(false);
+            let mut unique_objects: HashSet<String> = HashSet::new();
+            for dobj in &objects {
+                if unique_objects.insert(dobj.object_name.clone()) {
+                    batch = batch.add_write_lock(ObjectKey::new(bucket, dobj.object_name.clone()));
+                }
+            }
+            let unique_lock_count = batch.requests.len();
+
+            let mut failed_map = HashMap::new();
+            let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
+            let mut locked_objects = HashSet::new();
+
+            let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
+            let mut dist_batch_lock_lease = DistDeleteBatchLockLease::empty(set.lockers.clone());
+
+            if opts.no_lock {
+                locked_objects = unique_objects;
+            } else if dist_erasure {
+                (failed_map, locked_objects, dist_batch_lock_lease) = set.acquire_dist_delete_object_locks_batch(&batch).await;
+            } else {
+                let batch_result = set.local_lock_manager.acquire_locks_batch(batch).await;
+                _local_batch_guards = batch_result.guards;
+
+                for key in batch_result.successful_locks {
+                    locked_objects.insert(key.object.as_ref().to_string());
+                }
+
+                for (key, err) in batch_result.failed_locks {
+                    failed_map.insert((key.bucket.as_ref().to_string(), key.object.as_ref().to_string()), format!("{err:?}"));
+                }
+            }
+
+            if issue3031_diag_enabled() {
+                let failed_lock_count = failed_map.len();
+                let locked_object_count = locked_objects.len();
+                let dist_lock_id_count = dist_batch_lock_lease.lock_ids_by_client.iter().map(Vec::len).sum::<usize>();
+                warn!(
+                    target: "rustfs_ecstore::set_disk",
+                    bucket = %bucket,
+                    requested_object_count = objects.len(),
+                    unique_lock_count,
+                    locked_object_count,
+                    failed_lock_count,
+                    dist_erasure,
+                    dist_lock_id_count,
+                    failed_objects = ?failed_map.keys().collect::<Vec<_>>(),
+                    "issue3031_delete_objects_lock_batch_context"
+                );
+            }
+
+            // Mark failures for objects that could not be locked
+            for (i, dobj) in objects.iter().enumerate() {
+                if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
+                    del_errs[i] = Some(Error::other(err.to_string()));
+                }
+            }
+
+            let ver_cfg = BucketVersioningSys::get(bucket).await.unwrap_or_default();
+
+            // backlog#929 (HP-8): the per-object stat below exists solely to feed
+            // check_object_lock_delete (#4297). Resolve the bucket lock
+            // configuration once (in-memory cache) and skip the whole stat fanout
+            // for buckets without Object Lock; unknown metadata fails closed and
+            // keeps the stat, so the #4297 protection is preserved verbatim for
+            // every object-lock-enabled bucket.
+            let object_lock_checks_required = object_lock_delete_check_required(metadata_sys::get(bucket).await.ok().as_deref());
+
+            let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
+
+            for (i, dobj) in objects.iter().enumerate() {
+                if del_errs[i].is_some() {
                     continue;
                 }
-            }
 
-            let mut vr = FileInfo {
-                name: dobj.object_name.clone(),
-                version_id,
-                idx: i,
-                replication_state_internal: Some(dobj.replication_state()),
-                ..Default::default()
-            };
-
-            vr.set_tier_free_version_id(&Uuid::new_v4().to_string());
-
-            // Delete
-            // del_objects[i].object_name.clone_from(&vr.name);
-            // del_objects[i].version_id = vr.version_id.map(|v| v.to_string());
-
-            if dobj.version_id.is_none() {
-                let (suspended, versioned) = (ver_cfg.suspended(), ver_cfg.prefix_enabled(dobj.object_name.as_str()));
-                if suspended || versioned {
-                    vr.mod_time = Some(OffsetDateTime::now_utc());
-                    vr.deleted = true;
-                    if versioned {
-                        vr.version_id = Some(Uuid::new_v4());
+                let explicit_null_version = is_explicit_null_version(dobj.version_id);
+                let version_id = delete_file_info_version_id(dobj.version_id);
+                if object_lock_checks_required {
+                    let check_opts = ObjectOptions {
+                        version_id: version_id.map(|version_id| version_id.to_string()),
+                        versioned: ver_cfg.prefix_enabled(dobj.object_name.as_str()),
+                        version_suspended: ver_cfg.suspended(),
+                        object_lock_delete: opts.object_lock_delete.clone(),
+                        no_lock: true,
+                        ..Default::default()
+                    };
+                    let (goi, _write_quorum, gerr) = set.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
+                    if gerr.is_none()
+                        && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
+                    {
+                        del_errs[i] = Some(err);
+                        continue;
                     }
                 }
-            }
 
-            let v = {
-                if vers_map.contains_key(&dobj.object_name) {
-                    let val = vers_map.get_mut(&dobj.object_name).unwrap();
-                    val.versions.push(vr.clone());
-                    val.clone()
+                let mut vr = FileInfo {
+                    name: dobj.object_name.clone(),
+                    version_id,
+                    idx: i,
+                    replication_state_internal: Some(dobj.replication_state()),
+                    ..Default::default()
+                };
+
+                vr.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+                // Delete
+                // del_objects[i].object_name.clone_from(&vr.name);
+                // del_objects[i].version_id = vr.version_id.map(|v| v.to_string());
+
+                if dobj.version_id.is_none() {
+                    let (suspended, versioned) = (ver_cfg.suspended(), ver_cfg.prefix_enabled(dobj.object_name.as_str()));
+                    if suspended || versioned {
+                        vr.mod_time = Some(OffsetDateTime::now_utc());
+                        vr.deleted = true;
+                        if versioned {
+                            vr.version_id = Some(Uuid::new_v4());
+                        }
+                    }
+                }
+
+                let v = {
+                    if vers_map.contains_key(&dobj.object_name) {
+                        let val = vers_map.get_mut(&dobj.object_name).unwrap();
+                        val.versions.push(vr.clone());
+                        val.clone()
+                    } else {
+                        FileInfoVersions {
+                            name: vr.name.clone(),
+                            versions: vec![vr.clone()],
+                            ..Default::default()
+                        }
+                    }
+                };
+
+                if vr.deleted {
+                    del_objects[i] = DeletedObject {
+                        delete_marker: vr.deleted,
+                        delete_marker_version_id: vr.version_id,
+                        delete_marker_mtime: vr.mod_time,
+                        object_name: vr.name.clone(),
+                        replication_state: vr.replication_state_internal.clone(),
+                        ..Default::default()
+                    }
                 } else {
-                    FileInfoVersions {
-                        name: vr.name.clone(),
-                        versions: vec![vr.clone()],
+                    del_objects[i] = DeletedObject {
+                        object_name: vr.name.clone(),
+                        version_id: if explicit_null_version {
+                            Some(Uuid::nil())
+                        } else {
+                            vr.version_id
+                        },
+                        replication_state: vr.replication_state_internal.clone(),
                         ..Default::default()
                     }
                 }
-            };
 
-            if vr.deleted {
-                del_objects[i] = DeletedObject {
-                    delete_marker: vr.deleted,
-                    delete_marker_version_id: vr.version_id,
-                    delete_marker_mtime: vr.mod_time,
-                    object_name: vr.name.clone(),
-                    replication_state: vr.replication_state_internal.clone(),
-                    ..Default::default()
+                // Only add to vers_map if we hold the lock
+                if locked_objects.contains(&dobj.object_name) {
+                    vers_map.insert(&dobj.object_name, v);
                 }
-            } else {
-                del_objects[i] = DeletedObject {
-                    object_name: vr.name.clone(),
-                    version_id: if explicit_null_version {
-                        Some(Uuid::nil())
+            }
+
+            let mut vers = Vec::with_capacity(vers_map.len());
+
+            for (_, mut fi_vers) in vers_map {
+                fi_vers.versions.sort_by_key(|a| a.deleted);
+
+                if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
+                    fi_vers.versions.truncate(index + 1);
+                }
+
+                vers.push(fi_vers);
+            }
+
+            let lost_before_forward = dist_batch_lock_lease.lost_objects();
+            if !lost_before_forward.is_empty() {
+                vers.retain(|fi_vers| {
+                    if !lost_before_forward.contains(&fi_vers.name) {
+                        return true;
+                    }
+                    for fi in &fi_vers.versions {
+                        del_errs[fi.idx] = Some(Error::other("distributed delete lock quorum was lost"));
+                    }
+                    false
+                });
+            }
+
+            let rollback_dir = Uuid::new_v4();
+
+            let disks = set.disks.read().await;
+
+            let disks = disks.clone();
+
+            let mut futures = Vec::with_capacity(disks.len());
+
+            // let mut errors = Vec::with_capacity(disks.len());
+
+            for (disk_index, disk) in disks.iter().enumerate() {
+                let vers = vers.clone();
+                futures.push(async move {
+                    if let Some(disk) = disk {
+                        #[cfg(test)]
+                        record_batch_delete_test_call(
+                            BatchDeleteTestPhase::Forward,
+                            disk_index,
+                            vers.len(),
+                            vers.iter()
+                                .any(|versions| versions.name.starts_with(BATCH_DELETE_SCALE_TEST_PREFIX)),
+                        );
+                        let requested_len = vers.len();
+                        #[cfg(test)]
+                        let injected_versions = vers.clone();
+                        let results = disk
+                            .delete_versions(
+                                bucket,
+                                vers,
+                                DeleteOptions {
+                                    old_data_dir: Some(rollback_dir),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        let returned_len = results.len();
+                        if returned_len != requested_len {
+                            warn!(
+                                disk_index,
+                                requested_len, returned_len, "delete_versions returned a result vector with unexpected length"
+                            );
+                        }
+                        let results = normalize_delete_versions_results(results, requested_len);
+                        #[cfg(test)]
+                        let results = inject_batch_delete_results(disk_index, &injected_versions, results);
+                        results
                     } else {
-                        vr.version_id
-                    },
-                    replication_state: vr.replication_state_internal.clone(),
-                    ..Default::default()
-                }
-            }
-
-            // Only add to vers_map if we hold the lock
-            if locked_objects.contains(&dobj.object_name) {
-                vers_map.insert(&dobj.object_name, v);
-            }
-        }
-
-        let mut vers = Vec::with_capacity(vers_map.len());
-
-        for (_, mut fi_vers) in vers_map {
-            fi_vers.versions.sort_by_key(|a| a.deleted);
-
-            if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
-                fi_vers.versions.truncate(index + 1);
-            }
-
-            vers.push(fi_vers);
-        }
-
-        let rollback_dir = Uuid::new_v4();
-
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
-
-        let mut futures = Vec::with_capacity(disks.len());
-
-        // let mut errors = Vec::with_capacity(disks.len());
-
-        for disk in disks.iter() {
-            let vers = vers.clone();
-            futures.push(async move {
-                if let Some(disk) = disk {
-                    disk.delete_versions(
-                        bucket,
-                        vers,
-                        DeleteOptions {
-                            old_data_dir: Some(rollback_dir),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                } else {
-                    let mut errs = Vec::with_capacity(vers.len());
-                    for _ in 0..vers.len() {
-                        errs.push(Some(DiskError::DiskNotFound));
+                        let mut errs = Vec::with_capacity(vers.len());
+                        for _ in 0..vers.len() {
+                            errs.push(Some(DiskError::DiskNotFound));
+                        }
+                        errs
                     }
-                    errs
-                }
-            });
-        }
+                });
+            }
 
-        let results = join_all(futures).await;
+            let results = join_all(futures).await;
+            let lost_during_forward = dist_batch_lock_lease.lost_objects();
 
-        let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
+            let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
 
-        // For each disk delete all objects
-        for (disk_idx, errors) in results.into_iter().enumerate() {
-            // Deletion results for all objects
-            for idx in 0..vers.len() {
-                if errors[idx].is_some() {
-                    for fi in vers[idx].versions.iter() {
-                        del_obj_errs[disk_idx][fi.idx] = errors[idx].clone();
+            // For each disk delete all objects
+            for (disk_idx, errors) in results.into_iter().enumerate() {
+                // Deletion results for all objects
+                for (idx, versions) in vers.iter().enumerate() {
+                    let error = errors.get(idx).cloned().unwrap_or(Some(DiskError::Unexpected));
+                    if error.is_some() {
+                        for fi in &versions.versions {
+                            del_obj_errs[disk_idx][fi.idx] = error.clone();
+                        }
                     }
                 }
             }
-        }
 
-        for obj_idx in 0..objects.len() {
-            let mut disk_err = vec![None; disks.len()];
-
-            for disk_idx in 0..disks.len() {
-                if del_obj_errs[disk_idx][obj_idx].is_some() {
-                    disk_err[disk_idx] = del_obj_errs[disk_idx][obj_idx].clone();
+            for obj_idx in 0..objects.len() {
+                if lost_during_forward.contains(&objects[obj_idx].object_name) {
+                    del_errs[obj_idx] = Some(Error::other("distributed delete lock quorum was lost"));
+                    continue;
                 }
-            }
+                let mut disk_err = vec![None; disks.len()];
 
-            let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, disks.len() / 2 + 1);
-            if let Some(err) = has_err.clone() {
-                let er = err.into();
-                if (is_err_object_not_found(&er) || is_err_version_not_found(&er)) && !del_objects[obj_idx].delete_marker {
-                    has_err = None;
+                for disk_idx in 0..disks.len() {
+                    if del_obj_errs[disk_idx][obj_idx].is_some() {
+                        disk_err[disk_idx] = del_obj_errs[disk_idx][obj_idx].clone();
+                    }
                 }
-            } else {
-                del_objects[obj_idx].found = true;
-            }
 
-            if let Some(err) = has_err {
-                if del_objects[obj_idx].version_id.is_some() {
-                    del_errs[obj_idx] = Some(to_object_err(
-                        err.into(),
-                        vec![
-                            bucket,
-                            &objects[obj_idx].object_name.clone(),
-                            &objects[obj_idx].version_id.unwrap_or_default().to_string(),
-                        ],
-                    ));
+                let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, disks.len() / 2 + 1);
+                if let Some(err) = has_err.clone() {
+                    let er = err.into();
+                    if (is_err_object_not_found(&er) || is_err_version_not_found(&er)) && !del_objects[obj_idx].delete_marker {
+                        has_err = None;
+                    }
                 } else {
-                    del_errs[obj_idx] = Some(to_object_err(err.into(), vec![bucket, &objects[obj_idx].object_name.clone()]));
+                    del_objects[obj_idx].found = true;
+                }
+
+                if let Some(err) = has_err {
+                    if del_objects[obj_idx].version_id.is_some() {
+                        del_errs[obj_idx] = Some(to_object_err(
+                            err.into(),
+                            vec![
+                                bucket,
+                                &objects[obj_idx].object_name.clone(),
+                                &objects[obj_idx].version_id.unwrap_or_default().to_string(),
+                            ],
+                        ));
+                    } else {
+                        del_errs[obj_idx] = Some(to_object_err(err.into(), vec![bucket, &objects[obj_idx].object_name.clone()]));
+                    }
                 }
             }
-        }
 
-        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            set.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
-        let mut rollback_futures = Vec::new();
-        for fi_vers in &vers {
-            // delete_versions commits one xl.meta per object group, so rollback must use the same boundary.
-            let should_rollback = fi_vers.versions.iter().any(|fi| del_errs[fi.idx].is_some());
-            for (disk_idx, disk) in disks.iter().enumerate() {
-                // backlog#1158: on rollback, include every online disk so a disk that
-                // staged + applied the delete and then errored is still restored (the
-                // disk-side undo is idempotent, no-op when nothing was staged). On
-                // success, skip the errored disks and only clean up successful ones.
-                if !should_rollback && fi_vers.versions.iter().any(|fi| del_obj_errs[disk_idx][fi.idx].is_some()) {
-                    continue;
-                }
+            // A failed RPC has an ambiguous commit outcome, so compensate every disk
+            // that received the forward request. Both rollback and cleanup are
+            // idempotent when that disk never created rollback state.
+            let rollback_versions: Vec<_> = vers
+                .iter()
+                .filter(|fi_vers| fi_vers.versions.iter().any(|fi| del_errs[fi.idx].is_some()))
+                .cloned()
+                .collect();
+            let cleanup_paths: Vec<_> = vers
+                .iter()
+                .filter(|fi_vers| fi_vers.versions.iter().all(|fi| del_errs[fi.idx].is_none()))
+                .map(|fi_vers| format!("{}/{rollback_dir}", fi_vers.name))
+                .collect();
 
-                let Some(disk) = disk.as_ref() else {
-                    continue;
-                };
+            if !rollback_versions.is_empty() {
+                let mut rollback_futures = Vec::new();
+                for (disk_index, disk) in disks.iter().enumerate() {
+                    #[cfg(not(test))]
+                    let _ = disk_index;
+                    let Some(disk) = disk.as_ref() else {
+                        continue;
+                    };
 
-                let disk = disk.clone();
-                let bucket = bucket.to_string();
-                let object = fi_vers.name.clone();
-                let versions = fi_vers.clone();
-                rollback_futures.push(async move {
-                    if should_rollback {
+                    let disk = disk.clone();
+                    let bucket = bucket.to_string();
+                    let rollback_versions = rollback_versions.clone();
+                    rollback_futures.push(async move {
+                        #[cfg(test)]
+                        record_batch_delete_test_call(
+                            BatchDeleteTestPhase::Rollback,
+                            disk_index,
+                            rollback_versions.len(),
+                            rollback_versions
+                                .iter()
+                                .any(|versions| versions.name.starts_with(BATCH_DELETE_SCALE_TEST_PREFIX)),
+                        );
+                        let mut rollback_objects = Vec::with_capacity(rollback_versions.len());
+                        for versions in &rollback_versions {
+                            rollback_objects.push(versions.name.clone());
+                        }
                         let errs = disk
                             .delete_versions(
                                 &bucket,
-                                vec![versions],
+                                rollback_versions,
                                 DeleteOptions {
                                     undo_write: true,
                                     undo_delete: true,
@@ -1838,7 +2024,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 },
                             )
                             .await;
-                        if let Some(err) = errs.into_iter().flatten().next() {
+                        for (object, err) in rollback_objects
+                            .into_iter()
+                            .zip(errs)
+                            .filter_map(|(object, err)| err.map(|err| (object, err)))
+                        {
                             warn!(
                                 bucket = %bucket,
                                 object = %object,
@@ -1847,192 +2037,222 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 "failed to roll back batch delete after write quorum failure"
                             );
                         }
-                    } else {
-                        let rollback_path = format!("{object}/{rollback_dir}");
-                        if let Err(err) = disk
-                            .delete(
-                                &bucket,
-                                &rollback_path,
-                                DeleteOptions {
-                                    recursive: true,
-                                    immediate: true,
-                                    ..Default::default()
-                                },
-                            )
-                            .await
+                    });
+                }
+                join_all(rollback_futures).await;
+            }
+
+            if !cleanup_paths.is_empty() {
+                let cleanup_paths = Arc::new(cleanup_paths);
+                let mut cleanup_futures = Vec::new();
+                for (_disk_index, disk) in disks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, disk)| disk.as_ref().map(|disk| (index, disk)))
+                {
+                    let disk = disk.clone();
+                    let bucket = bucket.to_string();
+                    let cleanup_paths = Arc::clone(&cleanup_paths);
+                    cleanup_futures.push(async move {
+                        #[cfg(test)]
+                        record_batch_delete_test_call(
+                            BatchDeleteTestPhase::Cleanup,
+                            _disk_index,
+                            cleanup_paths.len(),
+                            cleanup_paths
+                                .iter()
+                                .any(|path| path.starts_with(BATCH_DELETE_SCALE_TEST_PREFIX)),
+                        );
+                        if let Err(err) = disk.delete_paths(&bucket, cleanup_paths.as_slice()).await
                             && err != DiskError::FileNotFound
                             && err != DiskError::VolumeNotFound
                         {
                             warn!(
                                 bucket = %bucket,
-                                object = %object,
                                 rollback_dir = %rollback_dir,
                                 error = ?err,
                                 "failed to clean batch delete rollback state after quorum success"
                             );
                         }
-                    }
-                });
+                    });
+                }
+                join_all(cleanup_futures).await;
             }
-        }
 
-        join_all(rollback_futures).await;
+            // TODO: add_partial
 
-        // TODO: add_partial
-
-        if dist_erasure {
-            self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
-        }
-
-        for (object, err) in objects.iter().zip(del_errs.iter()) {
-            if err.is_none() {
-                self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
+            if dist_erasure {
+                dist_batch_lock_lease.stop_heartbeat().await;
+                set.release_dist_delete_object_locks_batch(std::mem::take(&mut dist_batch_lock_lease.lock_ids_by_client))
+                    .await;
             }
-        }
 
-        (del_objects, del_errs)
+            for (object, err) in objects.iter().zip(del_errs.iter()) {
+                if err.is_none() {
+                    set.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
+                }
+            }
+
+            (del_objects, del_errs)
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
-        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let set = self.clone();
+        let bucket = bucket.to_string();
+        let object = object.to_string();
+        cancellation_shield(async move {
+            let bucket = bucket.as_str();
+            let object = object.as_str();
+            set.invalidate_get_object_metadata_cache(bucket, object).await;
 
-        // Guard lock for single object delete
-        let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
-            Some(self.acquire_write_lock_diag("delete_object", bucket, object).await?)
-        } else {
-            None
-        };
-        if opts.delete_prefix {
-            self.delete_prefix(bucket, object)
-                .await
-                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-
-            self.get_object_metadata_cache.invalidate_all();
-            return Ok(ObjectInfo::default());
-        }
-
-        // TODO: Lifecycle
-
-        let mut version_found = true;
-        let (mut goi, write_quorum, gerr) = self.get_object_info_and_quorum(bucket, object, &opts).await;
-        if let Some(err) = &gerr
-            && goi.name.is_empty()
-        {
-            if should_force_delete_marker_for_missing_version(&opts) {
-                version_found = false;
-            } else {
-                return Err(err.clone());
-            }
-        }
-
-        if version_found {
-            check_object_lock_delete(bucket, object, &goi, &opts).await?;
-        }
-
-        let otd = ObjectToDelete {
-            object_name: object.to_string(),
-            version_id: opts
-                .version_id
-                .clone()
-                .map(|v| Uuid::parse_str(v.as_str()).ok().unwrap_or_default()),
-            ..Default::default()
-        };
-
-        let dsc = if should_preserve_delete_replication_state(&opts) {
-            ReplicateDecision::default()
-        } else {
-            ReplicationObjectBridge::check_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
-        };
-
-        if dsc.replicate_any() {
-            opts.set_delete_replication_state(dsc);
-            goi.replication_decision = opts
-                .delete_replication
-                .as_ref()
-                .map(|v| v.replicate_decision_str.clone())
-                .unwrap_or_default();
-        }
-
-        let (mark_delete, mut delete_marker) = resolve_delete_version_state(&opts, &goi, version_found);
-
-        let mod_time = if let Some(mt) = opts.mod_time {
-            mt
-        } else {
-            OffsetDateTime::now_utc()
-        };
-
-        let find_vid = Uuid::new_v4();
-
-        if mark_delete && (opts.versioned || opts.version_suspended) {
-            if !delete_marker {
-                delete_marker = opts.version_suspended && opts.version_id.is_none();
-            }
-
-            let mut fi = FileInfo {
-                name: object.to_string(),
-                deleted: delete_marker,
-                mark_deleted: mark_delete,
-                mod_time: Some(mod_time),
-                replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
-                ..Default::default() // TODO: Transition
-            };
-
-            fi.set_tier_free_version_id(&find_vid.to_string());
-
-            if opts.skip_free_version {
-                fi.set_skip_tier_free_version();
-            }
-
-            fi.version_id = if let Some(vid) = opts.version_id.as_ref() {
-                Some(Uuid::parse_str(vid.as_str())?)
-            } else if opts.versioned {
-                Some(Uuid::new_v4())
+            // Guard lock for single object delete
+            let lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
+                Some(set.acquire_write_lock_diag("delete_object", bucket, object).await?)
             } else {
                 None
             };
+            if opts.delete_prefix {
+                set.delete_prefix(bucket, object)
+                    .await
+                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
-            self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
+                set.get_object_metadata_cache.invalidate_all();
+                return Ok(ObjectInfo::default());
+            }
+
+            // TODO: Lifecycle
+
+            let mut version_found = true;
+            let (mut goi, write_quorum, gerr) = set.get_object_info_and_quorum(bucket, object, &opts).await;
+            if let Some(err) = &gerr
+                && goi.name.is_empty()
+            {
+                if should_force_delete_marker_for_missing_version(&opts) {
+                    version_found = false;
+                } else {
+                    return Err(err.clone());
+                }
+            }
+
+            if version_found {
+                check_object_lock_delete(bucket, object, &goi, &opts).await?;
+            }
+
+            let otd = ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: opts
+                    .version_id
+                    .clone()
+                    .map(|v| Uuid::parse_str(v.as_str()).ok().unwrap_or_default()),
+                ..Default::default()
+            };
+
+            let dsc = if should_preserve_delete_replication_state(&opts) {
+                ReplicateDecision::default()
+            } else {
+                ReplicationObjectBridge::check_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
+            };
+
+            if dsc.replicate_any() {
+                opts.set_delete_replication_state(dsc);
+                goi.replication_decision = opts
+                    .delete_replication
+                    .as_ref()
+                    .map(|v| v.replicate_decision_str.clone())
+                    .unwrap_or_default();
+            }
+
+            let (mark_delete, mut delete_marker) = resolve_delete_version_state(&opts, &goi, version_found);
+
+            let mod_time = if let Some(mt) = opts.mod_time {
+                mt
+            } else {
+                OffsetDateTime::now_utc()
+            };
+
+            let find_vid = Uuid::new_v4();
+
+            if mark_delete && (opts.versioned || opts.version_suspended) {
+                if !delete_marker {
+                    delete_marker = opts.version_suspended && opts.version_id.is_none();
+                }
+
+                let mut fi = FileInfo {
+                    name: object.to_string(),
+                    deleted: delete_marker,
+                    mark_deleted: mark_delete,
+                    mod_time: Some(mod_time),
+                    replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
+                    ..Default::default() // TODO: Transition
+                };
+
+                fi.set_tier_free_version_id(&find_vid.to_string());
+
+                if opts.skip_free_version {
+                    fi.set_skip_tier_free_version();
+                }
+
+                fi.version_id = if let Some(vid) = opts.version_id.as_ref() {
+                    Some(Uuid::parse_str(vid.as_str())?)
+                } else if opts.versioned {
+                    Some(Uuid::new_v4())
+                } else {
+                    None
+                };
+
+                delete_object_version_with_guard(
+                    &set,
+                    bucket,
+                    object,
+                    &fi,
+                    should_force_delete_marker_for_missing_version(&opts),
+                    lock_guard.as_ref(),
+                )
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-            let disks = self.disk_inventory().await;
-            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+                let disks = set.disk_inventory().await;
+                set.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
-            let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-            oi.replication_decision = goi.replication_decision;
-            self.invalidate_get_object_metadata_cache(bucket, object).await;
-            return Ok(oi);
-        }
+                let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+                oi.replication_decision = goi.replication_decision;
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
+                return Ok(oi);
+            }
 
-        // Create a single object deletion request
-        let mut dfi = FileInfo {
-            name: object.to_string(),
-            version_id: opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
-            mark_deleted: mark_delete,
-            deleted: delete_marker,
-            mod_time: Some(mod_time),
-            replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
-            ..Default::default()
-        };
+            // Create a single object deletion request
+            let mut dfi = FileInfo {
+                name: object.to_string(),
+                version_id: opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok()),
+                mark_deleted: mark_delete,
+                deleted: delete_marker,
+                mod_time: Some(mod_time),
+                replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
+                ..Default::default()
+            };
 
-        dfi.set_tier_free_version_id(&find_vid.to_string());
+            dfi.set_tier_free_version_id(&find_vid.to_string());
 
-        if opts.skip_free_version {
-            dfi.set_skip_tier_free_version();
-        }
+            if opts.skip_free_version {
+                dfi.set_skip_tier_free_version();
+            }
 
-        self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
-            .await
-            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+            delete_object_version_with_guard(&set, bucket, object, &dfi, opts.delete_marker, lock_guard.as_ref())
+                .await
+                .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        let disks = self.disk_inventory().await;
-        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            let disks = set.disk_inventory().await;
+            set.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
-        let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
-        obj_info.size = goi.size;
-        self.invalidate_get_object_metadata_cache(bucket, object).await;
-        Ok(obj_info)
+            let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
+            obj_info.size = goi.size;
+            set.invalidate_get_object_metadata_cache(bucket, object).await;
+            Ok(obj_info)
+        })
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2864,6 +3084,248 @@ mod put_object_tags_early_stop_regression_tests {
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod delete_rollback_ambiguous_outcome_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::{DiskAPI as _, ReadOptions, STORAGE_FORMAT_FILE_BACKUP};
+    use std::path::Path;
+
+    async fn put_plain_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
+        let mut reader = PutObjReader::from_vec(vec![7_u8; 1024]);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("plain object should be written");
+    }
+
+    fn contains_metadata_backup(path: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry.file_name() == STORAGE_FORMAT_FILE_BACKUP || (entry_path.is_dir() && contains_metadata_backup(&entry_path)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn delete_versions_response_cardinality_mismatch_fails_closed() {
+        for results in [vec![], vec![None, None], vec![None, None, None, None]] {
+            let normalized = normalize_delete_versions_results(results, 3);
+            assert_eq!(normalized, vec![Some(DiskError::Unexpected); 3]);
+        }
+
+        let exact = vec![None, Some(DiskError::FileNotFound), None];
+        assert_eq!(normalize_delete_versions_results(exact.clone(), 3), exact);
+    }
+
+    #[tokio::test]
+    async fn single_delete_lock_loss_after_forward_rolls_back_before_return() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "single-delete-lock-loss-bucket";
+        let object = "single-delete-lock-loss-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, object).await;
+
+        let guard = set_disks
+            .acquire_write_lock_diag("single_delete_lock_loss_test", bucket, object)
+            .await
+            .expect("test namespace lock should be acquired");
+        // The production signal is set by the distributed heartbeat. This test
+        // flag is consulted at the same post-forward fence inside
+        // delete_object_version, making the rollback branch deterministic.
+        guard.force_lock_lost_for_test();
+        let fi = FileInfo {
+            name: object.to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let err = delete_object_version_with_guard(&set_disks, bucket, object, &fi, false, Some(&guard))
+            .await
+            .expect_err("lease loss after forward must not ACK the delete");
+        assert!(
+            matches!(err, StorageError::NamespaceLockQuorumUnavailable { .. }),
+            "lease loss must remain a retryable namespace-lock error: {err:?}"
+        );
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            disk.read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|read_err| panic!("disk {disk_index} must be restored before the guard is released: {read_err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_delete_rolls_back_disks_with_ambiguous_forward_errors() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ambiguous-single-delete-bucket";
+        let object = "ambiguous-single-delete-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, object).await;
+
+        inject_ambiguous_delete_failure(object, 0);
+        inject_ambiguous_delete_failure(object, 1);
+        set_disks
+            .delete_object(bucket, object, ObjectOptions::default())
+            .await
+            .expect_err("two ambiguous outcomes must fail the three-of-four write quorum");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            disk.read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} must restore the object after quorum failure: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_delete_rolls_back_ambiguous_object_and_cleans_success_state() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ambiguous-batch-delete-bucket";
+        let rollback_object = "ambiguous-batch-rollback-object";
+        let committed_object = "ambiguous-batch-committed-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, rollback_object).await;
+        put_plain_object(&set_disks, bucket, committed_object).await;
+
+        inject_ambiguous_delete_failure(rollback_object, 0);
+        inject_ambiguous_delete_failure(rollback_object, 1);
+        let objects = vec![
+            ObjectToDelete {
+                object_name: rollback_object.to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: committed_object.to_string(),
+                ..Default::default()
+            },
+        ];
+        let (_deleted, errors) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+
+        assert!(errors[0].is_some(), "ambiguous object must report the quorum failure");
+        assert!(errors[1].is_none(), "independent object must commit successfully");
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            disk.read_version("", bucket, rollback_object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} must restore the failed batch object: {err}"));
+            disk.read_version("", bucket, committed_object, "", &ReadOptions::default())
+                .await
+                .expect_err("the successful batch object must stay deleted");
+        }
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let active_backups = temp_dirs.iter().any(|temp_dir| {
+                [rollback_object, committed_object]
+                    .iter()
+                    .any(|object| contains_metadata_backup(&temp_dir.path().join(bucket).join(object)))
+            });
+            if !active_backups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < cleanup_deadline,
+                "batch delete must eventually remove active rollback metadata"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn thousand_key_batch_aggregates_forward_rollback_and_cleanup_per_disk() {
+        const OBJECT_COUNT: usize = 1000;
+        const DISK_COUNT: usize = 4;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(DISK_COUNT).await;
+        let bucket = "batch-delete-scale-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        clear_batch_delete_test_calls();
+        let objects: Vec<_> = (0..OBJECT_COUNT)
+            .map(|index| ObjectToDelete {
+                object_name: format!("{BATCH_DELETE_SCALE_TEST_PREFIX}{index:04}"),
+                ..Default::default()
+            })
+            .collect();
+        inject_ambiguous_delete_failure(&objects[0].object_name, 0);
+        inject_ambiguous_delete_failure(&objects[0].object_name, 1);
+
+        let (_deleted, errors) = set_disks
+            .delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(errors[0].is_some(), "the injected object must fail write quorum");
+        assert!(
+            errors[1..].iter().all(Option::is_none),
+            "unaffected objects must retain successful results"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let calls = batch_delete_test_calls();
+            if calls
+                .iter()
+                .filter(|call| call.phase == BatchDeleteTestPhase::Cleanup)
+                .count()
+                == DISK_COUNT
+            {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|call| call.phase == BatchDeleteTestPhase::Forward)
+                        .map(|call| call.item_count)
+                        .collect::<Vec<_>>(),
+                    vec![OBJECT_COUNT; DISK_COUNT],
+                    "forward delete must issue one full batch per disk"
+                );
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|call| call.phase == BatchDeleteTestPhase::Rollback)
+                        .map(|call| call.item_count)
+                        .collect::<Vec<_>>(),
+                    vec![1; DISK_COUNT],
+                    "rollback must issue one failed-object batch per disk"
+                );
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|call| call.phase == BatchDeleteTestPhase::Cleanup)
+                        .map(|call| call.item_count)
+                        .collect::<Vec<_>>(),
+                    vec![OBJECT_COUNT - 1; DISK_COUNT],
+                    "cleanup must issue one successful-object path batch per disk"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "batch cleanup calls did not complete before the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        clear_batch_delete_test_calls();
     }
 }
 

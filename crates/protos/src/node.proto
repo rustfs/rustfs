@@ -908,6 +908,7 @@ service NodeService {
   rpc UnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+  rpc RefreshBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {};
   rpc LockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {};
   rpc UnLockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {};
 

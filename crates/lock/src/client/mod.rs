@@ -48,6 +48,11 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
     /// Refresh lock
     async fn refresh(&self, lock_id: &LockId) -> Result<bool>;
 
+    /// Refresh multiple locks. Per-lock results preserve not-found and backend errors independently.
+    async fn refresh_locks_batch(&self, lock_ids: &[LockId]) -> Vec<Result<bool>> {
+        join_all(lock_ids.iter().map(|lock_id| self.refresh(lock_id))).await
+    }
+
     /// Force release lock
     async fn force_release(&self, lock_id: &LockId) -> Result<bool>;
 

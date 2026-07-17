@@ -226,6 +226,7 @@ pub(crate) mod rpc_consumer {
             get_local_server_property, load_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata,
             set_bucket_metadata, validate_batch_read_version_item_count,
         };
+        pub(crate) use rustfs_ecstore::api::disk::{decode_delete_options_payload, decode_rename_data_payload};
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
         #[cfg(test)]
@@ -912,6 +913,15 @@ pub(crate) trait StorageDiskRpcExt {
         dst_volume: &str,
         dst_path: &str,
     ) -> DiskResult<RenameDataResp>;
+    async fn rename_data_with_rollback(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        rollback_token: uuid::Uuid,
+    ) -> DiskResult<RenameDataResp>;
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
@@ -1042,6 +1052,27 @@ where
         dst_path: &str,
     ) -> DiskResult<RenameDataResp> {
         ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info, dst_volume, dst_path).await
+    }
+
+    async fn rename_data_with_rollback(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        rollback_token: uuid::Uuid,
+    ) -> DiskResult<RenameDataResp> {
+        ecstore_disk::DiskAPI::rename_data_with_rollback(
+            self,
+            src_volume,
+            src_path,
+            file_info,
+            dst_volume,
+            dst_path,
+            rollback_token,
+        )
+        .await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {

@@ -160,6 +160,7 @@ use rustfs_utils::{
 };
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::hash::Hash;
 use std::mem::{self};
 use std::pin::Pin;
@@ -177,7 +178,7 @@ use std::{
 use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
-    sync::{RwLock, broadcast},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, broadcast},
 };
 use tokio::{
     select,
@@ -189,11 +190,226 @@ use tracing::error;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 
+struct DistDeleteBatchLockLease {
+    lock_ids_by_client: Vec<Vec<rustfs_lock::LockId>>,
+    clients: Vec<Arc<dyn LockClient>>,
+    lost_objects: Arc<parking_lot::Mutex<HashSet<String>>>,
+    cancel: CancellationToken,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DistDeleteBatchLockLease {
+    fn empty(clients: Vec<Arc<dyn LockClient>>) -> Self {
+        Self {
+            lock_ids_by_client: vec![Vec::new(); clients.len()],
+            clients,
+            lost_objects: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            cancel: CancellationToken::new(),
+            heartbeat: None,
+        }
+    }
+
+    fn lost_objects(&self) -> HashSet<String> {
+        self.lost_objects.lock().clone()
+    }
+
+    async fn stop_heartbeat(&mut self) {
+        self.cancel.cancel();
+        if let Some(heartbeat) = self.heartbeat.take()
+            && let Err(err) = heartbeat.await
+            && !err.is_cancelled()
+        {
+            warn!("distributed delete lock heartbeat task failed: {}", err);
+        }
+    }
+}
+
+impl Drop for DistDeleteBatchLockLease {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+
+        let lock_ids_by_client = std::mem::take(&mut self.lock_ids_by_client);
+        if lock_ids_by_client.iter().all(Vec::is_empty) {
+            return;
+        }
+        let clients = self.clients.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let cleanup = handle.spawn(async move {
+                join_all(clients.into_iter().zip(lock_ids_by_client).filter_map(|(client, lock_ids)| {
+                    if lock_ids.is_empty() {
+                        None
+                    } else {
+                        Some(async move {
+                            if let Err(err) = client.release_locks_batch(&lock_ids).await {
+                                warn!(lock_count = lock_ids.len(), "failed to release dropped distributed delete lease: {}", err);
+                            }
+                        })
+                    }
+                }))
+                .await;
+            });
+            drop(cleanup);
+        }
+    }
+}
+
+fn spawn_dist_delete_batch_lock_heartbeat(
+    heartbeat_entries_by_client: Vec<Vec<(String, rustfs_lock::LockId, tokio::time::Instant)>>,
+    clients: Vec<Arc<dyn LockClient>>,
+    held_count_by_object: HashMap<String, usize>,
+    write_quorum: usize,
+    lost_objects: Arc<parking_lot::Mutex<HashSet<String>>>,
+    cancel: CancellationToken,
+    refresh_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = interval(refresh_interval);
+        let mut confirmed_until: Vec<Vec<_>> = heartbeat_entries_by_client
+            .iter()
+            .map(|entries| entries.iter().map(|(_, _, expires_at)| *expires_at).collect())
+            .collect();
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            select! {
+                _ = cancel.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+
+            let refresh_started = tokio::time::Instant::now();
+            let refreshes = join_all(clients.iter().zip(&heartbeat_entries_by_client).map(|(client, entries)| {
+                let client = client.clone();
+                let lock_ids = entries.iter().map(|(_, lock_id, _)| lock_id.clone()).collect::<Vec<_>>();
+                async move { client.refresh_locks_batch(&lock_ids).await }
+            }));
+            let results = select! {
+                _ = cancel.cancelled() => return,
+                results = refreshes => results,
+            };
+
+            let now = tokio::time::Instant::now();
+            let mut unavailable_by_object = HashMap::<String, usize>::new();
+            for (client_index, entries) in heartbeat_entries_by_client.iter().enumerate() {
+                let client_results = results.get(client_index);
+                for (entry_index, (object, _, _)) in entries.iter().enumerate() {
+                    match client_results.and_then(|results| results.get(entry_index)) {
+                        Some(Ok(true)) => {
+                            let expires_at = refresh_started + rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT;
+                            confirmed_until[client_index][entry_index] = expires_at;
+                            if now >= expires_at {
+                                *unavailable_by_object.entry(object.clone()).or_default() += 1;
+                            }
+                        }
+                        Some(Ok(false)) => {
+                            *unavailable_by_object.entry(object.clone()).or_default() += 1;
+                        }
+                        Some(Err(_)) | None if now >= confirmed_until[client_index][entry_index] => {
+                            *unavailable_by_object.entry(object.clone()).or_default() += 1;
+                        }
+                        Some(Err(_)) | None => {}
+                    }
+                }
+            }
+
+            for (object, unavailable) in unavailable_by_object {
+                let held_count = held_count_by_object.get(&object).copied().unwrap_or_default();
+                if unavailable > held_count.saturating_sub(write_quorum) && lost_objects.lock().insert(object.clone()) {
+                    warn!(
+                        object = %object,
+                        held_count,
+                        unavailable,
+                        write_quorum,
+                        "distributed delete lock refresh lost quorum"
+                    );
+                }
+            }
+        }
+    })
+}
+
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 type InlineBitrotReader = coding::BitrotReader<crate::io_support::bitrot::ShardReader>;
+const MAX_SHIELDED_SET_TRANSACTIONS: usize = 256;
+static SHIELDED_SET_TRANSACTIONS: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_SHIELDED_SET_TRANSACTIONS)));
+
+struct CancellationShield<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    future: Option<Pin<Box<F>>>,
+    permit: Option<OwnedSemaphorePermit>,
+    polling: bool,
+}
+
+impl<F> Future for CancellationShield<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polling = true;
+        let poll = self
+            .future
+            .as_mut()
+            .expect("cancellation shield polled after completion")
+            .as_mut()
+            .poll(cx);
+        self.polling = false;
+        if poll.is_ready() {
+            self.future.take();
+        }
+        poll
+    }
+}
+
+impl<F> Drop for CancellationShield<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn drop(&mut self) {
+        if self.polling {
+            return;
+        }
+        if let Some(future) = self.future.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let permit = self.permit.take();
+            let task = handle.spawn(async move {
+                let _permit = permit;
+                future.await
+            });
+            drop(task);
+        }
+    }
+}
+
+pub(in crate::set_disk) async fn cancellation_shield<F>(future: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let permit = Arc::clone(&SHIELDED_SET_TRANSACTIONS)
+        .acquire_owned()
+        .await
+        .expect("shielded transaction semaphore must remain open");
+    CancellationShield {
+        future: Some(Box::pin(future)),
+        permit: Some(permit),
+        polling: false,
+    }
+    .await
+}
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
@@ -226,6 +442,10 @@ const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
 struct ObjectLockDiagGuard {
     guard: NamespaceLockGuard,
+    #[cfg(test)]
+    forced_lock_lost: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    dropped_for_test: Arc<std::sync::atomic::AtomicBool>,
     enabled: bool,
     op: &'static str,
     bucket: Option<String>,
@@ -247,6 +467,10 @@ impl ObjectLockDiagGuard {
     ) -> Self {
         Self {
             guard,
+            #[cfg(test)]
+            forced_lock_lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            dropped_for_test: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enabled,
             op,
             bucket,
@@ -261,12 +485,39 @@ impl ObjectLockDiagGuard {
     /// refresh-quorum loss (backlog#899 Phase 2). Callers fence their commit
     /// point on this so a stale lock holder does not race a double-write.
     fn is_lock_lost(&self) -> bool {
-        self.guard.is_lock_lost()
+        if self.guard.is_lock_lost() {
+            return true;
+        }
+
+        #[cfg(test)]
+        if self.forced_lock_lost.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+
+        false
+    }
+
+    #[cfg(test)]
+    fn force_lock_lost_for_test(&self) {
+        self.forced_lock_lost.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn lock_lost_signal_for_test(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.forced_lock_lost)
+    }
+
+    #[cfg(test)]
+    fn drop_signal_for_test(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.dropped_for_test)
     }
 }
 
 impl Drop for ObjectLockDiagGuard {
     fn drop(&mut self) {
+        #[cfg(test)]
+        self.dropped_for_test.store(true, std::sync::atomic::Ordering::SeqCst);
+
         if !self.enabled || self.guard.is_released() {
             return;
         }
@@ -2494,7 +2745,7 @@ impl SetDisks {
     async fn acquire_dist_delete_object_locks_batch(
         &self,
         batch: &rustfs_lock::BatchLockRequest,
-    ) -> (HashMap<(String, String), String>, HashSet<String>, Vec<Vec<rustfs_lock::LockId>>) {
+    ) -> (HashMap<(String, String), String>, HashSet<String>, DistDeleteBatchLockLease) {
         let requests: Vec<rustfs_lock::LockRequest> = batch
             .requests
             .iter()
@@ -2511,7 +2762,8 @@ impl SetDisks {
             1
         };
 
-        let mut lock_ids_by_object: Vec<Vec<(usize, rustfs_lock::LockId)>> = vec![Vec::new(); requests.len()];
+        let mut lock_ids_by_object: Vec<Vec<(usize, rustfs_lock::LockId, tokio::time::Instant)>> =
+            vec![Vec::new(); requests.len()];
         let mut errors_by_object: Vec<Option<String>> = vec![None; requests.len()];
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum ObjectLockResolution {
@@ -2524,6 +2776,7 @@ impl SetDisks {
         let mut pending_clients = self.lockers.len();
         let mut unresolved_objects = requests.len();
         let mut cleanup_lock_ids_by_client = vec![Vec::new(); self.lockers.len()];
+        let conservative_confirmed_until = tokio::time::Instant::now() + rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT;
 
         let mut pending = tokio::task::JoinSet::new();
         for (client_idx, client) in self.lockers.iter().cloned().enumerate() {
@@ -2549,7 +2802,7 @@ impl SetDisks {
                                         .as_ref()
                                         .map(|lock_info| lock_info.id.clone())
                                         .unwrap_or_else(|| request.lock_id.clone());
-                                    lock_ids_by_object[req_idx].push((client_idx, lock_id));
+                                    lock_ids_by_object[req_idx].push((client_idx, lock_id, conservative_confirmed_until));
                                 }
                                 Some(response) => {
                                     if errors_by_object[req_idx].is_none() {
@@ -2702,20 +2955,28 @@ impl SetDisks {
 
         let mut failed_map = HashMap::new();
         let mut locked_objects = HashSet::new();
-        let mut held_lock_ids_by_client = vec![Vec::new(); self.lockers.len()];
+        let mut lease = DistDeleteBatchLockLease::empty(self.lockers.clone());
+        let mut heartbeat_entries_by_client = vec![Vec::new(); self.lockers.len()];
+        let mut held_count_by_object = HashMap::new();
         let mut rollback_lock_ids_by_client = vec![Vec::new(); self.lockers.len()];
 
         for (req_idx, req) in batch.requests.iter().enumerate() {
             let success_count = lock_ids_by_object[req_idx].len();
             match resolution_by_object[req_idx] {
                 ObjectLockResolution::Succeeded => {
-                    for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
-                        held_lock_ids_by_client[client_idx].push(lock_id);
+                    held_count_by_object.insert(req.key.object.as_ref().to_string(), lock_ids_by_object[req_idx].len());
+                    for (client_idx, lock_id, confirmed_until) in lock_ids_by_object[req_idx].drain(..) {
+                        lease.lock_ids_by_client[client_idx].push(lock_id.clone());
+                        heartbeat_entries_by_client[client_idx].push((
+                            req.key.object.as_ref().to_string(),
+                            lock_id,
+                            confirmed_until,
+                        ));
                     }
                     locked_objects.insert(req.key.object.as_ref().to_string());
                 }
                 ObjectLockResolution::Pending | ObjectLockResolution::Failed => {
-                    for (client_idx, lock_id) in lock_ids_by_object[req_idx].drain(..) {
+                    for (client_idx, lock_id, _) in lock_ids_by_object[req_idx].drain(..) {
                         rollback_lock_ids_by_client[client_idx].push(lock_id);
                     }
                     failed_map.insert(
@@ -2734,7 +2995,19 @@ impl SetDisks {
 
         self.release_dist_delete_object_locks_batch(rollback_lock_ids_by_client).await;
 
-        (failed_map, locked_objects, held_lock_ids_by_client)
+        if heartbeat_entries_by_client.iter().any(|entries| !entries.is_empty()) {
+            lease.heartbeat = Some(spawn_dist_delete_batch_lock_heartbeat(
+                heartbeat_entries_by_client,
+                self.lockers.clone(),
+                held_count_by_object,
+                write_quorum,
+                Arc::clone(&lease.lost_objects),
+                lease.cancel.clone(),
+                rustfs_lock::fast_lock::DEFAULT_LOCK_REFRESH_INTERVAL,
+            ));
+        }
+
+        (failed_map, locked_objects, lease)
     }
 
     async fn release_dist_delete_object_locks_batch(&self, lock_ids_by_client: Vec<Vec<rustfs_lock::LockId>>) {
@@ -3777,10 +4050,41 @@ mod tests {
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
     use serial_test::serial;
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use tokio::fs;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn cancellation_shield_finishes_transaction_after_parent_abort() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let task_completed = Arc::clone(&completed);
+
+        let parent = tokio::spawn(async move {
+            cancellation_shield(async move {
+                task_entered.notify_one();
+                task_release.notified().await;
+                task_completed.store(true, Ordering::Release);
+            })
+            .await;
+        });
+        entered.notified().await;
+        parent.abort();
+        release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !completed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shielded transaction should finish after parent abort");
+    }
 
     #[test]
     fn complete_part_error_maps_confirmed_missing_to_invalid_part() {
@@ -3852,6 +4156,99 @@ mod tests {
 
         async fn is_online(&self) -> bool {
             false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RefreshErrorClient;
+
+    #[async_trait::async_trait]
+    impl LockClient for RefreshErrorClient {
+        async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            Err(LockError::internal("unused acquire"))
+        }
+
+        async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Err(LockError::internal("simulated refresh outage"))
+        }
+
+        async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug)]
+    struct BatchRefreshCountingClient {
+        batch_calls: Arc<std::sync::atomic::AtomicUsize>,
+        refreshed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for BatchRefreshCountingClient {
+        async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            Err(LockError::internal("unused acquire"))
+        }
+
+        async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            panic!("batch heartbeat must not fan out through unary refresh")
+        }
+
+        async fn refresh_locks_batch(&self, lock_ids: &[rustfs_lock::LockId]) -> Vec<rustfs_lock::Result<bool>> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            self.refreshed.fetch_add(lock_ids.len(), Ordering::Relaxed);
+            lock_ids.iter().map(|_| Ok(true)).collect()
+        }
+
+        async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            true
         }
 
         async fn is_local(&self) -> bool {
@@ -3989,7 +4386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rename_data_quorum_failure_rolls_back_destination_object() {
+    async fn test_rename_data_join_error_rolls_back_destination_object() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let disk_root = dir.path().join("disk0");
         fs::create_dir_all(&disk_root).await.expect("disk root should be created");
@@ -4057,9 +4454,11 @@ mod tests {
 
         let disks = vec![Some(disk), None];
         let file_infos = vec![new_fi.clone(), new_fi];
-        let result = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, tmp_object, &file_infos, bucket, object, 2).await;
+        let _panic_after_commit = crate::set_disk::core::io_primitives::rename_fanout_barrier::panic_after_rename(object, 0);
+        let result =
+            SetDisks::rename_data(&disks, (RUSTFS_META_TMP_BUCKET, tmp_object), &file_infos, (bucket, object), 2, None).await;
 
-        assert!(result.is_err());
+        assert!(result.is_err(), "an ambiguous task failure must fail the transaction");
         let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
             .await
             .expect("destination metadata should remain readable");
@@ -4128,7 +4527,8 @@ mod tests {
 
         let disks = vec![Some(disk), None];
         let file_infos = vec![new_fi.clone(), new_fi];
-        let result = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, tmp_object, &file_infos, bucket, object, 2).await;
+        let result =
+            SetDisks::rename_data(&disks, (RUSTFS_META_TMP_BUCKET, tmp_object), &file_infos, (bucket, object), 2, None).await;
 
         assert!(result.is_err());
         let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
@@ -5243,17 +5643,17 @@ mod tests {
             .add_write_lock(ObjectKey::new("bucket", "object-a"))
             .add_write_lock(ObjectKey::new("bucket", "object-b"));
 
-        let (failed_map, locked_objects, held_lock_ids_by_client) =
-            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+        let (failed_map, locked_objects, mut lease) = set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
 
         assert!(failed_map.is_empty());
         assert_eq!(locked_objects.len(), 2);
         assert!(locked_objects.contains("object-a"));
         assert!(locked_objects.contains("object-b"));
-        assert_eq!(held_lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), batch.requests.len() * 2);
+        assert_eq!(lease.lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), batch.requests.len() * 2);
 
+        lease.stop_heartbeat().await;
         set_disks
-            .release_dist_delete_object_locks_batch(held_lock_ids_by_client)
+            .release_dist_delete_object_locks_batch(std::mem::take(&mut lease.lock_ids_by_client))
             .await;
 
         let local_lock_1 = NamespaceLock::with_local_manager("node-1".to_string(), manager1);
@@ -5272,6 +5672,126 @@ mod tests {
         drop(guard_2);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_dist_delete_batch_lock_heartbeat_detects_quorum_loss() {
+        let object = "slow-delete".to_string();
+        let resource = ObjectKey::new("bucket", object.clone());
+        let entries = vec![
+            vec![(
+                object.clone(),
+                rustfs_lock::LockId::new_unique(&resource),
+                tokio::time::Instant::now() + rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT,
+            )],
+            vec![(
+                object.clone(),
+                rustfs_lock::LockId::new_unique(&resource),
+                tokio::time::Instant::now() + rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT,
+            )],
+        ];
+        let clients = vec![
+            Arc::new(FailingClient) as Arc<dyn LockClient>,
+            Arc::new(FailingClient) as Arc<dyn LockClient>,
+        ];
+        let lost_objects = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let cancel = CancellationToken::new();
+        let heartbeat = spawn_dist_delete_batch_lock_heartbeat(
+            entries,
+            clients,
+            HashMap::from([(object.clone(), 2)]),
+            2,
+            Arc::clone(&lost_objects),
+            cancel.clone(),
+            Duration::from_secs(1),
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(lost_objects.lock().contains(&object));
+
+        cancel.cancel();
+        heartbeat.await.expect("heartbeat should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dist_delete_batch_lock_heartbeat_expires_unconfirmed_refreshes() {
+        let object = "unconfirmed-delete".to_string();
+        let resource = ObjectKey::new("bucket", object.clone());
+        let entries = vec![vec![(
+            object.clone(),
+            rustfs_lock::LockId::new_unique(&resource),
+            tokio::time::Instant::now() + rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT,
+        )]];
+        let clients = vec![Arc::new(RefreshErrorClient) as Arc<dyn LockClient>];
+        let lost_objects = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let cancel = CancellationToken::new();
+        let heartbeat = spawn_dist_delete_batch_lock_heartbeat(
+            entries,
+            clients,
+            HashMap::from([(object.clone(), 1)]),
+            1,
+            Arc::clone(&lost_objects),
+            cancel.clone(),
+            rustfs_lock::fast_lock::DEFAULT_LOCK_REFRESH_INTERVAL,
+        );
+
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(rustfs_lock::fast_lock::DEFAULT_LOCK_REFRESH_INTERVAL).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(lost_objects.lock().contains(&object));
+
+        cancel.cancel();
+        heartbeat.await.expect("heartbeat should stop cleanly");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dist_delete_batch_lock_heartbeat_batches_thousand_keys_per_locker() {
+        const OBJECT_COUNT: usize = 1000;
+        let batch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refreshed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = Arc::new(BatchRefreshCountingClient {
+            batch_calls: Arc::clone(&batch_calls),
+            refreshed: Arc::clone(&refreshed),
+        }) as Arc<dyn LockClient>;
+        let entries = vec![
+            (0..OBJECT_COUNT)
+                .map(|index| {
+                    let object = format!("object-{index:04}");
+                    let resource = ObjectKey::new("bucket", object.clone());
+                    (
+                        object,
+                        rustfs_lock::LockId::new_unique(&resource),
+                        tokio::time::Instant::now() + rustfs_lock::fast_lock::DEFAULT_LOCK_TIMEOUT,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let held_count_by_object = entries[0].iter().map(|(object, _, _)| (object.clone(), 1)).collect();
+        let lost_objects = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let cancel = CancellationToken::new();
+        let heartbeat = spawn_dist_delete_batch_lock_heartbeat(
+            entries,
+            vec![client],
+            held_count_by_object,
+            1,
+            Arc::clone(&lost_objects),
+            cancel.clone(),
+            Duration::from_secs(1),
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(refreshed.load(Ordering::Relaxed), OBJECT_COUNT);
+        assert!(lost_objects.lock().is_empty());
+
+        cancel.cancel();
+        heartbeat.await.expect("heartbeat should stop cleanly");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn test_acquire_dist_delete_object_locks_batch_rolls_back_when_quorum_not_reached() {
@@ -5286,12 +5806,11 @@ mod tests {
             .with_all_or_nothing(false)
             .add_write_lock(ObjectKey::new("bucket", "object-a"));
 
-        let (failed_map, locked_objects, held_lock_ids_by_client) =
-            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+        let (failed_map, locked_objects, lease) = set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
 
         assert!(locked_objects.is_empty());
         assert!(failed_map.contains_key(&("bucket".to_string(), "object-a".to_string())));
-        assert_eq!(held_lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), 0);
+        assert_eq!(lease.lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), 0);
 
         let local_lock = NamespaceLock::with_local_manager("node-1".to_string(), manager);
         let guard = local_lock
@@ -5328,8 +5847,7 @@ mod tests {
             .add_write_lock(ObjectKey::new("bucket", "object-b"));
 
         let started = Instant::now();
-        let (failed_map, locked_objects, held_lock_ids_by_client) =
-            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+        let (failed_map, locked_objects, mut lease) = set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
 
         assert!(
             started.elapsed() < Duration::from_millis(150),
@@ -5338,8 +5856,9 @@ mod tests {
         assert!(failed_map.is_empty());
         assert_eq!(locked_objects.len(), 2);
 
+        lease.stop_heartbeat().await;
         set_disks
-            .release_dist_delete_object_locks_batch(held_lock_ids_by_client)
+            .release_dist_delete_object_locks_batch(std::mem::take(&mut lease.lock_ids_by_client))
             .await;
 
         tokio::time::sleep(Duration::from_millis(350)).await;
@@ -5381,8 +5900,7 @@ mod tests {
             .add_write_lock(ObjectKey::new("bucket", "object-b"));
 
         let started = Instant::now();
-        let (failed_map, locked_objects, held_lock_ids_by_client) =
-            set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
+        let (failed_map, locked_objects, lease) = set_disks.acquire_dist_delete_object_locks_batch(&batch).await;
 
         assert!(
             started.elapsed() < Duration::from_millis(150),
@@ -5391,7 +5909,7 @@ mod tests {
         assert!(locked_objects.is_empty());
         assert!(failed_map.contains_key(&("bucket".to_string(), "object-a".to_string())));
         assert!(failed_map.contains_key(&("bucket".to_string(), "object-b".to_string())));
-        assert_eq!(held_lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), 0);
+        assert_eq!(lease.lock_ids_by_client.iter().map(Vec::len).sum::<usize>(), 0);
 
         tokio::time::sleep(Duration::from_millis(350)).await;
 

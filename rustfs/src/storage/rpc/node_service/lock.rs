@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::NodeService;
-use rustfs_lock::LockRequest;
+use rustfs_lock::{LockRequest, MAX_DELETE_LIST};
 use rustfs_protos::proto_gen::node_service::*;
 use tonic::{Request, Response, Status};
 
@@ -31,6 +31,15 @@ fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
         error_info: Some(error.into()),
         lock_info: None,
     }
+}
+
+fn validate_refresh_batch_len(len: usize) -> Result<(), Status> {
+    if len > MAX_DELETE_LIST {
+        return Err(Status::resource_exhausted(format!(
+            "refresh batch contains {len} locks; maximum is {MAX_DELETE_LIST}"
+        )));
+    }
+    Ok(())
 }
 
 /// Delegate a refresh RPC to the node's lock backend (`LocalClient::refresh`).
@@ -78,6 +87,29 @@ fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> Gen
     } else {
         lock_result_from_error(format!("lock not found for release: {lock_id}"))
     }
+}
+
+fn lock_result_from_refresh(result: rustfs_lock::Result<bool>) -> GenerallyLockResult {
+    match result {
+        Ok(success) => GenerallyLockResult {
+            success,
+            error_info: None,
+            lock_info: None,
+        },
+        Err(err) => lock_result_from_error(format!("can not refresh lock: {err}")),
+    }
+}
+
+async fn refresh_locks_batch(
+    lock_client: &std::sync::Arc<dyn rustfs_lock::client::LockClient>,
+    lock_ids: &[rustfs_lock::LockId],
+) -> Vec<GenerallyLockResult> {
+    lock_client
+        .refresh_locks_batch(lock_ids)
+        .await
+        .into_iter()
+        .map(lock_result_from_refresh)
+        .collect()
 }
 
 impl NodeService {
@@ -300,15 +332,55 @@ impl NodeService {
 
         Ok(Response::new(BatchGenerallyLockResponse { results }))
     }
+
+    pub(super) async fn handle_refresh_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        validate_refresh_batch_len(request.get_ref().args.len())?;
+        let request = request.into_inner();
+        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut lock_ids = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<LockRequest>(arg) {
+                Ok(args) => {
+                    lock_ids.push(args.lock_id);
+                    valid_indices.push(idx);
+                }
+                Err(err) => results[idx] = lock_result_from_error(format!("can not decode args, err: {err}")),
+            }
+        }
+
+        if !lock_ids.is_empty() {
+            let lock_client = self.get_lock_client()?;
+            for (result_idx, result) in refresh_locks_batch(&lock_client, &lock_ids).await.into_iter().enumerate() {
+                if let Some(request_idx) = valid_indices.get(result_idx) {
+                    results[*request_idx] = result;
+                }
+            }
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse { results }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_result_from_release, lock_result_from_response};
+    use super::{lock_result_from_release, lock_result_from_response, refresh_locks_batch, validate_refresh_batch_len};
 
     fn test_lock_id() -> rustfs_lock::LockId {
         rustfs_lock::LockRequest::new(rustfs_lock::ObjectKey::new("bucket", "object"), rustfs_lock::LockType::Exclusive, "owner")
             .lock_id
+    }
+
+    #[test]
+    fn refresh_batch_enforces_request_limit() {
+        assert!(validate_refresh_batch_len(rustfs_lock::MAX_DELETE_LIST).is_ok());
+        let status =
+            validate_refresh_batch_len(rustfs_lock::MAX_DELETE_LIST + 1).expect_err("oversized refresh batch should be rejected");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     #[test]
@@ -324,6 +396,30 @@ mod tests {
                 .expect("missing release should include error")
                 .contains("lock not found for release")
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_locks_batch_preserves_per_lock_results() {
+        use rustfs_lock::{GlobalLockManager, LockClient, LockType, ObjectKey, client::local::LocalClient};
+        use std::{sync::Arc, time::Duration};
+
+        let manager = Arc::new(GlobalLockManager::new());
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let request = rustfs_lock::LockRequest::new(ObjectKey::new("bucket", "held"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_secs(30));
+        let held = client
+            .acquire_lock(&request)
+            .await
+            .expect("lock acquisition should succeed")
+            .lock_info
+            .expect("successful lock should include info")
+            .id;
+        let missing = rustfs_lock::LockId::new_unique(&ObjectKey::new("bucket", "missing"));
+
+        let results = refresh_locks_batch(&client, &[held, missing]).await;
+        assert!(results[0].success);
+        assert!(!results[1].success);
+        assert!(results[1].error_info.is_none());
     }
 
     #[test]

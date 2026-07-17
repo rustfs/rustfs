@@ -192,10 +192,29 @@ fn bulk_channel_pool_size() -> usize {
 /// acquisitions across the pool.
 static BULK_CHANNEL_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChannelRequestTimeout {
+    Default,
+    Disabled,
+}
+
+impl ChannelRequestTimeout {
+    fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Default => Some(internode_rpc_timeout()),
+            Self::Disabled => None,
+        }
+    }
+}
+
 /// Connection-cache key for the `idx`-th bulk channel to `addr`. The NUL separator cannot appear
 /// in a URL, so a bulk key never collides with the control key (the bare `addr`).
 fn bulk_cache_key(addr: &str, idx: usize) -> String {
     format!("{addr}\u{0}bulk\u{0}{idx}")
+}
+
+fn transaction_cache_key(addr: &str) -> String {
+    format!("{addr}\u{0}transaction")
 }
 
 /// Acquire a cached-or-newly-dialed channel for the given peer and channel class.
@@ -221,7 +240,21 @@ pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Ch
         debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
         return Ok(channel);
     }
-    build_channel(addr, &cache_key).await
+    build_channel(addr, &cache_key, ChannelRequestTimeout::Default).await
+}
+
+/// Acquire a dedicated transaction channel without a per-RPC request timeout.
+///
+/// Connect timeout, TLS, TCP keepalive, and HTTP/2 keepalive remain enabled. The
+/// separate cache key prevents ordinary RPCs from accidentally inheriting the
+/// transaction channel's completion semantics.
+pub async fn get_transaction_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
+    let cache_key = transaction_cache_key(addr);
+    if let Some(channel) = cached_connection(&cache_key).await {
+        debug!("Using cached transaction gRPC channel for: {}", addr);
+        return Ok(channel);
+    }
+    build_channel(addr, &cache_key, ChannelRequestTimeout::Disabled).await
 }
 
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
@@ -235,7 +268,7 @@ pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Ch
 /// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (10s)
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     // The control channel is cached under the bare address, preserving the legacy key.
-    build_channel(addr, addr).await
+    build_channel(addr, addr, ChannelRequestTimeout::Default).await
 }
 
 /// Dial a new gRPC channel to `dial_addr` and cache it under `cache_key`.
@@ -244,15 +277,17 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// `cache_key` is the connection-cache key. They are identical for control channels and differ
 /// for isolated bulk channels (see [`bulk_cache_key`]), letting several physically distinct
 /// channels to the same peer be cached independently.
-async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<dyn Error>> {
+async fn build_channel(
+    dial_addr: &str,
+    cache_key: &str,
+    request_timeout: ChannelRequestTimeout,
+) -> Result<Channel, Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
     let tcp_keepalive = internode_tcp_keepalive();
     let http2_keepalive_interval = internode_http2_keep_alive_interval();
     let http2_keepalive_timeout = internode_http2_keep_alive_timeout();
-    let rpc_timeout = internode_rpc_timeout();
-
     let mut connector = Endpoint::from_shared(dial_addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
@@ -265,9 +300,13 @@ async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<
         // How long to wait for PING ACK before considering connection dead
         .keep_alive_timeout(http2_keepalive_timeout)
         // Send PINGs even when no active streams (critical for idle connections)
-        .keep_alive_while_idle(true)
-        // Overall timeout for any RPC - fail fast on unresponsive peers
-        .timeout(rpc_timeout);
+        .keep_alive_while_idle(true);
+
+    if let Some(timeout) = request_timeout.duration() {
+        // Ordinary RPCs fail fast on unresponsive peers. Transaction RPCs omit
+        // this layer so callers can observe their final server-side outcome.
+        connector = connector.timeout(timeout);
+    }
 
     // Raise HTTP/2 flow-control windows above the 64KiB library default so larger unary
     // responses (ReadMultiple/BatchReadVersion) are not throttled by the BDP. Mirrors the
@@ -391,6 +430,10 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
     evict_connection_with_log_level(addr, cache_log_level).await;
     TLS_GENERATION_CACHE.lock().await.remove(addr);
 
+    let transaction_key = transaction_cache_key(addr);
+    evict_connection_with_log_level(&transaction_key, cache_log_level).await;
+    TLS_GENERATION_CACHE.lock().await.remove(&transaction_key);
+
     // An RPC-triggered eviction is a peer-failure signal; feed it into the online/offline state so
     // the peer flips offline after enough consecutive failures (grpc-optimization P3).
     runtime_sources::record_peer_unreachable(addr, internode_offline_failure_threshold());
@@ -443,6 +486,18 @@ mod tests {
         assert!(k0.starts_with(addr));
         // The NUL separator cannot appear in a URL, so a bulk key never equals a real address.
         assert!(k0.contains('\u{0}'));
+    }
+
+    #[test]
+    fn transaction_channel_has_distinct_cache_and_timeout_policy() {
+        let addr = "https://node-a:9000";
+        let transaction_key = transaction_cache_key(addr);
+
+        assert_ne!(transaction_key, addr);
+        assert!(transaction_key.starts_with(addr));
+        assert!(transaction_key.contains('\u{0}'));
+        assert!(ChannelRequestTimeout::Default.duration().is_some());
+        assert_eq!(ChannelRequestTimeout::Disabled.duration(), None);
     }
 
     #[test]

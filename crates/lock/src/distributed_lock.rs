@@ -172,35 +172,39 @@ pub struct DistributedLockGuard {
     lock_lost: Arc<LockLostSignal>,
 }
 
+struct HeartbeatConfig {
+    interval: Duration,
+    lease_ttl: Duration,
+    initial_confirmed_until: tokio::time::Instant,
+    refresh_quorum: usize,
+    owner: String,
+    resource: ObjectKey,
+}
+
 impl DistributedLockGuard {
     /// Create a new guard.
     ///
     /// - `lock_id` is the id returned to the caller (`lock_id()`).
     /// - `entries` is the full list of underlying (LockId, client) pairs
     ///   that should be released when this guard is dropped.
-    /// - `refresh_interval`: `Some` spawns a heartbeat that refreshes every entry on that
-    ///   cadence; `None` (degenerate/single-client, or interval derived away) spawns nothing.
-    /// - `refresh_quorum`: minimum refreshes that must keep succeeding; if `not_found` exceeds
-    ///   `entries.len() - refresh_quorum` the guard is declared lost.
-    /// - `owner`/`resource`: diagnostics only.
-    pub(crate) fn new(
+    /// - `heartbeat`: `Some` spawns lease renewal; `None` is used by paths that
+    ///   do not need renewal. The config keeps TTL, quorum, and diagnostics
+    ///   together so they cannot drift between construction and the task.
+    fn new(
         lock_id: LockId,
         entries: Vec<(LockId, Arc<dyn LockClient>)>,
         lock_type: LockType,
-        refresh_interval: Option<Duration>,
-        refresh_quorum: usize,
-        owner: String,
-        resource: ObjectKey,
+        heartbeat: Option<HeartbeatConfig>,
     ) -> Self {
         record_lock_held_acquire(lock_type);
         let lock_lost = Arc::new(LockLostSignal::default());
-        let refresh_task = refresh_interval.and_then(|interval| {
+        let refresh_task = heartbeat.and_then(|heartbeat| {
             // Only spawn when a tokio runtime is available; guard construction off-runtime
             // (e.g. some tests) simply skips the heartbeat.
             tokio::runtime::Handle::try_current().ok().map(|handle| {
                 let entries = entries.clone();
                 let lock_lost = lock_lost.clone();
-                handle.spawn(Self::run_heartbeat(entries, interval, refresh_quorum, lock_lost, owner, resource))
+                handle.spawn(Self::run_heartbeat(entries, heartbeat, lock_lost))
             })
         });
         Self {
@@ -214,20 +218,18 @@ impl DistributedLockGuard {
     }
 
     /// Heartbeat loop: every `interval`, refresh all entries and classify the outcomes.
-    /// `Ok(true)` = refreshed, `Ok(false)` = not_found, `Err` = RPC jitter (ignored, absorbed by
-    /// the ttl > interval margin and retried next tick). Declares the lock lost when
-    /// `not_found > entries.len() - refresh_quorum`. Phase 1 does not release on loss: the guarded
-    /// operation is still running, and tearing the lock down here would only widen the window.
+    /// `Ok(true)` refreshes the confirmed lease, `Ok(false)` invalidates it
+    /// immediately, and `Err` is tolerated only until the previous confirmation
+    /// expires. Phase 1 does not release on loss: the guarded operation is still
+    /// running, and tearing the lock down here would only widen the window.
     async fn run_heartbeat(
         entries: Vec<(LockId, Arc<dyn LockClient>)>,
-        interval: Duration,
-        refresh_quorum: usize,
+        heartbeat: HeartbeatConfig,
         lock_lost: Arc<LockLostSignal>,
-        owner: String,
-        resource: ObjectKey,
     ) {
-        let tolerable_not_found = entries.len().saturating_sub(refresh_quorum);
-        let mut ticker = tokio::time::interval(interval);
+        let tolerable_not_found = entries.len().saturating_sub(heartbeat.refresh_quorum);
+        let mut confirmed_until = vec![heartbeat.initial_confirmed_until; entries.len()];
+        let mut ticker = tokio::time::interval(heartbeat.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick fires immediately; skip it so the first refresh lands one interval
         // after acquisition rather than right away.
@@ -235,6 +237,7 @@ impl DistributedLockGuard {
         loop {
             ticker.tick().await;
 
+            let refresh_started = tokio::time::Instant::now();
             let results = join_all(entries.iter().map(|(lock_id, client)| {
                 let lock_id = lock_id.clone();
                 let client = client.clone();
@@ -242,26 +245,39 @@ impl DistributedLockGuard {
             }))
             .await;
 
+            let now = tokio::time::Instant::now();
             let mut refreshed = 0usize;
-            let mut not_found = 0usize;
-            for result in &results {
+            let mut unavailable = 0usize;
+            for (index, result) in results.iter().enumerate() {
                 match result {
-                    Ok(true) => refreshed += 1,
-                    Ok(false) => not_found += 1,
-                    // RPC jitter: count as neither; the ttl > interval margin covers a transient
-                    // dip and the next tick retries.
+                    Ok(true) => {
+                        let expires_at = refresh_started + heartbeat.lease_ttl;
+                        confirmed_until[index] = expires_at;
+                        if now < expires_at {
+                            refreshed += 1;
+                        } else {
+                            unavailable += 1;
+                        }
+                    }
+                    Ok(false) => unavailable += 1,
+                    // A transient RPC error remains tolerated while the last
+                    // confirmed lease is valid. Once that TTL expires, the
+                    // backend may have granted the resource to another owner,
+                    // so treating the old guard as valid would permit a stale
+                    // writer to commit.
+                    Err(_) if now >= confirmed_until[index] => unavailable += 1,
                     Err(_) => {}
                 }
             }
 
-            if not_found > tolerable_not_found {
+            if unavailable > tolerable_not_found {
                 warn!(
-                    resource = %resource,
-                    owner = %owner,
+                    resource = %heartbeat.resource,
+                    owner = %heartbeat.owner,
                     refreshed,
-                    not_found,
+                    unavailable,
                     entries = entries.len(),
-                    refresh_quorum,
+                    refresh_quorum = heartbeat.refresh_quorum,
                     "lock refresh lost quorum"
                 );
                 record_lock_refresh_quorum_lost();
@@ -419,6 +435,11 @@ impl DistributedLock {
             return Err(LockError::internal("No lock clients available"));
         }
 
+        // Use the beginning of acquisition as the conservative initial lease
+        // confirmation point. Individual backends may grant at different times;
+        // starting the TTL at guard construction would overestimate the oldest
+        // lease and could briefly treat an expired guard as valid.
+        let acquisition_started = tokio::time::Instant::now();
         let required_quorum = self.required_quorum(request.lock_type);
         let LockAcquireQuorumResult {
             response: resp,
@@ -443,10 +464,14 @@ impl DistributedLock {
                 aggregate_lock_id,
                 individual_locks,
                 request.lock_type,
-                refresh_interval,
-                required_quorum,
-                request.owner.clone(),
-                request.resource.clone(),
+                refresh_interval.map(|interval| HeartbeatConfig {
+                    interval,
+                    lease_ttl: request.ttl,
+                    initial_confirmed_until: acquisition_started + request.ttl,
+                    refresh_quorum: required_quorum,
+                    owner: request.owner.clone(),
+                    resource: request.resource.clone(),
+                }),
             )))
         } else {
             // Check if it's a timeout or quorum failure
@@ -1020,9 +1045,10 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum RefreshOutcome {
-        Alive,    // Ok(true)  refresh succeeded
-        NotFound, // Ok(false) remote already lost the lock (reclaimed / never held)
-        RpcError, // Err        RPC jitter
+        Alive,                  // Ok(true)  refresh succeeded
+        DelayedAlive(Duration), // Ok(true) after response delay
+        NotFound,               // Ok(false) remote already lost the lock (reclaimed / never held)
+        RpcError,               // Err        RPC jitter
     }
 
     /// Counting test client: acquires successfully and echoes back request.lock_id as
@@ -1071,6 +1097,10 @@ mod tests {
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
             match self.outcome {
                 RefreshOutcome::Alive => Ok(true),
+                RefreshOutcome::DelayedAlive(delay) => {
+                    tokio::time::sleep(delay).await;
+                    Ok(true)
+                }
                 RefreshOutcome::NotFound => Ok(false),
                 RefreshOutcome::RpcError => Err(LockError::internal("refresh rpc jitter")),
             }
@@ -1239,9 +1269,10 @@ mod tests {
         );
     }
 
-    // A5 -- refresh RPC jitter (Err) is not counted as not_found; the lock is not declared lost.
+    // A5 -- refresh RPC jitter is tolerated within the last confirmed TTL, but
+    // must fence the guard once that TTL expires.
     #[tokio::test]
-    async fn heartbeat_rpc_error_not_counted_as_lock_lost() {
+    async fn heartbeat_rpc_error_fences_after_confirmed_lease_expires() {
         let (clients, _counters) = counting_clients(&[
             RefreshOutcome::RpcError,
             RefreshOutcome::RpcError,
@@ -1258,7 +1289,37 @@ mod tests {
 
         assert!(
             !guard.is_lock_lost(),
-            "RPC jitter (Err) must NOT be counted as not_found; lock must not be declared lost"
+            "transient RPC jitter within the confirmed lease TTL must be tolerated"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            guard.is_lock_lost(),
+            "RPC errors beyond the last confirmed lease TTL must fence the stale guard"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn delayed_refresh_success_does_not_extend_lease_from_response_time() {
+        let delay = Duration::from_millis(120);
+        let (clients, _counters) = counting_clients(&[
+            RefreshOutcome::DelayedAlive(delay),
+            RefreshOutcome::DelayedAlive(delay),
+            RefreshOutcome::DelayedAlive(delay),
+            RefreshOutcome::DelayedAlive(delay),
+        ]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "delayed-refresh"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(60))
+            .with_refresh_interval(Duration::from_millis(10));
+
+        let guard = lock.acquire_guard(&request).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(170)).await;
+
+        assert!(
+            guard.is_lock_lost(),
+            "a success response received after request-start + TTL must not revive an expired lease"
         );
         drop(guard);
     }
