@@ -23,6 +23,7 @@ pub(crate) fn iam_error_to_s3_error(err: IamError) -> S3Error {
         | IamError::NoSuchTempAccount(_)
         | IamError::NoSuchGroup(_)
         | IamError::NoSuchPolicy => S3ErrorCode::NoSuchResource,
+        IamError::InvalidAccessKeyLength | IamError::InvalidSecretKeyLength => S3ErrorCode::InvalidArgument,
         _ => S3ErrorCode::InternalError,
     };
 
@@ -54,7 +55,17 @@ mod tests {
     }
 
     #[test]
-    fn non_not_found_iam_errors_remain_internal_errors() {
+    fn credential_length_errors_map_to_invalid_argument() {
+        let errors = [IamError::InvalidAccessKeyLength, IamError::InvalidSecretKeyLength];
+
+        for err in errors {
+            let s3_error = iam_error_to_s3_error(err);
+            assert_eq!(s3_error.code(), &S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn non_validation_iam_errors_remain_internal_errors() {
         let s3_error = iam_error_to_s3_error(IamError::IamSysNotInitialized);
 
         assert_eq!(s3_error.code(), &S3ErrorCode::InternalError);
