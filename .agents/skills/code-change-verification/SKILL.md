@@ -43,16 +43,7 @@ Use this skill to review code changes consistently before merge, before release,
 
 #### Rust-specific checks (apply to all Rust changes)
 
-- **unwrap/expect in production**: Search changed files for `.unwrap()` and `.expect(` outside test modules. Every `unwrap()` in production code must have a justification comment or be replaced with `?`.
-- **Silent type truncation**: Search for `as u8/u16/u32/u64/usize/i8/i16/i32/i64/isize` casts. Every `as` cast must be justified; negative-to-unsigned and large-to-small are bugs by default. Use `try_into()` or explicit clamping.
-- **Unnecessary cloning**: Check `.clone()` calls in loops, per-request paths, and on structs with >5 heap-allocated fields. Consider `Arc`, references, or `Cow<str>`.
-- **Lock ordering**: If the change acquires multiple locks, verify the order matches all other call sites. Document the order in a comment.
-- **Locks across .await**: Flag any `tokio::sync::RwLock`/`Mutex` guard held across an `.await` point without bounded hold time.
-- **Recursion depth**: If the change adds or modifies a recursive function, verify it has a depth limit or uses iterative traversal with an explicit stack.
-- **Error types**: Flag `Result<_, String>`, `Box<dyn Error>`, and missing `Error::source()` implementations in public APIs.
-- **Test assertions**: Every test function must have at least one `assert!`. Flag tests that only call code without verifying results.
-- **println/eprintln**: Search changed files for `println!`/`eprintln!` outside test modules. Production code must use `tracing` macros.
-- **Serde safety**: Structs deserialized from untrusted input (S3 API, user config) should have `#[serde(deny_unknown_fields)]`.
+Run the full checklist in [rust-code-quality](../rust-code-quality/SKILL.md) — the canonical Rust review checklist for the unwrap/casting/cloning/locking/recursion/error-type/serde/test rules and the reuse-and-necessity checks (duplicated helpers, defensive branches without a nameable trigger, redundant error wrapping). Do not restate those rules here; carry its P0–P3 ratings over unchanged and use this skill's output format.
 
 ### 4) Findings-first output
 - Order findings by severity:
