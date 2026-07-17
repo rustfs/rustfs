@@ -26,6 +26,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     reload_transition_tier_config,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use crate::storage::storage_api::verify_tonic_canonical_body_digest;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -49,6 +50,8 @@ use tracing::{debug, error, info, warn};
 pub(crate) mod heal;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
+const HEAL_CONTROL_FINGERPRINT_MAX_SIZE: usize = 256;
+const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const LOG_SUBSYSTEM_RPC: &str = "rpc";
 const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
 const EVENT_RPC_REQUEST_REJECTED: &str = "rpc_request_rejected";
@@ -185,6 +188,33 @@ pub fn make_server() -> NodeService {
 pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
     NodeService { local_peer, context }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HealControlRpcService;
+
+pub fn make_heal_control_server() -> HealControlRpcService {
+    HealControlRpcService
+}
+
+#[tonic::async_trait]
+impl heal_control_service_server::HealControlService for HealControlRpcService {
+    async fn heal_control(&self, request: Request<HealControlRequest>) -> Result<Response<HealControlResponse>, Status> {
+        if request.get_ref().topology_fingerprint.len() > HEAL_CONTROL_FINGERPRINT_MAX_SIZE
+            || request.get_ref().command.len() > HEAL_CONTROL_PAYLOAD_MAX_SIZE
+        {
+            return Err(Status::invalid_argument("heal control request exceeds size limit"));
+        }
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+        )
+        .map_err(|_| Status::invalid_argument("heal control request length cannot be represented"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|err| Status::permission_denied(format!("heal control authentication failed: {err}")))?;
+        Err(Status::unimplemented("heal control routing is not enabled"))
+    }
 }
 
 impl NodeService {
@@ -1235,10 +1265,11 @@ impl Node for NodeService {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        CollectMetricsOpts, Error, MetricType, Node as _, NodeService, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
-        background_rebalance_start_error_message, make_server, stop_rebalance_response,
+        CollectMetricsOpts, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService, PEER_RESTSIGNAL,
+        PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
+        background_rebalance_start_error_message, make_heal_control_server, make_server, stop_rebalance_response,
     };
+    use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use bytes::Bytes;
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
@@ -1248,14 +1279,18 @@ mod tests {
         GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
         GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
         GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
-        HealBucketRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
-        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+        HealBucketRequest, HealControlRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest,
+        LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
         MakeVolumesRequest, Mss, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest,
         ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest,
         RenamePartRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest,
         StopRebalanceRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteMetadataRequest, WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
+        WriteMetadataRequest, WriteRequest,
+        heal_control_service_client::HealControlServiceClient,
+        heal_control_service_server::{HealControlService as _, HealControlServiceServer},
+        node_service_client::NodeServiceClient,
+        node_service_server::NodeServiceServer,
     };
     use std::collections::HashMap;
     use tokio::net::TcpListener;
@@ -1271,6 +1306,56 @@ mod tests {
         let service = make_server();
         // LocalPeerS3Client is a struct, not an Option, so we just check it exists
         assert!(format!("{:?}", service.local_peer).contains("LocalPeerS3Client"));
+    }
+
+    fn heal_control_request(command: &[u8]) -> Request<HealControlRequest> {
+        Request::new(HealControlRequest {
+            version: 1,
+            topology_fingerprint: "fingerprint".to_string(),
+            command: Bytes::copy_from_slice(command),
+        })
+    }
+
+    fn mark_v2_authenticated<T>(request: &mut Request<T>) {
+        request
+            .metadata_mut()
+            .insert("x-rustfs-rpc-auth-version", "2".parse().expect("valid metadata value"));
+    }
+
+    #[tokio::test]
+    async fn heal_control_requires_body_bound_auth_before_reporting_disabled() {
+        let service = make_heal_control_server();
+        let unsigned = service
+            .heal_control(heal_control_request(b"query"))
+            .await
+            .expect_err("unsigned request must fail");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
+
+        let mut tampered = heal_control_request(b"query");
+        let other_body =
+            rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"cancel").expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut tampered, &other_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut tampered);
+        let tampered = service.heal_control(tampered).await.expect_err("tampered request must fail");
+        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
+
+        let mut signed = heal_control_request(b"query");
+        let body =
+            rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"query").expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut signed, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut signed);
+        let disabled = service.heal_control(signed).await.expect_err("routing must remain disabled");
+        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn heal_control_rejects_oversized_command_before_canonical_copy() {
+        let service = make_heal_control_server();
+        let oversized = service
+            .heal_control(heal_control_request(&vec![0; HEAL_CONTROL_PAYLOAD_MAX_SIZE + 1]))
+            .await
+            .expect_err("oversized request must fail");
+        assert_eq!(oversized.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -3002,6 +3087,70 @@ mod tests {
                 .await
                 .expect("node service test client should connect"),
         )
+    }
+
+    async fn connect_test_heal_control_client() -> Option<HealControlServiceClient<tonic::transport::Channel>> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    HealControlServiceServer::new(make_heal_control_server())
+                        .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
+                        .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("heal control test server should run");
+        });
+
+        Some(
+            HealControlServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("heal control test client should connect"),
+        )
+    }
+
+    #[tokio::test]
+    async fn heal_control_transport_enforces_codec_limit_and_reaches_disabled_handler() {
+        let Some(mut client) = connect_test_heal_control_client().await else {
+            return;
+        };
+        let mut request = heal_control_request(b"query");
+        let body =
+            rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"query").expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+        let disabled = client.heal_control(request).await.expect_err("routing must remain disabled");
+        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+
+        let max_command = vec![0; HEAL_CONTROL_PAYLOAD_MAX_SIZE];
+        let mut max_request = heal_control_request(&max_command);
+        let max_body = rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", &max_command)
+            .expect("maximum request should encode");
+        set_tonic_canonical_body_digest(&mut max_request, &max_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut max_request);
+        let disabled = client
+            .heal_control(max_request)
+            .await
+            .expect_err("maximum valid request must reach disabled handler");
+        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+
+        let oversized = Request::new(HealControlRequest {
+            version: 1,
+            topology_fingerprint: "fingerprint".to_string(),
+            command: Bytes::from(vec![0; rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE]),
+        });
+        let rejected = client
+            .heal_control(oversized)
+            .await
+            .expect_err("oversized protobuf message must fail in codec");
+        assert_eq!(rejected.code(), tonic::Code::OutOfRange);
     }
 
     #[tokio::test]

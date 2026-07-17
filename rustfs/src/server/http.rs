@@ -35,7 +35,7 @@ use crate::server::{
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage_api::server::http::rpc::InternodeRpcService;
-use crate::storage_api::server::http::tonic_service::make_server;
+use crate::storage_api::server::http::tonic_service::{make_heal_control_server, make_server};
 use crate::storage_api::server::http::{
     ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
 };
@@ -55,7 +55,9 @@ use rustfs_common::GlobalReadiness;
 use rustfs_keystone::KeystoneAuthLayer;
 #[cfg(feature = "swift")]
 use rustfs_protocols::SwiftService;
-use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_protos::proto_gen::node_service::{
+    heal_control_service_server::HealControlServiceServer, node_service_server::NodeServiceServer,
+};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
 use s3s::{
@@ -73,6 +75,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tonic::service::Routes;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status};
 use tower::{Service, ServiceBuilder};
@@ -121,6 +124,7 @@ const EVENT_HTTP_CONNECTION_DRAIN: &str = "http_connection_drain";
 const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
 const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
 const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
+const HEAL_CONTROL_TONIC_RPC_PATH: &str = "/node_service.HealControlService/HealControl";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -1222,16 +1226,23 @@ fn process_connection(
         // Align the server codec limit with the client (both default to
         // `DEFAULT_GRPC_SERVER_MESSAGE_LEN`, 100 MiB) so `bytes`-carrying unary RPCs are not
         // capped by tonic's 4 MiB default. Env-overridable via RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE.
-        // The codec size limits live on `NodeServiceServer`, so set them before wrapping the
-        // service in the auth interceptor (which returns an `InterceptedService` without those
-        // methods).
+        // Codec size limits live on the generated service servers, so set them before wrapping
+        // each service in the auth interceptor.
         let rpc_max_message_size = rustfs_protos::internode_rpc_max_message_size();
-        let rpc_service = RpcRequestPathService::new(InterceptedService::new(
+        let node_service = InterceptedService::new(
             NodeServiceServer::new(make_server())
                 .max_decoding_message_size(rpc_max_message_size)
                 .max_encoding_message_size(rpc_max_message_size),
             check_auth,
-        ));
+        );
+        let heal_control_max_message_size = rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE;
+        let heal_control_service = InterceptedService::new(
+            HealControlServiceServer::new(make_heal_control_server())
+                .max_decoding_message_size(heal_control_max_message_size)
+                .max_encoding_message_size(heal_control_max_message_size),
+            check_auth,
+        );
+        let rpc_service = RpcRequestPathService::new(Routes::new(node_service).add_service(heal_control_service).prepare());
 
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(true, None, s3_service);
@@ -1769,6 +1780,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         .path()
         .strip_prefix(TONIC_RPC_PREFIX)
         .and_then(|suffix| suffix.strip_prefix('/'))
+        .or_else(|| (target.uri.path() == HEAL_CONTROL_TONIC_RPC_PATH).then_some("HealControl"))
         .filter(|method| !method.is_empty() && !method.contains('/'))
         .ok_or_else(|| Status::unauthenticated("Invalid RPC request path"))?;
     debug_assert!(!rpc_method.is_empty());
@@ -2172,6 +2184,32 @@ mod tests {
         });
         assert!(check_auth(request).is_ok(), "matching trusted node audience should authenticate");
 
+        let heal_headers =
+            storage::gen_tonic_signature_headers("127.0.0.1:9000", "node_service.HealControlService", "HealControl", None)
+                .expect("heal control auth headers should build");
+        let mut heal_request = Request::new(());
+        heal_request.metadata_mut().as_mut().extend(heal_headers);
+        heal_request.extensions_mut().insert(RpcRequestTarget {
+            uri: "http://127.0.0.1:9000/node_service.HealControlService/HealControl"
+                .parse()
+                .expect("heal control URI should parse"),
+            method: Method::POST,
+        });
+        assert!(check_auth(heal_request).is_ok(), "heal control service path should authenticate");
+
+        let replay_headers = storage::gen_tonic_signature_headers("127.0.0.1:9000", "node_service.NodeService", "Ping", None)
+            .expect("node service auth headers should build");
+        let mut cross_service_replay = Request::new(());
+        cross_service_replay.metadata_mut().as_mut().extend(replay_headers);
+        cross_service_replay.extensions_mut().insert(RpcRequestTarget {
+            uri: HEAL_CONTROL_TONIC_RPC_PATH.parse().expect("heal control path should parse"),
+            method: Method::POST,
+        });
+        assert!(
+            check_auth(cross_service_replay).is_err(),
+            "node service signature must not replay to heal control"
+        );
+
         rustfs_common::set_global_local_node_name("127.0.0.1:9001").await;
         let mut replay_to_other_node = Request::new(());
         replay_to_other_node.metadata_mut().as_mut().extend(headers.clone());
@@ -2194,6 +2232,54 @@ mod tests {
         let error = check_auth(get_request).expect_err("wire GET must not reuse a POST gRPC signature");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(error.message(), "Invalid RPC request method");
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_rest_heal_control_uses_production_auth_and_stays_online_when_disabled() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener address should be available");
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name(&addr.to_string()).await;
+
+        let node_service = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let heal_control_service = InterceptedService::new(
+            HealControlServiceServer::new(make_heal_control_server())
+                .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE),
+            check_auth,
+        );
+        let service = RpcRequestPathService::new(Routes::new(node_service).add_service(heal_control_service).prepare());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("test server should accept a connection");
+            let builder = ConnBuilder::new(TokioExecutor::new());
+            builder
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .await
+                .expect("test connection should complete");
+        });
+
+        let grid_host = format!("http://{addr}");
+        let host = rustfs_utils::XHost::try_from(addr.to_string()).expect("test address should resolve");
+        let client = storage::PeerRestClient::new(host, grid_host);
+        for _ in 0..2 {
+            let error = client
+                .heal_control(1, "fingerprint".to_string(), b"query".to_vec())
+                .await
+                .expect_err("dormant heal control must report disabled");
+            let message = error.to_string();
+            assert!(message.contains("routing is not enabled"));
+            assert!(!message.contains("temporarily offline"));
+        }
+
+        client.evict_connection().await;
+        server.abort();
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 

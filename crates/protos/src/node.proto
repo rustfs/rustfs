@@ -764,6 +764,18 @@ message BackgroundHealStatusResponse {
   optional string error_info = 3;
 }
 
+message HealControlRequest {
+  uint32 version = 1;
+  string topology_fingerprint = 2;
+  bytes command = 3;
+}
+
+message HealControlResponse {
+  bool success = 1;
+  bytes result = 2;
+  optional string error_info = 3;
+}
+
 message GetMetacacheListingRequest {
   bytes opts = 1;
 }
@@ -955,4 +967,8 @@ service NodeService {
   rpc ClearDecommission(ClearDecommissionRequest) returns (ClearDecommissionResponse) {};
   rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {};
   rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {};
+}
+
+service HealControlService {
+  rpc HealControl(HealControlRequest) returns (HealControlResponse) {};
 }

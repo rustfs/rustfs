@@ -1093,12 +1093,13 @@ mod tests {
             .metadata()
             .get(RPC_CONTENT_SHA256_HEADER)
             .and_then(|value| value.to_str().ok());
-        let headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "HealControl", content_sha256)
-            .expect("body-bound auth headers should build");
+        let headers =
+            gen_tonic_signature_headers("node-a:9000", "node_service.HealControlService", "HealControl", content_sha256)
+                .expect("body-bound auth headers should build");
         request.metadata_mut().as_mut().extend(headers.clone());
 
-        assert!(verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/HealControl", &headers).is_ok());
-        let replay = verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/HealControl", &headers)
+        assert!(verify_tonic_rpc_signature("node-a:9000", "/node_service.HealControlService/HealControl", &headers).is_ok());
+        let replay = verify_tonic_rpc_signature("node-a:9000", "/node_service.HealControlService/HealControl", &headers)
             .expect_err("reusing a body-bound nonce must fail");
         assert_eq!(replay.to_string(), "RPC request replay detected");
         assert!(verify_tonic_canonical_body_digest(&request, body).is_ok());
