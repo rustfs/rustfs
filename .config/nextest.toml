@@ -263,8 +263,8 @@ path = "junit.xml"
 # The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
 #   * protocols:: — FTPS/SFTP/WebDAV, still pinned to --test-threads=1 by fixed
 #     ports; they join a scheduled lane once ci-6 randomises the ports (ci-7).
-#   * the 6 cluster suites that spin up a RustFSTestClusterEnvironment
-#     (cluster_concurrency, stale_multipart_cleanup_cluster,
+#   * the 7 cluster suites that spin up a RustFSTestClusterEnvironment
+#     (cluster_concurrency, cluster_multidrive_pool, stale_multipart_cleanup_cluster,
 #     namespace_lock_quorum, heal_erasure_disk_rebuild, admin_timeout_regression,
 #     object_lambda) — too heavy for the merge budget; they run in ci-7's
 #     nightly 4-node lane.
@@ -301,7 +301,7 @@ path = "junit.xml"
 default-filter = """
     package(e2e_test)
     & !test(/^protocols::/)
-    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
     & !test(/^multipart_auth_test::test_signed_put_object_extract_(accepts_compat_header|expands_tar_entries_with_prefix_headers|expands_tar_gz_archive|expands_tbz2_archive|expands_tgz_archive|expands_txz_archive|expands_tzst_archive|normalizes_prefix_header_value|preserves_directory_markers_by_default|preserves_object_lock_legal_hold|preserves_object_lock_retention|preserves_pax_metadata_and_version_id|preserves_request_metadata_on_extracted_objects|preserves_sse_c|preserves_sse_s3_and_redirect|preserves_storage_class|uses_bucket_default_sse_s3)$/)
     & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(prefers_exact_minio_prefix_over_suffix_fallback|supports_minio_prefix_and_directory_markers)$/)

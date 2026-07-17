@@ -151,6 +151,10 @@ mod object_lock;
 #[cfg(test)]
 mod cluster_concurrency_test;
 
+// Multi-drive (drivesPerNode) and 2-pool cluster harness smoke tests
+#[cfg(test)]
+mod cluster_multidrive_pool_test;
+
 // PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
 #[cfg(test)]
 mod checksum_upload_test;
