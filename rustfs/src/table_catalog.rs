@@ -3672,6 +3672,16 @@ where
             .backend
             .list_objects(self.catalog_bucket(), &self.paths.namespace_entries_prefix(table_bucket))
             .await?;
+        let mut unmatched_table_objects = namespace_objects
+            .iter()
+            .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut unmatched_view_objects = namespace_objects
+            .iter()
+            .filter(|object| object.ends_with(VIEW_ENTRY_FILE))
+            .cloned()
+            .collect::<BTreeSet<_>>();
         for namespace_object in namespace_objects
             .iter()
             .filter(|object| object.ends_with(NAMESPACE_ENTRY_FILE))
@@ -3702,6 +3712,7 @@ where
                 .list_objects(self.catalog_bucket(), &self.paths.table_entries_prefix(table_bucket, &namespace))
                 .await?;
             for table_object in table_objects.iter().filter(|object| object.ends_with(TABLE_ENTRY_FILE)) {
+                unmatched_table_objects.remove(table_object);
                 guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), table_object).await?);
                 let Some((table_entry, _)) = self
                     .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), table_object)
@@ -3781,6 +3792,7 @@ where
                 .list_objects(self.catalog_bucket(), &self.paths.view_entries_prefix(table_bucket, &namespace))
                 .await?;
             for view_object in view_objects.iter().filter(|object| object.ends_with(VIEW_ENTRY_FILE)) {
+                unmatched_view_objects.remove(view_object);
                 guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), view_object).await?);
                 let Some((view_entry, _)) = self
                     .read_entry_unlocked::<ViewEntry>(self.catalog_bucket(), view_object)
@@ -3799,6 +3811,16 @@ where
                 views.push(view_entry);
             }
             namespaces.push(namespace_entry);
+        }
+        if let Some(object) = unmatched_table_objects.first() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "table entry has no namespace entry during durable strong migration: {object}"
+            )));
+        }
+        if let Some(object) = unmatched_view_objects.first() {
+            return Err(TableCatalogStoreError::Invalid(format!(
+                "view entry has no namespace entry during durable strong migration: {object}"
+            )));
         }
 
         namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
@@ -7390,7 +7412,17 @@ where
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
         let bucket_path = self.paths.table_bucket_entry_path(table_bucket);
         let _bucket_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?;
-        if self.get_namespace(table_bucket, &namespace.public_name()).await?.is_none() {
+        let namespace_path = self.paths.namespace_entry_path(table_bucket, &namespace);
+        // Match create_namespace and migration lock order while draining table/view creation.
+        let _namespace_guard = self
+            .backend
+            .acquire_write_lock(self.catalog_bucket(), &namespace_path)
+            .await?;
+        if self
+            .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
+            .await?
+            .is_none()
+        {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
                 table_bucket,
@@ -7412,7 +7444,7 @@ where
             )));
         }
         self.backend
-            .delete_object(self.catalog_bucket(), &self.paths.namespace_entry_path(table_bucket, &namespace))
+            .delete_object_unlocked(self.catalog_bucket(), &namespace_path)
             .await
     }
 
@@ -17765,6 +17797,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_table_catalog_store_serializes_namespace_drop_with_table_creation() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let metadata_location = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let table_path = store.paths.table_entry_path(bucket, &namespace, &table);
+        let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &table_path).await;
+        let create_store = store.clone();
+        let table_entry = test_table_entry(bucket, &namespace, &table, metadata_location);
+        let create = tokio::spawn(async move { create_store.create_table(table_entry).await });
+        pause.wait_started().await;
+
+        let drop_store = store.clone();
+        let namespace_name = namespace.public_name();
+        let mut drop_namespace = tokio::spawn(async move { drop_store.drop_namespace(bucket, &namespace_name).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut drop_namespace)
+                .await
+                .is_err()
+        );
+
+        pause.release();
+        create.await.unwrap().unwrap();
+        assert_matches!(
+            drop_namespace.await.unwrap(),
+            Err(TableCatalogStoreError::Conflict(message)) if message.contains("is not empty")
+        );
+        assert!(
+            store
+                .load_table(bucket, &namespace.public_name(), table.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn durable_strong_migration_dry_run_reports_ready_catalog_inventory() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -17826,6 +17904,91 @@ mod tests {
         );
         assert_eq!(report.rollback.backing_config_key, ENV_TABLE_CATALOG_BACKING);
         assert_eq!(report.rollback.rollback_backing_value, TABLE_CATALOG_BACKING_OBJECT);
+    }
+
+    #[tokio::test]
+    async fn durable_strong_migration_rejects_orphan_table_without_namespace() {
+        let backend = TestCatalogObjectBackend::default();
+        let object_store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        seed_table_for_metadata_maintenance(&object_store, bucket, &namespace, &table, current_metadata).await;
+
+        let namespace_path = object_store.paths.namespace_entry_path(bucket, &namespace);
+        backend
+            .delete_object(RUSTFS_META_BUCKET, &namespace_path)
+            .await
+            .expect("namespace marker should be removed");
+        assert!(
+            object_store
+                .load_table(bucket, &namespace.public_name(), table.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let error = object_store
+            .materialize_durable_strong_backing_migration(bucket)
+            .await
+            .unwrap_err();
+        assert_matches!(
+            error,
+            TableCatalogStoreError::Invalid(message) if message.contains("table entry has no namespace entry")
+        );
+        object_store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .expect("failed migration must leave source catalog writable");
+        object_store.put_table_bucket(test_bucket_entry("research")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_strong_migration_rejects_orphan_view_without_namespace() {
+        let backend = TestCatalogObjectBackend::default();
+        let object_store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
+        let metadata_location = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+
+        object_store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        object_store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        object_store
+            .create_view(test_view_entry(bucket, &namespace, &view, metadata_location))
+            .await
+            .unwrap();
+        object_store.backfill_table_warehouse_index(bucket).await.unwrap();
+
+        let namespace_path = object_store.paths.namespace_entry_path(bucket, &namespace);
+        backend
+            .delete_object(RUSTFS_META_BUCKET, &namespace_path)
+            .await
+            .expect("namespace marker should be removed");
+        assert!(
+            object_store
+                .load_view(bucket, &namespace.public_name(), view.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let error = object_store
+            .materialize_durable_strong_backing_migration(bucket)
+            .await
+            .unwrap_err();
+        assert_matches!(
+            error,
+            TableCatalogStoreError::Invalid(message) if message.contains("view entry has no namespace entry")
+        );
+        object_store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .expect("failed migration must leave source catalog writable");
     }
 
     #[tokio::test]
