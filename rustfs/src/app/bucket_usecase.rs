@@ -1205,7 +1205,9 @@ impl DefaultBucketUsecase {
         // Invalidate bucket validation cache
         crate::storage::invalidate_bucket_validation_cache(&input.bucket);
 
-        rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
+        // Re-evaluate lifecycle/replication after bucket removal and keep an
+        // absent-bucket dirty marker until a complete usage snapshot is durable.
+        rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
         if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
             warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");
         }
@@ -1407,7 +1409,6 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
@@ -1490,7 +1491,6 @@ impl DefaultBucketUsecase {
 
         info!(bucket = %bucket, "deleted bucket replication config");
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
@@ -2096,7 +2096,6 @@ impl DefaultBucketUsecase {
             });
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
 
@@ -2317,7 +2316,6 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
