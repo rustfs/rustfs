@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::config::storageclass;
 use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, object::ObjectOperations as _};
@@ -22,6 +23,143 @@ use support::{
     rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates, resolve_rebalance_delete_from_all_pools_result,
     resolve_rebalance_delete_from_all_pools_results, resolve_store_rebalance_pool_meta_reload_result,
 };
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct BackendStorageClassInfo {
+    standard_sc_data: Vec<usize>,
+    standard_sc_parities: Vec<usize>,
+    standard_sc_parity: Option<usize>,
+    rr_sc_data: Vec<usize>,
+    rr_sc_parities: Vec<usize>,
+    rr_sc_parity: Option<usize>,
+}
+
+fn resolve_pool_layout(
+    drives_per_set: &[usize],
+    mut parity_for_pool: impl FnMut(usize, usize) -> Option<usize>,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    let mut parities = Vec::with_capacity(drives_per_set.len());
+    let mut data = Vec::with_capacity(drives_per_set.len());
+
+    for (pool_index, &drives) in drives_per_set.iter().enumerate() {
+        if drives == 0 {
+            return None;
+        }
+
+        let parity = parity_for_pool(pool_index, drives)?;
+        let data_drives = drives.checked_sub(parity)?;
+        if data_drives == 0 || parity > data_drives {
+            return None;
+        }
+
+        data.push(data_drives);
+        parities.push(parity);
+    }
+
+    Some((parities, data))
+}
+
+fn homogeneous_parity(parities: &[usize]) -> Option<usize> {
+    let first = *parities.first()?;
+    parities.iter().all(|&parity| parity == first).then_some(first)
+}
+
+fn resolve_complete_pool_layouts(
+    drives_per_set: &[usize],
+    standard_parity_for_pool: impl FnMut(usize, usize) -> Option<usize>,
+    rr_parity_for_pool: impl FnMut(usize, usize) -> Option<usize>,
+) -> Option<BackendStorageClassInfo> {
+    let (standard_sc_parities, standard_sc_data) = resolve_pool_layout(drives_per_set, standard_parity_for_pool)?;
+    let (rr_sc_parities, rr_sc_data) = resolve_pool_layout(drives_per_set, rr_parity_for_pool)?;
+
+    for ((&standard_parity, &rr_parity), &drives) in standard_sc_parities.iter().zip(&rr_sc_parities).zip(drives_per_set) {
+        storageclass::validate_parity_inner(standard_parity, rr_parity, drives).ok()?;
+    }
+
+    Some(BackendStorageClassInfo {
+        standard_sc_parity: homogeneous_parity(&standard_sc_parities),
+        standard_sc_data,
+        standard_sc_parities,
+        rr_sc_parity: homogeneous_parity(&rr_sc_parities),
+        rr_sc_data,
+        rr_sc_parities,
+    })
+}
+
+fn resolve_backend_storage_class_info(
+    config: &storageclass::Config,
+    drives_per_set: &[usize],
+    default_standard_parities: &[usize],
+) -> BackendStorageClassInfo {
+    if drives_per_set.len() != default_standard_parities.len() {
+        return BackendStorageClassInfo::default();
+    }
+
+    if !config.is_initialized() {
+        let Some((standard_sc_parities, standard_sc_data)) =
+            resolve_pool_layout(drives_per_set, |pool_index, _| default_standard_parities.get(pool_index).copied())
+        else {
+            return BackendStorageClassInfo::default();
+        };
+
+        return BackendStorageClassInfo {
+            standard_sc_parity: homogeneous_parity(&standard_sc_parities),
+            standard_sc_data,
+            standard_sc_parities,
+            ..Default::default()
+        };
+    }
+
+    match (config.parities_for_sc(storageclass::STANDARD), config.parities_for_sc(storageclass::RRS)) {
+        (Some(standard), Some(rr)) if standard.len() == drives_per_set.len() && rr.len() == drives_per_set.len() => {
+            resolve_complete_pool_layouts(
+                drives_per_set,
+                |pool_index, drives| config.parity_for_pool(storageclass::STANDARD, pool_index, drives),
+                |pool_index, drives| config.parity_for_pool(storageclass::RRS, pool_index, drives),
+            )
+            .unwrap_or_default()
+        }
+        (None, None) => {
+            let Some(standard) = config.get_parity_for_sc(storageclass::STANDARD) else {
+                return BackendStorageClassInfo::default();
+            };
+            let Some(rr) = config.get_parity_for_sc(storageclass::RRS) else {
+                return BackendStorageClassInfo::default();
+            };
+
+            resolve_complete_pool_layouts(drives_per_set, |_, _| Some(standard), |_, _| Some(rr)).unwrap_or_default()
+        }
+        _ => BackendStorageClassInfo::default(),
+    }
+}
+
+fn build_backend_info(
+    config: &storageclass::Config,
+    drives_per_set: &[usize],
+    default_standard_parities: &[usize],
+    total_sets: &[usize],
+) -> rustfs_madmin::BackendInfo {
+    let storage_class_info = if total_sets.len() == drives_per_set.len() {
+        resolve_backend_storage_class_info(config, drives_per_set, default_standard_parities)
+    } else {
+        BackendStorageClassInfo::default()
+    };
+
+    rustfs_madmin::BackendInfo {
+        backend_type: rustfs_madmin::BackendByte::Erasure,
+        online_disks: rustfs_madmin::BackendDisks::new(),
+        offline_disks: rustfs_madmin::BackendDisks::new(),
+        standard_sc_data: storage_class_info.standard_sc_data,
+        standard_sc_parities: storage_class_info.standard_sc_parities,
+        standard_sc_parity: storage_class_info.standard_sc_parity,
+        rr_sc_data: storage_class_info.rr_sc_data,
+        rr_sc_parities: storage_class_info.rr_sc_parities,
+        rr_sc_parity: storage_class_info.rr_sc_parity,
+        total_sets: total_sets.to_vec(),
+        drives_per_set: drives_per_set.to_vec(),
+        ..Default::default()
+    }
+}
 
 impl ECStore {
     #[instrument(level = "debug", skip(self))]
@@ -509,37 +647,12 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_backend_info(&self) -> rustfs_madmin::BackendInfo {
-        let (standard_sc_parity, rr_sc_parity) =
-            runtime_sources::backend_storage_class_parities(self.pools[0].default_parity_count);
+        let drives_per_set = StorageAdminApi::set_drive_counts(self);
+        let default_standard_parities = self.pools.iter().map(|pool| pool.default_parity_count).collect::<Vec<_>>();
+        let storage_class = runtime_sources::storage_class_config_snapshot();
+        let total_sets = self.pools.iter().map(|pool| pool.set_count).collect::<Vec<_>>();
 
-        let mut standard_sc_data = Vec::new();
-        let mut rr_sc_data = Vec::new();
-        let mut drives_per_set = Vec::new();
-        let mut total_sets = Vec::new();
-
-        for (idx, set_count) in StorageAdminApi::set_drive_counts(self).iter().enumerate() {
-            if let Some(sc_parity) = standard_sc_parity {
-                standard_sc_data.push(set_count - sc_parity);
-            }
-            if let Some(sc_parity) = rr_sc_parity {
-                rr_sc_data.push(set_count - sc_parity);
-            }
-            total_sets.push(self.pools[idx].set_count);
-            drives_per_set.push(*set_count);
-        }
-
-        rustfs_madmin::BackendInfo {
-            backend_type: rustfs_madmin::BackendByte::Erasure,
-            online_disks: rustfs_madmin::BackendDisks::new(),
-            offline_disks: rustfs_madmin::BackendDisks::new(),
-            standard_sc_data,
-            standard_sc_parity,
-            rr_sc_data,
-            rr_sc_parity,
-            total_sets,
-            drives_per_set,
-            ..Default::default()
-        }
+        build_backend_info(&storage_class, &drives_per_set, &default_standard_parities, &total_sets)
     }
 
     #[instrument(skip(self))]
@@ -635,6 +748,166 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
+    use arc_swap::ArcSwap;
+    use rustfs_config::server_config::KVS;
+    use std::sync::Arc;
+
+    fn assert_backend_layout_empty(info: &rustfs_madmin::BackendInfo) {
+        assert!(info.standard_sc_parities.is_empty());
+        assert!(info.standard_sc_data.is_empty());
+        assert_eq!(info.standard_sc_parity, None);
+        assert!(info.rr_sc_parities.is_empty());
+        assert!(info.rr_sc_data.is_empty());
+        assert_eq!(info.rr_sc_parity, None);
+    }
+
+    #[test]
+    fn build_backend_info_reports_heterogeneous_automatic_config_in_pool_order() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic storage class should resolve");
+
+        let info = build_backend_info(&config, &[4, 2], &[2, 1], &[7, 3]);
+
+        assert!(matches!(info.backend_type, rustfs_madmin::BackendByte::Erasure));
+        assert_eq!(info.standard_sc_parities, vec![2, 1]);
+        assert_eq!(info.standard_sc_data, vec![2, 1]);
+        assert_eq!(info.standard_sc_parity, None);
+        assert_eq!(info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(info.rr_sc_data, vec![3, 1]);
+        assert_eq!(info.rr_sc_parity, Some(1));
+        assert_eq!(info.drives_per_set, vec![4, 2]);
+        assert_eq!(info.total_sets, vec![7, 3]);
+    }
+
+    #[test]
+    fn build_backend_info_keeps_truthful_homogeneous_scalar() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
+        let config =
+            lookup_config_for_pools_without_env(&kvs, &[4, 6]).expect("explicit storage class should resolve for every pool");
+
+        let info = build_backend_info(&config, &[4, 6], &[2, 3], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![2, 2]);
+        assert_eq!(info.standard_sc_data, vec![2, 4]);
+        assert_eq!(info.standard_sc_parity, Some(2));
+        assert_eq!(info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(info.rr_sc_data, vec![3, 5]);
+        assert_eq!(info.rr_sc_parity, Some(1));
+    }
+
+    #[test]
+    fn build_backend_info_reports_single_disk_pool_without_inventing_parity() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 1]).expect("single disk pool should resolve");
+
+        let info = build_backend_info(&config, &[4, 1], &[2, 0], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![2, 0]);
+        assert_eq!(info.standard_sc_data, vec![2, 1]);
+        assert_eq!(info.standard_sc_parity, None);
+        assert_eq!(info.rr_sc_parities, vec![1, 0]);
+        assert_eq!(info.rr_sc_data, vec![3, 1]);
+        assert_eq!(info.rr_sc_parity, None);
+    }
+
+    #[test]
+    fn build_backend_info_uses_pool_defaults_only_when_truly_uninitialized() {
+        let info = build_backend_info(&Default::default(), &[4, 2], &[1, 0], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![1, 0]);
+        assert_eq!(info.standard_sc_data, vec![3, 2]);
+        assert_eq!(info.standard_sc_parity, None);
+        assert!(info.rr_sc_parities.is_empty());
+        assert!(info.rr_sc_data.is_empty());
+        assert_eq!(info.rr_sc_parity, None);
+    }
+
+    #[test]
+    fn build_backend_info_fails_closed_on_initialized_snapshot_mismatch() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic storage class should resolve");
+
+        let info = build_backend_info(&config, &[4, 6], &[1, 2], &[1, 1]);
+
+        assert_backend_layout_empty(&info);
+        assert_eq!(info.drives_per_set, vec![4, 6]);
+        assert_eq!(info.total_sets, vec![1, 1]);
+    }
+
+    #[test]
+    fn build_backend_info_expands_valid_legacy_scalar_snapshot() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
+        kvs.insert(CLASS_RRS.to_string(), "EC:1".to_string());
+        let current =
+            lookup_config_for_pools_without_env(&kvs, &[4, 6]).expect("distinct legacy scalars should resolve for every pool");
+        let encoded = serde_json::to_string(&current).expect("config should serialize");
+        let legacy: storageclass::Config = serde_json::from_str(&encoded).expect("legacy scalar config should deserialize");
+
+        let info = build_backend_info(&legacy, &[4, 6], &[2, 3], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![2, 2]);
+        assert_eq!(info.standard_sc_data, vec![2, 4]);
+        assert_eq!(info.standard_sc_parity, Some(2));
+        assert_eq!(info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(info.rr_sc_data, vec![3, 5]);
+        assert_eq!(info.rr_sc_parity, Some(1));
+    }
+
+    #[test]
+    fn build_backend_info_rejects_legacy_scalar_invalid_for_later_pool() {
+        let current = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic config should resolve");
+        let encoded = serde_json::to_string(&current).expect("config should serialize");
+        let legacy: storageclass::Config = serde_json::from_str(&encoded).expect("legacy scalar config should deserialize");
+
+        let info = build_backend_info(&legacy, &[4, 2], &[2, 1], &[1, 1]);
+
+        assert_backend_layout_empty(&info);
+    }
+
+    #[test]
+    fn build_backend_info_never_reports_invalid_geometry() {
+        let config = storageclass::Config::default();
+
+        assert_backend_layout_empty(&build_backend_info(&config, &[4, 2], &[5, 1], &[1, 1]));
+        assert_backend_layout_empty(&build_backend_info(&config, &[0], &[0], &[1]));
+        assert_backend_layout_empty(&build_backend_info(&config, &[4], &[3], &[1]));
+    }
+
+    #[test]
+    fn build_backend_info_rejects_mismatched_topology_lengths() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic storage class should resolve");
+
+        assert_backend_layout_empty(&build_backend_info(&config, &[4, 2], &[2], &[1, 1]));
+        assert_backend_layout_empty(&build_backend_info(&config, &[4, 2], &[2, 1], &[1]));
+
+        let empty = build_backend_info(&Default::default(), &[], &[], &[]);
+        assert_backend_layout_empty(&empty);
+        assert!(empty.drives_per_set.is_empty());
+        assert!(empty.total_sets.is_empty());
+    }
+
+    #[test]
+    fn build_backend_info_uses_one_complete_arc_swap_snapshot() {
+        let old = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("old config should resolve");
+        let mut new_kvs = KVS::new();
+        new_kvs.insert(CLASS_STANDARD.to_string(), "EC:1".to_string());
+        let new = lookup_config_for_pools_without_env(&new_kvs, &[4, 2]).expect("new config should resolve");
+        let snapshots = ArcSwap::from_pointee(old);
+        let held_old = snapshots.load_full();
+        snapshots.store(Arc::new(new));
+
+        let old_info = build_backend_info(&held_old, &[4, 2], &[2, 1], &[1, 1]);
+        let new_info = build_backend_info(&snapshots.load_full(), &[4, 2], &[2, 1], &[1, 1]);
+
+        assert_eq!(old_info.standard_sc_parities, vec![2, 1]);
+        assert_eq!(old_info.standard_sc_data, vec![2, 1]);
+        assert_eq!(old_info.standard_sc_parity, None);
+        assert_eq!(old_info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(new_info.standard_sc_parities, vec![1, 1]);
+        assert_eq!(new_info.standard_sc_data, vec![3, 1]);
+        assert_eq!(new_info.standard_sc_parity, Some(1));
+        assert_eq!(new_info.rr_sc_parities, vec![1, 1]);
+    }
 
     fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
         ObjectInfo {

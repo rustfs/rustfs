@@ -50,6 +50,7 @@ const LOG_SUBSYSTEM_METRICS_COLLECTOR: &str = "metrics_collector";
 const EVENT_METRICS_COLLECTOR_STATE: &str = "metrics_collector_state";
 
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
+type ObsBackendInfo = <ObsStore as StorageAdminApi>::BackendInfo;
 
 struct ObsDataUsageInfo {
     last_update: Option<SystemTime>,
@@ -789,43 +790,86 @@ pub fn collect_internode_network_stats() -> Option<NetworkStats> {
 }
 
 /// Collect cluster config metrics from backend parity configuration.
+fn cluster_config_stats_from_backend_parities(
+    rr_sc_parity: Option<usize>,
+    standard_sc_parity: Option<usize>,
+) -> Option<ClusterConfigStats> {
+    Some(ClusterConfigStats {
+        rrs_parity: u32::try_from(rr_sc_parity?).ok()?,
+        standard_parity: u32::try_from(standard_sc_parity?).ok()?,
+    })
+}
+
 pub async fn collect_cluster_config_stats() -> Option<ClusterConfigStats> {
     let store = resolve_obs_object_store_handle()?;
     let backend = StorageAdminApi::backend_info(store.as_ref()).await;
 
-    Some(ClusterConfigStats {
-        rrs_parity: backend.rr_sc_parity.unwrap_or_default() as u32,
-        standard_parity: backend.standard_sc_parity.unwrap_or_default() as u32,
-    })
+    cluster_config_stats_from_backend_parities(backend.rr_sc_parity, backend.standard_sc_parity)
 }
 
-/// Collect cluster erasure set metrics from storage and backend topology info.
-pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
-    let Some(store) = resolve_obs_object_store_handle() else {
-        return Vec::new();
+fn standard_erasure_layout_from_backend(backend: &ObsBackendInfo, pool_idx: usize) -> Option<(usize, usize)> {
+    let drives_per_set = backend.drives_per_set.get(pool_idx).copied()?;
+    if drives_per_set == 0
+        || (!backend.standard_sc_data.is_empty() && backend.standard_sc_data.len() != backend.drives_per_set.len())
+        || (!backend.standard_sc_parities.is_empty() && backend.standard_sc_parities.len() != backend.drives_per_set.len())
+    {
+        return None;
+    }
+
+    let has_data = !backend.standard_sc_data.is_empty();
+    let has_parities = !backend.standard_sc_parities.is_empty();
+    let (data, parity) = match (has_data, has_parities) {
+        (true, true) => (
+            backend.standard_sc_data.get(pool_idx).copied()?,
+            backend.standard_sc_parities.get(pool_idx).copied()?,
+        ),
+        (true, false) => {
+            let data = backend.standard_sc_data.get(pool_idx).copied()?;
+            (data, drives_per_set.checked_sub(data)?)
+        }
+        (false, true) => {
+            let parity = backend.standard_sc_parities.get(pool_idx).copied()?;
+            (drives_per_set.checked_sub(parity)?, parity)
+        }
+        (false, false) => {
+            let parity = backend.standard_sc_parity?;
+            (drives_per_set.checked_sub(parity)?, parity)
+        }
     };
 
-    let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-    let backend = StorageAdminApi::backend_info(store.as_ref()).await;
+    if data == 0 || parity > data || data.checked_add(parity) != Some(drives_per_set) {
+        return None;
+    }
+
+    Some((data, parity))
+}
+
+fn erasure_set_stats_from_backend(storage_info: &ObsStorageInfo, backend: &ObsBackendInfo) -> Vec<ErasureSetStats> {
     let mut grouped: HashMap<(usize, usize), ErasureSetStats> = HashMap::new();
 
     for disk in &storage_info.disks {
-        let pool_idx = disk.pool_index.max(0) as usize;
-        let set_idx = disk.set_index.max(0) as usize;
-        let set_drive_count = backend.drives_per_set.get(pool_idx).copied().unwrap_or_default();
-        let parity = backend
-            .standard_sc_parities
-            .get(pool_idx)
-            .copied()
-            .or(backend.standard_sc_parity)
-            .unwrap_or(set_drive_count / 2);
+        let (Ok(pool_idx), Ok(set_idx)) = (usize::try_from(disk.pool_index), usize::try_from(disk.set_index)) else {
+            continue;
+        };
+        let Some((_, parity)) = standard_erasure_layout_from_backend(backend, pool_idx) else {
+            continue;
+        };
+        let set_drive_count = backend.drives_per_set[pool_idx];
+        let (Ok(pool_id), Ok(set_id), Ok(size), Ok(parity_metric)) = (
+            u32::try_from(pool_idx),
+            u32::try_from(set_idx),
+            u32::try_from(set_drive_count),
+            u32::try_from(parity),
+        ) else {
+            continue;
+        };
         let quorum_shape = derive_erasure_set_quorum_shape(set_drive_count, parity);
 
         let entry = grouped.entry((pool_idx, set_idx)).or_insert_with(|| ErasureSetStats {
-            pool_id: pool_idx as u32,
-            set_id: set_idx as u32,
-            size: set_drive_count as u32,
-            parity: parity as u32,
+            pool_id,
+            set_id,
+            size,
+            parity: parity_metric,
             data_shards: quorum_shape.data_shards,
             read_quorum: quorum_shape.read_quorum,
             write_quorum: quorum_shape.write_quorum,
@@ -853,6 +897,17 @@ pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
     let mut stats = grouped.into_values().collect::<Vec<_>>();
     stats.sort_by_key(|stat| (stat.pool_id, stat.set_id));
     stats
+}
+
+/// Collect cluster erasure set metrics from storage and backend topology info.
+pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
+    let Some(store) = resolve_obs_object_store_handle() else {
+        return Vec::new();
+    };
+
+    let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+    let backend = StorageAdminApi::backend_info(store.as_ref()).await;
+    erasure_set_stats_from_backend(&storage_info, &backend)
 }
 
 pub async fn collect_iam_stats() -> Option<IamStats> {
@@ -1118,6 +1173,101 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::thread;
     use std::time::Duration;
+
+    fn storage_info_with_one_online_disk() -> ObsStorageInfo {
+        let mut info = ObsStorageInfo::default();
+        info.disks.push(Default::default());
+        let disk = info.disks.last_mut().expect("inserted disk should exist");
+        disk.pool_index = 0;
+        disk.set_index = 0;
+        disk.disk_index = 0;
+        disk.state = DRIVE_STATE_OK.to_string();
+        disk.runtime_state = Some(DRIVE_STATE_ONLINE.to_string());
+        info
+    }
+
+    #[test]
+    fn cluster_config_stats_accept_homogeneous_backend_parities() {
+        let stats = cluster_config_stats_from_backend_parities(Some(1), Some(2))
+            .expect("homogeneous scalar parities should produce cluster config metrics");
+
+        assert_eq!(stats.rrs_parity, 1);
+        assert_eq!(stats.standard_parity, 2);
+    }
+
+    #[test]
+    fn cluster_config_stats_skip_heterogeneous_backend_parities() {
+        assert!(cluster_config_stats_from_backend_parities(Some(1), None).is_none());
+        assert!(cluster_config_stats_from_backend_parities(None, Some(2)).is_none());
+    }
+
+    #[test]
+    fn cluster_config_stats_reject_parity_larger_than_u32() {
+        match usize::try_from(u64::from(u32::MAX) + 1) {
+            Ok(overflow) => {
+                assert!(cluster_config_stats_from_backend_parities(Some(overflow), Some(2)).is_none());
+                assert!(cluster_config_stats_from_backend_parities(Some(1), Some(overflow)).is_none());
+            }
+            Err(_) => assert!(usize::BITS <= u32::BITS, "overflow input is unreachable only on narrow targets"),
+        }
+    }
+
+    #[test]
+    fn erasure_set_stats_skip_unknown_backend_layout() {
+        let storage_info = storage_info_with_one_online_disk();
+        let backend = ObsBackendInfo {
+            drives_per_set: vec![8],
+            ..Default::default()
+        };
+
+        assert!(erasure_set_stats_from_backend(&storage_info, &backend).is_empty());
+    }
+
+    #[test]
+    fn erasure_set_stats_skip_inconsistent_exact_layout_without_scalar_fallback() {
+        let storage_info = storage_info_with_one_online_disk();
+        let backend = ObsBackendInfo {
+            standard_sc_data: vec![6],
+            standard_sc_parities: vec![4],
+            standard_sc_parity: Some(2),
+            drives_per_set: vec![8],
+            ..Default::default()
+        };
+
+        assert!(erasure_set_stats_from_backend(&storage_info, &backend).is_empty());
+    }
+
+    #[test]
+    fn erasure_set_stats_accept_truthful_legacy_scalar_layout() {
+        let storage_info = storage_info_with_one_online_disk();
+        let backend = ObsBackendInfo {
+            standard_sc_parity: Some(2),
+            drives_per_set: vec![8],
+            ..Default::default()
+        };
+
+        let stats = erasure_set_stats_from_backend(&storage_info, &backend);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].size, 8);
+        assert_eq!(stats[0].parity, 2);
+        assert_eq!(stats[0].data_shards, 6);
+    }
+
+    #[test]
+    fn erasure_set_stats_exact_data_ignores_stale_scalar() {
+        let storage_info = storage_info_with_one_online_disk();
+        let backend = ObsBackendInfo {
+            standard_sc_data: vec![6],
+            standard_sc_parity: Some(4),
+            drives_per_set: vec![8],
+            ..Default::default()
+        };
+
+        let stats = erasure_set_stats_from_backend(&storage_info, &backend);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].parity, 2);
+        assert_eq!(stats[0].data_shards, 6);
+    }
 
     fn generate_loopback_traffic() -> std::io::Result<()> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
