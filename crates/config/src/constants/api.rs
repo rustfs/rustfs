@@ -50,3 +50,26 @@ pub const ENV_API_RATE_LIMIT_BURST: &str = "RUSTFS_API_RATE_LIMIT_BURST";
 
 /// Default for `RUSTFS_API_RATE_LIMIT_BURST` (`0` = same as RPM).
 pub const DEFAULT_API_RATE_LIMIT_BURST: u32 = 0;
+
+/// Sustained S3 API request budget per addressed bucket, in requests per
+/// minute — a collective ceiling shared by all clients of that bucket.
+///
+/// Complements the per-client-IP dimension: it protects the server from one
+/// hot bucket regardless of how many client IPs the traffic comes from. `0`
+/// disables the bucket dimension. Requires `RUSTFS_API_RATE_LIMIT_ENABLE`.
+/// Environment variable: RUSTFS_API_RATE_LIMIT_BUCKET_RPM
+/// Example: RUSTFS_API_RATE_LIMIT_BUCKET_RPM=60000
+pub const ENV_API_RATE_LIMIT_BUCKET_RPM: &str = "RUSTFS_API_RATE_LIMIT_BUCKET_RPM";
+
+/// Default for `RUSTFS_API_RATE_LIMIT_BUCKET_RPM` (`0` = dimension disabled).
+pub const DEFAULT_API_RATE_LIMIT_BUCKET_RPM: u32 = 0;
+
+/// Burst capacity per bucket (maximum tokens in the bucket-dimension bucket).
+///
+/// `0` means "same as `RUSTFS_API_RATE_LIMIT_BUCKET_RPM`".
+/// Environment variable: RUSTFS_API_RATE_LIMIT_BUCKET_BURST
+/// Example: RUSTFS_API_RATE_LIMIT_BUCKET_BURST=2000
+pub const ENV_API_RATE_LIMIT_BUCKET_BURST: &str = "RUSTFS_API_RATE_LIMIT_BUCKET_BURST";
+
+/// Default for `RUSTFS_API_RATE_LIMIT_BUCKET_BURST` (`0` = same as bucket RPM).
+pub const DEFAULT_API_RATE_LIMIT_BUCKET_BURST: u32 = 0;
