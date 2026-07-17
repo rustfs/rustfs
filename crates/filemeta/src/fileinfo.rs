@@ -23,13 +23,17 @@ use rustfs_utils::http::{
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use time::{format_description::FormatItem, macros::format_description};
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
+
+const MAX_ERASURE_SHARDS: usize = 16;
+const MAX_FILEINFO_PARTS: usize = 10_000;
+const MAX_FILEINFO_CHECKSUMS: usize = 10_000;
 
 // Additional constants from Go version
 pub const NULL_VERSION_ID: &str = "null";
@@ -243,6 +247,84 @@ pub struct FileInfo {
     pub uses_legacy_checksum: bool,
 }
 
+/// Selects the validation policy for a trusted operation boundary.
+///
+/// This mode is deliberately caller-selected and is never inferred from
+/// serialized [`FileInfo`] state such as `deleted` or `transition_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationMode {
+    /// Validate the complete storage erasure layout before payload access.
+    RequireErasure,
+    /// Validate delete metadata without requiring a payload erasure layout.
+    DeleteOnly,
+    /// Validate remote-object metadata without requiring a local payload layout.
+    RemoteOnly,
+    /// Validate multipart cleanup metadata without requiring a payload layout.
+    AbortOnly,
+}
+
+/// Erasure geometry that passed the storage-layout validation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedErasureLayout {
+    data_blocks: usize,
+    parity_blocks: usize,
+    total_blocks: usize,
+    block_size: usize,
+    index: usize,
+}
+
+impl ValidatedErasureLayout {
+    pub const fn data_blocks(&self) -> usize {
+        self.data_blocks
+    }
+
+    pub const fn parity_blocks(&self) -> usize {
+        self.parity_blocks
+    }
+
+    pub const fn total_blocks(&self) -> usize {
+        self.total_blocks
+    }
+
+    pub const fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+}
+
+/// A [`FileInfo`] together with the invariants established at its operation boundary.
+#[derive(Debug)]
+pub struct ValidatedFileInfo<'a> {
+    file_info: &'a FileInfo,
+    mode: ValidationMode,
+    erasure_layout: Option<ValidatedErasureLayout>,
+    checksum_indices: HashMap<usize, usize>,
+}
+
+impl<'a> ValidatedFileInfo<'a> {
+    pub const fn file_info(&self) -> &'a FileInfo {
+        self.file_info
+    }
+
+    pub const fn mode(&self) -> ValidationMode {
+        self.mode
+    }
+
+    pub const fn erasure_layout(&self) -> Option<&ValidatedErasureLayout> {
+        self.erasure_layout.as_ref()
+    }
+
+    /// Returns a checksum whose association with `part_number` was validated.
+    pub fn checksum_info(&self, part_number: usize) -> Option<&ChecksumInfo> {
+        self.checksum_indices
+            .get(&part_number)
+            .and_then(|&checksum_index| self.file_info.erasure.checksums.get(checksum_index))
+    }
+}
+
 /// Validates that an erasure `distribution` is a permutation of `1..=n`.
 ///
 /// A well-formed distribution has exactly `n` entries and each 1-based slot
@@ -304,19 +386,73 @@ impl FileInfo {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
-        if self.deleted {
-            return true;
+    /// Validates this metadata for the caller-selected operation boundary.
+    ///
+    /// All modes enforce collection bounds and checksum-to-part associations.
+    /// Only [`ValidationMode::RequireErasure`] establishes a payload erasure
+    /// layout; the other modes cannot be upgraded based on serialized flags.
+    pub fn validate(&self, mode: ValidationMode) -> Result<ValidatedFileInfo<'_>> {
+        if self.parts.len() > MAX_FILEINFO_PARTS
+            || self.erasure.checksums.len() > MAX_FILEINFO_CHECKSUMS
+            || self.erasure.distribution.len() > MAX_ERASURE_SHARDS
+        {
+            return Err(Error::FileCorrupt);
         }
 
-        let data_blocks = self.erasure.data_blocks;
-        let parity_blocks = self.erasure.parity_blocks;
+        let erasure_layout = match mode {
+            ValidationMode::RequireErasure => {
+                let erasure = &self.erasure;
+                if erasure.data_blocks == 0 || erasure.block_size == 0 || erasure.data_blocks < erasure.parity_blocks {
+                    return Err(Error::FileCorrupt);
+                }
 
-        (data_blocks >= parity_blocks)
-            && (data_blocks > 0)
-            && (self.erasure.index > 0
-                && self.erasure.index <= data_blocks + parity_blocks
-                && is_valid_distribution(&self.erasure.distribution, data_blocks + parity_blocks))
+                let total_blocks = erasure
+                    .data_blocks
+                    .checked_add(erasure.parity_blocks)
+                    .ok_or(Error::FileCorrupt)?;
+                if total_blocks > MAX_ERASURE_SHARDS
+                    || erasure.index == 0
+                    || erasure.index > total_blocks
+                    || !is_valid_distribution(&erasure.distribution, total_blocks)
+                {
+                    return Err(Error::FileCorrupt);
+                }
+
+                Some(ValidatedErasureLayout {
+                    data_blocks: erasure.data_blocks,
+                    parity_blocks: erasure.parity_blocks,
+                    total_blocks,
+                    block_size: erasure.block_size,
+                    index: erasure.index,
+                })
+            }
+            ValidationMode::DeleteOnly | ValidationMode::RemoteOnly | ValidationMode::AbortOnly => None,
+        };
+
+        let mut checksum_indices = HashMap::with_capacity(self.erasure.checksums.len());
+        if !self.erasure.checksums.is_empty() {
+            let mut part_numbers = HashSet::with_capacity(self.parts.len());
+            part_numbers.extend(self.parts.iter().map(|part| part.number));
+
+            for (checksum_index, checksum) in self.erasure.checksums.iter().enumerate() {
+                if !part_numbers.contains(&checksum.part_number)
+                    || checksum_indices.insert(checksum.part_number, checksum_index).is_some()
+                {
+                    return Err(Error::FileCorrupt);
+                }
+            }
+        }
+
+        Ok(ValidatedFileInfo {
+            file_info: self,
+            mode,
+            erasure_layout,
+            checksum_indices,
+        })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.validate(ValidationMode::RequireErasure).is_ok()
     }
 
     pub fn get_etag(&self) -> Option<String> {
@@ -815,6 +951,225 @@ mod tests {
         let mut fi = distribution_test_fileinfo();
         fi.erasure.distribution = vec![1, 2, 3];
         assert!(!fi.is_valid());
+    }
+
+    fn validation_test_fileinfo() -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 4, 2);
+        fi.erasure.index = 1;
+        fi.parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                ..Default::default()
+            },
+        ];
+        fi.erasure.checksums = vec![ChecksumInfo {
+            part_number: 2,
+            algorithm: HashAlgorithm::SHA256,
+            hash: Bytes::new(),
+        }];
+        fi
+    }
+
+    fn assert_file_corrupt(fi: &FileInfo, mode: ValidationMode) {
+        assert_eq!(fi.validate(mode).expect_err("invalid FileInfo must be rejected"), Error::FileCorrupt);
+    }
+
+    #[test]
+    fn validate_require_erasure_returns_checked_layout_and_checksum_index() {
+        let fi = validation_test_fileinfo();
+        let validated = fi
+            .validate(ValidationMode::RequireErasure)
+            .expect("well-formed erasure metadata must validate");
+
+        assert_eq!(validated.file_info(), &fi);
+        assert_eq!(validated.mode(), ValidationMode::RequireErasure);
+        let layout = validated
+            .erasure_layout()
+            .expect("strict validation must return an erasure layout");
+        assert_eq!(layout.data_blocks(), 4);
+        assert_eq!(layout.parity_blocks(), 2);
+        assert_eq!(layout.total_blocks(), 6);
+        assert_eq!(layout.block_size(), BLOCK_SIZE_V2);
+        assert_eq!(layout.index(), 1);
+        assert_eq!(
+            validated
+                .checksum_info(2)
+                .expect("validated checksum association must be indexed")
+                .algorithm,
+            HashAlgorithm::SHA256
+        );
+        assert!(validated.checksum_info(1).is_none());
+    }
+
+    #[test]
+    fn validate_require_erasure_accepts_zero_parity() {
+        let mut fi = FileInfo::new("bucket/object", 16, 0);
+        fi.erasure.index = 1;
+
+        let validated = fi
+            .validate(ValidationMode::RequireErasure)
+            .expect("zero parity is a valid storage layout");
+        assert_eq!(
+            validated
+                .erasure_layout()
+                .expect("strict layout must be present")
+                .total_blocks(),
+            16
+        );
+    }
+
+    #[test]
+    fn validate_require_erasure_rejects_invalid_geometry() {
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = 0;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.block_size = 0;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = usize::MAX;
+        fi.erasure.parity_blocks = 1;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = 9;
+        fi.erasure.parity_blocks = 8;
+        fi.erasure.index = 1;
+        fi.erasure.distribution = (1..=17).collect();
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = 1;
+        fi.erasure.parity_blocks = 2;
+        fi.erasure.index = 1;
+        fi.erasure.distribution = vec![1, 2, 3];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.index = 0;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.index = 7;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.distribution = vec![1, 2, 3, 4, 5, 5];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+    }
+
+    #[test]
+    fn validation_mode_is_caller_selected_and_flags_cannot_relax_strict_validation() {
+        let mut fi = FileInfo::new("bucket/legacy", 0, 2);
+        fi.erasure.index = 1;
+        fi.deleted = true;
+        fi.transition_status = TRANSITION_COMPLETE.to_owned();
+        fi.transitioned_objname = "remote/object".to_owned();
+        fi.transition_tier = "WARM".to_owned();
+
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert!(!fi.is_valid(), "wire-controlled state flags must not relax is_valid");
+
+        for mode in [
+            ValidationMode::DeleteOnly,
+            ValidationMode::RemoteOnly,
+            ValidationMode::AbortOnly,
+        ] {
+            let validated = fi
+                .validate(mode)
+                .expect("trusted non-payload mode must skip erasure geometry");
+            assert_eq!(validated.mode(), mode);
+            assert!(validated.erasure_layout().is_none());
+        }
+    }
+
+    #[test]
+    fn all_validation_modes_enforce_basic_collection_bounds() {
+        let modes = [
+            ValidationMode::RequireErasure,
+            ValidationMode::DeleteOnly,
+            ValidationMode::RemoteOnly,
+            ValidationMode::AbortOnly,
+        ];
+
+        let mut fi = validation_test_fileinfo();
+        fi.parts = (1..=10_001)
+            .map(|number| ObjectPartInfo {
+                number,
+                ..Default::default()
+            })
+            .collect();
+        for mode in modes {
+            assert_file_corrupt(&fi, mode);
+        }
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.checksums = (1..=10_001)
+            .map(|part_number| ChecksumInfo {
+                part_number,
+                ..Default::default()
+            })
+            .collect();
+        for mode in modes {
+            assert_file_corrupt(&fi, mode);
+        }
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.distribution = vec![1; 17];
+        for mode in modes {
+            assert_file_corrupt(&fi, mode);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_exact_collection_limits() {
+        let mut fi = validation_test_fileinfo();
+        fi.parts = (1..=10_000)
+            .map(|number| ObjectPartInfo {
+                number,
+                ..Default::default()
+            })
+            .collect();
+        fi.erasure.checksums = (1..=10_000)
+            .map(|part_number| ChecksumInfo {
+                part_number,
+                ..Default::default()
+            })
+            .collect();
+
+        let validated = fi
+            .validate(ValidationMode::RequireErasure)
+            .expect("exact collection limits must remain valid");
+        assert!(validated.checksum_info(10_000).is_some());
+    }
+
+    #[test]
+    fn all_validation_modes_reject_missing_or_duplicate_checksum_associations() {
+        let modes = [
+            ValidationMode::RequireErasure,
+            ValidationMode::DeleteOnly,
+            ValidationMode::RemoteOnly,
+            ValidationMode::AbortOnly,
+        ];
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.checksums[0].part_number = 99;
+        for mode in modes {
+            assert_file_corrupt(&fi, mode);
+        }
+
+        let mut fi = validation_test_fileinfo();
+        let duplicate = fi.erasure.checksums[0].clone();
+        fi.erasure.checksums.push(duplicate);
+        for mode in modes {
+            assert_file_corrupt(&fi, mode);
+        }
     }
 
     fn small_string_strategy() -> impl Strategy<Value = String> {
