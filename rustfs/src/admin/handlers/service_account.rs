@@ -397,7 +397,12 @@ impl Operation for AddServiceAccount {
                     error = ?e,
                     "admin service account state"
                 );
-                s3_error!(InternalError, "create service account failed, e: {:?}", e)
+                match e {
+                    rustfs_iam::error::Error::InvalidAccessKeyLength | rustfs_iam::error::Error::InvalidSecretKeyLength => {
+                        iam_error_to_s3_error(e)
+                    }
+                    err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
+                }
             })?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
@@ -1560,6 +1565,24 @@ mod tests {
 
         assert_eq!(*err.code(), S3ErrorCode::NoSuchResource);
         assert_eq!(err.message(), Some("service account 'missing' does not exist"));
+    }
+
+    #[test]
+    fn add_service_account_maps_iam_create_errors_to_s3_errors() {
+        let src = include_str!("service_account.rs");
+        let create_start = src
+            .find("impl Operation for AddServiceAccount")
+            .expect("AddServiceAccount operation should exist");
+        let create_block = &src[create_start..];
+        let create_end = create_block
+            .find("if let Err(err) = site_replication_iam_change_hook")
+            .expect("site replication hook marker should exist");
+        let create_block = &create_block[..create_end];
+
+        assert!(
+            create_block.contains("iam_error_to_s3_error(e)"),
+            "service-account create validation errors must map to client S3 errors"
+        );
     }
 
     #[test]

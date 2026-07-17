@@ -73,14 +73,35 @@ pub const DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS: usize = 64;
 /// - Example: `export RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT=5`
 pub const ENV_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT";
 
-/// Maximum time a GET request waits for a disk read permit (seconds).
+/// Maximum time a GET request waits for a primary disk read permit (seconds).
 ///
 /// Permits are held for the whole response body transfer, so slow clients can
 /// occupy all of them while the disks sit idle. Instead of stalling until the
-/// request-level timeout fires, a GET that waits longer than this proceeds
-/// without a permit (degraded pass-through) and the bypass is counted in
-/// metrics/logs. Set to 0 to wait indefinitely (previous behavior).
+/// request-level timeout fires, a GET that waits longer than this falls through
+/// to a bounded degraded admission lane; if that lane is also full the request
+/// is rejected with `SlowDown`/503 rather than proceeding without any permit.
+/// Set to 0 to wait on the primary lane indefinitely (never degrade or reject).
 pub const DEFAULT_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: u64 = 5;
+
+/// Environment variable for the bounded degraded disk-read admission lane size.
+/// - Purpose: Cap how many GETs may proceed after the primary disk-read permit
+///   pool is saturated, giving a hard upper bound on concurrent disk-active
+///   reads (primary cap + degraded cap) instead of an unbounded pass-through.
+/// - Unit: request count (usize). `0` means "mirror the primary cap", so the
+///   absolute hard cap defaults to twice the primary disk-read cap.
+/// - Example: `export RUSTFS_OBJECT_DISK_DEGRADED_READ_CAP=16`
+pub const ENV_OBJECT_DISK_DEGRADED_READ_CAP: &str = "RUSTFS_OBJECT_DISK_DEGRADED_READ_CAP";
+
+/// Size of the bounded degraded disk-read admission lane.
+///
+/// When the primary disk-read permit pool is saturated and a GET exceeds
+/// [`DEFAULT_OBJECT_DISK_PERMIT_WAIT_TIMEOUT`], it may take one permit from this
+/// bounded overflow lane instead of reading without any admission token. The
+/// total number of GETs performing disk-active reads is therefore hard-capped at
+/// `primary_cap + degraded_cap`; beyond that a GET is rejected with `SlowDown`.
+/// The default `0` mirrors the primary cap, so the hard cap is twice the primary
+/// disk-read concurrency.
+pub const DEFAULT_OBJECT_DISK_DEGRADED_READ_CAP: usize = 0;
 
 /// Skip bitrot hash verification on GetObject reads.
 ///
