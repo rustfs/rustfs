@@ -25,7 +25,7 @@ use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState},
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
     bucket::replication::{DynReplicationPool, ReplicationStats},
-    config::{get_global_storage_class, set_global_storage_class, storageclass},
+    config::{get_global_storage_class, get_global_storage_class_snapshot, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
     error::Result,
     layout::endpoints::{EndpointServerPools, SetupType},
@@ -239,23 +239,11 @@ pub(crate) fn ensure_test_rpc_secret() {
 }
 
 pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
-    get_global_storage_class().and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
-}
-
-pub(crate) fn backend_storage_class_parities(default_standard_parity: usize) -> (Option<usize>, Option<usize>) {
-    if let Some(sc) = get_global_storage_class() {
-        let standard = sc
-            .get_parity_for_sc(storageclass::CLASS_STANDARD)
-            .or(Some(default_standard_parity));
-        let reduced_redundancy = sc.get_parity_for_sc(storageclass::RRS);
-        (standard, reduced_redundancy)
-    } else {
-        (Some(default_standard_parity), None)
-    }
+    get_global_storage_class_snapshot().get_parity_for_sc(storage_class.unwrap_or_default())
 }
 
 pub(crate) fn storage_class_should_inline(shard_size: i64, versioned: bool) -> bool {
-    get_global_storage_class().is_some_and(|sc| sc.should_inline(shard_size, versioned))
+    get_global_storage_class_snapshot().should_inline(shard_size, versioned)
 }
 
 pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
@@ -328,6 +316,10 @@ pub(crate) fn set_server_config(config: Config) {
 
 pub(crate) fn storage_class_config() -> Option<storageclass::Config> {
     get_global_storage_class()
+}
+
+pub(crate) fn storage_class_config_snapshot() -> Arc<storageclass::Config> {
+    get_global_storage_class_snapshot()
 }
 
 pub(crate) fn set_storage_class_config(config: storageclass::Config) {

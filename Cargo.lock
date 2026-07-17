@@ -9049,6 +9049,7 @@ name = "rustfs-ecstore"
 version = "1.0.0-beta.10"
 dependencies = [
  "aes-gcm",
+ "arc-swap",
  "async-channel",
  "async-recursion",
  "async-trait",

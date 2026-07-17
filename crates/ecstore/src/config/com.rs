@@ -456,8 +456,7 @@ async fn new_and_save_server_config<S>(api: Arc<S>) -> Result<Config>
 where
     S: EcstoreObjectIO + StorageAdminApi,
 {
-    let mut cfg = new_server_config();
-    lookup_configs(&mut cfg, api.clone()).await;
+    let cfg = new_server_config();
     save_server_config(api, &cfg).await?;
 
     Ok(cfg)
@@ -1276,9 +1275,7 @@ where
     let cfg = if runtime_sources::first_cluster_node_is_local().await {
         new_and_save_server_config(api.clone()).await?
     } else {
-        let mut cfg = new_server_config();
-        lookup_configs(&mut cfg, api).await;
-        cfg
+        new_server_config()
     };
     warn!("Configuration initialization complete ({})", context);
     Ok(cfg)
@@ -1576,14 +1573,11 @@ where
     save_config(api, &config_file, data).await
 }
 
-pub async fn lookup_configs<S>(cfg: &mut Config, api: Arc<S>)
+pub async fn lookup_configs<S>(cfg: &mut Config, api: Arc<S>) -> Result<()>
 where
     S: StorageAdminApi,
 {
-    // TODO: from etcd
-    if let Err(err) = apply_dynamic_config(cfg, api).await {
-        error!("apply_dynamic_config err {:?}", &err);
-    }
+    apply_dynamic_config(cfg, api).await
 }
 
 async fn apply_dynamic_config<S>(cfg: &mut Config, api: Arc<S>) -> Result<()>
@@ -1601,23 +1595,33 @@ async fn apply_dynamic_config_for_sub_sys<S>(cfg: &mut Config, api: Arc<S>, subs
 where
     S: StorageAdminApi,
 {
+    apply_dynamic_config_for_sub_sys_with(
+        cfg,
+        api,
+        subsys,
+        storageclass::lookup_config_for_pools,
+        runtime_sources::set_storage_class_config,
+    )
+    .await
+}
+
+async fn apply_dynamic_config_for_sub_sys_with<S, R, F>(
+    cfg: &mut Config,
+    api: Arc<S>,
+    subsys: &str,
+    resolve_storage_class: R,
+    publish_storage_class: F,
+) -> Result<()>
+where
+    S: StorageAdminApi,
+    R: FnOnce(&KVS, &[usize]) -> Result<storageclass::Config>,
+    F: FnOnce(storageclass::Config),
+{
     let set_drive_counts = StorageAdminApi::set_drive_counts(api.as_ref());
     if subsys == STORAGE_CLASS_SUB_SYS {
         let kvs = cfg.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
-
-        for (i, count) in set_drive_counts.iter().enumerate() {
-            match storageclass::lookup_config(&kvs, *count) {
-                Ok(res) => {
-                    if i == 0 {
-                        runtime_sources::set_storage_class_config(res);
-                    }
-                }
-                Err(err) => {
-                    error!("init storage class err:{:?}", &err);
-                    break;
-                }
-            }
-        }
+        let candidate = resolve_storage_class(&kvs, &set_drive_counts)?;
+        publish_storage_class(candidate);
     }
 
     Ok(())
@@ -1626,8 +1630,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        read_config, read_config_preserve_empty, read_config_with_metadata, storage_class_kvs_mut,
+        apply_dynamic_config_for_sub_sys_with, configs_semantically_equal, decode_server_config_blob, encode_server_config_blob,
+        is_standard_object_server_config, lookup_configs, read_config, read_config_preserve_empty, read_config_with_metadata,
+        storage_class_kvs_mut,
     };
     use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
@@ -3008,6 +3013,7 @@ mod tests {
         state: Mutex<RecoveryReadState>,
         heal_replacement: Option<Vec<u8>>,
         heal_calls: AtomicUsize,
+        drive_counts: Vec<usize>,
     }
 
     impl RecoveryMockStore {
@@ -3016,7 +3022,13 @@ mod tests {
                 state: Mutex::new(state),
                 heal_replacement,
                 heal_calls: AtomicUsize::new(0),
+                drive_counts: vec![2],
             }
+        }
+
+        fn with_drive_counts(mut self, drive_counts: Vec<usize>) -> Self {
+            self.drive_counts = drive_counts;
+            self
         }
     }
 
@@ -3132,7 +3144,7 @@ mod tests {
         }
 
         fn set_drive_counts(&self) -> Vec<usize> {
-            vec![2]
+            self.drive_counts.clone()
         }
     }
 
@@ -3171,6 +3183,68 @@ mod tests {
         async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
             panic!("unused in test")
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn invalid_later_pool_does_not_partially_publish_storage_class() {
+        temp_env::async_with_vars(
+            [
+                (crate::config::storageclass::STANDARD_ENV, None::<&str>),
+                (crate::config::storageclass::RRS_ENV, None::<&str>),
+                (crate::config::storageclass::OPTIMIZE_ENV, None::<&str>),
+                (crate::config::storageclass::INLINE_BLOCK_ENV, None::<&str>),
+            ],
+            async {
+                let mut cfg = Config::new();
+                storage_class_kvs_mut(&mut cfg)
+                    .insert(crate::config::storageclass::CLASS_STANDARD.to_string(), "EC:2".to_string());
+                let store =
+                    Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(Vec::new()), None).with_drive_counts(vec![4, 2]));
+
+                let result = lookup_configs(&mut cfg, store.clone()).await;
+                assert!(result.is_err(), "public lookup entry must propagate an invalid later pool");
+
+                let mut publish_count = 0;
+                let result = apply_dynamic_config_for_sub_sys_with(
+                    &mut cfg,
+                    store,
+                    STORAGE_CLASS_SUB_SYS,
+                    crate::config::storageclass::lookup_config_for_pools_without_env,
+                    |_| {
+                        publish_count += 1;
+                    },
+                )
+                .await;
+                assert!(result.is_err(), "invalid later pool must fail the complete candidate");
+                assert_eq!(publish_count, 0, "failed reload must not publish any candidate");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_storage_class_publishes_one_multi_pool_snapshot() {
+        let mut cfg = Config::new();
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(Vec::new()), None).with_drive_counts(vec![4, 2]));
+
+        let mut published = None;
+        let result = apply_dynamic_config_for_sub_sys_with(
+            &mut cfg,
+            store,
+            STORAGE_CLASS_SUB_SYS,
+            crate::config::storageclass::lookup_config_for_pools_without_env,
+            |candidate| {
+                published = Some(candidate);
+            },
+        )
+        .await;
+
+        result.expect("valid multi-pool candidate should publish");
+        assert_eq!(
+            published.and_then(|cfg| cfg.parities_for_sc(crate::config::storageclass::STANDARD)),
+            Some(vec![2, 1])
+        );
     }
 
     fn encrypted_current_server_config_blob() -> Vec<u8> {
