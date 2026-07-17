@@ -1334,6 +1334,37 @@ mod tests {
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
     }
 
+    #[tokio::test]
+    async fn moka_buffered_fill_holds_conservative_claim_until_refresh() {
+        let backend = MokaBackend::new(&memory_gated_config(), Arc::new(ObjectDataCacheStats::default()))
+            .expect("moka backend should build");
+        let snapshot = crate::memory::ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        };
+        backend.memory_gate.set_test_snapshot(Some(snapshot));
+        let plan = cacheable_plan("object", "etag-a");
+
+        assert_eq!(
+            backend.fill_body(&plan, Bytes::from_static(b"hello")).await,
+            ObjectDataCacheFillResult::Inserted
+        );
+        assert_eq!(backend.memory_gate.claimed_bytes_for_test(), 5);
+
+        let _ = backend
+            .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "object"))
+            .await;
+        backend.cache.run_pending_tasks().await;
+        assert_eq!(
+            backend.memory_gate.claimed_bytes_for_test(),
+            5,
+            "an already-buffered body cannot be retrofitted with an allocation owner"
+        );
+
+        backend.memory_gate.store_raw_snapshot_for_test(snapshot);
+        assert_eq!(backend.memory_gate.claimed_bytes_for_test(), 0);
+    }
+
     // ODC-15 + ODC-18: a concurrent duplicate fill for the same key must NOT
     // wait for the in-flight leader (it already owns the body), and it must be
     // reported as JoinedInflightFill — not Inserted — so it records no fill

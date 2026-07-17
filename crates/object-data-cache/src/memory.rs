@@ -15,6 +15,7 @@
 use crate::config::ObjectDataCacheConfig;
 use crate::metrics::record_memory_pressure;
 use crate::stats::ObjectDataCacheStats;
+use bytes::Bytes;
 use std::hint::spin_loop;
 use std::sync::Arc;
 #[cfg(test)]
@@ -24,7 +25,10 @@ use std::time::Duration;
 use sysinfo::System;
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_STATE_RETRIES: usize = 64;
+// Each writer holds the sequence for only a few atomic loads/stores. Eight
+// attempts cover brief overlap without prolonged spinning on a Tokio worker;
+// exhaustion safely skips only the cache fill.
+const MAX_STATE_RETRIES: usize = 8;
 
 /// Source used to resolve the effective memory limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +248,21 @@ pub struct ObjectDataCacheMemoryReservation {
 }
 
 impl ObjectDataCacheMemoryReservation {
+    /// Attaches this reservation to a newly allocated body.
+    ///
+    /// Call this before cloning `bytes`. Every clone of the returned value then
+    /// shares one allocation owner, and the reservation is released only after
+    /// its last clone is dropped.
+    pub fn wrap_bytes(self, bytes: Bytes) -> Bytes {
+        if self.snapshot.is_none() {
+            return bytes;
+        }
+        Bytes::from_owner(ReservedBytes {
+            bytes,
+            _reservation: self,
+        })
+    }
+
     pub(crate) fn until_refresh(mut self) {
         self.snapshot = None;
     }
@@ -257,6 +276,17 @@ impl Drop for ObjectDataCacheMemoryReservation {
     }
 }
 
+struct ReservedBytes {
+    bytes: Bytes,
+    _reservation: ObjectDataCacheMemoryReservation,
+}
+
+impl AsRef<[u8]> for ReservedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
 /// Aborts the periodic refresher when the gate (and thus the cache) is dropped.
 #[derive(Debug)]
 struct RefresherGuard(tokio::task::JoinHandle<()>);
@@ -267,13 +297,12 @@ impl Drop for RefresherGuard {
     }
 }
 
-/// Memory gate that keeps a cheap, lock-free snapshot for fill-path checks.
+/// Memory gate that keeps a cheap atomic snapshot and reservation state.
 ///
 /// The snapshot is sampled off the fill path by a dedicated periodic refresher
 /// (the private `spawn_refresher` task) that
 /// runs the blocking `sysinfo` read on a `spawn_blocking` thread. `allows_fill`
-/// only reads atomics, so it never blocks a tokio worker and concurrent fills
-/// never serialize on a refresh.
+/// only performs bounded atomic operations, so it never blocks a tokio worker.
 #[derive(Debug)]
 pub struct ObjectDataCacheMemoryGate {
     snapshot: Arc<MemorySnapshotCell>,
@@ -367,7 +396,7 @@ impl ObjectDataCacheMemoryGate {
     fn try_claim_after(
         &self,
         required_bytes: u64,
-        cache_growth_headroom: u64,
+        _cache_growth_headroom: u64,
         before_claim: impl FnOnce(),
     ) -> Option<ObjectDataCacheMemoryReservation> {
         if self.min_free_memory_percent == 0 {
@@ -405,22 +434,23 @@ impl ObjectDataCacheMemoryGate {
             });
         }
         let claimed = self.snapshot.admitted_since_refresh.load(Ordering::Relaxed);
-        let reserved = claimed.min(cache_growth_headroom);
-        let effective_available = snapshot.available_bytes.saturating_sub(reserved);
-        let min_free = u64::from(self.min_free_memory_percent);
-        let has_percent_budget = effective_available.saturating_mul(100) >= snapshot.total_bytes.saturating_mul(min_free);
-        let has_entry_budget = effective_available >= required_bytes;
-        let Some(next_claimed) = claimed.checked_add(required_bytes) else {
+        let Some(claimed_after) = claimed.checked_add(required_bytes) else {
             record_memory_pressure(&self.stats, "moka");
             return None;
         };
+        let Some(available_after) = snapshot.available_bytes.checked_sub(claimed_after) else {
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        };
+        let min_free = u64::from(self.min_free_memory_percent);
+        let has_percent_budget = u128::from(available_after) * 100 >= u128::from(snapshot.total_bytes) * u128::from(min_free);
 
-        if !has_percent_budget || !has_entry_budget {
+        if !has_percent_budget {
             record_memory_pressure(&self.stats, "moka");
             return None;
         }
 
-        self.snapshot.admitted_since_refresh.store(next_claimed, Ordering::Relaxed);
+        self.snapshot.admitted_since_refresh.store(claimed_after, Ordering::Relaxed);
         Some(ObjectDataCacheMemoryReservation {
             snapshot: Some(Arc::clone(&self.snapshot)),
             bytes: required_bytes,
@@ -432,10 +462,9 @@ impl ObjectDataCacheMemoryGate {
     /// This is lock-free and does no blocking sysinfo read: it only reads the
     /// atomic snapshot maintained by the periodic refresher.
     ///
-    /// `cache_growth_headroom` is how many more bytes the cache itself can hold
-    /// before it is at capacity (`max_capacity - weighted_size()`). It caps how
-    /// far the in-window reservation may shrink the budget: see the reservation
-    /// note below.
+    /// `cache_growth_headroom` remains for source compatibility. Reservations
+    /// now follow live allocations, so cache capacity cannot cap the peak memory
+    /// held by an evicted entry whose response body is still alive.
     pub fn allows_fill(&self, required_bytes: u64, cache_growth_headroom: u64) -> bool {
         let Some(reservation) = self.try_claim(required_bytes, cache_growth_headroom) else {
             return false;
@@ -452,7 +481,7 @@ impl ObjectDataCacheMemoryGate {
     /// Writes the atomic snapshot directly, bypassing the `test_override` read
     /// path so a test can observe whether `allows_fill` mutates the snapshot.
     #[cfg(test)]
-    fn store_raw_snapshot_for_test(&self, snapshot: ObjectDataCacheMemorySnapshot) {
+    pub(crate) fn store_raw_snapshot_for_test(&self, snapshot: ObjectDataCacheMemorySnapshot) {
         self.snapshot.store(snapshot);
     }
 
@@ -473,7 +502,7 @@ impl ObjectDataCacheMemoryGate {
     }
 
     #[cfg(test)]
-    fn claimed_bytes_for_test(&self) -> u64 {
+    pub(crate) fn claimed_bytes_for_test(&self) -> u64 {
         self.snapshot.admitted()
     }
 }
@@ -491,6 +520,7 @@ mod tests {
     use super::{MemoryBasis, ObjectDataCacheMemoryGate, ObjectDataCacheMemorySnapshot, select_effective_memory};
     use crate::config::ObjectDataCacheConfig;
     use crate::stats::ObjectDataCacheStats;
+    use bytes::Bytes;
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::thread;
@@ -516,7 +546,7 @@ mod tests {
                 let gate = Arc::clone(&gate);
                 let ready = Arc::clone(&ready);
                 thread::spawn(move || {
-                    gate.try_claim_with_hook(400, u64::MAX, || {
+                    gate.try_claim_with_hook(300, u64::MAX, || {
                         ready.wait();
                     })
                 })
@@ -527,8 +557,8 @@ mod tests {
             .filter_map(|handle| handle.join().expect("claim thread should not panic"))
             .collect();
 
-        assert_eq!(claims.len(), 1, "only one 400-byte claim fits the shared budget");
-        assert_eq!(gate.claimed_bytes_for_test(), 400);
+        assert_eq!(claims.len(), 1, "only one 300-byte claim preserves the shared floor");
+        assert_eq!(gate.claimed_bytes_for_test(), 300);
         drop(claims);
         assert_eq!(gate.claimed_bytes_for_test(), 0, "dropping the owner releases its claim");
     }
@@ -598,6 +628,71 @@ mod tests {
         });
 
         assert!(claim.is_some(), "claim must use the epoch published before linearization");
+    }
+
+    #[test]
+    fn memory_gate_preserves_post_admission_floor_at_exact_boundary() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+
+        let boundary = gate.try_claim(300, 0);
+        assert!(boundary.is_some(), "a claim ending exactly at the 20% floor must fit");
+        drop(boundary);
+        assert!(gate.try_claim(301, u64::MAX).is_none(), "a claim crossing the floor must fail");
+    }
+
+    #[test]
+    fn full_cache_replacement_reserves_peak_live_bytes_until_last_body_owner_drops() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 1_000,
+        }));
+
+        let old_cached = gate
+            .try_claim(300, 0)
+            .expect("old allocation should fit")
+            .wrap_bytes(Bytes::from(vec![0; 300]));
+        let old_response = old_cached.clone();
+        let replacement = gate
+            .try_claim(300, 0)
+            .expect("replacement allocation should fit while the old response is live")
+            .wrap_bytes(Bytes::from(vec![0; 300]));
+        assert_eq!(gate.claimed_bytes_for_test(), 600, "replacement peak includes both live allocations");
+
+        drop(old_cached);
+        assert_eq!(
+            gate.claimed_bytes_for_test(),
+            600,
+            "eviction cannot release the response owner's allocation"
+        );
+        drop(replacement);
+        assert_eq!(gate.claimed_bytes_for_test(), 300);
+        drop(old_response);
+        assert_eq!(gate.claimed_bytes_for_test(), 0);
+    }
+
+    #[test]
+    fn eviction_completion_does_not_release_live_response_body_reservation() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+
+        let cached = gate
+            .try_claim(100, 0)
+            .expect("allocation should fit")
+            .wrap_bytes(Bytes::from(vec![0; 100]));
+        let response = cached.clone();
+        drop(cached);
+
+        assert_eq!(gate.claimed_bytes_for_test(), 100);
+        drop(response);
+        assert_eq!(gate.claimed_bytes_for_test(), 0);
     }
 
     #[test]
@@ -698,59 +793,37 @@ mod tests {
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
     }
 
-    // backlog#1212: `admitted_since_refresh` counts GROSS admitted bytes and
-    // never rolls back on an evicted/cancelled/lost-race fill, so a churn window
-    // (net footprint flat, far below capacity) balloons the raw counter past the
-    // memory the cache actually holds. Deducting it wholesale falsely trips the
-    // gate; capping the deduction at the cache's growth headroom fixes it.
+    // backlog#1331 supersedes the cache-capacity deduction from backlog#1212:
+    // an evicted cache entry can still have a live response clone, so cache
+    // growth headroom is not a safe bound on process memory ownership.
     #[test]
-    fn reservation_deduction_capped_at_growth_headroom_avoids_false_pressure() {
+    fn cache_growth_headroom_does_not_hide_outstanding_claims() {
         let stats = Arc::new(ObjectDataCacheStats::default());
         let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::clone(&stats));
         gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
             total_bytes: 1_000_000,
             available_bytes: 500_000, // 50% free, well above the 20% floor
         }));
-        // A churn window admitted far more GROSS bytes than the cache can hold;
-        // repeated insert/evict never rolled the counter back, so it now dwarfs
-        // the real available memory even though the live footprint stays tiny.
         gate.snapshot.reserve(10_000_000);
 
-        // Uncapped, the raw gross counter swamps the budget and falsely signals
-        // memory pressure even though the cache's net footprint is flat.
-        assert!(
-            !gate.allows_fill(1_000, u64::MAX),
-            "raw gross admitted-bytes deduction should falsely suppress (the bug being fixed)"
-        );
-
-        // Capping the deduction at the cache's growth headroom (net size flat,
-        // far below capacity) restores admission: gross churn is no longer
-        // mistaken for real memory growth.
-        assert!(
-            gate.allows_fill(1_000, 100_000),
-            "capping the reservation at cache growth headroom must not falsely suppress"
-        );
+        assert!(!gate.allows_fill(1_000, u64::MAX));
+        assert!(!gate.allows_fill(1_000, 0), "zero cache headroom must not erase a live allocation claim");
     }
 
-    // backlog#1212: capping the deduction must not defeat the reservation under
-    // genuine cache growth. When the cache still has room to grow, the in-window
-    // reservation must still shrink the budget so a burst cannot over-admit.
     #[test]
-    fn reservation_still_bounds_burst_within_growth_headroom() {
+    fn reservation_still_bounds_burst_independent_of_growth_headroom() {
         let stats = Arc::new(ObjectDataCacheStats::default());
         let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::clone(&stats));
         gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
             total_bytes: 1_000_000,
             available_bytes: 300_000, // 30% free; floor is 20% = 200_000
         }));
-        // The cache can still grow well past the reserved amount, so the cap does
-        // not bind and the reservation is deducted in full.
         gate.snapshot.reserve(150_000);
 
         // 300_000 available - 150_000 reserved = 150_000 effective, below the
         // 200_000 floor: the reservation must still suppress the fill.
         assert!(
-            !gate.allows_fill(1_000, u64::MAX),
+            !gate.allows_fill(1_000, 0),
             "reservation must still bound a burst while the cache can genuinely grow"
         );
     }
