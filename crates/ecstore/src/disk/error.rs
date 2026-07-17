@@ -141,7 +141,7 @@ pub enum DiskError {
     ErasureReadQuorum,
 
     #[error("io error {0}")]
-    Io(io::Error),
+    Io(#[source] io::Error),
 
     #[error("source stalled")]
     SourceStalled,
@@ -151,6 +151,12 @@ pub enum DiskError {
 
     #[error("invalid path")]
     InvalidPath,
+}
+
+impl From<crate::erasure::coding::ErasureConstructionError> for DiskError {
+    fn from(error: crate::erasure::coding::ErasureConstructionError) -> Self {
+        Self::Io(error.into_io_error())
+    }
 }
 
 impl DiskError {
@@ -600,6 +606,26 @@ impl std::fmt::Display for FileAccessDeniedWithContext {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn other_preserves_erasure_construction_source_chain() {
+        use crate::erasure::coding::ErasureConstructionError;
+        use std::error::Error as _;
+
+        let error = DiskError::from(ErasureConstructionError::ModernEncoder {
+            source: reed_solomon_erasure::Error::TooManyShards,
+        });
+        let io_source = error.source().expect("DiskError::Io must expose its io::Error source");
+        assert!(io_source.is::<io::Error>());
+        let construction_source = io_source
+            .source()
+            .expect("io::Error must expose the erasure construction error");
+        assert!(construction_source.is::<ErasureConstructionError>());
+        let encoder_source = construction_source
+            .source()
+            .expect("construction error must expose the encoder error");
+        assert!(encoder_source.is::<reed_solomon_erasure::Error>());
+    }
 
     #[test]
     fn test_disk_error_variants() {
