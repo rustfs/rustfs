@@ -141,6 +141,14 @@ pub fn calc_shard_size(block_size: usize, data_shards: usize) -> usize {
     (block_size.div_ceil(data_shards) + 1) & !1
 }
 
+fn checked_calc_shard_size(block_size: usize, data_shards: usize) -> Option<usize> {
+    if data_shards == 0 {
+        return None;
+    }
+
+    block_size.div_ceil(data_shards).checked_add(1).map(|size| size & !1)
+}
+
 impl ErasureInfo {
     pub fn get_checksum_info(&self, part_number: usize) -> ChecksumInfo {
         for sum in &self.checksums {
@@ -270,6 +278,7 @@ pub struct ValidatedErasureLayout {
     parity_blocks: usize,
     total_blocks: usize,
     block_size: usize,
+    shard_size: usize,
     index: usize,
 }
 
@@ -290,8 +299,21 @@ impl ValidatedErasureLayout {
         self.block_size
     }
 
+    pub const fn shard_size(&self) -> usize {
+        self.shard_size
+    }
+
     pub const fn index(&self) -> usize {
         self.index
+    }
+
+    /// Calculates a shard file size without overflowing the metadata's integer format.
+    pub fn shard_file_size(&self, total_length: usize) -> Option<i64> {
+        let full_blocks = total_length / self.block_size;
+        let last_block_size = total_length % self.block_size;
+        let last_shard_size = checked_calc_shard_size(last_block_size, self.data_blocks)?;
+        let shard_file_size = full_blocks.checked_mul(self.shard_size)?.checked_add(last_shard_size)?;
+        i64::try_from(shard_file_size).ok()
     }
 }
 
@@ -418,28 +440,48 @@ impl FileInfo {
                     return Err(Error::FileCorrupt);
                 }
 
-                Some(ValidatedErasureLayout {
+                let shard_size = checked_calc_shard_size(erasure.block_size, erasure.data_blocks)
+                    .filter(|&size| i64::try_from(size).is_ok())
+                    .ok_or(Error::FileCorrupt)?;
+                i64::try_from(erasure.block_size).map_err(|_| Error::FileCorrupt)?;
+
+                let layout = ValidatedErasureLayout {
                     data_blocks: erasure.data_blocks,
                     parity_blocks: erasure.parity_blocks,
                     total_blocks,
                     block_size: erasure.block_size,
+                    shard_size,
                     index: erasure.index,
-                })
+                };
+
+                let object_size = usize::try_from(self.size).map_err(|_| Error::FileCorrupt)?;
+                layout.shard_file_size(object_size).ok_or(Error::FileCorrupt)?;
+                for part in &self.parts {
+                    i64::try_from(part.size).map_err(|_| Error::FileCorrupt)?;
+                    layout.shard_file_size(part.size).ok_or(Error::FileCorrupt)?;
+
+                    let actual_size = usize::try_from(part.actual_size).map_err(|_| Error::FileCorrupt)?;
+                    layout.shard_file_size(actual_size).ok_or(Error::FileCorrupt)?;
+                }
+
+                Some(layout)
             }
             ValidationMode::DeleteOnly | ValidationMode::RemoteOnly | ValidationMode::AbortOnly => None,
         };
 
-        let mut checksum_indices = HashMap::with_capacity(self.erasure.checksums.len());
-        if !self.erasure.checksums.is_empty() {
-            let mut part_numbers = HashSet::with_capacity(self.parts.len());
-            part_numbers.extend(self.parts.iter().map(|part| part.number));
+        let mut part_numbers = HashSet::with_capacity(self.parts.len());
+        for part in &self.parts {
+            if !part_numbers.insert(part.number) {
+                return Err(Error::FileCorrupt);
+            }
+        }
 
-            for (checksum_index, checksum) in self.erasure.checksums.iter().enumerate() {
-                if !part_numbers.contains(&checksum.part_number)
-                    || checksum_indices.insert(checksum.part_number, checksum_index).is_some()
-                {
-                    return Err(Error::FileCorrupt);
-                }
+        let mut checksum_indices = HashMap::with_capacity(self.erasure.checksums.len());
+        for (checksum_index, checksum) in self.erasure.checksums.iter().enumerate() {
+            if !part_numbers.contains(&checksum.part_number)
+                || checksum_indices.insert(checksum.part_number, checksum_index).is_some()
+            {
+                return Err(Error::FileCorrupt);
             }
         }
 
@@ -966,11 +1008,18 @@ mod tests {
                 ..Default::default()
             },
         ];
-        fi.erasure.checksums = vec![ChecksumInfo {
-            part_number: 2,
-            algorithm: HashAlgorithm::SHA256,
-            hash: Bytes::new(),
-        }];
+        fi.erasure.checksums = vec![
+            ChecksumInfo {
+                part_number: 1,
+                algorithm: HashAlgorithm::HighwayHash256S,
+                hash: Bytes::from_static(b"checksum-one"),
+            },
+            ChecksumInfo {
+                part_number: 2,
+                algorithm: HashAlgorithm::SHA256,
+                hash: Bytes::from_static(b"checksum-two"),
+            },
+        ];
         fi
     }
 
@@ -994,15 +1043,28 @@ mod tests {
         assert_eq!(layout.parity_blocks(), 2);
         assert_eq!(layout.total_blocks(), 6);
         assert_eq!(layout.block_size(), BLOCK_SIZE_V2);
+        assert_eq!(layout.shard_size(), calc_shard_size(BLOCK_SIZE_V2, 4));
         assert_eq!(layout.index(), 1);
-        assert_eq!(
-            validated
-                .checksum_info(2)
-                .expect("validated checksum association must be indexed")
-                .algorithm,
-            HashAlgorithm::SHA256
-        );
-        assert!(validated.checksum_info(1).is_none());
+        let shard_size = i64::try_from(layout.shard_size()).expect("validated shard size must fit i64");
+        assert_eq!(layout.shard_file_size(0), Some(0));
+        assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2 - 1), Some(shard_size));
+        assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2), Some(shard_size));
+        assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2 + 1), Some(shard_size + 2));
+
+        let first_checksum = validated
+            .checksum_info(1)
+            .expect("the first validated checksum association must be indexed");
+        assert_eq!(first_checksum.part_number, 1);
+        assert_eq!(first_checksum.algorithm, HashAlgorithm::HighwayHash256S);
+        assert_eq!(first_checksum.hash, Bytes::from_static(b"checksum-one"));
+
+        let second_checksum = validated
+            .checksum_info(2)
+            .expect("the second validated checksum association must be indexed");
+        assert_eq!(second_checksum.part_number, 2);
+        assert_eq!(second_checksum.algorithm, HashAlgorithm::SHA256);
+        assert_eq!(second_checksum.hash, Bytes::from_static(b"checksum-two"));
+        assert_eq!(validated.checksum_info(3), None, "an absent part must not alias either checksum index");
     }
 
     #[test]
@@ -1061,6 +1123,71 @@ mod tests {
 
         let mut fi = validation_test_fileinfo();
         fi.erasure.distribution = vec![1, 2, 3, 4, 5, 5];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+    }
+
+    fn one_shard_validation_fileinfo(block_size: usize) -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 1, 0);
+        fi.erasure.index = 1;
+        fi.erasure.block_size = block_size;
+        fi
+    }
+
+    #[test]
+    fn validate_require_erasure_rejects_unrepresentable_shard_sizes() {
+        let fi = one_shard_validation_fileinfo(usize::MAX);
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        if let Some((max_i64, above_i64_max)) = usize::try_from(i64::MAX)
+            .ok()
+            .and_then(|max_i64| max_i64.checked_add(1).map(|above_i64_max| (max_i64, above_i64_max)))
+        {
+            let mut fi = FileInfo::new("bucket/object", 2, 0);
+            fi.erasure.index = 1;
+            fi.erasure.block_size = above_i64_max;
+            assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+            let mut fi = FileInfo::new("bucket/object", 2, 0);
+            fi.erasure.index = 1;
+            fi.erasure.block_size = max_i64;
+            fi.parts = vec![ObjectPartInfo {
+                number: 1,
+                size: above_i64_max,
+                ..Default::default()
+            }];
+            assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        }
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.size = -1;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.size = i64::MAX;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: usize::MAX,
+            ..Default::default()
+        }];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            actual_size: -1,
+            ..Default::default()
+        }];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            actual_size: i64::MAX,
+            ..Default::default()
+        }];
         assert_file_corrupt(&fi, ValidationMode::RequireErasure);
     }
 
@@ -1167,6 +1294,23 @@ mod tests {
         let mut fi = validation_test_fileinfo();
         let duplicate = fi.erasure.checksums[0].clone();
         fi.erasure.checksums.push(duplicate);
+        for mode in modes {
+            assert_file_corrupt(&fi, mode);
+        }
+    }
+
+    #[test]
+    fn all_validation_modes_reject_duplicate_part_numbers_without_checksums() {
+        let modes = [
+            ValidationMode::RequireErasure,
+            ValidationMode::DeleteOnly,
+            ValidationMode::RemoteOnly,
+            ValidationMode::AbortOnly,
+        ];
+        let mut fi = validation_test_fileinfo();
+        fi.parts[1].number = fi.parts[0].number;
+        fi.erasure.checksums.clear();
+
         for mode in modes {
             assert_file_corrupt(&fi, mode);
         }

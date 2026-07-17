@@ -14,7 +14,7 @@
 
 use crate::{
     ErasureAlgo, ErasureInfo, Error, FileInfo, FileInfoVersions, InlineData, NULL_VERSION_ID, ObjectPartInfo, RawFileInfo,
-    ReplicationState, ReplicationStatusType, Result, VersionPurgeStatusType, is_restored_object_on_disk,
+    ReplicationState, ReplicationStatusType, Result, ValidationMode, VersionPurgeStatusType, is_restored_object_on_disk,
     replication_statuses_map, version_purge_statuses_map,
 };
 use byteorder::ByteOrder;
@@ -395,6 +395,8 @@ impl FileMeta {
     // delete_version deletes version, returns data_dir
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
+        fi.validate(ValidationMode::DeleteOnly)?;
+
         let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
         let target_is_delete_marker = self
             .versions
@@ -410,10 +412,6 @@ impl FileMeta {
                 mod_time: fi.mod_time,
                 ..Default::default()
             });
-
-            if !fi.is_valid() {
-                return Err(Error::other("invalid file meta version"));
-            }
         }
 
         let mut update_version = false;
@@ -2023,6 +2021,103 @@ mod test {
             fm.versions.is_empty(),
             "delete-marker version purge should remove the local marker instead of rewriting purge metadata onto it"
         );
+    }
+
+    #[test]
+    fn delete_version_accepts_delete_only_marker_and_free_version_paths() {
+        let marker_version_id = Uuid::new_v4();
+        let mut marker_meta = FileMeta::new();
+        marker_meta
+            .delete_version(&FileInfo {
+                version_id: Some(marker_version_id),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete-marker metadata must not require a payload erasure layout");
+        assert_eq!(marker_meta.versions.len(), 1);
+        assert_eq!(marker_meta.versions[0].header.version_type, VersionType::Delete);
+
+        let object_version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut free_meta = FileMeta::new();
+        free_meta
+            .add_version(FileInfo {
+                volume: "bucket".to_string(),
+                name: "object".to_string(),
+                version_id: Some(object_version_id),
+                transition_status: TRANSITION_COMPLETE.to_string(),
+                transitioned_objname: "remote/object".to_string(),
+                transition_version_id: Some(remote_version_id),
+                transition_tier: "WARM".to_string(),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("transitioned object version must be seeded");
+
+        let mut transition_delete = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        transition_delete.set_tier_free_version_id(&free_version_id.to_string());
+        free_meta
+            .delete_version(&transition_delete)
+            .expect("transitioned delete must persist free-version cleanup metadata");
+
+        let mut free_version_delete = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(free_version_id),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        free_version_delete.set_tier_free_version();
+        free_meta
+            .delete_version(&free_version_delete)
+            .expect("free-version cleanup must not require a payload erasure layout");
+
+        let versions = free_meta
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions must remain readable after free-version cleanup");
+        assert!(versions.free_versions.is_empty());
+    }
+
+    #[test]
+    fn delete_version_validates_non_deleted_requests_before_mutation() {
+        let version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("object version must be seeded");
+        let original = fm.clone();
+
+        let err = fm
+            .delete_version(&FileInfo {
+                version_id: Some(version_id),
+                parts: vec![
+                    ObjectPartInfo {
+                        number: 1,
+                        ..Default::default()
+                    },
+                    ObjectPartInfo {
+                        number: 1,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })
+            .expect_err("non-deleted requests must not bypass boundary validation");
+
+        assert_eq!(err, Error::FileCorrupt);
+        assert_eq!(fm, original, "failed validation must happen before metadata mutation");
     }
 
     #[test]
