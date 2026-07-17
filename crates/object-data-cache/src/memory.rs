@@ -15,6 +15,7 @@
 use crate::config::ObjectDataCacheConfig;
 use crate::metrics::record_memory_pressure;
 use crate::stats::ObjectDataCacheStats;
+use std::hint::spin_loop;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -23,6 +24,7 @@ use std::time::Duration;
 use sysinfo::System;
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_STATE_RETRIES: usize = 64;
 
 /// Source used to resolve the effective memory limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +117,9 @@ impl ObjectDataCacheMemorySnapshot {
 /// Lock-free memory snapshot shared between the gate and its refresher task.
 #[derive(Debug)]
 struct MemorySnapshotCell {
+    /// Even values identify a stable state; an odd value means a writer owns
+    /// the short atomic update section.
+    sequence: AtomicU64,
     total_bytes: AtomicU64,
     available_bytes: AtomicU64,
     /// Bytes admitted by the gate since the last snapshot refresh. The snapshot
@@ -130,6 +135,7 @@ struct MemorySnapshotCell {
 impl MemorySnapshotCell {
     fn new(snapshot: ObjectDataCacheMemorySnapshot) -> Self {
         Self {
+            sequence: AtomicU64::new(0),
             total_bytes: AtomicU64::new(snapshot.total_bytes),
             available_bytes: AtomicU64::new(snapshot.available_bytes),
             admitted_since_refresh: AtomicU64::new(0),
@@ -139,16 +145,32 @@ impl MemorySnapshotCell {
     /// Stores a fresh snapshot and resets the admitted-bytes counter: the new
     /// reading already accounts for whatever was admitted since the last one.
     fn store(&self, snapshot: ObjectDataCacheMemorySnapshot) {
+        let Some(_writer) = self.try_write() else {
+            return;
+        };
         self.total_bytes.store(snapshot.total_bytes, Ordering::Relaxed);
         self.available_bytes.store(snapshot.available_bytes, Ordering::Relaxed);
         self.admitted_since_refresh.store(0, Ordering::Relaxed);
     }
 
-    fn load(&self) -> ObjectDataCacheMemorySnapshot {
-        ObjectDataCacheMemorySnapshot {
-            total_bytes: self.total_bytes.load(Ordering::Relaxed),
-            available_bytes: self.available_bytes.load(Ordering::Relaxed),
+    fn load(&self) -> Option<ObjectDataCacheMemorySnapshot> {
+        for _ in 0..MAX_STATE_RETRIES {
+            let start = self.sequence.load(Ordering::Acquire);
+            if start & 1 == 1 {
+                spin_loop();
+                continue;
+            }
+
+            let snapshot = ObjectDataCacheMemorySnapshot {
+                total_bytes: self.total_bytes.load(Ordering::Relaxed),
+                available_bytes: self.available_bytes.load(Ordering::Relaxed),
+            };
+            if self.sequence.load(Ordering::Acquire) == start {
+                return Some(snapshot);
+            }
         }
+
+        None
     }
 
     fn admitted(&self) -> u64 {
@@ -156,7 +178,82 @@ impl MemorySnapshotCell {
     }
 
     fn reserve(&self, bytes: u64) {
-        self.admitted_since_refresh.fetch_add(bytes, Ordering::Relaxed);
+        let Some(_writer) = self.try_write() else {
+            return;
+        };
+        let claimed = self.admitted_since_refresh.load(Ordering::Relaxed);
+        self.admitted_since_refresh
+            .store(claimed.saturating_add(bytes), Ordering::Relaxed);
+    }
+
+    fn release(&self, bytes: u64) {
+        let Some(_writer) = self.try_write() else {
+            // Keeping an over-count is fail-closed: it can only skip future
+            // cache fills, never allow an unsafe allocation.
+            return;
+        };
+        let claimed = self.admitted_since_refresh.load(Ordering::Relaxed);
+        self.admitted_since_refresh
+            .store(claimed.saturating_sub(bytes), Ordering::Relaxed);
+    }
+
+    fn try_write(&self) -> Option<MemoryStateWriteGuard<'_>> {
+        for _ in 0..MAX_STATE_RETRIES {
+            let sequence = self.sequence.load(Ordering::Acquire);
+            if sequence & 1 == 1 {
+                spin_loop();
+                continue;
+            }
+            let next_sequence = sequence.checked_add(2)?;
+            if self
+                .sequence
+                .compare_exchange_weak(sequence, sequence + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(MemoryStateWriteGuard {
+                    cell: self,
+                    next_sequence,
+                });
+            }
+        }
+
+        None
+    }
+}
+
+struct MemoryStateWriteGuard<'a> {
+    cell: &'a MemorySnapshotCell,
+    next_sequence: u64,
+}
+
+impl Drop for MemoryStateWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.sequence.store(self.next_sequence, Ordering::Release);
+    }
+}
+
+/// An exclusive claim on memory admitted for one cache allocation.
+///
+/// Dropping the token releases the claim. Callers that only use the legacy
+/// boolean admission API retain the claim until the next telemetry refresh.
+#[derive(Debug)]
+#[must_use = "dropping the reservation releases the admitted memory"]
+pub struct ObjectDataCacheMemoryReservation {
+    snapshot: Option<Arc<MemorySnapshotCell>>,
+    bytes: u64,
+}
+
+impl ObjectDataCacheMemoryReservation {
+    pub(crate) fn until_refresh(mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for ObjectDataCacheMemoryReservation {
+    fn drop(&mut self) {
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.release(self.bytes);
+        }
     }
 }
 
@@ -255,7 +352,79 @@ impl ObjectDataCacheMemoryGate {
             }
         }
 
-        self.snapshot.load()
+        self.snapshot.load().unwrap_or_default()
+    }
+
+    /// Atomically claims memory for one cache allocation.
+    ///
+    /// The returned token owns the claim and releases it on drop. Contention is
+    /// retried a bounded number of times; exhaustion fails closed by skipping
+    /// this cache fill without affecting the underlying object read.
+    pub fn try_claim(&self, required_bytes: u64, cache_growth_headroom: u64) -> Option<ObjectDataCacheMemoryReservation> {
+        self.try_claim_after(required_bytes, cache_growth_headroom, || {})
+    }
+
+    fn try_claim_after(
+        &self,
+        required_bytes: u64,
+        cache_growth_headroom: u64,
+        before_claim: impl FnOnce(),
+    ) -> Option<ObjectDataCacheMemoryReservation> {
+        if self.min_free_memory_percent == 0 {
+            return Some(ObjectDataCacheMemoryReservation {
+                snapshot: None,
+                bytes: 0,
+            });
+        }
+
+        before_claim();
+        let Some(_writer) = self.snapshot.try_write() else {
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        };
+        let snapshot = {
+            #[cfg(test)]
+            if let Some(snapshot) = *lock_or_recover(&self.test_override) {
+                snapshot
+            } else {
+                ObjectDataCacheMemorySnapshot {
+                    total_bytes: self.snapshot.total_bytes.load(Ordering::Relaxed),
+                    available_bytes: self.snapshot.available_bytes.load(Ordering::Relaxed),
+                }
+            }
+            #[cfg(not(test))]
+            ObjectDataCacheMemorySnapshot {
+                total_bytes: self.snapshot.total_bytes.load(Ordering::Relaxed),
+                available_bytes: self.snapshot.available_bytes.load(Ordering::Relaxed),
+            }
+        };
+        if snapshot.total_bytes == 0 {
+            return Some(ObjectDataCacheMemoryReservation {
+                snapshot: None,
+                bytes: 0,
+            });
+        }
+        let claimed = self.snapshot.admitted_since_refresh.load(Ordering::Relaxed);
+        let reserved = claimed.min(cache_growth_headroom);
+        let effective_available = snapshot.available_bytes.saturating_sub(reserved);
+        let min_free = u64::from(self.min_free_memory_percent);
+        let has_percent_budget = effective_available.saturating_mul(100) >= snapshot.total_bytes.saturating_mul(min_free);
+        let has_entry_budget = effective_available >= required_bytes;
+        let Some(next_claimed) = claimed.checked_add(required_bytes) else {
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        };
+
+        if !has_percent_budget || !has_entry_budget {
+            record_memory_pressure(&self.stats, "moka");
+            return None;
+        }
+
+        self.snapshot.admitted_since_refresh.store(next_claimed, Ordering::Relaxed);
+        Some(ObjectDataCacheMemoryReservation {
+            snapshot: Some(Arc::clone(&self.snapshot)),
+            bytes: required_bytes,
+        })
     }
 
     /// Returns true when the fill path may proceed under current memory pressure.
@@ -268,52 +437,11 @@ impl ObjectDataCacheMemoryGate {
     /// far the in-window reservation may shrink the budget: see the reservation
     /// note below.
     pub fn allows_fill(&self, required_bytes: u64, cache_growth_headroom: u64) -> bool {
-        // A zero floor opts out of the gate, so fill admission never depends on
-        // a live memory reading — which differs between a host and a container.
-        // This must short-circuit before any snapshot read (see 51a97a81c).
-        if self.min_free_memory_percent == 0 {
-            return true;
-        }
-
-        let snapshot = self.snapshot();
-        if snapshot.total_bytes == 0 {
-            return true;
-        }
-
-        // Effective budget is the snapshot's available memory minus what the
-        // gate has already admitted since that snapshot was taken. This bounds a
-        // burst that arrives faster than the 5 s refresh: each admission shrinks
-        // the budget the next one sees, so cumulative admission cannot exceed the
-        // real headroom even though every fill reads the same (stale) snapshot.
-        //
-        // `admitted_since_refresh` counts GROSS admitted bytes and never rolls
-        // back on a fill that is later evicted, cancelled, or loses the
-        // invalidation race; it only resets on the 5 s refresh. Under sustained
-        // churn (net footprint flat, far below capacity) the raw counter would
-        // balloon past the real memory the cache consumes and falsely trip the
-        // gate, skipping the hottest fills until the next refresh. The cache can
-        // never hold more than `max_capacity`, so a burst adds at most
-        // `cache_growth_headroom` bytes of real memory before moka evicts to stay
-        // bounded (net-zero churn beyond that point). Capping the deduction there
-        // keeps the reservation honest without treating gross churn as growth
-        // (backlog#1212).
-        let reserved = self.snapshot.admitted().min(cache_growth_headroom);
-        let effective_available = snapshot.available_bytes.saturating_sub(reserved);
-
-        let min_free = u64::from(self.min_free_memory_percent);
-        let has_percent_budget = effective_available.saturating_mul(100) >= snapshot.total_bytes.saturating_mul(min_free);
-        let has_entry_budget = effective_available >= required_bytes;
-        let allowed = has_percent_budget && has_entry_budget;
-
-        if allowed {
-            // Reserve the admitted bytes so a concurrent fill sees a smaller
-            // budget; the reservation clears on the next snapshot refresh.
-            self.snapshot.reserve(required_bytes);
-        } else {
-            record_memory_pressure(&self.stats, "moka");
-        }
-
-        allowed
+        let Some(reservation) = self.try_claim(required_bytes, cache_growth_headroom) else {
+            return false;
+        };
+        reservation.until_refresh();
+        true
     }
 
     #[cfg(test)]
@@ -331,7 +459,22 @@ impl ObjectDataCacheMemoryGate {
     /// Reads the atomic snapshot directly, bypassing `test_override`.
     #[cfg(test)]
     fn raw_snapshot_for_test(&self) -> ObjectDataCacheMemorySnapshot {
-        self.snapshot.load()
+        self.snapshot.load().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn try_claim_with_hook(
+        &self,
+        required_bytes: u64,
+        cache_growth_headroom: u64,
+        before_claim: impl FnOnce(),
+    ) -> Option<ObjectDataCacheMemoryReservation> {
+        self.try_claim_after(required_bytes, cache_growth_headroom, before_claim)
+    }
+
+    #[cfg(test)]
+    fn claimed_bytes_for_test(&self) -> u64 {
+        self.snapshot.admitted()
     }
 }
 
@@ -349,9 +492,113 @@ mod tests {
     use crate::config::ObjectDataCacheConfig;
     use crate::stats::ObjectDataCacheStats;
     use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::Duration;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn memory_gate_concurrent_claims_are_linearizable() {
+        const CLAIMERS: usize = 8;
+        let gate = Arc::new(ObjectDataCacheMemoryGate::new(
+            &ObjectDataCacheConfig::default(),
+            Arc::new(ObjectDataCacheStats::default()),
+        ));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+        let ready = Arc::new(Barrier::new(CLAIMERS));
+
+        let handles: Vec<_> = (0..CLAIMERS)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let ready = Arc::clone(&ready);
+                thread::spawn(move || {
+                    gate.try_claim_with_hook(400, u64::MAX, || {
+                        ready.wait();
+                    })
+                })
+            })
+            .collect();
+        let claims: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("claim thread should not panic"))
+            .collect();
+
+        assert_eq!(claims.len(), 1, "only one 400-byte claim fits the shared budget");
+        assert_eq!(gate.claimed_bytes_for_test(), 400);
+        drop(claims);
+        assert_eq!(gate.claimed_bytes_for_test(), 0, "dropping the owner releases its claim");
+    }
+
+    #[test]
+    fn memory_reservation_token_lifecycle_is_idempotent() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+
+        let mut claim = Some(gate.try_claim(100, u64::MAX).expect("100-byte claim should fit"));
+        assert_eq!(gate.claimed_bytes_for_test(), 100);
+        drop(claim.take());
+        drop(claim);
+
+        assert_eq!(gate.claimed_bytes_for_test(), 0, "the claim is released exactly once");
+    }
+
+    #[test]
+    fn memory_gate_claimed_bytes_never_exceed_epoch_budget() {
+        const CLAIMERS: usize = 32;
+        let gate = Arc::new(ObjectDataCacheMemoryGate::new(
+            &ObjectDataCacheConfig::default(),
+            Arc::new(ObjectDataCacheStats::default()),
+        ));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 500,
+        }));
+        let ready = Arc::new(Barrier::new(CLAIMERS));
+
+        let handles: Vec<_> = (0..CLAIMERS)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let ready = Arc::clone(&ready);
+                thread::spawn(move || {
+                    gate.try_claim_with_hook(100, u64::MAX, || {
+                        ready.wait();
+                    })
+                })
+            })
+            .collect();
+        let claims: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("claim thread should not panic"))
+            .collect();
+
+        assert_eq!(gate.claimed_bytes_for_test(), u64::try_from(claims.len()).unwrap_or(u64::MAX) * 100);
+        assert!(gate.claimed_bytes_for_test() <= 500);
+    }
+
+    #[test]
+    fn memory_gate_claim_retries_after_epoch_change() {
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::new(ObjectDataCacheStats::default()));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 100,
+        }));
+
+        let claim = gate.try_claim_with_hook(100, u64::MAX, || {
+            gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 500,
+            }));
+        });
+
+        assert!(claim.is_some(), "claim must use the epoch published before linearization");
+    }
 
     #[test]
     fn select_effective_memory_prefers_constraining_cgroup() {
@@ -551,7 +798,7 @@ mod tests {
         // real host reading (total memory is always far above 1 byte).
         let mut refreshed = false;
         for _ in 0..200 {
-            if snapshot.load().total_bytes > 1 {
+            if snapshot.load().is_some_and(|snapshot| snapshot.total_bytes > 1) {
                 refreshed = true;
                 break;
             }

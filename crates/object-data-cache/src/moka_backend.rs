@@ -504,9 +504,13 @@ impl MokaBackend {
         // and falsely skip fills (backlog#1212). weighted_size() is moka's
         // lazily-maintained approximation, which is all this bound needs.
         let cache_growth_headroom = self.max_capacity.saturating_sub(self.cache.weighted_size());
-        if !self.memory_gate.allows_fill(body_bytes, cache_growth_headroom) {
+        let Some(reservation) = self
+            .memory_gate
+            .try_claim(body_bytes, cache_growth_headroom)
+        else {
             return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure);
-        }
+        };
+        reservation.until_refresh();
 
         let identity = ObjectDataCacheIdentity::new(Arc::clone(&key.bucket), Arc::clone(&key.object));
         // Keep keys that are still cached or still mid-fill: another in-flight
