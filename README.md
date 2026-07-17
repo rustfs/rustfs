@@ -116,7 +116,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # Using specific version
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.10-preview.1
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.10
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
@@ -218,7 +218,10 @@ For scanner pacing, cycle budgets, bitrot cadence, lifecycle transition status,
 and single-node single-disk idle CPU tuning, see
 [Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md). For
 repeatable scanner-pressure validation, see
-[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md).
+[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md). For
+drive timeout knobs on slow storage — including the walk stall budget that
+governs `ListObjects` on large prefixes — see
+[Drive Timeout Tuning](docs/operations/drive-timeout-tuning.md).
 
 ### 5\. Nix Flake (Option 5)
 

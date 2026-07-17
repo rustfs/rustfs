@@ -976,21 +976,21 @@ impl Stream for ReceiverStream {
     }
 }
 
-pin_project! {
-    pub struct HttpWriter {
-        url:String,
-        method: Method,
-        headers: HeaderMap,
-        err_rx: tokio::sync::oneshot::Receiver<std::io::Error>,
-        start_tx: Option<tokio::sync::oneshot::Sender<()>>,
-        sender: PollSender<Option<Bytes>>,
-        handle: tokio::task::JoinHandle<std::io::Result<()>>,
-        pending_chunk: BytesMut,
-        finish:bool,
-        track_internode_metrics: bool,
-        internode_operation: Option<&'static str>,
-
-    }
+// Not pin-projected: every field is `Unpin` and the `AsyncWrite` impl accesses
+// them through `get_mut()`, so a plain struct lets us add a manual `Drop`
+// (pin-project forbids one) to abort the background HTTP task — see below.
+pub struct HttpWriter {
+    url: String,
+    method: Method,
+    headers: HeaderMap,
+    err_rx: tokio::sync::oneshot::Receiver<std::io::Error>,
+    start_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    sender: PollSender<Option<Bytes>>,
+    handle: tokio::task::JoinHandle<std::io::Result<()>>,
+    pending_chunk: BytesMut,
+    finish: bool,
+    track_internode_metrics: bool,
+    internode_operation: Option<&'static str>,
 }
 
 const HTTP_WRITER_CHANNEL_CAPACITY: usize = 8;
@@ -1476,6 +1476,20 @@ impl AsyncWrite for HttpWriter {
     }
 }
 
+impl Drop for HttpWriter {
+    /// Abort the background HTTP request when the writer is dropped without a
+    /// clean shutdown. On a stall timeout the caller drops this writer to fail
+    /// its shard (rustfs/backlog#1319); a black-hole peer would otherwise leave
+    /// the spawned task holding the connection and its buffered body alive. A
+    /// cleanly shut-down writer has already joined the task, so aborting a
+    /// finished handle is a no-op. This does not — and cannot — unsend bytes
+    /// already handed to the transport: those land only in the upload's unique
+    /// tmp path and are reclaimed by tmp GC, never touching a committed object.
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1877,21 +1891,77 @@ mod tests {
         };
 
         let writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
-        let HttpWriter {
-            handle,
-            sender,
-            start_tx,
-            ..
-        } = writer;
-        drop(start_tx);
-        drop(sender);
-        handle
-            .await
-            .expect("HttpWriter background task should not panic")
-            .expect("an unstarted HttpWriter should stop cleanly");
+        // Dropping an unstarted writer aborts its parked background task
+        // (rustfs/backlog#1319) before it can ever send a PUT.
+        drop(writer);
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(state.put_count.load(Ordering::SeqCst), 0);
         assert!(state.put_bodies.lock().await.is_empty());
+
+        server_handle.abort();
+    }
+
+    /// A PUT handler that registers the request, then parks forever without ever
+    /// sending a response — modeling a black-hole peer that accepts the
+    /// connection but never completes the request, so the writer's background
+    /// task stays parked at `request.send().await` until it is aborted.
+    async fn hanging_put(State(state): State<TestState>, _body: Body) -> impl IntoResponse {
+        state.put_count.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        StatusCode::OK
+    }
+
+    // rustfs/backlog#1319: when a stalled remote writer is dropped (the encode
+    // path drops it to fail its shard), the background HTTP task must be aborted
+    // so it stops holding the connection and buffered body — it must not linger.
+    #[tokio::test]
+    async fn http_writer_drop_aborts_background_request_to_hanging_peer() {
+        let state = TestState::default();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let app = Router::new()
+            .route("/hang", axum::routing::put(hanging_put))
+            .with_state(state.clone());
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/hang");
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        // A >1MiB write starts the request and hands the body to the background
+        // task, which then parks in the handler that never responds.
+        writer.write_all(&vec![0xa5u8; HTTP_WRITER_BUFFER_SIZE + 1]).await.unwrap();
+        // Let the server register the request, so the background task is parked
+        // (alive) at send() before we drop the writer.
+        for _ in 0..100 {
+            if state.put_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1, "server should have accepted the request");
+
+        // Observe the background task via its abort handle; it must still be
+        // running before the drop, then be aborted (finished) after it.
+        let task = writer.handle.abort_handle();
+        assert!(!task.is_finished(), "background task should still be running before drop");
+
+        drop(writer);
+
+        let mut aborted = false;
+        for _ in 0..500 {
+            if task.is_finished() {
+                aborted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(aborted, "dropping the writer must abort the background HTTP task");
 
         server_handle.abort();
     }

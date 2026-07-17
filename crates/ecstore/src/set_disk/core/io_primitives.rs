@@ -2050,7 +2050,7 @@ impl SetDisks {
         let bucket = Arc::new(bucket.to_string());
         let object = Arc::new(object.to_string());
         let version_id = Arc::new(version_id.to_string());
-        let futures = disks.iter().map(|disk| {
+        let futures = disks.iter().enumerate().map(|(disk_index, disk)| {
             let disk = disk.clone();
             let opts = opts.clone();
             let org_bucket = org_bucket.clone();
@@ -2060,6 +2060,7 @@ impl SetDisks {
             tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
+                    Self::record_read_version_call(&object, disk_index);
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -2145,6 +2146,7 @@ impl SetDisks {
             join_set.spawn(async move {
                 let response_start = Instant::now();
                 let result = if let Some(disk) = disk {
+                    Self::record_read_version_call(&object, index);
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
@@ -2522,11 +2524,57 @@ enum OrphanDirScan {
     Missing,
 }
 
-fn rename_data_versions_key(versions: &[u8]) -> Option<[u8; 8]> {
-    let prefix = versions.get(..8)?;
-    let mut key = [0; 8];
-    key.copy_from_slice(prefix);
-    Some(key)
+/// Outcome of a *post-quorum* `rename_data` commit, classifying whether the
+/// committed replicas converged so the caller can decide heal admission
+/// WITHOUT conflating "a version signature exists" with "this write needs
+/// heal" (rustfs/backlog#1321).
+///
+/// `rename_data` reaches this classification only once write quorum is met — a
+/// sub-quorum commit returns `Err` and never produces a convergence — so every
+/// variant describes an already-durable, already-ACKable write.
+///
+/// # Extension point for #1312 (commit fencing)
+///
+/// #1312 layers a per-object fencing epoch onto the SAME `rename_data` path.
+/// An epoch rejection is a *commit* failure surfaced through the existing
+/// `Result::Err` channel (the write never lands), which is orthogonal to this
+/// post-commit convergence signal (the write landed; do the replicas need
+/// heal). The two therefore compose: fencing gates whether we reach a
+/// convergence at all, and this enum classifies the convergence once reached.
+/// A future fence-aware variant, if ever needed, is an additive change here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::set_disk) enum RenameConvergence {
+    /// Every attempted disk committed and reported an identical, known version
+    /// signature. The committed replicas are already converged; no heal needed.
+    AllSuccessIdentical,
+    /// Write quorum was met but at least one attempted disk failed to commit
+    /// (error or offline). The committed set may be short a replica; the
+    /// laggard must be converged by heal.
+    PartialCommit,
+    /// Every attempted disk committed but their version signatures diverge (or
+    /// mix signed <=10-version disks with unsigned >10-version disks, itself a
+    /// version-count divergence). Heal must reconcile the committed replicas.
+    SignatureDivergent,
+    /// Every attempted disk committed but none produced a version signature
+    /// (all observed >10 versions, where the signature is deliberately
+    /// omitted). Divergence can neither be proven nor ruled out here, so any
+    /// latent divergence is left to the scanner backstop rather than enqueued
+    /// for heal.
+    Unknown,
+}
+
+impl RenameConvergence {
+    /// Whether this commit outcome must enqueue an object heal to converge the
+    /// committed replicas.
+    ///
+    /// `Unknown` and `AllSuccessIdentical` return `false`: the former is
+    /// scanner-backstopped (see the variant docs), the latter is already
+    /// converged. This is the single decision point that replaced the old
+    /// `Option<Vec<u8>>::is_some()` heuristic, under which a healthy MPU
+    /// (identical signatures on every disk) always looked like it needed heal.
+    pub(in crate::set_disk) fn needs_heal(&self) -> bool {
+        matches!(self, Self::PartialCommit | Self::SignatureDivergent)
+    }
 }
 
 impl SetDisks {
@@ -2555,7 +2603,7 @@ impl SetDisks {
         write_quorum: usize,
     ) -> disk::error::Result<(
         Vec<Option<DiskStore>>,
-        Option<Vec<u8>>,
+        RenameConvergence,
         Option<Uuid>,
         Vec<Option<DiskStore>>,
         Option<OldCurrentSize>,
@@ -2578,6 +2626,11 @@ impl SetDisks {
             let dst_bucket = dst_bucket.clone();
 
             futures.push(tokio::spawn(async move {
+                // Test-only introspection guard: counts this task as in-flight for
+                // the whole body. Compiles to `()` in production (no behavior).
+                #[allow(clippy::let_unit_value)]
+                let _fanout_task_guard = Self::rename_fanout_task_guard(&dst_object);
+
                 if file_info.erasure.index == 0 {
                     file_info.erasure.index = i + 1;
                 }
@@ -2585,6 +2638,10 @@ impl SetDisks {
                 if !file_info.is_valid() {
                     return Err(DiskError::FileCorrupt);
                 }
+
+                // Test-only awaitable pause point right before the disk rename.
+                // A no-op immediately-ready future in production.
+                Self::rename_fanout_barrier(&dst_object, i, rename_fanout_barrier_phase::RENAME).await;
 
                 if let Some(disk) = disk {
                     disk.rename_data(&src_bucket, &src_object, file_info, &dst_bucket, &dst_object)
@@ -2709,7 +2766,7 @@ impl SetDisks {
         }
 
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
-        let versions = Self::select_rename_data_versions(&disk_versions, &errs, write_quorum);
+        let convergence = Self::classify_rename_convergence(&disk_versions, &errs);
         let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
         let cleanup_disks = if let Some(data_dir) = data_dir {
@@ -2729,7 +2786,7 @@ impl SetDisks {
             vec![None; disks.len()]
         };
 
-        Ok((online_disks, versions, data_dir, cleanup_disks, old_current_size))
+        Ok((online_disks, convergence, data_dir, cleanup_disks, old_current_size))
     }
 
     /// rustfs/backlog#1009: reduce the per-disk observations of the
@@ -2760,61 +2817,62 @@ impl SetDisks {
         if max >= write_quorum { old_current_size } else { None }
     }
 
-    pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {
-        let mut versions_count = HashMap::new();
-
-        for versions in disk_versions.iter().flatten() {
-            if let Some(key) = rename_data_versions_key(versions) {
-                *versions_count.entry(key).or_insert(0usize) += 1;
-            }
-        }
-
-        let (common_versions, max_count) = versions_count
-            .into_iter()
-            .max_by_key(|(_, count)| *count)
-            .unwrap_or(([0; 8], 0));
-
-        if max_count < write_quorum {
-            return None;
-        }
-
-        disk_versions
-            .iter()
-            .flatten()
-            .find(|versions| rename_data_versions_key(versions).is_some_and(|key| key == common_versions))
-            .cloned()
-    }
-
-    pub(in crate::set_disk) fn select_rename_data_versions(
+    /// Classify a *post-quorum* `rename_data` commit into an explicit
+    /// convergence outcome (rustfs/backlog#1321). This runs only after the
+    /// write-quorum gate has already passed, so every returned variant
+    /// describes an already-durable, already-ACKable write; the decision here
+    /// is purely "do the committed replicas need heal to converge".
+    ///
+    /// The per-disk version signature (`disk_versions[i]`) is used only as
+    /// comparison material — it is deliberately NOT overloaded to also mean
+    /// "needs heal". A `Some(bytes)` signature carries the concatenated
+    /// version-id bytes of a disk that observed <=10 versions; a `None`
+    /// signature is a disk that committed but deliberately produced no
+    /// signature (>10 versions). A `None` entry for a *failed* disk never
+    /// reaches this point as a signature because failures are handled first.
+    pub(in crate::set_disk) fn classify_rename_convergence(
         disk_versions: &[Option<Vec<u8>>],
         errs: &[Option<DiskError>],
-        write_quorum: usize,
-    ) -> Option<Vec<u8>> {
-        let mut versions = Self::reduce_common_versions(disk_versions, write_quorum);
-        for (dversions, err) in disk_versions.iter().zip(errs.iter()) {
-            if err.is_some() {
-                continue;
-            }
-            let Some(dversions) = dversions.as_ref().filter(|versions| !versions.is_empty()) else {
+    ) -> RenameConvergence {
+        // Any failed / offline disk that got past the write-quorum gate means a
+        // committed replica is missing or stale: converge it via heal,
+        // regardless of what the surviving disks' signatures say.
+        if errs.iter().any(|err| err.is_some()) {
+            return RenameConvergence::PartialCommit;
+        }
+
+        // Every disk committed. Compare their reported version signatures.
+        let mut seen: Option<&Vec<u8>> = None;
+        let mut signed_count = 0usize;
+        let mut divergent = false;
+        for signature in disk_versions.iter() {
+            let Some(sig) = signature.as_ref() else {
                 continue;
             };
-
-            match versions.as_ref() {
-                Some(current_versions) if dversions != current_versions => {
-                    if dversions.len() > current_versions.len() {
-                        versions = Some(dversions.clone());
-                    }
-                    break;
-                }
+            signed_count += 1;
+            match seen {
+                None => seen = Some(sig),
+                Some(prev) if prev != sig => divergent = true,
                 Some(_) => {}
-                None => {
-                    versions = Some(dversions.clone());
-                    break;
-                }
             }
         }
 
-        versions
+        if divergent {
+            return RenameConvergence::SignatureDivergent;
+        }
+        if signed_count == 0 {
+            // No disk produced a signature (all observed >10 versions): a
+            // latent divergence cannot be proven or ruled out here, so it is
+            // left to the scanner backstop rather than enqueued for heal.
+            return RenameConvergence::Unknown;
+        }
+        if signed_count < disk_versions.len() {
+            // A mix of signed (<=10 versions) and unsigned (>10 versions) disks
+            // is itself a version-count divergence between committed replicas:
+            // reconcile it via heal.
+            return RenameConvergence::SignatureDivergent;
+        }
+        RenameConvergence::AllSuccessIdentical
     }
 
     /// Reclaim the old (now dereferenced) `object/<old_data_dir>` on the disks
@@ -2874,6 +2932,12 @@ impl SetDisks {
             let disk = disk.clone();
             let object_for_fault = object_for_fault.clone();
             tokio::spawn(async move {
+                // Test-only introspection guard + awaitable pause point for the
+                // old-data-dir cleanup fan-out. Both compile away in production.
+                #[allow(clippy::let_unit_value)]
+                let _fanout_task_guard = Self::rename_fanout_task_guard(&object_for_fault);
+                Self::rename_fanout_barrier(&object_for_fault, idx, rename_fanout_barrier_phase::CLEANUP).await;
+
                 if let Some(err) = Self::cleanup_injected_error(&object_for_fault, idx) {
                     return Some(err);
                 }
@@ -2913,6 +2977,56 @@ impl SetDisks {
     fn cleanup_injected_error(_object: &str, _disk_index: usize) -> Option<DiskError> {
         None
     }
+
+    /// Test-only seam that records one per-disk `read_version` metadata RPC for
+    /// the call-counter registry (backlog#1325). In production this is inlined to
+    /// nothing and adds no behavior; only the `#[cfg(test)]` variant touches the
+    /// registry. Placed inside the fan-out spawn tasks so counts are observed
+    /// even though the increments run on arbitrary runtime worker threads.
+    #[cfg(test)]
+    #[inline]
+    fn record_read_version_call(object: &str, disk_index: usize) {
+        disk_call_counters::record(object, disk_call_counters::KIND_READ_VERSION, disk_index);
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn record_read_version_call(_object: &str, _disk_index: usize) {}
+
+    /// Test-only awaitable pause point for the rename/commit fan-out (backlog#1325,
+    /// serving the barrier-style acceptances of #1312 / #1319 / #1313). `phase` is
+    /// [`rename_fanout_barrier::PHASE_RENAME`] or `PHASE_CLEANUP`. When a test has
+    /// armed a barrier for `object` at this `(disk_index, phase)`, the spawned
+    /// fan-out task blocks here until the test releases it, so the test can await
+    /// the pause point and then introspect in-flight background disk work. In
+    /// production this awaits an immediately-ready no-op future — no yield, no
+    /// registry access, no behavior change.
+    #[cfg(test)]
+    #[inline]
+    async fn rename_fanout_barrier(object: &str, disk_index: usize, phase: &'static str) {
+        rename_fanout_barrier::checkpoint(object, disk_index, phase).await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    #[allow(clippy::unused_async)]
+    async fn rename_fanout_barrier(_object: &str, _disk_index: usize, _phase: &'static str) {}
+
+    /// Test-only RAII counter for one in-flight rename/commit fan-out task
+    /// (backlog#1325). Held for the whole spawned task body so a test observing
+    /// `object` can assert "background disk writes are still running" while the
+    /// fan-out is paused and "no background disk writes remain" once it drains —
+    /// the exact signal #1312 needs after a lock release. In production this
+    /// returns `()` and touches no registry.
+    #[cfg(test)]
+    #[inline]
+    fn rename_fanout_task_guard(object: &str) -> rename_fanout_barrier::TaskGuard {
+        rename_fanout_barrier::task_guard(object)
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn rename_fanout_task_guard(_object: &str) {}
 
     /// Report a post-commit old-data-dir cleanup receipt: emit metrics, warn on
     /// residue/below-quorum, and — on residue — enqueue an object heal.
@@ -3909,6 +4023,340 @@ pub(in crate::set_disk) mod cleanup_fault_injection {
     }
 }
 
+/// Test-only per-disk call counters for the metadata fan-out (backlog#1325,
+/// serving the RPC-count assertions of #1309 / #1314 / #1315).
+///
+/// The metadata fan-out issues each per-disk `read_version` inside a
+/// `tokio::spawn` task, so the increments happen on arbitrary runtime worker
+/// threads. A thread-local `metrics::Recorder` (see `test_metrics.rs`) cannot
+/// observe those spawned increments; this registry is a process-global keyed by
+/// object name, so counts recorded inside spawned tasks are visible from the
+/// test thread that installed the observing scope.
+///
+/// The whole module is `#[cfg(test)]`, so it never compiles into production.
+/// Parallel tests stay isolated by observing distinct object names — an
+/// unobserved object records nothing, keeping the registry bounded, and each
+/// [`CallCounterScope`] clears only its own object's counts on drop.
+#[cfg(test)]
+pub(in crate::set_disk) mod disk_call_counters {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Kind label for the per-disk `read_version` metadata RPC.
+    pub const KIND_READ_VERSION: &str = "read_version";
+
+    /// Registry key: (object, kind, disk_index).
+    type CountKey = (String, String, usize);
+
+    #[derive(Default)]
+    struct Registry {
+        /// Object names with an active observing scope. Only these accumulate,
+        /// so unrelated concurrent tests never inflate one another's counts.
+        observed: HashSet<String>,
+        /// (object, kind, disk_index) -> call count.
+        counts: HashMap<CountKey, u64>,
+    }
+
+    fn registry() -> &'static Mutex<Registry> {
+        static REG: OnceLock<Mutex<Registry>> = OnceLock::new();
+        REG.get_or_init(|| Mutex::new(Registry::default()))
+    }
+
+    /// Record one call of `kind` against `object`'s `disk_index`. A no-op unless
+    /// an observing scope for `object` is currently installed.
+    pub(super) fn record(object: &str, kind: &str, disk_index: usize) {
+        let mut reg = registry().lock().expect("disk call-counter registry poisoned");
+        if !reg.observed.contains(object) {
+            return;
+        }
+        *reg.counts
+            .entry((object.to_string(), kind.to_string(), disk_index))
+            .or_insert(0) += 1;
+    }
+
+    /// RAII scope that observes call counts for a single `object`. Counts recorded
+    /// while the scope is alive — including those recorded inside spawned tasks —
+    /// are queryable; the scope clears its own counts on drop.
+    #[must_use]
+    pub struct CallCounterScope {
+        object: String,
+    }
+
+    /// Begin observing per-disk call counts for `object`.
+    pub fn observe(object: &str) -> CallCounterScope {
+        let mut reg = registry().lock().expect("disk call-counter registry poisoned");
+        reg.observed.insert(object.to_string());
+        CallCounterScope {
+            object: object.to_string(),
+        }
+    }
+
+    impl CallCounterScope {
+        /// Total number of `kind` calls across all disks for the observed object.
+        pub fn total(&self, kind: &str) -> u64 {
+            let reg = registry().lock().expect("disk call-counter registry poisoned");
+            reg.counts
+                .iter()
+                .filter(|((obj, k, _), _)| obj == &self.object && k == kind)
+                .map(|(_, count)| *count)
+                .sum()
+        }
+
+        /// Number of `kind` calls recorded against a specific `disk_index`.
+        pub fn for_disk(&self, kind: &str, disk_index: usize) -> u64 {
+            let reg = registry().lock().expect("disk call-counter registry poisoned");
+            reg.counts
+                .get(&(self.object.clone(), kind.to_string(), disk_index))
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for CallCounterScope {
+        fn drop(&mut self) {
+            let mut reg = registry().lock().expect("disk call-counter registry poisoned");
+            reg.observed.remove(&self.object);
+            reg.counts.retain(|(obj, _, _), _| obj != &self.object);
+        }
+    }
+}
+
+/// Fan-out phase labels for the rename/commit barrier seam (backlog#1325).
+///
+/// These are referenced from the production fan-out call sites (as inert string
+/// literals passed to a no-op seam), so — unlike the `#[cfg(test)]` barrier
+/// registry itself — they are defined unconditionally. In production builds the
+/// seam ignores them entirely.
+pub(in crate::set_disk) mod rename_fanout_barrier_phase {
+    /// The per-disk `rename_data` phase of the write-commit fan-out.
+    pub const RENAME: &str = "rename";
+    /// The per-disk old-data-dir cleanup phase of the commit fan-out.
+    pub const CLEANUP: &str = "cleanup";
+}
+
+/// Test-only awaitable pause barrier + background-task introspection for the
+/// rename/commit fan-out (backlog#1325, the second facility block after the
+/// per-disk call counters). Serves the barrier-style white-box acceptances of
+/// #1312 (commit fencing: "abort at the first-disk rename barrier, assert the
+/// coordinator still holds the lock, assert no background disk write remains
+/// after release"), #1319, and #1313.
+///
+/// Two independent, object-keyed mechanisms share one process-global registry:
+///
+/// 1. **Awaitable pause barrier.** A test [`arm`]s a barrier for `(object,
+///    disk_index, phase)`. The matching spawned fan-out task blocks at its
+///    [`checkpoint`] until the test releases it. The test awaits the pause via
+///    [`BarrierHandle::wait_until_paused`] (a deterministic `Notify` handshake —
+///    no sleeps) and resumes it via [`BarrierHandle::release`]. At most one
+///    barrier is armed per object at a time, matching the single-scope style of
+///    `disk_call_counters`.
+///
+/// 2. **Background-task introspection.** A test [`observe_tasks`] for `object`;
+///    each instrumented fan-out task then holds a [`TaskGuard`] for its whole
+///    body, so [`TaskTrackerScope::running`] reports how many rename/cleanup
+///    background disk tasks are still in flight. This is the concrete "is there
+///    still a background disk write?" signal #1312 asserts after a lock release.
+///
+/// Both are keyed by object and only accumulate for armed/observed objects, so
+/// concurrent tests using distinct object names stay fully isolated. The whole
+/// module is `#[cfg(test)]` and never compiles into production; the fan-out call
+/// sites reach it only through the `#[cfg(not(test))]` no-op seams on `SetDisks`.
+///
+/// Scope of this block (white-box, in-process only): coordinator lock-holding is
+/// asserted by the test at the store/coordinator layer via the guard it already
+/// holds — `io_primitives` has no handle to that namespace lock, and fabricating
+/// a lock-state registry here would be a look-alike rather than the real lock.
+/// Cross-process/black-box fault injection (toxiproxy, blackhole peers, 2-pool)
+/// is a later cluster-harness block, not this one.
+#[cfg(test)]
+pub(in crate::set_disk) mod rename_fanout_barrier {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+
+    pub use super::rename_fanout_barrier_phase::{CLEANUP as PHASE_CLEANUP, RENAME as PHASE_RENAME};
+
+    /// One armed barrier: the fan-out task matching `(disk_index, phase)` pauses.
+    struct Armed {
+        disk_index: usize,
+        phase: &'static str,
+        /// Signalled (task -> test) when the target task reaches the checkpoint.
+        arrived: Arc<Notify>,
+        /// Signalled (test -> task) to release the paused task.
+        release: Arc<Notify>,
+        /// Set once the target task is parked at the checkpoint.
+        paused: Arc<AtomicBool>,
+    }
+
+    #[derive(Default)]
+    struct Registry {
+        /// object -> armed barrier (at most one per object).
+        armed: HashMap<String, Armed>,
+        /// object -> live in-flight fan-out task count, only for observed objects.
+        observed: HashMap<String, Arc<AtomicUsize>>,
+    }
+
+    fn registry() -> &'static Mutex<Registry> {
+        static REG: OnceLock<Mutex<Registry>> = OnceLock::new();
+        REG.get_or_init(|| Mutex::new(Registry::default()))
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, Registry> {
+        registry().lock().expect("rename fan-out barrier registry poisoned")
+    }
+
+    /// RAII handle for one armed barrier. Dropping it disarms the barrier and
+    /// releases any still-parked task, so a panicking or forgetful test can never
+    /// leave a spawned fan-out task wedged.
+    #[must_use]
+    pub struct BarrierHandle {
+        object: String,
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+        paused: Arc<AtomicBool>,
+    }
+
+    /// Arm a barrier: the fan-out task for `object` at `(disk_index, phase)` will
+    /// pause at its checkpoint until the returned handle is released or dropped.
+    pub fn arm(object: &str, disk_index: usize, phase: &'static str) -> BarrierHandle {
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let paused = Arc::new(AtomicBool::new(false));
+        lock().armed.insert(
+            object.to_string(),
+            Armed {
+                disk_index,
+                phase,
+                arrived: arrived.clone(),
+                release: release.clone(),
+                paused: paused.clone(),
+            },
+        );
+        BarrierHandle {
+            object: object.to_string(),
+            arrived,
+            release,
+            paused,
+        }
+    }
+
+    impl BarrierHandle {
+        /// Await until the armed fan-out task has parked at the checkpoint. Uses a
+        /// stored-permit `Notify`, so this is race-free regardless of whether the
+        /// task reaches the checkpoint before or after this call — no sleeps.
+        pub async fn wait_until_paused(&self) {
+            if self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            self.arrived.notified().await;
+        }
+
+        /// Whether the target task is currently parked at the checkpoint.
+        pub fn is_paused(&self) -> bool {
+            self.paused.load(Ordering::SeqCst)
+        }
+
+        /// Release the parked task so the fan-out can proceed.
+        pub fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl Drop for BarrierHandle {
+        fn drop(&mut self) {
+            // Unblock any task still parked at the checkpoint before disarming, so
+            // a dropped handle can never wedge a spawned fan-out task.
+            self.release.notify_one();
+            lock().armed.remove(&self.object);
+        }
+    }
+
+    /// Seam entry point invoked from inside each spawned fan-out task. A no-op
+    /// unless a barrier is armed for exactly this `(object, disk_index, phase)`.
+    /// The registry mutex is released before awaiting, so it is never held across
+    /// the pause.
+    pub(in crate::set_disk) async fn checkpoint(object: &str, disk_index: usize, phase: &'static str) {
+        let hooks = {
+            let reg = lock();
+            match reg.armed.get(object) {
+                Some(a) if a.disk_index == disk_index && a.phase == phase => {
+                    Some((a.arrived.clone(), a.release.clone(), a.paused.clone()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((arrived, release, paused)) = hooks {
+            paused.store(true, Ordering::SeqCst);
+            arrived.notify_one();
+            release.notified().await;
+        }
+    }
+
+    /// RAII scope that observes in-flight fan-out task counts for a single
+    /// `object`. Counts accrue only while the scope is alive; it clears its own
+    /// entry on drop.
+    #[must_use]
+    pub struct TaskTrackerScope {
+        object: String,
+    }
+
+    /// Begin observing in-flight rename/cleanup fan-out task counts for `object`.
+    pub fn observe_tasks(object: &str) -> TaskTrackerScope {
+        lock()
+            .observed
+            .entry(object.to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+        TaskTrackerScope {
+            object: object.to_string(),
+        }
+    }
+
+    impl TaskTrackerScope {
+        /// Number of instrumented fan-out tasks for the observed object that are
+        /// currently in flight (task body entered, guard not yet dropped).
+        pub fn running(&self) -> usize {
+            lock()
+                .observed
+                .get(&self.object)
+                .map(|c| c.load(Ordering::SeqCst))
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for TaskTrackerScope {
+        fn drop(&mut self) {
+            lock().observed.remove(&self.object);
+        }
+    }
+
+    /// RAII guard held for the lifetime of one spawned fan-out task. Increments
+    /// the observed counter on creation (if the object is observed) and decrements
+    /// it on drop. Holding the `Arc` keeps the decrement sound even if the scope
+    /// is dropped while a task is still draining.
+    #[must_use]
+    pub struct TaskGuard {
+        counter: Option<Arc<AtomicUsize>>,
+    }
+
+    /// Create a task guard for `object`. A no-op guard unless `object` is observed.
+    pub(in crate::set_disk) fn task_guard(object: &str) -> TaskGuard {
+        let counter = lock().observed.get(object).cloned();
+        if let Some(c) = &counter {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+        TaskGuard { counter }
+    }
+
+    impl Drop for TaskGuard {
+        fn drop(&mut self) {
+            if let Some(c) = &self.counter {
+                c.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4041,6 +4489,226 @@ mod tests {
         temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, Some("0"), || {
             assert!(dangling_delete_grace().is_zero());
         });
+    }
+
+    /// Builds `count` empty local disks (each in its own tempdir) for the given
+    /// bucket. Returns the tempdir guards (which must outlive the disks) and the
+    /// disk slot vector expected by the metadata fan-out.
+    async fn call_counter_local_disks(bucket: &str, count: usize) -> (Vec<TempDir>, Vec<Option<DiskStore>>) {
+        let mut dirs = Vec::with_capacity(count);
+        let mut disks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        (dirs, disks)
+    }
+
+    /// Demo / regression guard for the backlog#1325 per-disk call counters.
+    ///
+    /// The metadata fan-out issues each `read_version` inside its own
+    /// `tokio::spawn` task; on a multi-thread runtime those tasks land on
+    /// arbitrary worker threads. This asserts the process-global registry still
+    /// observes every per-disk increment — the exact gap that makes the
+    /// thread-local `CapturingRecorder` unusable for #1309 / #1314 counting.
+    ///
+    /// Reverting `record_read_version_call` to a no-op drops both the total and
+    /// the per-disk counts to zero and fails this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_version_call_counter_observes_spawned_fanout() {
+        const DISKS: usize = 4;
+        let bucket = "counter-bucket";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+
+        let object = "counter-object";
+        let scope = disk_call_counters::observe(object);
+
+        // read_data=false, observe=false -> deterministic full-wait fan-out.
+        let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+
+        assert_eq!(
+            scope.total(disk_call_counters::KIND_READ_VERSION),
+            DISKS as u64,
+            "every online disk must record exactly one read_version, even from a spawned task"
+        );
+        for idx in 0..DISKS {
+            assert_eq!(
+                scope.for_disk(disk_call_counters::KIND_READ_VERSION, idx),
+                1,
+                "disk {idx} should record exactly one read_version"
+            );
+        }
+
+        // A second observed fan-out accumulates onto the same scope.
+        let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+        assert_eq!(scope.total(disk_call_counters::KIND_READ_VERSION), (DISKS * 2) as u64);
+
+        drop(dirs);
+    }
+
+    /// Isolation guard: unobserved objects record nothing (so parallel tests do
+    /// not inflate one another), and a scope clears its own counts on drop.
+    #[tokio::test]
+    async fn call_counter_isolates_unobserved_objects_and_clears_on_drop() {
+        let bucket = "counter-bucket-iso";
+        let (dirs, disks) = call_counter_local_disks(bucket, 1).await;
+        let object = "iso-object";
+
+        // No active scope: the fan-out records nothing.
+        let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+
+        {
+            let scope = disk_call_counters::observe(object);
+            assert_eq!(
+                scope.total(disk_call_counters::KIND_READ_VERSION),
+                0,
+                "reads before the scope existed must not be counted"
+            );
+            let _ = SetDisks::read_all_fileinfo(&disks, bucket, bucket, object, "", false, false, false).await;
+            assert_eq!(scope.total(disk_call_counters::KIND_READ_VERSION), 1);
+        }
+
+        // Previous scope dropped -> counts cleared; a fresh scope starts at zero.
+        let scope = disk_call_counters::observe(object);
+        assert_eq!(
+            scope.total(disk_call_counters::KIND_READ_VERSION),
+            0,
+            "dropping a scope must clear its counts"
+        );
+
+        drop(dirs);
+    }
+
+    /// Bound for the pause handshake. This is a hang-guard, not a timing
+    /// dependency: under a working barrier `wait_until_paused` returns via the
+    /// `Notify` handshake far below this bound regardless of IO pressure, so the
+    /// assertions never depend on the value. It only turns a neutralized-barrier
+    /// hang into a deterministic failure instead of an infinite wait.
+    const BARRIER_PAUSE_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn rename_barrier_fileinfos(object: &str, count: usize) -> Vec<FileInfo> {
+        (0..count).map(|_| metadata_test_fileinfo(object)).collect()
+    }
+
+    /// Demo / regression guard for the backlog#1325 rename fan-out pause barrier
+    /// and background-task introspection. Serves the barrier-style acceptance of
+    /// #1312 ("assert no background disk write remains after release").
+    ///
+    /// It drives the real `SetDisks::rename_data` fan-out: a barrier is armed at
+    /// the first disk's `rename` phase, and the test awaits that pause point,
+    /// asserts a background disk task is still in flight, releases it, and then
+    /// asserts the in-flight count drains to zero once the fan-out completes.
+    ///
+    /// Neutralizing the barrier seam (`rename_fanout_barrier` -> immediate no-op)
+    /// makes `wait_until_paused` never wake, so the guarded await elapses and the
+    /// test fails. Neutralizing the task guard (`rename_fanout_task_guard` ->
+    /// `()`) pins `running()` at zero, so the "still in flight" assertion fails.
+    #[tokio::test]
+    async fn rename_fanout_barrier_pauses_and_reports_running_background_tasks() {
+        const DISKS: usize = 4;
+        let bucket = "rename-barrier-bucket";
+        let object = "rename-barrier-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        let file_infos = rename_barrier_fileinfos(object, DISKS);
+
+        let tracker = rename_fanout_barrier::observe_tasks(object);
+        assert_eq!(tracker.running(), 0, "no fan-out tasks before rename starts");
+
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+        // Run the real rename fan-out concurrently with the control flow so we can
+        // introspect while it is parked at the first disk's rename checkpoint.
+        let rename_fut = SetDisks::rename_data(&disks, bucket, object, &file_infos, bucket, object, DISKS - 1);
+        let control_fut = async {
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                .await
+                .expect("fan-out must reach the armed rename barrier");
+            assert!(barrier.is_paused(), "target task must be parked at the checkpoint");
+            assert!(tracker.running() >= 1, "a background rename task must still be in flight while paused");
+            barrier.release();
+        };
+        let (_rename_res, ()) = tokio::join!(rename_fut, control_fut);
+
+        // The fan-out has fully joined -> every task guard has dropped.
+        assert_eq!(tracker.running(), 0, "no background rename task may remain once the fan-out has drained");
+
+        drop(dirs);
+    }
+
+    /// Demo / regression guard for the barrier on the commit (old-data-dir)
+    /// cleanup fan-out. Serves the same #1312/#1319 "no background disk write
+    /// after release" shape, on the reclamation path that runs *after* a write is
+    /// ACKed — the classic detached background delete #1312 fences against.
+    ///
+    /// It stages a real `object/<old_data_dir>` on two disks and drives the real
+    /// `commit_rename_data_dir` fan-out, pausing the first disk's cleanup delete.
+    #[tokio::test]
+    async fn commit_cleanup_fanout_barrier_pauses_background_deletes() {
+        let bucket = "cleanup-barrier-bucket";
+        let object = "cleanup-barrier-object";
+        let old_data_dir = "11111111-1111-1111-1111-111111111111";
+        let committed_data_dir = "22222222-2222-2222-2222-222222222222";
+        let path = format!("{object}/{old_data_dir}/part.1");
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[(&path, b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[(&path, b"two".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone())], 1).await;
+        let disks = [Some(disk1.clone()), Some(disk2.clone())];
+
+        let tracker = rename_fanout_barrier::observe_tasks(object);
+        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+
+        let cleanup_fut = set.commit_rename_data_dir(&disks, bucket, object, old_data_dir, committed_data_dir, 2);
+        let control_fut = async {
+            tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
+                .await
+                .expect("cleanup fan-out must reach the armed cleanup barrier");
+            assert!(tracker.running() >= 1, "a background cleanup delete must still be in flight while paused");
+            barrier.release();
+        };
+        let (cleanup, ()) = tokio::join!(cleanup_fut, control_fut);
+
+        assert_eq!(tracker.running(), 0, "no background cleanup task may remain after drain");
+        assert_eq!(cleanup.attempted, 2);
+        assert_eq!(cleanup.reclaimed, 2, "the real old-data-dir must still be reclaimed after release");
+
+        drop((disk1, disk2));
+    }
+
+    /// Isolation guard: an armed barrier / observed object only affects its own
+    /// object. A fan-out for a different (unobserved, unarmed) object must not be
+    /// paused and must not accrue any tracked task count — so concurrent tests
+    /// using distinct object names never interfere.
+    #[tokio::test]
+    async fn barrier_and_task_tracker_isolate_by_object() {
+        const DISKS: usize = 3;
+        let bucket = "barrier-iso-bucket";
+        let observed_object = "iso-observed-object";
+        let other_object = "iso-other-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+
+        // Observe + arm one object, then run the fan-out for a *different* object.
+        let tracker = rename_fanout_barrier::observe_tasks(observed_object);
+        let _barrier = rename_fanout_barrier::arm(observed_object, 0, rename_fanout_barrier::PHASE_RENAME);
+
+        let file_infos = rename_barrier_fileinfos(other_object, DISKS);
+        // This must run to completion without ever pausing (no barrier for it) and
+        // must not touch the observed object's counter. A hang here (e.g. if the
+        // barrier ignored the object key) would surface as a timeout.
+        let _ = tokio::time::timeout(
+            BARRIER_PAUSE_GUARD,
+            SetDisks::rename_data(&disks, bucket, other_object, &file_infos, bucket, other_object, DISKS - 1),
+        )
+        .await
+        .expect("fan-out for an unarmed object must not pause");
+
+        assert_eq!(
+            tracker.running(),
+            0,
+            "another object's fan-out must not accrue tracked tasks for the observed object"
+        );
+
+        drop(dirs);
     }
 
     #[tokio::test]
