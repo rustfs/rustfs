@@ -43,6 +43,19 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
+Render extra labels for the main Service resource.
+Merges (in order of increasing precedence):
+  - commonLabels
+  - service.labels
+*/}}
+{{- define "rustfs.serviceLabels" -}}
+{{- $labels := mergeOverwrite (dict) (default (dict) .Values.commonLabels) (default (dict) .Values.service.labels) }}
+{{- if $labels }}
+{{- toYaml $labels }}
+{{- end }}
+{{- end }}
+
+{{/*
 Selector labels
 */}}
 {{- define "rustfs.selectorLabels" -}}
@@ -186,6 +199,30 @@ Expects a dict with keys "root" (the chart root context) and "index".
 {{- end }}
 
 {{/*
+Return the number of data drives (PVCs) per pod for a pool.
+When .Values.drivesPerNode is set it applies to every pool. When unset the
+value is inferred per pool from its replica count so that rendered output
+stays identical to the pre-drivesPerNode chart: 4 replicas keep the legacy
+4-drive layout, everything else (16x1 and any new topology) gets one drive.
+Expects a dict with keys "root" (the chart root context) and "replicas".
+*/}}
+{{- define "rustfs.poolDrives" -}}
+{{- if kindIs "invalid" .root.Values.drivesPerNode -}}
+{{- if eq (int .replicas) 4 -}}
+4
+{{- else -}}
+1
+{{- end -}}
+{{- else -}}
+{{- $d := int .root.Values.drivesPerNode -}}
+{{- if lt $d 1 -}}
+{{- fail "drivesPerNode must be >= 1 when set" -}}
+{{- end -}}
+{{- $d -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Return the normalized list of server pools as JSON.
 With pools disabled this is a single pool built from the top-level
 replicaCount/storageclass values, which keeps all rendered output identical
@@ -206,14 +243,16 @@ so entries must never be removed or reordered.
 {{- range $i, $p := .Values.pools.list -}}
 {{- $p = default (dict) $p -}}
 {{- $replicas := int (default $.Values.replicaCount $p.replicaCount) -}}
-{{- if and (ne $replicas 4) (ne $replicas 16) -}}
-{{- fail (printf "pools.list[%d].replicaCount must be 4 or 16, got %d" $i $replicas) -}}
+{{- if lt $replicas 2 -}}
+{{- fail (printf "pools.list[%d].replicaCount must be >= 2, got %d" $i $replicas) -}}
 {{- end -}}
 {{- $sc := mergeOverwrite (deepCopy $.Values.storageclass) (default (dict) $p.storageclass) -}}
-{{- $pools = append $pools (dict "index" $i "fullname" (include "rustfs.poolFullname" (dict "root" $ "index" $i)) "replicaCount" $replicas "storageclass" $sc) -}}
+{{- $drives := int (include "rustfs.poolDrives" (dict "root" $ "replicas" $replicas)) -}}
+{{- $pools = append $pools (dict "index" $i "fullname" (include "rustfs.poolFullname" (dict "root" $ "index" $i)) "replicaCount" $replicas "drives" $drives "storageclass" $sc) -}}
 {{- end -}}
 {{- else -}}
-{{- $pools = append $pools (dict "index" 0 "fullname" (include "rustfs.fullname" .) "replicaCount" (int .Values.replicaCount) "storageclass" .Values.storageclass) -}}
+{{- $drives := int (include "rustfs.poolDrives" (dict "root" $ "replicas" (int .Values.replicaCount))) -}}
+{{- $pools = append $pools (dict "index" 0 "fullname" (include "rustfs.fullname" .) "replicaCount" (int .Values.replicaCount) "drives" $drives "storageclass" .Values.storageclass) -}}
 {{- end -}}
 {{- toJson $pools -}}
 {{- end }}
@@ -235,9 +274,10 @@ RUSTFS_VOLUMES on spaces, one pool per expression).
 {{- $exprs := list -}}
 {{- range $pool := include "rustfs.pools" . | fromJsonArray -}}
 {{- $n := int $pool.replicaCount -}}
-{{- if eq $n 4 -}}
-{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port (sub $n 1)) -}}
-{{- else if eq $n 16 -}}
+{{- $d := int $pool.drives -}}
+{{- if gt $d 1 -}}
+{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port (sub $d 1)) -}}
+{{- else -}}
 {{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port) -}}
 {{- end -}}
 {{- end -}}

@@ -1076,7 +1076,7 @@ impl SetDisks {
             if fi.is_compressed() {
                 record_compression_total_memory(actual_size as u64, w_size as u64).await;
             }
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
+            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
 
             fi.replication_state_internal = Some(replication_state_to_filemeta(&opts.put_replication_state()));
 
@@ -1801,7 +1801,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut rollback_futures = Vec::new();
         for fi_vers in &vers {
@@ -2022,7 +2022,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
             let disks = self.disk_inventory().await;
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
             let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
             oi.replication_decision = goi.replication_decision;
@@ -2052,7 +2052,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         let disks = self.disk_inventory().await;
-        record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
@@ -2351,7 +2351,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 "transition completed on remote tier but source cleanup failed; skipping external lifecycle transition notification"
             );
         } else {
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
         }
 
         for disk in disks.iter() {

@@ -41,6 +41,12 @@ pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::
 pub struct ConcurrencyManager {
     /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
+    /// Bounded overflow lane for GETs that time out waiting on the primary
+    /// disk-read permit pool. Admitting from this lane instead of reading
+    /// without any permit gives a hard upper bound on concurrent disk-active
+    /// reads (`primary cap + degraded cap`); when it is also full a GET is
+    /// rejected with `SlowDown` rather than proceeding unbounded.
+    degraded_read_semaphore: Arc<Semaphore>,
     /// I/O load metrics for adaptive strategy calculation
     io_metrics: Arc<Mutex<IoLoadMetrics>>,
     /// I/O priority queue for request scheduling
@@ -87,6 +93,27 @@ impl std::fmt::Debug for ConcurrencyManager {
             .finish()
     }
 }
+/// Outcome of [`ConcurrencyManager::admit_disk_read`].
+///
+/// `Primary`/`Degraded` both carry an owned permit that must be held for the
+/// full body transfer; `Rejected` means the hard concurrency cap was reached and
+/// the caller must fail the GET with `SlowDown`/503 instead of reading without a
+/// permit.
+#[derive(Debug)]
+pub enum DiskReadAdmission {
+    /// Admitted from the primary disk-read permit pool.
+    Primary(tokio::sync::OwnedSemaphorePermit),
+    /// Admitted from the bounded degraded overflow lane after the primary pool
+    /// stayed saturated past the configured wait.
+    Degraded(tokio::sync::OwnedSemaphorePermit),
+    /// Disk-read throttling is disabled (primary cap configured to `0`): the GET
+    /// proceeds without an admission token. This is the only permit-less path
+    /// and is an explicit operator opt-out, not a saturation bypass.
+    Unbounded,
+    /// Hard concurrency cap reached; the caller must reject with `SlowDown`.
+    Rejected,
+}
+
 #[allow(dead_code)]
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
@@ -98,6 +125,17 @@ impl ConcurrencyManager {
         let scheduler_config = IoSchedulerConfig::from_env();
 
         let max_disk_reads = scheduler_config.max_concurrent_reads;
+
+        // Bounded degraded admission lane. A configured `0` mirrors the primary
+        // cap, so the absolute hard cap on concurrent disk-active reads defaults
+        // to twice the primary disk-read concurrency.
+        let degraded_read_cap = {
+            let configured = rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_DISK_DEGRADED_READ_CAP,
+                rustfs_config::DEFAULT_OBJECT_DISK_DEGRADED_READ_CAP,
+            );
+            if configured == 0 { max_disk_reads } else { configured }
+        };
 
         // Detect storage media
         let storage_media =
@@ -129,6 +167,7 @@ impl ConcurrencyManager {
 
         Self {
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
+            degraded_read_semaphore: Arc::new(Semaphore::new(degraded_read_cap)),
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(scheduler_config.load_sample_window))),
             priority_queue: Arc::new(IoPriorityQueue::new(queue_config)),
             bytes_pool: Arc::new(BytesPool::new_tiered()),
@@ -138,6 +177,20 @@ impl ConcurrencyManager {
             bandwidth_monitor,
             metrics_collector,
         }
+    }
+
+    /// Build a manager with explicit disk-read admission caps for tests.
+    ///
+    /// Overrides only the primary/degraded semaphores and the snapshot cap so
+    /// admission behavior can be exercised deterministically under a paused
+    /// virtual clock, without depending on process-wide environment variables.
+    #[cfg(test)]
+    pub(crate) fn with_disk_read_caps_for_test(primary: usize, degraded: usize) -> Self {
+        let mut manager = Self::new();
+        manager.disk_read_semaphore = Arc::new(Semaphore::new(primary));
+        manager.degraded_read_semaphore = Arc::new(Semaphore::new(degraded));
+        manager.scheduler_config.max_concurrent_reads = primary;
+        manager
     }
 
     /// Track a GetObject request
@@ -175,6 +228,54 @@ impl ConcurrencyManager {
     /// response body streams that continue after the S3 handler returns.
     pub async fn acquire_owned_disk_read_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.disk_read_semaphore.clone().acquire_owned().await
+    }
+
+    /// Admit a GET disk read under a hard concurrency cap.
+    ///
+    /// The permit is held for the whole response body transfer, so this is the
+    /// single admission boundary that bounds concurrent disk-active reads:
+    ///
+    /// - `primary_wait == 0` waits on the primary permit pool indefinitely and
+    ///   always yields a [`DiskReadAdmission::Primary`] permit (no degrade, no
+    ///   reject); this preserves the "wait forever" opt-out.
+    /// - Otherwise it waits up to `primary_wait` for a primary permit. On
+    ///   timeout it takes one permit from the bounded degraded overflow lane
+    ///   without blocking. If that lane is also full the request is
+    ///   [`DiskReadAdmission::Rejected`] — it must surface as `SlowDown`/503
+    ///   rather than reading without any admission token.
+    ///
+    /// Total GETs holding a permit therefore never exceed
+    /// `primary_cap + degraded_cap`.
+    pub async fn admit_disk_read(&self, primary_wait: Duration) -> Result<DiskReadAdmission, tokio::sync::AcquireError> {
+        // Primary cap of 0 means disk-read throttling is disabled (matches the
+        // `AdmissionState::Disabled` snapshot semantics). Serve without an
+        // admission token rather than rejecting every GET; this preserves the
+        // pre-existing "permits disabled" behavior and is the only permit-less
+        // path.
+        if self.scheduler_config.max_concurrent_reads == 0 {
+            return Ok(DiskReadAdmission::Unbounded);
+        }
+
+        if primary_wait.is_zero() {
+            let permit = self.disk_read_semaphore.clone().acquire_owned().await?;
+            return Ok(DiskReadAdmission::Primary(permit));
+        }
+
+        match tokio::time::timeout(primary_wait, self.disk_read_semaphore.clone().acquire_owned()).await {
+            Ok(permit) => Ok(DiskReadAdmission::Primary(permit?)),
+            Err(_) => {
+                // Primary pool saturated within the wait window. Do not read
+                // without a permit; fall through to the bounded degraded lane,
+                // and reject once the hard cap is reached.
+                match self.degraded_read_semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => Ok(DiskReadAdmission::Degraded(permit)),
+                    // NoPermits => hard cap reached; Closed never happens for a
+                    // semaphore we never close. Either way, reject rather than
+                    // bypass admission.
+                    Err(_) => Ok(DiskReadAdmission::Rejected),
+                }
+            }
+        }
     }
 
     // ============================================
@@ -1034,5 +1135,152 @@ mod integration_tests {
 
         assert_eq!(small_file_strategy.priority, IoPriority::High);
         assert_eq!(large_file_strategy.priority, IoPriority::Low);
+    }
+
+    // ============================================
+    // Bounded disk-read admission (backlog#1317)
+    // ============================================
+
+    use super::DiskReadAdmission;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Primary pool saturation degrades into the bounded lane, and the hard cap
+    /// rejects with `Rejected` instead of admitting a permit-less read. Dropping
+    /// a permit frees the token so the next admission succeeds again.
+    #[tokio::test(start_paused = true)]
+    async fn test_admit_disk_read_degrades_then_hard_rejects() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+
+        // Primary permit granted immediately.
+        let primary = match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("expected primary admission, got {other:?}"),
+        };
+
+        // Primary pool saturated: next admission waits out the primary timeout
+        // and falls through to the bounded degraded lane.
+        let degraded = match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Degraded(permit) => permit,
+            other => panic!("expected degraded admission, got {other:?}"),
+        };
+
+        // Both lanes full: hard cap reached, must reject rather than bypass.
+        match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Rejected => {}
+            other => panic!("expected hard rejection, got {other:?}"),
+        }
+
+        // Releasing the degraded permit re-opens exactly one degraded slot.
+        drop(degraded);
+        match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Degraded(_permit) => {}
+            other => panic!("expected degraded admission after release, got {other:?}"),
+        }
+
+        // Releasing the primary permit re-opens the primary lane immediately
+        // (no timeout wait), proving EOF/drop returns the token.
+        drop(primary);
+        match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Primary(_permit) => {}
+            other => panic!("expected primary admission after release, got {other:?}"),
+        }
+    }
+
+    /// With max primary = 1 and degraded = 1, 100 concurrent GETs never hold
+    /// more than `1 + 1` admission tokens simultaneously. Reverting the hard cap
+    /// (unbounded bypass) would let this exceed 2 and fail the test.
+    #[tokio::test(start_paused = true)]
+    async fn test_admit_disk_read_hard_caps_concurrent_admissions() {
+        let manager = std::sync::Arc::new(ConcurrencyManager::with_disk_read_caps_for_test(1, 1));
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let admitted = std::sync::Arc::new(AtomicUsize::new(0));
+        let rejected = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let manager = manager.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            let admitted = admitted.clone();
+            let rejected = rejected.clone();
+            handles.push(tokio::spawn(async move {
+                match manager.admit_disk_read(Duration::from_millis(50)).await.unwrap() {
+                    DiskReadAdmission::Primary(permit) | DiskReadAdmission::Degraded(permit) => {
+                        let current = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        max_in_flight.fetch_max(current, AtomicOrdering::SeqCst);
+                        admitted.fetch_add(1, AtomicOrdering::SeqCst);
+                        // Hold the admission token across an await point, as the
+                        // real body transfer does, then release it.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                        drop(permit);
+                    }
+                    DiskReadAdmission::Rejected => {
+                        rejected.fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    DiskReadAdmission::Unbounded => {
+                        unreachable!("throttling is enabled (primary cap = 1) in this test");
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // The invariant the hard cap guarantees: never more than
+        // primary + degraded = 2 GETs admitted at once.
+        assert!(
+            max_in_flight.load(AtomicOrdering::SeqCst) <= 2,
+            "max concurrent admissions {} exceeded the hard cap of 2",
+            max_in_flight.load(AtomicOrdering::SeqCst)
+        );
+        // Every request is accounted for: admitted or explicitly rejected, never
+        // a permit-less bypass.
+        assert_eq!(admitted.load(AtomicOrdering::SeqCst) + rejected.load(AtomicOrdering::SeqCst), 100);
+        assert!(
+            rejected.load(AtomicOrdering::SeqCst) > 0,
+            "expected some hard rejections under saturation"
+        );
+    }
+
+    /// A primary cap of 0 (throttling disabled) serves every GET without an
+    /// admission token instead of rejecting them, preserving the pre-existing
+    /// "disk read permits disabled" behavior.
+    #[tokio::test(start_paused = true)]
+    async fn test_admit_disk_read_disabled_cap_is_unbounded() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(0, 0);
+        for _ in 0..10 {
+            match manager.admit_disk_read(Duration::from_millis(50)).await.unwrap() {
+                DiskReadAdmission::Unbounded => {}
+                other => panic!("expected unbounded admission when throttling disabled, got {other:?}"),
+            }
+        }
+    }
+
+    /// `primary_wait == 0` preserves the wait-forever opt-out: it always yields
+    /// a primary permit and never degrades or rejects.
+    #[tokio::test]
+    async fn test_admit_disk_read_zero_wait_waits_on_primary() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+        let held = match manager.admit_disk_read(Duration::ZERO).await.unwrap() {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("expected primary admission, got {other:?}"),
+        };
+
+        // A second zero-wait admission blocks on the primary pool rather than
+        // degrading; it completes only once the first permit is released.
+        let manager2 = manager.clone();
+        let waiter = tokio::spawn(async move { manager2.admit_disk_read(Duration::ZERO).await.unwrap() });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "zero-wait admission must block on the primary lane");
+
+        drop(held);
+        match waiter.await.unwrap() {
+            DiskReadAdmission::Primary(_permit) => {}
+            other => panic!("expected primary admission after release, got {other:?}"),
+        }
     }
 }

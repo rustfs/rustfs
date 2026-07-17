@@ -39,8 +39,8 @@ metadata:
   {{- end }}
   labels:
     {{- include "rustfs.labels" . | nindent 4 }}
-    {{- with .Values.commonLabels }}
-    {{- toYaml . | nindent 4 }}
+    {{- with (include "rustfs.serviceLabels" .) }}
+    {{- . | nindent 4 }}
     {{- end }}
 spec:
   {{- if eq $serviceType "ClusterIP" }}
@@ -63,6 +63,10 @@ spec:
   loadBalancerSourceRanges:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- end }}
+  {{- with .Values.service.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
   ports:
     - name: endpoint

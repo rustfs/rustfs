@@ -39,7 +39,7 @@ use super::storage_api::object_usecase::bucket::{
         objectlock_sys::{check_object_lock_for_deletion, is_retention_active},
     },
     predict_lifecycle_expiration,
-    quota::QuotaOperation,
+    quota::{QuotaCheckResult, QuotaError, QuotaOperation},
     replication::{
         REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType, check_replicate_delete,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
@@ -53,8 +53,8 @@ use super::storage_api::object_usecase::bucket::{
 };
 use super::storage_api::object_usecase::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::object_usecase::concurrency::{
-    self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
-    get_put_concurrency_aware_buffer_size,
+    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size,
+    get_concurrency_manager, get_put_concurrency_aware_buffer_size,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
@@ -133,13 +133,13 @@ use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
     headers::{
-        AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS, AMZ_MINIO_SNOWBALL_PREFIX,
-        AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_MODE_LOWER,
-        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS,
-        AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS, AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX,
-        AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
-        AMZ_SNOWBALL_EXTRACT, AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS,
-        AMZ_TAG_COUNT,
+        AMZ_CONTENT_SHA256, AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
+        AMZ_MINIO_SNOWBALL_PREFIX, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
+        AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE, AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS,
+        AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS, AMZ_RUSTFS_SNOWBALL_PREFIX, AMZ_SERVER_SIDE_ENCRYPTION,
+        AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_SNOWBALL_EXTRACT,
+        AMZ_SNOWBALL_IGNORE_DIRS, AMZ_SNOWBALL_IGNORE_ERRORS, AMZ_SNOWBALL_PREFIX, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
     },
     insert_str, remove_str,
 };
@@ -251,6 +251,115 @@ fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i
     match atoi::atoi::<i64>(val.as_bytes()) {
         Some(x) => Ok(Some(x)),
         None => Err(s3_error!(UnexpectedContent)),
+    }
+}
+
+/// Losslessly convert an s3s [`Range`] into the internal [`HTTPRangeSpec`].
+///
+/// Shared by GET and HEAD so both apply identical range semantics. s3s parses
+/// `first`/`last` as `u64`, but its own parser already rejects any value greater
+/// than `i64::MAX`, so the int branch is a checked cast that never truncates.
+///
+/// The suffix length, however, is an unchecked `u64`. A naive `length as i64`
+/// truncates deterministically: `bytes=-18446744073709551615` wraps to `-1` and
+/// is then read as "last 1 byte", and `bytes=-0` yields a 0-length 206 instead
+/// of a 416. This function instead mirrors s3s [`Range::check`] semantics:
+///   * a zero-length suffix is rejected with `InvalidRange` (416), matching AWS
+///     S3 and MinIO;
+///   * a suffix larger than `i64::MAX` is clamped to `i64::MAX`. Object sizes in
+///     this system are bounded by `i64::MAX`, so such a suffix always covers the
+///     whole object, and [`HTTPRangeSpec::get_length`] clamps it to the real
+///     size once the object is known.
+fn range_to_http_range_spec(range: Range) -> S3Result<HTTPRangeSpec> {
+    match range {
+        Range::Int { first, last } => {
+            let start = i64::try_from(first).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
+            let end = match last {
+                Some(last) => {
+                    i64::try_from(last).map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?
+                }
+                None => -1,
+            };
+            Ok(HTTPRangeSpec {
+                is_suffix_length: false,
+                start,
+                end,
+            })
+        }
+        Range::Suffix { length } => {
+            if length == 0 {
+                return Err(s3_error!(InvalidRange, "The requested range is not satisfiable"));
+            }
+            // Clamp to i64::MAX: any suffix >= object size returns the whole
+            // object, and object sizes never exceed i64::MAX.
+            let start = i64::try_from(length).unwrap_or(i64::MAX);
+            Ok(HTTPRangeSpec {
+                is_suffix_length: true,
+                start,
+                end: -1,
+            })
+        }
+    }
+}
+
+/// Resolve the authoritative object length that bucket-quota admission (and downstream sizing) must use.
+///
+/// `Content-Encoding: aws-chunked` alone only *declares* the encoding; whether the body actually arrived chunk-framed is signalled by a `STREAMING-*` `x-amz-content-sha256`, and the S3 auth layer both requires `x-amz-decoded-content-length` for those requests and hands the body down already de-framed. So when a decoded length is present it is authoritative (the wire `Content-Length` counts chunk framing and would overcount); a framed body without a decoded length is rejected rather than falling back to the framed wire length. A declared-only aws-chunked request (issue #1857 clients) carries an unframed body, so its wire `Content-Length` is the authoritative size, exactly as for a plain PUT. A negative or otherwise unknown length is rejected so it can never be reinterpreted as an enormous unsigned size downstream.
+fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Option<i64>) -> S3Result<i64> {
+    let decoded_content_length = decoded_content_length_from_headers(headers)?;
+    let aws_chunked = request_uses_aws_chunked(headers) || request_body_is_aws_chunked_framed(headers);
+    let size = match (aws_chunked, decoded_content_length, content_length) {
+        (true, Some(decoded), _) => decoded,
+        // Declared aws-chunked without a streaming payload: the body is not framed (the auth
+        // layer only de-frames STREAMING-* payloads, which always carry a decoded length), so
+        // the wire Content-Length is the real object size.
+        (true, None, Some(raw)) if !request_body_is_aws_chunked_framed(headers) => raw,
+        (true, None, _) => return Err(s3_error!(UnexpectedContent)),
+        (false, _, Some(raw)) => raw,
+        (false, Some(decoded), None) => decoded,
+        (false, None, None) => return Err(s3_error!(UnexpectedContent)),
+    };
+
+    if size < 0 {
+        return Err(s3_error!(UnexpectedContent));
+    }
+
+    Ok(size)
+}
+
+/// True when the request body actually arrived chunk-framed on the wire, i.e. the payload was
+/// signed as a SigV4 streaming upload (`x-amz-content-sha256: STREAMING-*`). This is the only
+/// case in which the auth layer de-frames the body; `Content-Encoding: aws-chunked` without a
+/// streaming payload is just a declared encoding over an unframed body.
+fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
+    headers
+        .get(AMZ_CONTENT_SHA256)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.len() >= 10 && value[..10].eq_ignore_ascii_case("STREAMING-"))
+}
+
+/// Map a bucket-quota checker outcome onto the S3 admission result.
+///
+/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
+fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<()> {
+    match outcome {
+        Ok(result) if !result.allowed => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!(
+                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
+                result.current_usage.unwrap_or(0),
+                result.quota_limit.unwrap_or(0)
+            ),
+        )),
+        Err(e) => {
+            counter!("rustfs_bucket_quota_check_failed_total").increment(1);
+            warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check failed closed");
+            Err(S3Error::with_message(
+                S3ErrorCode::ServiceUnavailable,
+                "Bucket quota check temporarily unavailable, please retry".to_string(),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -520,6 +629,11 @@ struct MemoryTrackedBytesStream {
     emitted: bool,
     completed: bool,
     expected: usize,
+    /// Set when the materialized buffer length disagrees with the declared
+    /// content length. Such a body would be truncated (short) or over-long
+    /// relative to the already-committed `Content-Length`, so the stream must
+    /// surface an error instead of a clean short/over-long body. See #1324.
+    length_mismatch: bool,
     started: std::time::Instant,
     source: &'static str,
     _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
@@ -618,11 +732,13 @@ impl MemoryTrackedBytesStream {
         guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
         lifecycle: GetObjectBodyLifecycle,
     ) -> Self {
+        let length_mismatch = bytes.len() != expected;
         Self {
             bytes,
             emitted: false,
-            completed: expected == 0,
+            completed: !length_mismatch && expected == 0,
             expected,
+            length_mismatch,
             started: std::time::Instant::now(),
             source,
             _guard: guard,
@@ -677,6 +793,26 @@ impl futures::Stream for MemoryTrackedBytesStream {
             return Poll::Ready(None);
         }
 
+        // Strict materialization guard (#1324): a body whose length disagrees
+        // with the declared content length must fail the transfer rather than be
+        // delivered as a clean short body (truncation) or an over-long body
+        // (protocol violation). The HTTP layer has already committed to
+        // `Content-Length == expected`, so there is no safe way to serve a
+        // differently sized body. This is a defense-in-depth backstop; the
+        // buffered/cache callers reject the mismatch before headers are sent.
+        if this.length_mismatch {
+            this.emitted = true;
+            this.finish_err();
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "materialized GET body length mismatch: expected {}, got {}",
+                    this.expected,
+                    this.bytes.len()
+                ),
+            ))));
+        }
+
         let first_byte_elapsed = (!this.bytes.is_empty()).then(|| this.started.elapsed());
         this.emitted = true;
         if let Some(elapsed) = first_byte_elapsed {
@@ -708,6 +844,96 @@ impl Drop for MemoryTrackedBytesStream {
         } else {
             self.finish_err();
         }
+    }
+}
+
+/// Failure modes of strictly materializing an object body into memory (#1324).
+#[derive(Debug)]
+enum StrictMaterializeError {
+    /// The reader produced a different number of bytes than the declared content
+    /// length (short or over-long). The response has already committed to
+    /// `Content-Length == expected`, so any other length is an unrecoverable,
+    /// broken HTTP response and must fail before headers are sent.
+    LengthMismatch { expected: usize, actual: usize },
+    /// A read error occurred after `consumed` bytes were already drained from the
+    /// reader. The caller MUST NOT fall back to streaming the same reader: the
+    /// drained prefix is gone, so streaming would ship a body missing its prefix
+    /// (the seek-buffer prefix-misalignment bug this issue closes).
+    Read { consumed: usize, source: std::io::Error },
+}
+
+impl std::fmt::Display for StrictMaterializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LengthMismatch { expected, actual } => {
+                write!(f, "materialized length mismatch: expected {expected}, got {actual}")
+            }
+            Self::Read { consumed, source } => {
+                write!(f, "read failed after {consumed} bytes: {source}")
+            }
+        }
+    }
+}
+
+impl StrictMaterializeError {
+    fn into_s3_error(self, response_content_length: i64) -> S3Error {
+        match self {
+            Self::LengthMismatch { expected, actual } => ApiError::from(StorageError::other(format!(
+                "GET object materialized length mismatch: declared content length {response_content_length}, expected {expected}, got {actual}"
+            )))
+            .into(),
+            Self::Read { consumed, source } => ApiError::from(StorageError::other(format!(
+                "Failed to read object body into memory after {consumed} bytes: {source}"
+            )))
+            .into(),
+        }
+    }
+}
+
+/// Strictly materialize an object body into memory, enforcing an exact-length
+/// contract (#1324).
+///
+/// Reads at most `expected + 1` bytes so an over-long stream is detected without
+/// buffering it unbounded, then requires `bytes_read == expected`. A short read
+/// (clean EOF before `expected`), an over-long read, or a mid-stream read error
+/// all return an error; only an exact-length read yields the buffer. Because the
+/// HTTP response commits to `Content-Length == expected` before the body is
+/// produced, this mirrors the streaming path (which already fails a short read
+/// with `UnexpectedEof`) and the ODC materialize-fill path, closing the
+/// warn-and-serve holes in the encrypted, seek, and cache memory branches.
+///
+/// On error the reader has already been (partially) consumed, so callers must
+/// propagate the error rather than fall back to streaming the same reader.
+async fn strict_materialize_object_body<R>(
+    reader: R,
+    expected: usize,
+    stage: &'static str,
+) -> Result<Vec<u8>, StrictMaterializeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(expected);
+    // Read one byte past the declared length so an over-long stream is detected
+    // rather than silently truncated to `Content-Length`.
+    let mut bounded = tokio::io::AsyncReadExt::take(reader, expected as u64 + 1);
+    let read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+    let read_result = tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut buf).await;
+    record_get_object_s3_handler_stage_duration(stage, read_start);
+    match read_result {
+        Ok(_) => {
+            if buf.len() == expected {
+                Ok(buf)
+            } else {
+                Err(StrictMaterializeError::LengthMismatch {
+                    expected,
+                    actual: buf.len(),
+                })
+            }
+        }
+        Err(source) => Err(StrictMaterializeError::Read {
+            consumed: buf.len(),
+            source,
+        }),
     }
 }
 
@@ -2500,21 +2726,7 @@ impl DefaultObjectUsecase {
             return Ok(());
         };
         let quota_checker = QuotaChecker::new(metadata_sys);
-        match quota_checker.check_quota(bucket, op, size).await {
-            Ok(result) if !result.allowed => Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!(
-                    "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                    result.current_usage.unwrap_or(0),
-                    result.quota_limit.unwrap_or(0)
-                ),
-            )),
-            Err(e) => {
-                warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check degraded to allow");
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await)
     }
 
     fn build_memory_bytes_blob(
@@ -2675,29 +2887,44 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectIoPlanning> {
         let permit_wait_start = std::time::Instant::now();
         let permit_wait_timeout = Self::disk_permit_wait_timeout();
-        // Permits are held for the whole body transfer, so slow clients can
-        // pin all of them while disks are idle. Bound the wait and degrade to
-        // a permit-less read instead of stalling into the request timeout.
-        let disk_permit = if permit_wait_timeout.is_zero() {
-            Some(
-                manager
-                    .acquire_owned_disk_read_permit()
-                    .await
-                    .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?,
-            )
-        } else {
-            match tokio::time::timeout(permit_wait_timeout, manager.acquire_owned_disk_read_permit()).await {
-                Ok(permit) => Some(permit.map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?),
-                Err(_) => {
-                    metrics::counter!("rustfs.get_object.disk_permit.bypass.total").increment(1);
-                    warn!(
-                        bucket = %bucket,
-                        key = %key,
-                        wait_ms = permit_wait_start.elapsed().as_millis() as u64,
-                        "GetObject proceeding without disk read permit after bounded wait"
-                    );
-                    None
-                }
+        // Permits are held for the whole body transfer, so slow clients can pin
+        // all of them while disks are idle. Bound the wait on the primary pool
+        // and, on timeout, admit from a bounded degraded overflow lane. Total
+        // concurrent disk-active GETs are hard-capped at
+        // `primary_cap + degraded_cap`; once that cap is reached we reject with
+        // `SlowDown` instead of reading without any admission token. Never
+        // proceed permit-less.
+        let disk_permit = match manager
+            .admit_disk_read(permit_wait_timeout)
+            .await
+            .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?
+        {
+            DiskReadAdmission::Primary(permit) => Some(permit),
+            // Throttling disabled by config (primary cap 0): proceed without an
+            // admission token. Not a saturation bypass.
+            DiskReadAdmission::Unbounded => None,
+            DiskReadAdmission::Degraded(permit) => {
+                metrics::counter!("rustfs.get_object.disk_permit.degraded.total").increment(1);
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    wait_ms = permit_wait_start.elapsed().as_millis() as u64,
+                    "GetObject admitted into bounded degraded disk-read lane after primary pool saturation"
+                );
+                Some(permit)
+            }
+            DiskReadAdmission::Rejected => {
+                metrics::counter!("rustfs.get_object.disk_permit.hard_reject.total").increment(1);
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    wait_ms = permit_wait_start.elapsed().as_millis() as u64,
+                    "GetObject rejected: disk-read hard concurrency cap reached"
+                );
+                return Err(s3_error!(
+                    SlowDown,
+                    "disk read concurrency limit reached, please reduce your request rate"
+                ));
             }
         };
         let permit_wait_duration = permit_wait_start.elapsed();
@@ -2758,18 +2985,7 @@ impl DefaultObjectUsecase {
 
         let part_number = parse_part_number_i32_to_usize(part_number, "GET")?;
 
-        let rs = range.map(|v| match v {
-            Range::Int { first, last } => HTTPRangeSpec {
-                is_suffix_length: false,
-                start: first as i64,
-                end: if let Some(last) = last { last as i64 } else { -1 },
-            },
-            Range::Suffix { length } => HTTPRangeSpec {
-                is_suffix_length: true,
-                start: length as i64,
-                end: -1,
-            },
-        });
+        let rs = range.map(range_to_http_range_spec).transpose()?;
 
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
@@ -3128,7 +3344,7 @@ impl DefaultObjectUsecase {
     }
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body<R>(
-        mut final_stream: R,
+        final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
@@ -3150,30 +3366,25 @@ impl DefaultObjectUsecase {
                 should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range, concurrent_requests);
 
             if should_buffer_encrypted_object {
-                let mut buf = Vec::with_capacity(response_content_length as usize);
-                let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-                let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
-                record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ, buffer_read_start);
-                if let Err(e) = read_result {
-                    lifecycle.finish_err();
-                    error!(error = %e, "GetObject decrypted object buffering failed");
-                    return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
+                // Strict materialization (#1324): a decrypted body that is shorter
+                // or longer than the declared content length must hard-fail before
+                // headers, not warn-and-serve a truncated/over-long body.
+                let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+                match strict_materialize_object_body(final_stream, expected, GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ).await {
+                    Ok(buf) => {
+                        return Ok(Self::build_memory_blob(
+                            buf,
+                            response_content_length,
+                            GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
+                            lifecycle,
+                        ));
+                    }
+                    Err(e) => {
+                        lifecycle.finish_err();
+                        error!(error = %e, "GetObject decrypted object strict materialization failed");
+                        return Err(e.into_s3_error(response_content_length));
+                    }
                 }
-
-                if buf.len() != response_content_length as usize {
-                    warn!(
-                        expected = response_content_length,
-                        actual = buf.len(),
-                        "Encrypted object size mismatch during read"
-                    );
-                }
-
-                return Ok(Self::build_memory_blob(
-                    buf,
-                    response_content_length,
-                    GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
-                    lifecycle,
-                ));
             }
 
             debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
@@ -3193,12 +3404,23 @@ impl DefaultObjectUsecase {
         }
 
         if let Some(buffered_body) = buffered_body {
-            if buffered_body.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
-                warn!(
+            // Strict materialization (#1324): the buffered body is the exact
+            // response payload; a length disagreement means an upstream/cache bug
+            // and must hard-fail before headers rather than serve a body that does
+            // not match its committed Content-Length.
+            let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+            if buffered_body.len() != expected {
+                lifecycle.finish_err();
+                error!(
                     expected = response_content_length,
                     actual = buffered_body.len(),
-                    "Buffered GetObject body size mismatch"
+                    "Buffered GetObject body length mismatch"
                 );
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Buffered GetObject body length mismatch: expected {response_content_length}, got {}",
+                    buffered_body.len()
+                )))
+                .into());
             }
 
             return Ok(Self::build_memory_bytes_blob(
@@ -3213,20 +3435,16 @@ impl DefaultObjectUsecase {
             should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range, concurrent_requests);
 
         if should_provide_seek_support {
-            let mut buf = Vec::with_capacity(response_content_length as usize);
-            let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
-            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ, buffer_read_start);
-            match read_result {
-                Ok(_) => {
-                    if buf.len() != response_content_length as usize {
-                        warn!(
-                            expected = response_content_length,
-                            actual = buf.len(),
-                            "Object size mismatch during seek-support read"
-                        );
-                    }
-
+            // Strict materialization (#1324): the previous implementation only
+            // logged a warning on a length mismatch, and — most dangerously — on a read
+            // error it fell through to streaming the *same* reader after
+            // `read_to_end` had already drained K bytes, shipping a body missing
+            // its prefix (prefix-misaligned data). Both are now hard errors: an
+            // exact-length read is required, and any read error returns without
+            // reusing the partially consumed reader.
+            let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+            match strict_materialize_object_body(final_stream, expected, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await {
+                Ok(buf) => {
                     return Ok(Self::build_memory_blob(
                         buf,
                         response_content_length,
@@ -3235,7 +3453,12 @@ impl DefaultObjectUsecase {
                     ));
                 }
                 Err(e) => {
-                    error!(error = %e, "GetObject seek-support buffering failed");
+                    lifecycle.finish_err();
+                    error!(
+                        error = %e,
+                        "GetObject seek-support strict materialization failed; refusing to reuse the partially consumed reader"
+                    );
+                    return Err(e.into_s3_error(response_content_length));
                 }
             }
         }
@@ -3377,35 +3600,19 @@ impl DefaultObjectUsecase {
                 )
                 .await;
             };
-            let mut buf = Vec::with_capacity(materialized_capacity);
-            // ODC-07: bound the read so a stream yielding more than the declared
-            // length cannot grow `buf` past the in-memory GET threshold. Reading
-            // one byte past the capacity is enough to detect an over-long stream.
-            let mut bounded_stream = tokio::io::AsyncReadExt::take(final_stream, materialized_capacity as u64 + 1);
-            let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut bounded_stream, &mut buf).await;
-            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ, buffer_read_start);
-
-            match read_result {
-                Ok(_) => {
-                    // ODC-07: treat a length mismatch as a hard error, matching
-                    // the direct-memory GET path. Serving a body whose decoded
-                    // length disagrees with the declared content length would
-                    // ship a truncated or over-long response.
-                    if buf.len() != materialized_capacity {
-                        lifecycle.finish_err();
-                        error!(
-                            expected = response_content_length,
-                            actual = buf.len(),
-                            "materialize-fill GET decoded length mismatch"
-                        );
-                        return Err(ApiError::from(StorageError::other(format!(
-                            "materialize-fill GET decoded length mismatch: expected {response_content_length}, got {}",
-                            buf.len()
-                        )))
-                        .into());
-                    }
-
+            // ODC-07 / #1324: share the strict exact-length materialization gate
+            // with the encrypted and seek memory branches. The helper bounds the
+            // read to `capacity + 1` (so an over-long stream is detected without
+            // buffering it unbounded), rejects short and over-long reads, and on a
+            // partial-read error refuses to reuse the consumed reader.
+            match strict_materialize_object_body(
+                final_stream,
+                materialized_capacity,
+                GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ,
+            )
+            .await
+            {
+                Ok(buf) => {
                     let bytes = Bytes::from(buf);
                     // ODC-15: fill off the response's critical path (see the
                     // buffered-body branch above).
@@ -3425,14 +3632,12 @@ impl DefaultObjectUsecase {
                 }
                 Err(e) => {
                     lifecycle.finish_err();
-                    error!(error = %e, "GetObject materialize-fill buffering failed");
-                    // The stream is partially consumed; falling back to the
-                    // streaming path would send a body missing its prefix, so
-                    // fail the request like the encrypted-buffer path does.
-                    return Err(ApiError::from(StorageError::other(format!(
-                        "Failed to read object body for cache materialization: {e}"
-                    )))
-                    .into());
+                    error!(error = %e, "GetObject materialize-fill strict materialization failed");
+                    // A short/over-long body would ship a truncated or over-long
+                    // response; a partial-read error leaves the stream consumed so
+                    // falling back to streaming would send a prefix-misaligned
+                    // body. Both fail the request.
+                    return Err(e.into_s3_error(response_content_length));
                 }
             }
         }
@@ -3536,10 +3741,6 @@ impl DefaultObjectUsecase {
             req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
 
-        if let Some(size) = content_length {
-            self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
-        }
-
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         // Guard against a proxy/CDN that forwards a partial body then goes silent
@@ -3554,17 +3755,11 @@ impl DefaultObjectUsecase {
             guard_put_object_body_read_timeout(body, &bucket, &key, &request_id, content_length, put_object_body_read_timeout())
         };
 
-        let decoded_content_length = decoded_content_length_from_headers(&req.headers)?;
-        let mut size = match (request_uses_aws_chunked(&req.headers), decoded_content_length, content_length) {
-            (true, Some(decoded), _) => decoded,
-            (_, _, Some(c)) => c,
-            (_, Some(decoded), None) => decoded,
-            _ => return Err(s3_error!(UnexpectedContent)),
-        };
+        // Resolve the authoritative decoded/plain object length (rejecting negative/unknown) before anything else consumes it.
+        let mut size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
 
-        if size == -1 {
-            return Err(s3_error!(UnexpectedContent));
-        }
+        // Bucket-quota admission runs exactly once, and only now that the authoritative object length is known. `size` is the same basis the settle phase records via ObjectInfo.size (actual, pre-compression/pre-encryption logical size), NOT the aws-chunked wire Content-Length. When no quota is configured this stays a zero-extra-I/O fast path; once a hard quota is set, checker/config/usage faults fail closed with a retryable error.
+        self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
 
         let ingress_stage_start = std::time::Instant::now();
         let should_compress = is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
@@ -3890,6 +4085,11 @@ impl DefaultObjectUsecase {
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
 
+        // Compute the replication decision exactly once per PUT. The same
+        // immutable `dsc` drives both the pending metadata written below and the
+        // post-commit schedule (see the reuse site further down), so a
+        // replication-config hot update can no longer split the two phases
+        // (https://github.com/rustfs/backlog/issues/1320).
         let dsc =
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
                 .await;
@@ -4029,9 +4229,15 @@ impl DefaultObjectUsecase {
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
-        let dsc = must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts).await;
         let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
 
+        // Reuse the single replication decision computed before commit (see `dsc`
+        // above) so the pending metadata persisted with the object and the
+        // post-commit schedule always derive from the same immutable decision.
+        // Recomputing here would repeat the versioning/config/target traversal and,
+        // worse, allow a replication-config hot update between the two phases to
+        // produce a pending-without-schedule or schedule-without-pending divergence
+        // (https://github.com/rustfs/backlog/issues/1320).
         if dsc.replicate_any() {
             schedule_object_replication(obj_info.clone(), store, dsc).await;
         }
@@ -5842,18 +6048,7 @@ impl DefaultObjectUsecase {
         // Parse part number from Option<i32> to Option<usize> with validation
         let part_number: Option<usize> = parse_part_number_i32_to_usize(part_number, "HEAD")?;
 
-        let rs = range.map(|v| match v {
-            Range::Int { first, last } => HTTPRangeSpec {
-                is_suffix_length: false,
-                start: first as i64,
-                end: if let Some(last) = last { last as i64 } else { -1 },
-            },
-            Range::Suffix { length } => HTTPRangeSpec {
-                is_suffix_length: true,
-                start: length as i64,
-                end: -1,
-            },
-        });
+        let rs = range.map(range_to_http_range_spec).transpose()?;
 
         if rs.is_some() && part_number.is_some() {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
@@ -6457,7 +6652,7 @@ impl DefaultObjectUsecase {
                 }
             }
         };
-        if size == -1 {
+        if size < 0 {
             return Err(s3_error!(UnexpectedContent));
         }
         validate_object_key(&key, "PUT")?;
@@ -7460,6 +7655,130 @@ mod tests {
         }
     }
 
+    // Emits `fail_after` bytes from `data`, then returns a hard read error. Used
+    // to inject the "read K bytes then Err" partial-read case (#1324).
+    struct ErrAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        fail_after: usize,
+        emitted: usize,
+    }
+
+    impl AsyncRead for ErrAfterReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.emitted >= self.fail_after {
+                return Poll::Ready(Err(std::io::Error::other("injected mid-stream read error")));
+            }
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let want = (self.fail_after - self.emitted).min(remaining);
+            let position = usize::try_from(self.data.position()).unwrap_or(usize::MAX);
+            let source = self.data.get_ref();
+            let end = position.saturating_add(want).min(source.len());
+            if end <= position {
+                return Poll::Ready(Err(std::io::Error::other("injected mid-stream read error")));
+            }
+            let chunk_len = end - position;
+            buf.put_slice(&source[position..end]);
+            self.data.set_position(u64::try_from(end).unwrap_or(u64::MAX));
+            self.emitted += chunk_len;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn cursor_reader(bytes: &[u8]) -> std::io::Cursor<Vec<u8>> {
+        std::io::Cursor::new(bytes.to_vec())
+    }
+
+    // #1324: the strict materialization helper is the shared exact-length gate
+    // for the encrypted, seek, and cache memory branches. For a declared length N
+    // only an exact N-byte read succeeds; a short read (N-1), an over-long read
+    // (N+1), and a mid-stream read error all hard-fail. This is the reversal
+    // guard for every one of those sources at once: restoring WARN-and-serve or a
+    // partial fallback would flip the short/over-long/error assertions to Ok.
+    #[tokio::test]
+    async fn strict_materialize_object_body_requires_exact_length() {
+        // Exact length: the only accepted outcome.
+        let buf = strict_materialize_object_body(cursor_reader(b"hello"), 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ)
+            .await
+            .expect("exact-length read must materialize");
+        assert_eq!(buf, b"hello");
+
+        // Short read (actual = expected - 1): a clean EOF before the declared
+        // length must be a hard error, never a truncated served body.
+        let short = strict_materialize_object_body(cursor_reader(b"hell"), 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await;
+        assert!(
+            matches!(short, Err(StrictMaterializeError::LengthMismatch { expected: 5, actual: 4 })),
+            "short read must fail with a length mismatch, got {short:?}",
+            short = short.as_ref().map(|b| b.len())
+        );
+
+        // Over-long read (actual = expected + 1): must fail rather than silently
+        // truncate to the committed Content-Length.
+        let long = strict_materialize_object_body(cursor_reader(b"hello!"), 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await;
+        assert!(
+            matches!(long, Err(StrictMaterializeError::LengthMismatch { expected: 5, actual: 6 })),
+            "over-long read must fail with a length mismatch, got {long:?}",
+            long = long.as_ref().map(|b| b.len())
+        );
+
+        // Read K bytes then Err: must surface the read error and never return the
+        // partially consumed buffer (which the caller could otherwise re-stream).
+        let reader = ErrAfterReader {
+            data: cursor_reader(b"hello"),
+            fail_after: 3,
+            emitted: 0,
+        };
+        let errored = strict_materialize_object_body(reader, 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await;
+        assert!(
+            matches!(errored, Err(StrictMaterializeError::Read { consumed: 3, .. })),
+            "a mid-stream read error must be reported as a read failure"
+        );
+    }
+
+    // #1324: the in-memory (buffered/cache) source is guarded by
+    // MemoryTrackedBytesStream. A buffer whose length disagrees with the declared
+    // content length must yield a stream error on first poll instead of a clean
+    // short body or an over-long body. Reverting to the old warn-and-serve
+    // behavior would make these assertions observe Ok chunks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn memory_tracked_bytes_stream_fails_short_body() {
+        let mut stream = MemoryTrackedBytesStream::new(
+            Bytes::from_static(b"test"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            None,
+            GetObjectBodyLifecycle::disabled(),
+        );
+        let err = stream
+            .next()
+            .await
+            .expect("mismatched memory body must yield an item")
+            .expect_err("a short memory body must fail the stream instead of serving a truncated body");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(stream.next().await.is_none(), "stream must terminate after the error");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn memory_tracked_bytes_stream_fails_over_long_body() {
+        let mut stream = MemoryTrackedBytesStream::new(
+            Bytes::from_static(b"hello!"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            None,
+            GetObjectBodyLifecycle::disabled(),
+        );
+        let err = stream
+            .next()
+            .await
+            .expect("mismatched memory body must yield an item")
+            .expect_err("an over-long memory body must fail the stream instead of serving mismatched bytes");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
     #[tokio::test]
     async fn get_object_streaming_reader_times_out_when_body_stalls() {
         let reader = GetObjectStreamingReader::new(
@@ -8333,6 +8652,189 @@ mod tests {
         assert!(
             result.is_err(),
             "an over-long materialize read must be a hard error, not a truncated served body"
+        );
+    }
+
+    // #1324: a materialize-fill read that ends short of the declared content
+    // length (clean EOF at N-1 for a declared N) must hard-fail, matching the
+    // over-long case above. Reverting to warn-and-serve would return Ok with a
+    // truncated body.
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_materialize_rejects_short_read() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        // Declared content length is 5, but the stream only yields 4 bytes.
+        let reader = DataProbeReader {
+            reads: Arc::clone(&reads),
+            data: std::io::Cursor::new(b"hell".to_vec()),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let result = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            "test-bucket",
+            "short-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a short materialize read must be a hard error, not a truncated served body"
+        );
+    }
+
+    // #1324: a materialize-fill read that fails after draining K bytes must
+    // propagate the read error and must NOT fall back to streaming the same
+    // (partially consumed) reader, which would ship a prefix-misaligned body.
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_materialize_rejects_partial_read_error() {
+        let reader = ErrAfterReader {
+            data: std::io::Cursor::new(b"hello".to_vec()),
+            fail_after: 3,
+            emitted: 0,
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let result = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            "test-bucket",
+            "partial-read-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a partial-read error during materialization must fail the request, not stream a prefix-misaligned body"
+        );
+    }
+
+    // #1324: the buffered-body (direct-memory / cache-served) source must also
+    // enforce the exact-length contract. A buffered body shorter than the
+    // declared content length is a hard error before headers.
+    #[tokio::test]
+    async fn build_get_object_body_rejects_short_buffered_body() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            ..Default::default()
+        };
+
+        let result = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            // Declared length 5 but only 4 buffered bytes.
+            Some(Bytes::from_static(b"hell")),
+            "test-bucket",
+            "short-buffered-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(result.is_err(), "a buffered body shorter than the declared content length must hard-fail");
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "the mismatch must be caught without touching the fallback reader"
+        );
+    }
+
+    // #1324 compatibility boundary: a legacy/backfilled object whose decoded
+    // bytes exactly equal its declared content length must still serve cleanly.
+    // The strict contract keys off actual-vs-declared equality only, so it never
+    // flips a legitimate exact-length object into a hard failure — it only
+    // rejects genuine short/over-long/errored reads.
+    #[tokio::test]
+    async fn build_get_object_body_serves_exact_length_buffered_body() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            ..Default::default()
+        };
+
+        let _body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"hello")),
+            "test-bucket",
+            "exact-buffered-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await
+        .expect("an exact-length buffered body must serve without error");
+
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "an exact-length buffered body must not read from the fallback reader"
         );
     }
 
@@ -10007,5 +10509,316 @@ mod tests {
             should_use_existing_delete_replication_info(&opts),
             "true version-delete requests should keep using the pre-delete object info"
         );
+    }
+
+    // -- Range: u64 -> i64 lossless conversion (issue rustfs/backlog#1322) --
+
+    const I64_MAX_AS_U64: u64 = i64::MAX as u64;
+
+    /// The conversion itself: s3s `Range` (u64) -> internal `HTTPRangeSpec`
+    /// (i64). This directly guards the suffix truncation fix. Reverting to
+    /// `length as i64` regresses the zero-suffix, `i64::MAX + 1` and `u64::MAX`
+    /// rows below.
+    #[test]
+    fn range_to_http_range_spec_is_lossless() {
+        // Zero-length suffix (`bytes=-0`) is unsatisfiable -> InvalidRange (416),
+        // never a 0-length 206.
+        let zero_suffix = range_to_http_range_spec(Range::Suffix { length: 0 });
+        assert_eq!(
+            zero_suffix.as_ref().err().map(|e| e.code()),
+            Some(&S3ErrorCode::InvalidRange),
+            "bytes=-0 must map to InvalidRange (416)"
+        );
+
+        // Suffix conversions: positive `start` holds the suffix length; values
+        // above i64::MAX clamp to i64::MAX (they always cover the whole object).
+        let suffix_cases = [
+            (1_u64, 1_i64),
+            (I64_MAX_AS_U64, i64::MAX),
+            (I64_MAX_AS_U64 + 1, i64::MAX), // was i64::MIN under `as i64` -> checked_neg overflow
+            (u64::MAX, i64::MAX),           // was -1 under `as i64` -> read as "last 1 byte"
+        ];
+        for (length, expected_start) in suffix_cases {
+            let spec = range_to_http_range_spec(Range::Suffix { length })
+                .unwrap_or_else(|_| panic!("suffix {length} must convert losslessly"));
+            assert!(spec.is_suffix_length, "suffix {length} must stay a suffix spec");
+            assert_eq!(spec.start, expected_start, "suffix {length} start");
+            assert_eq!(spec.end, -1, "suffix {length} end");
+        }
+
+        // Int ranges: s3s already rejects first/last > i64::MAX, so the checked
+        // cast never truncates. first-last and open-ended must not regress.
+        let int_first_last = range_to_http_range_spec(Range::Int {
+            first: 10,
+            last: Some(20),
+        })
+        .expect("first-last converts");
+        assert!(!int_first_last.is_suffix_length);
+        assert_eq!((int_first_last.start, int_first_last.end), (10, 20));
+
+        let int_open = range_to_http_range_spec(Range::Int { first: 5, last: None }).expect("open-ended converts");
+        assert_eq!((int_open.start, int_open.end), (5, -1));
+
+        let int_max = range_to_http_range_spec(Range::Int {
+            first: I64_MAX_AS_U64,
+            last: Some(I64_MAX_AS_U64),
+        })
+        .expect("i64::MAX int converts");
+        assert_eq!((int_max.start, int_max.end), (i64::MAX, i64::MAX));
+    }
+
+    /// Observable end-to-end effect the GET/HEAD handlers derive from a range
+    /// spec: `HTTPRangeSpec::get_offset_length` yields the (offset, length)
+    /// that becomes `Content-Length` and `Content-Range`, or an error that
+    /// surfaces as 416. Covers empty / 1-byte / normal objects.
+    #[test]
+    fn range_suffix_offset_length_matches_s3_semantics() {
+        // Expected outcome for a satisfiable range, or `None` for 416.
+        #[derive(Debug, PartialEq)]
+        enum Outcome {
+            /// (offset, content_length, content_range)
+            Partial(usize, i64, String),
+            Unsatisfiable,
+        }
+
+        fn derive(range: Range, size: i64) -> Outcome {
+            let spec = match range_to_http_range_spec(range) {
+                Ok(spec) => spec,
+                Err(_) => return Outcome::Unsatisfiable,
+            };
+            match spec.get_offset_length(size) {
+                Ok((offset, len)) => {
+                    let content_range = format!("bytes {}-{}/{}", offset, offset as i64 + len - 1, size);
+                    Outcome::Partial(offset, len, content_range)
+                }
+                Err(_) => Outcome::Unsatisfiable,
+            }
+        }
+
+        let suffix = |length: u64| Range::Suffix { length };
+
+        // size, range, expected
+        let normal = 100_i64;
+        let cases = [
+            // Zero suffix is always 416, whatever the size.
+            (0_i64, suffix(0), Outcome::Unsatisfiable),
+            (1, suffix(0), Outcome::Unsatisfiable),
+            (normal, suffix(0), Outcome::Unsatisfiable),
+            // Suffix within the object returns the trailing bytes.
+            (normal, suffix(1), Outcome::Partial(99, 1, "bytes 99-99/100".into())),
+            (normal, suffix(normal as u64), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            // Suffix >= size returns the whole object (never a truncated tail).
+            (normal, suffix(normal as u64 + 1), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            (normal, suffix(I64_MAX_AS_U64), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            (normal, suffix(I64_MAX_AS_U64 + 1), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            (normal, suffix(u64::MAX), Outcome::Partial(0, 100, "bytes 0-99/100".into())),
+            // 1-byte object: any non-zero suffix returns that single byte.
+            (1, suffix(1), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            (1, suffix(2), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            (1, suffix(I64_MAX_AS_U64 + 1), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            (1, suffix(u64::MAX), Outcome::Partial(0, 1, "bytes 0-0/1".into())),
+            // Normal first-last and open-ended int ranges must not regress.
+            (
+                normal,
+                Range::Int {
+                    first: 10,
+                    last: Some(19),
+                },
+                Outcome::Partial(10, 10, "bytes 10-19/100".into()),
+            ),
+            (
+                normal,
+                Range::Int { first: 90, last: None },
+                Outcome::Partial(90, 10, "bytes 90-99/100".into()),
+            ),
+        ];
+
+        for (size, range, expected) in cases {
+            let got = derive(range, size);
+            assert_eq!(got, expected, "size={size} range={range:?}");
+        }
+    }
+
+    // https://github.com/rustfs/backlog/issues/1311 — bucket-quota admission must run against the authoritative
+    // decoded/plain object length, never the aws-chunked wire Content-Length, and must reject negative/unknown lengths.
+    // https://github.com/rustfs/backlog/issues/1336 — but Content-Encoding: aws-chunked alone is only a declared
+    // encoding: without a STREAMING-* payload the body is unframed and the wire Content-Length is authoritative.
+    fn aws_chunked_headers(decoded_len: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked"));
+        if let Some(decoded) = decoded_len {
+            headers.insert(
+                HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).unwrap(),
+                HeaderValue::from_str(decoded).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn streaming_headers(decoded_len: Option<&str>) -> HeaderMap {
+        let mut headers = aws_chunked_headers(decoded_len);
+        headers.insert(
+            HeaderName::from_bytes(AMZ_CONTENT_SHA256.as_bytes()).unwrap(),
+            HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+        );
+        headers
+    }
+
+    #[test]
+    fn authoritative_size_prefers_aws_chunked_decoded_over_wire_content_length() {
+        // Wire Content-Length (chunk framing) differs from the decoded object length; the decoded length wins.
+        let headers = streaming_headers(Some("1000"));
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088)).expect("decoded length is authoritative");
+        assert_eq!(
+            size, 1000,
+            "aws-chunked admission must use the decoded object length, not the framed wire length"
+        );
+
+        // A declared-only aws-chunked request that still carries a decoded length behaves the same.
+        let headers = aws_chunked_headers(Some("1000"));
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088)).expect("decoded length is authoritative");
+        assert_eq!(size, 1000);
+    }
+
+    #[test]
+    fn authoritative_size_streaming_without_content_encoding_uses_decoded_length() {
+        // A streaming payload signals framing via x-amz-content-sha256 alone; Content-Encoding is optional.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(AMZ_CONTENT_SHA256.as_bytes()).unwrap(),
+            HeaderValue::from_static("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        );
+        headers.insert(
+            HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).unwrap(),
+            HeaderValue::from_static("1000"),
+        );
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088)).expect("decoded length is authoritative");
+        assert_eq!(
+            size, 1000,
+            "a streaming payload without Content-Encoding must still use the decoded length"
+        );
+    }
+
+    #[test]
+    fn authoritative_size_rejects_framed_body_without_decoded_length() {
+        // A genuinely framed upload without x-amz-decoded-content-length has no authoritative size;
+        // the framed wire length must NOT be a fallback.
+        let headers = streaming_headers(None);
+        let err = resolve_put_object_authoritative_size(&headers, Some(1088))
+            .expect_err("framed upload without decoded length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+
+        // ... even when the wire Content-Length is also absent.
+        let err =
+            resolve_put_object_authoritative_size(&headers, None).expect_err("framed upload without any length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_declared_aws_chunked_without_streaming_uses_wire_content_length() {
+        // backlog#1336: an SDK PUT that merely declares Content-Encoding: aws-chunked (issue #1857
+        // clients) has an unframed body and no decoded length; the wire Content-Length is the real
+        // object size and the request must be admitted, not rejected with UnexpectedContent.
+        let headers = aws_chunked_headers(None);
+        let size = resolve_put_object_authoritative_size(&headers, Some(1088))
+            .expect("declared-only aws-chunked must fall back to the wire Content-Length");
+        assert_eq!(size, 1088);
+
+        // Same for a combined declared encoding (aws-chunked,gzip).
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("aws-chunked,gzip"));
+        let size = resolve_put_object_authoritative_size(&headers, Some(2048))
+            .expect("declared-only aws-chunked,gzip must fall back to the wire Content-Length");
+        assert_eq!(size, 2048);
+
+        // Without any length information it is still rejected.
+        let headers = aws_chunked_headers(None);
+        let err = resolve_put_object_authoritative_size(&headers, None)
+            .expect_err("declared-only aws-chunked with no length at all must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_plain_put_uses_content_length() {
+        let headers = HeaderMap::new();
+        let size = resolve_put_object_authoritative_size(&headers, Some(4096)).expect("plain PUT uses Content-Length");
+        assert_eq!(size, 4096);
+    }
+
+    #[test]
+    fn authoritative_size_plain_put_falls_back_to_decoded_length() {
+        // Non-chunked request that only surfaced an explicit decoded length.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(AMZ_DECODED_CONTENT_LENGTH.as_bytes()).unwrap(),
+            HeaderValue::from_static("2048"),
+        );
+        let size = resolve_put_object_authoritative_size(&headers, None).expect("decoded length is the fallback");
+        assert_eq!(size, 2048);
+    }
+
+    #[test]
+    fn authoritative_size_rejects_unknown_length() {
+        let headers = HeaderMap::new();
+        let err = resolve_put_object_authoritative_size(&headers, None).expect_err("no length information must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_rejects_negative_length() {
+        // A negative decoded length would wrap to an enormous unsigned size for quota/buffer sizing; reject it.
+        let headers = aws_chunked_headers(Some("-1"));
+        let err =
+            resolve_put_object_authoritative_size(&headers, Some(64)).expect_err("negative decoded length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+
+        let plain = HeaderMap::new();
+        let err =
+            resolve_put_object_authoritative_size(&plain, Some(-100)).expect_err("negative Content-Length must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[test]
+    fn authoritative_size_accepts_exact_and_rejects_negative_boundary() {
+        // Exact zero-length object is admissible (the over-by-1/exact-limit boundary is enforced by the quota checker on this value).
+        let headers = aws_chunked_headers(Some("0"));
+        assert_eq!(
+            resolve_put_object_authoritative_size(&headers, Some(87)).expect("zero-length decoded is valid"),
+            0
+        );
+    }
+
+    fn quota_result(allowed: bool) -> QuotaCheckResult {
+        QuotaCheckResult {
+            allowed,
+            current_usage: Some(1024),
+            quota_limit: Some(2048),
+            operation_size: 512,
+            remaining: Some(512),
+        }
+    }
+
+    #[test]
+    fn quota_admission_allows_within_limit() {
+        map_quota_check_outcome("bucket", Ok(quota_result(true))).expect("an allowed result admits the write");
+    }
+
+    #[test]
+    fn quota_admission_rejects_over_limit() {
+        let err = map_quota_check_outcome("bucket", Ok(quota_result(false))).expect_err("an over-limit result rejects the write");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn quota_admission_fails_closed_on_checker_error() {
+        // A configured hard quota must never be bypassed by an internal fault: a checker error becomes a retryable ServiceUnavailable, not a silent allow.
+        let err = map_quota_check_outcome(
+            "bucket",
+            Err(QuotaError::InvalidConfig {
+                reason: "corrupt quota config".to_string(),
+            }),
+        )
+        .expect_err("a checker fault must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
     }
 }
