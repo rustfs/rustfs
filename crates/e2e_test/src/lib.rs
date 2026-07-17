@@ -27,6 +27,14 @@ pub mod chaos;
 #[cfg(test)]
 pub mod fake_s3_target;
 
+// Socket-level network fault-injection proxy for black-box cluster tests
+// (backlog#1325 network fault-injection block): latency / blackhole / one-way
+// partition on the wire between nodes. Serves #1312/#1319 (lock-plane one-way
+// partition, accept-then-blackhole peer) and #1327 (cross-process replay/tamper
+// seam); cluster-harness wiring is a follow-up (rustfs#4937).
+#[cfg(test)]
+pub mod fault_proxy;
+
 // Reliability tests built on the fault-injection harness
 #[cfg(test)]
 mod reliability_disk_fault_test;
