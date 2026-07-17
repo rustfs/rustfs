@@ -919,11 +919,9 @@ impl Operation for HealHandler {
             spawn_traced(async move {
                 // Create heal request through channel
                 let heal_request = build_heal_channel_request(&hip);
-                let client_token = heal_request.id.clone();
-
-                match rustfs_common::heal_channel::send_heal_request_with_admission(heal_request).await {
-                    Ok(admission) if admission.is_admitted() => {
-                        let resp_bytes = encode_heal_start_success(client_token, client_address);
+                match rustfs_common::heal_channel::send_heal_request_with_receipt(heal_request).await {
+                    Ok(receipt) if receipt.result.is_admitted() => {
+                        let resp_bytes = encode_heal_start_success(receipt.task_id, client_address);
                         match resp_bytes {
                             Ok(resp_bytes) => {
                                 let _ = tx_clone
@@ -943,13 +941,13 @@ impl Operation for HealHandler {
                             }
                         }
                     }
-                    Ok(admission) => {
+                    Ok(receipt) => {
                         let _ = tx_clone
                             .send(HealResp {
                                 api_err: Some(format!(
                                     "heal request not admitted: admission={}, reason={}",
-                                    admission.result_label(),
-                                    admission.reason_label()
+                                    receipt.result.result_label(),
+                                    receipt.result.reason_label()
                                 )),
                                 ..Default::default()
                             })

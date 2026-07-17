@@ -20,8 +20,8 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use rustfs_common::heal_channel::{
-    HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse,
-    HealRequestSource, HealScanMode, publish_heal_response,
+    HealAdmissionReceipt, HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest,
+    HealChannelResponse, HealReceiptCommand, HealReceiptReceiver, HealRequestSource, HealScanMode, publish_heal_response,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::Serialize;
@@ -79,8 +79,19 @@ impl HealChannelProcessor {
         }
     }
 
-    /// Start processing heal channel requests
-    pub async fn start(&mut self, mut receiver: HealChannelReceiver) -> Result<()> {
+    /// Start processing legacy heal channel requests.
+    pub async fn start(&mut self, receiver: HealChannelReceiver) -> Result<()> {
+        let (receipt_sender, receipt_receiver) = mpsc::unbounded_channel();
+        drop(receipt_sender);
+        self.start_with_receipts(receiver, receipt_receiver).await
+    }
+
+    /// Start processing legacy and canonical-receipt heal channel requests.
+    pub async fn start_with_receipts(
+        &mut self,
+        mut receiver: HealChannelReceiver,
+        mut receipt_receiver: HealReceiptReceiver,
+    ) -> Result<()> {
         info!(
             target: "rustfs::heal::channel",
             event = EVENT_HEAL_CHANNEL_STATE,
@@ -90,6 +101,7 @@ impl HealChannelProcessor {
             "Heal channel started"
         );
 
+        let mut receipt_channel_open = true;
         loop {
             tokio::select! {
                 command = receiver.recv() => {
@@ -118,6 +130,23 @@ impl HealChannelProcessor {
                             );
                             break;
                         }
+                    }
+                }
+                command = receipt_receiver.recv(), if receipt_channel_open => {
+                    let Some(HealReceiptCommand { request, response_tx }) = command else {
+                        receipt_channel_open = false;
+                        continue;
+                    };
+                    if let Err(e) = self.process_start_request(request, false, true, response_tx).await {
+                        error!(
+                            target: "rustfs::heal::channel",
+                            event = EVENT_HEAL_CHANNEL_REQUEST,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_CHANNEL,
+                            state = "receipt_process_failed",
+                            error = %e,
+                            "Heal receipt request processing failed"
+                        );
                     }
                 }
                 response = self.response_receiver.recv() => {
@@ -152,7 +181,7 @@ impl HealChannelProcessor {
     /// Process heal command
     async fn process_command(&self, command: HealChannelCommand) -> Result<()> {
         match command {
-            HealChannelCommand::Start { request, response_tx } => self.process_start_request(request, response_tx).await,
+            HealChannelCommand::Start { request, response_tx } => self.process_legacy_start_request(request, response_tx).await,
             HealChannelCommand::Query {
                 heal_path,
                 client_token,
@@ -166,11 +195,28 @@ impl HealChannelProcessor {
         }
     }
 
+    async fn process_legacy_start_request(
+        &self,
+        request: HealChannelRequest,
+        response_tx: oneshot::Sender<std::result::Result<HealAdmissionResult, String>>,
+    ) -> Result<()> {
+        let (receipt_tx, receipt_rx) = oneshot::channel();
+        self.process_start_request(request, true, false, receipt_tx).await?;
+        let result = receipt_rx
+            .await
+            .map_err(|err| Error::other(format!("heal receipt channel closed: {err}")))?
+            .map(|receipt| receipt.result);
+        let _ = response_tx.send(result);
+        Ok(())
+    }
+
     /// Process start request
     async fn process_start_request(
         &self,
         request: HealChannelRequest,
-        response_tx: oneshot::Sender<std::result::Result<HealAdmissionResult, String>>,
+        preserve_alias: bool,
+        publish_canonical_id: bool,
+        response_tx: oneshot::Sender<std::result::Result<HealAdmissionReceipt, String>>,
     ) -> Result<()> {
         debug!(
             target: "rustfs::heal::channel",
@@ -201,8 +247,13 @@ impl HealChannelProcessor {
         };
 
         // Submit to heal manager
-        match self.heal_manager.submit_heal_request(heal_request).await {
-            Ok(admission) => {
+        match self
+            .heal_manager
+            .submit_heal_request_with_receipt_and_alias(heal_request, preserve_alias)
+            .await
+        {
+            Ok(receipt) => {
+                let admission = receipt.result;
                 debug!(
                     target: "rustfs::heal::channel",
                     event = EVENT_HEAL_CHANNEL_REQUEST,
@@ -214,9 +265,13 @@ impl HealChannelProcessor {
                     "Heal admission decided"
                 );
 
-                let _ = response_tx.send(Ok(admission));
-
-                self.publish_response(admission_response(request.id, admission));
+                let response_id = if publish_canonical_id {
+                    receipt.task_id.clone()
+                } else {
+                    request.id.clone()
+                };
+                self.publish_response(admission_response(response_id, receipt.result));
+                let _ = response_tx.send(Ok(receipt));
             }
             Err(e) => {
                 let error_text = e.to_string();
@@ -537,6 +592,7 @@ mod tests {
         HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     };
     use std::sync::Arc;
+    use std::time::Duration;
 
     // Mock storage for testing
     struct MockStorage;
@@ -1097,27 +1153,190 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         processor
-            .process_start_request(request.clone(), tx)
+            .process_start_request(request.clone(), false, true, tx)
             .await
             .expect("first admission should succeed");
-        assert_eq!(
-            rx.await
-                .expect("oneshot should resolve")
-                .expect("admission should be returned"),
-            HealAdmissionResult::Accepted
-        );
+        let first = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("admission should be returned");
+        assert_eq!(first.result, HealAdmissionResult::Accepted);
+        assert_eq!(first.task_id, "admission-id");
+
+        let mut duplicate = request;
+        duplicate.id = "duplicate-id".to_string();
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_start_request(duplicate, false, true, tx)
+            .await
+            .expect("duplicate admission should succeed");
+        let merged = rx
+            .await
+            .expect("oneshot should resolve")
+            .expect("admission should be returned");
+        assert_eq!(merged.result, HealAdmissionResult::Merged);
+        assert_eq!(merged.task_id, "admission-id");
+    }
+
+    #[tokio::test]
+    async fn test_legacy_start_preserves_duplicate_alias_and_submitted_response_id() {
+        let manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(manager.clone());
+        let request = HealChannelRequest {
+            id: "legacy-original-id".to_string(),
+            bucket: "bucket".to_string(),
+            object_prefix: Some("object".to_string()),
+            priority: HealChannelPriority::Low,
+            source: HealRequestSource::Admin,
+            ..Default::default()
+        };
+        let mut responses = rustfs_common::heal_channel::subscribe_heal_responses();
 
         let (tx, rx) = oneshot::channel();
         processor
-            .process_start_request(request, tx)
+            .process_command(HealChannelCommand::Start {
+                request: request.clone(),
+                response_tx: tx,
+            })
             .await
-            .expect("duplicate admission should succeed");
+            .expect("legacy start should be processed");
         assert_eq!(
             rx.await
-                .expect("oneshot should resolve")
-                .expect("admission should be returned"),
+                .expect("legacy response should arrive")
+                .expect("legacy start should succeed"),
+            HealAdmissionResult::Accepted
+        );
+
+        let mut duplicate = request;
+        duplicate.id = "legacy-duplicate-id".to_string();
+        let (tx, rx) = oneshot::channel();
+        processor
+            .process_command(HealChannelCommand::Start {
+                request: duplicate,
+                response_tx: tx,
+            })
+            .await
+            .expect("legacy duplicate should be processed");
+        assert_eq!(
+            rx.await
+                .expect("legacy duplicate response should arrive")
+                .expect("legacy duplicate should succeed"),
             HealAdmissionResult::Merged
         );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let response = responses.recv().await.expect("legacy broadcast should stay open");
+                if response.request_id == "legacy-duplicate-id" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("legacy broadcast must retain the submitted request id");
+        assert_eq!(
+            manager
+                .get_task_status_for_path("bucket/object", "legacy-duplicate-id")
+                .await
+                .expect("legacy alias should resolve"),
+            HealTaskStatus::Pending
+        );
+        manager
+            .cancel_task("legacy-duplicate-id")
+            .await
+            .expect("legacy alias should cancel the canonical task");
+    }
+
+    #[tokio::test]
+    async fn test_public_legacy_start_processes_commands_with_receipt_channel_closed() {
+        let manager = create_test_heal_manager();
+        let mut processor = HealChannelProcessor::new(manager);
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let processor_task = tokio::spawn(async move { processor.start(command_rx).await });
+        let (response_tx, response_rx) = oneshot::channel();
+        command_tx
+            .send(HealChannelCommand::Start {
+                request: HealChannelRequest {
+                    id: "legacy-start-loop-id".to_string(),
+                    bucket: "bucket".to_string(),
+                    object_prefix: Some("object".to_string()),
+                    source: HealRequestSource::Admin,
+                    ..Default::default()
+                },
+                response_tx,
+            })
+            .expect("legacy command should send");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), response_rx)
+                .await
+                .expect("legacy processor should not starve")
+                .expect("legacy response should arrive")
+                .expect("legacy start should succeed"),
+            HealAdmissionResult::Accepted
+        );
+        drop(command_tx);
+        tokio::time::timeout(Duration::from_secs(1), processor_task)
+            .await
+            .expect("legacy processor should stop when command channel closes")
+            .expect("legacy processor task should join")
+            .expect("legacy processor should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn test_receipt_channel_returns_canonical_id_end_to_end() {
+        let manager = create_test_heal_manager();
+        let mut processor = HealChannelProcessor::new(manager);
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (receipt_tx, receipt_rx) = mpsc::unbounded_channel();
+        let processor_task = tokio::spawn(async move { processor.start_with_receipts(command_rx, receipt_rx).await });
+        let request = HealChannelRequest {
+            id: "receipt-original-id".to_string(),
+            bucket: "bucket".to_string(),
+            object_prefix: Some("object".to_string()),
+            source: HealRequestSource::Admin,
+            ..Default::default()
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        receipt_tx
+            .send(HealReceiptCommand {
+                request: request.clone(),
+                response_tx,
+            })
+            .expect("receipt command should send");
+        let accepted = tokio::time::timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("receipt processor should not starve")
+            .expect("receipt response should arrive")
+            .expect("receipt start should succeed");
+        assert_eq!(accepted.result, HealAdmissionResult::Accepted);
+        assert_eq!(accepted.task_id, "receipt-original-id");
+
+        let mut duplicate = request;
+        duplicate.id = "receipt-duplicate-id".to_string();
+        let (response_tx, response_rx) = oneshot::channel();
+        receipt_tx
+            .send(HealReceiptCommand {
+                request: duplicate,
+                response_tx,
+            })
+            .expect("duplicate receipt command should send");
+        let merged = tokio::time::timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("duplicate receipt should not starve")
+            .expect("duplicate receipt response should arrive")
+            .expect("duplicate receipt should succeed");
+        assert_eq!(merged.result, HealAdmissionResult::Merged);
+        assert_eq!(merged.task_id, "receipt-original-id");
+
+        drop(receipt_tx);
+        drop(command_tx);
+        tokio::time::timeout(Duration::from_secs(1), processor_task)
+            .await
+            .expect("receipt processor should stop when channels close")
+            .expect("receipt processor task should join")
+            .expect("receipt processor should stop cleanly");
     }
 
     #[tokio::test]
@@ -1147,7 +1366,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         processor
-            .process_start_request(request, tx)
+            .process_start_request(request, false, true, tx)
             .await
             .expect("processor should surface invalid request through response channel");
         assert!(rx.await.expect("oneshot should resolve").is_err());
