@@ -717,15 +717,166 @@ pub async fn awscurl_delete(
     execute_awscurl(url, "DELETE", None, access_key, secret_key).await
 }
 
+/// Cluster topology declaration for a `RustFSTestClusterEnvironment`.
+///
+/// Describes how many nodes to launch, how many data drives each node exposes,
+/// and how those nodes are grouped into erasure pools. The topology drives both
+/// on-disk directory creation and the `RUSTFS_VOLUMES` string assembled for the
+/// node processes.
+///
+/// # Single-host expressibility constraints
+///
+/// The harness runs every node on `127.0.0.1` with a distinct port, so the
+/// `RUSTFS_VOLUMES` string can only use the two forms the server parser accepts
+/// on a single machine (verified against `ecstore` `DisksLayout::from_volumes`):
+///
+/// * **Single pool** — every `(node, drive)` endpoint listed explicitly, no
+///   ellipses. This is the legacy form and yields exactly one pool spanning all
+///   nodes and drives (`DistErasure`). Any `drives_per_node >= 1` works.
+/// * **Multiple pools** — one ellipses arg per pool. A pool argument is a single
+///   URL template, so it can enumerate several drives on *one* host but cannot
+///   enumerate multiple distinct-port hosts. A pool that spanned two localhost
+///   nodes would need a host ellipses (`127.0.0.1:900{0...1}`), which forces the
+///   *same* on-disk path across those ports and collides physically. Therefore
+///   every pool in a multi-pool topology owns exactly one node. In addition, the
+///   parser rejects a single-drive ellipses pool (`drive{0...0}`), so a
+///   multi-pool topology requires `drives_per_node >= 2`.
+///
+/// Genuine multi-node pools (a pool striped across several hosts) require real
+/// multi-host infrastructure and are deferred to the nightly cluster CI lane
+/// (backlog #1313 / #1314); they are intentionally not expressible here.
+#[derive(Clone, Debug)]
+pub struct ClusterTopology {
+    /// Number of node processes to launch.
+    pub node_count: usize,
+    /// Number of independent data drives (directories) each node exposes.
+    pub drives_per_node: usize,
+    /// Pool membership as a list of node-index groups. An empty vector means a
+    /// single pool spanning every node.
+    pub pools: Vec<Vec<usize>>,
+}
+
+impl ClusterTopology {
+    /// Single pool, one drive per node — identical to the historical
+    /// `RustFSTestClusterEnvironment::new` layout.
+    pub fn single_pool(node_count: usize) -> Self {
+        Self {
+            node_count,
+            drives_per_node: 1,
+            pools: Vec::new(),
+        }
+    }
+
+    /// Single pool with `drives_per_node` drives on every node. The pool spans
+    /// all nodes and all drives (one `DistErasure` pool).
+    pub fn single_pool_multidrive(node_count: usize, drives_per_node: usize) -> Self {
+        Self {
+            node_count,
+            drives_per_node,
+            pools: Vec::new(),
+        }
+    }
+
+    /// Multi-pool topology where every pool owns exactly one node. `pools` lists
+    /// the node index backing each pool (e.g. `vec![vec![0], vec![1]]` for a
+    /// two-pool cluster). Requires `drives_per_node >= 2` (see the type-level
+    /// note on single-host expressibility).
+    pub fn per_node_pools(drives_per_node: usize, pools: Vec<Vec<usize>>) -> Self {
+        let node_count = pools.iter().flatten().copied().max().map(|m| m + 1).unwrap_or(0);
+        Self {
+            node_count,
+            drives_per_node,
+            pools,
+        }
+    }
+
+    /// Normalized pool membership: an empty `pools` becomes a single pool over
+    /// all node indices.
+    fn normalized_pools(&self) -> Vec<Vec<usize>> {
+        if self.pools.is_empty() {
+            vec![(0..self.node_count).collect()]
+        } else {
+            self.pools.clone()
+        }
+    }
+
+    /// Validate that the topology is expressible on a single localhost machine.
+    fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.node_count == 0 {
+            return Err("Node count must be greater than zero".into());
+        }
+        if self.drives_per_node == 0 {
+            return Err("drives_per_node must be greater than zero".into());
+        }
+
+        let pools = self.normalized_pools();
+
+        // Every referenced node index must be in range.
+        for (pool_idx, nodes) in pools.iter().enumerate() {
+            if nodes.is_empty() {
+                return Err(format!("pool {pool_idx} has no nodes").into());
+            }
+            for &n in nodes {
+                if n >= self.node_count {
+                    return Err(format!("pool {pool_idx} references node {n} but node_count is {}", self.node_count).into());
+                }
+            }
+        }
+
+        // Each node must belong to exactly one pool.
+        let mut seen = vec![0usize; self.node_count];
+        for nodes in &pools {
+            for &n in nodes {
+                seen[n] += 1;
+            }
+        }
+        for (n, count) in seen.iter().enumerate() {
+            match count {
+                0 => return Err(format!("node {n} is not assigned to any pool").into()),
+                1 => {}
+                _ => return Err(format!("node {n} is assigned to more than one pool").into()),
+            }
+        }
+
+        // Multi-pool constraints imposed by the single-host RUSTFS_VOLUMES syntax.
+        if pools.len() > 1 {
+            if self.drives_per_node < 2 {
+                return Err(
+                    "multi-pool topology requires drives_per_node >= 2 (the server parser rejects a single-drive ellipses pool)"
+                        .into(),
+                );
+            }
+            for (pool_idx, nodes) in pools.iter().enumerate() {
+                if nodes.len() != 1 {
+                    return Err(format!(
+                        "pool {pool_idx} spans {} nodes; a pool striped across multiple localhost nodes is not expressible (needs host ellipses, which collides on shared paths). Use one node per pool, or the nightly multi-host lane (backlog #1313/#1314).",
+                        nodes.len()
+                    )
+                    .into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Represents a single RustFS server instance in a test cluster.
 ///
 /// Each `ClusterNode` tracks the node's network address, base URL for
-/// S3-compatible requests, on-disk data directory, and the underlying
+/// S3-compatible requests, on-disk data directories, and the underlying
 /// child process handle when the node is running.
 pub struct ClusterNode {
     pub address: String,
     pub url: String,
+    /// Primary data directory for the node. For single-drive nodes this is the
+    /// node's only drive; for multi-drive nodes it is the first drive. Kept as a
+    /// stable field so existing single-drive tests continue to compile.
     pub data_dir: String,
+    /// All data drives exposed by this node (`data_dirs[0] == data_dir`).
+    pub data_dirs: Vec<String>,
+    /// Index of the pool this node belongs to.
+    pub pool_idx: usize,
     pub process: Option<Child>,
 }
 
@@ -741,6 +892,7 @@ pub struct RustFSTestClusterEnvironment {
     pub access_key: String,
     pub secret_key: String,
     pub extra_env: Vec<(String, String)>,
+    pub topology: ClusterTopology,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -762,26 +914,73 @@ impl RustFSTestClusterEnvironment {
     /// * `Err(Box<dyn Error + Send + Sync>)` - An error if any step fails, such as temporary
     ///   directory creation failure or available port lookup failure.
     pub async fn new(node_count: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if node_count == 0 {
-            return Err("Node count must be greater than zero".into());
-        }
+        Self::with_topology(ClusterTopology::single_pool(node_count)).await
+    }
+
+    /// Create a RustFS test cluster environment from an explicit topology.
+    ///
+    /// Allocates a unique temporary root directory, an available TCP port per
+    /// node, and one data directory per drive. The topology is validated up front
+    /// (node/pool assignment, single-host multi-pool constraints); node processes
+    /// are not started at this stage.
+    ///
+    /// When the topology exposes more than one local drive on a node (multi-drive
+    /// or multi-pool layouts), `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` is added to
+    /// every node's environment: those drives live on the same temp filesystem, so
+    /// the server's distinct-physical-disk safety check would otherwise reject
+    /// startup. Single-drive single-pool clusters keep the historical environment
+    /// unchanged.
+    pub async fn with_topology(topology: ClusterTopology) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        topology.validate()?;
+
         let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
         fs::create_dir_all(&temp_dir).await?;
 
-        let mut nodes = Vec::with_capacity(node_count);
-        for i in 0..node_count {
+        // Map every node to its owning pool index.
+        let pools = topology.normalized_pools();
+        let mut pool_of_node = vec![0usize; topology.node_count];
+        for (pool_idx, nodes) in pools.iter().enumerate() {
+            for &n in nodes {
+                pool_of_node[n] = pool_idx;
+            }
+        }
+
+        let multidrive = topology.drives_per_node > 1;
+
+        let mut nodes = Vec::with_capacity(topology.node_count);
+        for (i, &pool_idx) in pool_of_node.iter().enumerate() {
             let port = RustFSTestEnvironment::find_available_port().await?;
             let address = format!("127.0.0.1:{}", port);
             let url = format!("http://{}", address);
-            let data_dir = format!("{}/node{}", temp_dir, i);
-            fs::create_dir_all(&data_dir).await?;
+
+            // Single-drive nodes keep the historical `{temp}/node{i}` path so
+            // existing tests (and their on-disk assertions) are unaffected.
+            // Multi-drive nodes nest one `drive{d}` directory per drive so the
+            // ellipses form `drive{0...N-1}` can address them.
+            let data_dirs: Vec<String> = if multidrive {
+                (0..topology.drives_per_node)
+                    .map(|d| format!("{}/node{}/drive{}", temp_dir, i, d))
+                    .collect()
+            } else {
+                vec![format!("{}/node{}", temp_dir, i)]
+            };
+            for dir in &data_dirs {
+                fs::create_dir_all(dir).await?;
+            }
 
             nodes.push(ClusterNode {
                 address,
                 url,
-                data_dir,
+                data_dir: data_dirs[0].clone(),
+                data_dirs,
+                pool_idx,
                 process: None,
             });
+        }
+
+        let mut extra_env = Vec::new();
+        if multidrive {
+            extra_env.push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
         }
 
         Ok(Self {
@@ -789,7 +988,8 @@ impl RustFSTestClusterEnvironment {
             temp_dir,
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
-            extra_env: Vec::new(),
+            extra_env,
+            topology,
         })
     }
 
@@ -809,14 +1009,51 @@ impl RustFSTestClusterEnvironment {
         Ok(())
     }
 
-    /// Build the volumes argument string for RustFS binary (internal helper method).
+    /// Build the `RUSTFS_VOLUMES` argument string for the cluster's topology.
     ///
-    /// Concatenates the address and data directory of all cluster nodes into a single string
-    /// used as the `RUSTFS_VOLUMES` environment variable for RustFS node processes.
+    /// * **Single pool** — every `(node, drive)` endpoint is listed explicitly and
+    ///   space-joined. With no ellipses the server parser collapses them into one
+    ///   legacy pool spanning all nodes and drives.
+    /// * **Multiple pools** — each pool (exactly one node) contributes one ellipses
+    ///   argument `http://<addr><node-base>/drive{0...N-1}`; the space-separated
+    ///   arguments become one pool each.
+    ///
+    /// The server splits `RUSTFS_VOLUMES` on spaces (`value_delimiter = ' '`), which
+    /// this assembly matches, and the resulting layout is verified against the
+    /// `ecstore` parser in the unit tests below.
+    /// Public view of the assembled `RUSTFS_VOLUMES` string, so tests can assert
+    /// the pool/drive layout without starting node processes.
+    pub fn rustfs_volumes_arg(&self) -> String {
+        self.build_volumes_arg()
+    }
+
     fn build_volumes_arg(&self) -> String {
-        self.nodes
+        let pools = self.topology.normalized_pools();
+
+        if pools.len() <= 1 {
+            // Single pool: explicit enumeration of every drive on every node.
+            return self
+                .nodes
+                .iter()
+                .flat_map(|n| n.data_dirs.iter().map(move |dir| format!("http://{}{}", n.address, dir)))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+
+        // Multi-pool: one ellipses argument per single-node pool. The drive
+        // directories are `<temp>/node{i}/drive{0..N-1}`, so the ellipses base is
+        // the shared parent of the node's drives.
+        pools
             .iter()
-            .map(|n| format!("http://{}{}", n.address, n.data_dir))
+            .map(|nodes| {
+                let node = &self.nodes[nodes[0]];
+                let base = node
+                    .data_dirs
+                    .first()
+                    .and_then(|d| d.rsplit_once('/').map(|(parent, _)| parent))
+                    .unwrap_or(&node.data_dir);
+                format!("http://{}{}/drive{{0...{}}}", node.address, base, self.topology.drives_per_node - 1)
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -1090,5 +1327,131 @@ mod tests {
         assert!(!binary_features_match(&binary_path, Some("sftp")));
 
         stdfs::remove_file(stamp_path).ok();
+    }
+
+    /// Build a cluster environment struct in-memory (no ports, no processes) so
+    /// that `build_volumes_arg` can be exercised as a pure string builder. Node
+    /// directories mirror what `with_topology` would create for the topology.
+    fn fake_cluster(topology: ClusterTopology) -> RustFSTestClusterEnvironment {
+        let temp_dir = "/tmp/rustfs_cluster_test_FAKE".to_string();
+        let pools = topology.normalized_pools();
+        let mut pool_of_node = vec![0usize; topology.node_count];
+        for (pool_idx, nodes) in pools.iter().enumerate() {
+            for &n in nodes {
+                pool_of_node[n] = pool_idx;
+            }
+        }
+        let multidrive = topology.drives_per_node > 1;
+
+        let nodes = (0..topology.node_count)
+            .map(|i| {
+                let address = format!("127.0.0.1:{}", 9000 + i);
+                let data_dirs: Vec<String> = if multidrive {
+                    (0..topology.drives_per_node)
+                        .map(|d| format!("{}/node{}/drive{}", temp_dir, i, d))
+                        .collect()
+                } else {
+                    vec![format!("{}/node{}", temp_dir, i)]
+                };
+                ClusterNode {
+                    url: format!("http://{}", address),
+                    address,
+                    data_dir: data_dirs[0].clone(),
+                    data_dirs,
+                    pool_idx: pool_of_node[i],
+                    process: None,
+                }
+            })
+            .collect();
+
+        RustFSTestClusterEnvironment {
+            nodes,
+            temp_dir,
+            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: DEFAULT_SECRET_KEY.to_string(),
+            extra_env: Vec::new(),
+            topology,
+        }
+    }
+
+    #[test]
+    fn volumes_single_pool_single_drive_is_backward_compatible() {
+        // The historical layout: one explicit endpoint per node, space-joined,
+        // no ellipses, no `drive` sub-directory.
+        let env = fake_cluster(ClusterTopology::single_pool(4));
+        assert_eq!(
+            env.build_volumes_arg(),
+            "http://127.0.0.1:9000/tmp/rustfs_cluster_test_FAKE/node0 \
+             http://127.0.0.1:9001/tmp/rustfs_cluster_test_FAKE/node1 \
+             http://127.0.0.1:9002/tmp/rustfs_cluster_test_FAKE/node2 \
+             http://127.0.0.1:9003/tmp/rustfs_cluster_test_FAKE/node3"
+        );
+    }
+
+    #[test]
+    fn volumes_single_pool_multidrive_enumerates_every_drive() {
+        // 4 nodes x 2 drives -> 8 explicit endpoints, one legacy pool. No
+        // ellipses, so the server parser keeps this as a single DistErasure pool.
+        let env = fake_cluster(ClusterTopology::single_pool_multidrive(4, 2));
+        let expected = (0..4)
+            .flat_map(|i| {
+                (0..2).map(move |d| format!("http://127.0.0.1:{}/tmp/rustfs_cluster_test_FAKE/node{}/drive{}", 9000 + i, i, d))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(env.build_volumes_arg(), expected);
+        assert_eq!(env.build_volumes_arg().split(' ').count(), 8);
+    }
+
+    #[test]
+    fn volumes_two_pool_uses_one_ellipses_arg_per_pool() {
+        // Two single-node pools, 2 drives each -> two ellipses arguments. The
+        // server parser treats each space-separated ellipses arg as its own pool.
+        let env = fake_cluster(ClusterTopology::per_node_pools(2, vec![vec![0], vec![1]]));
+        assert_eq!(
+            env.build_volumes_arg(),
+            "http://127.0.0.1:9000/tmp/rustfs_cluster_test_FAKE/node0/drive{0...1} \
+             http://127.0.0.1:9001/tmp/rustfs_cluster_test_FAKE/node1/drive{0...1}"
+        );
+    }
+
+    #[test]
+    fn topology_rejects_multi_node_pool() {
+        // A pool striped across two localhost nodes is not expressible.
+        let err = ClusterTopology::per_node_pools(2, vec![vec![0, 1], vec![2, 3]])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not expressible"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn topology_rejects_single_drive_multi_pool() {
+        // The server parser rejects a single-drive ellipses pool (`drive{0...0}`).
+        let err = ClusterTopology::per_node_pools(1, vec![vec![0], vec![1]])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drives_per_node >= 2"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn topology_rejects_unassigned_and_duplicated_nodes() {
+        // Node 2 is never assigned to a pool.
+        let mut t = ClusterTopology::single_pool_multidrive(3, 2);
+        t.pools = vec![vec![0], vec![1]];
+        assert!(t.validate().unwrap_err().to_string().contains("not assigned"));
+
+        // Node 0 assigned twice.
+        let mut t = ClusterTopology::single_pool_multidrive(2, 2);
+        t.pools = vec![vec![0], vec![0]];
+        assert!(t.validate().unwrap_err().to_string().contains("more than one pool"));
+    }
+
+    #[test]
+    fn topology_single_pool_accepts_any_drive_count() {
+        assert!(ClusterTopology::single_pool(4).validate().is_ok());
+        assert!(ClusterTopology::single_pool_multidrive(4, 4).validate().is_ok());
+        assert!(ClusterTopology::single_pool_multidrive(1, 1).validate().is_ok());
     }
 }

@@ -1753,3 +1753,53 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         "GET of a restored object must be served locally, not from the tier"
     );
 }
+
+/// rustfs/backlog#1320: a single PUT must compute the replication decision
+/// exactly once. Historically the PUT path computed `must_replicate_object`
+/// twice with the same inputs — once before commit to persist the pending
+/// replication metadata, and again after commit to drive the schedule. Besides
+/// repeating the versioning/config/target traversal on the hot path, a
+/// replication-config hot update between the two computations could split the
+/// two phases (pending-without-schedule or schedule-without-pending). The fix
+/// reuses one immutable decision for both phases; this test observes the
+/// computation counter and fails if a second computation is reintroduced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state usecase integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn put_object_computes_replication_decision_exactly_once() {
+    use super::storage_api::object_usecase::bucket::replication::MUST_REPLICATE_OBJECT_CALLS;
+    use std::sync::atomic::Ordering;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::from_global();
+
+    let bucket = format!("test-repl-decision-once-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    let payload = b"replication decision single-compute payload";
+
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    // Reset immediately before the single PUT so the counter reflects only this
+    // request. `#[serial]` guarantees no other usecase PUT runs concurrently, so
+    // no unrelated `must_replicate_object` call can perturb the count.
+    MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
+
+    let input = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .body(Some(streaming_blob_from_bytes(payload)))
+        .content_length(Some(payload.len() as i64))
+        .build()
+        .unwrap();
+    Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT)))
+        .await
+        .expect("Failed to upload object through usecase");
+
+    let calls = MUST_REPLICATE_OBJECT_CALLS.load(Ordering::SeqCst);
+    assert_eq!(
+        calls, 1,
+        "a single PUT must compute the replication decision exactly once; reverting to a \
+         pre-commit + post-commit recompute makes this observe 2 (rustfs/backlog#1320)"
+    );
+}

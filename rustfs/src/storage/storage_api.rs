@@ -114,8 +114,8 @@ pub(crate) mod access_consumer {
 
 pub(crate) mod concurrency_consumer {
     pub(crate) use super::super::concurrency::{
-        ConcurrencyManager, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectGuard, get_concurrency_aware_buffer_size,
-        get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectGuard,
+        get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
     };
 }
 
