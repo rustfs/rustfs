@@ -24,6 +24,7 @@ use crate::server::RemoteAddr;
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::access_consumer::contract::bucket::BucketOperations;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use http::Method;
 use metrics::counter;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
@@ -1901,12 +1902,20 @@ impl S3Access for FS {
 
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
-        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        }
+        // s3s routes browser POST uploads (PostObject) through this hook after
+        // converting the form into a PutObjectInput. MinIO's PostPolicy handler
+        // gates POST solely on s3:PutObject — object-lock form fields are
+        // constrained by the POST policy conditions instead (s3s rejects any
+        // form field not covered by the policy) — so the object-lock action
+        // checks below apply to real PUT requests only (rustfs#4845).
+        if req.method != Method::POST {
+            if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
 
-        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+            if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+            }
         }
 
         Ok(())

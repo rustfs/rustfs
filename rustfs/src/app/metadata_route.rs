@@ -15,6 +15,7 @@
 //! MinIO-compatible metadata listing extension routes.
 
 use super::bucket_usecase::DefaultBucketUsecase;
+use crate::auth::{check_key_valid, get_session_token};
 use crate::storage::access::{ReqInfo, authorize_request, req_info_mut};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
@@ -104,8 +105,25 @@ fn metadata_operation(method: &Method, uri: &Uri, headers: &HeaderMap, host: Opt
 
 async fn check_metadata_access(req: &mut S3Request<Body>, target: BucketTarget) -> S3Result<()> {
     {
+        // s3s dispatches custom routes before the `S3Access::check` hook runs,
+        // so the signature credentials it verified have not been resolved into
+        // a `ReqInfo` yet. Resolve them here; otherwise a signed request is
+        // authorized as anonymous and denied (rustfs#4845).
         if req_info_mut(req).is_err() {
-            req.extensions.insert(ReqInfo::default());
+            let (cred, is_owner) = match req.credentials.as_ref() {
+                Some(input_cred) => {
+                    let (cred, is_owner) =
+                        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
+                            .await?;
+                    (Some(cred), is_owner)
+                }
+                None => (None, false),
+            };
+            req.extensions.insert(ReqInfo {
+                cred,
+                is_owner,
+                ..Default::default()
+            });
         }
         let req_info = req_info_mut(req)?;
         req_info.bucket = Some(target.bucket);

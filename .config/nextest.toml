@@ -292,8 +292,6 @@ path = "junit.xml"
 #     archive even under ignore-errors semantics.
 #   * rustfs#4844 — anonymous POST-object with SSE-S3 / bucket-default SSE
 #     returns 500.
-#   * rustfs#4845 — 403 on allowed anonymous POST object-lock fields and on
-#     the list metadata=true extension.
 #   * rustfs#4846 — distributed-lock quorum tests misclassify as timeout
 #     under parallel load (multi-node in-process clusters; natural home is
 #     ci-7's nightly cluster lane).
@@ -308,8 +306,6 @@ default-filter = """
     & !test(/^multipart_auth_test::test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled$/)
     & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(ignores_invalid_entries_when_requested|supports_standard_headers_with_combined_extract_options)$/)
     & !test(/^multipart_auth_test::test_anonymous_post_object_(accepts_sse_s3|rejects_sse_s3_missing_from_policy_conditions|uses_bucket_default_sse_kms|uses_bucket_default_sse_s3)$/)
-    & !test(/^multipart_auth_test::test_anonymous_post_object_(accepts_object_lock_legal_hold_field|accepts_object_lock_retention_fields)$/)
-    & !test(/^list_object(s_v2|_versions)_metadata_extension_test::/)
     & !test(/^reliant::lock::test_distributed_lock_(2_nodes_grpc_read_survives_failed_node|4_nodes_grpc_read_write_quorum_split_with_two_failed_nodes)$/)
 """
 fail-fast = false
