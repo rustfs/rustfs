@@ -88,6 +88,52 @@ async fn api_rate_limit_enforces_429_with_retry_after_when_enabled() -> TestResu
 
 #[tokio::test]
 #[serial]
+async fn api_rate_limit_bucket_dimension_throttles_per_bucket() -> TestResult {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    // Bucket dimension only: the readiness-poll ListBuckets calls hit "/"
+    // (no bucket) and therefore do not consume any budget.
+    env.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_API_RATE_LIMIT_ENABLE", "true"),
+            ("RUSTFS_API_RATE_LIMIT_BUCKET_RPM", "60"),
+            ("RUSTFS_API_RATE_LIMIT_BUCKET_BURST", "5"),
+        ],
+    )
+    .await?;
+
+    let client = local_http_client();
+
+    // Unauthenticated GETs are still counted arrivals (403, not 429, while
+    // within budget); the sixth rapid hit on the same bucket must throttle.
+    let mut throttled = false;
+    for i in 0..6 {
+        let response = client.get(format!("{}/hot-bucket/object-{i}", env.url)).send().await?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            throttled = true;
+            assert!(
+                response.headers().contains_key(reqwest::header::RETRY_AFTER),
+                "bucket-dimension 429 must carry Retry-After"
+            );
+            break;
+        }
+    }
+    assert!(throttled, "6 rapid requests against burst 5 must trip the bucket dimension");
+
+    // A different bucket has its own budget.
+    let other = client.get(format!("{}/cold-bucket/object", env.url)).send().await?;
+    assert_ne!(
+        other.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "an unrelated bucket must not be throttled"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn api_rate_limit_stays_inert_by_default() -> TestResult {
     init_logging();
     let mut env = RustFSTestEnvironment::new().await?;

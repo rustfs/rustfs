@@ -369,6 +369,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluator_skips_expiration_days_delete_marker_while_replication_pending() {
+        let evaluator = Evaluator::new(latest_expiration_lifecycle());
+
+        let events = evaluator
+            .eval(&[object_opts(ReplicationStatusType::Pending, VersionPurgeStatusType::default())])
+            .await
+            .expect("pending replication should still return a lifecycle decision");
+
+        assert_eq!(events[0].action, IlmAction::NoneAction);
+
+        let events = evaluator
+            .eval(&[object_opts(
+                ReplicationStatusType::Completed,
+                VersionPurgeStatusType::Complete,
+            )])
+            .await
+            .expect("completed replication should allow delete-marker expiration");
+
+        assert_eq!(events[0].action, IlmAction::DeleteVersionAction);
+    }
+
+    #[tokio::test]
     async fn evaluator_skips_latest_expiration_while_replication_failed() {
         let evaluator = Evaluator::new(latest_expiration_lifecycle());
 

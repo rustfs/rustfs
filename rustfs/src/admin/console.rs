@@ -17,8 +17,9 @@ use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::rate_limit::{
-    LABEL_RATE_LIMIT_SCOPE, METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL, RATE_LIMIT_SCOPE_CONSOLE, RateLimitDecision,
-    RateLimitQuota, RateLimiter, apply_throttle_headers, client_ip,
+    LABEL_RATE_LIMIT_DIMENSION, LABEL_RATE_LIMIT_SCOPE, METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL,
+    RATE_LIMIT_DIMENSION_CLIENT_IP, RATE_LIMIT_SCOPE_CONSOLE, RateLimitDecision, RateLimitQuota, RateLimiter,
+    apply_throttle_headers, client_ip,
 };
 use crate::server::{
     CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX,
@@ -581,15 +582,16 @@ fn setup_console_middleware_stack(
     // without one fail open rather than trusting spoofable headers.
     if rate_limit_enable {
         if let Some(quota) = RateLimitQuota::per_minute(rate_limit_rpm, 0) {
-            let limiter = Arc::new(RateLimiter::new(quota));
+            let limiter: Arc<RateLimiter> = Arc::new(RateLimiter::new(quota));
             app = app.layer(middleware::from_fn(move |req: Request, next: middleware::Next| {
                 let limiter = limiter.clone();
                 async move {
-                    match client_ip(&req).map(|ip| limiter.check(ip)) {
+                    match client_ip(&req).map(|ip| limiter.check(&ip)) {
                         Some(RateLimitDecision::Limited(throttle)) => {
                             metrics::counter!(
                                 METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL,
-                                LABEL_RATE_LIMIT_SCOPE => RATE_LIMIT_SCOPE_CONSOLE
+                                LABEL_RATE_LIMIT_SCOPE => RATE_LIMIT_SCOPE_CONSOLE,
+                                LABEL_RATE_LIMIT_DIMENSION => RATE_LIMIT_DIMENSION_CLIENT_IP
                             )
                             .increment(1);
                             debug!(retry_after_secs = throttle.retry_after_secs, "Console request rejected by rate limit");

@@ -116,7 +116,11 @@ async fn make_tar_with_pax_entry(path: &str, data: &[u8], mtime: Option<u64>, pa
             pax_payload.extend(build_pax_record(key, value));
         }
 
-        let mut pax_header = tokio_tar::Header::new_gnu();
+        // Pax extension entries must carry a POSIX ustar header — this is what real
+        // tar writers emit, and the server-side reader rejects an XHeader typeflag on
+        // GNU-format headers ("extension typeflag is not permitted on an unrecognized
+        // header").
+        let mut pax_header = tokio_tar::Header::new_ustar();
         pax_header.set_entry_type(tokio_tar::EntryType::XHeader);
         pax_header.set_size(pax_payload.len() as u64);
         pax_header.set_mode(0o644);
@@ -5071,7 +5075,9 @@ async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Resul
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
+        .await?;
 
     let bucket = "signed-extract-sse-s3-redirect";
     let archive_key = "encrypted-metadata.tar";
@@ -5348,7 +5354,9 @@ async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
+        .await?;
 
     let bucket = "signed-extract-default-sse-s3";
     let archive_key = "default-encryption.tar";

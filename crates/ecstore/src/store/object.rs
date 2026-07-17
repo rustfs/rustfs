@@ -103,6 +103,21 @@ impl ObjectLockDiagGuard {
     }
 }
 
+/// Opaque write-lock guard for the RestoreObject accept path; see
+/// [`ECStore::acquire_restore_accept_guard`]. Deliberately not a general lock
+/// API — it only exists so the accept path's restore-status compare-and-set
+/// can span the ecstore/API layer boundary.
+pub struct RestoreAcceptGuard(ObjectLockDiagGuard);
+
+impl RestoreAcceptGuard {
+    /// True when the underlying namespace lock was lost (e.g. heartbeat
+    /// refresh lost quorum). Callers must check this before committing the
+    /// restore-status write the guard exists to serialize.
+    pub fn is_lock_lost(&self) -> bool {
+        self.0.guard.is_lock_lost()
+    }
+}
+
 impl Drop for ObjectLockDiagGuard {
     fn drop(&mut self) {
         if !self.enabled || self.guard.is_released() {
@@ -437,6 +452,23 @@ impl ECStore {
         opts.no_lock = true;
 
         Ok(Some(guard))
+    }
+
+    /// Serializes the RestoreObject accept path — the read of the current
+    /// `x-amz-restore` status, the ongoing/already-restored decision, and the
+    /// metadata write that flips `ongoing-request="true"` — against concurrent
+    /// accepts of the same object, making that read-check-write an atomic
+    /// compare-and-set (backlog#1304). While the guard is held the caller must
+    /// pass `no_lock: true` on its reads/writes of this object, check
+    /// [`RestoreAcceptGuard::is_lock_lost`] before the status write, and drop
+    /// the guard before starting the tier copy-back so concurrent
+    /// HEAD/`get_object_info` stay non-blocking during the restore.
+    pub async fn acquire_restore_accept_guard(&self, bucket: &str, object: &str) -> Result<RestoreAcceptGuard> {
+        let object = encode_dir_object(object);
+        let guard = self
+            .acquire_object_write_lock("restore_object_accept", bucket, &object)
+            .await?;
+        Ok(RestoreAcceptGuard(guard))
     }
 
     async fn acquire_delete_objects_write_locks(
@@ -1308,19 +1340,25 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         let object = encode_dir_object(object);
-        let mut opts = opts.clone();
-        let _object_lock_guard = self
-            .acquire_object_write_lock_if_needed("restore_transitioned_object", bucket, &object, &mut opts)
-            .await?;
-
+        // Deliberately NOT holding the object write lock across the tier
+        // copy-back (backlog#1304): non-SELECT restore-vs-restore is
+        // serialized by the accept path's compare-and-set of the ongoing flag
+        // (see acquire_restore_accept_guard), and while ongoing-request="true"
+        // the restore header parses with no expiry, so DeleteRestoredAction
+        // cannot fire mid-copy-back. Torn-write protection against concurrent
+        // readers and writers stays with the inner put_object /
+        // complete_multipart_upload commit phases, which take this object's
+        // write lock themselves. A delete (user or lifecycle) landing between
+        // the tier read and that commit can still be overwritten by the
+        // commit — the same window MinIO accepts; a commit-time existence
+        // re-check is tracked separately. Holding the lock here instead
+        // (#4877) blocked HEAD/get_object_info for the whole copy-back and
+        // self-deadlocked on the inner commits.
         if self.single_pool() {
-            return self.pools[0]
-                .clone()
-                .restore_transitioned_object(bucket, &object, &opts)
-                .await;
+            return self.pools[0].clone().restore_transitioned_object(bucket, &object, opts).await;
         }
 
-        let opts = transition_restore_pool_opts(&opts);
+        let opts = transition_restore_pool_opts(opts);
         let (_, idx) = self
             .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
@@ -2179,25 +2217,32 @@ mod tests {
         );
     }
 
+    // NOTE: #4877's `restore_transitioned_object_waits_for_existing_reader`
+    // was removed with the whole-copy-back write lock it asserted
+    // (backlog#1304): restore entry no longer serializes on the object lock.
+    // The replacement semantics — non-blocking reads during the copy-back and
+    // fast rejection of a concurrent restore — are covered end-to-end by
+    // `restore_object_usecase_reports_ongoing_conflict_and_completion`
+    // (rustfs/src/app/lifecycle_transition_api_test.rs) and at the lock level
+    // by the accept-guard test below; restore-vs-reader data protection lives
+    // in the inner put_object/complete_multipart_upload commit locks.
     #[tokio::test]
     #[serial_test::serial]
-    async fn restore_transitioned_object_waits_for_existing_reader() {
+    async fn restore_accept_guard_serializes_concurrent_accepts() {
+        // backlog#1304: the accept guard is the compare-and-set boundary for
+        // the restore ongoing flag — a second accept of the same object must
+        // wait behind (here: time out on) the first.
         let store = Arc::new(new_read_lock_test_store().await);
-        let ns_lock = store
-            .handle_new_ns_lock("bucket", "object")
+        let _first = store
+            .acquire_restore_accept_guard("bucket", "object")
             .await
-            .expect("namespace lock should be created");
-        let _reader = ns_lock
-            .get_read_lock(Duration::from_secs(1))
-            .await
-            .expect("reader should acquire the object lock");
+            .expect("first accept guard should be acquired");
 
         let err = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
-            store
-                .clone()
-                .handle_restore_transitioned_object("bucket", "object", &ObjectOptions::default())
-                .await
-                .expect_err("restore must wait behind an existing reader")
+            match store.acquire_restore_accept_guard("bucket", "object").await {
+                Ok(_) => panic!("second accept guard must wait behind the first"),
+                Err(err) => err,
+            }
         })
         .await;
 

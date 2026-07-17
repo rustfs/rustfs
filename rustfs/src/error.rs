@@ -276,6 +276,13 @@ impl From<StorageError> for ApiError {
 
         let message = if code == S3ErrorCode::InternalError {
             err.to_string()
+        } else if let StorageError::InvalidArgument(_, _, reason) = &err
+            && !reason.is_empty()
+        {
+            // Argument-validation rejections carry a client-actionable reason
+            // (e.g. object keys unsupported on Windows hosts, issue #3299);
+            // a bare "Invalid argument" gives the caller nothing to fix.
+            format!("Invalid argument: {reason}")
         } else {
             ApiError::error_code_to_message(&code)
         };
@@ -395,6 +402,26 @@ mod tests {
             assert!(downcast_io_error.is_some());
             assert_eq!(downcast_io_error.unwrap().kind(), kind);
         }
+    }
+
+    #[test]
+    fn test_api_error_surfaces_invalid_argument_reason() {
+        let err = StorageError::InvalidArgument(
+            "bucket".into(),
+            "a:b*c".into(),
+            "object key contains characters unsupported on Windows hosts".into(),
+        );
+        let api_error: ApiError = err.into();
+        assert_eq!(api_error.code, S3ErrorCode::InvalidArgument);
+        assert_eq!(
+            api_error.message,
+            "Invalid argument: object key contains characters unsupported on Windows hosts"
+        );
+
+        // An empty reason falls back to the generic message.
+        let err = StorageError::InvalidArgument("bucket".into(), "object".into(), String::new());
+        let api_error: ApiError = err.into();
+        assert_eq!(api_error.message, "Invalid argument");
     }
 
     #[test]
