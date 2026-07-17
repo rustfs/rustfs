@@ -157,8 +157,8 @@ impl LocalKmsClient {
         Ok(salt)
     }
 
+    #[cfg(unix)]
     async fn set_file_permissions(path: &std::path::Path, permissions: Option<u32>) -> Result<()> {
-        #[cfg(unix)]
         if let Some(mode) = permissions {
             use std::os::unix::fs::PermissionsExt;
 
@@ -166,7 +166,11 @@ impl LocalKmsClient {
             fs::set_permissions(path, perms).await?;
         }
 
-        let _ = permissions;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn set_file_permissions(_path: &std::path::Path, _permissions: Option<u32>) -> Result<()> {
         Ok(())
     }
 

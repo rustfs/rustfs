@@ -3,7 +3,7 @@
 > Authoritative per-module test counts for the `e2e_test` crate (backlog#1149
 > ci-4), generated from `cargo nextest list -p e2e_test`. Regenerate with:
 > ```bash
-> cargo nextest list -p e2e_test --message-format oneline | awk '{split($2,a,"::"); print a[1]}' | sort | uniq -c
+> cargo nextest list -p e2e_test --message-format json | jq -r '.["rust-suites"][]?.testcases | to_entries[] | select(.value.ignored == false) | .key | split("::")[0]' | sort | uniq -c
 > ```
 > Modules marked ✅ are in the PR smoke profile `e2e-smoke`
 > (`.config/nextest.toml`); admission criteria: `crates/e2e_test/README.md`.
@@ -39,6 +39,7 @@
 | delete_object_no_content_length_test | 1 |  |
 | delete_objects_versioning_test | 2 | ✅ |
 | existing_object_tag_policy_test | 4 |  |
+| fake_s3_target | 4 | ✅ |
 | get_codec_streaming_compat_test | 1 |  |
 | head_object_consistency_test | 1 | ✅ |
 | head_object_range_test | 1 | ✅ |
@@ -74,4 +75,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 435 tests across 56 modules · PR smoke subset: 108 tests / 26 modules** (24 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-15.
+**Total listed: 439 tests across 57 modules · PR smoke subset: 112 tests / 27 modules** (25 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-16.

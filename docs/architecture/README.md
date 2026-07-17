@@ -30,6 +30,7 @@ Two rules keep this directory healthy:
 ## Contracts & invariants
 
 - [placement-repair-invariants.md](placement-repair-invariants.md)
+- [unified-object-generation.md](unified-object-generation.md) — single per-object generation authority (fencing epoch, transport/encoding/proto/mixed-version contracts)
 - [runtime-capability-contracts.md](runtime-capability-contracts.md)
 - [workload-admission-contracts.md](workload-admission-contracts.md)
 - [background-controller-contract.md](background-controller-contract.md)

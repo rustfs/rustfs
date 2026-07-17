@@ -1076,7 +1076,7 @@ impl SetDisks {
             if fi.is_compressed() {
                 record_compression_total_memory(actual_size as u64, w_size as u64).await;
             }
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
+            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
 
             fi.replication_state_internal = Some(replication_state_to_filemeta(&opts.put_replication_state()));
 
@@ -1801,7 +1801,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut rollback_futures = Vec::new();
         for fi_vers in &vers {
@@ -1997,7 +1997,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
             let disks = self.disk_inventory().await;
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
             let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
             oi.replication_decision = goi.replication_decision;
@@ -2027,7 +2027,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         let disks = self.disk_inventory().await;
-        record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
@@ -2326,7 +2326,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 "transition completed on remote tier but source cleanup failed; skipping external lifecycle transition notification"
             );
         } else {
-            record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
         }
 
         for disk in disks.iter() {
@@ -2384,7 +2384,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let (actual_fi, _, _) = fi?;
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
-        let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
+        let mut ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
+        // The restore copy-back re-writes this same object via put_object /
+        // new_multipart_upload / complete_multipart_upload, each of which takes
+        // the object write lock in its commit phase. The caller
+        // (handle_restore_transitioned_object, #4877) already holds that write
+        // lock for the whole restore and forwards no_lock=true, so the inner
+        // writes must inherit it or they self-deadlock on the lock we already
+        // hold and time out. put_restore_opts builds fresh options that default
+        // no_lock=false, so propagate it explicitly here.
+        ropts.no_lock = opts.no_lock;
         if oi.parts.len() == 1 {
             let mut opts = opts.clone();
             opts.part_number = Some(1);
@@ -2502,6 +2511,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 uploaded_parts,
                 &ObjectOptions {
                     mod_time: oi.mod_time,
+                    // Inherit the restore write lock (see ropts.no_lock above):
+                    // the commit phase re-acquires this object's write lock.
+                    no_lock: opts.no_lock,
                     ..Default::default()
                 },
             )
