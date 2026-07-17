@@ -24,6 +24,11 @@ use super::super::*;
 use crate::disk::OldCurrentSize;
 use crate::object_api::GetObjectBodySource;
 
+fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
+    coding::Erasure::try_new_with_options(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size, uses_legacy)
+        .map_err(Error::from)
+}
+
 /// Length of the full plaintext body when — and only when — this read's output
 /// is exactly the object's complete plaintext, so the app-layer body cache may
 /// serve it in place of the erasure read.
@@ -273,12 +278,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
 
-            let erasure = coding::Erasure::new_with_options(
-                fi.erasure.data_blocks,
-                fi.erasure.parity_blocks,
-                fi.erasure.block_size,
-                fi.uses_legacy_checksum,
-            );
+            let erasure = erasure_from_file_info(&fi, fi.uses_legacy_checksum)?;
             let read_length = erasure.shard_file_offset(0, object_size, object_size);
             let total_shards = data_shards + fi.erasure.parity_blocks;
             let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
@@ -741,7 +741,7 @@ impl SetDisks {
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
         let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = async {
-            let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+            let erasure = erasure_from_file_info(&fi, false)?;
 
             let put_object_size = known_put_object_storage_size(data.size());
             let is_inline_buffer =
@@ -2595,6 +2595,30 @@ fn drop_failed_writer_disks<D, W>(disks: &mut [Option<D>], writers: &[Option<W>]
         }
     }
     committed
+}
+
+#[cfg(test)]
+mod erasure_construction_tests {
+    use super::*;
+    use crate::erasure::coding::ErasureConstructionError;
+    use std::error::Error as _;
+
+    #[test]
+    fn object_file_info_mapping_preserves_construction_error() {
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.erasure.block_size = 0;
+
+        let error = match erasure_from_file_info(&fi, false) {
+            Ok(_) => panic!("invalid object erasure metadata must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("block_size must be greater than zero"));
+        let io_source = error.source().expect("StorageError::Io must expose its io::Error source");
+        let construction_source = io_source
+            .source()
+            .expect("io::Error must expose the erasure construction error");
+        assert!(construction_source.is::<ErasureConstructionError>());
+    }
 }
 
 #[cfg(test)]

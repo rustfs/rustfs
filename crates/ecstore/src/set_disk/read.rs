@@ -388,15 +388,13 @@ impl SetDisks {
             return Ok(None);
         }
 
-        let erasure = coding::Erasure::new_with_options(
+        let erasure = coding::Erasure::try_new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
             fi.uses_legacy_checksum,
-        );
-        if erasure.data_shards == 0 {
-            return Ok(None);
-        }
+        )
+        .map_err(Error::from)?;
 
         let checksum_info = fi.erasure.get_checksum_info(part.number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -618,21 +616,13 @@ impl SetDisks {
             object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
-        let erasure = coding::Erasure::new_with_options(
+        let erasure = coding::Erasure::try_new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
             fi.uses_legacy_checksum,
-        );
-
-        // Erasure params come from on-disk metadata; zero values must fail the read
-        // instead of panicking on the block/shard divisions below.
-        if !erasure.has_valid_dimensions() {
-            return Err(Error::other(format!(
-                "invalid erasure metadata for {bucket}/{object}: block_size={}, data_blocks={}",
-                erasure.block_size, erasure.data_shards
-            )));
-        }
+        )
+        .map_err(Error::from)?;
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -1061,22 +1051,13 @@ impl SetDisks {
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
-        let erasure = coding::Erasure::new_with_options(
+        let erasure = coding::Erasure::try_new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
             fi.uses_legacy_checksum,
-        );
-
-        // Erasure params come from on-disk metadata; zero values must fail the read
-        // instead of panicking on the block/shard divisions inside the codec
-        // streaming reader below. Mirrors the legacy multipart guard.
-        if !erasure.has_valid_dimensions() {
-            return Err(Error::other(format!(
-                "invalid erasure metadata for {bucket}/{object}: block_size={}, data_blocks={}",
-                erasure.block_size, erasure.data_shards
-            )));
-        }
+        )
+        .map_err(Error::from)?;
 
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
@@ -1918,7 +1899,12 @@ mod metadata_cache_tests {
         )
         .await
         .expect_err("invalid erasure metadata must fail before reader setup");
-        assert!(err.to_string().contains("invalid erasure metadata"));
+        assert!(err.to_string().contains("block_size must be greater than zero"));
+        let io_source = std::error::Error::source(&err).expect("StorageError::Io must expose its io::Error source");
+        let construction_source = io_source
+            .source()
+            .expect("io::Error must expose the erasure construction error");
+        assert!(construction_source.is::<crate::erasure::coding::ErasureConstructionError>());
         assert!(output.is_empty());
     }
 

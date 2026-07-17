@@ -308,8 +308,8 @@ pub mod error {
 
 pub mod erasure {
     pub use crate::erasure::coding::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ReedSolomonEncoder, calc_shard_size,
-        calc_shard_size_legacy,
+        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError, ReedSolomonEncoder,
+        calc_shard_size, calc_shard_size_legacy,
     };
 }
 
