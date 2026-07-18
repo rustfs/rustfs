@@ -28,4 +28,14 @@ pub(crate) mod fixture {
     pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
     pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
     pub(crate) use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
+
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::config::com::{delete_config, read_config, save_config};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::data_usage::{
+        load_data_usage_from_backend, load_data_usage_from_backend_cached, remove_bucket_usage_from_backend,
+        store_data_usage_in_backend,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::BUCKET_META_PREFIX;
 }

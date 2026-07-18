@@ -468,6 +468,7 @@ impl ECStore {
         }
 
         runtime_sources::init_bucket_monitor_for_current_endpoints();
+        crate::bucket::bucket_target_sys::BucketTargetSys::get().start_heartbeat();
 
         init_background_expiry(self.clone()).await;
         crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_stale_multipart_upload_cleanup(self.clone());

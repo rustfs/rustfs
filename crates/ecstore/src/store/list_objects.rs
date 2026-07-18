@@ -142,6 +142,13 @@ pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
 enum GatherResultsState {
     LimitReached,
     InputClosed,
+    /// The results receiver was dropped before the single page was delivered.
+    ///
+    /// With a capacity-1 results channel and at most one send per
+    /// `gather_results` call, a send failure is equivalent to the consumer
+    /// (the `list_path` wrapper future) having been dropped — e.g. the client
+    /// disconnected mid-listing. This is a benign completion, not an error.
+    ConsumerGone,
 }
 
 #[derive(Clone)]
@@ -4026,6 +4033,11 @@ impl ECStore {
                 match gather_results(cancel_rx2, opts, recv, result_tx).await {
                     Ok(GatherResultsState::LimitReached) => cancel.cancel(),
                     Ok(GatherResultsState::InputClosed) => {}
+                    // Consumer disconnect (e.g. client cancelled the request)
+                    // is a benign completion: no error log, no err_tx send.
+                    // The explicit cancel is idempotent and avoids relying on
+                    // the wrapper's drop-guard ordering to stop the producer.
+                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
                     Err(err) => {
                         log_list_path_worker_error("store", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
@@ -4683,7 +4695,10 @@ async fn gather_results(
                 "list_objects gather_results reached page limit and cancelled upstream listing"
             );
 
-            results_tx
+            // Invariant: the results channel has capacity 1 and this function
+            // performs at most one send per call, so a send failure here means
+            // the receiver was dropped (consumer gone), never a full buffer.
+            if results_tx
                 .send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
                         o: MetaCacheEntries(entries),
@@ -4692,7 +4707,15 @@ async fn gather_results(
                     err: None,
                 })
                 .await
-                .map_err(Error::other)?;
+                .is_err()
+            {
+                debug!(
+                    bucket = %opts.bucket,
+                    prefix = %opts.prefix,
+                    "list_objects gather_results consumer disconnected before limited page delivery"
+                );
+                return Ok(GatherResultsState::ConsumerGone);
+            }
             return Ok(GatherResultsState::LimitReached);
         }
     }
@@ -4724,7 +4747,10 @@ async fn gather_results(
         "list_objects gather_results drained all candidates without hitting limit"
     );
 
-    results_tx
+    // Invariant: the results channel has capacity 1 and this function performs
+    // at most one send per call, so a send failure here means the receiver was
+    // dropped (consumer gone), never a full buffer.
+    if results_tx
         .send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
                 o: MetaCacheEntries(entries),
@@ -4733,7 +4759,15 @@ async fn gather_results(
             err: Some(Error::Unexpected.into()),
         })
         .await
-        .map_err(Error::other)?;
+        .is_err()
+    {
+        debug!(
+            bucket = %opts.bucket,
+            prefix = %opts.prefix,
+            "list_objects gather_results consumer disconnected before eof page delivery"
+        );
+        return Ok(GatherResultsState::ConsumerGone);
+    }
 
     Ok(GatherResultsState::InputClosed)
 }
@@ -5264,6 +5298,11 @@ impl Sets {
                 match gather_results(cancel_rx2, opts, recv, result_tx).await {
                     Ok(GatherResultsState::LimitReached) => cancel.cancel(),
                     Ok(GatherResultsState::InputClosed) => {}
+                    // Consumer disconnect (e.g. client cancelled the request)
+                    // is a benign completion: no error log, no err_tx send.
+                    // The explicit cancel is idempotent and avoids relying on
+                    // the wrapper's drop-guard ordering to stop the producer.
+                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
                     Err(err) => {
                         log_list_path_worker_error("sets", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
@@ -6219,6 +6258,11 @@ impl SetDisks {
                 match gather_results(cancel_rx2, opts, recv, result_tx).await {
                     Ok(GatherResultsState::LimitReached) => cancel.cancel(),
                     Ok(GatherResultsState::InputClosed) => {}
+                    // Consumer disconnect (e.g. client cancelled the request)
+                    // is a benign completion: no error log, no err_tx send.
+                    // The explicit cancel is idempotent and avoids relying on
+                    // the wrapper's drop-guard ordering to stop the producer.
+                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
                     Err(err) => {
                         log_list_path_worker_error("set_disks", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
@@ -6638,6 +6682,51 @@ mod test {
     use tokio::sync::mpsc;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
     use uuid::Uuid;
 
     struct TestIndexGeneration {
@@ -7199,6 +7288,132 @@ mod test {
             .expect("gather_results should succeed");
         assert_eq!(state, GatherResultsState::InputClosed);
         assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_reports_consumer_gone_when_receiver_dropped_at_limit() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+
+        entry_tx
+            .send(test_meta_entry("obj-a"))
+            .await
+            .expect("test entry should be queued");
+        drop(result_rx);
+
+        let state = timeout(
+            Duration::from_secs(1),
+            gather_results(
+                cancel.clone(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    limit: 1,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            ),
+        )
+        .await
+        .expect("gather_results should finish promptly when the consumer is gone")
+        .expect("consumer disconnect must be a benign completion, not an error");
+
+        assert_eq!(state, GatherResultsState::ConsumerGone);
+        // The limit branch cancels upstream before attempting the send.
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_reports_consumer_gone_when_receiver_dropped_at_eof() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+
+        entry_tx
+            .send(test_meta_entry("obj-a"))
+            .await
+            .expect("test entry should be queued");
+        drop(entry_tx);
+        drop(result_rx);
+
+        let state = timeout(
+            Duration::from_secs(1),
+            gather_results(
+                cancel.clone(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    limit: 8,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            ),
+        )
+        .await
+        .expect("gather_results should finish promptly when the consumer is gone")
+        .expect("consumer disconnect must be a benign completion, not an error");
+
+        assert_eq!(state, GatherResultsState::ConsumerGone);
+        // The eof branch never cancels; the wrapper's ConsumerGone arm does.
+        assert!(!cancel.is_cancelled());
+    }
+
+    // The subscriber installed via `set_default` is thread-local, so this test
+    // must run on the current-thread runtime; a multi-thread runtime would make
+    // the log-absence assertion vacuous.
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_path_gather_results_consumer_gone_emits_no_worker_failure_log() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+
+        entry_tx
+            .send(test_meta_entry("obj-a"))
+            .await
+            .expect("test entry should be queued");
+        drop(entry_tx);
+        drop(result_rx);
+
+        let state = timeout(
+            Duration::from_secs(1),
+            gather_results(
+                cancel.clone(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    limit: 8,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            ),
+        )
+        .await
+        .expect("gather_results should finish promptly when the consumer is gone")
+        .expect("consumer disconnect must be a benign completion, not an error");
+        assert_eq!(state, GatherResultsState::ConsumerGone);
+
+        let captured = logs.contents();
+        // The consumer disconnect still surfaces as a debug-level ops signal,
+        // proving the subscriber captured output (non-vacuous assertion)...
+        assert!(captured.contains("consumer disconnected"));
+        // ...but it must never be logged as a worker failure. The wrappers'
+        // ConsumerGone arm contains no log call, so a direct gather_results
+        // invocation covers the only code path that could emit this string
+        // for a consumer disconnect.
+        assert!(!captured.contains("list_path worker failed"));
     }
 
     #[test]

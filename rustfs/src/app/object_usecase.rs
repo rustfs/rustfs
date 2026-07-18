@@ -5136,6 +5136,11 @@ impl DefaultObjectUsecase {
 
         let mut src_info = gr.object_info.clone();
 
+        // Capture the version actually read from the source before src_info is mutated/consumed
+        // below. This is the exact source version copied (issue #4976): the response must echo it
+        // via x-amz-copy-source-version-id, distinct from the destination version_id.
+        let src_resolved_version_id = src_info.version_id;
+
         // Validate copy source conditions
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
@@ -5293,6 +5298,24 @@ impl DefaultObjectUsecase {
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
         let dest_version = if dest_versioned { raw_dest_version } else { None };
 
+        // Echo the source version that was copied via x-amz-copy-source-version-id (issue #4976).
+        // AWS/MinIO return this whenever the source bucket carries versioning (enabled or
+        // suspended); render the null version as "null" like GET/HEAD do. This is the exact source
+        // version, kept distinct from the destination version_id above.
+        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await
+            || BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
+        let copy_source_version_id = if src_versioned {
+            src_resolved_version_id.map(|vid| {
+                if vid == Uuid::nil() {
+                    "null".to_string()
+                } else {
+                    vid.to_string()
+                }
+            })
+        } else {
+            None
+        };
+
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
@@ -5303,6 +5326,7 @@ impl DefaultObjectUsecase {
 
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
+            copy_source_version_id,
             server_side_encryption: effective_sse,
             ssekms_key_id: effective_kms_key_id,
             sse_customer_algorithm,
