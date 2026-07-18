@@ -17,6 +17,7 @@ This document describes the baseline (`main`) algorithm. Where the baseline has 
   - [../operations/tier-ilm-debugging.md](../operations/tier-ilm-debugging.md) — owns the ILM/tier runtime runbook, the dual internal-metadata-key table, the defensive binary-UUID read pattern, and the `xl.meta` inspection tooling (`dump_fileinfo` / `dump_versions`).
   - [AGENTS.md](../../AGENTS.md) "Cross-Cutting Domain Invariants" — dual internal metadata keys, defensive UUID reads, unversioned tier buckets.
   - [../../ARCHITECTURE.md](../../ARCHITECTURE.md) — crate roles (`ecstore`, `filemeta`, the `rustfs-erasure-codec` codec fork, `heal`, `scanner`).
+- **How references work here.** Code is cited by **file path plus symbol name** (function / type / constant), never by line number — symbols survive refactors, are greppable, and rename only on a deliberate change. `scripts/check_doc_paths.sh` validates the paths on every commit. The normative content is the *rule*; the linked file is where it is *implemented*. When you rename a governed symbol or change a governed behavior, update this document in the **same** change (§13) — this spec is what the next change is checked against, so a stale spec is a defect, not just documentation drift.
 
 ## Table of contents
 
@@ -43,8 +44,8 @@ RustFS stores every object as a Reed–Solomon erasure code across the drives of
 
 Two codec backends exist, selected per object from its metadata (never a runtime toggle):
 
-- **Modern backend** — Reed–Solomon over **GF(2⁸)** using `rustfs-erasure-codec` (a RustFS fork of `reed-solomon-erasure` v8, `Cargo.toml:279`), imported as `reed_solomon_erasure::galois_8::ReedSolomon` ([erasure.rs:20](../../crates/ecstore/src/erasure/coding/erasure.rs)). Vandermonde generator matrix; algorithm string `"rs-vandermonde"` ([object_api/mod.rs:52](../../crates/ecstore/src/object_api/mod.rs)). Field order is 256, so total shards per set is capped at 256 by the codec — well above the geometry cap of 16 (§2). Used for **all new writes**.
-- **Legacy backend** — Reed–Solomon over **GF(2¹⁶)** using `reed-solomon-simd` v3.1 (`Cargo.toml:280`), imported at [erasure.rs:21](../../crates/ecstore/src/erasure/coding/erasure.rs). Used **only** to read and heal objects written in the older MinIO-lineage format.
+- **Modern backend** — Reed–Solomon over **GF(2⁸)** using `rustfs-erasure-codec` (a RustFS fork of `reed-solomon-erasure` v8, `Cargo.toml`), imported as `reed_solomon_erasure::galois_8::ReedSolomon` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)). Vandermonde generator matrix; algorithm string `"rs-vandermonde"` ([object_api/mod.rs](../../crates/ecstore/src/object_api/mod.rs)). Field order is 256, so total shards per set is capped at 256 by the codec — well above the geometry cap of 16 (§2). Used for **all new writes**.
+- **Legacy backend** — Reed–Solomon over **GF(2¹⁶)** using `reed-solomon-simd` v3.1 (`Cargo.toml`), imported at [erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs). Used **only** to read and heal objects written in the older MinIO-lineage format.
 
 Industry alignment (all confirmed in code): byte-oriented RS over GF(2⁸) with a Vandermonde matrix, 1 MiB erasure block, and HighwayHash-256 bitrot checksums with a π-derived key — the same family and defaults MinIO uses. This is what makes byte-level `xl.meta` interoperability with MinIO possible (see [minio-file-format-compat.md](minio-file-format-compat.md)).
 
@@ -58,7 +59,7 @@ Where the code lives: the erasure engine is owned by `crates/ecstore/src/erasure
 
 A deployment is a list of **pools**; each pool's drives are partitioned into equal-size **erasure sets**; each set has `N` **drives**. Set-size selection lives in [disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs): the chosen set size is the largest member of `SET_SIZES` that divides the GCD of the pool sizes and is symmetric across the ellipsis patterns, preferring the fewest sets (`get_set_indexes`, `common_set_drive_count`, `possible_set_counts_with_symmetry`).
 
-- **INVARIANT — set size.** `SET_SIZES = [2, 3, …, 16]` ([disks_layout.rs:24](../../crates/ecstore/src/layout/disks_layout.rs)); `is_valid_set_size` requires `2 ≤ N ≤ 16` ([disks_layout.rs:329](../../crates/ecstore/src/layout/disks_layout.rs)). Every erasure set has `N ∈ 2..=16` drives. This bounds `data_blocks + parity_blocks ≤ 16`, which downstream metadata validation may rely on.
+- **INVARIANT — set size.** `SET_SIZES = [2, 3, …, 16]` ([disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs)); `is_valid_set_size` requires `2 ≤ N ≤ 16` ([disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs)). Every erasure set has `N ∈ 2..=16` drives. This bounds `data_blocks + parity_blocks ≤ 16`, which downstream metadata validation may rely on.
 - The `RUSTFS_ERASURE_SET_DRIVE_COUNT` override may pin the set size but only to a value that appears in the symmetric divisor set and still passes `is_valid_set_size` (≤ 16). It is a TUNABLE, not a way past the cap.
 - Runtime geometry is read back from the on-disk format: `set_drive_count = format.erasure.sets[0].len()`. The disk-UUID position within `format.erasure.sets` must not change — see [ecstore-layout-boundary.md](ecstore-layout-boundary.md).
 
@@ -66,7 +67,7 @@ Which **set** a key lands in (object-to-set placement) is a separate hash, owned
 
 ### 2.2 Parity selection
 
-Default parity by drive count — `default_parity_count(N)` ([storageclass.rs:24](../../crates/ecstore/src/config/storageclass.rs)):
+Default parity by drive count — `default_parity_count(N)` ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs)):
 
 | N | 1 | 2–3 | 4–5 | 6–7 | ≥8 |
 |---|---|-----|-----|-----|----|
@@ -93,7 +94,7 @@ write_quorum = data_drives ; if data_drives == parity_drives: write_quorum += 1
 
 ## 3. Distribution: shard placement within a set
 
-Within a set, the `N` shards of an object are assigned to drives by a **distribution vector** that is a permutation of `1..=N`, derived from the object key — `FileInfo::new` ([fileinfo.rs:277](../../crates/filemeta/src/fileinfo.rs)):
+Within a set, the `N` shards of an object are assigned to drives by a **distribution vector** that is a permutation of `1..=N`, derived from the object key — `FileInfo::new` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)):
 
 ```
 N       = data_blocks + parity_blocks
@@ -102,7 +103,7 @@ start   = key_crc % N
 distribution[i-1] = 1 + ((start + i) % N)   for i in 1..=N   // a cyclic rotation of 1..=N
 ```
 
-- **INVARIANT — distribution is a permutation of `1..=N`.** `is_valid_distribution` requires exactly `N` entries, each in `1..=N`, no duplicates ([fileinfo.rs:254](../../crates/filemeta/src/fileinfo.rs)). Values of `0` or `> N` are used as `distribution[k] − 1` slot indices and would underflow / index out of bounds; the shuffle helpers additionally `checked_sub(1)` and bounds-filter defensively ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs)).
+- **INVARIANT — distribution is a permutation of `1..=N`.** `is_valid_distribution` requires exactly `N` entries, each in `1..=N`, no duplicates ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)). Values of `0` or `> N` are used as `distribution[k] − 1` slot indices and would underflow / index out of bounds; the shuffle helpers additionally `checked_sub(1)` and bounds-filter defensively ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs)).
 - **INVARIANT — key-only, version-independent.** The distribution depends only on the object key (`[bucket, object].join("/")`), so all versions of a key share one distribution. Changing the derivation would misplace every existing object's shards. See also the placement-algorithm-preservation gate in [placement-repair-invariants.md](placement-repair-invariants.md).
 - `erasure.index` on a per-disk `FileInfo` is that disk's 1-based canonical shard slot. On write, disk `k` is placed at slot `distribution[k] − 1` and the shard written there records `erasure.index = slot + 1` ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs), `shuffle_disks_and_parts_metadata`). On read/heal, placement is re-derived by matching `distribution[k] == parts_metadata[k].erasure.index`, with a mod-time fallback when too many indices are inconsistent.
 
@@ -112,16 +113,16 @@ distribution[i-1] = 1 + ((start + i) % N)   for i in 1..=N   // a cyclic rotatio
 
 ### 4.1 Block size and shard sizing
 
-- **INVARIANT — block size.** New objects use `BLOCK_SIZE_V2 = 1 MiB` ([object_api/mod.rs:53](../../crates/ecstore/src/object_api/mod.rs)); it is stored per version in `ErasureInfo.block_size` and must be read back from metadata, never assumed.
+- **INVARIANT — block size.** New objects use `BLOCK_SIZE_V2 = 1 MiB` ([object_api/mod.rs](../../crates/ecstore/src/object_api/mod.rs)); it is stored per version in `ErasureInfo.block_size` and must be read back from metadata, never assumed.
 - **INVARIANT — shard-size formulas (frozen for on-disk compatibility).** Two formulas exist and must both be preserved:
-  - Modern ([erasure.rs:456](../../crates/ecstore/src/erasure/coding/erasure.rs)): `calc_shard_size(block_size, data_shards) = block_size.div_ceil(data_shards)`.
-  - Legacy ([erasure.rs:30](../../crates/ecstore/src/erasure/coding/erasure.rs)): `calc_shard_size_legacy = (block_size.div_ceil(data_shards) + 1) & !1` — round the ceiling **up to the nearest even number**, byte-identical to MinIO's even-padding and to `filemeta`'s own `calc_shard_size` ([fileinfo.rs:136](../../crates/filemeta/src/fileinfo.rs)).
-  - The runtime codec picks the formula from `uses_legacy` ([erasure.rs:820](../../crates/ecstore/src/erasure/coding/erasure.rs)); the metadata layer `ErasureInfo::shard_size` always uses the even-padded form. Modern reads/writes drive off `Erasure::shard_size`.
-- Whole-file logical shard size — `shard_file_size(total_length)` ([erasure.rs:829](../../crates/ecstore/src/erasure/coding/erasure.rs)): `0` for empty, pass-through for negative, else `full_blocks * shard_size() + shard_size_fn(last_block_size, data_shards)`. This is the pre-bitrot size; the on-disk file is larger by the per-block hash bytes (§5).
+  - Modern ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)): `calc_shard_size(block_size, data_shards) = block_size.div_ceil(data_shards)`.
+  - Legacy ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)): `calc_shard_size_legacy = (block_size.div_ceil(data_shards) + 1) & !1` — round the ceiling **up to the nearest even number**, byte-identical to MinIO's even-padding and to `filemeta`'s own `calc_shard_size` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)).
+  - The runtime codec picks the formula from `uses_legacy` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)); the metadata layer `ErasureInfo::shard_size` always uses the even-padded form. Modern reads/writes drive off `Erasure::shard_size`.
+- Whole-file logical shard size — `shard_file_size(total_length)` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)): `0` for empty, pass-through for negative, else `full_blocks * shard_size() + shard_size_fn(last_block_size, data_shards)`. This is the pre-bitrot size; the on-disk file is larger by the per-block hash bytes (§5).
 
 ### 4.2 Per-block encode
 
-`Erasure::encode_data(data)` ([erasure.rs:508](../../crates/ecstore/src/erasure/coding/erasure.rs)):
+`Erasure::encode_data(data)` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)):
 
 1. `per_shard_size = shard_size_fn(data.len(), data_shards)`; empty ⇒ emit `N` empty shards.
 2. Copy `data` into a buffer and **zero-pad** the tail to `per_shard_size * N`.
@@ -143,8 +144,8 @@ distribution[i-1] = 1 + ((start + i) % N)   for i in 1..=N   // a cyclic rotatio
 
 Each shard file is self-verifying against silent disk corruption.
 
-- **INVARIANT — hash algorithm.** The production bitrot hash is `HighwayHash256S` (streaming HighwayHash-256, 32-byte digest), the default of `HashAlgorithm` ([hash.rs:42](../../crates/utils/src/hash.rs)); `ErasureInfo::get_checksum_info` defaults an unspecified part to `HighwayHash256S` ([fileinfo.rs:141](../../crates/filemeta/src/fileinfo.rs)). Legacy files recorded as `HighwayHash256S` are verified with the legacy fixed-key variant `HighwayHash256SLegacy` (key `[3,4,2,1]`), selected on read when `fi.uses_legacy_checksum` ([set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs)). The modern key is the π-derived `MAGIC_HIGHWAY_HASH256_KEY` ([hash.rs](../../crates/utils/src/hash.rs)).
-- **INVARIANT — on-disk shard layout is interleaved `[hash][data]` per block.** `BitrotWriter::write` prepends `hash_algo.hash_encode(block)` before each block, written in one vectored write ([bitrot.rs:307](../../crates/ecstore/src/erasure/coding/bitrot.rs)). On-disk shard file size — `bitrot_shard_file_size(size, shard_size, algo)` ([bitrot.rs:436](../../crates/ecstore/src/erasure/coding/bitrot.rs)): for the two streaming Highway variants `= size.div_ceil(shard_size) * 32 + size` (one 32-byte hash per block); for any other algorithm (whole-file bitrot) `= size`.
+- **INVARIANT — hash algorithm.** The production bitrot hash is `HighwayHash256S` (streaming HighwayHash-256, 32-byte digest), the default of `HashAlgorithm` ([hash.rs](../../crates/utils/src/hash.rs)); `ErasureInfo::get_checksum_info` defaults an unspecified part to `HighwayHash256S` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)). Legacy files recorded as `HighwayHash256S` are verified with the legacy fixed-key variant `HighwayHash256SLegacy` (key `[3,4,2,1]`), selected on read when `fi.uses_legacy_checksum` ([set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs)). The modern key is the π-derived `MAGIC_HIGHWAY_HASH256_KEY` ([hash.rs](../../crates/utils/src/hash.rs)).
+- **INVARIANT — on-disk shard layout is interleaved `[hash][data]` per block.** `BitrotWriter::write` prepends `hash_algo.hash_encode(block)` before each block, written in one vectored write ([bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)). On-disk shard file size — `bitrot_shard_file_size(size, shard_size, algo)` ([bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)): for the two streaming Highway variants `= size.div_ceil(shard_size) * 32 + size` (one 32-byte hash per block); for any other algorithm (whole-file bitrot) `= size`.
 - **INVARIANT — verify before use.** `BitrotReader` reads `[hash][data]` in one pass, recomputes the hash, and returns `InvalidData "bitrot hash mismatch"` on mismatch; the data is handed to the caller **only after** verification passes. A short/truncated shard returns `UnexpectedEof` even under `skip_verify` ([bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)).
 - Only the streaming interleaved layout is written/verified; it is self-consistent only for `HighwayHash256S` / `HighwayHash256SLegacy`. The default resolving to `HighwayHash256S` is load-bearing (backlog#959, documented at [bitrot.rs](../../crates/ecstore/src/erasure/coding/bitrot.rs)).
 
@@ -197,7 +198,7 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 - `EcDist` is an **array** of per-shard slot values (not a bin blob). V2Obj does **not** store per-part bitrot checksums (only legacy V1 does).
 - `PartETags` / `PartASizes` / `MetaSys` / `MetaUsr` are written as msgpack nil when empty; **a reader must treat nil and empty identically**. `PartIdx` is omitted entirely when empty.
 - Part arrays are **parallel and index-aligned**: `PartNums` / `PartSizes` / `PartASizes` must be equal length (mismatch ⇒ `FileCorrupt`, because indexing would panic or miscompute Content-Length/Range); `PartETags` / `PartIdx` are soft-guarded (applied only if length matches, empty index ⇒ None).
-- **INVARIANT — negative `part.actual_size` is a valid sentinel** for "compressed, actual size unknown" ([fileinfo.rs:52](../../crates/filemeta/src/fileinfo.rs)); it is carried verbatim and must not be rejected on decode (see §11).
+- **INVARIANT — negative `part.actual_size` is a valid sentinel** for "compressed, actual size unknown" ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)); it is carried verbatim and must not be rejected on decode (see §11).
 
 **`MetaDeleteMarker` (DelObj)** — msgpack map, always 3 keys `ID`, `MTime`, `MetaSys` ([version.rs](../../crates/filemeta/src/filemeta/version.rs)); `MetaSys` is always written even when empty. Decode folds nil `ID` ⇒ None and epoch `MTime` ⇒ None, and skips unknown keys.
 
@@ -205,7 +206,7 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 
 ### 6.4 `ErasureInfo` and geometry on disk
 
-`ErasureInfo` ([fileinfo.rs:117](../../crates/filemeta/src/fileinfo.rs)): `algorithm` (`"rs-vandermonde"` for RS), `data_blocks` (=`EcM`), `parity_blocks` (=`EcN`), `block_size` (=`EcBSize`), `index` (=`EcIndex`), `distribution: Vec<usize>` (=`EcDist`), `checksums: Vec<ChecksumInfo>` (empty for V2Obj). On write, `From<FileInfo>` hardcodes `ReedSolomon` + `HighwayHash` algo enums.
+`ErasureInfo` ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)): `algorithm` (`"rs-vandermonde"` for RS), `data_blocks` (=`EcM`), `parity_blocks` (=`EcN`), `block_size` (=`EcBSize`), `index` (=`EcIndex`), `distribution: Vec<usize>` (=`EcDist`), `checksums: Vec<ChecksumInfo>` (empty for V2Obj). On write, `From<FileInfo>` hardcodes `ReedSolomon` + `HighwayHash` algo enums.
 
 ### 6.5 Internal metadata keys (dual prefix)
 
@@ -234,9 +235,9 @@ Small objects store their payload inline after the container CRC ([filemeta_inli
 
 - **INVARIANT — read quorum = `data_blocks`.** `object_quorum_from_meta` returns `(read_quorum = data_blocks, write_quorum)` ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs)); `parity_blocks = common_parity(...)` is the parity value held by the most disks that still reaches its own read quorum. When `default_parity_count == 0`, read = write = all shards.
 - Authoritative FileInfo selection — `find_file_info_in_quorum` ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs)) groups valid metas by a content-identity SHA-256 (`file_info_quorum_hash`) that hashes size/flags/mod_time/transition/version_id/data_dir/parts and, for real objects, data/parity/distribution — **excluding replication-status keys** so replication noise never splits quorum. A meta counts only if its mod_time equals the common mod_time (or etag matches when mod_time is absent). The winning hash must reach quorum, else `ErasureReadQuorum`. Latest-version reads may escalate to write_quorum to avoid resurrecting a partially-overwritten version.
-- **INVARIANT — decode needs ≥ `data_blocks` shards.** The stripe reader requires `available_shards ≥ data_shards`; below that the read fails closed with a read-quorum error (never silent truncation) ([set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs), [set_disk/shard_source.rs](../../crates/ecstore/src/set_disk/shard_source.rs)). Before any `block_size` / `data_shards` division, `has_valid_dimensions()` must hold (`block_size > 0 && data_shards > 0`) or the read fails instead of dividing by zero ([erasure.rs:809](../../crates/ecstore/src/erasure/coding/erasure.rs)).
+- **INVARIANT — decode needs ≥ `data_blocks` shards.** The stripe reader requires `available_shards ≥ data_shards`; below that the read fails closed with a read-quorum error (never silent truncation) ([set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs), [set_disk/shard_source.rs](../../crates/ecstore/src/set_disk/shard_source.rs)). Before any `block_size` / `data_shards` division, `has_valid_dimensions()` must hold (`block_size > 0 && data_shards > 0`) or the read fails instead of dividing by zero ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)).
 - If `available ≥ data_blocks` but some shards are missing, the read is served **and** a background read-repair heal is enqueued.
-- **INVARIANT — cross-stripe read verification.** When a data shard is missing and `available > data_blocks`, reconstruction regenerates parity and compares it to the surviving parity; a mismatch is `InvalidData "inconsistent read source shards"` (backlog#832), catching corruption that passed per-shard bitrot but disagrees across the stripe ([erasure.rs:711](../../crates/ecstore/src/erasure/coding/erasure.rs)).
+- **INVARIANT — cross-stripe read verification.** When a data shard is missing and `available > data_blocks`, reconstruction regenerates parity and compares it to the surviving parity; a mismatch is `InvalidData "inconsistent read source shards"` (backlog#832), catching corruption that passed per-shard bitrot but disagrees across the stripe ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)).
 
 ---
 
@@ -321,6 +322,7 @@ Decode tolerance
 ## 13. Change procedure and guardrails
 
 - **Risk tier.** All of the above is High-risk ([AGENTS.md](../../AGENTS.md)). Any behavior-affecting change requires the full seven-role adversarial validation.
+- **Keep this document in sync.** A change to any governed behavior, formula, format field, or invariant must update this spec in the same PR; renaming a cited symbol must update its reference here. The spec is normative and is the checklist the next change is reviewed against, so drift is a correctness defect. References are symbol-based (not line numbers) specifically so ordinary refactors do not invalidate them — but semantic changes still must.
 - **Adding an on-disk field** must be additive: new msgpack key or a `minor`/`meta_ver` bump with a read path for the old value; keep decoders skipping unknown keys; write both internal-key prefixes; never repurpose or reorder existing keys or header array positions.
 - **Never make a decode boundary stricter** than what §11 allows without (a) proving no legitimate older-RustFS or MinIO-migrated shape is rejected, and (b) a regression test against real on-disk and MinIO fixtures. New validation belongs at the trust boundary and must fail *open to a tolerant default*, not closed to `FileCorrupt`, for anything recoverable. (Concretely: rejecting a negative `actual_size`, or hard-failing a non-16-byte `transitioned-versionID`, breaks existing data — see §11.)
 - **Codec construction.** The baseline exposes panicking `Erasure::new` / `new_with_options` (the codec's shard-count validation surfaces as an `.expect` panic), plus `has_valid_dimensions()` as the read-path preflight ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)). Production paths that build a codec from on-disk geometry must guard with `has_valid_dimensions()` first; a fallible constructor is preferred over panicking in any path reachable from untrusted metadata.
@@ -334,7 +336,7 @@ Decode tolerance
 ## 14. References
 
 - Reed–Solomon codes; MDS property and GF(2⁸) byte-oriented coding — the standard basis for `rs-vandermonde` (Vandermonde generator matrix over GF(2⁸)).
-- `rustfs-erasure-codec` (RustFS fork of `reed-solomon-erasure`, GF(2⁸)) and `reed-solomon-simd` (GF(2¹⁶)) — `Cargo.toml:279`–`280`.
+- `rustfs-erasure-codec` (RustFS fork of `reed-solomon-erasure`, GF(2⁸)) and `reed-solomon-simd` (GF(2¹⁶)) — declared in the workspace `Cargo.toml`.
 - HighwayHash-256 — the bitrot checksum family; π-derived default key.
 - MinIO `xl.meta` v1.3 format lineage — RustFS is byte-compatible for read + one-way migration; see [minio-file-format-compat.md](minio-file-format-compat.md) for the fixture-proven matrix and scope.
 - Related invariants: [placement-repair-invariants.md](placement-repair-invariants.md), [ecstore-layout-boundary.md](ecstore-layout-boundary.md), [decommission-compatibility.md](decommission-compatibility.md), [../operations/tier-ilm-debugging.md](../operations/tier-ilm-debugging.md), and [AGENTS.md](../../AGENTS.md) Cross-Cutting Domain Invariants.
