@@ -55,6 +55,14 @@ const EVENT_RPC_RESPONSE_EMITTED: &str = "rpc_response_emitted";
 const EVENT_RPC_BACKGROUND_TASK_SPAWNED: &str = "rpc_background_task_spawned";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 
+fn scanner_activity_response(namespace_generation: u64) -> ScannerActivityResponse {
+    ScannerActivityResponse {
+        instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        namespace_generation,
+        maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+    }
+}
+
 macro_rules! log_load_rebalance_meta_rejected {
     ($reason:expr, $start_rebalance:expr) => {
         warn!(
@@ -980,6 +988,16 @@ impl Node for NodeService {
         }
     }
 
+    async fn scanner_activity(
+        &self,
+        _request: Request<ScannerActivityRequest>,
+    ) -> Result<Response<ScannerActivityResponse>, Status> {
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
+        Ok(Response::new(scanner_activity_response(store.scanner_namespace_mutation_generation())))
+    }
+
     async fn background_heal_status(
         &self,
         _request: Request<BackgroundHealStatusRequest>,
@@ -1216,7 +1234,7 @@ mod tests {
     use super::{
         CollectMetricsOpts, Error, MetricType, Node as _, NodeService, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
-        background_rebalance_start_error_message, make_server, stop_rebalance_response,
+        background_rebalance_start_error_message, make_server, scanner_activity_response, stop_rebalance_response,
     };
     use bytes::Bytes;
     use rustfs_protos::models::PingBodyBuilder;
@@ -1232,9 +1250,10 @@ mod tests {
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
         MakeVolumesRequest, Mss, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest,
         ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest,
-        RenamePartRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest,
-        StopRebalanceRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteMetadataRequest, WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
+        RenamePartRequest, ScannerActivityRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest,
+        StatVolumeRequest, StopRebalanceRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest,
+        WriteAllRequest, WriteMetadataRequest, WriteRequest, node_service_client::NodeServiceClient,
+        node_service_server::NodeServiceServer,
     };
     use std::collections::HashMap;
     use tokio::net::TcpListener;
@@ -2561,8 +2580,12 @@ mod tests {
     #[tokio::test]
     async fn test_load_bucket_metadata_empty_bucket() {
         let service = create_test_node_service();
+        let maintenance_generation = rustfs_scanner::scanner_maintenance_generation();
 
-        let request = Request::new(LoadBucketMetadataRequest { bucket: "".to_string() });
+        let request = Request::new(LoadBucketMetadataRequest {
+            bucket: "".to_string(),
+            scanner_maintenance_change: true,
+        });
 
         let response = service.load_bucket_metadata(request).await;
         assert!(response.is_ok());
@@ -2571,6 +2594,11 @@ mod tests {
         assert!(!load_response.success);
         assert!(load_response.error_info.is_some());
         assert!(load_response.error_info.unwrap().contains("bucket name is missing"));
+        assert_eq!(
+            rustfs_scanner::scanner_maintenance_generation(),
+            maintenance_generation,
+            "rejected metadata reloads must not advance scanner maintenance activity"
+        );
     }
 
     #[tokio::test]
@@ -2580,6 +2608,7 @@ mod tests {
 
         let request = Request::new(LoadBucketMetadataRequest {
             bucket: "test-bucket".to_string(),
+            scanner_maintenance_change: false,
         });
 
         let response = service.load_bucket_metadata(request).await;
@@ -2827,6 +2856,27 @@ mod tests {
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
         assert_eq!(signal_response.error_info.as_deref(), Some("unsupported service signal: 99"));
+    }
+
+    #[tokio::test]
+    async fn test_scanner_activity_requires_storage_layer() {
+        let service = create_test_node_service();
+
+        let err = service
+            .scanner_activity(Request::new(ScannerActivityRequest {}))
+            .await
+            .expect_err("activity queries must fail closed before storage is initialized");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn test_scanner_activity_response_uses_process_epoch_and_generations() {
+        let response = scanner_activity_response(17);
+
+        assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
+        assert_eq!(response.namespace_generation, 17);
+        assert_eq!(response.maintenance_generation, rustfs_scanner::scanner_maintenance_generation());
     }
 
     #[tokio::test]

@@ -2019,22 +2019,32 @@ impl TestSseDekProvider {
 
     /// Create a local SSE DEK provider for SSE-S3 when KMS is not configured.
     /// Requires RUSTFS_SSE_S3_MASTER_KEY to be a valid base64-encoded 32-byte key.
+    ///
+    /// The failures here are server configuration problems, not internal
+    /// faults: surface them as `InvalidRequest` (HTTP 400) so a managed-SSE
+    /// request against an unconfigured server does not report 500 (rustfs#4844).
     pub fn new_for_local_sse() -> Result<Self, ApiError> {
+        fn sse_not_configured(message: impl Into<String>) -> ApiError {
+            ApiError {
+                code: S3ErrorCode::InvalidRequest,
+                message: message.into(),
+                source: None,
+            }
+        }
+
         let Some(raw_value) = get_env_opt_str("RUSTFS_SSE_S3_MASTER_KEY").filter(|value| !value.trim().is_empty()) else {
-            return Err(ApiError::from(StorageError::other(
+            return Err(sse_not_configured(
                 "SSE-S3 requires RUSTFS_SSE_S3_MASTER_KEY to be set to a base64-encoded 32-byte key when KMS is not configured",
-            )));
+            ));
         };
 
         let decoded = BASE64_STANDARD.decode(raw_value.trim()).map_err(|err| {
-            ApiError::from(StorageError::other(format!(
+            sse_not_configured(format!(
                 "RUSTFS_SSE_S3_MASTER_KEY must be valid base64 for SSE-S3 when KMS is not configured: {err}"
-            )))
+            ))
         })?;
         let master_key: [u8; 32] = decoded.try_into().map_err(|_| {
-            ApiError::from(StorageError::other(
-                "RUSTFS_SSE_S3_MASTER_KEY must decode to exactly 32 bytes for SSE-S3 when KMS is not configured",
-            ))
+            sse_not_configured("RUSTFS_SSE_S3_MASTER_KEY must decode to exactly 32 bytes for SSE-S3 when KMS is not configured")
         })?;
 
         tracing::info!("Using RUSTFS_SSE_S3_MASTER_KEY for SSE-S3 (KMS not configured)");
@@ -3916,6 +3926,11 @@ mod tests {
                 .expect_err("SSE-S3 should fail closed without a configured local master key");
 
                 assert!(err.message.contains("RUSTFS_SSE_S3_MASTER_KEY"));
+                assert_eq!(
+                    err.code,
+                    S3ErrorCode::InvalidRequest,
+                    "missing local SSE master key is a configuration error, not a 500 (rustfs#4844)"
+                );
             },
         )
         .await;
@@ -3947,6 +3962,11 @@ mod tests {
                 .expect_err("SSE-S3 should fail closed with an invalid local master key");
 
                 assert!(err.message.contains("valid base64"));
+                assert_eq!(
+                    err.code,
+                    S3ErrorCode::InvalidRequest,
+                    "invalid local SSE master key is a configuration error, not a 500 (rustfs#4844)"
+                );
             },
         )
         .await;

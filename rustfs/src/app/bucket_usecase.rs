@@ -485,14 +485,27 @@ fn notify_bucket_metadata_reload(
     bucket: String,
     operation: &'static str,
     request_context: Option<request_context::RequestContext>,
+    scanner_maintenance_change: bool,
 ) {
+    record_local_scanner_maintenance_reload(&bucket, scanner_maintenance_change);
     spawn_background_with_context(request_context, async move {
-        if let Some(notification_sys) = current_notification_system()
-            && let Err(err) = notification_sys.load_bucket_metadata(&bucket).await
-        {
-            warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
+        if let Some(notification_sys) = current_notification_system() {
+            let result = if scanner_maintenance_change {
+                notification_sys.load_bucket_metadata_for_scanner_maintenance(&bucket).await
+            } else {
+                notification_sys.load_bucket_metadata(&bucket).await
+            };
+            if let Err(err) = result {
+                warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
+            }
         }
     });
+}
+
+fn record_local_scanner_maintenance_reload(bucket: &str, scanner_maintenance_change: bool) {
+    if scanner_maintenance_change {
+        rustfs_scanner::record_scanner_maintenance_change(bucket);
+    }
 }
 
 /// Notify peers to drop their cached metadata for a bucket that was just deleted,
@@ -1205,7 +1218,9 @@ impl DefaultBucketUsecase {
         // Invalidate bucket validation cache
         crate::storage::invalidate_bucket_validation_cache(&input.bucket);
 
-        rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
+        // Re-evaluate lifecycle/replication after bucket removal and keep an
+        // absent-bucket dirty marker until a complete usage snapshot is durable.
+        rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
         if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
             warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");
         }
@@ -1338,7 +1353,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context, false);
 
         let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1369,7 +1384,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context, false);
 
         let item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1400,14 +1415,13 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket lifecycle", request_context, true);
 
         let item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
@@ -1431,7 +1445,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket policy", request_context, false);
 
         let item = sr_bucket_meta_item(bucket.clone(), "policy");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1481,7 +1495,7 @@ impl DefaultBucketUsecase {
         }
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context, true);
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1490,7 +1504,6 @@ impl DefaultBucketUsecase {
 
         info!(bucket = %bucket, "deleted bucket replication config");
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
@@ -1506,7 +1519,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context, false);
 
         let item = sr_bucket_meta_item(bucket.clone(), "tags");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1538,7 +1551,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "delete public access block", request_context, false);
 
         Ok(S3Response::with_status(DeletePublicAccessBlockOutput::default(), StatusCode::NO_CONTENT))
     }
@@ -1990,7 +2003,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context, false);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         item.sse_config = Some(
@@ -2051,7 +2064,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket lifecycle", request_context, true);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "lc-config");
         item.expiry_lc_config =
@@ -2096,7 +2109,6 @@ impl DefaultBucketUsecase {
             });
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
 
@@ -2129,7 +2141,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context, false);
 
         let region = resolve_notification_region(self.global_region(), request_region);
         let notify = current_notify_interface_for_context(self.context.as_deref());
@@ -2232,7 +2244,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket policy", request_context, false);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "policy");
         item.policy = Some(serde_json::from_str(&policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
@@ -2266,7 +2278,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context, false);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         item.cors =
@@ -2307,7 +2319,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
         drop(targets_guard);
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context, true);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         item.replication_config = Some(
@@ -2317,7 +2329,6 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
         }
 
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
@@ -2347,7 +2358,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put public access block", request_context, false);
 
         Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
     }
@@ -2375,7 +2386,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context, false);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
         item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
@@ -2407,7 +2418,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context);
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context, false);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
         item.versioning = Some(
@@ -2654,23 +2665,23 @@ mod tests {
     #[test]
     fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
         let source = include_str!("bucket_usecase.rs");
-        for (method, operation) in [
-            ("execute_delete_bucket_policy", "delete bucket policy"),
-            ("execute_put_bucket_policy", "put bucket policy"),
-            ("execute_delete_public_access_block", "delete public access block"),
-            ("execute_put_public_access_block", "put public access block"),
-            ("execute_delete_bucket_lifecycle", "delete bucket lifecycle"),
-            ("execute_put_bucket_lifecycle_configuration", "put bucket lifecycle"),
-            ("execute_put_bucket_versioning", "put bucket versioning"),
-            ("execute_delete_bucket_tagging", "delete bucket tagging"),
-            ("execute_put_bucket_tagging", "put bucket tagging"),
-            ("execute_delete_bucket_replication", "delete bucket replication"),
-            ("execute_put_bucket_replication", "put bucket replication"),
-            ("execute_delete_bucket_cors", "delete bucket cors"),
-            ("execute_put_bucket_cors", "put bucket cors"),
-            ("execute_delete_bucket_encryption", "delete bucket encryption"),
-            ("execute_put_bucket_encryption", "put bucket encryption"),
-            ("execute_put_bucket_notification_configuration", "put bucket notification"),
+        for (method, operation, scanner_maintenance_change) in [
+            ("execute_delete_bucket_policy", "delete bucket policy", false),
+            ("execute_put_bucket_policy", "put bucket policy", false),
+            ("execute_delete_public_access_block", "delete public access block", false),
+            ("execute_put_public_access_block", "put public access block", false),
+            ("execute_delete_bucket_lifecycle", "delete bucket lifecycle", true),
+            ("execute_put_bucket_lifecycle_configuration", "put bucket lifecycle", true),
+            ("execute_put_bucket_versioning", "put bucket versioning", false),
+            ("execute_delete_bucket_tagging", "delete bucket tagging", false),
+            ("execute_put_bucket_tagging", "put bucket tagging", false),
+            ("execute_delete_bucket_replication", "delete bucket replication", true),
+            ("execute_put_bucket_replication", "put bucket replication", true),
+            ("execute_delete_bucket_cors", "delete bucket cors", false),
+            ("execute_put_bucket_cors", "put bucket cors", false),
+            ("execute_delete_bucket_encryption", "delete bucket encryption", false),
+            ("execute_put_bucket_encryption", "put bucket encryption", false),
+            ("execute_put_bucket_notification_configuration", "put bucket notification", false),
         ] {
             let body = usecase_method_source(source, method);
             assert!(
@@ -2681,7 +2692,29 @@ mod tests {
                 body.contains(operation),
                 "{method} should identify the bucket metadata operation in reload logs"
             );
+            let expected_reload = format!(
+                "notify_bucket_metadata_reload(bucket.clone(), \"{operation}\", request_context, {scanner_maintenance_change});"
+            );
+            assert!(
+                body.contains(&expected_reload),
+                "{method} should propagate scanner_maintenance_change={scanner_maintenance_change}"
+            );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scanner_maintenance_reload_marks_only_scanner_owned_config_changes() {
+        const BUCKET: &str = "scanner-maintenance-reload-test";
+        rustfs_scanner::clear_dirty_usage_bucket(BUCKET);
+        let before = rustfs_scanner::scanner_maintenance_generation();
+
+        record_local_scanner_maintenance_reload(BUCKET, false);
+        assert_eq!(rustfs_scanner::scanner_maintenance_generation(), before);
+
+        record_local_scanner_maintenance_reload(BUCKET, true);
+        assert_eq!(rustfs_scanner::scanner_maintenance_generation(), before.saturating_add(1));
+        rustfs_scanner::clear_dirty_usage_bucket(BUCKET);
     }
 
     fn replication_rule_for_target(arn: &str) -> ReplicationRule {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cluster::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
-use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
+use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend_cached};
 use crate::error::{Error, Result};
 use crate::{disk::endpoint::Endpoint, runtime::sources as runtime_sources};
 
@@ -42,6 +42,33 @@ use shadow_rs::shadow;
 shadow!(build);
 
 const SERVER_PING_TIMEOUT: Duration = Duration::from_secs(1);
+const DATA_USAGE_UNAVAILABLE_ERROR: &str = "data usage snapshot unavailable";
+
+fn apply_data_usage_result(
+    result: Result<rustfs_data_usage::DataUsageInfo>,
+    buckets: &mut rustfs_madmin::Buckets,
+    objects: &mut rustfs_madmin::Objects,
+    versions: &mut rustfs_madmin::Versions,
+    delete_markers: &mut rustfs_madmin::DeleteMarkers,
+    usage: &mut rustfs_madmin::Usage,
+) {
+    match result {
+        Ok(info) => {
+            buckets.count = info.buckets_count;
+            objects.count = info.objects_total_count;
+            versions.count = info.versions_total_count;
+            delete_markers.count = info.delete_markers_total_count;
+            usage.size = info.objects_total_size;
+        }
+        Err(_) => {
+            buckets.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
+            objects.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
+            versions.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
+            delete_markers.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
+            usage.error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string());
+        }
+    }
+}
 
 // pub const ITEM_OFFLINE: &str = "offline";
 // pub const ITEM_INITIALIZING: &str = "initializing";
@@ -246,22 +273,14 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
 
     if let Some(store) = runtime_sources::object_store_handle() {
         mode = ITEM_ONLINE;
-        match load_data_usage_from_backend(store.clone()).await {
-            Ok(res) => {
-                buckets.count = res.buckets_count;
-                objects.count = res.objects_total_count;
-                versions.count = res.versions_total_count;
-                delete_markers.count = res.delete_markers_total_count;
-                usage.size = res.objects_total_size;
-            }
-            Err(err) => {
-                buckets.error = Some(err.to_string());
-                objects.error = Some(err.to_string());
-                versions.error = Some(err.to_string());
-                delete_markers.error = Some(err.to_string());
-                usage.error = Some(err.to_string());
-            }
-        }
+        apply_data_usage_result(
+            load_data_usage_from_backend_cached(store.clone()).await,
+            &mut buckets,
+            &mut objects,
+            &mut versions,
+            &mut delete_markers,
+            &mut usage,
+        );
 
         let after3 = OffsetDateTime::now_utc();
 
@@ -433,7 +452,10 @@ mod tests {
     use crate::runtime::sources as runtime_sources;
     use rustfs_madmin::{Disk, ITEM_OFFLINE, ITEM_UNKNOWN};
 
-    use super::{get_local_server_property, get_online_offline_disks_stats, get_server_info};
+    use super::{
+        DATA_USAGE_UNAVAILABLE_ERROR, apply_data_usage_result, get_local_server_property, get_online_offline_disks_stats,
+        get_server_info,
+    };
 
     fn disk_with_state(endpoint: &str, state: &str) -> Disk {
         Disk {
@@ -469,6 +491,55 @@ mod tests {
             disks.len(),
             "online + offline + unknown must equal the total drive count"
         );
+    }
+
+    #[test]
+    fn data_usage_errors_are_sanitized_in_server_info() {
+        let mut buckets = rustfs_madmin::Buckets::default();
+        let mut objects = rustfs_madmin::Objects::default();
+        let mut versions = rustfs_madmin::Versions::default();
+        let mut delete_markers = rustfs_madmin::DeleteMarkers::default();
+        let mut usage = rustfs_madmin::Usage::default();
+
+        apply_data_usage_result(
+            Err(crate::error::Error::other("sensitive disk path")),
+            &mut buckets,
+            &mut objects,
+            &mut versions,
+            &mut delete_markers,
+            &mut usage,
+        );
+
+        assert_eq!(buckets.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(objects.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(versions.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(delete_markers.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+        assert_eq!(usage.error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+    }
+
+    #[test]
+    fn data_usage_counts_are_mapped_into_server_info() {
+        let mut buckets = rustfs_madmin::Buckets::default();
+        let mut objects = rustfs_madmin::Objects::default();
+        let mut versions = rustfs_madmin::Versions::default();
+        let mut delete_markers = rustfs_madmin::DeleteMarkers::default();
+        let mut usage = rustfs_madmin::Usage::default();
+        let info = rustfs_data_usage::DataUsageInfo {
+            buckets_count: 2,
+            objects_total_count: 3,
+            versions_total_count: 4,
+            delete_markers_total_count: 5,
+            objects_total_size: 6,
+            ..Default::default()
+        };
+
+        apply_data_usage_result(Ok(info), &mut buckets, &mut objects, &mut versions, &mut delete_markers, &mut usage);
+
+        assert_eq!(buckets.count, 2);
+        assert_eq!(objects.count, 3);
+        assert_eq!(versions.count, 4);
+        assert_eq!(delete_markers.count, 5);
+        assert_eq!(usage.size, 6);
     }
 
     #[serial]

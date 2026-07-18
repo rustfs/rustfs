@@ -923,6 +923,8 @@ pub struct GetAllBucketStatsResponse {
 pub struct LoadBucketMetadataRequest {
     #[prost(string, tag = "1")]
     pub bucket: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub scanner_maintenance_change: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadBucketMetadataResponse {
@@ -1065,6 +1067,17 @@ pub struct SignalServiceResponse {
     pub success: bool,
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerActivityRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerActivityResponse {
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub namespace_generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub maintenance_generation: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusRequest {}
@@ -2351,6 +2364,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "SignalService"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn scanner_activity(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ScannerActivityRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerActivityResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ScannerActivity");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ScannerActivity"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn background_heal_status(
             &mut self,
             request: impl tonic::IntoRequest<super::BackgroundHealStatusRequest>,
@@ -2825,6 +2853,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::SignalServiceRequest>,
         ) -> std::result::Result<tonic::Response<super::SignalServiceResponse>, tonic::Status>;
+        async fn scanner_activity(
+            &self,
+            request: tonic::Request<super::ScannerActivityRequest>,
+        ) -> std::result::Result<tonic::Response<super::ScannerActivityResponse>, tonic::Status>;
         async fn background_heal_status(
             &self,
             request: tonic::Request<super::BackgroundHealStatusRequest>,
@@ -4924,6 +4956,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SignalServiceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ScannerActivity" => {
+                    #[allow(non_camel_case_types)]
+                    struct ScannerActivitySvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ScannerActivityRequest> for ScannerActivitySvc<T> {
+                        type Response = super::ScannerActivityResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ScannerActivityRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::scanner_activity(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ScannerActivitySvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

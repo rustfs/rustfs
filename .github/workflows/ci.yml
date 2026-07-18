@@ -228,29 +228,23 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The #4877 restore self-deadlock is fixed in this PR, which re-enabled
-      # test_multipart_restore_preserves_parts_and_etag. The remaining exclusions
-      # each hit a DIFFERENT, independent issue (all tracked under
-      # rustfs/backlog#1148; they keep #[ignore] with a backlog reference):
+      # test_transition_and_restore_flows was re-enabled by rustfs/backlog#1303:
+      # its "missing xl.meta on disk2" was a test-util bug (open_disk hardcoded
+      # disk_index 0), not an EC metadata-distribution issue.
+      # restore_object_usecase_reports_ongoing_conflict_and_completion was
+      # re-enabled by backlog#1304 (restore accepts serialize on a short CAS
+      # guard; the copy-back no longer holds the #4877 whole-copy-back lock,
+      # so the mid-restore ongoing read and fast 409 rejection it asserts are
+      # the implemented contract). The remaining exclusions each hit a
+      # DIFFERENT, independent issue (all tracked under rustfs/backlog#1148;
+      # they keep #[ignore] with a backlog reference):
       #   - test_noncurrent_{expiry,transition}_still_works_after_immediate_compensation_transition:
       #     noncurrent transition/expiry after an immediate compensation transition.
-      #   - test_transition_and_restore_flows: transition metadata is missing on
-      #     one drive (assert_transition_meta_consistent: "missing xl.meta ... on
-      #     disk2") - an EC metadata-distribution issue, not the restore lock.
-      #   - test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore:
-      #     DeleteRestoredAction sets opts.transition.expire_restored, but no
-      #     delete path reads that flag, so cleanup deletes the whole object
-      #     instead of only the local restored copy (ObjectNotFound afterwards).
-      #     The expire_restored delete semantics are unimplemented.
-      #   - restore_object_usecase_reports_ongoing_conflict_and_completion: asserts
-      #     a concurrent get_object_info observes ongoing-request=true mid-restore,
-      #     which #4877's read-vs-restore serialization rules out (see backlog#1148
-      #     ilm-8 criterion 1 - an API-semantics decision, not a bug).
       - name: Run ignored ILM integration tests serially
         run: |
           cargo nextest run -j1 --run-ignored ignored-only \
             -p rustfs-scanner -p rustfs \
-            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition) or test(restore_object_usecase_reports_ongoing_conflict_and_completion) or test(test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore))'
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))'
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
