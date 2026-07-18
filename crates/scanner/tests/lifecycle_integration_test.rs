@@ -1780,7 +1780,7 @@ mod serial_tests {
     /// tier again -> a second restore succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there - DeleteRestoredAction/expire_restored delete semantics are unimplemented, so cleanup removes the whole object"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
     async fn test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
