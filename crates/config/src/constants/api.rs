@@ -73,3 +73,20 @@ pub const ENV_API_RATE_LIMIT_BUCKET_BURST: &str = "RUSTFS_API_RATE_LIMIT_BUCKET_
 
 /// Default for `RUSTFS_API_RATE_LIMIT_BUCKET_BURST` (`0` = same as bucket RPM).
 pub const DEFAULT_API_RATE_LIMIT_BUCKET_BURST: u32 = 0;
+
+/// Maximum concurrently served connections on the main API listener.
+///
+/// `0` (the default) means unlimited. When set, the accept loop stops
+/// accepting once the cap is reached and lets the kernel backlog absorb
+/// bursts, releasing capacity as connections close. This bounds file
+/// descriptor and memory usage under a connection flood.
+///
+/// The cap covers everything on the main listener — S3, admin, console,
+/// and internode gRPC — so size it well above peer-node count plus the
+/// expected client concurrency.
+/// Environment variable: RUSTFS_API_MAX_CONNECTIONS
+/// Example: RUSTFS_API_MAX_CONNECTIONS=10000
+pub const ENV_API_MAX_CONNECTIONS: &str = "RUSTFS_API_MAX_CONNECTIONS";
+
+/// Default for `RUSTFS_API_MAX_CONNECTIONS` (`0` = unlimited).
+pub const DEFAULT_API_MAX_CONNECTIONS: usize = 0;

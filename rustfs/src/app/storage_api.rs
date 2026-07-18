@@ -51,28 +51,17 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
 
-    pub(crate) async fn load_data_usage_from_backend(
+    pub(crate) async fn load_data_usage_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend(store).await
+        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend_cached(store).await
     }
 
-    pub(crate) async fn refresh_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
-        bucket_name: &str,
-    ) -> Result<rustfs_data_usage::BucketUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::refresh_bucket_usage_from_object_layer(
-            store,
-            data_usage_info,
-            bucket_name,
-        )
-        .await
-    }
-
-    pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
-        crate::storage::storage_api::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
-    }
+    // Test-only observables for the rustfs/backlog#1306 revert detector.
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::{
+        compute_bucket_usage, live_bucket_usage_computations, store_data_usage_in_backend,
+    };
 
     pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
         crate::storage::storage_api::ecstore_data_usage::record_bucket_object_delete_memory(
@@ -484,7 +473,7 @@ pub(crate) mod bucket {
             bucket: &str,
             config_file: &str,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::delete(bucket, config_file).await
+            crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
         }
 
         pub(crate) async fn get_bucket_policy(
@@ -562,7 +551,7 @@ pub(crate) mod bucket {
             config_file: &str,
             data: Vec<u8>,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::update(bucket, config_file, data).await
+            crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
         }
     }
 
@@ -936,10 +925,6 @@ pub(crate) mod s3_api {
 
 pub(crate) mod admin_usecase {
     pub(crate) mod contract {
-        pub(crate) mod bucket {
-            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
-        }
-
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
     }
 
@@ -1073,7 +1058,7 @@ pub(crate) mod test {
         }
     }
 
-    pub(crate) use super::{bucket, ecfs, object_utils, runtime};
+    pub(crate) use super::{bucket, data_usage, ecfs, object_utils, runtime};
     pub(crate) use crate::storage::storage_api::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
     };

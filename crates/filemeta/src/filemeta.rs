@@ -1153,6 +1153,53 @@ mod test {
         assert_eq!(fm, newfm)
     }
 
+    /// Regression for rustfs/backlog#1302: `delete_version` with
+    /// `expire_restored` must only strip the `x-amz-restore` headers and hand
+    /// back the local data dir for cleanup; the version itself must survive
+    /// with its transition metadata (and thus the remote tier copy) intact.
+    #[test]
+    fn test_delete_version_expire_restored_keeps_transitioned_version() {
+        use rustfs_utils::http::headers::{AMZ_RESTORE, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
+
+        let mut fm = FileMeta::new();
+        let vid = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+
+        let mut fi = FileInfo::new("restored.bin", 3, 2);
+        fi.version_id = Some(vid);
+        fi.data_dir = Some(data_dir);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fi.transition_status = TRANSITION_COMPLETE.to_string();
+        fi.transitioned_objname = "remote/obj".to_string();
+        fi.transition_tier = "COLDTIER".to_string();
+        fi.metadata.insert(
+            AMZ_RESTORE.to_string(),
+            "ongoing-request=\"false\", expiry-date=\"Fri, 17 Jul 2026 00:00:00 GMT\"".to_string(),
+        );
+        fi.metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), "1".to_string());
+        fi.metadata
+            .insert(AMZ_RESTORE_REQUEST_DATE.to_string(), "Thu, 16 Jul 2026 00:00:00 GMT".to_string());
+        fm.add_version(fi).unwrap();
+
+        let expire_fi = FileInfo {
+            name: "restored.bin".to_string(),
+            version_id: Some(vid),
+            expire_restored: true,
+            ..Default::default()
+        };
+        let freed = fm.delete_version(&expire_fi).unwrap();
+        assert_eq!(freed, Some(data_dir), "the restored copy's local data dir must be handed back");
+
+        assert_eq!(fm.versions.len(), 1, "the version must survive restored-copy expiry");
+        let after = fm.into_fileinfo("vol", "restored.bin", "", false, false, true).unwrap();
+        assert!(!after.metadata.contains_key(AMZ_RESTORE), "x-amz-restore must be stripped");
+        assert!(!after.metadata.contains_key(AMZ_RESTORE_EXPIRY_DAYS));
+        assert!(!after.metadata.contains_key(AMZ_RESTORE_REQUEST_DATE));
+        assert_eq!(after.transition_status, TRANSITION_COMPLETE);
+        assert_eq!(after.transitioned_objname, "remote/obj");
+        assert_eq!(after.transition_tier, "COLDTIER");
+    }
+
     #[test]
     fn test_get_idx_out_of_bounds_returns_error_without_panic() {
         let mut fm = FileMeta::new();

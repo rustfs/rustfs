@@ -406,16 +406,28 @@ mod tests {
     }
 
     async fn create_bucket_with_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str) {
+        let generation_before_make = ecstore.scanner_namespace_mutation_generation();
         ecstore
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_make.saturating_add(1),
+            "successful bucket creation should advance scanner namespace activity"
+        );
 
+        let generation_before_put = ecstore.scanner_namespace_mutation_generation();
         let mut reader = PutObjReader::from_vec(b"delete bucket semantics".to_vec());
         ecstore
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("object should be written");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_put.saturating_add(1),
+            "successful object creation should advance scanner namespace activity"
+        );
         ecstore
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
@@ -504,6 +516,7 @@ mod tests {
         create_bucket_with_object(&ecstore, &bucket, object).await;
         assert!(metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_ok());
 
+        let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
         ecstore
             .delete_bucket(
                 &bucket,
@@ -514,6 +527,11 @@ mod tests {
             )
             .await
             .expect("MarkDelete should not reject non-empty bucket data");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_delete.saturating_add(1),
+            "successful bucket deletion should advance scanner namespace activity"
+        );
 
         assert!(
             any_disk_has_object_metadata(&disk_paths, &bucket).await,
@@ -541,6 +559,7 @@ mod tests {
         write_bucket_metadata_marker(&disk_paths, &metadata_prefix).await;
         assert!(any_disk_path_exists(&disk_paths, &metadata_prefix).await);
 
+        let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
         ecstore
             .delete_bucket(
                 &bucket,
@@ -552,6 +571,11 @@ mod tests {
             )
             .await
             .expect("Purge should force-delete bucket data");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_delete.saturating_add(1),
+            "successful bucket purge should advance scanner namespace activity"
+        );
 
         assert!(!any_disk_path_exists(&disk_paths, &bucket).await, "Purge should remove the bucket volume");
         assert!(
@@ -573,12 +597,18 @@ mod tests {
 
         create_bucket_with_object(&ecstore, &bucket, object).await;
 
+        let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
         let err = ecstore
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect_err("default S3 DeleteBucket should reject non-empty buckets");
 
         assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_delete,
+            "failed bucket deletion must not advance scanner namespace activity"
+        );
         assert!(
             any_disk_has_object_metadata(&disk_paths, &bucket).await,
             "failed default S3 DeleteBucket must keep object data"

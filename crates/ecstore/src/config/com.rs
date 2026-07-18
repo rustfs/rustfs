@@ -279,6 +279,17 @@ where
     Ok(data)
 }
 
+/// Read an existing config object without treating an empty payload as absent.
+/// Callers that validate their own payload format need to distinguish corruption
+/// from `ConfigNotFound`.
+pub(crate) async fn read_config_preserve_empty<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+where
+    S: EcstoreObjectIO,
+{
+    let (data, _obj) = read_config_with_metadata_inner(api, file, &ObjectOptions::default(), true).await?;
+    Ok(data)
+}
+
 pub async fn read_config_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
 where
     S: ObjectIO<
@@ -315,6 +326,26 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
+    read_config_with_metadata_inner(api, file, opts, false).await
+}
+
+async fn read_config_with_metadata_inner<S>(
+    api: Arc<S>,
+    file: &str,
+    opts: &ObjectOptions,
+    preserve_empty: bool,
+) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let h = HeaderMap::new();
     let mut rd = api
         .get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts)
@@ -330,7 +361,7 @@ where
 
     let data = rd.read_all().await?;
 
-    if data.is_empty() {
+    if data.is_empty() && !preserve_empty {
         return Err(Error::ConfigNotFound);
     }
 
@@ -1600,7 +1631,8 @@ where
 mod tests {
     use super::{
         apply_dynamic_config_for_sub_sys_with, configs_semantically_equal, decode_server_config_blob, encode_server_config_blob,
-        is_standard_object_server_config, lookup_configs, read_config_with_metadata, storage_class_kvs_mut,
+        is_standard_object_server_config, lookup_configs, read_config, read_config_preserve_empty, read_config_with_metadata,
+        storage_class_kvs_mut,
     };
     use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
@@ -3068,6 +3100,21 @@ mod tests {
         ) -> Result<ObjectInfo> {
             panic!("unused in test")
         }
+    }
+
+    #[tokio::test]
+    async fn read_config_preserve_empty_distinguishes_empty_object() {
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(Vec::new()), None));
+
+        let err = read_config(store.clone(), "config/empty.json")
+            .await
+            .expect_err("the existing config contract treats empty objects as missing");
+        assert!(matches!(err, Error::ConfigNotFound));
+
+        let data = read_config_preserve_empty(store, "config/empty.json")
+            .await
+            .expect("payload-validating callers must observe the empty object");
+        assert!(data.is_empty());
     }
 
     #[async_trait::async_trait]
