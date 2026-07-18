@@ -16,10 +16,11 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - uses: overtrue/star-history-action@71eb65f6d4798cf9de2549af1205e911555d0511 # v1.1.0
+      - uses: overtrue/star-history-action@276780af00976fb90f2d9f312ce9e25c6eecdcf5 # v1.2.0
         with:
           github-token: ${{ github.token }}
           output-branch: star-history
           output-path: .
           chart-style: gradient
           animate: "true"
+          contributors: "true"
