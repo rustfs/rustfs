@@ -160,7 +160,7 @@ use rustfs_utils::{
 };
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -547,6 +547,7 @@ const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
 const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
 const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES";
+const GET_OBJECT_METADATA_CACHE_FENCE_SHARDS: u16 = 4096;
 
 // --- Codec Streaming Configuration ---
 
@@ -2014,6 +2015,8 @@ pub struct SetDisks {
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
+    get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
+    get_object_metadata_cache_generations: Arc<[AtomicU64]>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
     /// Per-instance runtime context (Phase 5, backlog#939).
@@ -2033,18 +2036,106 @@ pub struct SetDisks {
     capacity_dirty_generation: Arc<AtomicU64>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GetObjectMetadataCacheKey {
+    bucket: Arc<str>,
+    object: Arc<str>,
+    generation: u64,
+    hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GetObjectMetadataCacheGeneration {
+    index: usize,
+    value: u64,
+    hash: u64,
+}
+
+#[cfg(test)]
+struct MetadataCacheInvalidationProbeState {
     bucket: String,
     object: String,
+    count: AtomicU64,
+}
+
+#[cfg(test)]
+struct MetadataCacheInvalidationProbe {
+    state: Arc<MetadataCacheInvalidationProbeState>,
+}
+
+#[cfg(test)]
+static METADATA_CACHE_INVALIDATION_PROBE: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<MetadataCacheInvalidationProbeState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl MetadataCacheInvalidationProbe {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(MetadataCacheInvalidationProbeState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            count: AtomicU64::new(0),
+        });
+        let mut slot = METADATA_CACHE_INVALIDATION_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("metadata cache invalidation probe mutex should not poison");
+        assert!(
+            slot.is_none(),
+            "metadata cache invalidation probe must be installed by one test at a time"
+        );
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    fn count(&self) -> u64 {
+        self.state.count.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCacheInvalidationProbe {
+    fn drop(&mut self) {
+        let mut slot = METADATA_CACHE_INVALIDATION_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("metadata cache invalidation probe mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_metadata_cache_invalidation(bucket: &str, object: &str) {
+    let probe = METADATA_CACHE_INVALIDATION_PROBE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("metadata cache invalidation probe mutex should not poison")
+        .as_ref()
+        .filter(|probe| probe.bucket == bucket && probe.object == object)
+        .cloned();
+    if let Some(probe) = probe {
+        probe.count.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl GetObjectMetadataCacheKey {
-    fn new(bucket: &str, object: &str) -> Self {
+    fn new(bucket: &str, object: &str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
+            bucket: Arc::from(bucket),
+            object: Arc::from(object),
+            generation: generation.value,
+            hash: generation.hash,
         }
+    }
+}
+
+impl Hash for GetObjectMetadataCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+        self.generation.hash(state);
     }
 }
 
@@ -2075,10 +2166,50 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    fn get_object_metadata_cache_hash(&self, bucket: &str, object: &str) -> u64 {
+        let mut hasher = self.get_object_metadata_cache_hash_builder.build_hasher();
+        bucket.hash(&mut hasher);
+        object.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn get_object_metadata_cache_generation(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheGeneration> {
+        let hash = self.get_object_metadata_cache_hash(bucket, object);
+        let hash_bytes = hash.to_le_bytes();
+        let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
+        let value = self.get_object_metadata_cache_generations[index].load(Ordering::Acquire);
+        (value != u64::MAX).then_some(GetObjectMetadataCacheGeneration { index, value, hash })
+    }
+
+    fn is_get_object_metadata_cache_generation_current(&self, generation: GetObjectMetadataCacheGeneration) -> bool {
+        self.get_object_metadata_cache_generations[generation.index].load(Ordering::Acquire) == generation.value
+    }
+
     async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
+        let hash = self.get_object_metadata_cache_hash(bucket, object);
+        let hash_bytes = hash.to_le_bytes();
+        let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
+        let generation = &self.get_object_metadata_cache_generations[index];
+        let previous = match generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1)) {
+            Ok(previous) | Err(previous) => previous,
+        };
+        let previous = GetObjectMetadataCacheGeneration {
+            index,
+            value: previous,
+            hash,
+        };
         self.get_object_metadata_cache
-            .invalidate(&GetObjectMetadataCacheKey::new(bucket, object))
+            .invalidate(&GetObjectMetadataCacheKey::new(bucket, object, previous))
             .await;
+        #[cfg(test)]
+        record_metadata_cache_invalidation(bucket, object);
+    }
+
+    fn invalidate_all_get_object_metadata_cache(&self) {
+        for generation in self.get_object_metadata_cache_generations.iter() {
+            let _ = generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1));
+        }
+        self.get_object_metadata_cache.invalidate_all();
     }
 
     async fn acquire_read_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
@@ -2225,6 +2356,12 @@ impl SetDisks {
                 .max_capacity(get_object_metadata_cache_max_entries() as u64)
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
                 .build(),
+            get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState::new(),
+            get_object_metadata_cache_generations: Arc::from(
+                (0..usize::from(GET_OBJECT_METADATA_CACHE_FENCE_SHARDS))
+                    .map(|_| AtomicU64::new(0))
+                    .collect::<Vec<_>>(),
+            ),
             lockers,
             // Sourced from the instance context so each instance owns its lock
             // namespace (Phase 5 Slice 3). Single-instance: ctx aliases the

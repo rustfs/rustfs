@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
 use crate::client::transition_api::{ReadCloser, ReaderImpl};
@@ -141,6 +141,40 @@ struct MockWarmBackendInner {
     objects: Mutex<HashMap<String, MockStoredObject>>,
     faults: Mutex<FaultConfig>,
     op_log: Mutex<Vec<MockWarmOp>>,
+    put_versions: Mutex<Vec<(String, String)>>,
+    remove_versions: Mutex<Vec<(String, String)>>,
+    put_barrier: Mutex<Option<Arc<MockPutBarrierState>>>,
+}
+
+#[derive(Default)]
+struct MockPutBarrierState {
+    arrived: Notify,
+    release: Notify,
+}
+
+/// One-shot barrier that pauses a mock tier PUT after storing its remote body.
+pub struct MockPutBarrier {
+    state: Arc<MockPutBarrierState>,
+}
+
+impl MockPutBarrier {
+    /// Wait until the remote body is stored and the PUT is paused before returning.
+    pub async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("mock tier PUT should reach the deterministic barrier");
+    }
+
+    /// Release the paused PUT.
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+impl Drop for MockPutBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+    }
 }
 
 /// In-memory [`WarmBackend`] for lifecycle / tiering integration tests.
@@ -157,6 +191,13 @@ impl MockWarmBackend {
     /// Create an empty backend with no faults injected.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Arm a one-shot pause after the next tier PUT stores its remote body.
+    pub async fn arm_put_barrier(&self) -> MockPutBarrier {
+        let state = Arc::new(MockPutBarrierState::default());
+        *self.inner.put_barrier.lock().await = Some(Arc::clone(&state));
+        MockPutBarrier { state }
     }
 
     // ---- fault injection -------------------------------------------------
@@ -230,6 +271,16 @@ impl MockWarmBackend {
             .iter()
             .filter(|op| matches!(op, MockWarmOp::Remove { .. }))
             .count()
+    }
+
+    /// Return the exact object/version pairs produced by successful tier PUTs.
+    pub async fn put_versions(&self) -> Vec<(String, String)> {
+        self.inner.put_versions.lock().await.clone()
+    }
+
+    /// Return the exact object/version pairs passed to successful tier removes.
+    pub async fn remove_versions(&self) -> Vec<(String, String)> {
+        self.inner.remove_versions.lock().await.clone()
     }
 
     /// Number of `get` calls recorded — useful to assert restore reads hit the
@@ -358,6 +409,11 @@ impl WarmBackend for MockWarmBackend {
         self.precondition().await?;
         let bytes = self.read_bytes(r).await?;
         let version = self.put_bytes(object, bytes, HashMap::new()).await;
+        self.inner
+            .put_versions
+            .lock()
+            .await
+            .push((object.to_string(), version.clone()));
         self.record(MockWarmOp::Put {
             object: object.to_string(),
         })
@@ -398,6 +454,16 @@ impl WarmBackend for MockWarmBackend {
             metadata.insert("x-amz-object-lock-legal-hold".to_string(), opts.legalhold.as_str().to_string());
         }
         let version = self.put_bytes(object, bytes, metadata).await;
+        self.inner
+            .put_versions
+            .lock()
+            .await
+            .push((object.to_string(), version.clone()));
+        let barrier = self.inner.put_barrier.lock().await.take();
+        if let Some(barrier) = barrier {
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+        }
         self.record(MockWarmOp::Put {
             object: object.to_string(),
         })
@@ -427,9 +493,22 @@ impl WarmBackend for MockWarmBackend {
         Ok(tokio::io::BufReader::new(Cursor::new(bytes[start.min(bytes.len())..end].to_vec())))
     }
 
-    async fn remove(&self, object: &str, _rv: &str) -> Result<(), std::io::Error> {
+    async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         self.precondition().await?;
-        self.inner.objects.lock().await.remove(object);
+        let mut objects = self.inner.objects.lock().await;
+        if let Some(stored) = objects.get(object)
+            && !rv.is_empty()
+            && stored.remote_version_id != rv
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "NoSuchVersion"));
+        }
+        objects.remove(object);
+        drop(objects);
+        self.inner
+            .remove_versions
+            .lock()
+            .await
+            .push((object.to_string(), rv.to_string()));
         self.record(MockWarmOp::Remove {
             object: object.to_string(),
         })
