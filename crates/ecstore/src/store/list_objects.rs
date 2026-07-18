@@ -4054,6 +4054,13 @@ impl ECStore {
                     // The explicit cancel is idempotent and avoids relying on
                     // the wrapper's drop-guard ordering to stop the producer.
                     Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
+                    // Invariant (rustfs/backlog#1306): gather_results maps a
+                    // consumer disconnect to Ok(ConsumerGone) and has no
+                    // fallible pre-send path, so this arm is currently
+                    // unreachable. It is kept as a guard: it stays correct only
+                    // while a *real* gather_results error would still surface as
+                    // an error here. Real producer/listing errors take the
+                    // separate job1 -> err_tx -> err_rx path below, unaffected.
                     Err(err) => {
                         log_list_path_worker_error("store", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
@@ -5319,6 +5326,13 @@ impl Sets {
                     // The explicit cancel is idempotent and avoids relying on
                     // the wrapper's drop-guard ordering to stop the producer.
                     Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
+                    // Invariant (rustfs/backlog#1306): gather_results maps a
+                    // consumer disconnect to Ok(ConsumerGone) and has no
+                    // fallible pre-send path, so this arm is currently
+                    // unreachable. It is kept as a guard: it stays correct only
+                    // while a *real* gather_results error would still surface as
+                    // an error here. Real producer/listing errors take the
+                    // separate job1 -> err_tx -> err_rx path below, unaffected.
                     Err(err) => {
                         log_list_path_worker_error("sets", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
@@ -6279,6 +6293,13 @@ impl SetDisks {
                     // The explicit cancel is idempotent and avoids relying on
                     // the wrapper's drop-guard ordering to stop the producer.
                     Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
+                    // Invariant (rustfs/backlog#1306): gather_results maps a
+                    // consumer disconnect to Ok(ConsumerGone) and has no
+                    // fallible pre-send path, so this arm is currently
+                    // unreachable. It is kept as a guard: it stays correct only
+                    // while a *real* gather_results error would still surface as
+                    // an error here. Real producer/listing errors take the
+                    // separate job1 -> err_tx -> err_rx path below, unaffected.
                     Err(err) => {
                         log_list_path_worker_error("set_disks", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
@@ -7376,6 +7397,94 @@ mod test {
         assert_eq!(state, GatherResultsState::ConsumerGone);
         // The eof branch never cancels; the wrapper's ConsumerGone arm does.
         assert!(!cancel.is_cancelled());
+    }
+
+    /// A-1 guard (rustfs/backlog#1306): pin that a *successful* send is never
+    /// misclassified as `ConsumerGone`. With the receiver alive, gather_results
+    /// must return the real drain state and deliver the payload carrying the
+    /// state-specific `err` sentinel the wrappers depend on (limit reached =>
+    /// err None so the wrapper knows the disk may hold more; input closed =>
+    /// err Some so the wrapper knows the disk was fully drained). Together with
+    /// the receiver-dropped ConsumerGone tests above, this locks in
+    /// "ConsumerGone is returned only on send failure": a broken send-failure
+    /// check that classified a successful send as ConsumerGone would drop the
+    /// delivered payload (and its err sentinel) and trip this test.
+    #[tokio::test]
+    async fn list_path_gather_results_send_success_delivers_state_specific_err_sentinel() {
+        // Limit reached with the receiver alive: LimitReached + err None.
+        {
+            let (entry_tx, entry_rx) = mpsc::channel(4);
+            let (result_tx, mut result_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            entry_tx
+                .send(test_meta_entry("obj-a"))
+                .await
+                .expect("test entry should be queued");
+
+            let handle = tokio::spawn(gather_results(
+                cancel.clone(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    limit: 1,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            ));
+
+            let result = timeout(Duration::from_secs(1), result_rx.recv())
+                .await
+                .expect("limited result should be sent promptly")
+                .expect("limited result should be present");
+            assert_eq!(result.entries.expect("limit payload delivers entries").entries().len(), 1);
+            assert!(result.err.is_none(), "limit-reached payload must carry no err sentinel");
+
+            let state = timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("gather_results should finish")
+                .expect("gather_results task should not panic")
+                .expect("a successful send must not surface as an error");
+            assert_eq!(state, GatherResultsState::LimitReached);
+        }
+
+        // Input closed with the receiver alive: InputClosed + err Some (eof sentinel).
+        {
+            let (entry_tx, entry_rx) = mpsc::channel(4);
+            let (result_tx, mut result_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            entry_tx
+                .send(test_meta_entry("obj-a"))
+                .await
+                .expect("test entry should be queued");
+            drop(entry_tx);
+
+            let handle = tokio::spawn(gather_results(
+                cancel.clone(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    limit: 8,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            ));
+
+            let result = timeout(Duration::from_secs(1), result_rx.recv())
+                .await
+                .expect("eof result should be sent promptly")
+                .expect("eof result should be present");
+            assert_eq!(result.entries.expect("eof payload delivers entries").entries().len(), 1);
+            assert!(result.err.is_some(), "eof payload must carry the sentinel err the wrapper relies on");
+
+            let state = timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("gather_results should finish")
+                .expect("gather_results task should not panic")
+                .expect("a successful send must not surface as an error");
+            assert_eq!(state, GatherResultsState::InputClosed);
+        }
     }
 
     // The subscriber installed via `set_default` is thread-local, so this test
