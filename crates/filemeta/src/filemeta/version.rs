@@ -838,6 +838,22 @@ impl From<FileInfo> for FileMetaVersion {
                 uses_legacy_checksum: false,
             }
         } else {
+            // A `deleted` FileInfo that is not a canonical delete marker is only
+            // legitimate as a purge-pending payload, which carries real erasure
+            // geometry and is intentionally serialized as an Object. A `deleted`
+            // FileInfo with neither a canonical-marker shape nor valid erasure
+            // geometry would silently serialize as a zero-geometry MetaObject that
+            // later fails `validate_for_metadata_read`. Write paths validate first
+            // (`validate_for_erasure_write` / `validate_for_metadata_read`), so this
+            // is a caller bug — surface it rather than writing malformed metadata
+            // silently. (`From` is infallible, so this cannot return an error.)
+            if value.deleted && !value.has_valid_erasure_geometry() {
+                tracing::warn!(
+                    event = "filemeta_non_canonical_deleted_fileinfo_as_object",
+                    component = "filemeta",
+                    "serializing a deleted FileInfo that is neither a canonical delete marker nor a valid erasure payload as an Object version; upstream validation should have rejected it"
+                );
+            }
             FileMetaVersion {
                 version_type: VersionType::Object,
                 legacy_object: None,
