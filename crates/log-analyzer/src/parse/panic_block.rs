@@ -65,6 +65,11 @@ pub(crate) fn starts(line: &str, line_no: u64) -> Option<PanicAcc> {
     None
 }
 
+/// Whether `line` begins a panic block (either format), without allocating.
+pub(crate) fn is_start(line: &str) -> bool {
+    START_NEW.is_match(line) || START_OLD.is_match(line)
+}
+
 impl PanicAcc {
     fn new(thread: &str, location: &str, payload: Option<String>, raw: &str, line_no: u64) -> Self {
         let expect_payload = payload.is_none();
@@ -82,9 +87,15 @@ impl PanicAcc {
     /// Whether the block absorbs this line (call only while the block is open).
     pub(crate) fn absorbs(&self, line: &str) -> bool {
         if self.expect_payload {
-            return true;
+            // The next line is normally this panic's payload, but a line that
+            // is itself a new event (JSON) or a fresh panic header is not —
+            // swallowing it would drop a real log event (e.g. an interleaved
+            // ERROR in merged stdout/stderr, or a panic-during-panic header).
+            return !is_start(line) && !line.trim_start().starts_with('{');
         }
-        line.starts_with(char::is_whitespace) || line == "stack backtrace:" || line.starts_with("note: run with")
+        // `note: ` covers both "run with `RUST_BACKTRACE`…" and the trailing
+        // "Some details are omitted, run with …" line emitted at BACKTRACE=1.
+        line.starts_with(char::is_whitespace) || line == "stack backtrace:" || line.starts_with("note: ")
     }
 
     pub(crate) fn push(&mut self, line: &str) {

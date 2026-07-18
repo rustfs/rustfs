@@ -83,6 +83,28 @@ fn sample_key(event: &LogEvent) -> (bool, Option<DateTime<FixedOffset>>, &str, u
     (event.timestamp.is_none(), event.timestamp, &event.source.file, event.source.line)
 }
 
+/// `DateTime<FixedOffset>` orders by instant, so two equal instants carrying
+/// different offsets compare equal and `min`/`max` keep whichever arrived
+/// first — an input-order dependency that then leaks into the serialized
+/// RFC3339 offset. Break the tie on the offset itself to stay deterministic.
+fn earliest(a: DateTime<FixedOffset>, b: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    match a.cmp(&b) {
+        std::cmp::Ordering::Less => a,
+        std::cmp::Ordering::Greater => b,
+        std::cmp::Ordering::Equal if a.offset().local_minus_utc() <= b.offset().local_minus_utc() => a,
+        std::cmp::Ordering::Equal => b,
+    }
+}
+
+fn latest(a: DateTime<FixedOffset>, b: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
+    match a.cmp(&b) {
+        std::cmp::Ordering::Greater => a,
+        std::cmp::Ordering::Less => b,
+        std::cmp::Ordering::Equal if a.offset().local_minus_utc() >= b.offset().local_minus_utc() => a,
+        std::cmp::Ordering::Equal => b,
+    }
+}
+
 impl FindingsCollector {
     pub fn new(max_samples: usize) -> Self {
         Self {
@@ -119,8 +141,8 @@ impl FindingsCollector {
         finding.count += 1;
 
         if let Some(ts) = event.timestamp {
-            finding.first_seen = Some(finding.first_seen.map_or(ts, |cur| cur.min(ts)));
-            finding.last_seen = Some(finding.last_seen.map_or(ts, |cur| cur.max(ts)));
+            finding.first_seen = Some(finding.first_seen.map_or(ts, |cur| earliest(cur, ts)));
+            finding.last_seen = Some(finding.last_seen.map_or(ts, |cur| latest(cur, ts)));
         }
 
         finding.nodes.insert(event.node.as_deref().unwrap_or("-").to_string());
@@ -143,9 +165,14 @@ impl FindingsCollector {
                 if slot.values.contains(&value) {
                     continue;
                 }
-                if slot.values.len() < EVIDENCE_VALUES_CAP {
-                    slot.values.insert(value);
-                } else {
+                slot.values.insert(value);
+                // Keep a deterministic subset — the lexicographically smallest
+                // EVIDENCE_VALUES_CAP distinct values — so the evidence set is
+                // order-independent (previously it kept the first-10-by-arrival).
+                if slot.values.len() > EVIDENCE_VALUES_CAP {
+                    if let Some(max) = slot.values.iter().next_back().cloned() {
+                        slot.values.remove(&max);
+                    }
                     slot.overflow += 1;
                 }
             }

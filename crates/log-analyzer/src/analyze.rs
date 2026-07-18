@@ -186,7 +186,7 @@ impl Analyzer {
     }
 
     /// Wire this directly as the ingest `on_event` callback.
-    pub fn observe(&mut self, event: LogEvent) {
+    pub fn observe(&mut self, mut event: LogEvent) {
         self.events_total += 1;
 
         if let Some(ts) = event.timestamp
@@ -200,6 +200,15 @@ impl Analyzer {
             return;
         }
         self.events_after_filter += 1;
+
+        // Under --redact, hash the node label once here so every downstream
+        // surface (summary.nodes, per-node timeline ranges, samples, timeline
+        // anomalies) shows the same stable hash rather than the raw hostname.
+        if self.opts.redact
+            && let Some(node) = event.node.as_deref()
+        {
+            event.node = Some(std::sync::Arc::from(redact::hash_value(node).as_str()));
+        }
 
         let level_key = event.level.map_or_else(|| "no_level".to_string(), |l| l.to_string());
         *self.level_counts.entry(level_key).or_insert(0) += 1;
@@ -618,19 +627,35 @@ fn collapse_findings(findings: &mut [Finding]) {
 
 fn redact_report(report: &mut AnalysisReport) {
     for finding in report.findings.iter_mut().chain(report.low_confidence.iter_mut()) {
+        // Samples carry the full event (message + every field + provenance);
+        // node labels are already hashed at ingestion time.
         for sample in &mut finding.samples {
             redact::redact_event(sample);
         }
+        // Evidence values: sensitive-named fields hash whole, everything else
+        // is scrubbed for embedded IPs / key=value identifiers.
         for (field, values) in &mut finding.evidence {
-            if redact::is_sensitive_field(field) {
-                let hashed: BTreeSet<String> = values.values.iter().map(|v| redact::hash_value(v)).collect();
-                values.values = hashed;
-            }
+            let redacted: BTreeSet<String> = values
+                .values
+                .iter()
+                .map(|v| redact::redact_evidence_value(field, v))
+                .collect();
+            values.values = redacted;
         }
     }
     for cluster in &mut report.unmatched_top {
+        cluster.template = redact::redact_text(&cluster.template);
         cluster.sample = redact::redact_text(&cluster.sample);
+        if let Some(target) = cluster.target.take() {
+            cluster.target = Some(redact::redact_text(&target));
+        }
     }
+    // Skipped-input provenance (customer archive names / absolute paths).
+    for (path, _) in &mut report.skipped_inputs {
+        *path = redact::redact_provenance(path);
+    }
+    // summary.nodes and every node label inside timeline_anomalies derive from
+    // event.node, hashed at ingestion, so no separate pass is needed here.
 }
 
 // Template normalization, applied in order (rustfs/backlog#1287 §2).
@@ -1053,6 +1078,57 @@ mod tests {
         assert!(hashed.starts_with("h:"));
         // Same value -> same hash across samples.
         assert_eq!(redacted.findings[0].samples[1].field_str("bucket"), Some(hashed.as_str()));
+    }
+
+    #[test]
+    fn redaction_covers_evidence_provenance_node_and_template() {
+        let mut a = analyzer(AnalyzeOptions {
+            redact: true,
+            ..Default::default()
+        });
+
+        // Matched rule that captures a `peer` evidence field (not a whitelisted
+        // name before the fix), on a customer node label + provenance path,
+        // with an IPv6 peer in the message.
+        let mut ev = event(
+            "peer_connection_marked_offline dial fe80::dead:9 failed",
+            Some(LogLevel::Error),
+            Some("2026-07-15T03:00:00+08:00"),
+        );
+        ev.fields
+            .insert("peer".into(), serde_json::Value::String("10.0.0.99:9000".into()));
+        ev.node = Some(Arc::from("prod-node-01"));
+        ev.source = SourceRef {
+            file: Arc::from("/home/acme-corp/bundle/prod-node-01/rustfs.log"),
+            line: 42,
+        };
+        a.observe(ev);
+
+        // Unmatched ERROR whose message carries a field-shaped bucket name.
+        let mut un = event("GetObject failed bucket: topsecret down", Some(LogLevel::Error), None);
+        un.node = Some(Arc::from("prod-node-01"));
+        a.observe(un);
+
+        let report = a.finalize(IngestReport::default());
+        let mut out = Vec::new();
+        crate::report::render(&report, crate::report::ReportFormat::Text, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(!text.contains("10.0.0.99"), "peer evidence leaked:\n{text}");
+        assert!(!text.contains("fe80::dead"), "IPv6 in sample leaked:\n{text}");
+        assert!(!text.contains("prod-node-01"), "node label leaked:\n{text}");
+        assert!(!text.contains("acme-corp"), "provenance prefix leaked:\n{text}");
+        assert!(!text.contains("topsecret"), "unmatched template bucket leaked:\n{text}");
+        // Node stays correlatable via a stable hash.
+        assert_eq!(report.summary.nodes.len(), 1);
+        assert!(report.summary.nodes[0].starts_with("h:"), "node not hashed: {:?}", report.summary.nodes);
+        // The JSON renderer dumps the whole sample event — it must not leak the
+        // raw peer field either.
+        let mut jout = Vec::new();
+        crate::report::render(&report, crate::report::ReportFormat::Json, &mut jout).expect("json");
+        let json = String::from_utf8(jout).expect("utf8");
+        assert!(!json.contains("10.0.0.99"), "JSON fields dump leaked peer:\n{json}");
+        assert!(!json.contains("prod-node-01"), "JSON leaked node:\n{json}");
     }
 
     #[test]

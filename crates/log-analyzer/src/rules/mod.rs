@@ -272,6 +272,31 @@ mod tests {
     }
 
     #[test]
+    fn evidence_cap_keeps_smallest_subset_regardless_of_order() {
+        let mut r = rule("e", Severity::P2Degraded, Matcher::MessageContains("x".into()));
+        r.evidence_fields = vec!["disk".to_string()];
+        let retained = |order: &[u64]| -> Vec<String> {
+            let mut c = FindingsCollector::new(3);
+            for &i in order {
+                let mut ev = event("x", Some(LogLevel::Error), i);
+                // Zero-padded so lexicographic order matches numeric order.
+                ev.fields
+                    .insert("disk".to_string(), serde_json::Value::String(format!("/d/{i:02}")));
+                c.observe(&r, 0, &ev);
+            }
+            c.into_findings()[0].evidence["disk"].values.iter().cloned().collect()
+        };
+        let forward: Vec<u64> = (0..15).collect();
+        let reverse: Vec<u64> = (0..15).rev().collect();
+        let shuffled: Vec<u64> = vec![7, 3, 14, 0, 9, 2, 11, 5, 13, 1, 8, 4, 12, 6, 10];
+        let a = retained(&forward);
+        assert_eq!(a, retained(&reverse), "reverse order changed the retained set");
+        assert_eq!(a, retained(&shuffled), "shuffled order changed the retained set");
+        // The kept subset is the lexicographically smallest 10, deterministically.
+        assert_eq!(a, (0..10).map(|i| format!("/d/{i:02}")).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn below_min_count_is_flagged() {
         let mut r = rule("m", Severity::P3ClientSide, Matcher::MessageContains("denied".into()));
         r.min_count = 5;

@@ -48,8 +48,9 @@ rustfs diagnose logs.tar.gz --since 24h --format md > report.md
 
 ## `--redact`(报告需要转发时)
 
-把 bucket/object/AK/IP 等客户标识替换为稳定哈希(同值同哈希,保持可关联),
-规则 id、诊断文本与 panic 源码位置保留。适合把报告转发到工单系统或群聊。
+把 bucket/object/AK、IPv4/IPv6、peer 与磁盘路径、节点标签、来源文件路径等客户标识替换为稳定哈希(同值同哈希,保持可关联);规则 id、诊断文本、模块 target 与 panic 源码位置(RustFS 自身代码,非客户数据)保留。样本会连同其完整 `fields` 一起脱敏。
+
+覆盖是尽力而为,不是绝对保证:结构化字段与 `key=value`/IP 形态的文本都会被处理,但散落在自由文本里、既非字段形态也非 IP 的标识(例如句子里顺带提到的一个 bucket 名)可能仍有残留。转发前建议再抽查一遍。
 
 ## 自定义规则(`--rules <file.json>`)
 

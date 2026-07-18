@@ -19,6 +19,13 @@ use super::{human_bytes, parse_percentage};
 use crate::analyze::AnalysisReport;
 use std::io;
 
+/// GFM parses a table row into cells before inline code, so a literal `|`
+/// (even inside a backtick span) splits the cell. Escape it so customer log
+/// text can never break the table structure.
+fn cell(s: &str) -> String {
+    s.replace('|', "\\|")
+}
+
 pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Result<()> {
     writeln!(w, "# RustFS 日志诊断报告")?;
     writeln!(w)?;
@@ -39,7 +46,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
         if report.summary.nodes.is_empty() {
             "-".to_string()
         } else {
-            report.summary.nodes.join(", ")
+            cell(&report.summary.nodes.join(", "))
         }
     )?;
     let levels: Vec<String> = report
@@ -66,7 +73,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
         writeln!(w, "| ⚠ 时区 | 混合偏移 {} | ", report.summary.distinct_offsets.join(" / "))?;
     }
     for (path, reason) in &report.skipped_inputs {
-        writeln!(w, "| ⚠ 跳过 | `{path}` ({reason:?}) |")?;
+        writeln!(w, "| ⚠ 跳过 | `{}` ({reason:?}) |", cell(path))?;
     }
     writeln!(w)?;
 
@@ -148,7 +155,7 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
         writeln!(w, "| 次数 | 级别 | 模板 |")?;
         writeln!(w, "|---|---|---|")?;
         for cluster in &report.unmatched_top {
-            writeln!(w, "| {} | {} | `{}` |", cluster.count, cluster.level, cluster.template)?;
+            writeln!(w, "| {} | {} | `{}` |", cluster.count, cluster.level, cell(&cluster.template))?;
         }
     }
     writeln!(w)?;

@@ -237,6 +237,37 @@ mod tests {
     }
 
     #[test]
+    fn immediate_json_after_new_format_header_is_not_swallowed() {
+        // Merged stdout/stderr can interleave a JSON ERROR on the line right
+        // after a panic header; it must be emitted as its own event, not
+        // absorbed as the panic payload.
+        let mut p = parser();
+        assert!(p.feed("thread 'main' panicked at src/main.rs:3:5:", 1).is_empty());
+        let events = p.feed(JSON_LINE, 2);
+        assert_eq!(events.len(), 2, "panic flushed + JSON preserved");
+        assert_eq!(events[0].kind, EventKind::Panic);
+        assert_faulty_disk_json(&events[1]);
+        assert_eq!(p.stats().panic_blocks, 1);
+        assert_eq!(p.stats().json_ok, 1);
+    }
+
+    #[test]
+    fn consecutive_panic_headers_are_not_merged() {
+        // A panic-during-panic: the second header starts its own block instead
+        // of being swallowed as the first panic's payload.
+        let mut p = parser();
+        assert!(p.feed("thread 'a' panicked at a.rs:1:1:", 1).is_empty());
+        let events = p.feed("thread 'b' panicked at b.rs:2:2:", 2);
+        assert_eq!(events.len(), 1, "first panic flushed");
+        assert_eq!(events[0].kind, EventKind::Panic);
+        assert!(events[0].message.contains("a.rs:1:1"));
+        assert!(!events[0].message.contains("b.rs"), "second header must not be absorbed");
+        let tail = p.finish().expect("second panic flushed at EOF");
+        assert!(tail.message.contains("b.rs:2:2"));
+        assert_eq!(p.stats().panic_blocks, 2);
+    }
+
+    #[test]
     fn old_format_panic_normalizes_to_same_message_shape() {
         let mut p = parser();
         assert!(p.feed("thread 'main' panicked at 'oh no', src/main.rs:3:5", 1).is_empty());

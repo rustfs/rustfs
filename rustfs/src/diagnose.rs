@@ -18,9 +18,11 @@
 //! `rustfs info` / `rustfs tls inspect`: the report goes to stdout and must
 //! not be wrapped by the JSON logger.
 //!
-//! Exit codes: 0 = diagnosis completed (findings or not), 2 = bad
-//! arguments or no readable input. Findings never fail the process — this
-//! is a diagnosis tool, not a CI gate.
+//! Exit codes: 0 = diagnosis completed (findings or not); 2 = a rejected
+//! argument value (bad `--since`/`--until`/`--min-level`/`--rules`) or no
+//! readable input; 1 = a clap-level usage error (missing path, unknown flag),
+//! handled by the shared arg parser before this subcommand runs. Findings
+//! never fail the process — this is a diagnosis tool, not a CI gate.
 
 use crate::config::{DiagnoseFormat, DiagnoseOpts};
 use chrono::{DateTime, FixedOffset, Local};
@@ -135,7 +137,12 @@ fn parse_time_arg(raw: &str) -> std::result::Result<DateTime<FixedOffset>, Strin
         "d" => chrono::Duration::days(amount),
         _ => return Err(format!("invalid time '{raw}' (RFC-3339 or relative like 30m/24h/7d)")),
     };
-    Ok((Local::now() - duration).fixed_offset())
+    // `checked_sub_signed`: an absurd amount (e.g. `100000000d`) underflows the
+    // representable date range — return an error instead of panicking.
+    Local::now()
+        .checked_sub_signed(duration)
+        .map(|t| t.fixed_offset())
+        .ok_or_else(|| format!("invalid time '{raw}' (out of representable range)"))
 }
 
 #[cfg(test)]
@@ -155,5 +162,9 @@ mod tests {
         // Negative relative times would mean "in the future" — rejected.
         assert!(parse_time_arg("-1h").is_err());
         assert!(parse_time_arg("-24h").is_err());
+        // Absurd amounts underflow the representable date range: return an
+        // error rather than panicking (checked_sub_signed).
+        assert!(parse_time_arg("100000000d").is_err());
+        assert!(parse_time_arg("4000000000h").is_err());
     }
 }
