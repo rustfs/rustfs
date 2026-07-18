@@ -25,8 +25,8 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
     reload_transition_tier_config,
 };
-use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::verify_tonic_canonical_body_digest;
+use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
+use crate::storage::storage_api::{sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -190,11 +190,94 @@ pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>
     NodeService { local_peer, context }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct HealControlRpcService;
+#[derive(Clone, Debug, Default)]
+pub struct HealControlRpcService {
+    #[cfg(test)]
+    endpoint_pools: Option<EndpointServerPools>,
+    topology_fingerprint: Arc<tokio::sync::OnceCell<String>>,
+    #[cfg(test)]
+    endpoint_pools_source: Option<Arc<tokio::sync::RwLock<Option<EndpointServerPools>>>>,
+}
 
 pub fn make_heal_control_server() -> HealControlRpcService {
-    HealControlRpcService
+    make_heal_control_server_with_cache(Arc::new(tokio::sync::OnceCell::new()))
+}
+
+pub(crate) fn make_heal_control_server_with_cache(
+    topology_fingerprint: Arc<tokio::sync::OnceCell<String>>,
+) -> HealControlRpcService {
+    HealControlRpcService {
+        topology_fingerprint,
+        #[cfg(test)]
+        endpoint_pools: None,
+        #[cfg(test)]
+        endpoint_pools_source: None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn make_heal_control_server_for_source()
+-> (HealControlRpcService, Arc<tokio::sync::RwLock<Option<EndpointServerPools>>>) {
+    let source = Arc::new(tokio::sync::RwLock::new(None));
+    (
+        HealControlRpcService {
+            endpoint_pools: None,
+            topology_fingerprint: Arc::new(tokio::sync::OnceCell::new()),
+            endpoint_pools_source: Some(Arc::clone(&source)),
+        },
+        source,
+    )
+}
+
+impl HealControlRpcService {
+    async fn capability_fingerprint(&self) -> Result<&str, Status> {
+        if let Some(fingerprint) = self.topology_fingerprint.get() {
+            return Ok(fingerprint);
+        }
+
+        #[cfg(test)]
+        {
+            return self
+                .topology_fingerprint
+                .get_or_try_init(|| async {
+                    let endpoint_pools = self
+                        .endpoint_pools()
+                        .await
+                        .ok_or_else(|| Status::failed_precondition("heal control topology is not initialized"))?;
+                    tokio::task::spawn_blocking(move || heal::heal_topology_fingerprint(&endpoint_pools))
+                        .await
+                        .map_err(|_| Status::internal("heal control topology calculation failed"))?
+                        .map_err(|_| Status::failed_precondition("heal control topology is invalid"))
+                })
+                .await
+                .map(String::as_str);
+        }
+
+        #[cfg(not(test))]
+        Err(Status::failed_precondition("heal control topology is not initialized"))
+    }
+
+    #[cfg(test)]
+    async fn endpoint_pools(&self) -> Option<EndpointServerPools> {
+        if let Some(source) = self.endpoint_pools_source.as_ref() {
+            return source.read().await.clone();
+        }
+        self.endpoint_pools.clone()
+    }
+}
+
+pub(crate) async fn initialize_heal_topology_fingerprint(
+    cache: Arc<tokio::sync::OnceCell<String>>,
+    endpoint_pools: EndpointServerPools,
+) -> Result<(), String> {
+    if cache.get().is_some() {
+        return Ok(());
+    }
+    let fingerprint = tokio::task::spawn_blocking(move || heal::heal_topology_fingerprint(&endpoint_pools))
+        .await
+        .map_err(|_| "heal control topology calculation task failed".to_string())??;
+    let _ = cache.set(fingerprint);
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -213,6 +296,28 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
         .map_err(|_| Status::invalid_argument("heal control request length cannot be represented"))?;
         verify_tonic_canonical_body_digest(&request, &body)
             .map_err(|err| Status::permission_denied(format!("heal control authentication failed: {err}")))?;
+        if request.get_ref().version != rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION {
+            return Err(Status::failed_precondition("unsupported heal control protocol version"));
+        }
+        if rustfs_protos::is_heal_control_capability_probe(&request.get_ref().command) {
+            let fingerprint = self.capability_fingerprint().await?;
+            if request.get_ref().topology_fingerprint != *fingerprint {
+                return Err(Status::failed_precondition("heal control topology does not match"));
+            }
+            let canonical_ack = rustfs_protos::canonical_heal_control_capability_ack(
+                request.get_ref().version,
+                fingerprint,
+                &request.get_ref().command,
+            )
+            .map_err(|_| Status::internal("heal control acknowledgement length cannot be represented"))?;
+            let result = sign_tonic_rpc_response_proof(&canonical_ack)
+                .map_err(|_| Status::internal("heal control response proof is unavailable"))?;
+            return Ok(Response::new(HealControlResponse {
+                success: true,
+                result: result.into(),
+                error_info: None,
+            }));
+        }
         Err(Status::unimplemented("heal control routing is not enabled"))
     }
 }
@@ -1267,9 +1372,15 @@ mod tests {
     use super::{
         CollectMetricsOpts, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService, PEER_RESTSIGNAL,
         PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
-        background_rebalance_start_error_message, make_heal_control_server, make_server, stop_rebalance_response,
+        background_rebalance_start_error_message, initialize_heal_topology_fingerprint, make_heal_control_server,
+        make_heal_control_server_with_cache, make_server, stop_rebalance_response,
     };
+    use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
+    use crate::storage::storage_api::{
+        Endpoint,
+        ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
+    };
     use bytes::Bytes;
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
@@ -1292,7 +1403,7 @@ mod tests {
         node_service_client::NodeServiceClient,
         node_service_server::NodeServiceServer,
     };
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
@@ -1314,6 +1425,29 @@ mod tests {
             topology_fingerprint: "fingerprint".to_string(),
             command: Bytes::copy_from_slice(command),
         })
+    }
+
+    fn heal_control_test_endpoints(last_host: &str) -> EndpointServerPools {
+        let endpoints = ["node-a", "node-b", "node-c", last_host]
+            .into_iter()
+            .enumerate()
+            .map(|(index, host)| {
+                let mut endpoint = Endpoint::try_from(format!("http://{host}:9000/disk{}", index + 1).as_str())
+                    .expect("test endpoint should parse");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(index / 2);
+                endpoint.set_disk_index(index % 2);
+                endpoint
+            })
+            .collect::<Vec<_>>();
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 2,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }])
     }
 
     fn mark_v2_authenticated<T>(request: &mut Request<T>) {
@@ -1356,6 +1490,95 @@ mod tests {
             .await
             .expect_err("oversized request must fail");
         assert_eq!(oversized.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn heal_control_probe_requires_exact_topology_and_keeps_commands_disabled() {
+        let _ = rustfs_credentials::set_global_rpc_secret("heal-control-node-service-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints("node-d");
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
+        let cache = Arc::new(tokio::sync::OnceCell::new());
+        initialize_heal_topology_fingerprint(Arc::clone(&cache), endpoints)
+            .await
+            .expect("valid topology should initialize");
+        let service = make_heal_control_server_with_cache(cache);
+
+        let probe_command = rustfs_protos::heal_control_capability_probe(&[7; 16]);
+        let mut probe = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            probe.get_ref().version,
+            &probe.get_ref().topology_fingerprint,
+            &probe.get_ref().command,
+        )
+        .expect("probe should encode");
+        set_tonic_canonical_body_digest(&mut probe, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut probe);
+        let response = service
+            .heal_control(probe)
+            .await
+            .expect("matching topology should be acknowledged");
+        let canonical_ack = rustfs_protos::canonical_heal_control_capability_ack(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            &probe_command,
+        )
+        .expect("acknowledgement should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_ack, &response.into_inner().result)
+            .expect("response proof should authenticate the exact acknowledgement");
+
+        let divergent_probe = rustfs_protos::heal_control_capability_probe(&[8; 16]);
+        let mut divergent = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: heal_topology_fingerprint(&heal_control_test_endpoints("node-e"))
+                .expect("divergent topology should hash"),
+            command: Bytes::from(divergent_probe),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            divergent.get_ref().version,
+            &divergent.get_ref().topology_fingerprint,
+            &divergent.get_ref().command,
+        )
+        .expect("probe should encode");
+        set_tonic_canonical_body_digest(&mut divergent, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut divergent);
+        let mismatch = service
+            .heal_control(divergent)
+            .await
+            .expect_err("divergent topology must fail closed");
+        assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
+
+        let mut command = heal_control_request(b"start");
+        let body = rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"start").expect("command should encode");
+        set_tonic_canonical_body_digest(&mut command, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut command);
+        let disabled = service
+            .heal_control(command)
+            .await
+            .expect_err("commands must remain disabled");
+        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn server_owned_heal_topology_initialization_only_publishes_valid_layouts() {
+        let topology = heal_control_test_endpoints("node-d");
+        let expected = heal_topology_fingerprint(&topology).expect("test topology should hash");
+        let cache = Arc::new(tokio::sync::OnceCell::new());
+        initialize_heal_topology_fingerprint(Arc::clone(&cache), topology)
+            .await
+            .expect("valid topology should initialize");
+        assert_eq!(cache.get(), Some(&expected));
+
+        let mut invalid = heal_control_test_endpoints("node-d");
+        invalid.as_mut()[0].endpoints.as_mut()[0].pool_idx = -1;
+        let invalid_cache = Arc::new(tokio::sync::OnceCell::new());
+        initialize_heal_topology_fingerprint(Arc::clone(&invalid_cache), invalid)
+            .await
+            .expect_err("invalid topology must fail closed");
+        assert!(invalid_cache.get().is_none());
     }
 
     #[tokio::test]

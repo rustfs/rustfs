@@ -13,17 +13,118 @@
 // limitations under the License.
 
 use crate::startup_background::{heal_enabled_from_env, scanner_enabled_from_env};
+use crate::storage::storage_api::runtime_sources_consumer::EndpointServerPools;
 use rmp_serde::Deserializer;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_heal::HealOperationsSnapshot;
 use rustfs_scanner::scanner::BackgroundHealInfo;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Cursor;
 
 use super::super::encode_msgpack_map;
 
 const NODE_HEAL_STATUS_VERSION: u8 = 1;
 const NODE_HEAL_STATUS_MAX_SIZE: usize = 64 * 1024;
+const HEAL_TOPOLOGY_FINGERPRINT_DOMAIN: &[u8] = b"rustfs-heal-topology-v1\0";
+
+fn hash_sized(hasher: &mut Sha256, value: &[u8]) -> Result<(), String> {
+    let len = u64::try_from(value.len()).map_err(|_| "heal topology field length cannot be represented".to_string())?;
+    hasher.update(len.to_be_bytes());
+    hasher.update(value);
+    Ok(())
+}
+
+/// Returns a node-independent digest of the complete pool/set/disk layout.
+/// Locality is deliberately excluded because it differs on every peer.
+pub(crate) fn heal_topology_fingerprint(endpoint_pools: &EndpointServerPools) -> Result<String, String> {
+    if endpoint_pools.as_ref().is_empty() {
+        return Err("heal topology has no storage pools".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(HEAL_TOPOLOGY_FINGERPRINT_DOMAIN);
+    hasher.update(
+        u64::try_from(endpoint_pools.as_ref().len())
+            .map_err(|_| "heal topology pool count cannot be represented".to_string())?
+            .to_be_bytes(),
+    );
+
+    for (pool_index, pool) in endpoint_pools.as_ref().iter().enumerate() {
+        if pool.set_count == 0 || pool.drives_per_set == 0 {
+            return Err(format!("heal topology pool {pool_index} has an empty set or drive layout"));
+        }
+        let expected_endpoints = pool
+            .set_count
+            .checked_mul(pool.drives_per_set)
+            .ok_or_else(|| "heal topology endpoint count overflow".to_string())?;
+        if pool.endpoints.as_ref().len() != expected_endpoints {
+            return Err(format!(
+                "heal topology pool {pool_index} has {} endpoints, expected {expected_endpoints}",
+                pool.endpoints.as_ref().len()
+            ));
+        }
+
+        hasher.update(
+            u64::try_from(pool_index)
+                .map_err(|_| "heal topology pool index cannot be represented")?
+                .to_be_bytes(),
+        );
+        hasher.update(
+            u64::try_from(pool.set_count)
+                .map_err(|_| "heal topology set count cannot be represented")?
+                .to_be_bytes(),
+        );
+        hasher.update(
+            u64::try_from(pool.drives_per_set)
+                .map_err(|_| "heal topology drive count cannot be represented")?
+                .to_be_bytes(),
+        );
+        hasher.update([u8::from(pool.legacy)]);
+
+        let mut entries = Vec::with_capacity(pool.endpoints.as_ref().len());
+        for (endpoint_index, endpoint) in pool.endpoints.as_ref().iter().enumerate() {
+            let declared_pool = usize::try_from(endpoint.pool_idx)
+                .map_err(|_| format!("heal topology endpoint {endpoint_index} has an invalid pool index"))?;
+            if declared_pool != pool_index {
+                return Err(format!("heal topology endpoint declares pool {declared_pool}, expected {pool_index}"));
+            }
+            let set_index = usize::try_from(endpoint.set_idx)
+                .map_err(|_| format!("heal topology endpoint {endpoint_index} has an invalid set index"))?;
+            let disk_index = usize::try_from(endpoint.disk_idx)
+                .map_err(|_| format!("heal topology endpoint {endpoint_index} has an invalid disk index"))?;
+            if set_index >= pool.set_count || disk_index >= pool.drives_per_set {
+                return Err(format!(
+                    "heal topology endpoint position {pool_index}/{set_index}/{disk_index} is out of range"
+                ));
+            }
+            entries.push((set_index, disk_index, endpoint.url.as_str()));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        for pair in entries.windows(2) {
+            if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 {
+                return Err(format!(
+                    "heal topology contains duplicate endpoint position {pool_index}/{}/{}",
+                    pair[0].0, pair[0].1
+                ));
+            }
+        }
+        for (set_index, disk_index, endpoint) in entries {
+            hasher.update(
+                u64::try_from(set_index)
+                    .map_err(|_| "heal topology set index cannot be represented")?
+                    .to_be_bytes(),
+            );
+            hasher.update(
+                u64::try_from(disk_index)
+                    .map_err(|_| "heal topology disk index cannot be represented")?
+                    .to_be_bytes(),
+            );
+            hash_sized(&mut hasher, endpoint.as_bytes())?;
+        }
+    }
+
+    Ok(hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -145,10 +246,119 @@ pub(crate) fn decode_node_heal_status(data: &[u8]) -> Result<NodeHealStatusSnaps
 mod tests {
     use super::{
         NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_VERSION, NodeHealProgress, NodeHealStatusSnapshot, decode_node_heal_status,
-        encode_node_heal_status,
+        encode_node_heal_status, heal_topology_fingerprint,
+    };
+    use crate::storage::storage_api::{
+        Endpoint,
+        ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use rustfs_heal::HealOperationsSnapshot;
     use rustfs_scanner::scanner::BackgroundHealInfo;
+
+    fn topology_endpoints(last_host: &str) -> EndpointServerPools {
+        let endpoints = ["node-a", "node-b", "node-c", last_host]
+            .into_iter()
+            .enumerate()
+            .map(|(index, host)| {
+                let mut endpoint = Endpoint::try_from(format!("http://{host}:9000/disk{}", index + 1).as_str())
+                    .expect("test endpoint should parse");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(index / 2);
+                endpoint.set_disk_index(index % 2);
+                endpoint.is_local = index == 0;
+                endpoint
+            })
+            .collect::<Vec<_>>();
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 2,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }])
+    }
+
+    #[test]
+    fn heal_topology_fingerprint_is_node_independent_and_layout_complete() {
+        let topology = topology_endpoints("node-d");
+        let expected = heal_topology_fingerprint(&topology).expect("valid topology should hash");
+
+        let mut other_node_view = topology;
+        for endpoint in other_node_view.as_mut()[0].endpoints.as_mut() {
+            endpoint.is_local = endpoint.host_port() == "node-c:9000";
+        }
+        assert_eq!(
+            heal_topology_fingerprint(&other_node_view).expect("locality must not affect the hash"),
+            expected
+        );
+
+        let mut reordered = topology_endpoints("node-d");
+        reordered.as_mut()[0].endpoints.as_mut().reverse();
+        assert_eq!(
+            heal_topology_fingerprint(&reordered).expect("explicit positions must normalize endpoint order"),
+            expected
+        );
+
+        let mut legacy = topology_endpoints("node-d");
+        legacy.as_mut()[0].legacy = true;
+        assert_ne!(heal_topology_fingerprint(&legacy).expect("legacy topology should hash"), expected);
+
+        let changed = topology_endpoints("node-e");
+        assert_ne!(heal_topology_fingerprint(&changed).expect("changed topology should still hash"), expected);
+    }
+
+    #[test]
+    fn heal_topology_fingerprint_rejects_duplicate_positions() {
+        let mut topology = topology_endpoints("node-d");
+        topology.as_mut()[0].endpoints.as_mut()[1].set_set_index(0);
+        topology.as_mut()[0].endpoints.as_mut()[1].set_disk_index(0);
+        let err = heal_topology_fingerprint(&topology).expect_err("duplicate position must fail closed");
+        assert!(err.contains("duplicate endpoint position"));
+    }
+
+    #[test]
+    fn heal_topology_fingerprint_rejects_uninitialized_indices_and_empty_layouts() {
+        let mut uninitialized = topology_endpoints("node-d");
+        uninitialized.as_mut()[0].endpoints.as_mut()[0].pool_idx = -1;
+        let err = heal_topology_fingerprint(&uninitialized).expect_err("negative index must fail closed");
+        assert!(err.contains("invalid pool index"));
+
+        let empty = EndpointServerPools::default();
+        let err = heal_topology_fingerprint(&empty).expect_err("empty topology must fail closed");
+        assert!(err.contains("no storage pools"));
+
+        let mut cases = Vec::new();
+        let mut zero_sets = topology_endpoints("node-d");
+        zero_sets.as_mut()[0].set_count = 0;
+        cases.push(("zero sets", zero_sets, "empty set or drive layout"));
+        let mut zero_drives = topology_endpoints("node-d");
+        zero_drives.as_mut()[0].drives_per_set = 0;
+        cases.push(("zero drives", zero_drives, "empty set or drive layout"));
+        let mut missing_endpoint = topology_endpoints("node-d");
+        missing_endpoint.as_mut()[0].endpoints.as_mut().pop();
+        cases.push(("missing endpoint", missing_endpoint, "has 3 endpoints, expected 4"));
+        let mut wrong_pool = topology_endpoints("node-d");
+        wrong_pool.as_mut()[0].endpoints.as_mut()[0].set_pool_index(1);
+        cases.push(("wrong pool", wrong_pool, "declares pool 1, expected 0"));
+        let mut negative_set = topology_endpoints("node-d");
+        negative_set.as_mut()[0].endpoints.as_mut()[0].set_idx = -1;
+        cases.push(("negative set", negative_set, "invalid set index"));
+        let mut negative_disk = topology_endpoints("node-d");
+        negative_disk.as_mut()[0].endpoints.as_mut()[0].disk_idx = -1;
+        cases.push(("negative disk", negative_disk, "invalid disk index"));
+        let mut out_of_range_set = topology_endpoints("node-d");
+        out_of_range_set.as_mut()[0].endpoints.as_mut()[0].set_set_index(2);
+        cases.push(("set out of range", out_of_range_set, "is out of range"));
+        let mut out_of_range_disk = topology_endpoints("node-d");
+        out_of_range_disk.as_mut()[0].endpoints.as_mut()[0].set_disk_index(2);
+        cases.push(("disk out of range", out_of_range_disk, "is out of range"));
+
+        for (name, topology, expected) in cases {
+            let err = heal_topology_fingerprint(&topology).expect_err(name);
+            assert!(err.contains(expected), "{name}: {err}");
+        }
+    }
 
     #[test]
     fn node_heal_status_round_trip_is_versioned() {

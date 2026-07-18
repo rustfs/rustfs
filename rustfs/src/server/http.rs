@@ -35,7 +35,7 @@ use crate::server::{
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage_api::server::http::rpc::InternodeRpcService;
-use crate::storage_api::server::http::tonic_service::{make_heal_control_server, make_server};
+use crate::storage_api::server::http::tonic_service::make_server;
 use crate::storage_api::server::http::{
     ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
 };
@@ -682,7 +682,7 @@ pub async fn start_http_server(
         // Bind the S3 service to this server's context slot (backlog#1052 S2)
         // so request dispatch resolves the server's own store.
         let admin_server_ctx = server_ctx.clone();
-        let store = storage::ecfs::FS::with_server_ctx(server_ctx);
+        let store = storage::ecfs::FS::with_server_ctx(server_ctx.clone());
         let mut b = S3ServiceBuilder::new(store.clone());
 
         let access_key = config.access_key.clone();
@@ -973,6 +973,7 @@ pub async fn start_http_server(
                 keystone_auth: auth_keystone::get_keystone_auth(),
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
                 rate_limit_layer: api_rate_limit_layer.clone(),
+                server_ctx: Arc::clone(&server_ctx),
             };
 
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher());
@@ -1032,6 +1033,7 @@ struct ConnectionContext {
     /// Per-client API rate limit layer; `None` when disabled (the default).
     /// All clones share one limiter, keeping budgets global across connections.
     rate_limit_layer: Option<RateLimitLayer>,
+    server_ctx: Arc<ServerContextSlot>,
 }
 
 #[derive(Clone)]
@@ -1217,6 +1219,7 @@ fn process_connection(
             keystone_auth,
             trusted_proxy_layer,
             rate_limit_layer,
+            server_ctx,
         } = context;
 
         // Build the hybrid service per-connection.
@@ -1237,9 +1240,11 @@ fn process_connection(
         );
         let heal_control_max_message_size = rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE;
         let heal_control_service = InterceptedService::new(
-            HealControlServiceServer::new(make_heal_control_server())
-                .max_decoding_message_size(heal_control_max_message_size)
-                .max_encoding_message_size(heal_control_max_message_size),
+            HealControlServiceServer::new(storage::tonic_service::make_heal_control_server_with_cache(
+                server_ctx.heal_topology_fingerprint(),
+            ))
+            .max_decoding_message_size(heal_control_max_message_size)
+            .max_encoding_message_size(heal_control_max_message_size),
             check_auth,
         );
         let rpc_service = RpcRequestPathService::new(Routes::new(node_service).add_service(heal_control_service).prepare());
@@ -1905,6 +1910,8 @@ mod tests {
     use std::future::Ready;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
+    use storage::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
+    use storage::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use tower::{Layer, Service, ServiceBuilder};
 
     /// Baseline constants — reference the authoritative config defaults.
@@ -2248,9 +2255,25 @@ mod tests {
         let previous_node_name = rustfs_common::get_global_local_node_name().await;
         rustfs_common::set_global_local_node_name(&addr.to_string()).await;
 
+        let endpoint_pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![{
+                let mut endpoint = Endpoint::try_from("http://node-a:9000/disk1").expect("test endpoint should parse");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(0);
+                endpoint
+            }]),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let fingerprint = heal_topology_fingerprint(&endpoint_pools).expect("test topology should hash");
+        let (heal_control_server, endpoint_pools_source) = make_heal_control_server_for_source();
         let node_service = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
         let heal_control_service = InterceptedService::new(
-            HealControlServiceServer::new(make_heal_control_server())
+            HealControlServiceServer::new(heal_control_server)
                 .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
                 .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE),
             check_auth,
@@ -2268,6 +2291,14 @@ mod tests {
         let grid_host = format!("http://{addr}");
         let host = rustfs_utils::XHost::try_from(addr.to_string()).expect("test address should resolve");
         let client = storage::PeerRestClient::new(host, grid_host);
+        let not_ready = client
+            .probe_heal_control(fingerprint.clone())
+            .await
+            .expect_err("an uninitialized topology must fail closed");
+        assert!(not_ready.to_string().contains("topology is not initialized"));
+        assert!(!not_ready.to_string().contains("temporarily offline"));
+        *endpoint_pools_source.write().await = Some(endpoint_pools);
+
         for _ in 0..2 {
             let error = client
                 .heal_control(1, "fingerprint".to_string(), b"query".to_vec())
@@ -2277,6 +2308,33 @@ mod tests {
             assert!(message.contains("routing is not enabled"));
             assert!(!message.contains("temporarily offline"));
         }
+        client
+            .probe_heal_control(fingerprint.clone())
+            .await
+            .expect("production client should accept an exact capability acknowledgement");
+
+        let mismatch = client
+            .probe_heal_control("different-topology".to_string())
+            .await
+            .expect_err("a divergent topology must fail closed");
+        assert!(mismatch.to_string().contains("topology does not match"));
+        assert!(!mismatch.to_string().contains("temporarily offline"));
+
+        let unsupported = client
+            .heal_control(
+                rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION + 1,
+                fingerprint.clone(),
+                rustfs_protos::heal_control_capability_probe(&[9; 16]),
+            )
+            .await
+            .expect_err("an unsupported protocol version must fail closed");
+        assert!(unsupported.to_string().contains("unsupported heal control protocol version"));
+        assert!(!unsupported.to_string().contains("temporarily offline"));
+
+        client
+            .probe_heal_control(fingerprint)
+            .await
+            .expect("semantic probe failures must not mark a reachable peer offline");
 
         client.evict_connection().await;
         server.abort();
