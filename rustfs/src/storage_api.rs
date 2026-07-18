@@ -225,6 +225,9 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod storage {
+        pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{
+            INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV,
+        };
         pub(crate) use crate::storage::storage_api::{
             ECStore, EndpointServerPools, InstanceContext, bootstrap_instance_ctx, global_config_init_error_is_deterministic,
             init_background_replication, init_compression_total_memory_from_backend, init_ecstore_config, init_global_config_sys,

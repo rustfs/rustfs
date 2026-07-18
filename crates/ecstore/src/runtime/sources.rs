@@ -322,6 +322,21 @@ pub(crate) fn storage_class_config_snapshot() -> Arc<storageclass::Config> {
     get_global_storage_class_snapshot()
 }
 
+/// Scalar STANDARD / RRS parity for backend-info reporting.
+///
+/// Retained for the rebalance/backend-info path. `get_parity_for_sc` returns
+/// `None` when the runtime config is uninitialized or (post per-pool support)
+/// when pools disagree, so STANDARD falls back to the caller's default and RRS
+/// stays `None` — matching the pre-per-pool scalar reporting.
+pub(crate) fn backend_storage_class_parities(default_standard_parity: usize) -> (Option<usize>, Option<usize>) {
+    let sc = get_global_storage_class_snapshot();
+    let standard = sc
+        .get_parity_for_sc(storageclass::CLASS_STANDARD)
+        .or(Some(default_standard_parity));
+    let reduced_redundancy = sc.get_parity_for_sc(storageclass::RRS);
+    (standard, reduced_redundancy)
+}
+
 pub(crate) fn set_storage_class_config(config: storageclass::Config) {
     set_global_storage_class(config);
 }

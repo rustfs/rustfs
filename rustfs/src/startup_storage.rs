@@ -351,10 +351,14 @@ mod tests {
         global_config_retry_exhausted, init_embedded_startup_storage_foundation, init_startup_storage_foundation,
         storage_pool_has_host_failure_risk,
     };
-    use crate::storage::storage_api::ecstore_config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
-    use crate::storage_api::startup::storage::{InstanceContext, bootstrap_instance_ctx};
-    use rustfs_config::ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT;
+    use crate::storage_api::startup::storage::{
+        INLINE_BLOCK_ENV, InstanceContext, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV, bootstrap_instance_ctx,
+    };
     use std::sync::Arc;
+
+    // The erasure-set-drive-count env var name, kept local to this test to avoid
+    // reaching across the storage facade boundary for a bare string constant.
+    const ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT: &str = "RUSTFS_ERASURE_SET_DRIVE_COUNT";
 
     #[test]
     fn reports_host_failure_risk_only_for_multi_drive_sets() {
