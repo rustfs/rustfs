@@ -36,6 +36,9 @@ rg -n 'println!\|eprintln!' <changed-files> | grep -v test
 
 # 6. Ordering::Relaxed usage (verify each is intentional)
 rg -n 'Ordering::Relaxed' <changed-files>
+
+# 7. Default substituted for a possibly-required value (judge each: is the value optional by domain?)
+rg -n 'unwrap_or_default\(\)|unwrap_or\(' <changed-files>
 ```
 
 ## Manual Review Checklist
@@ -55,8 +58,8 @@ For every Rust code change, verify:
 - [ ] No `f64 as usize` without prior clamping
 
 ### Concurrency
-- [ ] Lock acquisition order is documented when multiple locks are used
-- [ ] No `tokio::sync` write guards held across `.await` without bounded hold time
+- [ ] Lock acquisition order is documented when multiple locks are used, and matches every other call site taking any overlapping subset (ABBA check)
+- [ ] No `tokio::sync` lock guard (read or write) held across `.await` without bounded hold time — long-lived read guards wedge writers (#4195)
 - [ ] Concurrent counters use `compare_exchange` loops, not load-then-store
 - [ ] `std::sync::Mutex` in async context is held only briefly, never across `.await`
 
@@ -84,12 +87,19 @@ For every Rust code change, verify:
 - [ ] No camelCase statics or Hungarian notation
 - [ ] New string literals don't duplicate existing constants
 
+### Reuse and Necessity
+- [ ] No new helper duplicating an existing workspace utility (`crates/utils`, `crates/common`, the touched crate) or plain std/tokio behavior no wrapper refines; reused helpers match the call site's semantics (normalization, error type, backoff, durability gating)
+- [ ] No branch without a nameable concrete trigger; no re-validation of what a validated upstream layer on the same path already guarantees (Cross-Cutting Domain Invariant patterns and pre-destructive-action re-checks are load-bearing — keep them)
+- [ ] Error context attached once where actionable, not re-wrapped at every hop; no typed→generic error conversion below aggregation/quorum layers
+- [ ] No comments narrating the next line, restating a signature, or describing the change itself (invariant comments — lock ordering, `SAFETY`, unwrap justification — are not narration)
+- [ ] No near-duplicate test pinning the same code path and poison-value class as an existing test (boundary companions — n==max vs max+1, absent/empty/nil UUID — are never near-duplicates)
+
 ## Severity Classification
 
 - **P0 (Block merge)**: `unwrap()` in request hot path, silent truncation on user input, lock ordering violation, recursion without depth limit
-- **P1 (Must fix)**: `Result<_, String>` in public API, unnecessary clone in hot path, `Box<dyn Error>` in trait method
-- **P2 (Should fix)**: Missing `assert!` in test, `println!` in production, missing `with_capacity`
-- **P3 (Nice to fix)**: Naming convention violation, missing doc comment, `as_ptr()` vs `Arc::ptr_eq`
+- **P1 (Must fix)**: `Result<_, String>` in public API, unnecessary clone in hot path, `Box<dyn Error>` in trait method, `unwrap_or_default()` on a domain-required value (metadata, quorum, version id)
+- **P2 (Should fix)**: Missing `assert!` in test, `println!` in production, missing `with_capacity`, new helper duplicating an existing workspace utility, defensive branch with no nameable trigger (corrupt or stale persisted/peer data is always a nameable trigger for boundary-crossing values), near-duplicate test, redundant error re-wrapping
+- **P3 (Nice to fix)**: Naming convention violation, missing doc comment, `as_ptr()` vs `Arc::ptr_eq`, narrating comment
 
 ## Output Template
 

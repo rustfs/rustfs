@@ -53,6 +53,17 @@ fn sse_customer_key_md5_base64(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(md5::compute(key).0)
 }
 
+/// Env var consumed by the local SSE-S3 DEK provider when KMS is not configured.
+///
+/// Since rustfs#3564 the server fails closed on managed SSE (SSE-S3 or
+/// bucket-default encryption) unless KMS is configured or this master key is
+/// provided, so tests exercising managed SSE on a bare server must seed it.
+const LOCAL_SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
+
+fn local_sse_master_key_value() -> String {
+    base64::engine::general_purpose::STANDARD.encode([0x42u8; 32])
+}
+
 async fn make_tar(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
     let buf = Cursor::new(Vec::new());
     let mut builder = tokio_tar::Builder::new(buf);
@@ -105,7 +116,11 @@ async fn make_tar_with_pax_entry(path: &str, data: &[u8], mtime: Option<u64>, pa
             pax_payload.extend(build_pax_record(key, value));
         }
 
-        let mut pax_header = tokio_tar::Header::new_gnu();
+        // Pax extension entries must carry a POSIX ustar header — this is what real
+        // tar writers emit, and the server-side reader rejects an XHeader typeflag on
+        // GNU-format headers ("extension typeflag is not permitted on an unrecognized
+        // header").
+        let mut pax_header = tokio_tar::Header::new_ustar();
         pax_header.set_entry_type(tokio_tar::EntryType::XHeader);
         pax_header.set_size(pax_payload.len() as u64);
         pax_header.set_mode(0o644);
@@ -926,7 +941,9 @@ async fn test_anonymous_post_object_accepts_sse_s3() -> Result<(), Box<dyn std::
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let master_key = local_sse_master_key_value();
+    env.start_rustfs_server_with_env(vec![], &[(LOCAL_SSE_MASTER_KEY_ENV, master_key.as_str())])
+        .await?;
 
     let bucket = "anon-post-sse-s3";
     let object_key = "post-sse-s3-object.txt";
@@ -982,7 +999,9 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), B
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let master_key = local_sse_master_key_value();
+    env.start_rustfs_server_with_env(vec![], &[(LOCAL_SSE_MASTER_KEY_ENV, master_key.as_str())])
+        .await?;
 
     let bucket = "anon-post-default-sse-s3";
     let object_key = "post-default-sse-s3-object.txt";
@@ -1053,7 +1072,9 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), 
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let master_key = local_sse_master_key_value();
+    env.start_rustfs_server_with_env(vec![], &[(LOCAL_SSE_MASTER_KEY_ENV, master_key.as_str())])
+        .await?;
 
     let bucket = "anon-post-default-sse-kms";
     let object_key = "post-default-sse-kms-object.txt";
@@ -1172,15 +1193,24 @@ async fn test_anonymous_post_object_rejects_sse_s3_policy_mismatch() -> Result<(
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_rejects_sse_s3_missing_from_policy_conditions()
+async fn test_anonymous_post_object_accepts_sse_s3_missing_from_policy_conditions()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
+    // MinIO-compatible POST-policy validation (s3s-project/s3s#608) exempts the
+    // x-amz-server-side-encryption* form fields from the "every form field must
+    // appear in the policy conditions" rule, so an SSE-S3 field that the policy
+    // does not mention is accepted and encryption is applied. When the policy
+    // does cover the field, a value mismatch is still rejected — see
+    // test_anonymous_post_object_rejects_sse_s3_policy_mismatch.
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let master_key = local_sse_master_key_value();
+    env.start_rustfs_server_with_env(vec![], &[(LOCAL_SSE_MASTER_KEY_ENV, master_key.as_str())])
+        .await?;
 
     let bucket = "anon-post-sse-s3-missing";
     let object_key = "post-sse-s3-missing-object.txt";
+    let expected_body = b"post-sse-s3-missing".to_vec();
 
     let admin_client = env.create_s3_client();
     admin_client.create_bucket().bucket(bucket).send().await?;
@@ -1198,7 +1228,7 @@ async fn test_anonymous_post_object_rejects_sse_s3_missing_from_policy_condition
         .text("x-amz-server-side-encryption", "AES256")
         .part(
             "file",
-            reqwest::multipart::Part::bytes(b"post-sse-s3-missing".to_vec())
+            reqwest::multipart::Part::bytes(expected_body.clone())
                 .file_name("upload.txt")
                 .mime_str("text/plain")?,
         );
@@ -1212,11 +1242,15 @@ async fn test_anonymous_post_object_rejects_sse_s3_missing_from_policy_condition
     let status = post_resp.status();
     let response_body = post_resp.text().await?;
 
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(
-        response_body.contains("<Code>AccessDenied</Code>"),
-        "response should contain AccessDenied code, got: {response_body}"
-    );
+    assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
+    assert!(response_body.is_empty(), "204 response should not contain a body, got: {response_body}");
+
+    let head = admin_client.head_object().bucket(bucket).key(object_key).send().await?;
+    assert_eq!(head.server_side_encryption().map(|value| value.as_str()), Some("AES256"));
+
+    let uploaded = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
+    let uploaded = uploaded.body.collect().await?.into_bytes();
+    assert_eq!(uploaded.as_ref(), expected_body.as_slice());
 
     Ok(())
 }
@@ -5041,7 +5075,9 @@ async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Resul
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
+        .await?;
 
     let bucket = "signed-extract-sse-s3-redirect";
     let archive_key = "encrypted-metadata.tar";
@@ -5318,7 +5354,9 @@ async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
+        .await?;
 
     let bucket = "signed-extract-default-sse-s3";
     let archive_key = "default-encryption.tar";

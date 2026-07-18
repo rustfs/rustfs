@@ -103,6 +103,10 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn is_remove_dir_not_empty_error(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists)
+}
+
 fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -4361,7 +4365,7 @@ impl LocalDisk {
                 // debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
                 match err.kind() {
                     ErrorKind::NotFound => (),
-                    ErrorKind::DirectoryNotEmpty => (),
+                    kind if is_remove_dir_not_empty_error(kind) => (),
                     kind => {
                         warn!(
                             event = EVENT_DISK_LOCAL_DELETE_FAILED,
@@ -7927,6 +7931,13 @@ mod test {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn remove_dir_not_empty_accepts_illumos_eexist() {
+        assert!(is_remove_dir_not_empty_error(ErrorKind::DirectoryNotEmpty));
+        assert!(is_remove_dir_not_empty_error(ErrorKind::AlreadyExists));
+        assert!(!is_remove_dir_not_empty_error(ErrorKind::PermissionDenied));
     }
 
     impl<'a> MakeWriter<'a> for CapturedLogs {

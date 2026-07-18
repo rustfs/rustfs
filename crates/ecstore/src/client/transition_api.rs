@@ -92,9 +92,18 @@ fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
     signer_error::invalid_utf8_header_error(scope, header_name)
 }
 
-fn validate_header_values(headers: &HeaderMap, scope: &str) -> Result<(), std::io::Error> {
+fn validate_header_values(headers: &HeaderMap, scope: &str, signer_type: &SignatureType) -> Result<(), std::io::Error> {
     for (name, value) in headers {
-        value.to_str().map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+        if signer_type == &SignatureType::SignatureV2 {
+            // The SigV2 canonicalizer only supports visible ASCII values. Keep rejecting
+            // non-ASCII here so it cannot silently omit a value that is sent on the wire.
+            value.to_str().map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+        } else {
+            let value = std::str::from_utf8(value.as_bytes()).map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+            if value.chars().any(|ch| !ch.is_ascii() && ch.is_whitespace()) {
+                return Err(invalid_utf8_header_error(scope, name.as_str()));
+            }
+        }
     }
     Ok(())
 }
@@ -586,7 +595,7 @@ impl TransitionClient {
                     )));
                 }
                 if let Some(extra_headers) = metadata.extra_pre_sign_header.as_ref() {
-                    validate_header_values(extra_headers, "presign extra header")?;
+                    validate_header_values(extra_headers, "presign extra header", &signer_type)?;
                     let headers = req.headers_mut();
                     for (k, v) in extra_headers {
                         headers.insert(k, v.clone());
@@ -611,7 +620,7 @@ impl TransitionClient {
         }
 
         self.set_user_agent(&mut req);
-        validate_header_values(&metadata.custom_header, "request custom header")?;
+        validate_header_values(&metadata.custom_header, "request custom header", &signer_type)?;
 
         for (k, v) in metadata.custom_header.clone() {
             if let Some(key) = k {
@@ -1383,7 +1392,7 @@ pub struct CreateBucketConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tls_config, signer_error_to_io_error, validate_header_values, with_rustls_init_guard};
+    use super::{SignatureType, build_tls_config, signer_error_to_io_error, validate_header_values, with_rustls_init_guard};
     use http::{HeaderMap, HeaderValue};
 
     #[test]
@@ -1427,9 +1436,32 @@ mod tests {
             HeaderValue::from_bytes(&[0xFF]).expect("invalid utf8 bytes should be accepted by HeaderValue"),
         );
 
-        let err =
-            validate_header_values(&headers, "request custom header").expect_err("invalid header value should fail validation");
+        let err = validate_header_values(&headers, "request custom header", &SignatureType::SignatureV4)
+            .expect_err("invalid header value should fail validation");
         assert!(err.to_string().contains("x-amz-meta-invalid"));
+    }
+
+    #[test]
+    fn validate_header_values_accepts_utf8_for_v4_but_not_v2() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("20260715/鲁A12345/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        assert!(validate_header_values(&headers, "request custom header", &SignatureType::SignatureV4).is_ok());
+        assert!(validate_header_values(&headers, "request custom header", &SignatureType::SignatureV2).is_err());
+    }
+
+    #[test]
+    fn validate_header_values_rejects_non_ascii_whitespace_for_v4() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("tier/a\u{00a0}b/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        assert!(validate_header_values(&headers, "request custom header", &SignatureType::SignatureV4).is_err());
     }
 
     #[test]

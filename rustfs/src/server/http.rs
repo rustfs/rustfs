@@ -609,6 +609,28 @@ pub async fn start_http_server(
         );
     }
 
+    // Expanded virtual-hosted-style domain set (with port variants); shared by
+    // the s3s host router below and the rate limit layer's bucket extraction.
+    let host_domain_sets = if !config.server_domains.is_empty() && !config.console_enable {
+        MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
+
+        // add the default port number to the given server domains
+        let mut domain_sets = std::collections::HashSet::new();
+        for domain in &config.server_domains {
+            domain_sets.insert(domain.to_string());
+            if let Some((host, _)) = domain.split_once(':') {
+                domain_sets.insert(format!("{host}:{local_port}"));
+            } else {
+                domain_sets.insert(format!("{domain}:{local_port}"));
+            }
+        }
+
+        Some(domain_sets)
+    } else {
+        None
+    };
+    let rate_limit_vh_domains: Vec<String> = host_domain_sets.iter().flatten().cloned().collect();
+
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
     let s3_service = {
@@ -620,24 +642,6 @@ pub async fn start_http_server(
 
         let access_key = config.access_key.clone();
         let secret_key = config.secret_key.clone();
-        let host_domain_sets = if !config.server_domains.is_empty() && !config.console_enable {
-            MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
-
-            // add the default port number to the given server domains
-            let mut domain_sets = std::collections::HashSet::new();
-            for domain in &config.server_domains {
-                domain_sets.insert(domain.to_string());
-                if let Some((host, _)) = domain.split_once(':') {
-                    domain_sets.insert(format!("{host}:{local_port}"));
-                } else {
-                    domain_sets.insert(format!("{domain}:{local_port}"));
-                }
-            }
-
-            Some(domain_sets)
-        } else {
-            None
-        };
         let metadata_route_host = host_domain_sets
             .as_ref()
             .map(MultiDomain::new)
@@ -702,20 +706,23 @@ pub async fn start_http_server(
         );
     }
 
-    // Per-client S3 API rate limiting (backlog#1191). Built once so every
-    // connection's stack shares the same limiter state; `None` (the default)
-    // leaves the request path unchanged.
-    let api_rate_limit_layer = api_rate_limit_layer_from_env();
+    // Per-client / per-bucket S3 API rate limiting (backlog#1191). Built once
+    // so every connection's stack shares the same limiter state; `None` (the
+    // default) leaves the request path unchanged.
+    let api_rate_limit_layer = api_rate_limit_layer_from_env(rate_limit_vh_domains);
     match &api_rate_limit_layer {
         Some(layer) => {
-            let quota = layer.quota();
+            let client_quota = layer.client_quota();
+            let bucket_quota = layer.bucket_quota();
             info!(
                 event = EVENT_API_RATE_LIMIT_STATE,
                 component = LOG_COMPONENT_SERVER,
                 subsystem = LOG_SUBSYSTEM_HTTP,
                 state = "enabled",
-                requests_per_minute = quota.requests_per_minute,
-                burst = quota.burst,
+                client_rpm = client_quota.map(|q| q.requests_per_minute).unwrap_or(0),
+                client_burst = client_quota.map(|q| q.burst).unwrap_or(0),
+                bucket_rpm = bucket_quota.map(|q| q.requests_per_minute).unwrap_or(0),
+                bucket_burst = bucket_quota.map(|q| q.burst).unwrap_or(0),
                 "API rate limit state changed"
             );
         }

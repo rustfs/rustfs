@@ -148,7 +148,7 @@ impl RuleValidate for LifecycleRule {
             return Err(std::io::Error::other(ERR_LIFECYCLE_EXPIRED_OBJECT_DELETE_MARKER_WITH_TAGS));
         }
         if let Some(expiration) = &self.expiration
-            && expiration.expired_object_delete_marker.is_some_and(|v| v)
+            && expiration.expired_object_delete_marker.is_some()
             && (expiration.days.is_some() || expiration.date.is_some())
         {
             return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_DELETE_MARKER));
@@ -547,6 +547,19 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             });
                             // Stop after scheduling an expired delete-marker event.
                             break;
+                        }
+                    }
+                    if let Some(days) = rule.expiration.as_ref().and_then(|expiration| expiration.days) {
+                        let due = expected_expiry_time(mod_time, days);
+                        if now.unix_timestamp() >= due.unix_timestamp() {
+                            events.push(Event {
+                                action: IlmAction::DeleteVersionAction,
+                                rule_id: rule.id.clone().unwrap_or_default(),
+                                due: Some(due),
+                                noncurrent_days: 0,
+                                newer_noncurrent_versions: 0,
+                                storage_class: "".into(),
+                            });
                         }
                     }
                     // DelMarkerExpiration: expire delete marker after N days from mod_time
@@ -2605,6 +2618,97 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn expiration_days_deletes_only_expired_delete_marker_when_due() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(3),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-expiration-days".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+                del_marker_expiration: None,
+            }],
+        };
+        let only_delete_marker = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 1,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let due = expected_expiry_time(base_time, 3);
+
+        let before_due = lc.eval_inner(&only_delete_marker, due - Duration::seconds(1), 0).await;
+        assert_eq!(before_due.action, IlmAction::NoneAction);
+
+        let at_due = lc.eval_inner(&only_delete_marker, due, 0).await;
+        assert_eq!(at_due.action, IlmAction::DeleteVersionAction);
+        assert_eq!(at_due.rule_id, "rule-expiration-days");
+        assert_eq!(at_due.due, Some(due));
+
+        let marker_with_older_version = ObjectOpts {
+            num_versions: 2,
+            ..only_delete_marker
+        };
+        let not_expired = lc
+            .eval_inner(&marker_with_older_version, base_time + Duration::days(4), 0)
+            .await;
+        assert_eq!(not_expired.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expiration_days_uses_earliest_due_rule_for_expired_delete_marker() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let make_rule = |id: &str, days| LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            expiration: Some(LifecycleExpiration {
+                days: Some(days),
+                ..Default::default()
+            }),
+            abort_incomplete_multipart_upload: None,
+            filter: None,
+            id: Some(id.to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+            del_marker_expiration: None,
+        };
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![make_rule("rule-30-days", 30), make_rule("rule-3-days", 3)],
+        };
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            delete_marker: true,
+            num_versions: 1,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let event = lc.eval_inner(&opts, base_time + Duration::days(31), 0).await;
+
+        assert_eq!(event.action, IlmAction::DeleteVersionAction);
+        assert_eq!(event.rule_id, "rule-3-days");
+        assert_eq!(event.due, Some(expected_expiry_time(base_time, 3)));
+    }
+
+    #[tokio::test]
     async fn validate_rejects_expired_object_delete_marker_with_date() {
         let future_date = OffsetDateTime::from_unix_timestamp(86_400 * 10).expect("valid midnight UTC test timestamp");
         let lc = BucketLifecycleConfiguration {
@@ -2646,6 +2750,61 @@ mod tests {
                 abort_incomplete_multipart_upload: None,
                 filter: None,
                 id: Some("rule-days-del-marker".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+                del_marker_expiration: None,
+            }],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_DELETE_MARKER);
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_false_expired_object_delete_marker_with_date() {
+        let date = OffsetDateTime::from_unix_timestamp(86_400 * 10).expect("valid midnight UTC test timestamp");
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    date: Some(date.into()),
+                    expired_object_delete_marker: Some(false),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-date-false-del-marker".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+                del_marker_expiration: None,
+            }],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_DELETE_MARKER);
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_false_expired_object_delete_marker_with_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    expired_object_delete_marker: Some(false),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                filter: None,
+                id: Some("rule-days-false-del-marker".to_string()),
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
