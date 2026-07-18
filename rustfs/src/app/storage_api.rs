@@ -473,7 +473,7 @@ pub(crate) mod bucket {
             bucket: &str,
             config_file: &str,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::delete(bucket, config_file).await
+            crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
         }
 
         pub(crate) async fn get_bucket_policy(
@@ -551,7 +551,7 @@ pub(crate) mod bucket {
             config_file: &str,
             data: Vec<u8>,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::update(bucket, config_file, data).await
+            crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
         }
     }
 

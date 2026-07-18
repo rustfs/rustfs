@@ -37,6 +37,7 @@ struct ScannerStatusResponse {
     disabled_reason: Option<String>,
     freshness: ScannerFreshnessStatus,
     metrics: ScannerMetricsReport,
+    cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
     runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
 }
 
@@ -55,13 +56,15 @@ fn scanner_disabled_reason(enabled: bool) -> Option<String> {
 fn scanner_freshness_status(
     metrics: &ScannerMetricsReport,
     runtime_config: &rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
+    effective_cycle_interval_seconds: u64,
 ) -> ScannerFreshnessStatus {
     const FRESHNESS_MULTIPLIER: u64 = 2;
 
-    let max_expected_age_seconds = runtime_config
+    let expected_cycle_interval_seconds = runtime_config
         .cycle_interval_seconds
         .value
-        .saturating_mul(FRESHNESS_MULTIPLIER);
+        .max(effective_cycle_interval_seconds);
+    let max_expected_age_seconds = expected_cycle_interval_seconds.saturating_mul(FRESHNESS_MULTIPLIER);
     if metrics.last_cycle_end_unix_secs == 0 {
         return ScannerFreshnessStatus {
             state: "unknown",
@@ -87,6 +90,23 @@ fn scanner_freshness_status(
         last_cycle_end_unix_secs: metrics.last_cycle_end_unix_secs,
         max_expected_age_seconds,
         reason: None,
+    }
+}
+
+fn scanner_status_response(
+    enabled: bool,
+    metrics: ScannerMetricsReport,
+    runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
+    cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
+) -> ScannerStatusResponse {
+    let freshness = scanner_freshness_status(&metrics, &runtime_config, cycle_schedule.effective_interval_seconds());
+    ScannerStatusResponse {
+        enabled,
+        disabled_reason: scanner_disabled_reason(enabled),
+        freshness,
+        metrics,
+        cycle_schedule,
+        runtime_config,
     }
 }
 
@@ -142,14 +162,8 @@ impl Operation for ScannerStatusHandler {
         let enabled = scanner_enabled_from_env();
         let metrics = current_scanner_metrics_report().await;
         let runtime_config = rustfs_scanner::scanner_runtime_config_status();
-        let freshness = scanner_freshness_status(&metrics, &runtime_config);
-        let response = ScannerStatusResponse {
-            enabled,
-            disabled_reason: scanner_disabled_reason(enabled),
-            freshness,
-            metrics,
-            runtime_config,
-        };
+        let cycle_schedule = rustfs_scanner::scanner_cycle_schedule_status();
+        let response = scanner_status_response(enabled, metrics, runtime_config, cycle_schedule);
         let body = serde_json::to_vec(&response).map_err(|err| {
             S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode scanner status: {err}"))
         })?;
@@ -174,7 +188,7 @@ mod tests {
         let mut runtime_config = rustfs_scanner::scanner_runtime_config_status();
         runtime_config.cycle_interval_seconds.value = 60;
 
-        let freshness = scanner_freshness_status(&metrics, &runtime_config);
+        let freshness = scanner_freshness_status(&metrics, &runtime_config, 0);
 
         assert_eq!(freshness.state, "unknown");
         assert_eq!(freshness.last_cycle_end_unix_secs, 0);
@@ -191,10 +205,43 @@ mod tests {
         let mut runtime_config = rustfs_scanner::scanner_runtime_config_status();
         runtime_config.cycle_interval_seconds.value = 60;
 
-        let freshness = scanner_freshness_status(&metrics, &runtime_config);
+        let freshness = scanner_freshness_status(&metrics, &runtime_config, 0);
 
         assert_eq!(freshness.state, "stale");
         assert_eq!(freshness.max_expected_age_seconds, 120);
         assert_eq!(freshness.reason, Some("last cycle is older than freshness window"));
+    }
+
+    #[test]
+    fn scanner_freshness_uses_effective_clean_idle_interval() {
+        let metrics = ScannerMetricsReport {
+            last_cycle_end_unix_secs: u64::try_from(Utc::now().timestamp().max(0))
+                .expect("non-negative timestamp should fit in u64")
+                .saturating_sub(300),
+            ..Default::default()
+        };
+        let mut runtime_config = rustfs_scanner::scanner_runtime_config_status();
+        runtime_config.cycle_interval_seconds.value = 60;
+
+        let freshness = scanner_freshness_status(&metrics, &runtime_config, 3_600);
+
+        assert_eq!(freshness.state, "fresh");
+        assert_eq!(freshness.max_expected_age_seconds, 7_200);
+        assert_eq!(freshness.reason, None);
+    }
+
+    #[test]
+    fn scanner_status_serializes_cycle_schedule_contract() {
+        let response = scanner_status_response(
+            true,
+            ScannerMetricsReport::default(),
+            rustfs_scanner::scanner_runtime_config_status(),
+            rustfs_scanner::ScannerCycleScheduleStatus::default(),
+        );
+
+        let encoded = serde_json::to_value(response).expect("scanner status should serialize");
+        assert_eq!(encoded["cycle_schedule"]["effective_interval_seconds"], 0);
+        assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_enabled"], false);
+        assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_multiplier"], 1);
     }
 }

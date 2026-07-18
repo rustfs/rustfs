@@ -1169,7 +1169,9 @@ pub(crate) fn get_global_bucket_metadata_sys() -> Option<Arc<tokio::sync::RwLock
 }
 
 pub(crate) async fn delete_bucket_metadata_config(bucket: &str, config_file: &str) -> Result<time::OffsetDateTime> {
-    ecstore_bucket::metadata_sys::delete(bucket, config_file).await
+    let updated_at = ecstore_bucket::metadata_sys::delete(bucket, config_file).await?;
+    record_scanner_maintenance_config_change(bucket, config_file);
+    Ok(updated_at)
 }
 
 pub(crate) async fn get_bucket_metadata(bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -1241,7 +1243,22 @@ pub(crate) async fn update_bucket_metadata_config(
     config_file: &str,
     data: Vec<u8>,
 ) -> Result<time::OffsetDateTime> {
-    ecstore_bucket::metadata_sys::update(bucket, config_file, data).await
+    let updated_at = ecstore_bucket::metadata_sys::update(bucket, config_file, data).await?;
+    record_scanner_maintenance_config_change(bucket, config_file);
+    Ok(updated_at)
+}
+
+fn record_scanner_maintenance_config_change(bucket: &str, config_file: &str) {
+    if scanner_maintenance_config_file(config_file) {
+        rustfs_scanner::record_scanner_maintenance_change(bucket);
+    }
+}
+
+fn scanner_maintenance_config_file(config_file: &str) -> bool {
+    matches!(
+        config_file,
+        ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG | ecstore_bucket::metadata::BUCKET_REPLICATION_CONFIG
+    )
 }
 
 pub(crate) fn add_object_lock_years(dt: time::OffsetDateTime, years: i32) -> time::OffsetDateTime {
@@ -1465,7 +1482,9 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 
 #[cfg(test)]
 mod tests {
-    use super::{bucket_targets_metadata_lock_shard, lock_bucket_targets_metadata};
+    use super::{
+        bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata, scanner_maintenance_config_file,
+    };
     use std::time::Duration;
 
     #[tokio::test]
@@ -1493,5 +1512,12 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn scanner_maintenance_config_only_includes_scanner_owned_work() {
+        assert!(scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG));
+        assert!(scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_REPLICATION_CONFIG));
+        assert!(!scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_POLICY_CONFIG));
     }
 }
