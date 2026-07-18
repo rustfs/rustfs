@@ -138,7 +138,7 @@ pub(crate) mod runtime {
     // The mock (and the tier types it used to need) now live in ecstore behind
     // the `test-util` feature.
     #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_tier::test_util::{MockWarmBackend, register_mock_tier};
+    pub(crate) use crate::storage::storage_api::ecstore_tier::test_util::{MockWarmBackend, MockWarmOp, register_mock_tier};
 
     pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
         crate::storage::storage_api::ecstore_config::set_global_storage_class(cfg);

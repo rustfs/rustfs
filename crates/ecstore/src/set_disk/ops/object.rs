@@ -2354,6 +2354,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
         }
 
+        // delete_object_version persisted transition_status=complete and freed the
+        // local data, but does not touch the GET metadata cache. Drop any cached
+        // pre-transition entry so a late duplicate transition task (or a plain GET)
+        // re-reads the fresh state; a stale hit here defeats the TRANSITION_COMPLETE
+        // early-return above and streams the already-deleted local data to the
+        // remote tier again (rustfs/rustfs#4827).
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+
         for disk in disks.iter() {
             if let Some(disk) = disk {
                 continue;
