@@ -288,19 +288,6 @@ impl ValidatedErasureLayout {
     }
 }
 
-/// A [`FileInfo`] together with the invariants established at its operation boundary.
-#[derive(Debug)]
-pub struct ValidatedFileInfo<'a> {
-    _file_info: &'a FileInfo,
-    erasure_layout: Option<ValidatedErasureLayout>,
-}
-
-impl<'a> ValidatedFileInfo<'a> {
-    pub const fn erasure_layout(&self) -> Option<&ValidatedErasureLayout> {
-        self.erasure_layout.as_ref()
-    }
-}
-
 fn mark_fileinfo_part(bitmap: &mut [u64; FILEINFO_PART_BITMAP_WORDS], part_number: usize) -> bool {
     let Some(index) = part_number.checked_sub(1).filter(|&index| index < MAX_FILEINFO_PARTS) else {
         return false;
@@ -530,12 +517,14 @@ impl FileInfo {
         Ok(())
     }
 
-    /// Validates this metadata for the caller-selected operation boundary.
+    /// Validates this metadata for the caller-selected operation boundary and
+    /// returns the payload erasure layout when one is established.
     ///
     /// All modes enforce collection bounds and checksum-to-part associations.
     /// Only [`ValidationMode::RequireErasure`] establishes a payload erasure
-    /// layout; the other modes cannot be upgraded based on serialized flags.
-    pub fn validate(&self, mode: ValidationMode) -> Result<ValidatedFileInfo<'_>> {
+    /// layout; the other modes cannot be upgraded based on serialized flags and
+    /// return `None`.
+    pub fn validate(&self, mode: ValidationMode) -> Result<Option<ValidatedErasureLayout>> {
         self.validate_collection_bounds()?;
 
         let erasure_layout = match mode {
@@ -547,10 +536,7 @@ impl FileInfo {
         };
         self.validate_collection_contents(erasure_layout.as_ref())?;
 
-        Ok(ValidatedFileInfo {
-            _file_info: self,
-            erasure_layout,
-        })
+        Ok(erasure_layout)
     }
 
     /// Validate metadata returned by a disk or peer as a strict tagged union.
@@ -1168,12 +1154,9 @@ mod tests {
     #[test]
     fn validate_require_erasure_returns_checked_layout() {
         let fi = validation_test_fileinfo();
-        let validated = fi
+        let layout = fi
             .validate(ValidationMode::RequireErasure)
-            .expect("well-formed erasure metadata must validate");
-
-        let layout = validated
-            .erasure_layout()
+            .expect("well-formed erasure metadata must validate")
             .expect("strict validation must return an erasure layout");
         assert_eq!(layout.data_blocks, 4);
         assert_eq!(layout.block_size, BLOCK_SIZE_V2);
@@ -1190,10 +1173,10 @@ mod tests {
         let mut fi = FileInfo::new("bucket/object", 16, 0);
         fi.erasure.index = 1;
 
-        let validated = fi
+        let layout = fi
             .validate(ValidationMode::RequireErasure)
             .expect("zero parity is a valid storage layout");
-        assert_eq!(validated.erasure_layout().expect("strict layout must be present").data_blocks, 16);
+        assert_eq!(layout.expect("strict layout must be present").data_blocks, 16);
     }
 
     #[test]

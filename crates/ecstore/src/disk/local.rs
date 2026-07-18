@@ -6163,8 +6163,7 @@ impl DiskAPI for LocalDisk {
     }
     #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        let validated = fi.validate(ValidationMode::RequireErasure)?;
-        let layout = validated.erasure_layout().ok_or(DiskError::FileCorrupt)?;
+        let layout = fi.validate(ValidationMode::RequireErasure)?.ok_or(DiskError::FileCorrupt)?;
         let volume_dir = self.get_bucket_path(volume)?;
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
