@@ -9685,16 +9685,20 @@ version = "1.0.0-beta.10"
 dependencies = [
  "flatbuffers",
  "prost 0.14.4",
+ "rmp-serde",
  "rustfs-common",
  "rustfs-config",
  "rustfs-io-metrics",
  "rustfs-tls-runtime",
  "rustfs-utils",
+ "serde",
+ "serde_json",
  "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

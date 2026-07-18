@@ -16,6 +16,7 @@
 // scoped to that module so generated internals do not relax lints elsewhere.
 #[allow(unsafe_code)]
 mod generated;
+pub mod heal_control;
 mod runtime_sources;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
