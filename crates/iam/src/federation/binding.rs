@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub(crate) mod federated_identity;
-pub(crate) mod session_policy;
-pub mod site_replication;
+use super::{FederatedSessionBindingError, FederatedSessionTransaction};
+use rustfs_credentials::Credentials;
+
+#[async_trait::async_trait]
+pub trait FederatedSessionBinding: Send + Sync {
+    async fn bind(
+        &self,
+        transaction: &FederatedSessionTransaction,
+    ) -> core::result::Result<Credentials, FederatedSessionBindingError>;
+}
