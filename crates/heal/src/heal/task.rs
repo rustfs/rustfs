@@ -43,6 +43,7 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const EVENT_HEAL_TASK_STATE: &str = "heal_task_state";
 const EVENT_HEAL_OBJECT_STAGE: &str = "heal_object_stage";
 const EVENT_HEAL_OBJECT_MISSING: &str = "heal_object_missing";
+const MAX_RETAINED_HEAL_RESULT_ITEMS: usize = 1024;
 const EVENT_HEAL_OBJECT_RESULT: &str = "heal_object_result";
 const MAX_BUCKET_OBJECT_HEAL_RETRIES: u32 = 3;
 const MAX_BUCKET_FAILURE_LOG_SAMPLES: u64 = 5;
@@ -306,6 +307,7 @@ pub struct HealTask {
     pub progress: Arc<RwLock<HealProgress>>,
     /// Result items collected from storage heal calls.
     pub result_items: Arc<RwLock<Vec<HealResultItem>>>,
+    result_items_truncated: Arc<AtomicBool>,
     batch_failure: Arc<RwLock<Option<BatchHealFailure>>>,
     batch_failure_recorded: Arc<AtomicBool>,
     /// Created time
@@ -337,6 +339,7 @@ impl HealTask {
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),
+            result_items_truncated: Arc::new(AtomicBool::new(false)),
             batch_failure: Arc::new(RwLock::new(None)),
             batch_failure_recorded: Arc::new(AtomicBool::new(false)),
             created_at: request.created_at,
@@ -741,8 +744,17 @@ impl HealTask {
         self.result_items.read().await.clone()
     }
 
+    pub fn result_items_truncated(&self) -> bool {
+        self.result_items_truncated.load(Ordering::Relaxed)
+    }
+
     async fn record_result_item(&self, result: HealResultItem) {
-        self.result_items.write().await.push(result);
+        let mut result_items = self.result_items.write().await;
+        if result_items.len() < MAX_RETAINED_HEAL_RESULT_ITEMS {
+            result_items.push(result);
+        } else {
+            self.result_items_truncated.store(true, Ordering::Relaxed);
+        }
     }
 
     // specific heal implementation method
@@ -2654,6 +2666,19 @@ mod tests {
         let result_items = task.get_result_items().await;
         assert_eq!(result_items.len(), 3);
         assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn result_items_are_bounded_and_report_truncation() {
+        let storage = Arc::new(MockStorage::default());
+        let task = HealTask::from_request(HealRequest::bucket("bucket-a".to_string()), storage);
+
+        for _ in 0..=MAX_RETAINED_HEAL_RESULT_ITEMS {
+            task.record_result_item(HealResultItem::default()).await;
+        }
+
+        assert_eq!(task.get_result_items().await.len(), MAX_RETAINED_HEAL_RESULT_ITEMS);
+        assert!(task.result_items_truncated());
     }
 
     #[tokio::test]

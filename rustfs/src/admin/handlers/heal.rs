@@ -15,21 +15,23 @@
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{app_context_from_req, object_store_from_extensions};
-use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
 use crate::admin::storage_api::contract::heal::HealOperations as _;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
-    NodeHealProgress, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
+    HealControlCoordinator, NodeHealProgress, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
+    heal_control_coordinator, heal_topology_fingerprint,
 };
 use bytes::Bytes;
 use futures_util::future::join_all;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_common::heal_channel::{HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource, HealScanMode};
+use rustfs_common::heal_channel::{
+    HealAdmissionReceipt, HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource, HealScanMode,
+};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_heal::heal::utils::format_set_disk_id;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -39,9 +41,10 @@ use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
@@ -175,6 +178,7 @@ pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct HealResp {
     resp_bytes: Vec<u8>,
@@ -200,6 +204,8 @@ struct HealTaskStatus {
     heal_settings: HealOpts,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<serde_json::Value>,
 }
@@ -479,15 +485,281 @@ async fn read_cluster_heal_status(
     merge_peer_heal_statuses(snapshots, peer_statuses, expected_nodes)
 }
 
+fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
+    warn!(
+        event = EVENT_ADMIN_REQUEST_FAILED,
+        component = LOG_COMPONENT_ADMIN_API,
+        subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+        operation = "heal_control",
+        result = "failed",
+        reason,
+        "cluster heal coordination unavailable"
+    );
+    s3_error!(InternalError, "cluster heal coordination unavailable")
+}
+
+struct PreparedHealControlRoute {
+    remote_grid_hosts: Vec<String>,
+    fingerprint: String,
+    coordinator_epoch: u64,
+    coordinator: HealControlCoordinator,
+}
+
+fn prepare_heal_control_route(context: &crate::admin::runtime_sources::AppContext) -> S3Result<PreparedHealControlRoute> {
+    let endpoints = context
+        .endpoints()
+        .handle()
+        .ok_or_else(|| cluster_heal_control_unavailable("endpoint_topology_unavailable"))?;
+    let fingerprint = heal_topology_fingerprint(&endpoints)
+        .map_err(|_| cluster_heal_control_unavailable("topology_fingerprint_unavailable"))?;
+    let coordinator_epoch = rustfs_protos::heal_control_coordinator_epoch(&fingerprint)
+        .map_err(|_| cluster_heal_control_unavailable("topology_epoch_unavailable"))?;
+    let coordinator =
+        heal_control_coordinator(&endpoints).map_err(|_| cluster_heal_control_unavailable("coordinator_unavailable"))?;
+    let remote_grid_hosts = endpoints
+        .get_nodes()
+        .into_iter()
+        .filter(|node| !node.is_local)
+        .map(|node| node.grid_host)
+        .collect();
+    Ok(PreparedHealControlRoute {
+        remote_grid_hosts,
+        fingerprint,
+        coordinator_epoch,
+        coordinator,
+    })
+}
+
+fn new_heal_control_metadata(route: &PreparedHealControlRoute) -> S3Result<rustfs_protos::heal_control::RequestMetadata> {
+    let now = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    let now = i64::try_from(now).map_err(|_| cluster_heal_control_unavailable("clock_out_of_range"))?;
+    let lifetime_ms = i64::try_from(rustfs_protos::heal_control_execution_timeout().as_millis())
+        .map_err(|_| cluster_heal_control_unavailable("execution_timeout_out_of_range"))?;
+    Ok(rustfs_protos::heal_control::RequestMetadata::new(
+        *uuid::Uuid::new_v4().as_bytes(),
+        now,
+        now.saturating_add(lifetime_ms),
+        route.coordinator_epoch,
+    ))
+}
+
+async fn require_cluster_heal_control_capability(
+    context: &crate::admin::runtime_sources::AppContext,
+    route: &PreparedHealControlRoute,
+) -> S3Result<()> {
+    if route.remote_grid_hosts.is_empty() {
+        return Ok(());
+    }
+    let notification_system = context
+        .notification_system()
+        .handle()
+        .ok_or_else(|| cluster_heal_control_unavailable("notification_system_unavailable"))?;
+    let clients = route
+        .remote_grid_hosts
+        .iter()
+        .map(|grid_host| {
+            notification_system
+                .peer_client_for_grid_host(grid_host)
+                .ok_or_else(|| cluster_heal_control_unavailable("peer_capability_client_unavailable"))
+        })
+        .collect::<S3Result<Vec<_>>>()?;
+    let results = join_all(clients.into_iter().map(|client| {
+        let fingerprint = route.fingerprint.clone();
+        async move { client.probe_heal_control(fingerprint).await }
+    }))
+    .await;
+    if let Some(err) = results.into_iter().find_map(Result::err) {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+            operation = "heal_control",
+            result = "failed",
+            reason = "cluster_capability_unavailable",
+            error = %err,
+            "cluster heal coordination failed"
+        );
+        return Err(cluster_heal_control_unavailable("cluster_capability_unavailable"));
+    }
+    Ok(())
+}
+
+async fn route_cluster_heal_control(
+    context: &crate::admin::runtime_sources::AppContext,
+    route: &PreparedHealControlRoute,
+    envelope: rustfs_protos::heal_control::Envelope,
+    request_id: &str,
+    coordinator_capability_verified: bool,
+) -> S3Result<rustfs_protos::heal_control::Outcome> {
+    let response = if route.coordinator.is_local {
+        crate::storage::rpc::node_service::execute_heal_control_envelope(envelope, route.coordinator_epoch)
+            .await
+            .map_err(|err| {
+                warn!(
+                    event = EVENT_ADMIN_REQUEST_FAILED,
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                    operation = "heal_control",
+                    result = "failed",
+                    reason = "local_coordinator_failed",
+                    error = %err,
+                    "cluster heal coordination failed"
+                );
+                cluster_heal_control_unavailable("local_coordinator_failed")
+            })?
+    } else {
+        let notification_system = context
+            .notification_system()
+            .handle()
+            .ok_or_else(|| cluster_heal_control_unavailable("notification_system_unavailable"))?;
+        let client = notification_system
+            .peer_client_for_grid_host(&route.coordinator.grid_host)
+            .ok_or_else(|| cluster_heal_control_unavailable("coordinator_client_unavailable"))?;
+        if !coordinator_capability_verified {
+            client.probe_heal_control(route.fingerprint.clone()).await.map_err(|err| {
+                warn!(
+                    event = EVENT_ADMIN_REQUEST_FAILED,
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                    operation = "heal_control",
+                    result = "failed",
+                    reason = "coordinator_capability_unavailable",
+                    error = %err,
+                    "cluster heal coordination failed"
+                );
+                cluster_heal_control_unavailable("coordinator_capability_unavailable")
+            })?;
+        }
+        let command = rustfs_protos::heal_control::encode_envelope(&envelope)
+            .map_err(|err| s3_error!(InternalError, "encode heal control request failed: {err}"))?;
+        client
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, route.fingerprint.clone(), command)
+            .await
+            .map_err(|err| {
+                warn!(
+                    event = EVENT_ADMIN_REQUEST_FAILED,
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                    operation = "heal_control",
+                    result = "failed",
+                    reason = "coordinator_request_failed",
+                    error = %err,
+                    "cluster heal coordination failed"
+                );
+                cluster_heal_control_unavailable("coordinator_request_failed")
+            })?
+    };
+    rustfs_protos::heal_control::decode_result(&response)
+        .and_then(|result| result.into_outcome(request_id, route.coordinator_epoch))
+        .map_err(|err| {
+            warn!(
+                event = EVENT_ADMIN_REQUEST_FAILED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = "heal_control",
+                result = "failed",
+                reason = "coordinator_response_invalid",
+                error = %err,
+                "cluster heal coordination failed"
+            );
+            cluster_heal_control_unavailable("coordinator_response_invalid")
+        })
+}
+
+async fn execute_after_heal_control_capability<P, PF, E, EF, T>(probe: P, execute: E) -> S3Result<T>
+where
+    P: FnOnce() -> PF,
+    PF: Future<Output = S3Result<()>>,
+    E: FnOnce() -> EF,
+    EF: Future<Output = S3Result<T>>,
+{
+    probe().await?;
+    execute().await
+}
+
+async fn submit_cluster_heal_start(
+    context: Arc<crate::admin::runtime_sources::AppContext>,
+    hip: &HealInitParams,
+) -> S3Result<HealAdmissionReceipt> {
+    let route = prepare_heal_control_route(&context)?;
+    let result = execute_after_heal_control_capability(
+        || require_cluster_heal_control_capability(&context, &route),
+        || async {
+            let heal_request = build_heal_channel_request(hip);
+            let request_id = heal_request.id.clone();
+            let envelope = rustfs_protos::heal_control::Envelope::start(heal_request, new_heal_control_metadata(&route)?)
+                .map_err(|err| s3_error!(InternalError, "encode heal control request failed: {err}"))?;
+            route_cluster_heal_control(&context, &route, envelope, &request_id, true).await
+        },
+    )
+    .await?;
+    match result {
+        rustfs_protos::heal_control::Outcome::Start { task_id, admission } => Ok(HealAdmissionReceipt {
+            result: admission.into_heal_admission_result(),
+            task_id,
+        }),
+        rustfs_protos::heal_control::Outcome::Channel { .. } => {
+            Err(s3_error!(InternalError, "coordinator returned an unexpected heal result"))
+        }
+    }
+}
+
+fn reject_heal_admission(result: rustfs_common::heal_channel::HealAdmissionResult) -> s3s::S3Error {
+    use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
+
+    match result {
+        HealAdmissionResult::Full | HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull) => s3_error!(
+            SlowDown,
+            "heal request not admitted: admission={}, reason={}",
+            result.result_label(),
+            result.reason_label()
+        ),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped) => s3_error!(
+            OperationAborted,
+            "heal request not admitted: admission={}, reason={}",
+            result.result_label(),
+            result.reason_label()
+        ),
+        HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {
+            s3_error!(InternalError, "admitted heal request was rejected unexpectedly")
+        }
+    }
+}
+
+async fn submit_cluster_heal_channel_command(
+    context: Arc<crate::admin::runtime_sources::AppContext>,
+    route: PreparedHealControlRoute,
+    envelope: rustfs_protos::heal_control::Envelope,
+    request_id: &str,
+    response_id: String,
+) -> S3Result<rustfs_common::heal_channel::HealChannelResponse> {
+    match route_cluster_heal_control(&context, &route, envelope, request_id, false).await? {
+        rustfs_protos::heal_control::Outcome::Channel { success, data, error } => {
+            Ok(rustfs_common::heal_channel::HealChannelResponse {
+                request_id: response_id,
+                success,
+                data,
+                error,
+            })
+        }
+        rustfs_protos::heal_control::Outcome::Start { .. } => {
+            Err(s3_error!(InternalError, "coordinator returned an unexpected heal result"))
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct HealTaskStatusPayload {
     summary: String,
     #[serde(default)]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
     #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
     progress: Option<serde_json::Value>,
 }
 
+#[cfg(test)]
 fn map_heal_response(result: Option<HealResp>) -> S3Result<(StatusCode, Vec<u8>)> {
     match result {
         Some(result) => {
@@ -528,6 +800,7 @@ fn encode_heal_task_status(
     failure_detail: String,
     heal_settings: HealOpts,
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    truncated: bool,
     progress: Option<serde_json::Value>,
 ) -> S3Result<Vec<u8>> {
     encode_json(&HealTaskStatus {
@@ -536,6 +809,7 @@ fn encode_heal_task_status(
         start_time: current_rfc3339_time()?,
         heal_settings,
         items,
+        truncated,
         progress,
     })
 }
@@ -577,15 +851,15 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
 
 fn heal_channel_response_status(
     response: &rustfs_common::heal_channel::HealChannelResponse,
-) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>, Option<serde_json::Value>) {
+) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>, bool, Option<serde_json::Value>) {
     let Some(data) = response.data.as_deref() else {
-        return ("running".to_string(), Vec::new(), None);
+        return ("running".to_string(), Vec::new(), false, None);
     };
 
     if let Ok(payload) = serde_json::from_slice::<HealTaskStatusPayload>(data)
         && !payload.summary.is_empty()
     {
-        return (payload.summary, payload.items, payload.progress);
+        return (payload.summary, payload.items, payload.truncated, payload.progress);
     }
 
     let summary = std::str::from_utf8(data)
@@ -593,7 +867,7 @@ fn heal_channel_response_status(
         .filter(|summary| !summary.is_empty())
         .unwrap_or("running")
         .to_string();
-    (summary, Vec::new(), None)
+    (summary, Vec::new(), false, None)
 }
 
 #[cfg(test)]
@@ -610,7 +884,7 @@ fn heal_channel_response_items(
 
 #[cfg(test)]
 fn heal_channel_response_progress(response: &rustfs_common::heal_channel::HealChannelResponse) -> Option<serde_json::Value> {
-    heal_channel_response_status(response).2
+    heal_channel_response_status(response).3
 }
 
 fn encode_background_heal_status(
@@ -732,6 +1006,7 @@ impl Operation for HealHandler {
             .get::<Option<RemoteAddr>>()
             .and_then(|opt| opt.map(|addr| addr.0.to_string()))
             .unwrap_or_default();
+        let app_context = app_context_from_req(&req);
         let mut input = req.input;
         let bytes = match input.store_all_limited(MAX_HEAL_REQUEST_SIZE).await {
             Ok(b) => b,
@@ -804,179 +1079,120 @@ impl Operation for HealHandler {
         };
 
         let heal_path = path_join(&[PathBuf::from(hip.bucket.clone()), PathBuf::from(hip.obj_prefix.clone())]);
-        let (tx, mut rx) = mpsc::channel(1);
-
         if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
-            // Query heal status
-            let tx_clone = tx.clone();
             let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
-            spawn_traced(async move {
-                match rustfs_common::heal_channel::query_heal_status(heal_path_str, client_token).await {
-                    Ok(response) if response.success => {
-                        let (summary, items, progress) = heal_channel_response_status(&response);
-                        let resp_bytes = encode_heal_task_status(
-                            summary,
-                            response.error.unwrap_or_default(),
-                            HealOpts::default(),
-                            items,
-                            progress,
-                        );
-                        match resp_bytes {
-                            Ok(resp_bytes) => {
-                                let _ = tx_clone
-                                    .send(HealResp {
-                                        resp_bytes,
-                                        ..Default::default()
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx_clone
-                                    .send(HealResp {
-                                        api_err: Some(e.to_string()),
-                                        ..Default::default()
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    Ok(response) => {
-                        let _ = tx_clone
-                            .send(HealResp {
-                                api_err: Some(response.error.unwrap_or_else(|| "query heal status failed".to_string())),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        let _ = tx_clone
-                            .send(HealResp {
-                                api_err: Some(format!("query heal status failed: {e}")),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                }
-            });
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let context = app_context
+                .clone()
+                .ok_or_else(|| cluster_heal_control_unavailable("app_context_unavailable"))?;
+            let route = prepare_heal_control_route(&context)?;
+            let envelope = rustfs_protos::heal_control::Envelope::query(
+                request_id.clone(),
+                new_heal_control_metadata(&route)?,
+                heal_path_str,
+                client_token.clone(),
+            )
+            .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
+            let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token).await?;
+            if !response.success {
+                return Err(s3_error!(
+                    InternalError,
+                    "{}",
+                    response.error.unwrap_or_else(|| "query heal status failed".to_string())
+                ));
+            }
+            let (summary, items, truncated, progress) = heal_channel_response_status(&response);
+            let body = encode_heal_task_status(
+                summary,
+                response.error.unwrap_or_default(),
+                HealOpts::default(),
+                items,
+                truncated,
+                progress,
+            )?;
+            info!(
+                event = EVENT_ADMIN_RESPONSE_EMITTED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = response_operation,
+                result = "success",
+                status_code = StatusCode::OK.as_u16(),
+                "admin response emitted"
+            );
+            return Ok(json_response(StatusCode::OK, body));
         } else if hip.force_stop {
-            // Cancel heal task
-            let tx_clone = tx.clone();
             let heal_path_str = heal_path.to_str().unwrap_or_default().to_string();
             let client_token = hip.client_token.clone();
-            let client_address = client_address.clone();
-            let heal_settings = hip.hs;
-            spawn_traced(async move {
-                match rustfs_common::heal_channel::cancel_heal_task(heal_path_str, client_token.clone()).await {
-                    Ok(response) if response.success => {
-                        let resp_bytes = if client_token.is_empty() {
-                            encode_heal_start_success(response.request_id, client_address)
-                        } else {
-                            let (summary, items, progress) = heal_channel_response_status(&response);
-                            encode_heal_task_status(summary, response.error.unwrap_or_default(), heal_settings, items, progress)
-                        };
-                        match resp_bytes {
-                            Ok(resp_bytes) => {
-                                let _ = tx_clone
-                                    .send(HealResp {
-                                        resp_bytes,
-                                        ..Default::default()
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx_clone
-                                    .send(HealResp {
-                                        api_err: Some(e.to_string()),
-                                        ..Default::default()
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    Ok(response) => {
-                        let _ = tx_clone
-                            .send(HealResp {
-                                api_err: Some(response.error.unwrap_or_else(|| "cancel heal task failed".to_string())),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        let _ = tx_clone
-                            .send(HealResp {
-                                api_err: Some(format!("cancel heal task failed: {e}")),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                }
-            });
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let context = app_context
+                .clone()
+                .ok_or_else(|| cluster_heal_control_unavailable("app_context_unavailable"))?;
+            let route = prepare_heal_control_route(&context)?;
+            let envelope = rustfs_protos::heal_control::Envelope::cancel(
+                request_id.clone(),
+                new_heal_control_metadata(&route)?,
+                heal_path_str,
+                client_token.clone(),
+            )
+            .map_err(|err| s3_error!(InternalError, "encode heal control cancel failed: {err}"))?;
+            let response = submit_cluster_heal_channel_command(
+                context,
+                route,
+                envelope,
+                &request_id,
+                if client_token.is_empty() {
+                    heal_path.to_string_lossy().into_owned()
+                } else {
+                    client_token.clone()
+                },
+            )
+            .await?;
+            if !response.success {
+                return Err(s3_error!(
+                    InternalError,
+                    "{}",
+                    response.error.unwrap_or_else(|| "cancel heal task failed".to_string())
+                ));
+            }
+            let body = if client_token.is_empty() {
+                encode_heal_start_success(response.request_id, client_address)?
+            } else {
+                let (summary, items, truncated, progress) = heal_channel_response_status(&response);
+                encode_heal_task_status(summary, response.error.unwrap_or_default(), hip.hs, items, truncated, progress)?
+            };
+            info!(
+                event = EVENT_ADMIN_RESPONSE_EMITTED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = response_operation,
+                result = "success",
+                status_code = StatusCode::OK.as_u16(),
+                "admin response emitted"
+            );
+            return Ok(json_response(StatusCode::OK, body));
         } else if hip.client_token.is_empty() {
-            // Use new heal channel mechanism
-            let tx_clone = tx.clone();
-            let client_address = client_address.clone();
-            spawn_traced(async move {
-                // Create heal request through channel
-                let heal_request = build_heal_channel_request(&hip);
-                match rustfs_common::heal_channel::send_heal_request_with_receipt(heal_request).await {
-                    Ok(receipt) if receipt.result.is_admitted() => {
-                        let resp_bytes = encode_heal_start_success(receipt.task_id, client_address);
-                        match resp_bytes {
-                            Ok(resp_bytes) => {
-                                let _ = tx_clone
-                                    .send(HealResp {
-                                        resp_bytes,
-                                        ..Default::default()
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx_clone
-                                    .send(HealResp {
-                                        api_err: Some(e.to_string()),
-                                        ..Default::default()
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    Ok(receipt) => {
-                        let _ = tx_clone
-                            .send(HealResp {
-                                api_err: Some(format!(
-                                    "heal request not admitted: admission={}, reason={}",
-                                    receipt.result.result_label(),
-                                    receipt.result.reason_label()
-                                )),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        // Error - send error response
-                        let _ = tx_clone
-                            .send(HealResp {
-                                api_err: Some(format!("send heal request failed: {e}")),
-                                ..Default::default()
-                            })
-                            .await;
-                    }
-                }
-            });
+            let Some(context) = app_context else {
+                return Err(cluster_heal_control_unavailable("app_context_unavailable"));
+            };
+            let receipt = submit_cluster_heal_start(context, &hip).await?;
+            if !receipt.result.is_admitted() {
+                return Err(reject_heal_admission(receipt.result));
+            }
+            let body = encode_heal_start_success(receipt.task_id, client_address)?;
+            info!(
+                event = EVENT_ADMIN_RESPONSE_EMITTED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
+                operation = response_operation,
+                result = "success",
+                status_code = StatusCode::OK.as_u16(),
+                "admin response emitted"
+            );
+            return Ok(json_response(StatusCode::OK, body));
         }
 
-        let (status, body) = map_heal_response(rx.recv().await)?;
-        info!(
-            event = EVENT_ADMIN_RESPONSE_EMITTED,
-            component = LOG_COMPONENT_ADMIN_API,
-            subsystem = LOG_SUBSYSTEM_HEAL_ADMIN,
-            operation = response_operation,
-            result = "success",
-            status_code = status.as_u16(),
-            "admin response emitted"
-        );
-        Ok(json_response(status, body))
+        Err(s3_error!(InvalidRequest, "invalid heal control request"))
     }
 }
 
@@ -1037,9 +1253,10 @@ mod tests {
     use super::{
         BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, aggregate_cluster_heal_status,
         background_heal_runtime_state, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary,
-        json_response, map_heal_response, map_root_heal_status, merge_peer_heal_statuses, peer_topology_complete,
-        query_peer_heal_status, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
+        encode_heal_task_status, execute_after_heal_control_capability, heal_channel_response_items,
+        heal_channel_response_progress, heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status,
+        merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status, reject_heal_admission,
+        should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
     };
     use crate::admin::storage_api::error::StorageError;
     use crate::storage::rpc::node_service::heal::{NodeHealProgress, NodeHealStatusSnapshot};
@@ -1047,16 +1264,60 @@ mod tests {
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
-    use rustfs_common::heal_channel::{HealChannelPriority, HealOpts, HealRequestSource, HealScanMode};
+    use rustfs_common::heal_channel::{
+        HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealOpts, HealRequestSource, HealScanMode,
+    };
     use rustfs_scanner::scanner::BackgroundHealInfo;
     use s3s::{
         S3ErrorCode,
         header::{CONTENT_LENGTH, CONTENT_TYPE},
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
     use tokio::time::Duration;
+
+    #[tokio::test]
+    async fn cluster_capability_gate_runs_before_execution() {
+        let executed = AtomicBool::new(false);
+        let rejected = execute_after_heal_control_capability(
+            || async { Err(super::cluster_heal_control_unavailable("test_capability_failure")) },
+            || async {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(rejected.is_err());
+        assert!(!executed.load(Ordering::SeqCst));
+
+        execute_after_heal_control_capability(
+            || async { Ok(()) },
+            || async {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(executed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_reject_heal_admission_preserves_retry_semantics() {
+        for admission in [
+            HealAdmissionResult::Full,
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull),
+        ] {
+            assert_eq!(reject_heal_admission(admission).code(), &S3ErrorCode::SlowDown);
+        }
+        assert_eq!(
+            reject_heal_admission(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)).code(),
+            &S3ErrorCode::OperationAborted
+        );
+        assert_eq!(reject_heal_admission(HealAdmissionResult::Accepted).code(), &S3ErrorCode::InternalError);
+    }
 
     #[test]
     fn test_heal_opts_serialization() {
@@ -1775,6 +2036,7 @@ mod tests {
             String::new(),
             HealOpts::default(),
             Vec::new(),
+            false,
             None,
         )
         .expect("status response should serialize");
@@ -1783,9 +2045,26 @@ mod tests {
         assert_eq!(json["summary"], "Heal status query accepted");
         assert_eq!(json["detail"], "");
         assert!(json["items"].is_null());
+        assert!(json["truncated"].is_null());
         assert!(json["settings"].is_object());
         let start_time = json["startTime"].as_str().expect("startTime should be a string");
         OffsetDateTime::parse(start_time, &Rfc3339).expect("startTime should be RFC3339");
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_reports_truncated_items() {
+        let encoded = encode_heal_task_status(
+            "running".to_string(),
+            "heal result items were truncated".to_string(),
+            HealOpts::default(),
+            Vec::new(),
+            true,
+            None,
+        )
+        .expect("truncated status response should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
+
+        assert_eq!(json["truncated"], true);
     }
 
     #[test]
@@ -1800,6 +2079,7 @@ mod tests {
             String::new(),
             HealOpts::default(),
             Vec::new(),
+            false,
             Some(progress.clone()),
         )
         .expect("status response should serialize");
