@@ -1,0 +1,23 @@
+name: Star History
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: star-history
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: overtrue/star-history-action@55f14521516d3d02ea2434dd1a514437ba8fe78f # v1.0.0
+        with:
+          github-token: ${{ github.token }}
+          output-branch: star-history
+          output-path: .
