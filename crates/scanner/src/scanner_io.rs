@@ -2487,10 +2487,16 @@ mod tests {
             meta.add_version(fi).expect("object version should be added");
         }
 
-        let mut delete_marker = FileInfo::new(object, 1, 1);
-        delete_marker.version_id = Some(Uuid::new_v4());
-        delete_marker.mod_time = Some(OffsetDateTime::from_unix_timestamp(30).expect("timestamp should be valid"));
-        delete_marker.deleted = true;
+        // A real delete marker carries no erasure geometry (delete paths build it as
+        // `FileInfo { deleted: true, .. }`). Construct it that way so it classifies as a
+        // storage delete marker rather than a purge-pending payload object.
+        let delete_marker = FileInfo {
+            name: object.to_string(),
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(30).expect("timestamp should be valid")),
+            deleted: true,
+            ..Default::default()
+        };
         meta.add_version(delete_marker).expect("delete marker should be added");
 
         tokio::fs::write(&metadata_path, meta.marshal_msg().expect("metadata should marshal"))
