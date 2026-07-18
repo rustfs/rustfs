@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" role="img" aria-labelledby="title description" data-style="gradient" data-animated="true">
 <title id="title">rustfs/rustfs star history</title>
-<desc id="description">29.9K stars as of 2026-07-18. Daily cumulative star trend.</desc>
+<desc id="description">30K stars as of 2026-07-18. Daily cumulative star trend.</desc>
 <defs>
 <linearGradient id="trend" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#0284c7"/></linearGradient>
 <linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#059669" stop-opacity="0.28"/><stop offset="60%" stop-color="#0284c7" stop-opacity="0.10"/><stop offset="100%" stop-color="#0284c7" stop-opacity="0.02"/></linearGradient>
@@ -41,7 +41,7 @@
 </g>
 <g class="marker-enter">
 <circle cx="928.0" cy="72.7" r="5" fill="#0284c7" stroke="#f8fafc" stroke-width="2"/>
-<text x="920.0" y="88.0" fill="#0284c7" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16" font-weight="600" text-anchor="end">29.9K</text>
+<text x="920.0" y="88.0" fill="#0284c7" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16" font-weight="600" text-anchor="end">30K</text>
 </g>
 <text x="928" y="524" fill="#526072" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" font-weight="500" text-anchor="end">Updated 2026-07-18</text>
 </svg>
