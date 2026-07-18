@@ -197,7 +197,6 @@ impl StarshardIdentityIndex {
             .is_some_and(|key_set| key_set.contains(key))
     }
 
-    #[cfg(test)]
     pub(crate) async fn contains_generation(
         &self,
         identity: &ObjectDataCacheIdentity,

@@ -22,7 +22,7 @@
 use super::super::*;
 
 use crate::disk::OldCurrentSize;
-use crate::object_api::GetObjectBodySource;
+use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 
 /// Length of the full plaintext body when — and only when — this read's output
 /// is exactly the object's complete plaintext, so the app-layer body cache may
@@ -61,6 +61,11 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
         || crate::object_api::restore_request_active(opts)
         || object_info.is_encrypted()
         || object_info.is_remote()
+        || object_info.delete_marker
+        || object_info.size == 0
+        || object_info.version_only
+        || object_info.metadata_only
+        || object_info.is_inline_fast_path_eligible()
     {
         return None;
     }
@@ -70,6 +75,14 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
     }
 
     Some(object_info.size)
+}
+
+pub(crate) fn body_cache_plaintext_len(
+    range: &Option<HTTPRangeSpec>,
+    opts: &ObjectOptions,
+    object_info: &ObjectInfo,
+) -> Option<i64> {
+    full_object_plaintext_len(range, opts, object_info)
 }
 
 #[async_trait::async_trait]
@@ -131,16 +144,21 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = Instant::now();
-        let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true, true).await {
-            Ok(result) => result,
-            Err(err) => {
-                rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
-                record_get_object_pipeline_failure(GET_STAGE_METADATA, classify_storage_error(&err));
-                return Err(to_object_err(err, vec![bucket, object]));
+        let (fi, files, disks, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
+            (prepared.fi, prepared.files, prepared.disks, prepared.object_info)
+        } else {
+            match self.get_object_fileinfo(bucket, object, opts, true, true).await {
+                Ok((fi, files, disks)) => (fi, files, disks, None),
+                Err(err) => {
+                    rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
+                    record_get_object_pipeline_failure(GET_STAGE_METADATA, classify_storage_error(&err));
+                    return Err(to_object_err(err, vec![bucket, object]));
+                }
             }
         };
         let object_info_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let object_info = prepared_object_info
+            .unwrap_or_else(|| build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
         let object_class = classify_get_codec_streaming_object_class(&range, &object_info, &fi);
         let size_bucket = rustfs_io_metrics::get_object_size_bucket(object_info.size);
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
@@ -410,6 +428,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // it forward.
         let mut body_source = GetObjectBodySource::Unprobed;
         if let Some(plaintext_len) = full_object_plaintext_len(&range, opts, &object_info)
+            && !get_object_body_cache_hook_suppressed()
             && let Some(hook) = get_object_body_cache_hook()
         {
             match hook.lookup(bucket, object, &object_info).await {

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup};
+use crate::cache::{
+    ObjectDataCacheBodyReservation, ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheInvalidationResult,
+    ObjectDataCacheLookup, ObjectDataCacheReservedBody,
+};
 use crate::config::ObjectDataCacheConfig;
 use crate::entry::{ObjectDataCacheEntry, projected_weight};
 use crate::index::{ObjectDataCacheGenerationalInsertResult, ObjectDataCacheIdentityIndex};
@@ -26,7 +29,7 @@ use moka::ops::compute;
 use std::future::ready;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 #[derive(Debug)]
 struct ClearFence {
@@ -48,7 +51,7 @@ struct ClearOperation {
 }
 
 #[derive(Debug)]
-struct FillGenerationGuard {
+pub(crate) struct FillGenerationGuard {
     fence: Arc<ClearFence>,
     generation: u64,
 }
@@ -122,6 +125,12 @@ impl ClearFence {
         if next_generation.is_some() {
             state.clear = None;
         }
+    }
+}
+
+impl FillGenerationGuard {
+    fn belongs_to(&self, fence: &Arc<ClearFence>) -> bool {
+        Arc::ptr_eq(&self.fence, fence)
     }
 }
 
@@ -447,8 +456,60 @@ impl MokaBackend {
         }
     }
 
+    pub(crate) fn reserve_body(&self, plan: &ObjectDataCacheGetPlan) -> Option<ObjectDataCacheBodyReservation> {
+        let ObjectDataCacheGetPlan::Cacheable { key } = plan else {
+            return None;
+        };
+        if projected_weight(key, key.size) > self.max_capacity {
+            return None;
+        }
+        // Register with the clear fence before the caller allocates or reads
+        // the body. A clear that starts after this point must wait for this
+        // reservation to publish or be dropped, so an old cold read cannot
+        // become visible after clear returns.
+        let fill_generation = self.clear_fence.try_register_fill()?;
+        let permit = Arc::clone(&self.fill_semaphore).try_acquire_owned().ok()?;
+        let cache_growth_headroom = self.max_capacity.saturating_sub(self.cache.weighted_size());
+        let memory = self.memory_gate.try_claim(key.size, cache_growth_headroom)?;
+        Some(ObjectDataCacheBodyReservation {
+            memory,
+            permit,
+            fill_generation,
+            key: key.clone(),
+            expected_size: key.size,
+        })
+    }
+
     /// Inserts a cached body for the supplied plan.
     pub async fn fill_body(&self, plan: &ObjectDataCacheGetPlan, bytes: Bytes) -> ObjectDataCacheFillResult {
+        self.fill_body_inner(plan, bytes, None).await
+    }
+
+    pub(crate) async fn fill_reserved_body(
+        &self,
+        plan: &ObjectDataCacheGetPlan,
+        body: ObjectDataCacheReservedBody,
+    ) -> ObjectDataCacheFillResult {
+        let ObjectDataCacheGetPlan::Cacheable { key } = plan else {
+            return ObjectDataCacheFillResult::SkippedNotCacheable;
+        };
+        if !body.fill_generation.belongs_to(&self.clear_fence) || body.key != *key {
+            return ObjectDataCacheFillResult::SkippedNotCacheable;
+        }
+        if u64::try_from(body.bytes.len()).unwrap_or(u64::MAX) != body.expected_size {
+            return ObjectDataCacheFillResult::SkippedSizeMismatch;
+        }
+        let (bytes, permit, fill_generation) = body.into_parts();
+        self.fill_body_inner(plan, bytes, Some((permit, fill_generation))).await
+    }
+
+    async fn fill_body_inner(
+        &self,
+        plan: &ObjectDataCacheGetPlan,
+        bytes: Bytes,
+        reservation: Option<(OwnedSemaphorePermit, FillGenerationGuard)>,
+    ) -> ObjectDataCacheFillResult {
+        let is_pre_reserved = reservation.is_some();
         let ObjectDataCacheGetPlan::Cacheable { key } = plan else {
             return ObjectDataCacheFillResult::SkippedNotCacheable;
         };
@@ -471,8 +532,14 @@ impl MokaBackend {
         // closing the check/register race without holding a lock across body
         // processing or cache/index I/O. Only the singleflight leader can
         // publish, so duplicate fills stay off this global hot-path lock.
-        let Some(fill_generation) = self.clear_fence.try_register_fill() else {
-            return leader.finish(ObjectDataCacheFillResult::SkippedInvalidationRace);
+        let (reserved_permit, fill_generation) = match reservation {
+            Some((permit, fill_generation)) => (Some(permit), fill_generation),
+            None => {
+                let Some(fill_generation) = self.clear_fence.try_register_fill() else {
+                    return leader.finish(ObjectDataCacheFillResult::SkippedInvalidationRace);
+                };
+                (None, fill_generation)
+            }
         };
 
         #[cfg(test)]
@@ -493,16 +560,19 @@ impl MokaBackend {
         // Bound distinct-key fill concurrency after winning leadership and
         // before the memory-gate check. Reject rather than queue: queuing would
         // reintroduce the GET-latency coupling this path is meant to avoid.
-        let permit = match Arc::clone(&self.fill_semaphore).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedFillConcurrency),
+        let permit = match reserved_permit {
+            Some(permit) => permit,
+            None => match Arc::clone(&self.fill_semaphore).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedFillConcurrency),
+            },
         };
 
         // Keep passing cache growth headroom for compatibility with the public
         // gate API. Allocation-scoped reservations deliberately do not cap by
         // this value because an evicted entry can still have live body clones.
         let cache_growth_headroom = self.max_capacity.saturating_sub(self.cache.weighted_size());
-        if !self.memory_gate.try_claim_buffered(body_bytes, cache_growth_headroom) {
+        if !is_pre_reserved && !self.memory_gate.try_claim_buffered(body_bytes, cache_growth_headroom) {
             return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure);
         }
 
@@ -534,7 +604,9 @@ impl MokaBackend {
         // if the enclosing fill future is aborted (e.g. the detached fill task
         // is cancelled). Aborting the outer future then only detaches this
         // JoinHandle; the task still finishes the undo, so a stale body cannot
-        // survive with no index entry. Dropping the leader releases the key.
+        // survive with no index entry. The owned singleflight leader moves into
+        // the task as well, keeping later same-key fills out until publication
+        // or rollback is complete.
         let cache = self.cache.clone();
         let index = Arc::clone(&self.index);
         let fill_key = key.clone();
@@ -563,7 +635,7 @@ impl MokaBackend {
             // cancelled, this owned task still acknowledges the clear fence.
             let fill_generation = fill_generation;
             if !fill_generation.is_current() {
-                return ObjectDataCacheFillResult::SkippedInvalidationRace;
+                return leader.finish(ObjectDataCacheFillResult::SkippedInvalidationRace);
             }
             // Register the key in the identity index BEFORE the entry becomes
             // visible in the cache, so a concurrent invalidation always finds it.
@@ -611,7 +683,7 @@ impl MokaBackend {
                 // Leave the registered key for the owned clear drain. Besides
                 // making the acknowledgement visible to clear, this preserves
                 // the pre-existing invalidation outcome count for admin stats.
-                return ObjectDataCacheFillResult::SkippedInvalidationRace;
+                return leader.finish(ObjectDataCacheFillResult::SkippedInvalidationRace);
             }
 
             let _ = cache
@@ -622,8 +694,8 @@ impl MokaBackend {
             // An invalidation may have raced between the index and cache
             // inserts; re-check the index and undo the fill so the stale
             // body cannot outlive the invalidation.
-            let indexed = index.contains_key(&fill_identity, &fill_key).await;
-            if fill_generation.is_current() && indexed {
+            let indexed = index.contains_generation(&fill_identity, &fill_key, generation).await;
+            let result = if fill_generation.is_current() && indexed {
                 ObjectDataCacheFillResult::Inserted
             } else {
                 cache.remove(&fill_key).await;
@@ -631,12 +703,11 @@ impl MokaBackend {
                     index.remove_generation(&fill_identity, &fill_key, generation).await;
                 }
                 ObjectDataCacheFillResult::SkippedInvalidationRace
-            }
+            };
+            leader.finish(result)
         });
 
-        let result = handle.await.unwrap_or(ObjectDataCacheFillResult::SkippedInvalidationRace);
-
-        leader.finish(result)
+        handle.await.unwrap_or(ObjectDataCacheFillResult::SkippedInvalidationRace)
     }
 
     /// Conservatively invalidates all cached keys matching the object identity.
@@ -1062,6 +1133,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_fences_body_reserved_before_materialization() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
+        let clear_barrier = backend.install_clear_barrier();
+        let plan = cacheable_plan("reserved-object", "etag-a");
+        let reservation = backend
+            .reserve_body(&plan)
+            .expect("reservation must register before body reads");
+
+        let clear_backend = Arc::clone(&backend);
+        let clear = tokio::spawn(async move { clear_backend.clear().await });
+        clear_barrier.wait_until_reached().await;
+        clear_barrier.release();
+        assert!(
+            !clear.is_finished(),
+            "clear must wait while a pre-materialization reservation can still publish"
+        );
+
+        let body = reservation.wrap_bytes(Bytes::from_static(b"hello"));
+        assert_eq!(
+            backend.fill_reserved_body(&plan, body).await,
+            ObjectDataCacheFillResult::SkippedInvalidationRace
+        );
+        assert_eq!(clear.await.expect("clear task should finish"), ObjectDataCacheInvalidationResult::NoOp);
+        assert!(matches!(backend.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        assert_eq!(backend.index.identity_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn clear_fences_fill_registered_before_cache_publish() {
         let backend = Arc::new(
             MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
@@ -1201,6 +1302,13 @@ mod tests {
             1,
             "the detached publish task must retain its active-fill acknowledgement"
         );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), backend.fill_body(&plan, Bytes::from_static(b"newer")),)
+                .await
+                .expect("same-key retry must not wait for detached publication"),
+            ObjectDataCacheFillResult::JoinedInflightFill,
+            "the detached publication must retain same-key singleflight ownership",
+        );
 
         let clear_barrier = backend.install_clear_barrier();
         let clear_backend = Arc::clone(&backend);
@@ -1326,6 +1434,63 @@ mod tests {
         assert_eq!(result, ObjectDataCacheFillResult::SkippedMemoryPressure);
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
+    }
+
+    #[test]
+    fn reserve_body_rejects_before_materialization_under_memory_pressure() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let backend = MokaBackend::new(&memory_gated_config(), Arc::clone(&stats)).expect("moka backend should build");
+        backend
+            .memory_gate
+            .set_test_snapshot(Some(crate::memory::ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 100,
+            }));
+
+        assert!(backend.reserve_body(&cacheable_plan("object", "etag-a")).is_none());
+        assert_eq!(backend.memory_gate.claimed_bytes_for_test(), 0);
+        assert_eq!(stats.snapshot().memory_pressure_events, 1);
+    }
+
+    #[tokio::test]
+    async fn reserved_body_claim_survives_cache_eviction_until_last_clone_drops() {
+        let backend = MokaBackend::new(&memory_gated_config(), Arc::new(ObjectDataCacheStats::default()))
+            .expect("moka backend should build");
+        backend
+            .memory_gate
+            .set_test_snapshot(Some(crate::memory::ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 500,
+            }));
+        let plan = cacheable_plan("object", "etag-a");
+        let body = backend
+            .reserve_body(&plan)
+            .expect("the allocation should fit the memory budget")
+            .wrap_bytes(Bytes::from_static(b"hello"));
+        assert_eq!(backend.memory_gate.claimed_bytes_for_test(), 5);
+
+        assert_eq!(backend.fill_reserved_body(&plan, body).await, ObjectDataCacheFillResult::Inserted);
+        assert_eq!(
+            backend.memory_gate.claimed_bytes_for_test(),
+            5,
+            "reserved fill must not claim the same allocation twice"
+        );
+        let ObjectDataCacheLookup::Hit(response_body) = backend.lookup_body(&plan).await else {
+            panic!("the reserved body should be cached");
+        };
+        let _ = backend
+            .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "object"))
+            .await;
+        backend.cache.run_pending_tasks().await;
+        assert_eq!(
+            backend.memory_gate.claimed_bytes_for_test(),
+            5,
+            "the response clone still owns the cached allocation"
+        );
+
+        drop(response_body);
+        backend.cache.run_pending_tasks().await;
+        assert_eq!(backend.memory_gate.claimed_bytes_for_test(), 0);
     }
 
     #[tokio::test]

@@ -114,7 +114,6 @@ impl ObjectDataCacheKeySet {
         self.keys.iter().any(|existing| &existing.key == key)
     }
 
-    #[cfg(test)]
     pub(crate) fn contains_generation(&self, key: &ObjectDataCacheKey, generation: ObjectDataCacheGeneration) -> bool {
         self.keys
             .iter()

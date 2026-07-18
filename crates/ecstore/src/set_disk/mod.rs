@@ -623,11 +623,283 @@ mod core;
 mod ctx;
 mod metadata;
 mod ops;
+pub(crate) use ops::object::body_cache_plaintext_len;
 mod read;
 mod replication;
 pub(crate) mod shard_source;
 
 pub use ops::heal_walk::HealWalkVersion;
+
+pub(crate) struct PreparedGetObjectMetadata {
+    fi: FileInfo,
+    files: Vec<FileInfo>,
+    disks: Vec<Option<DiskStore>>,
+    object_info: Option<ObjectInfo>,
+}
+
+impl PreparedGetObjectMetadata {
+    pub(crate) fn object_info(&self) -> &ObjectInfo {
+        self.object_info
+            .as_ref()
+            .expect("prepared GET metadata must retain its ObjectInfo until consumed")
+    }
+
+    pub(crate) fn take_object_info(&mut self) -> ObjectInfo {
+        self.object_info
+            .take()
+            .expect("prepared GET metadata ObjectInfo must be consumed exactly once")
+    }
+}
+
+tokio::task_local! {
+    static PREPARED_GET_OBJECT_METADATA: std::cell::RefCell<Option<PreparedGetObjectMetadata>>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static GET_OBJECT_INFO_CONVERSIONS: Arc<AtomicU64>;
+}
+
+fn build_get_object_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+    #[cfg(test)]
+    let _ = GET_OBJECT_INFO_CONVERSIONS.try_with(|conversions| {
+        conversions.fetch_add(1, Ordering::Relaxed);
+    });
+    ObjectInfo::from_file_info(fi, bucket, object, versioned)
+}
+
+fn take_prepared_get_object_metadata() -> Option<PreparedGetObjectMetadata> {
+    PREPARED_GET_OBJECT_METADATA
+        .try_with(|prepared| prepared.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+async fn with_prepared_get_object_metadata<F>(metadata: PreparedGetObjectMetadata, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PREPARED_GET_OBJECT_METADATA
+        .scope(std::cell::RefCell::new(Some(metadata)), future)
+        .await
+}
+
+#[cfg(test)]
+mod prepared_get_object_metadata_tests {
+    use super::*;
+    use crate::ecstore_validation_blackbox::make_local_set_disks;
+    use crate::object_api::{BLOCK_SIZE_V2, PutObjReader};
+    use crate::set_disk::core::io_primitives::disk_call_counters;
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use http::HeaderMap;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn prepared_metadata_is_consumed_exactly_once() {
+        let metadata = PreparedGetObjectMetadata {
+            fi: FileInfo::default(),
+            files: Vec::new(),
+            disks: Vec::new(),
+            object_info: None,
+        };
+
+        with_prepared_get_object_metadata(metadata, async {
+            assert!(take_prepared_get_object_metadata().is_some());
+            assert!(take_prepared_get_object_metadata().is_none());
+        })
+        .await;
+        assert!(take_prepared_get_object_metadata().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_reuses_metadata_fanout_exactly_once() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "prepared-metadata-fanout";
+        let object = "prepared-metadata-fanout-object.bin";
+        let payload = b"prepared-metadata-fanout-payload-".repeat(40_000);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let calls = disk_call_counters::observe(object);
+        let conversions = Arc::new(AtomicU64::new(0));
+        let restored = GET_OBJECT_INFO_CONVERSIONS
+            .scope(Arc::clone(&conversions), async {
+                let metadata = set_disks
+                    .prepare_get_object_metadata(bucket, object, &opts)
+                    .await
+                    .expect("prepared metadata should resolve");
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    4,
+                    "preparation should fan out to each online disk exactly once"
+                );
+
+                let mut reader = set_disks
+                    .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
+                    .await
+                    .expect("prepared body reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("prepared body should stream");
+                restored
+            })
+            .await;
+
+        assert_eq!(restored, payload);
+        assert_eq!(
+            conversions.load(Ordering::Relaxed),
+            1,
+            "prepared reader must consume the ObjectInfo built during metadata preparation"
+        );
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            4,
+            "reader construction must consume prepared metadata instead of repeating the fanout"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_rebuilds_object_info_when_precomputed_value_is_absent() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "prepared-object-info-fallback";
+        let object = "prepared-object-info-fallback.bin";
+        let payload = b"prepared-object-info-fallback-payload".repeat(4_000);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let conversions = Arc::new(AtomicU64::new(0));
+        let restored = GET_OBJECT_INFO_CONVERSIONS
+            .scope(Arc::clone(&conversions), async {
+                let mut metadata = set_disks
+                    .prepare_get_object_metadata(bucket, object, &opts)
+                    .await
+                    .expect("prepared metadata should resolve");
+                metadata.object_info = None;
+                let mut reader = set_disks
+                    .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
+                    .await
+                    .expect("reader should rebuild missing prepared ObjectInfo");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("fallback reader should stream");
+                restored
+            })
+            .await;
+
+        assert_eq!(restored, payload);
+        assert_eq!(
+            conversions.load(Ordering::Relaxed),
+            2,
+            "missing precomputed ObjectInfo must trigger exactly one structural fallback rebuild"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_restores_full_body_with_one_offline_shard() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "prepared-reader-offline-shard";
+        let object = "prepared-reader-offline-shard-object.bin";
+        let payload = (0..(BLOCK_SIZE_V2 + 321))
+            .map(|idx| ((idx * 19) % 251) as u8)
+            .collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+        set_disks.disks.write().await[0] = None;
+
+        let metadata = set_disks
+            .prepare_get_object_metadata(bucket, object, &opts)
+            .await
+            .expect("prepared metadata should tolerate one offline shard");
+        let mut reader = set_disks
+            .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
+            .await
+            .expect("prepared body reader should open with one offline shard");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("degraded prepared body should stream");
+
+        assert_eq!(restored, payload);
+    }
+}
+
+impl SetDisks {
+    pub(crate) async fn prepare_get_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<PreparedGetObjectMetadata> {
+        let (fi, files, disks) = self.get_object_fileinfo(bucket, object, opts, true, true).await?;
+        let object_info = build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        Ok(PreparedGetObjectMetadata {
+            fi,
+            files,
+            disks,
+            object_info: Some(object_info),
+        })
+    }
+
+    pub(crate) async fn get_object_reader_with_prepared_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        headers: HeaderMap,
+        opts: &ObjectOptions,
+        metadata: PreparedGetObjectMetadata,
+    ) -> Result<GetObjectReader> {
+        with_prepared_get_object_metadata(metadata, self.get_object_reader(bucket, object, range, headers, opts)).await
+    }
+}
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid

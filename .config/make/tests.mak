@@ -26,6 +26,9 @@ script-tests: ## Run shell script tests
 	@echo "Running script tests..."
 	./scripts/test_build_rustfs_options.sh
 	./scripts/test_entrypoint_credentials.sh
+	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
+	python3 ./scripts/check_object_data_cache_follower_samples.py --self-test
+	./scripts/validate_object_data_cache_cold_stampede.sh --self-test
 
 .PHONY: test
 test: core-deps script-tests ## Run all tests (needs cargo-nextest; RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1 to override)
