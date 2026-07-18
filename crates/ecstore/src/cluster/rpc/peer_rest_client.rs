@@ -34,9 +34,9 @@ use rustfs_protos::proto_gen::node_service::{
     GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest,
     GetSysErrorsRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ServerInfoRequest,
-    SignalServiceRequest, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
-    node_service_client::NodeServiceClient,
+    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ScannerActivityRequest,
+    ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, StartDecommissionRequest, StartProfilingRequest,
+    StopRebalanceRequest, node_service_client::NodeServiceClient,
 };
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
@@ -62,6 +62,31 @@ pub const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = 1;
 pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerPeerActivity {
+    pub instance_id: String,
+    pub namespace_generation: u64,
+    pub maintenance_generation: u64,
+}
+
+fn decode_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerPeerActivity> {
+    let instance_id = response.instance_id;
+    if instance_id.len() != 32
+        || !instance_id
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(Error::other("peer returned an invalid scanner activity instance ID"));
+    }
+    Ok(ScannerPeerActivity {
+        instance_id,
+        namespace_generation: response.namespace_generation,
+        maintenance_generation: response.maintenance_generation,
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
@@ -639,12 +664,13 @@ impl PeerRestClient {
         Err(Error::NotImplemented)
     }
 
-    pub async fn load_bucket_metadata(&self, bucket: &str) -> Result<()> {
+    pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
         self.finalize_result(
             async {
                 let mut client = self.get_client().await?;
                 let request = Request::new(LoadBucketMetadataRequest {
                     bucket: bucket.to_string(),
+                    scanner_maintenance_change,
                 });
 
                 let response = client.load_bucket_metadata(request).await?.into_inner();
@@ -908,6 +934,25 @@ impl PeerRestClient {
         .await
     }
 
+    pub async fn scanner_activity(&self) -> Result<ScannerPeerActivity> {
+        self.finalize_result(
+            async {
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
+                let response = client
+                    .scanner_activity(Request::new(ScannerActivityRequest {}))
+                    .await?
+                    .into_inner();
+                decode_scanner_activity(response)
+            }
+            .await,
+        )
+        .await
+    }
+
     pub async fn get_metacache_listing(&self) -> Result<()> {
         warn!("get_metacache_listing is not implemented in PeerRestClient");
         Err(Error::NotImplemented)
@@ -1155,6 +1200,48 @@ mod tests {
             },
             "http://127.0.0.1:9000".to_string(),
         )
+    }
+
+    #[test]
+    fn scanner_activity_requires_restart_safe_peer_identity() {
+        let missing_instance = ScannerActivityResponse {
+            instance_id: String::new(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+        };
+        assert!(
+            decode_scanner_activity(missing_instance)
+                .expect_err("an empty instance ID is not restart safe")
+                .to_string()
+                .contains("instance ID")
+        );
+
+        let malformed_instance = ScannerActivityResponse {
+            instance_id: "ABCDEF0123456789ABCDEF0123456789".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+        };
+        assert!(
+            decode_scanner_activity(malformed_instance)
+                .expect_err("activity instance IDs must use the canonical lowercase hex form")
+                .to_string()
+                .contains("instance ID")
+        );
+
+        let activity = decode_scanner_activity(ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+        })
+        .expect("complete activity responses should be accepted");
+        assert_eq!(
+            activity,
+            ScannerPeerActivity {
+                instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                namespace_generation: 7,
+                maintenance_generation: 3,
+            }
+        );
     }
 
     #[test]

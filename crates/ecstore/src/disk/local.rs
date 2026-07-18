@@ -28,7 +28,7 @@ use crate::disk::{
     format::FormatV3,
     fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     os,
-    os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
+    os::{check_path_length, is_dir_not_empty_error, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
@@ -231,6 +231,31 @@ async fn restore_delete_rollback_after_error(
     }
 
     err
+}
+
+/// Whether a failed `remove_dir` while cleaning up an object path is benign.
+///
+/// The directory is either already gone (`NotFound`) or still holds sibling
+/// entries owned by another step — e.g. the delete rollback-staging dir, which
+/// the caller removes only after write quorum is confirmed — in which case it is
+/// left intact. illumos/Solaris report the still-populated case as EEXIST rather
+/// than ENOTEMPTY (see [`is_dir_not_empty_error`]), so matching `ErrorKind`
+/// alone misclassifies it as a hard failure and turns a benign delete into a
+/// spurious `FileAccessDenied` (rustfs/rustfs#4978).
+fn is_benign_object_rmdir_error(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::NotFound || is_dir_not_empty_error(err)
+}
+
+/// Classify a `delete_volume` removal error. A non-force `remove_dir` on a
+/// populated bucket must map to `VolumeNotEmpty`; illumos/Solaris report that as
+/// EEXIST rather than ENOTEMPTY, which `to_volume_error` would otherwise pass
+/// through as a raw OS error (rustfs/rustfs#4978).
+fn classify_delete_volume_error(err: std::io::Error) -> DiskError {
+    if is_dir_not_empty_error(&err) {
+        DiskError::VolumeNotEmpty
+    } else {
+        to_volume_error(err).into()
+    }
 }
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -4359,24 +4384,23 @@ impl LocalDisk {
             // debug!("delete_file remove_dir {:?}", &delete_path);
             if let Err(err) = fs::remove_dir(&delete_path).await {
                 // debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
-                match err.kind() {
-                    ErrorKind::NotFound => (),
-                    ErrorKind::DirectoryNotEmpty => (),
-                    kind => {
-                        warn!(
-                            event = EVENT_DISK_LOCAL_DELETE_FAILED,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            path = ?delete_path,
-                            operation = "remove_dir",
-                            error_kind = %kind,
-                            "Disk local delete failed"
-                        );
-                        return Err(Error::other(FileAccessDeniedWithContext {
-                            path: delete_path.clone(),
-                            source: err,
-                        }));
-                    }
+                // A missing or still-populated directory is benign here; see
+                // is_benign_object_rmdir_error (handles the illumos/Solaris EEXIST
+                // convention, rustfs/rustfs#4978).
+                if !is_benign_object_rmdir_error(&err) {
+                    warn!(
+                        event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = ?delete_path,
+                        operation = "remove_dir",
+                        error_kind = %err.kind(),
+                        "Disk local delete failed"
+                    );
+                    return Err(Error::other(FileAccessDeniedWithContext {
+                        path: delete_path.clone(),
+                        source: err,
+                    }));
                 }
             }
             // debug!("delete_file remove_dir done {:?}", &delete_path);
@@ -7792,7 +7816,7 @@ impl DiskAPI for LocalDisk {
         };
 
         if let Err(err) = res {
-            let e: DiskError = to_volume_error(err).into();
+            let e: DiskError = classify_delete_volume_error(err);
             if e != DiskError::VolumeNotFound {
                 return Err(e);
             }
@@ -7974,6 +7998,50 @@ mod test {
         let rollback_dir = inline_metadata_rollback_dir(target_version, &meta);
         assert_ne!(rollback_dir, colliding_dir);
         assert!(!rollback_dir.is_nil());
+    }
+
+    // Call-site guards for rustfs/rustfs#4978. On Linux/macOS CI a real
+    // non-empty rmdir yields ENOTEMPTY (already tolerated by the pre-fix paths),
+    // so an end-to-end delete test cannot detect a call-site regression. These
+    // drive the decision functions the call sites use with a synthetic Solaris
+    // EEXIST, so reverting the fix at either site turns a test red on any host.
+    #[test]
+    fn is_benign_object_rmdir_error_tolerates_missing_and_non_empty() {
+        assert!(is_benign_object_rmdir_error(&std::io::Error::from(std::io::ErrorKind::NotFound)));
+        assert!(is_benign_object_rmdir_error(&std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty)));
+        // A genuine failure must still propagate.
+        assert!(!is_benign_object_rmdir_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        #[cfg(unix)]
+        {
+            assert!(is_benign_object_rmdir_error(&std::io::Error::from_raw_os_error(libc::ENOTEMPTY)));
+            // illumos/Solaris report a non-empty rmdir as EEXIST, not ENOTEMPTY.
+            assert!(is_benign_object_rmdir_error(&std::io::Error::from_raw_os_error(libc::EEXIST)));
+            assert!(!is_benign_object_rmdir_error(&std::io::Error::from_raw_os_error(libc::EACCES)));
+        }
+    }
+
+    #[test]
+    fn classify_delete_volume_error_maps_not_empty_and_missing() {
+        assert!(matches!(
+            classify_delete_volume_error(std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty)),
+            DiskError::VolumeNotEmpty
+        ));
+        assert!(matches!(
+            classify_delete_volume_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            DiskError::VolumeNotFound
+        ));
+        #[cfg(unix)]
+        {
+            assert!(matches!(
+                classify_delete_volume_error(std::io::Error::from_raw_os_error(libc::ENOTEMPTY)),
+                DiskError::VolumeNotEmpty
+            ));
+            // illumos/Solaris non-empty rmdir -> EEXIST must still refuse the bucket.
+            assert!(matches!(
+                classify_delete_volume_error(std::io::Error::from_raw_os_error(libc::EEXIST)),
+                DiskError::VolumeNotEmpty
+            ));
+        }
     }
 
     async fn ensure_test_volume(disk: &LocalDisk, volume: &str) {

@@ -73,6 +73,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status};
 use tower::{Service, ServiceBuilder};
@@ -94,6 +95,7 @@ const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_re
 const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+const METRIC_HTTP_SERVER_CONNECTION_CAP_SATURATED_TOTAL: &str = "rustfs_http_server_connection_cap_saturated_total";
 
 /// Cached handle for the per-response-body-chunk byte counter. A streamed GET
 /// emits many chunks, so resolving the `counter!` registry entry once — the
@@ -115,6 +117,7 @@ const EVENT_HTTP_STARTUP_ENDPOINTS: &str = "http_startup_endpoints";
 const EVENT_HTTP_HOST_ROUTING: &str = "http_host_routing";
 const EVENT_HTTP_COMPRESSION_STATE: &str = "http_compression_state";
 const EVENT_API_RATE_LIMIT_STATE: &str = "api_rate_limit_state";
+const EVENT_CONNECTION_CAP_STATE: &str = "connection_cap_state";
 const EVENT_HTTP_TRANSPORT_PARAMETERS: &str = "http_transport_parameters";
 const EVENT_HTTP_ACCEPT_LOOP_STATE: &str = "http_accept_loop_state";
 const EVENT_HTTP_CONNECTION_DRAIN: &str = "http_connection_drain";
@@ -778,6 +781,33 @@ pub async fn start_http_server(
         }
     }
 
+    // Global connection cap (backlog#1191 follow-up sub-item): bounds the
+    // number of concurrently served connections on this listener so a
+    // connection flood cannot exhaust file descriptors or memory. `None`
+    // (the default, RUSTFS_API_MAX_CONNECTIONS=0) leaves the accept loop
+    // unchanged.
+    let max_connections =
+        rustfs_utils::get_env_usize(rustfs_config::ENV_API_MAX_CONNECTIONS, rustfs_config::DEFAULT_API_MAX_CONNECTIONS);
+    let connection_limiter = (max_connections > 0).then(|| Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS))));
+    if connection_limiter.is_some() {
+        info!(
+            event = EVENT_CONNECTION_CAP_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "enabled",
+            max_connections,
+            "Connection cap state changed"
+        );
+    } else {
+        debug!(
+            event = EVENT_CONNECTION_CAP_STATE,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "disabled",
+            "Connection cap state changed"
+        );
+    }
+
     let is_console = config.console_enable;
     let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
@@ -871,6 +901,47 @@ pub async fn start_http_server(
 
         loop {
             trace!("Waiting for new connection");
+
+            // Connection cap: acquire a permit BEFORE accepting, so that at
+            // saturation the loop stops accepting and the kernel backlog
+            // absorbs bursts (TCP-native backpressure) instead of accept-then-
+            // close churn. The permit travels into the connection task and is
+            // released by RAII when the connection ends.
+            let connection_permit = match &connection_limiter {
+                None => None,
+                Some(semaphore) => match semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        counter!(METRIC_HTTP_SERVER_CONNECTION_CAP_SATURATED_TOTAL).increment(1);
+                        debug!(
+                            event = EVENT_CONNECTION_CAP_STATE,
+                            component = LOG_COMPONENT_SERVER,
+                            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                            state = "saturated",
+                            "Connection cap state changed"
+                        );
+                        tokio::select! {
+                            permit = semaphore.clone().acquire_owned() => match permit {
+                                Ok(permit) => Some(permit),
+                                // The semaphore is never closed; fail safe by
+                                // stopping the accept loop if it ever is.
+                                Err(_) => break,
+                            },
+                            _ = shutdown_rx.recv() => {
+                                info!(
+                                    event = EVENT_HTTP_ACCEPT_LOOP_STATE,
+                                    component = LOG_COMPONENT_SERVER,
+                                    subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                                    state = "shutdown_signal_received",
+                                    "HTTP accept loop state changed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                },
+            };
+
             let (socket, _) = {
                 #[cfg(unix)]
                 {
@@ -971,7 +1042,7 @@ pub async fn start_http_server(
                 rate_limit_layer: api_rate_limit_layer.clone(),
             };
 
-            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher());
+            process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher(), connection_permit);
         }
 
         let active_connections = graceful.count();
@@ -1201,8 +1272,12 @@ fn process_connection(
     tls_acceptor: Option<Arc<TlsAcceptorHolder>>,
     context: ConnectionContext,
     graceful: Watcher,
+    connection_permit: Option<OwnedSemaphorePermit>,
 ) {
     tokio::spawn(async move {
+        // Hold the connection-cap permit for the lifetime of this task; RAII
+        // release covers TLS handshake failures and normal close alike.
+        let _connection_permit = connection_permit;
         let ConnectionContext {
             http_server,
             s3_service,
