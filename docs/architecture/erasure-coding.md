@@ -44,8 +44,8 @@ RustFS stores every object as a Reed–Solomon erasure code across the drives of
 
 Two codec backends exist, selected per object from its metadata (never a runtime toggle):
 
-- **Modern backend** — Reed–Solomon over **GF(2⁸)** using `rustfs-erasure-codec` (a RustFS fork of `reed-solomon-erasure` v8, `Cargo.toml`), imported as `reed_solomon_erasure::galois_8::ReedSolomon` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)). Vandermonde generator matrix; algorithm string `"rs-vandermonde"` ([object_api/mod.rs](../../crates/ecstore/src/object_api/mod.rs)). Field order is 256, so total shards per set is capped at 256 by the codec — well above the geometry cap of 16 (§2). Used for **all new writes**.
-- **Legacy backend** — Reed–Solomon over **GF(2¹⁶)** using `reed-solomon-simd` v3.1 (`Cargo.toml`), imported at [erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs). Used **only** to read and heal objects written in the older MinIO-lineage format.
+- **Modern backend** — Reed–Solomon over **GF(2⁸)** using `rustfs-erasure-codec` (a RustFS fork of `reed-solomon-erasure` v8, `Cargo.toml`), imported as `reed_solomon_erasure::galois_8::ReedSolomon` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)). Vandermonde generator matrix; algorithm string `"rs-vandermonde"` ([object_api/mod.rs](../../crates/ecstore/src/object_api/mod.rs)). The GF(2⁸) field bounds total shards per set far above the geometry cap of 16 (§2). Used for **all new writes** — and, because MinIO uses the same `rs-vandermonde` GF(2⁸) scheme, for **all MinIO-migrated objects** too.
+- **Legacy backend** — Reed–Solomon over **GF(2¹⁶)** using `reed-solomon-simd` v3.1 (`Cargo.toml`), imported at [erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs). Used **only** to read and heal objects written in **RustFS's own older ("main branch") format** — the `rmp_serde`-serialized layout detected by `uses_legacy_checksum` (see §11). This backend is **not** MinIO-compatible; MinIO-migrated data is decoded by the modern GF(2⁸) backend above (see [minio-file-format-compat.md](minio-file-format-compat.md)). The backend is chosen per object from its metadata (`uses_legacy_checksum`), never by a runtime toggle.
 
 Industry alignment (all confirmed in code): byte-oriented RS over GF(2⁸) with a Vandermonde matrix, 1 MiB erasure block, and HighwayHash-256 bitrot checksums with a π-derived key — the same family and defaults MinIO uses. This is what makes byte-level `xl.meta` interoperability with MinIO possible (see [minio-file-format-compat.md](minio-file-format-compat.md)).
 
@@ -59,7 +59,7 @@ Where the code lives: the erasure engine is owned by `crates/ecstore/src/erasure
 
 A deployment is a list of **pools**; each pool's drives are partitioned into equal-size **erasure sets**; each set has `N` **drives**. Set-size selection lives in [disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs): the chosen set size is the largest member of `SET_SIZES` that divides the GCD of the pool sizes and is symmetric across the ellipsis patterns, preferring the fewest sets (`get_set_indexes`, `common_set_drive_count`, `possible_set_counts_with_symmetry`).
 
-- **INVARIANT — set size.** `SET_SIZES = [2, 3, …, 16]` ([disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs)); `is_valid_set_size` requires `2 ≤ N ≤ 16` ([disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs)). Every erasure set has `N ∈ 2..=16` drives. This bounds `data_blocks + parity_blocks ≤ 16`, which downstream metadata validation may rely on.
+- **INVARIANT — set size.** `SET_SIZES = [2, 3, …, 16]` ([disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs)); `is_valid_set_size` requires `2 ≤ N ≤ 16` ([disks_layout.rs](../../crates/ecstore/src/layout/disks_layout.rs)). Every multi-drive (ellipses) erasure set has `N ∈ 2..=16` drives, bounding `data_blocks + parity_blocks ≤ 16` (which downstream metadata validation may rely on). A single-drive deployment is the one exception: it runs at `N = 1` with parity `0` via a separate layout path (`is_single_drive_layout`) that does not go through `is_valid_set_size`.
 - The `RUSTFS_ERASURE_SET_DRIVE_COUNT` override may pin the set size but only to a value that appears in the symmetric divisor set and still passes `is_valid_set_size` (≤ 16). It is a TUNABLE, not a way past the cap.
 - Runtime geometry is read back from the on-disk format: `set_drive_count = format.erasure.sets[0].len()`. The disk-UUID position within `format.erasure.sets` must not change — see [ecstore-layout-boundary.md](ecstore-layout-boundary.md).
 
@@ -75,7 +75,7 @@ Default parity by drive count — `default_parity_count(N)` ([storageclass.rs](.
 
 Two storage classes: `STANDARD` (SC) and `REDUCED_REDUNDANCY` (RRS) ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs)), configured as `"EC:<parity>"` via the `standard` / `rrs` config keys or the `RUSTFS_STORAGE_CLASS_STANDARD` / `RUSTFS_STORAGE_CLASS_RRS` env overrides. Absent config falls back to `default_parity_count` (SC) and `1`, or `0` on a single drive (RRS).
 
-- **INVARIANT — parity bounds.** `validate_parity_inner` requires `parity ≤ N/2` for both classes and `SC parity ≥ RRS parity` when both are non-zero ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs), `validate_parity` / `validate_parity_inner`). Parity `0` is permitted (single-drive / capacity setups); there is no non-zero minimum.
+- **INVARIANT — parity bounds.** Parity must satisfy `parity ≤ N/2` for both classes, and `SC parity ≥ RRS parity` when both are non-zero ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs), `validate_parity` / `validate_parity_inner`). Enforcement nuance to be aware of: `validate_parity_inner` (the path a user-configured `EC:<parity>` storage class flows through) only applies the `parity ≤ N/2` check for `N > 2`, so degenerate small-set values (e.g. `EC:2` on `N = 2`, giving `data_blocks = 0`) are not caught there; the standalone `validate_parity` enforces the bound unconditionally but is applied only to the resolved default parity. A change that lets user-configured parity reach a write path must not assume the `≤ N/2` bound was enforced for `N ≤ 2`. Parity `0` is permitted (single-drive / capacity setups); there is no non-zero minimum.
 - **INVARIANT — per-pool validity.** Each pool's resolved parity must be valid for **that pool's own drive count**. A heterogeneous deployment (pools of different widths) must resolve parity per pool; applying one pool's parity to a narrower pool can drive `data_blocks = N − parity` to `0` and make encoding impossible.
   - Baseline defect: `main` computes `common_parity_drives` from the **first** pool only and applies it to every pool ([store/init.rs](../../crates/ecstore/src/store/init.rs), `ec_drives_no_config` at [store/init_format.rs](../../crates/ecstore/src/store/init_format.rs)); this is issue #4801 (a smaller later pool panics with `TooFewDataShards`). The correct rule is per-pool resolution.
 
@@ -175,7 +175,7 @@ Produced by `FileMeta::marshal_msg` ([codec.rs](../../crates/filemeta/src/fileme
 
 ### 6.2 Shallow header (`FileMetaVersionHeader`)
 
-Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u8`, `ec_n: u8`, `ec_m: u8` ([version.rs](../../crates/filemeta/src/filemeta/version.rs)). Three wire versions dispatched by array length:
+Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u8`, `ec_n: u8`, `ec_m: u8` ([version.rs](../../crates/filemeta/src/filemeta/version.rs)). Three wire versions, dispatched by `header_ver` (each version then validates its array length as a consistency check):
 
 | header_ver | array len | fields (in order) |
 |------------|-----------|-------------------|
@@ -183,7 +183,7 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 | 2 | 5 | version_id, mod_time, signature, type, flags |
 | 3 (current) | 7 | version_id, mod_time, signature, type, flags, `ec_n`, `ec_m` |
 
-- **INVARIANT.** Array length discriminates the header format; a reader must branch on `header_ver`. Writes always emit v3 (len 7). `ec_m = data`, `ec_n = parity` (header order is `ec_n` then `ec_m`) — a mirror of the geometry for quorum decisions without parsing the body.
+- **INVARIANT.** A reader must branch on `header_ver` (the meta-blob int), not guess from length; each version's decoder then enforces its array length (4/5/7). Writes always emit v3 (len 7). `ec_m = data`, `ec_n = parity` (header order is `ec_n` then `ec_m`) — a mirror of the geometry for quorum decisions without parsing the body.
 - **INVARIANT — flags.** `FreeVersion = 1<<0`, `UsesDataDir = 1<<1`, `InlineData = 1<<2` ([version.rs](../../crates/filemeta/src/filemeta/version.rs)).
 - The v3 header intentionally keeps a null version id as `Some(nil)` (null-version disambiguation via mod_time), unlike the body decoders which fold nil → None.
 - `signature` is a RustFS-internal content hash for divergence/heal detection; it is recomputed on write and never compared byte-wise against MinIO.
@@ -197,7 +197,7 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 - `MTime` is **unix-nanos** sint; `UNIX_EPOCH` ⇒ `None`, and `None` is omitted on write so it never round-trips to `Some(epoch)`.
 - `EcDist` is an **array** of per-shard slot values (not a bin blob). V2Obj does **not** store per-part bitrot checksums (only legacy V1 does).
 - `PartETags` / `PartASizes` / `MetaSys` / `MetaUsr` are written as msgpack nil when empty; **a reader must treat nil and empty identically**. `PartIdx` is omitted entirely when empty.
-- Part arrays are **parallel and index-aligned**: `PartNums` / `PartSizes` / `PartASizes` must be equal length (mismatch ⇒ `FileCorrupt`, because indexing would panic or miscompute Content-Length/Range); `PartETags` / `PartIdx` are soft-guarded (applied only if length matches, empty index ⇒ None).
+- Part arrays are **parallel and index-aligned**: when parts are materialized (the `all_parts` decode path), `PartNums` / `PartSizes` / `PartASizes` must be equal length (mismatch ⇒ `FileCorrupt`, because indexing would panic or miscompute Content-Length/Range); `PartETags` / `PartIdx` are soft-guarded (applied only if length matches, empty index ⇒ None). When parts are not materialized the arrays are not cross-checked.
 - **INVARIANT — negative `part.actual_size` is a valid sentinel** for "compressed, actual size unknown" ([fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)); it is carried verbatim and must not be rejected on decode (see §11).
 
 **`MetaDeleteMarker` (DelObj)** — msgpack map, always 3 keys `ID`, `MTime`, `MetaSys` ([version.rs](../../crates/filemeta/src/filemeta/version.rs)); `MetaSys` is always written even when empty. Decode folds nil `ID` ⇒ None and epoch `MTime` ⇒ None, and skips unknown keys.
@@ -210,9 +210,9 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 
 ### 6.5 Internal metadata keys (dual prefix)
 
-- **INVARIANT — dual prefixes.** Internal keys carry both `x-rustfs-internal-<suffix>` and `x-minio-internal-<suffix>` ([metadata_compat.rs](../../crates/utils/src/http/metadata_compat.rs)). Write path writes **both** (`insert_str` / `insert_bytes`); read path **prefers RustFS, falls back to MinIO** (`get_str` / `get_bytes`), case-insensitive on the prefix. Both prefixes must stay recognized on read and emitted on write — this is what makes MinIO-migrated keys round-trip without rewrite. See [AGENTS.md](../../AGENTS.md) Cross-Cutting Domain Invariants and the runbook table in [../operations/tier-ilm-debugging.md](../operations/tier-ilm-debugging.md).
+- **INVARIANT — dual prefixes.** Internal keys carry both `x-rustfs-internal-<suffix>` and `x-minio-internal-<suffix>` ([metadata_compat.rs](../../crates/utils/src/http/metadata_compat.rs)). Write path writes **both** (`insert_str` / `insert_bytes`); read path **prefers RustFS, falls back to MinIO** (`get_str` / `get_bytes`). Both prefixes must stay recognized on read and emitted on write — this is what makes MinIO-migrated keys round-trip without rewrite. Case sensitivity is not uniform: key classification (`is_internal_key` / `has_internal_suffix`) and `get_str` are ASCII-case-insensitive, but `get_bytes` (which reads the binary `meta_sys` values) matches only the two canonical lowercase keys — do not assume mixed-case foreign `meta_sys` keys are tolerated. See [AGENTS.md](../../AGENTS.md) Cross-Cutting Domain Invariants and the runbook table in [../operations/tier-ilm-debugging.md](../operations/tier-ilm-debugging.md).
 - **INVARIANT — suffix strings** (partial list, all exact): `inline-data`, `compression`, `actual-size`, `crc`, `transition-status`, `transitioned-object`, `transitioned-versionID`, `transition-tier`, `free-version`, `purgestatus`, the replication suffixes, `tier-free-versionID`, `tier-free-marker`, `data-mov`, `healing` ([metadata_compat.rs](../../crates/utils/src/http/metadata_compat.rs)). These are the second half of on-disk keys; changing one orphans existing metadata.
-- **INVARIANT — transitioned-versionID encoding.** Stored as **16 raw UUID bytes** in `meta_sys[transitioned-versionID]` (RustFS-native); read defensively as `Uuid::from_slice(...).ok().filter(!nil)` so absent / empty / nil / unparseable all mean "no tier version" (§11). MinIO stores this value as a UUID **string**; a compliant reader must accept the string form as well (or tolerate it as None) — never fail the object read on it.
+- **INVARIANT — transitioned-versionID encoding.** Stored as **16 raw UUID bytes** in `meta_sys[transitioned-versionID]` (RustFS-native); read defensively as `Uuid::from_slice(...).ok().filter(!nil)` so absent / empty / nil / **any non-16-byte value all decode to "no tier version" (`None`)** — never a fatal read error (§11). Note MinIO stores this value as a UUID *string* (non-16-byte); on the baseline that string decodes to `None` under the same rule (RustFS transitioned-`xl.meta` interop is out of scope per [minio-file-format-compat.md](minio-file-format-compat.md)). A reader may additionally recover the string form, but the load-bearing invariant is only "tolerate, never fail the read".
 
 ### 6.6 Inline data
 
@@ -273,7 +273,7 @@ RustFS is a **read-forward-compatible consumer**: it writes the current format a
 - **Version anchors — accept-older, reject-newer.** Writes emit `XL_META_VERSION = 3`. The reader accepts container `major == 1` with any `minor`, `header_ver ≤ 3`, and `meta_ver ≤ 3` (1/2/3), and rejects only newer ([codec.rs](../../crates/filemeta/src/filemeta/codec.rs)). Legacy `meta_ver = 2` objects are supported and normalized on rewrite. `XL_META_VERSION` / `BUCKET_METADATA_*` are compatibility anchors — bumping any requires a read path for the prior value plus a migration story (see [minio-file-format-compat.md](minio-file-format-compat.md)).
 - **MinIO interop is fixture-proven** against a real MinIO corpus; migration is one-way (MinIO → RustFS). Reverse round-trip (a live MinIO re-reading RustFS drives) and formats MinIO SNSD never wrote (CORS / public-access-block / bucket-ACL, transitioned `xl.meta`) are explicitly out of scope — owned by [minio-file-format-compat.md](minio-file-format-compat.md).
 
-**Decode-tolerance invariants (be liberal in what you accept on decode).** These are the contract this document newly codifies. Metadata read from disk or a peer is untrusted input, but decode must not reject shapes that legitimate older / foreign writers produce. Validation may be added, but only if it never rejects data the current or any prior RustSF/MinIO writer can legitimately produce:
+**Decode-tolerance invariants (be liberal in what you accept on decode).** These are the contract this document newly codifies. Metadata read from disk or a peer is untrusted input, but decode must not reject shapes that legitimate older / foreign writers produce. Validation may be added, but only if it never rejects data the current or any prior RustFS/MinIO writer can legitimately produce:
 
 - **Nil UUID ⇒ None.** `version_id`, `data_dir`, `transitioned-versionID` read as `Uuid::from_slice(...).ok().filter(!nil)` — absent, empty, and nil all mean "no value", never `Uuid::nil()` ([version.rs](../../crates/filemeta/src/filemeta/version.rs); [AGENTS.md](../../AGENTS.md) Cross-Cutting Domain Invariants).
 - **Epoch mod_time ⇒ None**, and `None` is omitted on write.
@@ -293,7 +293,7 @@ Two related hardening exceptions that are legitimate (fail-closed is correct the
 Do not change any of the following without a format-version bump, a read path for the old value, a migration story, and a real-sample compatibility test (§13):
 
 Geometry & math
-- Set size `N ∈ 2..=16`; `N = data_blocks + parity_blocks`.
+- Set size `N ∈ 2..=16` for multi-drive layouts (single-drive deployments run at `N = 1`, parity 0); `N = data_blocks + parity_blocks`.
 - `parity ≤ N/2`; `STANDARD parity ≥ RRS parity`; parity resolved **per pool** for its own `N`.
 - `read_quorum = data_blocks`; `write_quorum = data_blocks` (`+1` iff `data == parity`); delete-marker quorum `N/2 + 1`.
 - Decode requires `≥ data_blocks` shards; below that, fail closed. Writes missing quorum roll back.
@@ -306,7 +306,7 @@ Algorithm
 
 On-disk format
 - Container: `"XL2 "`, LE major/minor `1`/`3`, bin32(BE-len) meta, `0xce`+BE-u32 xxh64(seed 0) CRC, trailing inline blob.
-- Header array length ⇒ version (4/5/7); v3 order `id, mtime, sig, type, flags, ec_n, ec_m`; flags `FreeVersion|UsesDataDir|InlineData`.
+- Header dispatched by `header_ver`; per-version array length (4/5/7) validated on decode; v3 order `id, mtime, sig, type, flags, ec_n, ec_m`; flags `FreeVersion|UsesDataDir|InlineData`.
 - `VersionType` {0,1,2,3}; wrapper keys `Type/V1Obj/V2Obj/DelObj/v`; V2Obj key set (§6.3); `EcDist` an array; nil == empty for the four collection fields; `PartIdx` omitted when empty.
 - UUIDs 16 raw bytes (nil ⇄ None); mod_time unix-nanos (epoch ⇄ None); negative `actual_size` sentinel.
 - Dual internal prefixes and exact suffix strings; inline map keyed by `"null"` / version-UUID.
