@@ -29,13 +29,14 @@ use super::storage_api::test::StoragePutObjReader as PutObjReader;
 use super::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use super::storage_api::test::contract::object::ObjectIO as _;
 use super::storage_api::test::data_usage::{
-    compute_bucket_usage, live_bucket_usage_computations, record_bucket_object_write_memory, store_data_usage_in_backend,
+    compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached, record_bucket_object_write_memory,
+    store_data_usage_in_backend,
 };
 use crate::app::admin_usecase::DefaultAdminUsecase;
 use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
 use serial_test::serial;
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 const SEEDED_BUCKET_SIZE: u64 = 123_456;
@@ -58,6 +59,26 @@ fn seeded_data_usage_info(bucket: &str, last_update: SystemTime) -> DataUsageInf
     };
     info.buckets_usage = HashMap::from([(bucket.to_string(), usage)]);
     info.bucket_sizes = HashMap::from([(bucket.to_string(), SEEDED_BUCKET_SIZE)]);
+    info
+}
+
+fn sized_data_usage_info(bucket: &str, size: u64, last_update: SystemTime) -> DataUsageInfo {
+    let usage = BucketUsageInfo {
+        size,
+        objects_count: 1,
+        versions_count: 1,
+        ..Default::default()
+    };
+
+    let mut info = DataUsageInfo {
+        last_update: Some(last_update),
+        buckets_count: 1,
+        objects_total_count: 1,
+        objects_total_size: size,
+        ..Default::default()
+    };
+    info.buckets_usage = HashMap::from([(bucket.to_string(), usage)]);
+    info.bucket_sizes = HashMap::from([(bucket.to_string(), size)]);
     info
 }
 
@@ -132,6 +153,60 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
         .get(&overlay_bucket)
         .expect("overlay bucket must come from the memory overlay");
     assert_eq!(overlay_usage.size, 512);
+}
+
+/// Revert detector for the snapshot-cache invalidation in
+/// `save_data_usage_in_backend` (rustfs/backlog#1306): a fresh scanner save must
+/// be visible to the very next cached read, not deferred until the 30s TTL
+/// expires. Removing the `*data_usage_snapshot_cache().write().await = None`
+/// invalidation makes the post-save cached read return the stale warmed value
+/// and trips this test.
+#[tokio::test]
+#[serial]
+async fn save_data_usage_invalidates_snapshot_cache() {
+    let ecstore = shared_gating_ecstore().await;
+    let bucket = format!("usage-invalidate-{}", Uuid::new_v4());
+
+    // Future-date both snapshots beyond the stale-guard's 5min tolerance so the
+    // persists win deterministically over whatever snapshot a sibling serial
+    // test may have left behind, regardless of test execution order.
+    let warm_at = SystemTime::now() + Duration::from_secs(600);
+    let changed_at = warm_at + Duration::from_secs(1);
+
+    const WARM_SIZE: u64 = 111_000;
+    const CHANGED_SIZE: u64 = 222_000;
+
+    // Persist an initial snapshot and warm the cache from it.
+    store_data_usage_in_backend(sized_data_usage_info(&bucket, WARM_SIZE, warm_at), ecstore.clone())
+        .await
+        .expect("persist initial snapshot");
+    let warmed = load_data_usage_from_backend_cached(ecstore.clone())
+        .await
+        .expect("warm cached snapshot");
+    assert_eq!(
+        warmed.buckets_usage.get(&bucket).map(|usage| usage.size),
+        Some(WARM_SIZE),
+        "cache must be warmed with the initial snapshot before the changed save"
+    );
+
+    // Persist a changed snapshot; the save must invalidate the warmed cache.
+    store_data_usage_in_backend(sized_data_usage_info(&bucket, CHANGED_SIZE, changed_at), ecstore.clone())
+        .await
+        .expect("persist changed snapshot");
+
+    let reloaded = load_data_usage_from_backend_cached(ecstore.clone())
+        .await
+        .expect("reload cached snapshot after save");
+    assert_eq!(
+        reloaded.buckets_usage.get(&bucket).map(|usage| usage.size),
+        Some(CHANGED_SIZE),
+        "cached read after save must observe the new snapshot, not the stale warmed value"
+    );
+    assert_eq!(
+        reloaded.last_update,
+        Some(changed_at),
+        "cached read after save must report the new snapshot timestamp"
+    );
 }
 
 /// Wire pin for the no-snapshot response shape (rustfs/backlog#1306): a
