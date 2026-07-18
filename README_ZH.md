@@ -252,7 +252,10 @@ RustFS 是一个社区驱动的项目，我们感谢所有的贡献。请查看 
 
 ## Star 历史
 
-[![Star History Chart](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rustfs/rustfs/star-history/star-history-dark.svg">
+  <img src="https://raw.githubusercontent.com/rustfs/rustfs/star-history/star-history-light.svg" alt="RustFS Star 历史图表">
+</picture>
 
 ## 许可证
 
