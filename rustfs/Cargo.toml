@@ -206,6 +206,7 @@ proptest = "1"
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 temp-env = { workspace = true, features = ["async_closure"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
+metrics-util = { version = "0.20", features = ["debugging"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 rsa = { workspace = true }
 rcgen = { workspace = true }

@@ -158,6 +158,7 @@ mod list;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
+pub use object::PreparedGetObjectReader;
 mod peer;
 mod rebalance;
 pub(crate) mod utils;

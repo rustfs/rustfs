@@ -13,11 +13,26 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use std::cmp;
 
+use crate::index::ObjectDataCacheGeneration;
 use crate::key::ObjectDataCacheKey;
 
-const ENTRY_OVERHEAD_BYTES: usize = 64;
+const ENTRY_OVERHEAD_BYTES: u64 = 64;
+
+/// Estimates the weighted capacity charged for a key and planned body.
+pub(crate) fn projected_weight(key: &ObjectDataCacheKey, body_bytes: u64) -> u64 {
+    let key_bytes = key
+        .bucket
+        .len()
+        .saturating_add(key.object.len())
+        .saturating_add(key.version_id.len())
+        .saturating_add(key.etag.len());
+
+    u64::try_from(key_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(body_bytes)
+        .saturating_add(ENTRY_OVERHEAD_BYTES)
+}
 
 /// Cached object body entry.
 ///
@@ -29,12 +44,17 @@ const ENTRY_OVERHEAD_BYTES: usize = 64;
 #[derive(Debug, Clone)]
 pub struct ObjectDataCacheEntry {
     bytes: Bytes,
+    generation: ObjectDataCacheGeneration,
 }
 
 impl ObjectDataCacheEntry {
     /// Creates a new cached entry.
     pub fn new(bytes: Bytes) -> Self {
-        Self { bytes }
+        Self { bytes, generation: 0 }
+    }
+
+    pub(crate) fn with_generation(bytes: Bytes, generation: ObjectDataCacheGeneration) -> Self {
+        Self { bytes, generation }
     }
 
     /// Returns a clone of the cached body bytes.
@@ -42,14 +62,14 @@ impl ObjectDataCacheEntry {
         self.bytes.clone()
     }
 
+    pub(crate) const fn generation(&self) -> ObjectDataCacheGeneration {
+        self.generation
+    }
+
     /// Returns the estimated weighted size for capacity accounting.
     pub fn estimated_weight(&self, key: &ObjectDataCacheKey) -> u32 {
-        let key_bytes = key.bucket.len() + key.object.len() + key.version_id.len() + key.etag.len();
-        let body_bytes = self.bytes.len();
-        let total = key_bytes.saturating_add(body_bytes).saturating_add(ENTRY_OVERHEAD_BYTES);
-        let clamped = cmp::min(total, u32::MAX as usize);
-
-        u32::try_from(clamped).unwrap_or(u32::MAX)
+        let body_bytes = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
+        u32::try_from(projected_weight(key, body_bytes)).unwrap_or(u32::MAX)
     }
 }
 
