@@ -77,6 +77,7 @@ rustfs-iam = { workspace = true }
 rustfs-keystone = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
+rustfs-log-analyzer = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
@@ -210,6 +211,9 @@ metrics-util = { version = "0.20", features = ["debugging"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 rsa = { workspace = true }
 rcgen = { workspace = true }
+# diagnose_e2e fixtures (archives are generated in-test, never checked in)
+zip = { workspace = true }
+zstd = { workspace = true }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
 # the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
 rustfs-ecstore = { workspace = true, features = ["test-util"] }

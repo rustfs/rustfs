@@ -167,6 +167,13 @@ jobs:
           cargo nextest run --profile ci --all --exclude e2e_test
           cargo test --all --doc
 
+      # rustfs/backlog#1289: fail if a seed rule's log anchor no longer exists
+      # verbatim in the source tree (log message drifted without updating the
+      # rule). Placed here where the workspace — including the la-dump-anchors
+      # bin — is already built by the clippy/test steps above.
+      - name: Check log-analyzer rule anchors
+        run: ./scripts/check_log_analyzer_rules.sh
+
       - name: Upload test junit report
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
