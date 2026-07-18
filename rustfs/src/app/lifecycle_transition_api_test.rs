@@ -866,9 +866,6 @@ async fn get_transitioned_object_uses_remote_codec_fallback_path() {
             .collect();
 
         create_test_bucket(&ecstore, bucket.as_str()).await;
-        set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
-            .await
-            .expect("Failed to set lifecycle configuration");
 
         let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
         let transition_opts = ObjectOptions {
