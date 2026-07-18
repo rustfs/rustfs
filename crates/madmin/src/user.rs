@@ -771,6 +771,33 @@ mod tests {
         assert_eq!(value["object_versions_histogram"]["SINGLE_VERSION"], 7);
     }
 
+    /// Wire pin (rustfs/backlog#1306): a scanned-but-empty bucket carries
+    /// Some(0) usage stats that must serialize as zeros, staying distinct from
+    /// the no-snapshot (None) case that is omitted. Guards against replacing
+    /// `Option::is_none` with a predicate that also skips zero values.
+    #[test]
+    fn bucket_access_info_serializes_zero_usage_stats() {
+        let info = BucketAccessInfo {
+            name: "empty-snapshot".to_string(),
+            size: Some(0),
+            objects: Some(0),
+            object_sizes_histogram: Some(HashMap::new()),
+            object_versions_histogram: Some(HashMap::new()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("size"));
+        assert!(obj.contains_key("objects"));
+        assert!(obj.contains_key("object_sizes_histogram"));
+        assert!(obj.contains_key("object_versions_histogram"));
+        assert_eq!(value.get("size"), Some(&serde_json::json!(0)));
+        assert_eq!(value["objects"], 0);
+        assert_eq!(value["object_sizes_histogram"], serde_json::json!({}));
+        assert_eq!(value["object_versions_histogram"], serde_json::json!({}));
+    }
+
     #[test]
     fn test_account_status_try_from_invalid() {
         let result = AccountStatus::try_from("invalid");
