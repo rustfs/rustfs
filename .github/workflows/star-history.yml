@@ -16,7 +16,7 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - uses: overtrue/repo-visuals-action@fc2347f1df64da7122b0775b3f20083d7f7294dd # v1.2.1
+      - uses: overtrue/repo-visuals-action@72f34d24769ff5d341956da2f23952594ef2f1e2 # v1.3.0
         with:
           github-token: ${{ github.token }}
           output-branch: star-history
