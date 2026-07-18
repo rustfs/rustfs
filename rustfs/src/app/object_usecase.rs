@@ -4989,6 +4989,7 @@ impl DefaultObjectUsecase {
             object_lock_mode,
             object_lock_retain_until_date,
             storage_class,
+            checksum_algorithm,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -5141,6 +5142,20 @@ impl DefaultObjectUsecase {
         // via x-amz-copy-source-version-id, distinct from the destination version_id.
         let src_resolved_version_id = src_info.version_id;
 
+        // Source object's existing checksum, if any. When the copy does not request a new
+        // algorithm, AWS preserves the source object's checksum on the destination (#4996); the
+        // copy does not transform the plaintext, so we carry the stored value over unchanged
+        // rather than re-hashing every byte.
+        let src_checksum = src_info.checksum.as_ref().and_then(|bytes| {
+            let (pairs, _) = rustfs_rio::read_checksums(bytes.as_ref(), 0);
+            pairs.into_iter().find_map(|(k, v)| {
+                rustfs_rio::ChecksumType::from_string(&k)
+                    .is_s3s_typed()
+                    .then(|| rustfs_rio::Checksum::new_from_string(&k, &v))
+                    .flatten()
+            })
+        });
+
         // Validate copy source conditions
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
@@ -5238,6 +5253,26 @@ impl DefaultObjectUsecase {
             HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
 
+        // Give the destination object a checksum so CopyObject returns it and a later checksum-mode
+        // HEAD/GET matches (#4996). When the caller requests an algorithm, compute it fresh over the
+        // copied plaintext (the hasher sits on the innermost reader so it digests plaintext). When
+        // none is requested, carry the source object's stored checksum over unchanged — the copy
+        // does not alter the plaintext, so re-hashing would be wasted work and would flatten a
+        // multipart composite value.
+        match checksum_algorithm.as_ref() {
+            Some(algo) => {
+                let ct = rustfs_rio::ChecksumType::from_string(algo.as_str());
+                if ct.is_set() {
+                    reader.add_calculated_checksum(ct).map_err(ApiError::from)?;
+                }
+            }
+            None => {
+                if let Some(cs) = src_checksum {
+                    reader.add_non_trailing_checksum(Some(cs), true).map_err(ApiError::from)?;
+                }
+            }
+        }
+
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -5316,12 +5351,24 @@ impl DefaultObjectUsecase {
             None
         };
 
+        // Report the destination object's checksum in the response, decoded the same way GetObject
+        // / HeadObject do so the value is identical to a later checksum-mode HEAD/GET (#4996).
+        let response_checksums = oi
+            .decrypt_checksums(0, &req.headers)
+            .map(|(pairs, _)| classify_response_checksums(pairs))
+            .unwrap_or_default();
+
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
             e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
-            ..Default::default()
+            checksum_crc32: response_checksums.crc32,
+            checksum_crc32c: response_checksums.crc32c,
+            checksum_sha1: response_checksums.sha1,
+            checksum_sha256: response_checksums.sha256,
+            checksum_crc64nvme: response_checksums.crc64nvme,
+            checksum_type: response_checksums.checksum_type,
         };
 
         let output = CopyObjectOutput {
