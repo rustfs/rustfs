@@ -421,8 +421,14 @@ impl FileInfo {
                 i64::try_from(part.size).map_err(|_| Error::FileCorrupt)?;
                 layout.shard_file_size(part.size).ok_or(Error::FileCorrupt)?;
 
-                let actual_size = usize::try_from(part.actual_size).map_err(|_| Error::FileCorrupt)?;
-                layout.shard_file_size(actual_size).ok_or(Error::FileCorrupt)?;
+                // A negative `actual_size` is the documented "unknown size" sentinel for
+                // compressed streaming objects (see `ObjectPartInfo::actual_size` /
+                // `ObjectInfo::get_actual_size`), written to xl.meta by both RustFS and
+                // MinIO. Only shard-validate a real, non-negative size; rejecting the
+                // sentinel would make legitimate compressed objects unreadable.
+                if let Ok(actual_size) = usize::try_from(part.actual_size) {
+                    layout.shard_file_size(actual_size).ok_or(Error::FileCorrupt)?;
+                }
             }
             if !mark_fileinfo_part(&mut part_numbers, part.number) {
                 return Err(Error::FileCorrupt);
@@ -1286,13 +1292,17 @@ mod tests {
         }];
         assert_file_corrupt(&fi, ValidationMode::RequireErasure);
 
+        // A negative `actual_size` is the compressed "unknown size" sentinel, not an
+        // unrepresentable size: it must stay readable so existing compressed objects
+        // remain accessible. Only real (non-negative) sizes are shard-validated.
         let mut fi = one_shard_validation_fileinfo(2);
         fi.parts = vec![ObjectPartInfo {
             number: 1,
             actual_size: -1,
             ..Default::default()
         }];
-        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        fi.validate(ValidationMode::RequireErasure)
+            .expect("negative actual_size sentinel (compressed objects) must remain readable");
 
         let mut fi = one_shard_validation_fileinfo(2);
         fi.parts = vec![ObjectPartInfo {

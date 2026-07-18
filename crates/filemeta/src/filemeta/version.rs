@@ -249,6 +249,27 @@ fn parse_legacy_uuid_bytes(bytes: &[u8], field: &str) -> Result<Option<Uuid>> {
     Ok((!id.is_nil()).then_some(id))
 }
 
+/// Decode a stored transitioned-version-id from a version's `meta_sys`.
+///
+/// RustFS writes it as 16 raw UUID bytes; MinIO-migrated tiered objects store
+/// the remote tier's version id as a UUID *string*. Accept both, and treat any
+/// absent / nil / otherwise-unparseable value as "no tier version" (matching the
+/// tolerant pre-hardening behavior) rather than failing the whole object read —
+/// a malformed tier id must not make an otherwise-readable object unreadable.
+fn transitioned_version_id_from_meta_sys(meta_sys: &HashMap<String, Vec<u8>>) -> Option<Uuid> {
+    let value = get_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)?;
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(id) = Uuid::from_slice(&value) {
+        return (!id.is_nil()).then_some(id);
+    }
+    std::str::from_utf8(&value)
+        .ok()
+        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+        .filter(|id| !id.is_nil())
+}
+
 fn parse_legacy_erasure_algo(value: &str) -> ErasureAlgo {
     match value {
         "ReedSolomon" => ErasureAlgo::ReedSolomon,
@@ -2361,15 +2382,7 @@ impl MetaObject {
         let transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
-        let transition_version_id = match get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) {
-            None => None,
-            Some(value) if value.is_empty() => None,
-            Some(value) => match Uuid::from_slice(value.as_slice()) {
-                Ok(version_id) if version_id.is_nil() => None,
-                Ok(version_id) => Some(version_id),
-                Err(_) => return Err(Error::FileCorrupt),
-            },
-        };
+        let transition_version_id = transitioned_version_id_from_meta_sys(&self.meta_sys);
         let transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
@@ -2664,19 +2677,7 @@ impl MetaDeleteMarker {
                 .map(|v| String::from_utf8_lossy(&v).to_string())
                 .unwrap_or_default();
 
-            fi.transition_version_id = match get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID) {
-                None => None,
-                Some(value) if value.is_empty() => None,
-                Some(value) => match Uuid::from_slice(value.as_slice()) {
-                    Ok(version_id) if version_id.is_nil() => None,
-                    Ok(version_id) => Some(version_id),
-                    // `MetaDeleteMarker::into_fileinfo` predates fallible
-                    // conversion. Preserve corruption as the nil sentinel so
-                    // metadata-boundary validation rejects it instead of
-                    // treating a malformed remote version as unversioned.
-                    Err(_) => Some(Uuid::nil()),
-                },
-            };
+            fi.transition_version_id = transitioned_version_id_from_meta_sys(&self.meta_sys);
         }
 
         fi
@@ -4070,13 +4071,29 @@ mod tests {
     }
 
     #[test]
-    fn meta_object_transition_version_id_malformed_is_corrupt() {
+    fn meta_object_transition_version_id_unparseable_stays_readable_as_none() {
+        // A non-UUID / non-16-byte tier version id must NOT make the object
+        // unreadable; it is tolerated as "no tier version" (compat with
+        // pre-hardening behavior and foreign/edge metadata).
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
-        let err = make_meta_object_with_sys(sys)
+        let fi = make_meta_object_with_sys(sys)
             .into_fileinfo("b", "k", false)
-            .expect_err("malformed transition version UUID must be rejected");
-        assert!(matches!(err, Error::FileCorrupt));
+            .expect("unparseable transition version id must not fail the object read");
+        assert_eq!(fi.transition_version_id, None);
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_minio_string_form_is_recovered() {
+        // MinIO-migrated tiered objects store the remote tier's version id as a
+        // UUID string, not 16 raw bytes; recover it instead of dropping it.
+        let id = sample_version_id();
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.to_string().into_bytes());
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("string-form transition version id must decode");
+        assert_eq!(fi.transition_version_id, Some(id));
     }
 
     #[test]
@@ -4109,7 +4126,10 @@ mod tests {
     }
 
     #[test]
-    fn delete_marker_free_version_transition_version_id_malformed_is_corrupt() {
+    fn delete_marker_free_version_transition_version_id_unparseable_stays_readable() {
+        // A malformed tier version id must not make a free-version record corrupt:
+        // it decodes to None and stays readable. Otherwise free-version expiry
+        // fails and the remote-tier object leaks.
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
@@ -4122,7 +4142,28 @@ mod tests {
         }
         .into_fileinfo("b", "k", false);
 
-        assert!(matches!(fi.validate_for_metadata_read(), Err(Error::FileCorrupt)));
+        assert_eq!(fi.transition_version_id, None);
+        fi.validate_for_metadata_read()
+            .expect("free-version record with an unparseable tier id must remain readable");
+    }
+
+    #[test]
+    fn delete_marker_free_version_transition_version_id_minio_string_form_is_recovered() {
+        // MinIO stores the tier version id as a UUID string; recover it.
+        let id = sample_version_id();
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.to_string().into_bytes());
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_TIER, b"WARM".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_OBJECTNAME, b"remote-object".to_vec());
+        let fi = MetaDeleteMarker {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
+
+        assert_eq!(fi.transition_version_id, Some(id));
     }
 
     #[test]
