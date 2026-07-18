@@ -991,6 +991,52 @@ mod test {
         assert!(!fi.parts.is_empty(), "multipart/part layout present");
     }
 
+    /// Compatibility guard for the tightened `validate_for_metadata_read()` decode
+    /// boundary (the rolling-upgrade / MinIO-migration risk): every version of
+    /// every real, historically-written `xl.meta` fixture must still be *accepted*
+    /// on read, never rejected as `FileCorrupt`. This is the empirical companion to
+    /// the code-reasoned decode-tolerance invariants in
+    /// `docs/architecture/erasure-coding.md` §11 — reverting the tolerant handling
+    /// (delete-marker shape, legacy per-part checksums, string/short
+    /// `transitioned-versionID`, negative `actual_size`) turns one of these red.
+    /// It covers real MinIO-written objects (inline, versioned incl. a delete
+    /// marker, and multipart), a legacy V1 (`xl.json`-derived) object, and a legacy
+    /// meta_ver 2 object.
+    #[test]
+    fn real_historical_xlmeta_versions_pass_metadata_read_validation() {
+        let fixtures: [(&str, Vec<u8>); 5] = [
+            ("minio-small-inline", create_minio_small_object_xlmeta().expect("small fixture")),
+            (
+                "minio-versioned+delete-marker",
+                create_minio_versioned_object_xlmeta().expect("versioned fixture"),
+            ),
+            ("minio-large-multipart", create_minio_large_object_xlmeta().expect("large fixture")),
+            ("legacy-v1-object", create_legacy_v1_object_xlmeta().expect("legacy v1 fixture")),
+            (
+                "legacy-meta-v2-object",
+                create_issue_2265_legacy_meta_v2_object_xlmeta().expect("legacy meta v2 fixture"),
+            ),
+        ];
+
+        for (label, bytes) in fixtures {
+            let fm = FileMeta::load(&bytes).unwrap_or_else(|e| panic!("{label}: load real xl.meta failed: {e}"));
+            // `all_parts = true` materializes the part arrays so the checksum/part and
+            // shard-size checks in `validate_for_metadata_read` are actually exercised.
+            let versions = fm
+                .list_versions("interop", "object", true)
+                .unwrap_or_else(|e| panic!("{label}: list_versions failed: {e}"));
+            assert!(!versions.is_empty(), "{label}: fixture must contain at least one version");
+            for (i, fi) in versions.iter().enumerate() {
+                fi.validate_for_metadata_read().unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: version {i} (deleted={}) rejected by validate_for_metadata_read: {e:?}",
+                        fi.deleted
+                    )
+                });
+            }
+        }
+    }
+
     /// Wraps a raw meta block in a valid XL2 container (header, bin32 length
     /// prefix, and CRC trailer) so decode tests exercise the meta parsing
     /// itself rather than the envelope checks.
