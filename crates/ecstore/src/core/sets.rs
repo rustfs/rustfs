@@ -35,7 +35,7 @@ use crate::{
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     runtime::instance::{InstanceContext, bootstrap_ctx},
     runtime::sources as runtime_sources,
-    set_disk::SetDisks,
+    set_disk::{PreparedGetObjectMetadata, SetDisks},
     store::init_format::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
 use futures::{
@@ -403,6 +403,31 @@ impl crate::storage_api_contracts::object::ObjectIO for Sets {
 }
 
 impl Sets {
+    pub(crate) async fn prepare_get_object_reader_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<PreparedGetObjectMetadata> {
+        self.get_disks_by_key(object)
+            .prepare_get_object_metadata(bucket, object, opts)
+            .await
+    }
+
+    pub(crate) async fn get_object_reader_with_prepared_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        headers: HeaderMap,
+        opts: &ObjectOptions,
+        metadata: PreparedGetObjectMetadata,
+    ) -> Result<GetObjectReader> {
+        self.get_disks_by_key(object)
+            .get_object_reader_with_prepared_metadata(bucket, object, range, headers, opts, metadata)
+            .await
+    }
+
     /// `put_object` plus the rename_data old-size backfill
     /// (rustfs/backlog#1009); see `SetDisks::put_object_with_old_current_size`.
     pub async fn put_object_with_old_current_size(

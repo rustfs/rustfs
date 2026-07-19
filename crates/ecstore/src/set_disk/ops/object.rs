@@ -21,8 +21,17 @@
 
 use super::super::*;
 
+use crate::bucket::lifecycle::tier_sweeper::{RemoteTierDeleteOutcome, delete_object_from_remote_tier_with_lease_idempotent};
 use crate::disk::OldCurrentSize;
-use crate::object_api::GetObjectBodySource;
+use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
+use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
+use futures::FutureExt as _;
+use std::future::Future;
+
+fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
+    coding::Erasure::try_new_with_options(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size, uses_legacy)
+        .map_err(Error::from)
+}
 
 /// Length of the full plaintext body when — and only when — this read's output
 /// is exactly the object's complete plaintext, so the app-layer body cache may
@@ -61,6 +70,11 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
         || crate::object_api::restore_request_active(opts)
         || object_info.is_encrypted()
         || object_info.is_remote()
+        || object_info.delete_marker
+        || object_info.size == 0
+        || object_info.version_only
+        || object_info.metadata_only
+        || object_info.is_inline_fast_path_eligible()
     {
         return None;
     }
@@ -70,6 +84,14 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
     }
 
     Some(object_info.size)
+}
+
+pub(crate) fn body_cache_plaintext_len(
+    range: &Option<HTTPRangeSpec>,
+    opts: &ObjectOptions,
+    object_info: &ObjectInfo,
+) -> Option<i64> {
+    full_object_plaintext_len(range, opts, object_info)
 }
 
 #[async_trait::async_trait]
@@ -131,16 +153,21 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = Instant::now();
-        let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true, true).await {
-            Ok(result) => result,
-            Err(err) => {
-                rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
-                record_get_object_pipeline_failure(GET_STAGE_METADATA, classify_storage_error(&err));
-                return Err(to_object_err(err, vec![bucket, object]));
+        let (fi, files, disks, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
+            (prepared.fi, prepared.files, prepared.disks, prepared.object_info)
+        } else {
+            match self.get_object_fileinfo(bucket, object, opts, true, true).await {
+                Ok((fi, files, disks)) => (fi, files, disks, None),
+                Err(err) => {
+                    rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
+                    record_get_object_pipeline_failure(GET_STAGE_METADATA, classify_storage_error(&err));
+                    return Err(to_object_err(err, vec![bucket, object]));
+                }
             }
         };
         let object_info_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let object_info = prepared_object_info
+            .unwrap_or_else(|| build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended));
         let object_class = classify_get_codec_streaming_object_class(&range, &object_info, &fi);
         let size_bucket = rustfs_io_metrics::get_object_size_bucket(object_info.size);
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
@@ -273,12 +300,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
 
-            let erasure = coding::Erasure::new_with_options(
-                fi.erasure.data_blocks,
-                fi.erasure.parity_blocks,
-                fi.erasure.block_size,
-                fi.uses_legacy_checksum,
-            );
+            let erasure = erasure_from_file_info(&fi, fi.uses_legacy_checksum)?;
             let read_length = erasure.shard_file_offset(0, object_size, object_size);
             let total_shards = data_shards + fi.erasure.parity_blocks;
             let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
@@ -382,7 +404,16 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             if object_info.parts.len() == 1 {
                 opts.part_number = Some(1);
             }
-            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
+            let gr = get_transitioned_object_reader_with_tier_manager(
+                bucket,
+                object,
+                &range,
+                &h,
+                &object_info,
+                &opts,
+                &self.ctx.tier_config_mgr(),
+            )
+            .await?;
             return Ok(finish_set_disk_read_lock(
                 gr,
                 read_lock_guard.take(),
@@ -410,6 +441,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // it forward.
         let mut body_source = GetObjectBodySource::Unprobed;
         if let Some(plaintext_len) = full_object_plaintext_len(&range, opts, &object_info)
+            && !get_object_body_cache_hook_suppressed()
             && let Some(hook) = get_object_body_cache_hook()
         {
             match hook.lookup(bucket, object, &object_info).await {
@@ -670,6 +702,7 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         crate::hp_guard!("SetDisks::put_object");
+        let storage_class_config = self.storage_class_config_snapshot();
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let disks = self.get_disks_internal().await;
@@ -695,18 +728,18 @@ impl SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
-
-        let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
-        if opts.max_parity {
-            parity_drives = disks.len() / 2;
-        }
-
-        let data_drives = disks.len() - parity_drives;
-        let mut write_quorum = data_drives;
-        if data_drives == parity_drives {
-            write_quorum += 1
-        }
+        let WriteLayout {
+            data_drives,
+            parity_drives,
+            write_quorum,
+        } = resolve_write_layout(
+            &storage_class_config,
+            self.pool_index,
+            disks.len(),
+            self.default_parity_count,
+            user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str),
+            opts.max_parity,
+        )?;
 
         // if filtered_online < write_quorum {
         //     warn!(
@@ -741,11 +774,10 @@ impl SetDisks {
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
         let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = async {
-            let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+            let erasure = erasure_from_file_info(&fi, false)?;
 
             let put_object_size = known_put_object_storage_size(data.size());
-            let is_inline_buffer =
-                runtime_sources::storage_class_should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
+            let is_inline_buffer = storage_class_config.should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
 
             let shard_file_size = erasure.shard_file_size(put_object_size);
             let shard_size = erasure.shard_size();
@@ -1222,6 +1254,570 @@ impl SetDisks {
     }
 }
 
+struct TransitionUploadReader<R> {
+    inner: R,
+    consumed: Arc<AtomicU64>,
+}
+
+impl<R> TransitionUploadReader<R> {
+    fn new(inner: R, consumed: Arc<AtomicU64>) -> Self {
+        Self { inner, consumed }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TransitionUploadReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let read = buf.filled().len() - before;
+                let read =
+                    u64::try_from(read).map_err(|_| std::io::Error::other("transition upload read count exceeds u64::MAX"))?;
+                self.consumed
+                    .fetch_update(Ordering::Release, Ordering::Relaxed, |consumed| consumed.checked_add(read))
+                    .map_err(|_| std::io::Error::other("transition upload read count overflow"))?;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+struct TransitionUploadWriter<W> {
+    inner: W,
+    produced: u64,
+}
+
+impl<W> TransitionUploadWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, produced: 0 }
+    }
+
+    fn produced(&self) -> u64 {
+        self.produced
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for TransitionUploadWriter<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                let written_u64 = u64::try_from(written)
+                    .map_err(|_| std::io::Error::other("transition upload write count exceeds u64::MAX"))?;
+                self.produced = self
+                    .produced
+                    .checked_add(written_u64)
+                    .ok_or_else(|| std::io::Error::other("transition upload write count overflow"))?;
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TransitionUploadFailure {
+    pub(crate) error: StorageError,
+    pub(crate) candidate: Option<TransitionUploadCandidate>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TransitionUploadCompletion {
+    pub(crate) candidate: TransitionUploadCandidate,
+    pub(crate) produced: u64,
+    pub(crate) consumed: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransitionUploadCandidate {
+    remote_version: TransitionUploadRemoteVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TransitionUploadRemoteVersion {
+    KnownExact(String),
+    KnownUnversioned(String),
+}
+
+impl TransitionUploadCandidate {
+    pub(crate) fn from_put_response(remote_version: String) -> Self {
+        let remote_version =
+            if remote_version.is_empty() || Uuid::parse_str(&remote_version).is_ok_and(|version_id| version_id.is_nil()) {
+                TransitionUploadRemoteVersion::KnownUnversioned(remote_version)
+            } else {
+                TransitionUploadRemoteVersion::KnownExact(remote_version)
+            };
+        Self { remote_version }
+    }
+
+    pub(crate) fn remote_version(&self) -> &str {
+        match &self.remote_version {
+            TransitionUploadRemoteVersion::KnownExact(remote_version)
+            | TransitionUploadRemoteVersion::KnownUnversioned(remote_version) => remote_version,
+        }
+    }
+
+    pub(crate) fn cleanup_version(&self) -> &str {
+        match &self.remote_version {
+            TransitionUploadRemoteVersion::KnownExact(remote_version) => remote_version,
+            TransitionUploadRemoteVersion::KnownUnversioned(_) => "",
+        }
+    }
+}
+
+pub(crate) async fn complete_transition_upload<Remote, Producer>(
+    remote_upload: Remote,
+    producer: Producer,
+    expected_size: u64,
+    consumed: Arc<AtomicU64>,
+) -> std::result::Result<TransitionUploadCompletion, TransitionUploadFailure>
+where
+    Remote: Future<Output = std::result::Result<String, std::io::Error>>,
+    Producer: Future<Output = Result<u64>>,
+{
+    let producer = std::panic::AssertUnwindSafe(producer).catch_unwind();
+    let (remote_result, producer_result) = tokio::join!(remote_upload, producer);
+    let remote_version = match remote_result {
+        Ok(remote_version) => remote_version,
+        Err(remote_error) => {
+            let error = match producer_result {
+                Ok(Err(StorageError::Io(producer_error))) if producer_error.kind() == std::io::ErrorKind::BrokenPipe => {
+                    StorageError::Io(remote_error)
+                }
+                Ok(Err(producer_error)) => producer_error,
+                Err(_) => StorageError::Unexpected,
+                Ok(Ok(_)) => StorageError::Io(remote_error),
+            };
+            return Err(TransitionUploadFailure { error, candidate: None });
+        }
+    };
+    let candidate = TransitionUploadCandidate::from_put_response(remote_version);
+    let produced = match producer_result {
+        Ok(Ok(produced)) => produced,
+        Ok(Err(error)) => {
+            return Err(TransitionUploadFailure {
+                error,
+                candidate: Some(candidate),
+            });
+        }
+        Err(_) => {
+            return Err(TransitionUploadFailure {
+                error: StorageError::Unexpected,
+                candidate: Some(candidate),
+            });
+        }
+    };
+    let consumed = consumed.load(Ordering::Acquire);
+    if produced != expected_size || consumed != expected_size {
+        let error = if produced < expected_size || consumed < expected_size {
+            StorageError::LessData
+        } else {
+            StorageError::MoreData
+        };
+        return Err(TransitionUploadFailure {
+            error,
+            candidate: Some(candidate),
+        });
+    }
+    Ok(TransitionUploadCompletion {
+        candidate,
+        produced,
+        consumed,
+    })
+}
+
+pub(crate) async fn cleanup_uncommitted_transition_upload(
+    lease: &TierOperationLease,
+    object: &str,
+    candidate: &TransitionUploadCandidate,
+) -> std::io::Result<RemoteTierDeleteOutcome> {
+    delete_object_from_remote_tier_with_lease_idempotent(object, candidate.cleanup_version(), lease).await
+}
+
+fn log_transition_upload_cleanup_failure(
+    lease: &TierOperationLease,
+    object: &str,
+    candidate: &TransitionUploadCandidate,
+    err: &std::io::Error,
+) {
+    warn!(
+        tier = lease.tier_name(),
+        tier_generation = lease.generation(),
+        object,
+        remote_version = candidate.cleanup_version(),
+        error = ?err,
+        "failed to clean uncommitted transition upload"
+    );
+}
+
+pub(crate) struct TransitionUploadCleanup {
+    lease: TierOperationLease,
+    object: String,
+    candidate: TransitionUploadCandidate,
+    armed: bool,
+}
+
+impl TransitionUploadCleanup {
+    pub(crate) fn new(lease: TierOperationLease, object: &str, candidate: TransitionUploadCandidate) -> Self {
+        Self {
+            lease,
+            object: object.to_string(),
+            candidate,
+            armed: true,
+        }
+    }
+
+    pub(crate) async fn cleanup(&mut self) -> std::io::Result<RemoteTierDeleteOutcome> {
+        match cleanup_uncommitted_transition_upload(&self.lease, &self.object, &self.candidate).await {
+            Ok(outcome) => {
+                self.armed = false;
+                Ok(outcome)
+            }
+            Err(err) => {
+                log_transition_upload_cleanup_failure(&self.lease, &self.object, &self.candidate, &err);
+                Err(err)
+            }
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransitionUploadCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let lease = match self.lease.try_clone() {
+            Ok(lease) => lease,
+            Err(err) => {
+                warn!(
+                    tier = self.lease.tier_name(),
+                    tier_generation = self.lease.generation(),
+                    object = self.object,
+                    error = ?err,
+                    "unable to retain tier lease for cancelled transition cleanup"
+                );
+                return;
+            }
+        };
+        let object = self.object.clone();
+        let candidate = self.candidate.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(err) = cleanup_uncommitted_transition_upload(&lease, &object, &candidate).await {
+                    log_transition_upload_cleanup_failure(&lease, &object, &candidate, &err);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransitionCommitPause {
+    BeforeLeaseCheck,
+    AfterLeaseCheck,
+}
+
+#[cfg(test)]
+struct TransitionCommitBarrierState {
+    bucket: String,
+    object: String,
+    pause: TransitionCommitPause,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct TransitionCommitBarrier {
+    state: Arc<TransitionCommitBarrierState>,
+}
+
+#[cfg(test)]
+static TRANSITION_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionCommitBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl TransitionCommitBarrier {
+    fn install(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, TransitionCommitPause::BeforeLeaseCheck)
+    }
+
+    fn install_after_lease_check(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, TransitionCommitPause::AfterLeaseCheck)
+    }
+
+    fn install_at(bucket: &str, object: &str, pause: TransitionCommitPause) -> Self {
+        let state = Arc::new(TransitionCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            pause,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = TRANSITION_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition commit barrier mutex should not poison");
+        assert!(slot.is_none(), "transition commit barrier must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("transition should reach the deterministic commit barrier");
+    }
+
+    fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TransitionCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TRANSITION_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCommitPause) {
+    let barrier = TRANSITION_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+fn parse_transition_version_id(remote_version: &str) -> std::result::Result<Option<Uuid>, uuid::Error> {
+    if remote_version.is_empty() {
+        return Ok(None);
+    }
+    Uuid::parse_str(remote_version).map(|version_id| (!version_id.is_nil()).then_some(version_id))
+}
+
+#[cfg(test)]
+mod transition_upload_completion_tests {
+    use super::*;
+
+    fn consumed(bytes: u64) -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(bytes))
+    }
+
+    #[tokio::test]
+    async fn rejects_source_errors_at_first_middle_and_last_chunk() {
+        let remote_version = Uuid::nil().to_string();
+        for consumed_bytes in [0, 512, 1023] {
+            let result = complete_transition_upload(
+                std::future::ready(Ok(remote_version.clone())),
+                std::future::ready(Err(StorageError::FileCorrupt)),
+                1024,
+                consumed(consumed_bytes),
+            )
+            .await;
+            let failure = result.expect_err("a source read error must fail the upload completion protocol");
+            assert!(matches!(failure.error, StorageError::FileCorrupt));
+            assert_eq!(
+                failure.candidate.as_ref().map(TransitionUploadCandidate::remote_version),
+                Some(remote_version.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_partial_body_accepted_by_remote() {
+        let failure = complete_transition_upload(
+            std::future::ready(Ok(Uuid::new_v4().to_string())),
+            std::future::ready(Ok(1024)),
+            1024,
+            consumed(511),
+        )
+        .await
+        .expect_err("remote success must not hide a partially consumed body");
+        assert!(matches!(failure.error, StorageError::LessData));
+        assert!(failure.candidate.is_some());
+    }
+
+    #[tokio::test]
+    async fn maps_source_panic_cancel_and_early_close_to_failures() {
+        let panic_failure = complete_transition_upload(
+            std::future::ready(Ok(Uuid::new_v4().to_string())),
+            async {
+                panic!("injected transition producer panic");
+                #[allow(unreachable_code)]
+                Ok(0)
+            },
+            1,
+            consumed(0),
+        )
+        .await
+        .expect_err("a producer panic must not enter local commit");
+        assert!(matches!(panic_failure.error, StorageError::Unexpected));
+
+        let cancelled = complete_transition_upload(
+            std::future::ready(Ok(Uuid::new_v4().to_string())),
+            std::future::ready(Err(StorageError::OperationCanceled)),
+            1,
+            consumed(0),
+        )
+        .await
+        .expect_err("a cancelled producer must not enter local commit");
+        assert!(matches!(cancelled.error, StorageError::OperationCanceled));
+
+        let early_close = complete_transition_upload(
+            std::future::ready(Ok(Uuid::new_v4().to_string())),
+            std::future::ready(Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "remote reader closed early",
+            )))),
+            1024,
+            consumed(16),
+        )
+        .await
+        .expect_err("an early remote close must not enter local commit");
+        assert!(matches!(early_close.error, StorageError::Io(ref err) if err.kind() == std::io::ErrorKind::BrokenPipe));
+    }
+
+    #[tokio::test]
+    async fn rejects_declared_size_mismatches_and_accepts_zero_size() {
+        let shorter = complete_transition_upload(
+            std::future::ready(Ok(Uuid::new_v4().to_string())),
+            std::future::ready(Ok(511)),
+            512,
+            consumed(511),
+        )
+        .await
+        .expect_err("a short source must fail the declared-size check");
+        assert!(matches!(shorter.error, StorageError::LessData));
+
+        let longer = complete_transition_upload(
+            std::future::ready(Ok(Uuid::new_v4().to_string())),
+            std::future::ready(Ok(513)),
+            512,
+            consumed(513),
+        )
+        .await
+        .expect_err("an oversized source must fail the declared-size check");
+        assert!(matches!(longer.error, StorageError::MoreData));
+
+        let exact_remote_version = Uuid::new_v4().to_string();
+        let exact = complete_transition_upload(
+            std::future::ready(Ok(exact_remote_version.clone())),
+            std::future::ready(Ok(512)),
+            512,
+            consumed(512),
+        )
+        .await
+        .expect("an exact producer and consumer byte count must complete");
+        assert_eq!(exact.candidate.remote_version(), exact_remote_version);
+        assert_eq!((exact.produced, exact.consumed), (512, 512));
+
+        let remote_version = Uuid::nil().to_string();
+        let result =
+            complete_transition_upload(std::future::ready(Ok(remote_version.clone())), std::future::ready(Ok(0)), 0, consumed(0))
+                .await
+                .expect("an empty source and empty remote body must complete");
+        assert_eq!(result.candidate.remote_version(), remote_version);
+        assert_eq!((result.produced, result.consumed), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn preserves_remote_error_when_commit_status_is_unknown() {
+        let failure = complete_transition_upload(
+            std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "remote response was lost"))),
+            std::future::ready(Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "consumer disappeared",
+            )))),
+            1024,
+            consumed(0),
+        )
+        .await
+        .expect_err("an unknown remote commit result must fail closed");
+        assert!(matches!(failure.error, StorageError::Io(ref err) if err.kind() == std::io::ErrorKind::ConnectionReset));
+        assert!(failure.candidate.is_none(), "unknown remote versions must never enter precise cleanup");
+
+        let source_failure = complete_transition_upload(
+            std::future::ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "remote rejected the truncated body",
+            ))),
+            std::future::ready(Err(StorageError::FileCorrupt)),
+            1024,
+            consumed(128),
+        )
+        .await
+        .expect_err("a source integrity error must survive a concurrent remote failure");
+        assert!(matches!(source_failure.error, StorageError::FileCorrupt));
+        assert!(source_failure.candidate.is_none());
+    }
+}
+
+#[cfg(test)]
+mod transition_version_id_tests {
+    use super::{TransitionUploadCandidate, parse_transition_version_id};
+    use uuid::Uuid;
+
+    #[test]
+    fn normalizes_unversioned_remote_ids() {
+        assert_eq!(parse_transition_version_id("").expect("empty remote version should be valid"), None);
+        assert_eq!(
+            parse_transition_version_id(&Uuid::nil().to_string()).expect("nil remote version should be valid"),
+            None
+        );
+        assert_eq!(
+            TransitionUploadCandidate::from_put_response(Uuid::nil().to_string()).cleanup_version(),
+            ""
+        );
+        assert_eq!(TransitionUploadCandidate::from_put_response(String::new()).cleanup_version(), "");
+    }
+
+    #[test]
+    fn preserves_valid_remote_id_and_rejects_invalid_text() {
+        let version_id = Uuid::new_v4();
+        assert_eq!(
+            parse_transition_version_id(&version_id.to_string()).expect("UUID remote version should be valid"),
+            Some(version_id)
+        );
+        assert_eq!(
+            TransitionUploadCandidate::from_put_response(version_id.to_string()).cleanup_version(),
+            version_id.to_string()
+        );
+        assert_eq!(
+            TransitionUploadCandidate::from_put_response("opaque-version-token".to_string()).cleanup_version(),
+            "opaque-version-token"
+        );
+        assert!(parse_transition_version_id("not-a-uuid").is_err());
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     type Error = Error;
@@ -1350,7 +1946,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let inline_data = fi.inline_data();
 
             for fi in metas.iter_mut() {
-                if fi.is_valid() {
+                if fi.has_valid_erasure_geometry() {
                     fi.metadata = (*src_info.user_defined).clone();
                     if let Some(etag) = &src_info.etag {
                         fi.metadata.insert("etag".to_owned(), etag.clone());
@@ -1908,7 +2504,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
-            self.get_object_metadata_cache.invalidate_all();
+            self.invalidate_all_get_object_metadata_cache();
             return Ok(ObjectInfo::default());
         }
 
@@ -2199,9 +2795,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-        let mut tier_config_mgr = tier_config_mgr.write().await;
-        let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
+        let tier_config_mgr = self.ctx.tier_config_mgr();
+        let tgt_client = match TierConfigMgr::acquire_operation_lease(&tier_config_mgr, &opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
                 return Err(Error::other(format!("remote tier error: {err}")));
@@ -2236,7 +2831,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Some(mod_time1) = opts.mod_time {
             if let Some(mod_time2) = fi.mod_time.as_ref() {
                 if mod_time1.unix_timestamp() != mod_time2.unix_timestamp()
-                /*|| transition_etag != stored_etag*/
+                    || (!transition_etag.is_empty() && transition_etag != stored_etag)
                 {
                     return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
                 }
@@ -2289,9 +2884,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        let (pr, mut pw) = tokio::io::duplex(fi.erasure.block_size);
+        let expected_size = u64::try_from(fi.size).map_err(|_| StorageError::FileCorrupt)?;
+        let (pr, pw) = tokio::io::duplex(fi.erasure.block_size);
+        let consumed = Arc::new(AtomicU64::new(0));
         let reader = ReaderImpl::ObjectBody(GetObjectReader {
-            stream: Box::new(pr),
+            stream: Box::new(TransitionUploadReader::new(pr, Arc::clone(&consumed))),
             object_info: oi,
             buffered_body: None,
             body_source: GetObjectBodySource::Unprobed,
@@ -2304,13 +2901,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
         let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(cloned_fi.size);
-        tokio::spawn(async move {
-            if let Err(e) = Self::get_object_with_fileinfo(
+        let producer = async move {
+            let mut writer = TransitionUploadWriter::new(pw);
+            Self::get_object_with_fileinfo(
                 &cloned_bucket,
                 &cloned_object,
                 0,
                 cloned_fi.size,
-                &mut pw,
+                &mut writer,
                 cloned_fi,
                 meta_arr,
                 &online_disks,
@@ -2322,36 +2920,121 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
                 metrics_size_bucket,
             )
-            .await
-            {
-                error!("get_object_with_fileinfo err {:?}", e);
-            };
-        });
+            .await?;
+            writer.shutdown().await?;
+            Ok(writer.produced())
+        };
 
-        let rv = tgt_client.put_with_meta(&dest_obj, reader, fi.size, transition_meta).await;
-        if let Err(err) = rv {
-            return Err(StorageError::Io(err));
+        let rv = complete_transition_upload(
+            tgt_client.put_with_meta(&dest_obj, reader, fi.size, transition_meta),
+            producer,
+            expected_size,
+            consumed,
+        )
+        .await;
+        let candidate = match rv {
+            Ok(completion) => completion.candidate,
+            Err(failure) => {
+                if let Some(candidate) = failure.candidate {
+                    let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate);
+                    let _cleanup_result = upload_cleanup.cleanup().await;
+                }
+                return Err(failure.error);
+            }
+        };
+
+        let transition_version_id = match parse_transition_version_id(candidate.remote_version()) {
+            Ok(version_id) => version_id,
+            Err(err) => {
+                let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate);
+                let _cleanup_result = upload_cleanup.cleanup().await;
+                return Err(err.into());
+            }
+        };
+        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate);
+
+        let mut commit_opts = opts.clone();
+        commit_opts.no_lock = true;
+        commit_opts.metadata_cache_safe = false;
+        let transition_lock_guard = if opts.no_lock {
+            None
+        } else {
+            match self.acquire_write_lock_diag("transition_object_commit", bucket, object).await {
+                Ok(guard) => Some(guard),
+                Err(err) => {
+                    let _cleanup_result = upload_cleanup.cleanup().await;
+                    return Err(err);
+                }
+            }
+        };
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let current = self.get_object_fileinfo(bucket, object, &commit_opts, true, false).await;
+        let (mut current_fi, _, _) = match current {
+            Ok(current) => current,
+            Err(err) => {
+                drop(transition_lock_guard);
+                let _cleanup_result = upload_cleanup.cleanup().await;
+                return Err(err);
+            }
+        };
+        let source_matches = current_fi.version_id == fi.version_id
+            && current_fi.data_dir == fi.data_dir
+            && current_fi.mod_time == fi.mod_time
+            && current_fi.size == fi.size
+            && rustfs_utils::path::trim_etag(&get_raw_etag(&current_fi.metadata)) == stored_etag;
+        if current_fi.transition_status == TRANSITION_COMPLETE || !source_matches {
+            let already_transitioned = current_fi.transition_status == TRANSITION_COMPLETE;
+            drop(transition_lock_guard);
+            let _cleanup_result = upload_cleanup.cleanup().await;
+            if already_transitioned {
+                return Ok(());
+            }
+            return Err(to_object_err(Error::other(DiskError::FileNotFound), vec![bucket, object]));
         }
-        let rv = rv?;
-        fi.transition_status = TRANSITION_COMPLETE.to_string();
-        fi.transitioned_objname = dest_obj;
-        fi.transition_tier = opts.transition.tier.clone();
-        fi.transition_version_id = if rv.is_empty() { None } else { Some(Uuid::parse_str(&rv)?) };
+
+        current_fi.transition_status = TRANSITION_COMPLETE.to_string();
+        current_fi.transitioned_objname = dest_obj;
+        current_fi.transition_tier = opts.transition.tier.clone();
+        current_fi.transition_version_id = transition_version_id;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut current_fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(upload_cleanup.lease.backend_identity()),
+        );
+        fi = current_fi;
         let event_name = EventName::LifecycleTransition.as_str();
-        let mut should_notify_transition = true;
 
-        let disks = self.disk_inventory().await;
-
+        if transition_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            drop(transition_lock_guard);
+            let _cleanup_result = upload_cleanup.cleanup().await;
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "transition_object_commit",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        #[cfg(test)]
+        pause_transition_commit(bucket, object, TransitionCommitPause::BeforeLeaseCheck).await;
+        if !upload_cleanup.lease.is_current_generation() {
+            drop(transition_lock_guard);
+            let _cleanup_result = upload_cleanup.cleanup().await;
+            return Err(Error::other("remote tier configuration changed during transition"));
+        }
+        #[cfg(test)]
+        pause_transition_commit(bucket, object, TransitionCommitPause::AfterLeaseCheck).await;
+        upload_cleanup.disarm();
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
-            should_notify_transition = false;
             warn!(
                 bucket = bucket,
                 object = object,
                 error = ?err,
-                "transition completed on remote tier but source cleanup failed; skipping external lifecycle transition notification"
+                "transition remote upload completed but local commit failed"
             );
-        } else {
-            self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+            drop(transition_lock_guard);
+            return Err(err);
         }
 
         // delete_object_version persisted transition_status=complete and freed the
@@ -2361,6 +3044,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // early-return above and streams the already-deleted local data to the
         // remote tier again (rustfs/rustfs#4827).
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        drop(transition_lock_guard);
+        let disks = self.disk_inventory().await;
+        self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         for disk in disks.iter() {
             if let Some(disk) = disk {
@@ -2372,17 +3058,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             break;
         }
 
-        if should_notify_transition {
-            let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-            send_event(EventArgs {
-                event_name: event_name.to_string(),
-                bucket_name: bucket.to_string(),
-                object: obj_info,
-                user_agent: "Internal: [ILM-Transition]".to_string(),
-                host: runtime_sources::default_local_node_name(),
-                ..Default::default()
-            });
-        }
+        let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        send_event(EventArgs {
+            event_name: event_name.to_string(),
+            bucket_name: bucket.to_string(),
+            object: obj_info,
+            user_agent: "Internal: [ILM-Transition]".to_string(),
+            host: runtime_sources::default_local_node_name(),
+            ..Default::default()
+        });
         //let tags = opts.lifecycle_audit_event.tags();
         //auditLogLifecycle(ctx, objInfo, ILMTransition, tags, traceFn)
         Ok(())
@@ -2431,7 +3115,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let mut opts = opts.clone();
             opts.part_number = Some(1);
             let rs: Option<HTTPRangeSpec> = None;
-            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &opts).await;
+            let gr = get_transitioned_object_reader_with_tier_manager(
+                bucket,
+                object,
+                &rs,
+                &HeaderMap::new(),
+                &oi,
+                &opts,
+                &self_.ctx.tier_config_mgr(),
+            )
+            .await;
             if let Err(err) = gr {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
             }
@@ -2498,7 +3191,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     .await;
                 }
             };
-            let gr = match get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &part_opts).await {
+            let gr = match get_transitioned_object_reader_with_tier_manager(
+                bucket,
+                object,
+                &rs,
+                &HeaderMap::new(),
+                &oi,
+                &part_opts,
+                &self_.ctx.tier_config_mgr(),
+            )
+            .await
+            {
                 Ok(reader) => reader,
                 Err(err) => {
                     return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
@@ -2631,6 +3334,30 @@ fn drop_failed_writer_disks<D, W>(disks: &mut [Option<D>], writers: &[Option<W>]
 }
 
 #[cfg(test)]
+mod erasure_construction_tests {
+    use super::*;
+    use crate::erasure::coding::ErasureConstructionError;
+    use std::error::Error as _;
+
+    #[test]
+    fn object_file_info_mapping_preserves_construction_error() {
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.erasure.block_size = 0;
+
+        let error = match erasure_from_file_info(&fi, false) {
+            Ok(_) => panic!("invalid object erasure metadata must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("block_size must be greater than zero"));
+        let io_source = error.source().expect("StorageError::Io must expose its io::Error source");
+        let construction_source = io_source
+            .source()
+            .expect("io::Error must expose the erasure construction error");
+        assert!(construction_source.is::<ErasureConstructionError>());
+    }
+}
+
+#[cfg(test)]
 mod b3_write_quorum_tests {
     use super::drop_failed_writer_disks;
 
@@ -2675,14 +3402,15 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    pub(in crate::set_disk::ops) async fn make_formatted_local_disk(
+    async fn make_formatted_local_disk_for_pool(
         disk_idx: usize,
+        pool_index: usize,
         format: &FormatV3,
     ) -> (TempDir, Endpoint, DiskStore) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let mut endpoint =
             Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
-        endpoint.set_pool_index(0);
+        endpoint.set_pool_index(pool_index);
         endpoint.set_set_index(0);
         endpoint.set_disk_index(disk_idx);
 
@@ -2706,6 +3434,14 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     }
 
     pub(in crate::set_disk::ops) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+        hermetic_set_disks_for_pool_with_default_parity(disk_count, 0, disk_count / 2).await
+    }
+
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks_for_pool_with_default_parity(
+        disk_count: usize,
+        pool_index: usize,
+        default_parity_count: usize,
+    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
         let mut temp_dirs = Vec::with_capacity(disk_count);
@@ -2714,7 +3450,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         let mut disks = Vec::with_capacity(disk_count);
 
         for disk_idx in 0..disk_count {
-            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_pool(disk_idx, pool_index, &format).await;
             temp_dirs.push(temp_dir);
             endpoints.push(endpoint);
             disk_stores.push(disk.clone());
@@ -2725,9 +3461,9 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             "hermetic-ops-test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
             disk_count,
-            disk_count / 2,
+            default_parity_count,
             0,
-            0,
+            pool_index,
             endpoints,
             format,
             Vec::new(),
@@ -2735,6 +3471,797 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         .await;
 
         (temp_dirs, disk_stores, set_disks)
+    }
+}
+
+#[cfg(test)]
+mod metadata_mutation_generation_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::DiskAPI as _;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+    async fn put_and_prime(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+    ) -> (ObjectInfo, GetObjectMetadataCacheKey) {
+        let mut reader = PutObjReader::from_vec(payload.to_vec());
+        let info = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("test object should be written");
+        set_disks
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+            .expect("test object metadata should resolve");
+        let generation = set_disks
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("metadata cache generation should be active");
+        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        assert!(
+            set_disks.get_object_metadata_cache.get(&key).await.is_some(),
+            "metadata priming should publish the current generation"
+        );
+        (info, key)
+    }
+
+    async fn assert_retired(set_disks: &SetDisks, key: &GetObjectMetadataCacheKey) {
+        set_disks.get_object_metadata_cache.run_pending_tasks().await;
+        assert!(
+            set_disks.get_object_metadata_cache.get(key).await.is_none(),
+            "the mutation must physically retire the prior metadata generation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(metadata_cache_invalidation_probe)]
+    async fn metadata_semantic_mutation_generation_matrix_retires_cached_snapshot() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "metadata-mutation-generation-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let put_object = "put-object";
+        let (_, put_key) = put_and_prime(&set_disks, bucket, put_object, b"initial PUT body").await;
+        let put_probe = MetadataCacheInvalidationProbe::install(bucket, put_object);
+        let mut replacement = PutObjReader::from_vec(b"replacement PUT body".to_vec());
+        set_disks
+            .put_object(bucket, put_object, &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("replacement PUT should succeed");
+        assert_eq!(put_probe.count(), 2, "PUT must invalidate before mutation and after commit");
+        assert_retired(&set_disks, &put_key).await;
+        drop(put_probe);
+
+        let delete_object = "delete-object";
+        let (_, delete_key) = put_and_prime(&set_disks, bucket, delete_object, b"DELETE body").await;
+        let delete_probe = MetadataCacheInvalidationProbe::install(bucket, delete_object);
+        set_disks
+            .delete_object(bucket, delete_object, ObjectOptions::default())
+            .await
+            .expect("DELETE should succeed");
+        assert_eq!(delete_probe.count(), 2, "DELETE must invalidate before mutation and after commit");
+        assert_retired(&set_disks, &delete_key).await;
+        drop(delete_probe);
+
+        let copy_object = "copy-object";
+        let (mut copy_info, copy_key) = put_and_prime(&set_disks, bucket, copy_object, b"COPY body").await;
+        copy_info.metadata_only = true;
+        Arc::make_mut(&mut copy_info.user_defined).insert("x-amz-meta-copy".to_string(), "updated".to_string());
+        let copy_probe = MetadataCacheInvalidationProbe::install(bucket, copy_object);
+        set_disks
+            .copy_object(
+                bucket,
+                copy_object,
+                bucket,
+                copy_object,
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("metadata COPY should succeed");
+        assert_eq!(
+            copy_probe.count(),
+            4,
+            "metadata COPY must retain both outer and update-object-meta fences"
+        );
+        assert_retired(&set_disks, &copy_key).await;
+        drop(copy_probe);
+
+        let metadata_object = "metadata-object";
+        let (_, metadata_key) = put_and_prime(&set_disks, bucket, metadata_object, b"metadata body").await;
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-meta-updated".to_string(), "true".to_string());
+        let metadata_opts = ObjectOptions {
+            eval_metadata: Some(metadata),
+            ..Default::default()
+        };
+        let metadata_probe = MetadataCacheInvalidationProbe::install(bucket, metadata_object);
+        set_disks
+            .put_object_metadata(bucket, metadata_object, &metadata_opts)
+            .await
+            .expect("metadata PUT should succeed");
+        assert_eq!(
+            metadata_probe.count(),
+            4,
+            "metadata PUT must retain both outer and update-object-meta fences"
+        );
+        assert_retired(&set_disks, &metadata_key).await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod transition_commit_failure_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+    use crate::disk::DiskAPI as _;
+    use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
+    use crate::services::tier::tier::TierConfigMgr;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use http::HeaderMap;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_commit_failure_returns_error_and_preserves_remote_candidate() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-commit-failure-bucket";
+        let object = "object.bin";
+        let payload = b"transition commit failure must preserve the uploaded candidate".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let (fi, parts_metadata, online_disks) = set_disks
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+            .expect("source metadata should resolve");
+        let generation = set_disks
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("metadata cache generation should be active");
+        let cache_key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        set_disks
+            .get_object_metadata_cache
+            .insert(
+                cache_key.clone(),
+                Arc::new(GetObjectMetadataCacheEntry {
+                    created_at: Instant::now(),
+                    fi: fi.clone(),
+                    parts_metadata,
+                    online_disks,
+                    read_quorum: 2,
+                }),
+            )
+            .await;
+        assert!(set_disks.get_object_metadata_cache.get(&cache_key).await.is_some());
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install(bucket, object);
+        let invalidations = MetadataCacheInvalidationProbe::install(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(invalidations.count(), 1, "precommit revalidation must fence the old metadata once");
+        let saved_disks = {
+            let mut disks = set_disks.disks.write().await;
+            let saved = std::mem::take(&mut *disks);
+            *disks = vec![None; saved.len()];
+            saved
+        };
+        barrier.release();
+        let result = transition.await.expect("transition task should not panic");
+        *set_disks.disks.write().await = saved_disks;
+
+        result.expect_err("local write quorum failure must be returned to the transition worker");
+        assert_eq!(
+            invalidations.count(),
+            2,
+            "local commit failure must fence any partially committed metadata again"
+        );
+        assert_eq!(backend.put_count().await, 1);
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "ambiguous local commit failure must retain the remote candidate"
+        );
+        assert_eq!(backend.object_count().await, 1);
+        assert!(
+            set_disks.get_object_metadata_cache.get(&cache_key).await.is_none(),
+            "local commit failure must invalidate pre-transition metadata"
+        );
+
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the local source must remain readable after a fail-before-commit result")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the local source body should drain");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_transition_replacement_revokes_commit_and_cleans_with_old_driver() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-generation-fence-bucket";
+        let object = "object.bin";
+        let payload = b"generation replacement must fence the local transition commit".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(payload);
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let manager = runtime_sources::global_tier_config_mgr();
+        let old_backend = register_mock_tier(&manager, &tier_name).await;
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.clone(),
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(old_backend.put_count().await, 1, "remote candidate must exist before replacement");
+
+        let replacement_backend = MockWarmBackend::new();
+        let replacement_manager = Arc::new(RwLock::new(TierConfigMgr {
+            driver_cache: HashMap::new(),
+            tiers: manager.read().await.tiers.clone(),
+            last_refreshed_at: OffsetDateTime::now_utc(),
+        }));
+        {
+            let mut replacement = replacement_manager.write().await;
+            replacement
+                .tiers
+                .get_mut(&tier_name)
+                .and_then(|tier| tier.minio.as_mut())
+                .expect("replacement tier should exist")
+                .prefix = "replacement/".to_string();
+            replacement
+                .install_test_driver(&tier_name, Box::new(replacement_backend))
+                .expect("replacement driver should install");
+        }
+        let replacement = match Arc::try_unwrap(replacement_manager) {
+            Ok(manager) => manager.into_inner(),
+            Err(_) => panic!("replacement manager should have one owner"),
+        };
+        let publish_handle = manager.clone();
+        let publish_tier = tier_name.clone();
+        let publish =
+            tokio::spawn(
+                async move { TierConfigMgr::publish_candidate(&publish_handle, replacement, Some(&publish_tier)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match TierConfigMgr::acquire_operation_lease(&manager, &tier_name).await {
+                    Err(err) if err.message.contains("being replaced") => break,
+                    Ok(lease) => drop(lease),
+                    Err(err) => panic!("unexpected lease error while replacement drains: {err}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement should revoke the in-flight generation");
+        assert!(!publish.is_finished(), "replacement must wait for the production transition lease");
+
+        barrier.release();
+        transition
+            .await
+            .expect("transition task should join")
+            .expect_err("revoked generation must not commit tier-name metadata");
+        publish
+            .await
+            .expect("replacement task should join")
+            .expect("replacement should finish after old cleanup releases its lease");
+        assert_eq!(
+            old_backend.remove_count().await,
+            1,
+            "cancelled transition must clean up with the old driver"
+        );
+        assert_eq!(old_backend.object_count().await, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_reload_rejects_route_change_after_local_transition_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-post-check-fence-bucket";
+        let object = "object.bin";
+        let payload = b"the operation lease must cover the local transition commit".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let manager = runtime_sources::global_tier_config_mgr();
+        let old_backend = register_mock_tier(&manager, &tier_name).await;
+        let old_prefix = manager.read().await.tiers[&tier_name]
+            .minio
+            .as_ref()
+            .expect("old tier route should exist")
+            .prefix
+            .clone();
+        let old_identity = TierConfigMgr::acquire_operation_lease(&manager, &tier_name)
+            .await
+            .expect("old tier identity should be available")
+            .backend_identity();
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.clone(),
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install_after_lease_check(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(old_backend.put_count().await, 1, "remote candidate must exist before replacement");
+
+        let replacement_manager = Arc::new(RwLock::new(TierConfigMgr {
+            driver_cache: HashMap::new(),
+            tiers: manager.read().await.tiers.clone(),
+            last_refreshed_at: OffsetDateTime::now_utc(),
+        }));
+        {
+            let mut replacement = replacement_manager.write().await;
+            replacement
+                .tiers
+                .get_mut(&tier_name)
+                .and_then(|tier| tier.minio.as_mut())
+                .expect("replacement tier should exist")
+                .prefix = "replacement/".to_string();
+        }
+        let replacement = match Arc::try_unwrap(replacement_manager) {
+            Ok(manager) => manager.into_inner(),
+            Err(_) => panic!("replacement manager should have one owner"),
+        };
+        let publish_handle = manager.clone();
+        let publish = tokio::spawn(async move { publish_handle.write().await.publish_legacy_reload(replacement).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy reload should hold the manager guard while the checked generation drains");
+        assert!(
+            !publish.is_finished(),
+            "replacement must wait until the local transition commit releases its lease"
+        );
+
+        barrier.release();
+        transition
+            .await
+            .expect("transition task should join")
+            .expect("a transition linearized before replacement should commit");
+        publish
+            .await
+            .expect("replacement task should join")
+            .expect_err("replacement must not rebind a tier name referenced by the committed transition");
+        assert_eq!(old_backend.remove_count().await, 0, "committed transition data must not be cleaned up");
+        assert_eq!(old_backend.object_count().await, 1);
+        let transitioned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("transitioned metadata should resolve");
+        let expected_identity = rustfs_utils::crypto::hex(old_identity);
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_str(
+                &transitioned.user_defined,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            )
+            .as_deref(),
+            Some(expected_identity.as_str())
+        );
+        assert_eq!(
+            manager
+                .read()
+                .await
+                .tiers
+                .get(&tier_name)
+                .and_then(|tier| tier.minio.as_ref())
+                .expect("old tier route should remain configured")
+                .prefix,
+            old_prefix
+        );
+
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the transitioned object must remain routed through the old generation")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the transitioned object body should drain");
+        assert_eq!(restored, payload);
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod transition_upload_integrity_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+    use crate::disk::DiskAPI as _;
+    use crate::services::tier::test_util::register_mock_tier;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use http::HeaderMap;
+
+    async fn assert_local_source_intact(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, payload: &[u8]) {
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed transition must leave the local source readable")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("local source should drain after failed transition");
+        assert_eq!(restored, payload);
+        let (fi, _, _) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("local source metadata should remain available");
+        assert_ne!(fi.transition_status, TRANSITION_COMPLETE);
+    }
+
+    async fn write_source(
+        set_disks: &Arc<SetDisks>,
+        disk_stores: &[DiskStore],
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+    ) -> ObjectInfo {
+        for disk in disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(payload.to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written")
+    }
+
+    fn transition_options(original: &ObjectInfo, tier_name: String) -> ObjectOptions {
+        ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn partial_remote_acceptance_cleans_exact_candidate_and_preserves_source() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-partial-accept-bucket";
+        let object = "object.bin";
+        let payload = vec![0x5a; 2 * 1024 * 1024];
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let remote_version = Uuid::nil().to_string();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_read_limit(Some(4096)).await;
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+
+        let error = set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("accepting only a prefix must fail transition completion");
+        assert!(matches!(error, StorageError::Io(_) | StorageError::LessData));
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(
+            removed_versions[0].1, "",
+            "the nil UUID response is the backend's unversioned sentinel and must not become an S3 versionId"
+        );
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn opaque_remote_version_is_cleaned_before_parse_failure() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-unknown-version-bucket";
+        let object = "object.bin";
+        let payload = b"unknown remote version must retain local data".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some("opaque-version-token".to_string())).await;
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("an unparseable remote version must fail closed");
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(removed_versions[0].1, "opaque-version-token");
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod transition_source_identity_matrix_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+    use crate::disk::DiskAPI as _;
+    use crate::services::tier::test_util::register_mock_tier;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transition_source_identity_field_matrix_rejects_single_field_drift() {
+        #[derive(Clone, Copy, Debug)]
+        enum IdentityField {
+            VersionId,
+            DataDir,
+            ModTime,
+            Size,
+            Etag,
+        }
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-identity-matrix-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+
+        for (index, field) in [
+            IdentityField::VersionId,
+            IdentityField::DataDir,
+            IdentityField::ModTime,
+            IdentityField::Size,
+            IdentityField::Etag,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let object = format!("identity-{index}.bin");
+            let payload = vec![u8::try_from(index + 1).expect("matrix index should fit u8"); 1024 * 1024];
+            let mut reader = PutObjReader::from_vec(payload);
+            let original = set_disks
+                .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("source object should be written");
+            let (source, _, _) = set_disks
+                .get_object_fileinfo(bucket, &object, &ObjectOptions::default(), true, false)
+                .await
+                .expect("source metadata should resolve");
+            let opts = ObjectOptions {
+                no_lock: true,
+                transition: TransitionOptions {
+                    status: TRANSITION_PENDING.to_string(),
+                    tier: tier_name.clone(),
+                    etag: original.etag.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+                version_id: original.version_id.map(|version| version.to_string()),
+                mod_time: original.mod_time,
+                ..Default::default()
+            };
+            let put_barrier = backend.arm_put_barrier().await;
+            let transition_set = Arc::clone(&set_disks);
+            let transition_object = object.clone();
+            let transition =
+                tokio::spawn(async move { transition_set.transition_object(bucket, &transition_object, &opts).await });
+            put_barrier.wait_until_paused().await;
+
+            let mut changed = source.clone();
+            match field {
+                IdentityField::VersionId => changed.version_id = Some(Uuid::new_v4()),
+                IdentityField::DataDir => changed.data_dir = Some(Uuid::new_v4()),
+                IdentityField::ModTime => {
+                    changed.mod_time = changed.mod_time.map(|value| value + time::Duration::nanoseconds(1));
+                }
+                IdentityField::Size => changed.size += 1,
+                IdentityField::Etag => {
+                    changed.metadata.insert("etag".to_string(), format!("changed-{index}"));
+                }
+            }
+            for disk in &disk_stores {
+                disk.write_metadata("", bucket, &object, changed.clone())
+                    .await
+                    .expect("single-field metadata drift should be written");
+            }
+            put_barrier.release();
+
+            transition
+                .await
+                .expect("transition task should not panic")
+                .expect_err("transition must reject a source whose identity changed after upload");
+            let expected_attempts = index + 1;
+            assert_eq!(backend.put_count().await, expected_attempts);
+            assert_eq!(backend.remove_count().await, expected_attempts);
+            assert_eq!(
+                backend.remove_versions().await,
+                backend.put_versions().await,
+                "rejected identity drift must remove the exact uploaded version"
+            );
+
+            match field {
+                IdentityField::VersionId => assert_ne!(source.version_id, changed.version_id),
+                IdentityField::DataDir => assert_ne!(source.data_dir, changed.data_dir),
+                IdentityField::ModTime => assert_ne!(source.mod_time, changed.mod_time),
+                IdentityField::Size => assert_ne!(source.size, changed.size),
+                IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata)),
+            }
+            if !matches!(field, IdentityField::VersionId) {
+                assert_eq!(source.version_id, changed.version_id);
+            }
+            if !matches!(field, IdentityField::DataDir) {
+                assert_eq!(source.data_dir, changed.data_dir);
+            }
+            if !matches!(field, IdentityField::ModTime) {
+                assert_eq!(source.mod_time, changed.mod_time);
+            }
+            if !matches!(field, IdentityField::Size) {
+                assert_eq!(source.size, changed.size);
+            }
+            if !matches!(field, IdentityField::Etag) {
+                assert_eq!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod heterogeneous_pool_put_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity;
+    use super::*;
+    use crate::config::storageclass::lookup_config_for_pools_without_env;
+    use crate::disk::{DiskAPI as _, ReadOptions};
+    use rustfs_config::server_config::KVS;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn second_pool_regular_put_uses_its_own_layout_and_round_trips() {
+        // Deliberately inject the first pool's invalid scalar fallback. The
+        // test can pass only if the production PUT uses the held [4, 2]
+        // storage-class snapshot and resolves pool 1 to parity 1.
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(2, 1, 2).await;
+        set_disks.set_test_storage_class_config(
+            lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("heterogeneous pool storage class should resolve"),
+        );
+
+        let bucket = "regular-put-second-pool-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let payload = vec![0x3c; 4096];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("second-pool regular PUT should encode without zero data shards");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist valid second-pool metadata: {err}"));
+            assert_eq!(file_info.erasure.data_blocks, 1);
+            assert_eq!(file_info.erasure.parity_blocks, 1);
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("second-pool regular PUT should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("second-pool regular PUT should stream");
+        assert_eq!(restored, payload);
     }
 }
 

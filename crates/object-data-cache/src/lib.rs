@@ -57,8 +57,9 @@ pub mod starshard_index;
 pub mod stats;
 
 pub use cache::{
-    ObjectDataCache, ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheGetRequest,
-    ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup,
+    ObjectDataCache, ObjectDataCacheBodyReservation, ObjectDataCacheFillResult, ObjectDataCacheGetPlan,
+    ObjectDataCacheGetRequest, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup,
+    ObjectDataCacheReservedBody,
 };
 pub use config::{ObjectDataCacheConfig, ObjectDataCacheMode};
 pub use error::ObjectDataCacheConfigError;

@@ -472,8 +472,12 @@ pub(crate) mod ecstore_rpc {
 }
 
 pub(crate) mod ecstore_object {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        GetObjectBodyCacheHook, ObjectMutationHook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, ObjectMutationHook, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
 }
 
@@ -491,7 +495,7 @@ pub(crate) mod ecstore_storage {
 }
 
 pub(crate) mod ecstore_tier {
-    pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
+    pub(crate) use rustfs_ecstore::api::tier::tier::{TierConfigMgr, TierConfigUpdateError};
     pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers};
     // Shared lifecycle/tier test utilities behind ecstore's `test-util` feature
     // (rustfs/backlog#1148 ilm-6). Only linked into test builds.
@@ -588,6 +592,7 @@ pub(crate) type ReplicationStatusType = ecstore_bucket::replication::Replication
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
+pub(crate) type TierConfigUpdateError = ecstore_tier::TierConfigUpdateError;
 pub(crate) use ecstore_disk::validate_batch_read_version_item_count;
 pub(crate) type TransitionState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::TransitionState;
 pub(crate) type Error = ecstore_error::Error;
@@ -1453,7 +1458,8 @@ pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
 }
 
 pub(crate) async fn reload_transition_tier_config(api: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_runtime::global_tier_config_mgr().write().await.reload(api).await
+    let handle = api.tier_config_mgr();
+    TierConfigMgr::reload_handle(&handle, api).await
 }
 
 pub(crate) async fn all_local_disk_path() -> Vec<String> {

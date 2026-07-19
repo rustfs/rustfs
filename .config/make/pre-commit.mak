@@ -23,7 +23,7 @@ pre-commit: fmt-check unsafe-code-check architecture-migration-check logging-gua
 	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: pre-pr
-pre-pr: fmt-check unsafe-code-check architecture-migration-check logging-guardrails-check tokio-io-uring-check extension-schema-check body-cache-whitelist-check doc-paths-check planning-docs-check clippy-check test ## Run full pre-PR checks with clippy and tests
+pre-pr: fmt-check unsafe-code-check architecture-migration-check logging-guardrails-check tokio-io-uring-check extension-schema-check body-cache-whitelist-check doc-paths-check planning-docs-check log-analyzer-rules-check clippy-check test ## Run full pre-PR checks with clippy and tests
 	@echo "✅ All pre-PR checks passed!"
 
 .PHONY: dev-check

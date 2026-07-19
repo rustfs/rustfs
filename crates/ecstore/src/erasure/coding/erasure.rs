@@ -25,6 +25,62 @@ use tokio::io::AsyncRead;
 use tracing::warn;
 use uuid::Uuid;
 
+const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
+
+/// Errors returned when constructing an [`Erasure`] codec.
+#[derive(Debug, thiserror::Error)]
+pub enum ErasureConstructionError {
+    /// Erasure coding requires at least one data shard.
+    #[error("data_shards must be greater than zero")]
+    ZeroDataShards,
+
+    /// Erasure coding requires a non-zero logical block size.
+    #[error("block_size must be greater than zero")]
+    ZeroBlockSize,
+
+    /// The total shard count cannot be represented by `usize`.
+    #[error("data_shards ({data_shards}) + parity_shards ({parity_shards}) overflows usize")]
+    ShardCountOverflow { data_shards: usize, parity_shards: usize },
+
+    /// The modern GF(2^8) codec cannot represent this shard configuration.
+    #[error("modern codec does not support {data_shards} data shards and {parity_shards} parity shards")]
+    UnsupportedModernShardCount { data_shards: usize, parity_shards: usize },
+
+    /// The legacy SIMD codec cannot represent this shard configuration.
+    #[error("legacy codec does not support {data_shards} data shards and {parity_shards} parity shards")]
+    UnsupportedLegacyShardCount { data_shards: usize, parity_shards: usize },
+
+    /// The modern encoder rejected dimensions that passed the preflight checks.
+    #[error("failed to construct modern Reed-Solomon encoder")]
+    ModernEncoder {
+        #[source]
+        source: reed_solomon_erasure::Error,
+    },
+
+    /// The legacy encoder wrapper failed to initialize.
+    #[error("failed to construct legacy Reed-Solomon encoder")]
+    LegacyEncoder {
+        #[source]
+        source: io::Error,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+struct ErasureConstructionIoSource {
+    #[source]
+    source: ErasureConstructionError,
+}
+
+impl ErasureConstructionError {
+    pub(crate) fn into_io_error(self) -> io::Error {
+        // `io::Error::source` forwards to the wrapped error's source rather
+        // than exposing the wrapped error itself. This adapter keeps the
+        // construction error as an observable link in the source chain.
+        io::Error::other(ErasureConstructionIoSource { source: self })
+    }
+}
+
 /// Legacy calc_shard_size formula: (block_size.div_ceil(data_shards) + 1) & !1
 /// Matches main branch and filemeta::ErasureInfo for old-version files.
 pub fn calc_shard_size_legacy(block_size: usize, data_shards: usize) -> usize {
@@ -233,12 +289,9 @@ impl Clone for ReedSolomonEncoder {
 }
 
 impl ReedSolomonEncoder {
-    /// Create a new Reed-Solomon encoder with specified data and parity shards.
-    pub fn new(data_shards: usize, parity_shards: usize) -> io::Result<Self> {
+    fn try_new_typed(data_shards: usize, parity_shards: usize) -> Result<Self, reed_solomon_erasure::Error> {
         let encoder = if parity_shards > 0 {
-            ReedSolomon::new(data_shards, parity_shards)
-                .map_err(|e| io::Error::other(format!("Failed to create Reed-Solomon encoder: {e:?}")))
-                .map(Some)?
+            Some(ReedSolomon::new(data_shards, parity_shards)?)
         } else {
             None
         };
@@ -248,6 +301,12 @@ impl ReedSolomonEncoder {
             parity_shards,
             encoder,
         })
+    }
+
+    /// Create a new Reed-Solomon encoder with specified data and parity shards.
+    pub fn new(data_shards: usize, parity_shards: usize) -> io::Result<Self> {
+        Self::try_new_typed(data_shards, parity_shards)
+            .map_err(|error| io::Error::other(format!("Failed to create Reed-Solomon encoder: {error:?}")))
     }
 
     /// Encode data shards with parity.
@@ -464,28 +523,105 @@ impl Erasure {
     /// * `data_shards` - Number of data shards.
     /// * `parity_shards` - Number of parity shards.
     /// * `block_size` - Block size for each shard.
+    ///
+    /// # Panics
+    /// Panics when the dimensions are invalid or unsupported. RustFS production
+    /// paths use [`Self::try_new`] instead.
     pub fn new(data_shards: usize, parity_shards: usize, block_size: usize) -> Self {
-        Self::new_with_options(data_shards, parity_shards, block_size, false)
+        match Self::try_new(data_shards, parity_shards, block_size) {
+            Ok(erasure) => erasure,
+            Err(error) => panic!("invalid erasure codec configuration: {error}"),
+        }
     }
 
     /// Create a new Erasure instance with legacy format support.
     ///
     /// When `uses_legacy` is true, uses main-branch shard_size formula and reed-solomon-simd
     /// for decode/reconstruct (for reading and healing old-version files).
+    ///
+    /// # Panics
+    /// Panics when the dimensions are invalid or unsupported. RustFS production
+    /// paths use [`Self::try_new_with_options`] instead.
     pub fn new_with_options(data_shards: usize, parity_shards: usize, block_size: usize, uses_legacy: bool) -> Self {
+        match Self::try_new_with_options(data_shards, parity_shards, block_size, uses_legacy) {
+            Ok(erasure) => erasure,
+            Err(error) => panic!("invalid erasure codec configuration: {error}"),
+        }
+    }
+
+    /// Tries to create a modern Erasure codec.
+    ///
+    /// # Errors
+    /// Returns [`ErasureConstructionError`] when dimensions are zero,
+    /// overflow the shard count, exceed the modern codec's supported range, or
+    /// the underlying encoder rejects the configuration.
+    pub fn try_new(data_shards: usize, parity_shards: usize, block_size: usize) -> Result<Self, ErasureConstructionError> {
+        Self::try_new_with_options(data_shards, parity_shards, block_size, false)
+    }
+
+    /// Tries to create an Erasure codec using the selected format backend.
+    ///
+    /// # Errors
+    /// Returns [`ErasureConstructionError`] when dimensions are zero,
+    /// overflow the shard count, are unsupported by the selected codec, or the
+    /// selected encoder fails to initialize.
+    pub fn try_new_with_options(
+        data_shards: usize,
+        parity_shards: usize,
+        block_size: usize,
+        uses_legacy: bool,
+    ) -> Result<Self, ErasureConstructionError> {
+        if data_shards == 0 {
+            return Err(ErasureConstructionError::ZeroDataShards);
+        }
+        if block_size == 0 {
+            return Err(ErasureConstructionError::ZeroBlockSize);
+        }
+
+        let total_shards = data_shards
+            .checked_add(parity_shards)
+            .ok_or(ErasureConstructionError::ShardCountOverflow {
+                data_shards,
+                parity_shards,
+            })?;
+
+        if parity_shards > 0 {
+            if uses_legacy
+                && (total_shards > reed_solomon_simd::engine::GF_ORDER
+                    || !reed_solomon_simd::ReedSolomonEncoder::supports(data_shards, parity_shards))
+            {
+                return Err(ErasureConstructionError::UnsupportedLegacyShardCount {
+                    data_shards,
+                    parity_shards,
+                });
+            }
+            if !uses_legacy && total_shards > MODERN_MAX_TOTAL_SHARDS {
+                return Err(ErasureConstructionError::UnsupportedModernShardCount {
+                    data_shards,
+                    parity_shards,
+                });
+            }
+        }
+
         let encoder = if !uses_legacy && parity_shards > 0 {
-            Some(ReedSolomonEncoder::new(data_shards, parity_shards).expect("operation should succeed"))
+            Some(
+                ReedSolomonEncoder::try_new_typed(data_shards, parity_shards)
+                    .map_err(|source| ErasureConstructionError::ModernEncoder { source })?,
+            )
         } else {
             None
         };
 
         let legacy_encoder = if uses_legacy && parity_shards > 0 {
-            Some(LegacyReedSolomonEncoder::new(data_shards, parity_shards).expect("operation should succeed"))
+            Some(
+                LegacyReedSolomonEncoder::new(data_shards, parity_shards)
+                    .map_err(|source| ErasureConstructionError::LegacyEncoder { source })?,
+            )
         } else {
             None
         };
 
-        Erasure {
+        Ok(Erasure {
             data_shards,
             parity_shards,
             block_size,
@@ -493,7 +629,7 @@ impl Erasure {
             legacy_encoder,
             uses_legacy,
             _id: Uuid::nil(), // Unused in hot paths; avoid CSPRNG syscall
-        }
+        })
     }
 
     /// Encode data into data and parity shards.
@@ -946,6 +1082,15 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
 
+    fn erasure_with_invalid_dimensions(data_shards: usize, parity_shards: usize, block_size: usize) -> Erasure {
+        Erasure {
+            data_shards,
+            parity_shards,
+            block_size,
+            ..Default::default()
+        }
+    }
+
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
         shards.iter().map(|shard| Some(shard.to_vec())).collect()
     }
@@ -1011,6 +1156,156 @@ mod tests {
     }
 
     #[test]
+    fn try_new_rejects_zero_and_overflowing_dimensions_with_typed_errors() {
+        let Err(zero_data) = Erasure::try_new(0, 2, 64) else {
+            panic!("zero data shards must be rejected");
+        };
+        assert!(matches!(zero_data, ErasureConstructionError::ZeroDataShards));
+
+        let Err(zero_block) = Erasure::try_new(2, 2, 0) else {
+            panic!("zero block size must be rejected");
+        };
+        assert!(matches!(zero_block, ErasureConstructionError::ZeroBlockSize));
+
+        let Err(overflow) = Erasure::try_new(usize::MAX, 1, 64) else {
+            panic!("overflowing shard counts must be rejected");
+        };
+        assert!(matches!(
+            overflow,
+            ErasureConstructionError::ShardCountOverflow {
+                data_shards: usize::MAX,
+                parity_shards: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn try_new_rejects_backend_specific_unsupported_dimensions() {
+        let Err(modern) = Erasure::try_new(256, 1, 64) else {
+            panic!("modern dimensions beyond GF(2^8) must be rejected");
+        };
+        assert!(matches!(
+            modern,
+            ErasureConstructionError::UnsupportedModernShardCount {
+                data_shards: 256,
+                parity_shards: 1,
+            }
+        ));
+
+        let Err(legacy) = Erasure::try_new_with_options(60_000, 5_000, 64, true) else {
+            panic!("unsupported legacy SIMD dimensions must be rejected");
+        };
+        assert!(matches!(
+            legacy,
+            ErasureConstructionError::UnsupportedLegacyShardCount {
+                data_shards: 60_000,
+                parity_shards: 5_000,
+            }
+        ));
+    }
+
+    #[test]
+    fn try_new_accepts_exact_backend_shard_limits() {
+        let modern_data_shards = MODERN_MAX_TOTAL_SHARDS - 1;
+        let modern =
+            Erasure::try_new(modern_data_shards, 1, 64).expect("the modern codec's exact field-size boundary must remain valid");
+        assert_eq!(modern.total_shard_count(), MODERN_MAX_TOTAL_SHARDS);
+        assert!(modern.encoder.is_some());
+        assert!(modern.legacy_encoder.is_none());
+
+        let legacy_data_shards = reed_solomon_simd::engine::GF_ORDER / 2;
+        let legacy_parity_shards = reed_solomon_simd::engine::GF_ORDER - legacy_data_shards;
+        let legacy = Erasure::try_new_with_options(legacy_data_shards, legacy_parity_shards, 64, true)
+            .expect("the legacy codec's exact field-size boundary must remain valid");
+        assert_eq!(legacy.total_shard_count(), reed_solomon_simd::engine::GF_ORDER);
+        assert!(legacy.encoder.is_none());
+        assert!(legacy.legacy_encoder.is_some());
+    }
+
+    #[test]
+    fn try_new_accepts_zero_parity_without_backend_limits() {
+        let no_parity = Erasure::try_new(2, 0, 64).expect("zero parity is a valid generic codec configuration");
+        assert_eq!(no_parity.total_shard_count(), 2);
+        assert!(no_parity.encoder.is_none());
+        assert!(no_parity.legacy_encoder.is_none());
+
+        let large_modern = Erasure::try_new(257, 0, 64).expect("zero parity must not inherit the modern backend shard limit");
+        assert_eq!(large_modern.total_shard_count(), 257);
+        assert!(large_modern.encoder.is_none());
+        assert!(large_modern.legacy_encoder.is_none());
+
+        let legacy_data_shards = reed_solomon_simd::engine::GF_ORDER + 1;
+        let large_legacy = Erasure::try_new_with_options(legacy_data_shards, 0, 64, true)
+            .expect("zero parity must not inherit the legacy backend shard limit");
+        assert_eq!(large_legacy.total_shard_count(), legacy_data_shards);
+        assert!(large_legacy.encoder.is_none());
+        assert!(large_legacy.legacy_encoder.is_none());
+    }
+
+    #[test]
+    fn try_new_accepts_generic_layouts_above_storage_drive_limits() {
+        let erasure = Erasure::try_new(2, 3, 64).expect("generic 2+3 erasure coding must remain supported");
+        assert_eq!(erasure.total_shard_count(), 5);
+        assert!(erasure.encoder.is_some());
+        assert!(erasure.legacy_encoder.is_none());
+
+        let modern = Erasure::try_new(9, 8, 64).expect("the codec must not impose the storage layer's drive limit");
+        assert_eq!(modern.total_shard_count(), 17);
+        assert!(modern.encoder.is_some());
+        assert!(modern.legacy_encoder.is_none());
+
+        let legacy = Erasure::try_new_with_options(9, 8, 64, true)
+            .expect("the legacy codec must not impose the storage layer's drive limit");
+        assert_eq!(legacy.total_shard_count(), 17);
+        assert!(legacy.encoder.is_none());
+        assert!(legacy.legacy_encoder.is_some());
+    }
+
+    #[test]
+    fn try_new_with_options_initializes_only_the_selected_backend() {
+        let modern = Erasure::try_new_with_options(4, 2, 64, false).expect("modern codec should construct");
+        assert!(modern.encoder.is_some());
+        assert!(modern.legacy_encoder.is_none());
+
+        let legacy = Erasure::try_new_with_options(4, 2, 64, true).expect("legacy codec should construct");
+        assert!(legacy.encoder.is_none());
+        assert!(legacy.legacy_encoder.is_some());
+    }
+
+    #[test]
+    fn construction_errors_preserve_encoder_sources() {
+        let modern = ErasureConstructionError::ModernEncoder {
+            source: reed_solomon_erasure::Error::TooManyShards,
+        };
+        assert!(
+            std::error::Error::source(&modern)
+                .and_then(|source| source.downcast_ref::<reed_solomon_erasure::Error>())
+                .is_some()
+        );
+
+        let legacy = ErasureConstructionError::LegacyEncoder {
+            source: io::Error::other("legacy encoder failure"),
+        };
+        assert!(
+            std::error::Error::source(&legacy)
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid erasure codec configuration")]
+    fn new_panics_on_invalid_dimensions() {
+        let _ = Erasure::new(0, 1, 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid erasure codec configuration")]
+    fn new_with_options_panics_on_invalid_dimensions() {
+        let _ = Erasure::new_with_options(1, 1, 0, true);
+    }
+
+    #[test]
     fn has_valid_dimensions_rejects_zero_block_size_or_data_shards() {
         // Well-formed erasure metadata is accepted.
         assert!(Erasure::new(4, 2, 64).has_valid_dimensions());
@@ -1018,11 +1313,9 @@ mod tests {
 
         // Corrupted on-disk metadata with a zero block_size or zero data_shards
         // must be rejected before it reaches the shard/offset divisions.
-        // (parity_shards is kept 0 for the zero-data_shards cases so the
-        // Reed-Solomon encoder is not constructed with an invalid shard count.)
-        assert!(!Erasure::new(4, 2, 0).has_valid_dimensions());
-        assert!(!Erasure::new(0, 0, 64).has_valid_dimensions());
-        assert!(!Erasure::new(0, 0, 0).has_valid_dimensions());
+        assert!(!erasure_with_invalid_dimensions(4, 2, 0).has_valid_dimensions());
+        assert!(!erasure_with_invalid_dimensions(0, 0, 64).has_valid_dimensions());
+        assert!(!erasure_with_invalid_dimensions(0, 0, 0).has_valid_dimensions());
     }
 
     #[tokio::test]
@@ -1762,7 +2055,7 @@ mod tests {
         use std::io::Cursor;
         use std::sync::{Arc, Mutex};
 
-        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let erasure = Arc::new(erasure_with_invalid_dimensions(1, 0, 0));
         let mut reader = Cursor::new(b"payload".to_vec());
         let observed = Arc::new(Mutex::new(None));
         let observed_clone = observed.clone();

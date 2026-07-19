@@ -18,8 +18,9 @@ use crate::admin::runtime_sources::{
     current_app_context, current_object_store_handle_for_context, current_server_config_for_context, publish_server_config,
 };
 use crate::admin::service::config::{
-    apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_config_snapshot_reload, signal_dynamic_config_reload,
-    validate_server_config,
+    CONFIG_WORKER_RELOAD_FAILURE_STATE, EVENT_CONFIG_WORKER_RELOAD_FAILED, FULL_CONFIG_WORKER_SUBSYSTEMS, LOG_COMPONENT_ADMIN,
+    LOG_SUBSYSTEM_CONFIG, PreparedRuntimeConfig, apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem,
+    prepare_server_config, signal_config_snapshot_reload, signal_dynamic_config_reload,
 };
 use crate::admin::storage_api::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
 use crate::admin::storage_api::config::{
@@ -81,7 +82,9 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error}
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::future::Future;
 use time::OffsetDateTime;
+use tracing::warn;
 use uuid::Uuid;
 
 const REDACTED_VALUE: &str = "*redacted*";
@@ -94,7 +97,6 @@ const CONFIG_APPLIED_HEADER: &str = "x-rustfs-config-applied";
 const CONFIG_APPLIED_COMPAT_HEADER: &str = "x-minio-config-applied";
 const CONFIG_APPLIED_TRUE: &str = "true";
 const DEFAULT_COMMENT_DESCRIPTION: &str = "optionally add a comment to this setting";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigEntry {
     key: String,
@@ -1542,20 +1544,37 @@ fn build_help_response(sub_system: Option<&str>, key: Option<&str>, env_only: bo
     })
 }
 
-/// Re-apply all dynamic subsystems from the given config and signal peers to reload.
-/// Used after full-config operations (restore, set-config) where the leader replaces
-/// the entire config and must ensure runtime state (e.g. GLOBAL_STORAGE_CLASS) is
-/// refreshed on both the leader and all peers.
-async fn apply_and_signal_dynamic_subsystems(config: &ServerConfig) {
-    for sub_system in [
-        STORAGE_CLASS_SUB_SYS,
-        AUDIT_WEBHOOK_SUB_SYS,
-        AUDIT_MQTT_SUB_SYS,
-        SCANNER_SUB_SYS,
-        HEAL_SUB_SYS,
-    ] {
-        if apply_dynamic_config_for_subsystem(config, sub_system).await.unwrap_or(false) {
-            signal_dynamic_config_reload(sub_system).await;
+fn publish_prepared_config_snapshots(config: ServerConfig, prepared: PreparedRuntimeConfig) -> S3Result<()> {
+    prepared.publish_storage_class()?;
+    publish_server_config(config);
+    Ok(())
+}
+
+async fn commit_prepared_config(
+    config: ServerConfig,
+    prepared: PreparedRuntimeConfig,
+    persist: impl Future<Output = S3Result<()>>,
+    publish: impl FnOnce(ServerConfig, PreparedRuntimeConfig) -> S3Result<()>,
+) -> S3Result<()> {
+    persist.await?;
+    publish(config, prepared)
+}
+
+/// Re-apply local mutable worker families after a full-config replacement.
+/// Peers receive one full-snapshot signal after this returns; signaling each
+/// family here as well would recreate audit/scanner targets twice per peer.
+async fn apply_dynamic_subsystems(config: &ServerConfig) {
+    for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
+        if let Err(err) = apply_dynamic_config_for_subsystem(config, sub_system).await {
+            warn!(
+                event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_subsystem = sub_system,
+                state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
+                error = %err,
+                "Published server config but failed to reload a local worker subsystem"
+            );
         }
     }
 }
@@ -1595,21 +1614,34 @@ impl Operation for SetConfigKVHandler {
         let sub_system = config_update_sub_system(&directives)?;
         let mut config = load_server_config_from_store().await?;
         apply_set_directives(&mut config, &directives)?;
-        validate_server_config(&config, sub_system).await?;
+        let prepared = prepare_server_config(&config, sub_system).await?;
         save_server_config_history(&body).await?;
-        save_server_config_to_store(&config).await?;
-        publish_server_config(config.clone());
-        let mut config_applied = false;
-        if let Some(sub_system) = sub_system
-            && is_dynamic_config_subsystem(sub_system)
-        {
-            config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
-            if config_applied {
-                signal_dynamic_config_reload(sub_system).await;
-            }
+        let config_applied = if sub_system == Some(STORAGE_CLASS_SUB_SYS) {
+            commit_prepared_config(
+                config.clone(),
+                prepared,
+                save_server_config_to_store(&config),
+                publish_prepared_config_snapshots,
+            )
+            .await?;
+            signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
+            true
         } else {
-            signal_config_snapshot_reload().await;
-        }
+            save_server_config_to_store(&config).await?;
+            publish_server_config(config.clone());
+            if let Some(sub_system) = sub_system
+                && is_dynamic_config_subsystem(sub_system)
+            {
+                let config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
+                if config_applied {
+                    signal_dynamic_config_reload(sub_system).await;
+                }
+                config_applied
+            } else {
+                signal_config_snapshot_reload().await;
+                false
+            }
+        };
 
         success_response(config_applied)
     }
@@ -1631,21 +1663,34 @@ impl Operation for DelConfigKVHandler {
         let sub_system = config_update_sub_system(&directives)?;
         let mut config = load_server_config_from_store().await?;
         apply_delete_directives(&mut config, &directives);
-        validate_server_config(&config, sub_system).await?;
+        let prepared = prepare_server_config(&config, sub_system).await?;
         save_server_config_history(&body).await?;
-        save_server_config_to_store(&config).await?;
-        publish_server_config(config.clone());
-        let mut config_applied = false;
-        if let Some(sub_system) = sub_system
-            && is_dynamic_config_subsystem(sub_system)
-        {
-            config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
-            if config_applied {
-                signal_dynamic_config_reload(sub_system).await;
-            }
+        let config_applied = if sub_system == Some(STORAGE_CLASS_SUB_SYS) {
+            commit_prepared_config(
+                config.clone(),
+                prepared,
+                save_server_config_to_store(&config),
+                publish_prepared_config_snapshots,
+            )
+            .await?;
+            signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
+            true
         } else {
-            signal_config_snapshot_reload().await;
-        }
+            save_server_config_to_store(&config).await?;
+            publish_server_config(config.clone());
+            if let Some(sub_system) = sub_system
+                && is_dynamic_config_subsystem(sub_system)
+            {
+                let config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
+                if config_applied {
+                    signal_dynamic_config_reload(sub_system).await;
+                }
+                config_applied
+            } else {
+                signal_config_snapshot_reload().await;
+                false
+            }
+        };
 
         success_response(config_applied)
     }
@@ -1730,10 +1775,16 @@ impl Operation for RestoreConfigHistoryKVHandler {
 
         let mut config = ServerConfig::new();
         apply_set_directives(&mut config, &directives)?;
-        validate_server_config(&config, None).await?;
-        save_server_config_to_store(&config).await?;
-        publish_server_config(config.clone());
-        apply_and_signal_dynamic_subsystems(&config).await;
+        let prepared = prepare_server_config(&config, None).await?;
+        commit_prepared_config(
+            config.clone(),
+            prepared,
+            save_server_config_to_store(&config),
+            publish_prepared_config_snapshots,
+        )
+        .await?;
+        signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
+        apply_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 
         success_response(false)
@@ -1768,11 +1819,17 @@ impl Operation for SetConfigHandler {
 
         let mut config = ServerConfig::new();
         apply_set_directives(&mut config, &directives)?;
-        validate_server_config(&config, None).await?;
+        let prepared = prepare_server_config(&config, None).await?;
         save_server_config_history(&body).await?;
-        save_server_config_to_store(&config).await?;
-        publish_server_config(config.clone());
-        apply_and_signal_dynamic_subsystems(&config).await;
+        commit_prepared_config(
+            config.clone(),
+            prepared,
+            save_server_config_to_store(&config),
+            publish_prepared_config_snapshots,
+        )
+        .await?;
+        signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
+        apply_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 
         success_response(false)
@@ -1782,6 +1839,142 @@ impl Operation for SetConfigHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn prepared_config_commit_persists_before_publish() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let persist_events = events.clone();
+        let publish_events = events.clone();
+
+        commit_prepared_config(
+            ServerConfig::new(),
+            PreparedRuntimeConfig::default(),
+            async move {
+                persist_events.lock().expect("persist events lock").push("persist");
+                Ok(())
+            },
+            move |_, _| {
+                publish_events.lock().expect("publish events lock").push("publish");
+                Ok(())
+            },
+        )
+        .await
+        .expect("prepared config commit");
+
+        assert_eq!(*events.lock().expect("result events lock"), ["persist", "publish"]);
+    }
+
+    #[tokio::test]
+    async fn prepared_config_commit_does_not_publish_after_persist_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let persist_events = events.clone();
+        let publish_events = events.clone();
+
+        let err = commit_prepared_config(
+            ServerConfig::new(),
+            PreparedRuntimeConfig::default(),
+            async move {
+                persist_events.lock().expect("persist events lock").push("persist");
+                Err(s3_error!(InternalError, "injected persistence failure"))
+            },
+            move |_, _| {
+                publish_events.lock().expect("publish events lock").push("publish");
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("persistence failure must propagate");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(*events.lock().expect("result events lock"), ["persist"]);
+    }
+
+    #[test]
+    fn storage_config_write_handlers_persist_before_publishing() {
+        const SOURCE: &str = include_str!("config_admin.rs");
+
+        for (handler, next_handler, follow_up) in [
+            (
+                "SetConfigKVHandler",
+                "DelConfigKVHandler",
+                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
+            ),
+            (
+                "DelConfigKVHandler",
+                "HelpConfigKVHandler",
+                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
+            ),
+            (
+                "RestoreConfigHistoryKVHandler",
+                "GetConfigHandler",
+                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
+            ),
+            (
+                "SetConfigHandler",
+                "#[cfg(test)]",
+                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
+            ),
+        ] {
+            let start_marker = format!("impl Operation for {handler}");
+            let start = SOURCE
+                .find(&start_marker)
+                .unwrap_or_else(|| panic!("missing {handler} implementation"));
+            let tail = &SOURCE[start..];
+            let end = tail
+                .find(next_handler)
+                .unwrap_or_else(|| panic!("missing {next_handler} after {handler}"));
+            let implementation = &tail[..end];
+            let prepared_commit_path = if matches!(handler, "SetConfigKVHandler" | "DelConfigKVHandler") {
+                let branch_start = implementation
+                    .find("if sub_system == Some(STORAGE_CLASS_SUB_SYS)")
+                    .unwrap_or_else(|| panic!("missing storage-class branch in {handler}"));
+                let branch = &implementation[branch_start..];
+                let branch_end = branch
+                    .find("} else {")
+                    .unwrap_or_else(|| panic!("missing non-storage branch in {handler}"));
+                &branch[..branch_end]
+            } else {
+                implementation
+            };
+
+            assert_eq!(prepared_commit_path.matches("commit_prepared_config(").count(), 1, "{handler}");
+            let commit_start = prepared_commit_path.find("commit_prepared_config(").expect("commit call");
+            let commit_end = prepared_commit_path[commit_start..].find(';').expect("commit terminator") + commit_start;
+            let commit_statement = &prepared_commit_path[commit_start..=commit_end];
+            assert!(commit_statement.contains(".await?;"), "{handler} must propagate commit failure");
+
+            let follow_up_start = prepared_commit_path
+                .find(follow_up)
+                .unwrap_or_else(|| panic!("missing follow-up in {handler}"));
+            assert!(follow_up_start > commit_end, "{handler} must run follow-up only after commit");
+            assert!(
+                !prepared_commit_path.contains("publish_server_config("),
+                "{handler} must not publish directly"
+            );
+            assert!(
+                !prepared_commit_path.contains(".publish_storage_class("),
+                "{handler} must not publish directly"
+            );
+
+            if matches!(handler, "RestoreConfigHistoryKVHandler" | "SetConfigHandler") {
+                let worker_start = prepared_commit_path
+                    .find("apply_dynamic_subsystems(&config).await")
+                    .unwrap_or_else(|| panic!("missing local worker apply in {handler}"));
+                let signal_start = prepared_commit_path
+                    .find("signal_config_snapshot_reload().await")
+                    .unwrap_or_else(|| panic!("missing snapshot signal in {handler}"));
+                assert!(
+                    worker_start > follow_up_start,
+                    "{handler} must converge peer parity before local worker apply"
+                );
+                assert!(
+                    signal_start > worker_start,
+                    "{handler} must signal the full snapshot after local worker apply"
+                );
+            }
+        }
+    }
 
     #[test]
     fn tokenize_config_line_handles_quotes_and_escapes() {

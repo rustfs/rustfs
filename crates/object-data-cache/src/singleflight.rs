@@ -33,7 +33,7 @@ fn lock_fills(fills: &FillSet) -> std::sync::MutexGuard<'_, HashSet<ObjectDataCa
 /// reports [`Busy`](ObjectDataCacheSingleflightAcquire::Busy) to everyone else.
 #[derive(Debug)]
 pub struct ObjectDataCacheSingleflight {
-    fills: FillSet,
+    fills: Arc<FillSet>,
     stats: Arc<ObjectDataCacheStats>,
 }
 
@@ -41,7 +41,7 @@ impl ObjectDataCacheSingleflight {
     /// Creates a new singleflight controller.
     pub fn new(stats: Arc<ObjectDataCacheStats>) -> Self {
         Self {
-            fills: Mutex::new(HashSet::new()),
+            fills: Arc::new(Mutex::new(HashSet::new())),
             stats,
         }
     }
@@ -53,7 +53,7 @@ impl ObjectDataCacheSingleflight {
     /// [`Busy`](ObjectDataCacheSingleflightAcquire::Busy). The caller already
     /// owns the body, so a `Busy` outcome skips the redundant fill rather than
     /// waiting for another request's leader to finish.
-    pub fn try_acquire(&self, key: ObjectDataCacheKey) -> ObjectDataCacheSingleflightAcquire<'_> {
+    pub fn try_acquire(&self, key: ObjectDataCacheKey) -> ObjectDataCacheSingleflightAcquire<'static> {
         // Keep the critical section to the map mutation only; emit metrics after
         // dropping the guard so the recorder round-trip never serializes fills.
         let inflight_len = {
@@ -75,9 +75,10 @@ impl ObjectDataCacheSingleflight {
                 set_inflight_fills(&self.stats, "moka", len);
                 ObjectDataCacheSingleflightAcquire::Leader(ObjectDataCacheSingleflightLeader {
                     key,
-                    fills: &self.fills,
+                    fills: Arc::clone(&self.fills),
                     stats: Arc::clone(&self.stats),
                     finished: false,
+                    lifetime: std::marker::PhantomData,
                 })
             }
         }
@@ -104,12 +105,13 @@ pub enum ObjectDataCacheSingleflightAcquire<'a> {
 /// Leader handle for a singleflight fill operation.
 pub struct ObjectDataCacheSingleflightLeader<'a> {
     key: ObjectDataCacheKey,
-    fills: &'a FillSet,
+    fills: Arc<FillSet>,
     stats: Arc<ObjectDataCacheStats>,
     finished: bool,
+    lifetime: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> ObjectDataCacheSingleflightLeader<'a> {
+impl ObjectDataCacheSingleflightLeader<'_> {
     /// Completes the leader operation and releases the key.
     pub fn finish(mut self, result: ObjectDataCacheFillResult) -> ObjectDataCacheFillResult {
         self.remove_entry();
@@ -121,7 +123,7 @@ impl<'a> ObjectDataCacheSingleflightLeader<'a> {
         // Capture the length under the guard, then emit the gauge after dropping
         // it so the recorder round-trip stays out of the critical section.
         let len = {
-            let mut fills = lock_fills(self.fills);
+            let mut fills = lock_fills(&self.fills);
             fills.remove(&self.key);
             fills.len()
         };
@@ -129,7 +131,7 @@ impl<'a> ObjectDataCacheSingleflightLeader<'a> {
     }
 }
 
-impl<'a> Drop for ObjectDataCacheSingleflightLeader<'a> {
+impl Drop for ObjectDataCacheSingleflightLeader<'_> {
     fn drop(&mut self) {
         // A leader dropped without finish() was cancelled mid-fill (e.g. the
         // fill task was aborted). Release the key so a later fill can become the

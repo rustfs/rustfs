@@ -97,7 +97,7 @@ use crate::storage_api_contracts::{
 use crate::store::utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
-        LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
+        LifecycleOps, gen_transition_objname, get_transitioned_object_reader_with_tier_manager, put_restore_opts,
     },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
     config::storageclass,
@@ -160,7 +160,7 @@ use rustfs_utils::{
 };
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
 use sha2::{Digest, Sha256};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -223,6 +223,14 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
 const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
+
+/// Validate disk metadata at a boundary that may legitimately return a delete
+/// marker. Disk/RPC decode boundaries perform the full collection validation
+/// once; repeated quorum passes use the cheap erasure-geometry predicate for
+/// payload entries and the canonical marker predicate for pure delete markers.
+pub(in crate::set_disk) fn file_info_is_valid_for_metadata(file_info: &FileInfo) -> bool {
+    file_info.has_valid_metadata_shape()
+}
 
 struct ObjectLockDiagGuard {
     guard: NamespaceLockGuard,
@@ -547,6 +555,7 @@ const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
 const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
 const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES";
+const GET_OBJECT_METADATA_CACHE_FENCE_SHARDS: u16 = 4096;
 
 // --- Codec Streaming Configuration ---
 
@@ -623,11 +632,285 @@ mod core;
 mod ctx;
 mod metadata;
 mod ops;
+pub(crate) use ops::object::body_cache_plaintext_len;
 mod read;
 mod replication;
 pub(crate) mod shard_source;
+#[cfg(all(test, feature = "test-util"))]
+mod transition_matrix_tests;
 
 pub use ops::heal_walk::HealWalkVersion;
+
+pub(crate) struct PreparedGetObjectMetadata {
+    fi: FileInfo,
+    files: Vec<FileInfo>,
+    disks: Vec<Option<DiskStore>>,
+    object_info: Option<ObjectInfo>,
+}
+
+impl PreparedGetObjectMetadata {
+    pub(crate) fn object_info(&self) -> &ObjectInfo {
+        self.object_info
+            .as_ref()
+            .expect("prepared GET metadata must retain its ObjectInfo until consumed")
+    }
+
+    pub(crate) fn take_object_info(&mut self) -> ObjectInfo {
+        self.object_info
+            .take()
+            .expect("prepared GET metadata ObjectInfo must be consumed exactly once")
+    }
+}
+
+tokio::task_local! {
+    static PREPARED_GET_OBJECT_METADATA: std::cell::RefCell<Option<PreparedGetObjectMetadata>>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static GET_OBJECT_INFO_CONVERSIONS: Arc<AtomicU64>;
+}
+
+fn build_get_object_info(fi: &FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+    #[cfg(test)]
+    let _ = GET_OBJECT_INFO_CONVERSIONS.try_with(|conversions| {
+        conversions.fetch_add(1, Ordering::Relaxed);
+    });
+    ObjectInfo::from_file_info(fi, bucket, object, versioned)
+}
+
+fn take_prepared_get_object_metadata() -> Option<PreparedGetObjectMetadata> {
+    PREPARED_GET_OBJECT_METADATA
+        .try_with(|prepared| prepared.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+async fn with_prepared_get_object_metadata<F>(metadata: PreparedGetObjectMetadata, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PREPARED_GET_OBJECT_METADATA
+        .scope(std::cell::RefCell::new(Some(metadata)), future)
+        .await
+}
+
+#[cfg(test)]
+mod prepared_get_object_metadata_tests {
+    use super::*;
+    use crate::ecstore_validation_blackbox::make_local_set_disks;
+    use crate::object_api::{BLOCK_SIZE_V2, PutObjReader};
+    use crate::set_disk::core::io_primitives::disk_call_counters;
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use http::HeaderMap;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn prepared_metadata_is_consumed_exactly_once() {
+        let metadata = PreparedGetObjectMetadata {
+            fi: FileInfo::default(),
+            files: Vec::new(),
+            disks: Vec::new(),
+            object_info: None,
+        };
+
+        with_prepared_get_object_metadata(metadata, async {
+            assert!(take_prepared_get_object_metadata().is_some());
+            assert!(take_prepared_get_object_metadata().is_none());
+        })
+        .await;
+        assert!(take_prepared_get_object_metadata().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_reuses_metadata_fanout_exactly_once() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "prepared-metadata-fanout";
+        let object = "prepared-metadata-fanout-object.bin";
+        let payload = b"prepared-metadata-fanout-payload-".repeat(40_000);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let calls = disk_call_counters::observe(object);
+        let conversions = Arc::new(AtomicU64::new(0));
+        let restored = GET_OBJECT_INFO_CONVERSIONS
+            .scope(Arc::clone(&conversions), async {
+                let metadata = set_disks
+                    .prepare_get_object_metadata(bucket, object, &opts)
+                    .await
+                    .expect("prepared metadata should resolve");
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    4,
+                    "preparation should fan out to each online disk exactly once"
+                );
+
+                let mut reader = set_disks
+                    .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
+                    .await
+                    .expect("prepared body reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("prepared body should stream");
+                restored
+            })
+            .await;
+
+        assert_eq!(restored, payload);
+        assert_eq!(
+            conversions.load(Ordering::Relaxed),
+            1,
+            "prepared reader must consume the ObjectInfo built during metadata preparation"
+        );
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            4,
+            "reader construction must consume prepared metadata instead of repeating the fanout"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_rebuilds_object_info_when_precomputed_value_is_absent() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "prepared-object-info-fallback";
+        let object = "prepared-object-info-fallback.bin";
+        let payload = b"prepared-object-info-fallback-payload".repeat(4_000);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let conversions = Arc::new(AtomicU64::new(0));
+        let restored = GET_OBJECT_INFO_CONVERSIONS
+            .scope(Arc::clone(&conversions), async {
+                let mut metadata = set_disks
+                    .prepare_get_object_metadata(bucket, object, &opts)
+                    .await
+                    .expect("prepared metadata should resolve");
+                metadata.object_info = None;
+                let mut reader = set_disks
+                    .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
+                    .await
+                    .expect("reader should rebuild missing prepared ObjectInfo");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("fallback reader should stream");
+                restored
+            })
+            .await;
+
+        assert_eq!(restored, payload);
+        assert_eq!(
+            conversions.load(Ordering::Relaxed),
+            2,
+            "missing precomputed ObjectInfo must trigger exactly one structural fallback rebuild"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_restores_full_body_with_one_offline_shard() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "prepared-reader-offline-shard";
+        let object = "prepared-reader-offline-shard-object.bin";
+        let payload = (0..(BLOCK_SIZE_V2 + 321))
+            .map(|idx| ((idx * 19) % 251) as u8)
+            .collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+        set_disks.disks.write().await[0] = None;
+
+        let metadata = set_disks
+            .prepare_get_object_metadata(bucket, object, &opts)
+            .await
+            .expect("prepared metadata should tolerate one offline shard");
+        let mut reader = set_disks
+            .get_object_reader_with_prepared_metadata(bucket, object, None, HeaderMap::new(), &opts, metadata)
+            .await
+            .expect("prepared body reader should open with one offline shard");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("degraded prepared body should stream");
+
+        assert_eq!(restored, payload);
+    }
+}
+
+impl SetDisks {
+    pub(crate) async fn prepare_get_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<PreparedGetObjectMetadata> {
+        let (fi, files, disks) = self.get_object_fileinfo(bucket, object, opts, true, true).await?;
+        let object_info = build_get_object_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        Ok(PreparedGetObjectMetadata {
+            fi,
+            files,
+            disks,
+            object_info: Some(object_info),
+        })
+    }
+
+    pub(crate) async fn get_object_reader_with_prepared_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        headers: HeaderMap,
+        opts: &ObjectOptions,
+        metadata: PreparedGetObjectMetadata,
+    ) -> Result<GetObjectReader> {
+        with_prepared_get_object_metadata(metadata, self.get_object_reader(bucket, object, range, headers, opts)).await
+    }
+}
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
@@ -1696,25 +1979,209 @@ fn issue3031_diag_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }
 
-fn build_tiered_decommission_file_info(
-    bucket: &str,
-    object: &str,
-    fi: &FileInfo,
-    disk_count: usize,
-    default_parity_count: usize,
-    storage_class: Option<&str>,
-) -> (FileInfo, usize) {
-    let parity_drives = runtime_sources::storage_class_parity(storage_class).unwrap_or(default_parity_count);
-    let data_drives = disk_count - parity_drives;
-    let mut write_quorum = data_drives;
-    if data_drives == parity_drives {
-        write_quorum += 1;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WriteLayout {
+    data_drives: usize,
+    parity_drives: usize,
+    write_quorum: usize,
+}
+
+impl WriteLayout {
+    fn from_parity(drive_count: usize, parity_drives: usize) -> Result<Self> {
+        let max_parity = drive_count / 2;
+        if parity_drives > max_parity {
+            return Err(Error::other(format!(
+                "write parity {parity_drives} exceeds the maximum {max_parity} for {drive_count} drives"
+            )));
+        }
+
+        let data_drives = drive_count
+            .checked_sub(parity_drives)
+            .filter(|&data_drives| data_drives > 0 && parity_drives <= data_drives)
+            .ok_or_else(|| Error::other(format!("invalid write layout with {drive_count} drives and parity {parity_drives}")))?;
+        let write_quorum = data_drives
+            .checked_add(usize::from(data_drives == parity_drives))
+            .filter(|&write_quorum| write_quorum <= drive_count)
+            .ok_or_else(|| Error::other(format!("invalid write quorum for {drive_count} drives and parity {parity_drives}")))?;
+
+        Ok(Self {
+            data_drives,
+            parity_drives,
+            write_quorum,
+        })
     }
+}
+
+pub(super) fn resolve_write_layout(
+    config: &storageclass::Config,
+    pool_index: usize,
+    drive_count: usize,
+    fallback_parity: usize,
+    storage_class: Option<&str>,
+    max_parity: bool,
+) -> Result<WriteLayout> {
+    let configured_parity = if config.is_initialized() {
+        config
+            .parity_for_pool(storage_class.unwrap_or_default(), pool_index, drive_count)
+            .ok_or_else(|| {
+                Error::other(format!("storage class layout does not match pool {pool_index} with {drive_count} drives"))
+            })?
+    } else {
+        fallback_parity
+    };
+    let parity_drives = if max_parity { drive_count / 2 } else { configured_parity };
+
+    WriteLayout::from_parity(drive_count, parity_drives)
+}
+
+#[cfg(test)]
+mod write_layout_tests {
+    use super::{WriteLayout, resolve_write_layout};
+    use crate::config::storageclass::{
+        CLASS_RRS, CLASS_STANDARD, INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS, RRS_ENV, STANDARD_ENV, lookup_config_for_pools,
+        lookup_config_for_pools_without_env,
+    };
+    use arc_swap::ArcSwap;
+    use rustfs_config::server_config::KVS;
+    use std::sync::Arc;
+
+    #[test]
+    fn automatic_standard_layout_is_resolved_per_pool() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2])
+            .expect("automatic storage class should resolve for both pools");
+
+        assert_eq!(
+            resolve_write_layout(&config, 0, 4, 2, None, false).expect("first pool should resolve"),
+            WriteLayout {
+                data_drives: 2,
+                parity_drives: 2,
+                write_quorum: 3,
+            }
+        );
+        assert_eq!(
+            resolve_write_layout(&config, 1, 2, 1, None, false).expect("second pool should resolve"),
+            WriteLayout {
+                data_drives: 1,
+                parity_drives: 1,
+                write_quorum: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn reduced_redundancy_layout_allows_single_disk_zero_parity() {
+        let config =
+            lookup_config_for_pools_without_env(&KVS::new(), &[4, 1]).expect("reduced redundancy should resolve for both pools");
+
+        assert_eq!(
+            resolve_write_layout(&config, 0, 4, 2, Some(RRS), false).expect("four-drive RRS pool should resolve"),
+            WriteLayout {
+                data_drives: 3,
+                parity_drives: 1,
+                write_quorum: 3,
+            }
+        );
+        assert_eq!(
+            resolve_write_layout(&config, 1, 1, 0, Some(RRS), false).expect("single-drive RRS pool should resolve"),
+            WriteLayout {
+                data_drives: 1,
+                parity_drives: 0,
+                write_quorum: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn write_layout_rejects_unknown_topology_and_invalid_parity() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("test storage class should resolve");
+
+        assert!(resolve_write_layout(&config, 2, 2, 1, None, false).is_err());
+        assert!(resolve_write_layout(&config, 1, 4, 2, None, false).is_err());
+        assert!(WriteLayout::from_parity(4, 3).is_err());
+        assert!(WriteLayout::from_parity(0, 0).is_err());
+
+        let mut zero_parity_kvs = KVS::new();
+        zero_parity_kvs.insert(CLASS_STANDARD.to_string(), "EC:0".to_string());
+        zero_parity_kvs.insert(CLASS_RRS.to_string(), "EC:0".to_string());
+        let zero_parity = lookup_config_for_pools_without_env(&zero_parity_kvs, &[4]).expect("zero-parity config should resolve");
+        assert_eq!(
+            resolve_write_layout(&zero_parity, 0, 4, 2, None, true).expect("max parity should override configured parity"),
+            WriteLayout {
+                data_drives: 2,
+                parity_drives: 2,
+                write_quorum: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn only_uninitialized_config_falls_back_to_pool_startup_parity() {
+        let uninitialized = crate::config::storageclass::Config::default();
+        assert_eq!(
+            resolve_write_layout(&uninitialized, 99, 2, 0, None, false)
+                .expect("uninitialized config should preserve the pool's startup fallback"),
+            WriteLayout {
+                data_drives: 2,
+                parity_drives: 0,
+                write_quorum: 2,
+            }
+        );
+
+        let initialized = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("initialized config should resolve");
+        assert!(resolve_write_layout(&initialized, 99, 2, 1, None, false).is_err());
+        assert!(resolve_write_layout(&initialized, 1, 4, 2, None, false).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn held_snapshot_keeps_parity_and_inline_policy_consistent_across_reload() {
+        let old = temp_env::with_vars(
+            [
+                (STANDARD_ENV, Some("")),
+                (RRS_ENV, Some("")),
+                (OPTIMIZE_ENV, None),
+                (INLINE_BLOCK_ENV, Some("1KiB")),
+            ],
+            || lookup_config_for_pools(&KVS::new(), &[4, 2]),
+        )
+        .expect("old config should resolve");
+        let new = temp_env::with_vars(
+            [
+                (STANDARD_ENV, Some("EC:1")),
+                (RRS_ENV, Some("EC:1")),
+                (OPTIMIZE_ENV, None),
+                (INLINE_BLOCK_ENV, Some("0B")),
+            ],
+            || lookup_config_for_pools(&KVS::new(), &[4, 2]),
+        )
+        .expect("new config should resolve");
+
+        let published = ArcSwap::from_pointee(old);
+        let held = published.load_full();
+        published.store(Arc::new(new));
+
+        let held_layout = resolve_write_layout(&held, 0, 4, 2, None, false).expect("held snapshot should remain valid");
+        assert_eq!(held_layout.parity_drives, 2);
+        assert!(held.should_inline(512, false));
+
+        let current = published.load_full();
+        let current_layout = resolve_write_layout(&current, 0, 4, 2, None, false).expect("new snapshot should resolve");
+        assert_eq!(current_layout.parity_drives, 1);
+        assert!(!current.should_inline(512, false));
+    }
+}
+
+fn build_tiered_decommission_file_info(bucket: &str, object: &str, fi: &FileInfo, layout: WriteLayout) -> FileInfo {
+    let WriteLayout {
+        data_drives,
+        parity_drives,
+        ..
+    } = layout;
 
     let mut updated = fi.clone();
     updated.erasure = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives).erasure;
 
-    (updated, write_quorum)
+    updated
 }
 
 fn resolve_tiered_decommission_write_quorum_result(
@@ -1742,6 +2209,8 @@ pub struct SetDisks {
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
+    get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState,
+    get_object_metadata_cache_generations: Arc<[AtomicU64]>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
     /// Per-instance runtime context (Phase 5, backlog#939).
@@ -1759,20 +2228,110 @@ pub struct SetDisks {
     /// writes skip the global registry mutex (backlog#1315). `Arc` so clones of
     /// a set share one generation marker.
     capacity_dirty_generation: Arc<AtomicU64>,
+    #[cfg(test)]
+    storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GetObjectMetadataCacheKey {
+    bucket: Arc<str>,
+    object: Arc<str>,
+    generation: u64,
+    hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GetObjectMetadataCacheGeneration {
+    index: usize,
+    value: u64,
+    hash: u64,
+}
+
+#[cfg(test)]
+struct MetadataCacheInvalidationProbeState {
     bucket: String,
     object: String,
+    count: AtomicU64,
+}
+
+#[cfg(test)]
+struct MetadataCacheInvalidationProbe {
+    state: Arc<MetadataCacheInvalidationProbeState>,
+}
+
+#[cfg(test)]
+static METADATA_CACHE_INVALIDATION_PROBE: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<MetadataCacheInvalidationProbeState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl MetadataCacheInvalidationProbe {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(MetadataCacheInvalidationProbeState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            count: AtomicU64::new(0),
+        });
+        let mut slot = METADATA_CACHE_INVALIDATION_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("metadata cache invalidation probe mutex should not poison");
+        assert!(
+            slot.is_none(),
+            "metadata cache invalidation probe must be installed by one test at a time"
+        );
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    fn count(&self) -> u64 {
+        self.state.count.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCacheInvalidationProbe {
+    fn drop(&mut self) {
+        let mut slot = METADATA_CACHE_INVALIDATION_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("metadata cache invalidation probe mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_metadata_cache_invalidation(bucket: &str, object: &str) {
+    let probe = METADATA_CACHE_INVALIDATION_PROBE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("metadata cache invalidation probe mutex should not poison")
+        .as_ref()
+        .filter(|probe| probe.bucket == bucket && probe.object == object)
+        .cloned();
+    if let Some(probe) = probe {
+        probe.count.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl GetObjectMetadataCacheKey {
-    fn new(bucket: &str, object: &str) -> Self {
+    fn new(bucket: &str, object: &str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
+            bucket: Arc::from(bucket),
+            object: Arc::from(object),
+            generation: generation.value,
+            hash: generation.hash,
         }
+    }
+}
+
+impl Hash for GetObjectMetadataCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+        self.generation.hash(state);
     }
 }
 
@@ -1803,10 +2362,72 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    fn storage_class_config_snapshot(&self) -> Arc<storageclass::Config> {
+        #[cfg(test)]
+        if let Some(config) = self
+            .storage_class_config_override
+            .read()
+            .expect("test storage class override lock should not be poisoned")
+            .as_ref()
+        {
+            return config.clone();
+        }
+
+        runtime_sources::storage_class_config_snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_storage_class_config(&self, config: storageclass::Config) {
+        *self
+            .storage_class_config_override
+            .write()
+            .expect("test storage class override lock should not be poisoned") = Some(Arc::new(config));
+    }
+
+    fn get_object_metadata_cache_hash(&self, bucket: &str, object: &str) -> u64 {
+        let mut hasher = self.get_object_metadata_cache_hash_builder.build_hasher();
+        bucket.hash(&mut hasher);
+        object.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn get_object_metadata_cache_generation(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheGeneration> {
+        let hash = self.get_object_metadata_cache_hash(bucket, object);
+        let hash_bytes = hash.to_le_bytes();
+        let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
+        let value = self.get_object_metadata_cache_generations[index].load(Ordering::Acquire);
+        (value != u64::MAX).then_some(GetObjectMetadataCacheGeneration { index, value, hash })
+    }
+
+    fn is_get_object_metadata_cache_generation_current(&self, generation: GetObjectMetadataCacheGeneration) -> bool {
+        self.get_object_metadata_cache_generations[generation.index].load(Ordering::Acquire) == generation.value
+    }
+
     async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
+        let hash = self.get_object_metadata_cache_hash(bucket, object);
+        let hash_bytes = hash.to_le_bytes();
+        let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
+        let generation = &self.get_object_metadata_cache_generations[index];
+        let previous = match generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1)) {
+            Ok(previous) | Err(previous) => previous,
+        };
+        let previous = GetObjectMetadataCacheGeneration {
+            index,
+            value: previous,
+            hash,
+        };
         self.get_object_metadata_cache
-            .invalidate(&GetObjectMetadataCacheKey::new(bucket, object))
+            .invalidate(&GetObjectMetadataCacheKey::new(bucket, object, previous))
             .await;
+        #[cfg(test)]
+        record_metadata_cache_invalidation(bucket, object);
+    }
+
+    fn invalidate_all_get_object_metadata_cache(&self) {
+        for generation in self.get_object_metadata_cache_generations.iter() {
+            let _ = generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1));
+        }
+        self.get_object_metadata_cache.invalidate_all();
     }
 
     async fn acquire_read_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
@@ -1953,6 +2574,12 @@ impl SetDisks {
                 .max_capacity(get_object_metadata_cache_max_entries() as u64)
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
                 .build(),
+            get_object_metadata_cache_hash_builder: std::collections::hash_map::RandomState::new(),
+            get_object_metadata_cache_generations: Arc::from(
+                (0..usize::from(GET_OBJECT_METADATA_CACHE_FENCE_SHARDS))
+                    .map(|_| AtomicU64::new(0))
+                    .collect::<Vec<_>>(),
+            ),
             lockers,
             // Sourced from the instance context so each instance owns its lock
             // namespace (Phase 5 Slice 3). Single-instance: ctx aliases the
@@ -1961,6 +2588,8 @@ impl SetDisks {
             ctx,
             capacity_scope_cache: Arc::new(std::sync::RwLock::new(CapacityScopeCache::default())),
             capacity_dirty_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            #[cfg(test)]
+            storage_class_config_override: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -2477,7 +3106,7 @@ fn collect_inline_data_shard_fileinfos_by_index<'a>(
         if block_index == 0 || block_index > data_shards {
             continue;
         }
-        if !file_info.is_valid() {
+        if !file_info.has_valid_erasure_geometry() {
             continue;
         }
         if file_info.data.as_ref().is_none_or(|data| data.is_empty()) {
@@ -2911,6 +3540,7 @@ impl SetDisks {
         fi: &FileInfo,
         opts: &ObjectOptions,
     ) -> Result<()> {
+        let storage_class_config = self.storage_class_config_snapshot();
         let _lock_guard = if !opts.no_lock {
             Some(
                 self.new_ns_lock(bucket, object)
@@ -2925,8 +3555,16 @@ impl SetDisks {
 
         let disks = self.disks.read().await.clone();
         let storage_class = opts.user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str);
-        let (fi, write_quorum) =
-            build_tiered_decommission_file_info(bucket, object, fi, disks.len(), self.default_parity_count, storage_class);
+        let layout = resolve_write_layout(
+            &storage_class_config,
+            self.pool_index,
+            disks.len(),
+            self.default_parity_count,
+            storage_class,
+            opts.max_parity,
+        )?;
+        let fi = build_tiered_decommission_file_info(bucket, object, fi, layout);
+        let write_quorum = layout.write_quorum;
         let parts_metadata = vec![fi.clone(); disks.len()];
         let (shuffle_disks, parts_metadata) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
@@ -2996,13 +3634,13 @@ fn is_object_dangling(
     let mut valid_meta = FileInfo::default();
 
     for fi in meta_arr.iter() {
-        if fi.is_valid() {
+        if file_info_is_valid_for_metadata(fi) {
             valid_meta = fi.clone();
             break;
         }
     }
 
-    if !valid_meta.is_valid() {
+    if !file_info_is_valid_for_metadata(&valid_meta) {
         let data_blocks = meta_arr.len().div_ceil(2);
         if not_found_parts_errs > data_blocks {
             return (valid_meta, true);
@@ -3015,7 +3653,7 @@ fn is_object_dangling(
         return (valid_meta, false);
     }
 
-    if valid_meta.deleted {
+    if valid_meta.is_canonical_delete_marker() {
         let data_blocks = errs.len().div_ceil(2);
         return (valid_meta, not_found_meta_errs > data_blocks);
     }
@@ -3128,12 +3766,12 @@ async fn disks_with_all_parts(
     // Check for inconsistent erasure distribution
     let mut inconsistent = 0;
     for (index, meta) in parts_metadata.iter().enumerate() {
-        if !meta.is_valid() {
+        if !file_info_is_valid_for_metadata(meta) {
             // Since for majority of the cases erasure.Index matches with erasure.Distribution we can
             // consider the offline disks as consistent.
             continue;
         }
-        if !meta.deleted {
+        if !meta.is_canonical_delete_marker() {
             if meta.erasure.distribution.len() != online_disks.len() {
                 // Erasure distribution seems to have lesser
                 // number of items than number of online disks.
@@ -3193,7 +3831,7 @@ async fn disks_with_all_parts(
         }
 
         if erasure_distribution_reliable {
-            if !meta.is_valid() {
+            if !file_info_is_valid_for_metadata(meta) {
                 info!(
                     "disks_with_all_partsv2: metadata is not valid, object_name={}, index: {index}",
                     object_name
@@ -3204,7 +3842,7 @@ async fn disks_with_all_parts(
                 continue;
             }
 
-            if !meta.deleted && meta.erasure.distribution.len() != online_disks_len {
+            if !meta.is_canonical_delete_marker() && meta.erasure.distribution.len() != online_disks_len {
                 // Erasure distribution is not the same as onlineDisks
                 // attempt a fix if possible, assuming other entries
                 // might have the right erasure distribution.
@@ -3247,7 +3885,7 @@ async fn disks_with_all_parts(
         };
 
         let meta = &mut parts_metadata[index];
-        if meta.deleted || meta.is_remote() {
+        if meta.is_canonical_delete_marker() || meta.is_remote() {
             continue;
         }
 
@@ -3377,7 +4015,7 @@ pub fn should_heal_object_on_disk(
         return (true, true, Some(DiskError::OutdatedXLMeta));
     }
 
-    if !meta.deleted && !meta.is_remote() {
+    if !meta.is_canonical_delete_marker() && !meta.is_remote() {
         let err_vec = [CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT];
         for part_err in parts_errs.iter() {
             if err_vec.contains(part_err) {
@@ -5945,6 +6583,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 4,
                 parity_blocks: 2,
+                block_size: 4,
                 index: 1,                             // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6], // Must match data_blocks + parity_blocks
                 ..Default::default()
@@ -5957,6 +6596,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 6,
                 parity_blocks: 3,
+                block_size: 4,
                 index: 1,                                      // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], // Must match data_blocks + parity_blocks
                 ..Default::default()
@@ -5969,6 +6609,7 @@ mod tests {
             erasure: ErasureInfo {
                 data_blocks: 2,
                 parity_blocks: 1,
+                block_size: 4,
                 index: 1,                    // Must be > 0 for is_valid() to return true
                 distribution: vec![1, 2, 3], // Must match data_blocks + parity_blocks
                 ..Default::default()
@@ -5986,6 +6627,102 @@ mod tests {
         assert_eq!(parities[0], 2); // parity_blocks from first file
         assert_eq!(parities[1], 3); // parity_blocks from second file
         assert_eq!(parities[2], 1); // half of total shards (3/2 = 1) for zero size file
+    }
+
+    #[test]
+    fn delete_markers_participate_in_four_disk_metadata_quorum_without_erasure_geometry() {
+        let marker = FileInfo {
+            name: "bucket/deleted".to_string(),
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let parts_metadata = vec![marker; 4];
+        let errs = vec![None; 4];
+
+        assert!(parts_metadata.iter().all(file_info_is_valid_for_metadata));
+        assert!(parts_metadata.iter().all(|metadata| !metadata.is_valid()));
+        assert_eq!(SetDisks::list_object_parities(&parts_metadata, &errs), vec![2; 4]);
+        assert_eq!(
+            SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
+                .expect("four matching delete markers must reach metadata quorum"),
+            (2, 3)
+        );
+    }
+
+    #[test]
+    fn metadata_boundary_does_not_relax_non_delete_or_malformed_delete_metadata() {
+        assert!(!file_info_is_valid_for_metadata(&FileInfo::default()));
+
+        let mut transitioned = FileInfo::new("bucket/transitioned", 2, 2);
+        transitioned.erasure.index = 1;
+        transitioned.transition_status = TRANSITION_COMPLETE.to_string();
+        assert!(file_info_is_valid_for_metadata(&transitioned));
+
+        transitioned.erasure = ErasureInfo::default();
+        assert!(
+            !file_info_is_valid_for_metadata(&transitioned),
+            "transition state must not relax local erasure validation"
+        );
+
+        let mut purge_pending = FileInfo::new("bucket/purge-pending", 2, 2);
+        purge_pending.erasure.index = 1;
+        purge_pending.deleted = true;
+        purge_pending.parts.push(ObjectPartInfo {
+            number: 1,
+            ..Default::default()
+        });
+        assert!(
+            file_info_is_valid_for_metadata(&purge_pending),
+            "purge-pending payload metadata must retain its valid erasure vote"
+        );
+        assert!(!purge_pending.is_canonical_delete_marker());
+
+        let mut malformed_marker = FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+        malformed_marker.parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            },
+        ];
+        assert!(!file_info_is_valid_for_metadata(&malformed_marker));
+    }
+
+    #[test]
+    fn purge_pending_payload_uses_its_erasure_parity_for_metadata_quorum() {
+        let version_id = Uuid::new_v4();
+        let mod_time = OffsetDateTime::now_utc();
+        let parts_metadata = (1..=6)
+            .map(|disk_index| {
+                let mut purge_pending = FileInfo::new("bucket/purge-pending", 5, 1);
+                purge_pending.name = "bucket/purge-pending".to_string();
+                purge_pending.version_id = Some(version_id);
+                purge_pending.mod_time = Some(mod_time);
+                purge_pending.size = 1;
+                purge_pending.deleted = true;
+                purge_pending.erasure.index = disk_index;
+                purge_pending.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
+                purge_pending
+            })
+            .collect::<Vec<_>>();
+        let errs = vec![None; 6];
+
+        assert!(parts_metadata.iter().all(file_info_is_valid_for_metadata));
+        assert!(parts_metadata.iter().all(|metadata| !metadata.is_canonical_delete_marker()));
+        assert_eq!(SetDisks::list_object_parities(&parts_metadata, &errs), vec![1; 6]);
+        assert_eq!(
+            SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 3)
+                .expect("purge-pending payload should retain its EC:1 quorum"),
+            (5, 5)
+        );
     }
 
     #[test]
@@ -6730,7 +7467,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (updated, write_quorum) = build_tiered_decommission_file_info("bucket", "object", &original, 16, 4, None);
+        let layout = WriteLayout::from_parity(16, 4).expect("tiered write layout should be valid");
+        let updated = build_tiered_decommission_file_info("bucket", "object", &original, layout);
 
         assert_eq!(updated.version_id, original.version_id);
         assert_eq!(updated.transition_status, original.transition_status);
@@ -6739,7 +7477,7 @@ mod tests {
         assert_eq!(updated.transition_version_id, original.transition_version_id);
         assert_eq!(updated.erasure.data_blocks, 12);
         assert_eq!(updated.erasure.parity_blocks, 4);
-        assert_eq!(write_quorum, 12);
+        assert_eq!(layout.write_quorum, 12);
         assert_ne!(updated.erasure.distribution, original.erasure.distribution);
     }
 
@@ -7984,11 +8722,15 @@ mod tests {
     }
 
     async fn make_local_bucket_test_set_disks() -> Arc<SetDisks> {
-        let format = FormatV3::new(1, 2);
+        make_local_bucket_test_set_disks_with_drive_count(2).await
+    }
+
+    async fn make_local_bucket_test_set_disks_with_drive_count(drive_count: usize) -> Arc<SetDisks> {
+        let format = FormatV3::new(1, drive_count);
         let mut endpoints = Vec::new();
         let mut disks = Vec::new();
 
-        for disk_idx in 0..2 {
+        for disk_idx in 0..drive_count {
             let dir = tempfile::tempdir().expect("tempdir should be created");
             let mut endpoint =
                 Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
@@ -8017,18 +8759,23 @@ mod tests {
             disks.push(Some(disk));
         }
 
-        SetDisks::new(
+        let set_disks = SetDisks::new(
             "test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
-            2,
-            1,
+            drive_count,
+            drive_count / 2,
             0,
             0,
             endpoints,
             format,
             Vec::new(),
         )
-        .await
+        .await;
+        set_disks.set_test_storage_class_config(
+            storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[drive_count])
+                .expect("test storage class should resolve for the local drive count"),
+        );
+        set_disks
     }
 
     async fn make_local_bucket_test_set_disks_with_missing_format() -> Arc<SetDisks> {
@@ -8498,7 +9245,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_level_versioned_delete_marker_hides_object_without_corrupting_version_metadata() {
-        let set_disks = make_local_bucket_test_set_disks().await;
+        let set_disks = make_local_bucket_test_set_disks_with_drive_count(4).await;
         let bucket = "bucket-versioned-delete";
         let object = "object.txt";
         let opts = ObjectOptions {

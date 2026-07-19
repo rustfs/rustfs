@@ -137,6 +137,7 @@ pub(crate) const GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED: &str = "not_fou
 pub(crate) const GET_METADATA_CACHE_REASON_NOT_READ_DATA: &str = "not_read_data";
 pub(crate) const GET_METADATA_CACHE_REASON_PART_NUMBER: &str = "part_number";
 pub(crate) const GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ: &str = "raw_data_movement_read";
+pub(crate) const GET_METADATA_CACHE_REASON_STALE_PUBLICATION: &str = "stale_publication";
 pub(crate) const GET_METADATA_CACHE_REASON_USABLE: &str = "usable";
 pub(crate) const GET_METADATA_CACHE_REASON_VERSION_ID: &str = "version_id";
 pub(crate) const GET_METADATA_CACHE_REASON_VERSION_SUSPENDED: &str = "version_suspended";
@@ -386,6 +387,7 @@ mod tests {
         assert_eq!(GET_METADATA_CACHE_REASON_NOT_READ_DATA, "not_read_data");
         assert_eq!(GET_METADATA_CACHE_REASON_PART_NUMBER, "part_number");
         assert_eq!(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, "raw_data_movement_read");
+        assert_eq!(GET_METADATA_CACHE_REASON_STALE_PUBLICATION, "stale_publication");
         assert_eq!(GET_METADATA_CACHE_REASON_USABLE, "usable");
         assert_eq!(GET_METADATA_CACHE_REASON_VERSION_ID, "version_id");
         assert_eq!(GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, "version_suspended");

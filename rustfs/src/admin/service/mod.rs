@@ -13,4 +13,6 @@
 // limitations under the License.
 
 pub mod config;
+pub(crate) mod federated_identity;
+pub(crate) mod session_policy;
 pub mod site_replication;
