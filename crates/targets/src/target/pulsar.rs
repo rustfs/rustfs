@@ -637,7 +637,13 @@ mod tests {
 
     #[test]
     fn init_producer_uses_generated_unique_producer_name_contract() {
-        let source = include_str!("pulsar.rs");
+        fn without_ascii_whitespace(value: &str) -> String {
+            let mut compacted = String::with_capacity(value.len());
+            compacted.extend(value.bytes().filter(|byte| !byte.is_ascii_whitespace()).map(char::from));
+            compacted
+        }
+
+        let source = without_ascii_whitespace(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/target/pulsar.rs")));
         let expected_name_call = [
             ".with_name(",
             "pulsar_producer_name(&self.id, self.args.target_type, Uuid::new_v4())",
@@ -646,7 +652,7 @@ mod tests {
         .concat();
         let forbidden_target_id_call = [".with_name(", "self.id.id.clone()", ")"].concat();
 
-        assert!(source.contains(&expected_name_call));
-        assert!(!source.contains(&forbidden_target_id_call));
+        assert!(source.contains(&without_ascii_whitespace(&expected_name_call)));
+        assert!(!source.contains(&without_ascii_whitespace(&forbidden_target_id_call)));
     }
 }
