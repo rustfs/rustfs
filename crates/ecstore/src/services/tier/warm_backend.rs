@@ -65,7 +65,15 @@ pub struct WarmBackendGetOpts {
 
 #[async_trait::async_trait]
 pub trait WarmBackend {
+    /// Return `Ok` only after the backend has consumed the complete declared
+    /// body and its storage service has acknowledged the PUT. The built-in S3
+    /// family uses the transition client's declared-length request plus
+    /// Content-MD5 for multipart parts, while GCS materializes the body before
+    /// awaiting its buffered write response. Test backends may deliberately
+    /// violate this contract to exercise transition compensation.
     async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error>;
+    /// The same completion contract as [`WarmBackend::put`] applies when
+    /// metadata is attached.
     async fn put_with_meta(
         &self,
         object: &str,

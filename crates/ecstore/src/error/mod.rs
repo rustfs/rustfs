@@ -215,9 +215,15 @@ pub enum StorageError {
     #[error("method not allowed")]
     MethodNotAllowed,
     #[error("Io error: {0}")]
-    Io(std::io::Error),
+    Io(#[source] std::io::Error),
     #[error("Lock error: {0}")]
     Lock(#[from] rustfs_lock::LockError),
+}
+
+impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
+    fn from(error: crate::erasure::coding::ErasureConstructionError) -> Self {
+        Self::Io(error.into_io_error())
+    }
 }
 
 impl StorageError {
@@ -1175,6 +1181,26 @@ pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn other_preserves_erasure_construction_source_chain() {
+        use crate::erasure::coding::ErasureConstructionError;
+        use std::error::Error as _;
+
+        let error = StorageError::from(ErasureConstructionError::ModernEncoder {
+            source: reed_solomon_erasure::Error::TooManyShards,
+        });
+        let io_source = error.source().expect("StorageError::Io must expose its io::Error source");
+        assert!(io_source.is::<std::io::Error>());
+        let construction_source = io_source
+            .source()
+            .expect("io::Error must expose the erasure construction error");
+        assert!(construction_source.is::<ErasureConstructionError>());
+        let encoder_source = construction_source
+            .source()
+            .expect("construction error must expose the encoder error");
+        assert!(encoder_source.is::<reed_solomon_erasure::Error>());
+    }
 
     // Regression for #952 (ECA-11): an all-`DiskNotFound` slice (every drive in
     // every set unreachable) must NOT be classified as "all not found",

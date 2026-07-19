@@ -118,6 +118,8 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "PUT /buckets/{warehouse}",
     "GET /buckets/{warehouse}",
     "GET /{warehouse}/catalog/migration",
+    "POST /{warehouse}/catalog/migration",
+    "DELETE /{warehouse}/catalog/migration",
     "GET /{warehouse}/namespaces",
     "POST /{warehouse}/namespaces",
     "GET /{warehouse}/namespaces/{namespace}",
@@ -165,6 +167,9 @@ static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
 static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {};
 static GET_TABLE_CATALOG_MIGRATION_HANDLER: GetTableCatalogMigrationHandler = GetTableCatalogMigrationHandler {};
+static MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER: MaterializeTableCatalogMigrationHandler =
+    MaterializeTableCatalogMigrationHandler {};
+static CANCEL_TABLE_CATALOG_MIGRATION_HANDLER: CancelTableCatalogMigrationHandler = CancelTableCatalogMigrationHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
 static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
@@ -831,6 +836,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
         AdminOperation(&GET_TABLE_CATALOG_MIGRATION_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
+        AdminOperation(&MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
+        AdminOperation(&CANCEL_TABLE_CATALOG_MIGRATION_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -5012,6 +5027,46 @@ impl Operation for GetTableCatalogMigrationHandler {
     }
 }
 
+pub struct MaterializeTableCatalogMigrationHandler {}
+
+#[async_trait::async_trait]
+impl Operation for MaterializeTableCatalogMigrationHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let store = table_catalog_object_store()?;
+        let started = Instant::now();
+        let result = store
+            .materialize_durable_strong_backing_migration(&warehouse)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("migration-materialize", &warehouse, "", "", started, &result);
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct CancelTableCatalogMigrationHandler {}
+
+#[async_trait::async_trait]
+impl Operation for CancelTableCatalogMigrationHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let store = table_catalog_object_store()?;
+        let started = Instant::now();
+        let result = store
+            .cancel_durable_strong_backing_migration(&warehouse)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("migration-cancel", &warehouse, "", "", started, &result);
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RestListNamespacesHandler {}
 
 #[async_trait::async_trait]
@@ -5871,6 +5926,8 @@ mod tests {
         assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
         assert!(response.endpoints.contains(&"GET /v1/{prefix}/namespaces"));
         assert!(response.endpoints.contains(&"GET /{warehouse}/catalog/migration"));
+        assert!(response.endpoints.contains(&"POST /{warehouse}/catalog/migration"));
+        assert!(response.endpoints.contains(&"DELETE /{warehouse}/catalog/migration"));
         assert!(response.endpoints.contains(&"HEAD /v1/{prefix}/namespaces/{namespace}"));
         assert!(
             response
@@ -6122,6 +6179,20 @@ mod tests {
             migration_block.contains("TableCatalogResource::warehouse(&warehouse)"),
             "catalog migration dry-run should authorize against the warehouse resource"
         );
+        for handler in [
+            "MaterializeTableCatalogMigrationHandler",
+            "CancelTableCatalogMigrationHandler",
+        ] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;"),
+                "{handler} should require the global catalog migration action"
+            );
+            assert!(
+                !block.contains("authorize_table_catalog_resource_request("),
+                "{handler} must not imply that a global backing cutover is warehouse-scoped"
+            );
+        }
 
         for (handler, action) in [
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
@@ -6166,6 +6237,8 @@ mod tests {
 
         for handler in [
             "GetTableCatalogMigrationHandler",
+            "MaterializeTableCatalogMigrationHandler",
+            "CancelTableCatalogMigrationHandler",
             "RestListNamespacesHandler",
             "RestCreateNamespaceHandler",
             "RestGetNamespaceHandler",
@@ -6280,6 +6353,8 @@ mod tests {
         let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
         let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
         let _: &GetTableCatalogMigrationHandler = &GET_TABLE_CATALOG_MIGRATION_HANDLER;
+        let _: &MaterializeTableCatalogMigrationHandler = &MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER;
+        let _: &CancelTableCatalogMigrationHandler = &CANCEL_TABLE_CATALOG_MIGRATION_HANDLER;
         let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
         let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
         let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;
@@ -6320,6 +6395,8 @@ mod tests {
         assert_operation::<EnableTableBucketHandler>();
         assert_operation::<GetTableBucketHandler>();
         assert_operation::<GetTableCatalogMigrationHandler>();
+        assert_operation::<MaterializeTableCatalogMigrationHandler>();
+        assert_operation::<CancelTableCatalogMigrationHandler>();
         assert_operation::<RestListNamespacesHandler>();
         assert_operation::<RestCreateNamespaceHandler>();
         assert_operation::<RestGetNamespaceHandler>();

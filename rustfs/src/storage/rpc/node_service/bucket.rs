@@ -57,6 +57,7 @@ impl NodeService {
         request: Request<LoadBucketMetadataRequest>,
     ) -> Result<Response<LoadBucketMetadataResponse>, Status> {
         let request = request.into_inner();
+        let scanner_maintenance_change = request.scanner_maintenance_change;
         let bucket = request.bucket;
         if bucket.is_empty() {
             return Ok(Response::new(LoadBucketMetadataResponse {
@@ -74,12 +75,15 @@ impl NodeService {
 
         match load_bucket_metadata(store, &bucket).await {
             Ok(meta) => {
-                if let Err(err) = set_bucket_metadata(bucket, meta).await {
+                if let Err(err) = set_bucket_metadata(bucket.clone(), meta).await {
                     return Ok(Response::new(LoadBucketMetadataResponse {
                         success: false,
                         error_info: Some(err.to_string()),
                     }));
                 };
+                if scanner_maintenance_change {
+                    rustfs_scanner::record_scanner_maintenance_change(&bucket);
+                }
                 Ok(Response::new(LoadBucketMetadataResponse {
                     success: true,
                     error_info: None,

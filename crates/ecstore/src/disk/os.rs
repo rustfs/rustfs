@@ -645,6 +645,34 @@ pub fn file_exists(path: impl AsRef<Path>) -> bool {
     std::fs::metadata(path.as_ref()).map(|_| true).unwrap_or(false)
 }
 
+/// Whether an [`io::Error`] means "the directory is not empty".
+///
+/// POSIX lets `rmdir`/`rename` report a non-empty directory as either
+/// `ENOTEMPTY` or `EEXIST`. Linux uses `ENOTEMPTY` (which Rust surfaces as
+/// [`io::ErrorKind::DirectoryNotEmpty`]); illumos/Solaris return `EEXIST`
+/// (errno 17), which Rust surfaces as [`io::ErrorKind::AlreadyExists`] and
+/// which the `DirectoryNotEmpty` kind therefore never catches. Matching only on
+/// the kind silently misclassifies the Solaris case as a hard failure, so
+/// callers that must treat a still-populated directory as benign (deleting the
+/// object metadata while a rollback-staging dir remains, non-force
+/// `DeleteBucket` on a populated bucket) have to test the raw errno as well.
+/// Mirrors MinIO's `isSysErrNotEmpty`.
+pub fn is_dir_not_empty_error(err: &io::Error) -> bool {
+    // Linux/Windows: ENOTEMPTY / ERROR_DIR_NOT_EMPTY -> DirectoryNotEmpty.
+    if err.kind() == io::ErrorKind::DirectoryNotEmpty {
+        return true;
+    }
+    // illumos/Solaris report a non-empty `rmdir`/`rename` as EEXIST (errno 17),
+    // which Rust surfaces as `AlreadyExists` (so the `DirectoryNotEmpty` kind
+    // never catches it). Confirm against the raw errno directly so the
+    // classification holds regardless of how the platform std maps it.
+    #[cfg(unix)]
+    if matches!(err.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST)) {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,6 +835,62 @@ mod tests {
         let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         assert!(should_retry_rename(&denied, 0));
         assert!(!should_retry_rename(&denied, 1));
+    }
+
+    #[test]
+    fn is_dir_not_empty_error_recognizes_directory_not_empty_kind() {
+        let err = io::Error::from(io::ErrorKind::DirectoryNotEmpty);
+        assert!(is_dir_not_empty_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_dir_not_empty_error_recognizes_raw_enotempty() {
+        // Linux/BSD/macOS non-empty rmdir/rename errno.
+        let err = io::Error::from_raw_os_error(libc::ENOTEMPTY);
+        assert!(is_dir_not_empty_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_dir_not_empty_error_recognizes_solaris_eexist() {
+        // illumos/Solaris report a non-empty rmdir/rename as EEXIST, which Rust
+        // surfaces as `AlreadyExists` (never `DirectoryNotEmpty`). This is the
+        // core of rustfs/rustfs#4978: matching only the kind misclassified this
+        // benign condition as a hard failure.
+        let err = io::Error::from_raw_os_error(libc::EEXIST);
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(is_dir_not_empty_error(&err));
+    }
+
+    #[test]
+    fn is_dir_not_empty_error_rejects_unrelated_errors() {
+        assert!(!is_dir_not_empty_error(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!is_dir_not_empty_error(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        #[cfg(unix)]
+        {
+            assert!(!is_dir_not_empty_error(&io::Error::from_raw_os_error(libc::EACCES)));
+            assert!(!is_dir_not_empty_error(&io::Error::from_raw_os_error(libc::ENOENT)));
+        }
+    }
+
+    #[tokio::test]
+    async fn is_dir_not_empty_error_matches_real_non_empty_rmdir() {
+        // Validate against the host's actual errno, whatever it is: Linux/macOS
+        // return ENOTEMPTY, illumos/Solaris return EEXIST. The removal must be
+        // classified as "not empty" on every platform.
+        let temp_dir = tempdir().expect("create temp dir");
+        let populated = temp_dir.path().join("populated");
+        std::fs::create_dir(&populated).expect("create dir");
+        std::fs::write(populated.join("child"), b"x").expect("write child");
+
+        let err = std::fs::remove_dir(&populated).expect_err("non-empty rmdir must fail");
+        assert!(
+            is_dir_not_empty_error(&err),
+            "non-empty rmdir must classify as not-empty, got kind {:?} errno {:?}",
+            err.kind(),
+            err.raw_os_error()
+        );
     }
 
     #[tokio::test]

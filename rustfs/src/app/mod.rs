@@ -29,9 +29,11 @@ pub(crate) mod storage_api;
 #[cfg(test)]
 mod capacity_dirty_scope_test;
 #[cfg(test)]
+mod data_usage_snapshot_gating_test;
+#[cfg(test)]
 mod delete_objects_stat_gating_test;
 #[cfg(test)]
-mod gating_test_env;
+pub(crate) mod gating_test_env;
 #[cfg(test)]
 mod lifecycle_transition_api_test;
 #[cfg(test)]

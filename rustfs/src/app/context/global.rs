@@ -17,24 +17,25 @@ use super::super::storage_api::context::runtime::set_object_store_resolver;
 use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_boot_time_interface, default_bucket_metadata_interface,
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
-    default_endpoints_interface, default_expiry_state_interface, default_internode_metrics_interface,
-    default_kms_runtime_interface, default_local_node_name_interface, default_lock_client_interface,
-    default_lock_clients_interface, default_notification_system_interface, default_notify_interface, default_oidc_interface,
-    default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_region_interface,
-    default_replication_pool_interface, default_replication_stats_interface, default_runtime_port_interface,
-    default_s3select_db_interface, default_scanner_metrics_interface, default_server_config_interface,
-    default_storage_class_interface, default_tier_config_interface, default_transition_state_interface, oidc_interface,
+    default_endpoints_interface, default_expiry_state_interface, default_federated_identity_interface,
+    default_internode_metrics_interface, default_kms_runtime_interface, default_local_node_name_interface,
+    default_lock_client_interface, default_lock_clients_interface, default_notification_system_interface,
+    default_notify_interface, default_outbound_tls_runtime_interface, default_performance_metrics_interface,
+    default_region_interface, default_replication_pool_interface, default_replication_stats_interface,
+    default_runtime_port_interface, default_s3select_db_interface, default_scanner_metrics_interface,
+    default_server_config_interface, default_storage_class_interface, default_tier_config_interface,
+    default_transition_state_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
-    DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
-    KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface,
-    NotifyInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
-    ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
+    DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, FederatedIdentityInterface, IamInterface,
+    InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
+    LockClientsInterface, NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
+    RegionInterface, ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface,
+    ScannerMetricsInterface, ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
 };
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
-use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{federation::FederatedIdentityService, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};
 
@@ -43,7 +44,7 @@ use std::sync::{Arc, OnceLock};
 pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
-    oidc: Arc<dyn OidcInterface>,
+    federated_identity: Arc<dyn FederatedIdentityInterface>,
     #[allow(dead_code)]
     kms: Arc<dyn KmsInterface>,
     kms_runtime: Arc<dyn KmsRuntimeInterface>,
@@ -91,7 +92,7 @@ impl AppContext {
         Self {
             object_store,
             iam,
-            oidc: default_oidc_interface(),
+            federated_identity: default_federated_identity_interface(),
             kms,
             kms_runtime: default_kms_runtime_interface(),
             outbound_tls_runtime: default_outbound_tls_runtime_interface(),
@@ -129,9 +130,7 @@ impl AppContext {
         iam: Arc<IamSys<ObjectStore>>,
         kms: Arc<KmsServiceManager>,
     ) -> Self {
-        let mut context = Self::new(object_store, Arc::new(IamHandle::new(iam)), Arc::new(KmsHandle::new(kms)));
-        context.oidc = oidc_interface(super::runtime_sources::oidc_handle());
-        context
+        Self::new(object_store, Arc::new(IamHandle::new(iam)), Arc::new(KmsHandle::new(kms)))
     }
 
     pub fn object_store(&self) -> Arc<ECStore> {
@@ -142,12 +141,12 @@ impl AppContext {
         self.iam.clone()
     }
 
-    pub fn oidc(&self) -> Arc<dyn OidcInterface> {
-        self.oidc.clone()
+    pub fn federated_identity(&self) -> Arc<dyn FederatedIdentityInterface> {
+        self.federated_identity.clone()
     }
 
-    pub fn publish_oidc_handle(&self, oidc: Arc<OidcSys>) -> bool {
-        self.oidc.publish_handle(oidc)
+    pub fn publish_federated_identity_service(&self, service: Arc<FederatedIdentityService>) -> bool {
+        self.federated_identity.publish_handle(service)
     }
 
     #[allow(dead_code)]
@@ -276,7 +275,7 @@ impl AppContext {
 #[cfg(test)]
 pub(super) struct AppContextTestInterfaces {
     pub(super) iam: Arc<dyn IamInterface>,
-    pub(super) oidc: Arc<dyn OidcInterface>,
+    pub(super) federated_identity: Arc<dyn FederatedIdentityInterface>,
     pub(super) kms: Arc<dyn KmsInterface>,
     pub(super) kms_runtime: Arc<dyn KmsRuntimeInterface>,
     pub(super) outbound_tls_runtime: Arc<dyn OutboundTlsRuntimeInterface>,
@@ -313,7 +312,7 @@ impl AppContext {
         Self {
             object_store,
             iam: interfaces.iam,
-            oidc: interfaces.oidc,
+            federated_identity: interfaces.federated_identity,
             kms: interfaces.kms,
             kms_runtime: interfaces.kms_runtime,
             outbound_tls_runtime: interfaces.outbound_tls_runtime,
@@ -344,6 +343,16 @@ impl AppContext {
             buffer_config: interfaces.buffer_config,
             object_data_cache: ObjectDataCacheAdapter::disabled_arc(),
         }
+    }
+
+    pub(crate) fn with_test_runtime_config_interfaces(
+        mut self,
+        server_config: Arc<dyn ServerConfigInterface>,
+        storage_class: Arc<dyn StorageClassInterface>,
+    ) -> Self {
+        self.server_config = server_config;
+        self.storage_class = storage_class;
+        self
     }
 }
 

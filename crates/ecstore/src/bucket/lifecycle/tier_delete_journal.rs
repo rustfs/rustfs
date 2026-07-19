@@ -20,10 +20,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bucket::lifecycle::config_boundary;
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
+use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::services::tier::tier::tier_destination_id_from_metadata;
 use crate::storage_api_contracts::{
     list::ListOperations as _,
     object::{DeletedObject, ObjectIO, ObjectOperations, ObjectToDelete},
@@ -37,7 +38,7 @@ const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal";
 
 pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 1_000;
-const TIER_DELETE_JOURNAL_VERSION: u8 = 1;
+const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
 const TIER_DELETE_JOURNAL_PREFIX: &str = "ilm/tier-delete-journal/";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,22 +48,26 @@ struct PersistedTierDeleteJournalEntry {
     obj_name: String,
     version_id: String,
     tier_name: String,
+    #[serde(default)]
+    backend_identity: Option<[u8; 32]>,
 }
 
 impl PersistedTierDeleteJournalEntry {
     fn from_jentry(je: &Jentry) -> Self {
         Self {
-            version: TIER_DELETE_JOURNAL_VERSION,
+            version: if je.backend_identity.is_some() {
+                TIER_DELETE_JOURNAL_VERSION
+            } else {
+                1
+            },
             obj_name: je.obj_name.clone(),
             version_id: je.version_id.clone(),
             tier_name: je.tier_name.clone(),
+            backend_identity: je.backend_identity,
         }
     }
 
     fn into_jentry(self) -> Result<Jentry> {
-        if self.version != TIER_DELETE_JOURNAL_VERSION {
-            return Err(Error::other(format!("unsupported tier delete journal version {}", self.version)));
-        }
         // Empty `version_id` is a legal sentinel for objects transitioned to an
         // unversioned remote tier (see CLAUDE.md: a tier version of `None`/`""`
         // means the tier bucket is unversioned, so the remote delete is issued
@@ -71,10 +76,19 @@ impl PersistedTierDeleteJournalEntry {
         if self.obj_name.is_empty() || self.tier_name.is_empty() {
             return Err(Error::other("tier delete journal entry is incomplete"));
         }
+        let backend_identity = match self.version {
+            1 => None,
+            TIER_DELETE_JOURNAL_VERSION => Some(
+                self.backend_identity
+                    .ok_or_else(|| Error::other("tier delete journal v2 entry is missing its backend identity"))?,
+            ),
+            version => return Err(Error::other(format!("unsupported tier delete journal version {version}"))),
+        };
         Ok(Jentry {
             obj_name: self.obj_name,
             version_id: self.version_id,
             tier_name: self.tier_name,
+            backend_identity,
         })
     }
 }
@@ -95,6 +109,10 @@ pub(crate) fn tier_delete_journal_object_name(je: &Jentry) -> String {
     hasher.update(je.obj_name.as_bytes());
     hasher.update([0]);
     hasher.update(je.version_id.as_bytes());
+    if let Some(backend_identity) = je.backend_identity {
+        hasher.update([0]);
+        hasher.update(backend_identity);
+    }
     format!(
         "{TIER_DELETE_JOURNAL_PREFIX}{}.json",
         rustfs_utils::crypto::hex(hasher.finalize().as_slice())
@@ -110,6 +128,16 @@ fn decode_tier_delete_journal_entry(data: &[u8]) -> Result<Jentry> {
 fn encode_tier_delete_journal_entry(je: &Jentry) -> Result<Vec<u8>> {
     serde_json::to_vec(&PersistedTierDeleteJournalEntry::from_jentry(je))
         .map_err(|err| Error::other(format!("encode tier delete journal failed: {err}")))
+}
+
+pub fn record_tier_delete_journal_backend_identity(
+    je: &mut Jentry,
+    metadata: &std::collections::HashMap<String, String>,
+) -> std::io::Result<()> {
+    if let Some(identity) = tier_destination_id_from_metadata(metadata)? {
+        je.backend_identity = Some(identity);
+    }
+    Ok(())
 }
 
 pub async fn persist_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
@@ -148,7 +176,17 @@ where
 }
 
 pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -> std::io::Result<()> {
-    delete_object_from_remote_tier_idempotent(&je.obj_name, &je.version_id, &je.tier_name).await?;
+    let backend_identity = je
+        .backend_identity
+        .ok_or_else(|| std::io::Error::other("legacy tier delete journal has no durable backend identity"))?;
+    delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+        &je.obj_name,
+        &je.version_id,
+        &je.tier_name,
+        backend_identity,
+        &api.tier_config_mgr(),
+    )
+    .await?;
     remove_tier_delete_journal_entry(api, je).await
 }
 
@@ -218,6 +256,21 @@ pub async fn recover_tier_delete_journal_entries(
             }
         };
 
+        if je.backend_identity.is_none() {
+            stats.failed += 1;
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                journal_object = %object.name,
+                remote_object = %je.obj_name,
+                remote_version_id = %je.version_id,
+                tier = %je.tier_name,
+                "Legacy tier delete journal entry has no durable backend identity and will be retained"
+            );
+            continue;
+        }
+
         match process_tier_delete_journal_entry(api.clone(), &je).await {
             Ok(()) => stats.deleted += 1,
             Err(err) => {
@@ -281,7 +334,10 @@ pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_tok
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_tier_delete_journal_entry, encode_tier_delete_journal_entry, tier_delete_journal_object_name};
+    use super::{
+        decode_tier_delete_journal_entry, encode_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
+        tier_delete_journal_object_name,
+    };
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
 
     fn journal_entry() -> Jentry {
@@ -289,6 +345,7 @@ mod tests {
             obj_name: "remote/object".to_string(),
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
+            backend_identity: Some([7; 32]),
         }
     }
 
@@ -302,6 +359,7 @@ mod tests {
         assert_eq!(decoded.obj_name, je.obj_name);
         assert_eq!(decoded.version_id, je.version_id);
         assert_eq!(decoded.tier_name, je.tier_name);
+        assert_eq!(decoded.backend_identity, je.backend_identity);
     }
 
     #[test]
@@ -315,6 +373,63 @@ mod tests {
         assert!(first.starts_with("ilm/tier-delete-journal/"));
         assert!(first.ends_with(".json"));
         assert!(!first.contains("remote/object"));
+    }
+
+    #[test]
+    fn tier_delete_journal_paths_separate_legacy_and_backend_identities() {
+        let mut legacy = journal_entry();
+        legacy.backend_identity = None;
+        let mut backend_a = journal_entry();
+        backend_a.backend_identity = Some([1; 32]);
+        let mut backend_b = journal_entry();
+        backend_b.backend_identity = Some([2; 32]);
+
+        assert_eq!(
+            tier_delete_journal_object_name(&legacy),
+            "ilm/tier-delete-journal/5ba6a7eb6338412b771613a6845a42ae5b8e26b5d201323eb01b38c5b42ff300.json"
+        );
+        assert_ne!(tier_delete_journal_object_name(&legacy), tier_delete_journal_object_name(&backend_a));
+        assert_ne!(tier_delete_journal_object_name(&backend_a), tier_delete_journal_object_name(&backend_b));
+    }
+
+    #[test]
+    fn tier_delete_journal_v2_requires_backend_identity() {
+        let payload = br#"{"version":2,"obj_name":"remote/object","version_id":"v1","tier_name":"WARM"}"#;
+
+        let err = decode_tier_delete_journal_entry(payload).expect_err("v2 entry without identity must fail closed");
+
+        assert!(err.to_string().contains("backend identity"));
+    }
+
+    #[test]
+    fn tier_delete_journal_uses_persisted_transition_destination_identity() {
+        let mut je = journal_entry();
+        je.backend_identity = None;
+        let identity = [9_u8; 32];
+        let mut metadata = std::collections::HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity),
+        );
+
+        record_tier_delete_journal_backend_identity(&mut je, &metadata).expect("persisted transition identity should decode");
+        let encoded = encode_tier_delete_journal_entry(&je).expect("identity-bound journal should encode");
+        let decoded = decode_tier_delete_journal_entry(&encoded).expect("identity-bound journal should decode");
+
+        assert_eq!(decoded.backend_identity, Some(identity));
+    }
+
+    #[test]
+    fn tier_delete_journal_without_transition_identity_stays_legacy() {
+        let mut je = journal_entry();
+        je.backend_identity = None;
+
+        let encoded = encode_tier_delete_journal_entry(&je).expect("legacy journal should remain encodable");
+        let persisted: serde_json::Value = serde_json::from_slice(&encoded).expect("journal JSON should decode");
+
+        assert_eq!(persisted["version"], 1);
+        assert!(persisted["backend_identity"].is_null());
     }
 
     #[test]
@@ -339,6 +454,7 @@ mod tests {
         assert_eq!(decoded.obj_name, "remote/object");
         assert!(decoded.version_id.is_empty());
         assert_eq!(decoded.tier_name, "WARM");
+        assert_eq!(decoded.backend_identity, None);
     }
 
     #[test]

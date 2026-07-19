@@ -1331,6 +1331,42 @@ async fn assert_managed_sse_replication_fails_explicitly(label: &str, kms: bool)
     Ok(())
 }
 
+async fn wait_for_source_delete_marker_replication_failed(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    key: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let url = format!(
+        "{}/rustfs/admin/v3/replication/diff?bucket={}&prefix={}",
+        env.url,
+        urlencoding::encode(bucket),
+        urlencoding::encode(key)
+    );
+
+    loop {
+        let response = signed_request(http::Method::POST, &url, &env.access_key, &env.secret_key, None, None).await?;
+        if response.status() != StatusCode::OK {
+            return Err(format!("replication diff failed with status {}", response.status()).into());
+        }
+        let diff: serde_json::Value = response.json().await?;
+        let failed = diff["Entries"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["Object"].as_str() == Some(key)
+                    && entry["IsDeleteMarker"].as_bool() == Some(true)
+                    && entry["ReplicationStatus"].as_str() == Some("FAILED")
+            })
+        });
+        if failed {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("source delete marker {key} never reported FAILED; last diff={diff}").into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Return the `LastModified` of the (single) delete marker for `key`, if present.
 async fn delete_marker_last_modified(
     client: &Client,
@@ -3691,23 +3727,9 @@ async fn test_bucket_replication_replays_failed_entries_after_source_restart() -
     Ok(())
 }
 
-/// backlog#1147 repl-5, scenario (c) — replayed delete marker keeps the source
-/// mtime (mirrors backlog#867).
-///
-/// A delete marker is created while the target is down; the source is then
-/// restarted (data preserved) and the target brought back, so the marker
-/// replicates through the failure-replay path. The replayed marker must carry
-/// the SOURCE's `LastModified`, not the replay time. A deliberate gap before
-/// recovery makes any regression (replay-time stamping) obvious.
-///
-/// The source restart is load-bearing, not just paranoia: on a live
-/// (never-restarted) source, the failed delete-marker replication wedges the
-/// per-object `/[replicate]/<key>` namespace lock and the marker never
-/// replicates even after the target recovers — tracked as backlog#1278. Once
-/// that is fixed, a restart-free variant of this scenario should be added.
 #[tokio::test]
 #[serial]
-async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime() -> TestResult {
+async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime_without_source_restart() -> TestResult {
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
@@ -3759,13 +3781,11 @@ async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime()
         .await?
         .ok_or("source has no delete marker after DELETE")?;
 
+    wait_for_source_delete_marker_replication_failed(&source_env, source_bucket, object_key).await?;
+
     // Widen the gap so a replay-time-stamping regression is unmistakable.
     sleep(Duration::from_secs(3)).await;
 
-    // Restart the source (see the doc comment: live-source replay is wedged by
-    // backlog#1278), then bring the target back; the restarted source's scanner
-    // heal pass replays the failed delete marker.
-    source_env.restart_server_preserving_data(vec![], &source_env_vars).await?;
     target_env.restart_server_preserving_data(vec![], &[]).await?;
 
     let target_mtime = wait_for_target_delete_marker(&target_client, target_bucket, object_key).await?;
