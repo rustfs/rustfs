@@ -1607,6 +1607,74 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    #[serial(metadata_cache_invalidation_probe)]
+    async fn complete_multipart_generation_retires_cached_snapshot() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+        use crate::storage_api_contracts::object::ObjectIO as _;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-metadata-generation-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut initial_reader = PutObjReader::from_vec(b"old multipart body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be written");
+        set_disks
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+            .expect("initial metadata should resolve");
+        let generation = set_disks
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("metadata cache generation should be active");
+        let retired_key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        assert!(set_disks.get_object_metadata_cache.get(&retired_key).await.is_some());
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        let payload = vec![9u8; 4096];
+        let payload_len = i64::try_from(payload.len()).expect("test payload length should fit i64");
+        let mut part_reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(payload), payload_len, payload_len, None, None, false)
+                .expect("part hash reader should be created"),
+        );
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("multipart part should be written");
+
+        let invalidations = MetadataCacheInvalidationProbe::install(bucket, object);
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("multipart completion should succeed");
+
+        assert_eq!(
+            invalidations.count(),
+            2,
+            "multipart completion must invalidate before mutation and after commit"
+        );
+        set_disks.get_object_metadata_cache.run_pending_tasks().await;
+        assert!(set_disks.get_object_metadata_cache.get(&retired_key).await.is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn multipart_upload_read_lock_waits_for_upload_writer() {
