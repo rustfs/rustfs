@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub(crate) mod federated_identity;
-pub(crate) mod session_policy;
-pub mod site_replication;
+use crate::oidc::{OidcProviderSummary, OidcSys};
+
+pub(super) fn list_providers(oidc: &OidcSys) -> Vec<OidcProviderSummary> {
+    oidc.list_providers()
+}
+
+pub(super) fn list_visible_providers(oidc: &OidcSys) -> Vec<OidcProviderSummary> {
+    oidc.list_visible_providers()
+}
