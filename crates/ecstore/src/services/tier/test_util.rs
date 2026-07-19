@@ -140,6 +140,8 @@ pub struct MockStoredObject {
 struct MockWarmBackendInner {
     objects: Mutex<HashMap<String, MockStoredObject>>,
     faults: Mutex<FaultConfig>,
+    put_read_limit: Mutex<Option<usize>>,
+    put_remote_version: Mutex<Option<String>>,
     op_log: Mutex<Vec<MockWarmOp>>,
     put_versions: Mutex<Vec<(String, String)>>,
     remove_versions: Mutex<Vec<(String, String)>>,
@@ -230,6 +232,18 @@ impl MockWarmBackend {
     /// Clear all injected faults, restoring healthy behaviour.
     pub async fn clear_faults(&self) {
         *self.inner.faults.lock().await = FaultConfig::default();
+    }
+
+    /// Limit how many body bytes a successful mock PUT consumes. `None` drains
+    /// the complete body. This models a backend that incorrectly accepts a
+    /// truncated stream while still returning success.
+    pub async fn set_put_read_limit(&self, limit: Option<usize>) {
+        *self.inner.put_read_limit.lock().await = limit;
+    }
+
+    /// Override the remote version returned by subsequent successful PUTs.
+    pub async fn set_put_remote_version(&self, remote_version: Option<String>) {
+        *self.inner.put_remote_version.lock().await = remote_version;
     }
 
     async fn precondition(&self) -> Result<(), std::io::Error> {
@@ -379,7 +393,13 @@ impl MockWarmBackend {
     // ---- internal helpers -----------------------------------------------
 
     async fn put_bytes(&self, object: &str, bytes: Vec<u8>, metadata: HashMap<String, String>) -> String {
-        let remote_version_id = Uuid::new_v4().to_string();
+        let remote_version_id = self
+            .inner
+            .put_remote_version
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         self.inner.objects.lock().await.insert(
             object.to_string(),
             MockStoredObject {
@@ -392,11 +412,18 @@ impl MockWarmBackend {
     }
 
     async fn read_bytes(&self, reader: ReaderImpl) -> Result<Vec<u8>, std::io::Error> {
+        let limit = *self.inner.put_read_limit.lock().await;
         match reader {
-            ReaderImpl::Body(bytes) => Ok(bytes.to_vec()),
+            ReaderImpl::Body(bytes) => Ok(bytes.slice(..limit.unwrap_or(bytes.len()).min(bytes.len())).to_vec()),
             ReaderImpl::ObjectBody(mut reader) => {
                 let mut buf = Vec::new();
-                reader.stream.read_to_end(&mut buf).await?;
+                if let Some(limit) = limit {
+                    let limit =
+                        u64::try_from(limit).map_err(|_| std::io::Error::other("mock PUT read limit exceeds u64::MAX"))?;
+                    reader.stream.take(limit).read_to_end(&mut buf).await?;
+                } else {
+                    reader.stream.read_to_end(&mut buf).await?;
+                }
                 Ok(buf)
             }
         }
@@ -519,7 +546,7 @@ impl WarmBackend for MockWarmBackend {
     async fn in_use(&self) -> Result<bool, std::io::Error> {
         self.precondition().await?;
         self.record(MockWarmOp::InUse).await;
-        Ok(false)
+        Ok(!self.inner.objects.lock().await.is_empty())
     }
 }
 
@@ -558,7 +585,9 @@ pub async fn register_mock_tier_backend(handle: &Arc<RwLock<TierConfigMgr>>, tie
             ..Default::default()
         },
     );
-    tier_config_mgr.driver_cache.insert(tier_name.to_string(), Box::new(backend));
+    tier_config_mgr
+        .install_test_driver(tier_name, Box::new(backend))
+        .expect("mock tier driver should install");
 }
 
 /// The transition-state tuple read from an on-disk `xl.meta`, plus the object's

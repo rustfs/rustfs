@@ -264,7 +264,7 @@ impl ECStore {
 
     /// Get the tier config manager
     pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::services::tier::tier::TierConfigMgr>> {
-        runtime_sources::global_tier_config_mgr()
+        self.ctx.tier_config_mgr()
     }
 
     /// Get the server configuration
