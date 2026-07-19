@@ -225,6 +225,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod storage {
+        #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{
             INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV,
         };
