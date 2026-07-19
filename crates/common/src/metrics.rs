@@ -2434,6 +2434,18 @@ impl Metrics {
         self.current_scan_cycle_work_active.store(false, Ordering::Relaxed);
     }
 
+    pub fn current_scan_cycle_has_unresolved_heal_work(&self) -> bool {
+        if !self.current_scan_cycle_work_active.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let source_work = self.scanner_source_work_since(&self.current_scan_cycle_source_work_start_values());
+        [ScannerWorkSource::Heal, ScannerWorkSource::Bitrot]
+            .into_iter()
+            .filter_map(|source| source_work.get(source.index()))
+            .any(|work| work.queued > 0 || work.skipped > 0 || work.failed > 0 || work.missed > 0)
+    }
+
     fn scan_cycle_work_snapshot(&self) -> ScanCycleWorkSnapshot {
         ScanCycleWorkSnapshot {
             objects_scanned: self.lifetime(Metric::ScanObject),
@@ -3358,6 +3370,40 @@ mod tests {
         assert_eq!(bucket_replication.reason, "queued_work");
         assert_eq!(bucket_replication.current_queued, 1);
 
+        metrics.finish_scan_cycle_work(start);
+    }
+
+    #[test]
+    fn unresolved_heal_work_only_reflects_the_active_cycle() {
+        let metrics = Metrics::new();
+        assert!(!metrics.current_scan_cycle_has_unresolved_heal_work());
+
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_missed(ScannerWorkSource::Heal, 1);
+        assert!(metrics.current_scan_cycle_has_unresolved_heal_work());
+
+        metrics.finish_scan_cycle_work(start);
+        assert!(!metrics.current_scan_cycle_has_unresolved_heal_work());
+
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_queued(ScannerWorkSource::Heal, 1);
+        assert!(metrics.current_scan_cycle_has_unresolved_heal_work());
+        metrics.finish_scan_cycle_work(start);
+
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_work(
+            ScannerWorkSource::Bitrot,
+            ScannerSourceWorkUpdate {
+                skipped: 1,
+                ..Default::default()
+            },
+        );
+        assert!(metrics.current_scan_cycle_has_unresolved_heal_work());
+        metrics.finish_scan_cycle_work(start);
+
+        let start = metrics.start_scan_cycle_work();
+        metrics.record_scanner_source_failed(ScannerWorkSource::Bitrot, 1);
+        assert!(metrics.current_scan_cycle_has_unresolved_heal_work());
         metrics.finish_scan_cycle_work(start);
     }
 

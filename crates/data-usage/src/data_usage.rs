@@ -18,8 +18,26 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     path::Path,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
+
+/// Maximum amount a persisted `last_update` may lead the local wall clock before the
+/// persisted timestamp is treated as untrustworthy.
+///
+/// Invariant: the "skip stale usage update" monotonicity check (incoming `last_update`
+/// <= existing `last_update` => skip persisting) is only valid while the existing
+/// timestamp could plausibly have been produced by a healthy clock. If the on-disk
+/// snapshot is future-dated beyond this tolerance (NTP step-back, or scanner
+/// leadership moving to a node with a slower clock), the comparison would skip every
+/// save forever and freeze admin usage stats; callers must bypass the skip instead.
+pub const USAGE_LAST_UPDATE_FUTURE_TOLERANCE: Duration = Duration::from_secs(5 * 60);
+
+/// Returns true when `existing_last_update` is ahead of `now` by more than
+/// [`USAGE_LAST_UPDATE_FUTURE_TOLERANCE`], i.e. the persisted timestamp cannot be
+/// trusted for staleness comparisons and a fresh snapshot save must be allowed.
+pub fn usage_last_update_is_untrusted_future(existing_last_update: SystemTime, now: SystemTime) -> bool {
+    existing_last_update > now + USAGE_LAST_UPDATE_FUTURE_TOLERANCE
+}
 
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TierStats {
@@ -1296,6 +1314,22 @@ pub struct CompressionTotalInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_usage_last_update_future_tolerance_boundary() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        // Within tolerance (including the exact boundary) the timestamp is trusted.
+        assert!(!usage_last_update_is_untrusted_future(now, now));
+        assert!(!usage_last_update_is_untrusted_future(now - Duration::from_secs(60), now));
+        assert!(!usage_last_update_is_untrusted_future(now + USAGE_LAST_UPDATE_FUTURE_TOLERANCE, now));
+
+        // Beyond tolerance the persisted timestamp is untrustworthy.
+        assert!(usage_last_update_is_untrusted_future(
+            now + USAGE_LAST_UPDATE_FUTURE_TOLERANCE + Duration::from_secs(1),
+            now
+        ));
+    }
 
     #[test]
     fn test_data_usage_info_creation() {

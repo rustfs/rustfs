@@ -41,7 +41,7 @@ The repository is a Cargo workspace with a flat `crates/` layout:
 
 ```
 rustfs/                      # Workspace root (virtual manifest)
-├── rustfs/                  # Main binary + library crate (75K lines)
+├── rustfs/                  # Main binary + library crate
 │   └── src/
 │       ├── main.rs          # Entry point, startup sequence
 │       ├── lib.rs           # Module tree root
@@ -53,7 +53,7 @@ rustfs/                      # Workspace root (virtual manifest)
 │       ├── config/          # CLI args, config parsing, workload profiles
 │       └── ...
 ├── crates/                  # library crates (authoritative list: Cargo.toml [workspace].members)
-│   ├── ecstore/             # Erasure-coded storage engine (⚠️ 87K lines)
+│   ├── ecstore/             # Erasure-coded storage engine
 │   ├── rio/                 # Reader I/O pipeline (encrypt, compress, hash)
 │   ├── io-core/             # Zero-copy I/O, scheduling, buffer pool
 │   ├── io-metrics/          # I/O metrics collection
@@ -83,124 +83,25 @@ A request flows **downward** through the layers. No layer should reach upward
 
 ### Crate Reference
 
-> Depth levels, line counts, and crate counts in this section are a
-> point-in-time snapshot and drift with refactors. Treat them as orders of
-> magnitude; `Cargo.toml` and `cargo tree` are the source of truth.
-
-Crates are organized in a dependency DAG with 9 depth levels (0 = leaf, 8 = top):
-
-```
-Depth 0 — LEAF (no internal deps):
-  appauth, checksums, config, credentials, crypto, io-metrics,
-  madmin, s3-common, workers, zip
-
-Depth 1:
-  io-core (→ io-metrics)
-  policy (→ config, credentials, crypto)
-  utils                                   (historical → config edge removed; now effectively leaf)
-
-Depth 2:
-  concurrency, filemeta, keystone, kms, lock, obs,
-  signer, targets, trusted-proxies
-
-Depth 3:
-  common                                  (historical → filemeta/madmin edges removed; now effectively leaf)
-
-Depth 4:
-  object-capacity, protos, rio
-
-Depth 5 — CORE:
-  ecstore (16 internal deps, 11 dependents — the architectural heart)
-
-Depth 6:
-  audit, heal, iam, metrics, notify, s3select-api, scanner
-
-Depth 7:
-  object-io, protocols, s3select-query
-
-Depth 8 — TOP:
-  rustfs (35 internal deps — the binary, depends on almost everything)
-```
+`Cargo.toml` is the authoritative workspace membership and `cargo tree` is the
+authoritative dependency graph. This overview deliberately avoids line-count
+and dependency-depth snapshots because both quickly become stale during
+refactors.
 
 #### By Domain
 
-**Core Infrastructure:**
+| Domain | Current workspace crates | Responsibility |
+|--------|--------------------------|----------------|
+| Foundation | `checksums`, `common`, `config`, `data-usage`, `utils` | Shared configuration, data-usage models, utilities, and checksums. |
+| I/O and storage | `concurrency`, `ecstore`, `filemeta`, `heal`, `io-core`, `io-metrics`, `lifecycle`, `lock`, `object-capacity`, `object-data-cache`, `replication`, `rio`, `rio-v2`, `scanner`, `storage-api` | Erasure-coded object storage, metadata, recovery, lifecycle, replication, locking, cache, and I/O pipelines. |
+| Security and identity | `credentials`, `crypto`, `iam`, `keystone`, `kms`, `policy`, `security-governance`, `signer`, `tls-runtime`, `trusted-proxies` | Credentials, authentication, authorization, encryption, key management, TLS, and security contracts. |
+| Protocols and contracts | `extension-schema`, `madmin`, `protos`, `protocols`, `s3-ops`, `s3-types`, `s3select-api`, `s3select-query` | Admin, inter-node, S3, S3 Select, and optional protocol contracts. |
+| Operations and integration | `audit`, `notify`, `obs`, `targets`, `zip` | Auditing, observability, event delivery, notification targets, and archive support. |
+| Test support | `e2e_test`, `test-utils` | End-to-end validation and shared test bootstrap utilities. |
 
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `config` | 3.3K | Configuration types and environment parsing |
-| `utils` | 8.7K | Pure utilities (paths, compression, network, retry) |
-| `common` | 4.4K | Shared runtime state, globals, data usage types, metrics |
-| `madmin` | 5.5K | Admin API request/response types |
-
-**I/O Pipeline:**
-
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `io-core` | 6.5K | Zero-copy I/O, buffer pool, direct I/O, scheduling, backpressure |
-| `io-metrics` | 4.5K | I/O operation metrics and counters |
-| `rio` | 6.9K | Composable reader chain (encrypt → compress → hash → limit) |
-| `object-io` | 2.4K | High-level object read/write using rio + ecstore |
-| `concurrency` | 0.8K | Shared concurrency contract types: workload admission snapshots, worker-slot pool, policy types (runtime control lives in `rustfs/src/storage`) |
-
-**Storage Engine:**
-
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `ecstore` | 87K | ⚠️ Erasure-coded storage: disks, pools, buckets, replication, lifecycle |
-| `filemeta` | 10K | File/object metadata types and versioning |
-| `checksums` | 732 | Checksum computation |
-| `lock` | 7.1K | Distributed lock manager |
-| `heal` | 5.9K | Data healing / bitrot repair |
-| `scanner` | 5.4K | Background data usage scanner |
-| `object-capacity` | 2.5K | Capacity tracking and management |
-
-**Security & Auth:**
-
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `crypto` | 1.6K | Encryption primitives |
-| `credentials` | 713 | Credential types (access key / secret key) |
-| `signer` | 1.4K | S3 v4 request signing |
-| `iam` | 9.0K | Identity and access management |
-| `policy` | 8.8K | Policy engine (S3 bucket/IAM policies) |
-| `kms` | 8.1K | Key management service integration |
-| `keystone` | 1.9K | OpenStack Keystone auth |
-| `appauth` | 143 | Application-level auth tokens |
-
-**Protocol & API:**
-
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `protos` | 5.7K | Protobuf/gRPC definitions for inter-node RPC |
-| `protocols` | 18K | FTP/FTPS, WebDAV, Swift API support |
-| `s3-common` | 738 | Shared S3 types |
-| `s3select-api` | 1.9K | S3 Select interface |
-| `s3select-query` | 3.6K | S3 Select query engine |
-
-**Observability:**
-
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `metrics` | 8.4K | Prometheus metric collectors |
-| `io-metrics` | 4.5K | I/O-specific metrics |
-| `obs` | 5.6K | OpenTelemetry tracing and telemetry |
-| `audit` | 2.4K | Audit logging |
-
-**Events:**
-
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `notify` | 5.5K | Event notification system |
-| `targets` | 3.2K | Notification targets (Kafka, AMQP, webhook, etc.) |
-
-**Other:**
-
-| Crate | Lines | Purpose |
-|-------|-------|---------|
-| `trusted-proxies` | 4.0K | Trusted proxy / IP forwarding |
-| `zip` | 986 | ZIP archive support for bulk downloads |
-| `workers` | 136 | Simple worker abstraction |
+The `rustfs` binary crate composes these libraries into the running server.
+`ecstore` remains the storage engine at the architectural center; its internal
+module split is tracked under `docs/architecture/`.
 
 ## Architecture Invariants
 
@@ -212,7 +113,7 @@ Depth 8 — TOP:
    No upward imports.
 
 2. **Leaf crates have zero internal dependencies.** `config`, `credentials`, `crypto`,
-   `io-metrics`, `madmin`, `s3-common` should depend only on external crates.
+   `io-metrics`, and `madmin` should depend only on external crates.
    - ✅ RESOLVED: the historical `utils → config` and `common → filemeta`/`madmin`
      edges were removed; do not reintroduce them (see Known Structural Issues).
 

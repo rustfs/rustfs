@@ -2294,24 +2294,47 @@ async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycle
     false
 }
 
+/// Build the delete options for a lifecycle expiry event on a transitioned
+/// object. Versioned events target the exact version; restore-expiry events
+/// (`DeleteRestoredAction`/`DeleteRestoredVersionAction`) set
+/// `transition.expire_restored` so the set-layer delete strips only the
+/// `x-amz-restore` headers and the local restored copy while the version stays
+/// transitioned (rustfs/backlog#1302).
+fn transitioned_object_delete_opts(
+    oi: &ObjectInfo,
+    action: IlmAction,
+    versioned: bool,
+    version_suspended: bool,
+) -> ObjectOptions {
+    let mut opts = ObjectOptions {
+        versioned,
+        version_suspended,
+        expiration: ExpirationOptions { expire: true },
+        ..Default::default()
+    };
+    if action.delete_versioned() {
+        opts.version_id = oi.version_id.map(|id| id.to_string());
+    }
+    if action.delete_restored() {
+        opts.transition.expire_restored = true;
+    }
+    opts
+}
+
 pub async fn expire_transitioned_object(
     api: Arc<ECStore>,
     oi: &ObjectInfo,
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
 ) -> Result<ObjectInfo, std::io::Error> {
-    let mut opts = ObjectOptions {
-        versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
-        version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
-        expiration: ExpirationOptions { expire: true },
-        ..Default::default()
-    };
-    if lc_event.action == IlmAction::DeleteVersionAction {
-        opts.version_id = oi.version_id.map(|id| id.to_string());
-    }
+    let opts = transitioned_object_delete_opts(
+        oi,
+        lc_event.action,
+        BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
+        BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
+    );
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
-    if lc_event.action == IlmAction::DeleteRestoredAction {
-        opts.transition.expire_restored = true;
+    if lc_event.action.delete_restored() {
         return match api.delete_object(&oi.bucket, &oi.name, opts).await {
             Ok(dobj) => {
                 // Drop any cached restored-copy body so it does not sit resident
@@ -3056,7 +3079,7 @@ mod tests {
         merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_queue_capacity,
         resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
         select_restore_s3_location, should_defer_date_expiry_for_recent_config_update,
-        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple,
+        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
     use crate::bucket::lifecycle::replication_sink::{
@@ -3097,6 +3120,45 @@ mod tests {
     use tokio::fs;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    /// Pins the expiry-event routing for transitioned objects
+    /// (rustfs/backlog#1302): restore-expiry events must set
+    /// `transition.expire_restored` (strip-restored-copy semantics, never a
+    /// full delete), and versioned events must target the exact version.
+    #[test]
+    fn transitioned_object_delete_opts_routes_expiry_actions() {
+        let vid = Uuid::new_v4();
+        let vid_str = vid.to_string();
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(vid),
+            ..Default::default()
+        };
+
+        // Plain version expiry: exact version, real delete.
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteVersionAction, true, false);
+        assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
+        assert!(!opts.transition.expire_restored);
+        assert!(opts.expiration.expire);
+
+        // Restore-expiry of the latest version: restored-copy cleanup only.
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredAction, true, false);
+        assert!(opts.version_id.is_none());
+        assert!(opts.transition.expire_restored);
+
+        // Restore-expiry of a noncurrent version: restored-copy cleanup of the
+        // exact version. Routing this through the full transitioned-object
+        // delete instead would remove the remote tier data.
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteRestoredVersionAction, true, false);
+        assert_eq!(opts.version_id.as_deref(), Some(vid_str.as_str()));
+        assert!(opts.transition.expire_restored);
+
+        // Whole-object expiry stays a real delete.
+        let opts = transitioned_object_delete_opts(&oi, IlmAction::DeleteAction, false, false);
+        assert!(opts.version_id.is_none());
+        assert!(!opts.transition.expire_restored);
+    }
 
     #[tokio::test]
     #[serial]

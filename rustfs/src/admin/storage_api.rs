@@ -245,11 +245,11 @@ pub(crate) mod metadata_sys {
     }
 
     pub(crate) async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-        super::ecstore_bucket::metadata_sys::update(bucket, config_file, data).await
+        crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
 
     pub(crate) async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
-        super::ecstore_bucket::metadata_sys::delete(bucket, config_file).await
+        crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
     }
 
     pub(crate) async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
@@ -456,27 +456,16 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
 
-    pub(crate) async fn refresh_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
-        bucket_name: &str,
-    ) -> Result<rustfs_data_usage::BucketUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::refresh_bucket_usage_from_object_layer(
-            store,
-            data_usage_info,
-            bucket_name,
-        )
-        .await
-    }
-
     pub(crate) async fn load_data_usage_from_backend(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend(store).await
     }
 
-    pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
-        crate::storage::storage_api::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
+    pub(crate) async fn load_data_usage_from_backend_cached(
+        store: Arc<crate::storage::storage_api::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend_cached(store).await
     }
 }
 

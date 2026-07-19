@@ -24,7 +24,7 @@ use crate::storage_api_contracts::{
 };
 use crate::{
     bucket::{metadata_sys::get_replication_config, versioning::VersioningApi as _, versioning_sys::BucketVersioningSys},
-    config::com::read_config,
+    config::com::{read_config, read_config_preserve_empty},
     disk::DiskAPI,
     error::{Error, classify_system_path_failure_reason},
     object_api::ObjectInfo,
@@ -41,7 +41,10 @@ use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     future::Future,
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use tokio::fs;
@@ -75,6 +78,67 @@ type LiveBucketUsageCache = moka::future::Cache<String, BucketUsageInfo>;
 static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
 static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
 static LIVE_BUCKET_USAGE_CACHE: OnceLock<LiveBucketUsageCache> = OnceLock::new();
+
+/// Cached copy of the last persisted data usage snapshot, served to admin
+/// endpoints for up to `DATA_USAGE_CACHE_TTL_SECS` between backend reads.
+#[derive(Debug, Clone)]
+struct CachedDataUsageSnapshot {
+    info: Option<DataUsageInfo>,
+    loaded_at: tokio::time::Instant,
+}
+
+impl CachedDataUsageSnapshot {
+    fn result(&self) -> Result<DataUsageInfo, Error> {
+        self.info
+            .clone()
+            .ok_or_else(|| Error::other("data usage snapshot load recently failed"))
+    }
+}
+
+fn fresh_cached_data_usage_snapshot(
+    cache: &Option<CachedDataUsageSnapshot>,
+    now: tokio::time::Instant,
+    ttl: Duration,
+) -> Option<Result<DataUsageInfo, Error>> {
+    cache
+        .as_ref()
+        .filter(|cached| now.duration_since(cached.loaded_at) < ttl)
+        .map(CachedDataUsageSnapshot::result)
+}
+
+fn cache_data_usage_snapshot_result(
+    cache: &mut Option<CachedDataUsageSnapshot>,
+    result: Result<DataUsageInfo, Error>,
+    loaded_at: tokio::time::Instant,
+) -> Result<DataUsageInfo, Error> {
+    match result {
+        Ok(info) => {
+            *cache = Some(CachedDataUsageSnapshot {
+                info: Some(info.clone()),
+                loaded_at,
+            });
+            Ok(info)
+        }
+        Err(e) => {
+            *cache = Some(CachedDataUsageSnapshot { info: None, loaded_at });
+            Err(e)
+        }
+    }
+}
+
+type DataUsageSnapshotCache = Arc<RwLock<Option<CachedDataUsageSnapshot>>>;
+
+static DATA_USAGE_SNAPSHOT_CACHE: OnceLock<DataUsageSnapshotCache> = OnceLock::new();
+
+// Always-on revert detector for rustfs/backlog#1306: one relaxed increment per
+// full-bucket version listing is negligible and lets tests prove that admin
+// request paths never trigger live listings.
+static LIVE_BUCKET_USAGE_COMPUTATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of live full-bucket usage computations performed by this process.
+pub fn live_bucket_usage_computations() -> u64 {
+    LIVE_BUCKET_USAGE_COMPUTATIONS.load(Ordering::Relaxed)
+}
 
 /// Deferred persist thresholds for compression totals: persist after this many
 /// operations recorded, but no more often than the min interval.
@@ -115,6 +179,10 @@ fn cache_updating() -> &'static CacheUpdating {
     USAGE_CACHE_UPDATING.get_or_init(|| Arc::new(RwLock::new(false)))
 }
 
+fn data_usage_snapshot_cache() -> &'static DataUsageSnapshotCache {
+    DATA_USAGE_SNAPSHOT_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
 fn live_bucket_usage_cache() -> &'static LiveBucketUsageCache {
     LIVE_BUCKET_USAGE_CACHE.get_or_init(|| {
         moka::future::Cache::builder()
@@ -135,6 +203,7 @@ lazy_static::lazy_static! {
         SLASH_SEPARATOR,
         DATA_USAGE_OBJ_NAME
     );
+    static ref DATA_USAGE_OBJ_BACKUP_PATH: String = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
     pub static ref DATA_USAGE_BLOOM_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
         SLASH_SEPARATOR,
@@ -147,18 +216,56 @@ lazy_static::lazy_static! {
     );
 }
 
+/// Decide whether an incoming usage snapshot must be skipped as stale, given the local
+/// wall clock `now`. Mirrors `stale_data_usage_update_reason` in
+/// `crates/scanner/src/scanner.rs` — keep the two consistent.
+///
+/// If the persisted `existing.last_update` is future-dated beyond
+/// [`rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE`] (clock step-back or a
+/// slower-clock scanner leader), it is untrustworthy: the save is allowed so usage
+/// stats cannot freeze forever.
+fn stale_data_usage_persist_reason(incoming: &DataUsageInfo, existing: &DataUsageInfo, now: SystemTime) -> Option<&'static str> {
+    match (incoming.last_update, existing.last_update) {
+        (Some(new_ts), Some(existing_ts))
+            if new_ts <= existing_ts && !rustfs_data_usage::usage_last_update_is_untrusted_future(existing_ts, now) =>
+        {
+            Some("older_or_equal_last_update")
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageSnapshotSource {
+    Primary,
+    Backup,
+    Missing,
+}
+
+fn stale_data_usage_persist_reason_for_source(
+    incoming: &DataUsageInfo,
+    existing: &DataUsageInfo,
+    source: UsageSnapshotSource,
+    now: SystemTime,
+) -> Option<&'static str> {
+    let reason = stale_data_usage_persist_reason(incoming, existing, now);
+    if source == UsageSnapshotSource::Backup && incoming.last_update == existing.last_update {
+        None
+    } else {
+        reason
+    }
+}
+
 /// Store data usage info to backend storage
 #[instrument(skip(store))]
 pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
     // Prevent older data from overwriting newer persisted stats
-    if let Ok(buf) = read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await
-        && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
-        && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
-        && new_ts <= existing_ts
+    if let Ok((existing, source)) = load_data_usage_snapshot(store.clone()).await
+        && let Some(reason) = stale_data_usage_persist_reason_for_source(&data_usage_info, &existing, source, SystemTime::now())
     {
         info!(
-            "Skip persisting data usage: incoming last_update {:?} <= existing {:?}",
-            new_ts, existing_ts
+            "Skip persisting data usage ({reason}): incoming last_update {:?} <= existing {:?}",
+            data_usage_info.last_update, existing.last_update
         );
         return Ok(());
     }
@@ -174,6 +281,12 @@ async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<E
     crate::config::com::save_config(store, &DATA_USAGE_OBJ_NAME_PATH, data)
         .await
         .map_err(Error::other)?;
+
+    // Invalidate the cached snapshot so readers observe the new save on their
+    // next request instead of waiting out the remaining TTL. The next cached
+    // read reloads through `load_data_usage_from_backend`, keeping its
+    // backward-compatibility post-processing.
+    *data_usage_snapshot_cache().write().await = None;
 
     Ok(())
 }
@@ -224,8 +337,8 @@ pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str)
     live_bucket_usage_cache().invalidate(bucket).await;
     clear_bucket_usage_memory(bucket).await;
 
-    let data_usage_info = load_data_usage_from_backend(store.clone()).await?;
-    let existing = load_data_usage_from_backend(store.clone()).await.ok();
+    let data_usage_info = load_primary_data_usage_from_backend(store.clone()).await?;
+    let existing = load_primary_data_usage_from_backend(store.clone()).await.ok();
 
     if let Some(data_usage_info) = merge_bucket_usage_removal(data_usage_info, existing, bucket) {
         save_data_usage_in_backend(data_usage_info, store).await?;
@@ -234,47 +347,123 @@ pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str)
     Ok(())
 }
 
+fn record_usage_snapshot_failure(operation: &'static str, object: &str, e: &Error) {
+    let reason = classify_system_path_failure_reason(e);
+    record_system_path_failure("data_usage", operation, reason);
+    error!(
+        event = "data_usage_snapshot_load_failed",
+        component = "ecstore",
+        subsystem = "data_usage",
+        state = "read_failed",
+        operation,
+        reason,
+        object = %object,
+        error = %e,
+        "data usage snapshot load failed"
+    );
+}
+
+fn record_usage_snapshot_decode_failure(operation: &'static str, object: &str, e: &Error) {
+    const REASON: &str = "decode_error";
+    record_system_path_failure("data_usage", operation, REASON);
+    error!(
+        event = "data_usage_snapshot_load_failed",
+        component = "ecstore",
+        subsystem = "data_usage",
+        state = "decode_failed",
+        operation,
+        reason = REASON,
+        object = %object,
+        error = %e,
+        "data usage snapshot load failed"
+    );
+}
+
+fn parse_usage_snapshot(buf: &[u8]) -> Result<DataUsageInfo, Error> {
+    serde_json::from_slice(buf).map_err(|e| {
+        Error::other(format!(
+            "Failed to deserialize data usage info: {:?} at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })
+}
+
+/// Decide which usage snapshot to serve: the primary `.usage.json` or its
+/// `.bkp` backup. The backup future is polled only when the primary is unusable,
+/// so the healthy path performs a single read.
+///
+/// `Ok(DataUsageInfo::default())` is returned only when BOTH the primary and
+/// the backup are `ConfigNotFound` — a genuine "no snapshot yet". A real
+/// primary failure with a missing backup propagates as an error instead of
+/// being rendered as confirmed all-zero stats.
+async fn resolve_loaded_snapshot_with_source(
+    primary: Result<Vec<u8>, Error>,
+    backup: impl Future<Output = Result<Vec<u8>, Error>>,
+) -> Result<(DataUsageInfo, UsageSnapshotSource), Error> {
+    let primary_failure = match primary {
+        Ok(buf) => match parse_usage_snapshot(&buf) {
+            Ok(info) => return Ok((info, UsageSnapshotSource::Primary)),
+            Err(e) => {
+                record_usage_snapshot_decode_failure("parse_primary", DATA_USAGE_OBJ_NAME_PATH.as_str(), &e);
+                e
+            }
+        },
+        Err(e) => {
+            if e != Error::ConfigNotFound {
+                record_usage_snapshot_failure("read_primary", DATA_USAGE_OBJ_NAME_PATH.as_str(), &e);
+            }
+            e
+        }
+    };
+    match backup.await {
+        Ok(buf) => match parse_usage_snapshot(&buf) {
+            Ok(info) => Ok((info, UsageSnapshotSource::Backup)),
+            Err(e) => {
+                record_usage_snapshot_decode_failure("parse_backup", &DATA_USAGE_OBJ_BACKUP_PATH, &e);
+                Err(e)
+            }
+        },
+        Err(Error::ConfigNotFound) if primary_failure == Error::ConfigNotFound => {
+            Ok((DataUsageInfo::default(), UsageSnapshotSource::Missing))
+        }
+        Err(Error::ConfigNotFound) => Err(primary_failure),
+        Err(e) => {
+            record_usage_snapshot_failure("read_backup", &DATA_USAGE_OBJ_BACKUP_PATH, &e);
+            Err(e)
+        }
+    }
+}
+
+async fn resolve_loaded_snapshot(
+    primary: Result<Vec<u8>, Error>,
+    backup: impl Future<Output = Result<Vec<u8>, Error>>,
+) -> Result<DataUsageInfo, Error> {
+    Ok(resolve_loaded_snapshot_with_source(primary, backup).await?.0)
+}
+
+async fn load_data_usage_snapshot(store: Arc<ECStore>) -> Result<(DataUsageInfo, UsageSnapshotSource), Error> {
+    let primary = read_config_preserve_empty(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await;
+    resolve_loaded_snapshot_with_source(
+        primary,
+        async move { read_config_preserve_empty(store, &DATA_USAGE_OBJ_BACKUP_PATH).await },
+    )
+    .await
+}
+
+async fn load_primary_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let buf = read_config_preserve_empty(store, &DATA_USAGE_OBJ_NAME_PATH).await?;
+    Ok(normalize_loaded_data_usage(parse_usage_snapshot(&buf)?).await)
+}
+
 /// Load data usage info from backend storage
 #[instrument(skip(store))]
 pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    let buf: Vec<u8> = match read_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await {
-        Ok(data) => data,
-        Err(e) => {
-            let reason = classify_system_path_failure_reason(&e);
-            record_system_path_failure("data_usage", "read_primary", reason);
-            error!(
-                path_kind = "data_usage",
-                operation = "read_primary",
-                reason,
-                object = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
-                error = %e,
-                "system path read failed"
-            );
+    Ok(normalize_loaded_data_usage(load_data_usage_snapshot(store).await?.0).await)
+}
 
-            match read_config(store.clone(), format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()).as_str()).await {
-                Ok(data) => data,
-                Err(e) => {
-                    if e == Error::ConfigNotFound {
-                        return Ok(DataUsageInfo::default());
-                    }
-                    let reason = classify_system_path_failure_reason(&e);
-                    record_system_path_failure("data_usage", "read_backup", reason);
-                    error!(
-                        path_kind = "data_usage",
-                        operation = "read_backup",
-                        reason,
-                        object = %format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
-                        error = %e,
-                        "system path read failed"
-                    );
-                    return Err(Error::other(e));
-                }
-            }
-        }
-    };
-    let mut data_usage_info: DataUsageInfo =
-        serde_json::from_slice(&buf).map_err(|e| Error::other(format!("Failed to deserialize data usage info: {e}")))?;
-
+async fn normalize_loaded_data_usage(mut data_usage_info: DataUsageInfo) -> DataUsageInfo {
     info!("Loaded data usage info from backend with {} buckets", data_usage_info.buckets_count);
 
     // Handle backward compatibility
@@ -325,7 +514,34 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
         }
     }
 
-    Ok(data_usage_info)
+    data_usage_info
+}
+
+/// Load the persisted data usage snapshot through a small in-process cache.
+///
+/// Admin read endpoints call this on every request; the cache bounds backend
+/// reads (and the associated JSON parse and INFO log) to once per
+/// `DATA_USAGE_CACHE_TTL_SECS` per process. `save_data_usage_in_backend`
+/// invalidates the cache so a fresh scanner save is visible immediately.
+pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+
+    {
+        let cache = data_usage_snapshot_cache().read().await;
+        if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            return result;
+        }
+    }
+
+    // Re-check under the write lock so concurrent expirations trigger a single
+    // backend read instead of a stampede.
+    let mut cache = data_usage_snapshot_cache().write().await;
+    if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+        return result;
+    }
+
+    let result = load_data_usage_from_backend(store).await;
+    cache_data_usage_snapshot_result(&mut cache, result, tokio::time::Instant::now())
 }
 
 /// Aggregate usage information from local disk snapshots.
@@ -530,6 +746,7 @@ impl BucketUsageAccumulator {
 type UsageVersionPage = StorageListObjectVersionsInfo<ObjectInfo>;
 
 pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Result<BucketUsageInfo, Error> {
+    LIVE_BUCKET_USAGE_COMPUTATIONS.fetch_add(1, Ordering::Relaxed);
     let bucket = bucket_name.to_string();
     compute_bucket_usage_with_pages(bucket_name, move |marker, version_marker| {
         let store = Arc::clone(&store);
@@ -923,7 +1140,7 @@ async fn update_usage_cache_if_needed() {
         let updating_clone = (*cache_updating()).clone();
         tokio::spawn(async move {
             if let Some(store) = runtime_sources::object_store_handle()
-                && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
+                && let Ok(data_usage_info) = load_data_usage_from_backend(store).await
             {
                 replace_bucket_usage_memory_from_info(&data_usage_info).await;
             }
@@ -947,7 +1164,7 @@ async fn update_usage_cache_if_needed() {
     drop(updating);
 
     if let Some(store) = runtime_sources::object_store_handle()
-        && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
+        && let Ok(data_usage_info) = load_data_usage_from_backend(store).await
     {
         replace_bucket_usage_memory_from_info(&data_usage_info).await;
     }
@@ -1370,6 +1587,250 @@ mod tests {
         info.buckets_count = info.buckets_usage.len() as u64;
         info.calculate_totals();
         info
+    }
+
+    fn usage_with_last_update(last_update: Option<SystemTime>) -> DataUsageInfo {
+        DataUsageInfo {
+            last_update,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_allows_newer_incoming() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let incoming = usage_with_last_update(Some(now));
+        let existing = usage_with_last_update(Some(now - Duration::from_secs(60)));
+        assert_eq!(stale_data_usage_persist_reason(&incoming, &existing, now), None);
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_skips_older_or_equal_incoming() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let existing = usage_with_last_update(Some(now - Duration::from_secs(60)));
+
+        let older = usage_with_last_update(Some(now - Duration::from_secs(120)));
+        assert_eq!(
+            stale_data_usage_persist_reason(&older, &existing, now),
+            Some("older_or_equal_last_update")
+        );
+
+        let equal = usage_with_last_update(existing.last_update);
+        assert_eq!(
+            stale_data_usage_persist_reason(&equal, &existing, now),
+            Some("older_or_equal_last_update")
+        );
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_allows_save_when_existing_is_future_dated() {
+        // Existing snapshot timestamp beyond the clock tolerance is untrustworthy
+        // (clock step-back / slower-clock leader): the save must be allowed even
+        // though incoming <= existing, otherwise usage stats freeze forever.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let existing =
+            usage_with_last_update(Some(now + rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE + Duration::from_secs(1)));
+        let incoming = usage_with_last_update(Some(now));
+        assert_eq!(stale_data_usage_persist_reason(&incoming, &existing, now), None);
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_skips_at_exact_tolerance_boundary() {
+        // Exactly at now + tolerance is still within the trusted window.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let existing = usage_with_last_update(Some(now + rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE));
+        let incoming = usage_with_last_update(Some(now));
+        assert_eq!(
+            stale_data_usage_persist_reason(&incoming, &existing, now),
+            Some("older_or_equal_last_update")
+        );
+    }
+
+    #[test]
+    fn stale_data_usage_persist_reason_preserves_none_handling() {
+        // This call site (unlike the scanner sibling) allows saves when either
+        // timestamp is missing — pin that behavior.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        let incoming_none = usage_with_last_update(None);
+        let existing_some = usage_with_last_update(Some(now - Duration::from_secs(60)));
+        assert_eq!(stale_data_usage_persist_reason(&incoming_none, &existing_some, now), None);
+
+        let incoming_some = usage_with_last_update(Some(now));
+        let existing_none = usage_with_last_update(None);
+        assert_eq!(stale_data_usage_persist_reason(&incoming_some, &existing_none, now), None);
+
+        let both_none = usage_with_last_update(None);
+        assert_eq!(stale_data_usage_persist_reason(&both_none, &usage_with_last_update(None), now), None);
+    }
+
+    #[test]
+    fn backup_stale_guard_allows_equal_snapshot_to_repair_primary() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let existing = usage_with_last_update(Some(now - Duration::from_secs(60)));
+        let equal = usage_with_last_update(existing.last_update);
+        let older = usage_with_last_update(Some(now - Duration::from_secs(120)));
+
+        assert_eq!(
+            stale_data_usage_persist_reason_for_source(&equal, &existing, UsageSnapshotSource::Backup, now),
+            None
+        );
+        assert_eq!(
+            stale_data_usage_persist_reason_for_source(&older, &existing, UsageSnapshotSource::Backup, now),
+            Some("older_or_equal_last_update")
+        );
+    }
+
+    fn snapshot_bytes(bucket: &str) -> Vec<u8> {
+        let info = data_usage_info_for_test(bucket, 3, 42, SystemTime::UNIX_EPOCH);
+        serde_json::to_vec(&info).expect("test snapshot must serialize")
+    }
+
+    #[test]
+    fn data_usage_backup_path_appends_suffix_to_primary() {
+        assert_eq!(DATA_USAGE_OBJ_BACKUP_PATH.as_str(), format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()));
+    }
+
+    fn assert_snapshot_bucket(info: &DataUsageInfo, bucket: &str) {
+        assert!(
+            info.buckets_usage.contains_key(bucket),
+            "expected snapshot for bucket {bucket}, got buckets {:?}",
+            info.buckets_usage.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_snapshot_error_does_not_include_payload_value() {
+        let err =
+            parse_usage_snapshot(br#"{"buckets_count":"secret-marker"}"#).expect_err("an invalid field type must fail decoding");
+        assert!(!err.to_string().contains("secret-marker"));
+    }
+
+    #[test]
+    fn cached_snapshot_failure_is_reused_until_ttl_expires() {
+        let loaded_at = tokio::time::Instant::now();
+        let mut cache = None;
+
+        let first = cache_data_usage_snapshot_result(&mut cache, Err(Error::ErasureReadQuorum), loaded_at);
+        assert!(matches!(first, Err(Error::ErasureReadQuorum)));
+
+        let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
+            .expect("the failed load must remain cached within the TTL");
+        assert!(cached.is_err());
+
+        assert!(fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(30), Duration::from_secs(30)).is_none());
+    }
+
+    #[test]
+    fn cached_snapshot_success_is_reused_until_ttl_expires() {
+        let loaded_at = tokio::time::Instant::now();
+        let expected = data_usage_info_for_test("bucket", 3, 42, SystemTime::UNIX_EPOCH);
+        let mut cache = None;
+
+        let first =
+            cache_data_usage_snapshot_result(&mut cache, Ok(expected), loaded_at).expect("successful load must be returned");
+        assert_snapshot_bucket(&first, "bucket");
+
+        let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
+            .expect("successful load must remain cached within the TTL")
+            .expect("cached success must remain successful");
+        assert_snapshot_bucket(&cached, "bucket");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_ok_is_used_without_backup_read() {
+        let backup_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backup_read_probe = Arc::clone(&backup_read);
+
+        let info = resolve_loaded_snapshot(Ok(snapshot_bytes("primary-bucket")), async move {
+            backup_read_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(snapshot_bytes("backup-bucket"))
+        })
+        .await
+        .expect("healthy primary snapshot must load");
+
+        assert_snapshot_bucket(&info, "primary-bucket");
+        assert!(
+            !backup_read.load(std::sync::atomic::Ordering::SeqCst),
+            "backup must not be read when the primary parses"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_corrupt_falls_back_to_backup() {
+        let (info, source) =
+            resolve_loaded_snapshot_with_source(Ok(b"{not json".to_vec()), async { Ok(snapshot_bytes("backup-bucket")) })
+                .await
+                .expect("backup snapshot must be served when the primary is corrupt");
+
+        assert_snapshot_bucket(&info, "backup-bucket");
+        assert_eq!(source, UsageSnapshotSource::Backup);
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_corrupt_backup_corrupt_is_error() {
+        let err = resolve_loaded_snapshot(Ok(b"{not json".to_vec()), async { Ok(b"also not json".to_vec()) })
+            .await
+            .expect_err("two corrupt snapshots must not produce stats");
+        assert!(err.to_string().contains("deserialize"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_corrupt_backup_missing_is_error() {
+        let err = resolve_loaded_snapshot(Ok(b"{not json".to_vec()), async { Err(Error::ConfigNotFound) })
+            .await
+            .expect_err("a corrupt primary without a backup must not produce stats");
+        assert!(err.to_string().contains("deserialize"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_empty_backup_missing_is_error() {
+        let err = resolve_loaded_snapshot(Ok(Vec::new()), async { Err(Error::ConfigNotFound) })
+            .await
+            .expect_err("an empty primary object is corrupt, not an absent snapshot");
+        assert!(err.to_string().contains("deserialize"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_read_error_falls_back_to_backup() {
+        let info = resolve_loaded_snapshot(Err(Error::ErasureReadQuorum), async { Ok(snapshot_bytes("backup-bucket")) })
+            .await
+            .expect("backup snapshot must be served when the primary read fails");
+
+        assert_snapshot_bucket(&info, "backup-bucket");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_real_error_backup_missing_is_error_not_zeros() {
+        let err = resolve_loaded_snapshot(Err(Error::ErasureReadQuorum), async { Err(Error::ConfigNotFound) })
+            .await
+            .expect_err("primary corruption must not be rendered as all-zero stats");
+        assert!(matches!(err, Error::ErasureReadQuorum), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_primary_missing_uses_backup() {
+        let info = resolve_loaded_snapshot(Err(Error::ConfigNotFound), async { Ok(snapshot_bytes("backup-bucket")) })
+            .await
+            .expect("an existing backup must be used when the primary is missing");
+        assert_snapshot_bucket(&info, "backup-bucket");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_backup_read_error_is_preserved() {
+        let err = resolve_loaded_snapshot(Err(Error::ConfigNotFound), async { Err(Error::ErasureReadQuorum) })
+            .await
+            .expect_err("a backup read failure must be returned");
+        assert!(matches!(err, Error::ErasureReadQuorum), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_snapshot_both_missing_is_default() {
+        let info = resolve_loaded_snapshot(Err(Error::ConfigNotFound), async { Err(Error::ConfigNotFound) })
+            .await
+            .expect("no snapshot yet must resolve to empty stats");
+        assert_eq!(info.buckets_count, 0);
+        assert!(info.buckets_usage.is_empty());
     }
 
     #[tokio::test]
