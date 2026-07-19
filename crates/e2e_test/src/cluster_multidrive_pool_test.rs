@@ -87,12 +87,6 @@ async fn cluster_two_pool_smoke() -> TestResult {
 
     let mut cluster =
         RustFSTestClusterEnvironment::with_topology(ClusterTopology::per_node_pools(2, vec![vec![0], vec![1]])).await?;
-    cluster.access_key = "custom-two-pool-access".to_string();
-    cluster.secret_key = "custom-two-pool-secret".to_string();
-    // Override any inherited test-runner value with an explicit blank. The
-    // credentials getter treats blank as absent and must derive one stable RPC
-    // secret from the shared non-default credential pair on every node.
-    cluster.set_env("RUSTFS_RPC_SECRET", "");
 
     // The two-pool layout must emit one ellipses argument per pool.
     let volumes = cluster.rustfs_volumes_arg();
