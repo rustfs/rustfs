@@ -395,7 +395,24 @@ impl FileMeta {
     // delete_version deletes version, returns data_dir
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
+        fi.validate_for_delete_operation()?;
+
         let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
+        if fi.deleted && fi.tier_free_version() {
+            let Some(index) = self.versions.iter().position(|version| {
+                version.header.version_id == vid
+                    && version.header.version_type == VersionType::Delete
+                    && version.header.free_version()
+                    && version
+                        .parse_version_meta()
+                        .is_ok_and(|decoded| decoded.free_version() && decoded.header().version_id == vid)
+            }) else {
+                return Err(Error::FileVersionNotFound);
+            };
+            self.versions.remove(index);
+            return Ok(None);
+        }
+
         let target_is_delete_marker = self
             .versions
             .iter()
@@ -410,10 +427,6 @@ impl FileMeta {
                 mod_time: fi.mod_time,
                 ..Default::default()
             });
-
-            if !fi.is_valid() {
-                return Err(Error::other("invalid file meta version"));
-            }
         }
 
         let mut update_version = false;
@@ -976,6 +989,52 @@ mod test {
             .expect("large fileinfo");
         assert_eq!(fi.size, 300_000, "large.bin size");
         assert!(!fi.parts.is_empty(), "multipart/part layout present");
+    }
+
+    /// Compatibility guard for the tightened `validate_for_metadata_read()` decode
+    /// boundary (the rolling-upgrade / MinIO-migration risk): every version of
+    /// every real, historically-written `xl.meta` fixture must still be *accepted*
+    /// on read, never rejected as `FileCorrupt`. This is the empirical companion to
+    /// the code-reasoned decode-tolerance invariants in
+    /// `docs/architecture/erasure-coding.md` §11 — reverting the tolerant handling
+    /// (delete-marker shape, legacy per-part checksums, string/short
+    /// `transitioned-versionID`, negative `actual_size`) turns one of these red.
+    /// It covers real MinIO-written objects (inline, versioned incl. a delete
+    /// marker, and multipart), a legacy V1 (`xl.json`-derived) object, and a legacy
+    /// meta_ver 2 object.
+    #[test]
+    fn real_historical_xlmeta_versions_pass_metadata_read_validation() {
+        let fixtures: [(&str, Vec<u8>); 5] = [
+            ("minio-small-inline", create_minio_small_object_xlmeta().expect("small fixture")),
+            (
+                "minio-versioned+delete-marker",
+                create_minio_versioned_object_xlmeta().expect("versioned fixture"),
+            ),
+            ("minio-large-multipart", create_minio_large_object_xlmeta().expect("large fixture")),
+            ("legacy-v1-object", create_legacy_v1_object_xlmeta().expect("legacy v1 fixture")),
+            (
+                "legacy-meta-v2-object",
+                create_issue_2265_legacy_meta_v2_object_xlmeta().expect("legacy meta v2 fixture"),
+            ),
+        ];
+
+        for (label, bytes) in fixtures {
+            let fm = FileMeta::load(&bytes).unwrap_or_else(|e| panic!("{label}: load real xl.meta failed: {e}"));
+            // `all_parts = true` materializes the part arrays so the checksum/part and
+            // shard-size checks in `validate_for_metadata_read` are actually exercised.
+            let versions = fm
+                .list_versions("interop", "object", true)
+                .unwrap_or_else(|e| panic!("{label}: list_versions failed: {e}"));
+            assert!(!versions.is_empty(), "{label}: fixture must contain at least one version");
+            for (i, fi) in versions.iter().enumerate() {
+                fi.validate_for_metadata_read().unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: version {i} (deleted={}) rejected by validate_for_metadata_read: {e:?}",
+                        fi.deleted
+                    )
+                });
+            }
+        }
     }
 
     /// Wraps a raw meta block in a valid XL2 container (header, bin32 length
@@ -2069,6 +2128,152 @@ mod test {
         assert!(
             fm.versions.is_empty(),
             "delete-marker version purge should remove the local marker instead of rewriting purge metadata onto it"
+        );
+    }
+
+    #[test]
+    fn delete_version_accepts_delete_only_marker_and_free_version_paths() {
+        let marker_version_id = Uuid::new_v4();
+        let mut marker_meta = FileMeta::new();
+        marker_meta
+            .delete_version(&FileInfo {
+                version_id: Some(marker_version_id),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete-marker metadata must not require a payload erasure layout");
+        assert_eq!(marker_meta.versions.len(), 1);
+        assert_eq!(marker_meta.versions[0].header.version_type, VersionType::Delete);
+
+        let object_version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut free_meta = FileMeta::new();
+        free_meta
+            .add_version(FileInfo {
+                volume: "bucket".to_string(),
+                name: "object".to_string(),
+                version_id: Some(object_version_id),
+                transition_status: TRANSITION_COMPLETE.to_string(),
+                transitioned_objname: "remote/object".to_string(),
+                transition_version_id: Some(remote_version_id),
+                transition_tier: "WARM".to_string(),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("transitioned object version must be seeded");
+
+        let mut transition_delete = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        transition_delete.set_tier_free_version_id(&free_version_id.to_string());
+        free_meta
+            .delete_version(&transition_delete)
+            .expect("transitioned delete must persist free-version cleanup metadata");
+
+        let mut free_version_delete = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(free_version_id),
+            deleted: true,
+            ..Default::default()
+        };
+        free_version_delete.set_tier_free_version();
+        free_meta
+            .delete_version(&free_version_delete)
+            .expect("free-version cleanup must not require a payload erasure layout");
+
+        let versions = free_meta
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions must remain readable after free-version cleanup");
+        assert!(versions.free_versions.is_empty());
+    }
+
+    #[test]
+    fn delete_version_validates_requests_before_mutation() {
+        let version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("object version must be seeded");
+        let original = fm.clone();
+
+        let err = fm
+            .delete_version(&FileInfo {
+                version_id: Some(version_id),
+                parts: vec![
+                    ObjectPartInfo {
+                        number: 1,
+                        ..Default::default()
+                    },
+                    ObjectPartInfo {
+                        number: 1,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })
+            .expect_err("non-deleted requests must not bypass boundary validation");
+
+        assert_eq!(err, Error::FileCorrupt);
+        assert_eq!(fm, original, "failed validation must happen before metadata mutation");
+
+        let err = fm
+            .delete_version(&FileInfo {
+                version_id: Some(version_id),
+                deleted: true,
+                mod_time: None,
+                ..Default::default()
+            })
+            .expect_err("malformed delete markers must fail before removing the existing object version");
+
+        assert_eq!(err, Error::FileCorrupt);
+        assert_eq!(fm, original, "malformed delete-marker validation must precede metadata mutation");
+
+        let mut free_version_delete = FileInfo {
+            version_id: Some(version_id),
+            deleted: true,
+            ..Default::default()
+        };
+        free_version_delete.set_tier_free_version();
+        let err = fm
+            .delete_version(&free_version_delete)
+            .expect_err("tier free-version cleanup must not remove an ordinary object version");
+
+        assert_eq!(err, Error::FileVersionNotFound);
+        assert_eq!(fm, original, "missing free-version cleanup must not mutate ordinary metadata");
+
+        let mut poisoned_object_header = fm.clone();
+        poisoned_object_header.versions[0].header.flags |= XL_FLAG_FREE_VERSION;
+        let poisoned_original = poisoned_object_header.clone();
+        let err = poisoned_object_header
+            .delete_version(&free_version_delete)
+            .expect_err("a free-version flag on an Object header must not authorize cleanup deletion");
+        assert_eq!(err, Error::FileVersionNotFound);
+        assert_eq!(
+            poisoned_object_header, poisoned_original,
+            "a poisoned Object header must remain unchanged after rejected cleanup"
+        );
+
+        let mut mismatched_delete_header = fm.clone();
+        mismatched_delete_header.versions[0].header.flags |= XL_FLAG_FREE_VERSION;
+        mismatched_delete_header.versions[0].header.version_type = VersionType::Delete;
+        let mismatched_original = mismatched_delete_header.clone();
+        let err = mismatched_delete_header
+            .delete_version(&free_version_delete)
+            .expect_err("a Delete/free header over an Object body must fail closed");
+        assert_eq!(err, Error::FileVersionNotFound);
+        assert_eq!(
+            mismatched_delete_header, mismatched_original,
+            "header/body mismatch must not mutate metadata"
         );
     }
 

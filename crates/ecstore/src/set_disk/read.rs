@@ -121,7 +121,7 @@ impl SetDisks {
         online_disks: &[Option<DiskStore>],
         read_quorum: usize,
     ) {
-        if fi.deleted || !fi.is_valid() {
+        if fi.deleted || !fi.has_valid_erasure_geometry() {
             return;
         }
         let (bucket, object) = identity;
@@ -3192,10 +3192,13 @@ mod tests {
         let mut historical = metadata_fanout_test_fileinfo("object");
         historical.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
 
-        let mut delete_marker = metadata_fanout_test_fileinfo("object");
-        delete_marker.deleted = true;
-        delete_marker.version_id =
-            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").expect("static uuid should parse"));
+        let delete_marker = FileInfo {
+            name: "object".to_string(),
+            deleted: true,
+            version_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").expect("static uuid should parse")),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(3).expect("static timestamp should parse")),
+            ..Default::default()
+        };
 
         let diagnostics = MetadataFanoutDiagnostics::new(
             Duration::from_millis(9),
@@ -3297,6 +3300,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_quorum_accumulator_rejects_semantic_field_splits() {
+        type FileInfoMutation = fn(&mut FileInfo);
+
+        let mutations: &[(&str, FileInfoMutation)] = &[
+            ("transition_status", |fi| fi.transition_status = "complete".to_string()),
+            ("transitioned_objname", |fi| fi.transitioned_objname = "remote-object".to_string()),
+            ("transition_tier", |fi| fi.transition_tier = "WARM".to_string()),
+            ("transition_version_id", |fi| fi.transition_version_id = Some(Uuid::from_u128(10))),
+            ("expire_restored", |fi| fi.expire_restored = true),
+            ("written_by_version", |fi| fi.written_by_version = Some(1)),
+            ("replication_state_internal", |fi| {
+                fi.replication_state_internal = Some(Default::default())
+            }),
+            ("num_versions", |fi| fi.num_versions = 2),
+            ("successor_mod_time", |fi| {
+                fi.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(10).expect("static timestamp should parse"));
+            }),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut accumulator = metadata_early_stop_accumulator();
+            let first = metadata_early_stop_candidate("object", 1);
+            let mut second = metadata_early_stop_candidate("object", 2);
+            let mut third = metadata_early_stop_candidate("object", 3);
+            mutate(&mut second);
+            mutate(&mut third);
+
+            accumulator.observe_file_info(&first);
+            accumulator.observe_file_info(&second);
+            accumulator.observe_file_info(&third);
+
+            assert!(accumulator.conflicting_metadata, "split {field} must block metadata early-stop");
+            assert!(
+                accumulator.early_stop_decision().is_none(),
+                "split {field} must not be mistaken for three matching votes"
+            );
+            assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
+        }
+    }
+
+    #[test]
     fn metadata_quorum_accumulator_falls_back_on_split_data_dir() {
         let mut accumulator = metadata_early_stop_accumulator();
         let mut first = metadata_early_stop_candidate("object", 1);
@@ -3325,8 +3369,15 @@ mod tests {
     #[test]
     fn metadata_quorum_accumulator_hits_delete_marker_quorum_early_stop() {
         let mut accumulator = metadata_early_stop_accumulator();
-        let mut deleted = metadata_early_stop_candidate("object", 1);
-        deleted.deleted = true;
+        let deleted = FileInfo {
+            name: "object".to_string(),
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        assert!(!deleted.is_valid(), "real delete markers do not carry erasure geometry");
 
         accumulator.observe_file_info(&deleted);
         accumulator.observe_file_info(&deleted);
@@ -3344,13 +3395,61 @@ mod tests {
     #[test]
     fn metadata_quorum_accumulator_falls_back_on_delete_marker_below_quorum() {
         let mut accumulator = metadata_early_stop_accumulator();
-        let mut deleted = metadata_early_stop_candidate("object", 1);
-        deleted.deleted = true;
+        let deleted = FileInfo {
+            name: "object".to_string(),
+            deleted: true,
+            version_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000004").expect("static uuid should parse")),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(4).expect("static timestamp should parse")),
+            ..Default::default()
+        };
 
         accumulator.observe_file_info(&deleted);
 
         assert!(accumulator.early_stop_decision().is_none());
         assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_does_not_treat_purge_pending_payload_as_delete_marker() {
+        let mut accumulator = MetadataQuorumAccumulator::new(6, 3, true);
+        let version_id = Uuid::parse_str("00000000-0000-0000-0000-000000000005").expect("static uuid should parse");
+
+        for disk_index in 1..=4 {
+            let mut purge_pending = FileInfo::new("object", 5, 1);
+            purge_pending.name = "object".to_string();
+            purge_pending.version_id = Some(version_id);
+            purge_pending.mod_time = Some(OffsetDateTime::from_unix_timestamp(5).expect("static timestamp should parse"));
+            purge_pending.size = 1;
+            purge_pending.deleted = true;
+            purge_pending.erasure.index = disk_index;
+            purge_pending.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
+
+            accumulator.observe_file_info(&purge_pending);
+        }
+
+        assert!(!accumulator.delete_marker_seen);
+        assert_eq!(accumulator.candidate_votes, 4);
+        assert!(
+            accumulator.early_stop_decision().is_none(),
+            "EC:1 purge-pending payload on six disks still requires five matching payload votes"
+        );
+
+        let mut fifth = FileInfo::new("object", 5, 1);
+        fifth.name = "object".to_string();
+        fifth.version_id = Some(version_id);
+        fifth.mod_time = Some(OffsetDateTime::from_unix_timestamp(5).expect("static timestamp should parse"));
+        fifth.size = 1;
+        fifth.deleted = true;
+        fifth.erasure.index = 5;
+        fifth.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
+        accumulator.observe_file_info(&fifth);
+
+        assert_eq!(
+            accumulator.early_stop_decision(),
+            Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM
+            })
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@ use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::services::tier::{
-    tier::{TierConfigMgr, tier_destination_id_from_metadata},
+    tier::{TierConfigMgr, TierOperationLease, tier_destination_id_from_metadata},
     warm_backend::WarmBackendGetOpts,
 };
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
@@ -77,8 +77,10 @@ use std::env;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
@@ -2539,7 +2541,34 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
             );
             e
         })?;
-    Ok(get_fn(reader, h.clone()))
+    Ok(attach_tier_operation_lease(get_fn(reader, h.clone()), tgt_client))
+}
+
+struct TierOperationLeaseReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    lease: Option<TierOperationLease>,
+}
+
+impl AsyncRead for TierOperationLeaseReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let had_capacity = buf.remaining() > 0;
+        let filled_before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Err(_)))
+            || (had_capacity && matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before)
+        {
+            self.lease.take();
+        }
+        poll
+    }
+}
+
+fn attach_tier_operation_lease(mut reader: GetObjectReader, lease: TierOperationLease) -> GetObjectReader {
+    reader.stream = Box::new(TierOperationLeaseReader {
+        inner: reader.stream,
+        lease: Some(lease),
+    });
+    reader
 }
 
 pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, std::io::Error> {
@@ -3139,11 +3168,19 @@ mod tests {
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
+    #[cfg(feature = "test-util")]
+    use crate::client::transition_api::ReaderImpl;
     use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
     use crate::disk::endpoint::Endpoint;
     use crate::error::is_err_invalid_upload_id;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
+    #[cfg(feature = "test-util")]
+    use crate::services::tier::test_util::register_mock_tier;
+    #[cfg(feature = "test-util")]
+    use crate::services::tier::tier::TierConfigMgr;
+    #[cfg(feature = "test-util")]
+    use crate::services::tier::warm_backend::WarmBackend as _;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
@@ -3151,7 +3188,11 @@ mod tests {
         multipart::MultipartOperations as _,
     };
     use crate::store::ECStore;
+    #[cfg(feature = "test-util")]
+    use bytes::Bytes;
     use futures::FutureExt;
+    #[cfg(feature = "test-util")]
+    use http::HeaderMap;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use s3s::dto::{
@@ -3168,8 +3209,72 @@ mod tests {
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
     use tokio::fs;
+    #[cfg(feature = "test-util")]
+    use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_reader_holds_tier_operation_lease_until_stream_finishes() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"transitioned object body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body.clone()),
+                i64::try_from(body.len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: i64::try_from(body.len()).expect("body length should fit"),
+            transitioned_object: TransitionedObject {
+                name: remote_object,
+                version_id: remote_version,
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier: tier.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut reader = get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+        )
+        .await
+        .expect("transitioned reader should open");
+
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            1,
+            "returned reader must keep the tier generation leased"
+        );
+
+        let mut got = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut got)
+            .await
+            .expect("transitioned reader should drain");
+        assert_eq!(got, body.as_ref());
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            0,
+            "tier generation lease should release after EOF"
+        );
+    }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]

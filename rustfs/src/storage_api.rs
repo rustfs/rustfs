@@ -93,7 +93,16 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
-        pub(crate) use crate::storage::storage_api::{ServerContextSlot, TONIC_RPC_PREFIX, verify_rpc_signature};
+        pub(crate) use crate::storage::storage_api::{
+            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
+        };
+
+        pub(crate) fn try_current_local_node_name() -> Option<String> {
+            crate::storage::storage_api::try_current_local_node_name()
+        }
+
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::gen_tonic_signature_headers;
 
         pub(crate) mod ecfs {
             pub(crate) type FS = crate::storage::storage_api::FS;

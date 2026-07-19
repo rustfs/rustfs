@@ -344,6 +344,16 @@ impl AppContext {
             object_data_cache: ObjectDataCacheAdapter::disabled_arc(),
         }
     }
+
+    pub(crate) fn with_test_runtime_config_interfaces(
+        mut self,
+        server_config: Arc<dyn ServerConfigInterface>,
+        storage_class: Arc<dyn StorageClassInterface>,
+    ) -> Self {
+        self.server_config = server_config;
+        self.storage_class = storage_class;
+        self
+    }
 }
 
 static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();

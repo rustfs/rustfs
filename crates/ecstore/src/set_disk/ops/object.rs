@@ -702,6 +702,7 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         crate::hp_guard!("SetDisks::put_object");
+        let storage_class_config = self.storage_class_config_snapshot();
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let disks = self.get_disks_internal().await;
@@ -727,18 +728,18 @@ impl SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
-
-        let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
-        if opts.max_parity {
-            parity_drives = disks.len() / 2;
-        }
-
-        let data_drives = disks.len() - parity_drives;
-        let mut write_quorum = data_drives;
-        if data_drives == parity_drives {
-            write_quorum += 1
-        }
+        let WriteLayout {
+            data_drives,
+            parity_drives,
+            write_quorum,
+        } = resolve_write_layout(
+            &storage_class_config,
+            self.pool_index,
+            disks.len(),
+            self.default_parity_count,
+            user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str),
+            opts.max_parity,
+        )?;
 
         // if filtered_online < write_quorum {
         //     warn!(
@@ -776,8 +777,7 @@ impl SetDisks {
             let erasure = erasure_from_file_info(&fi, false)?;
 
             let put_object_size = known_put_object_storage_size(data.size());
-            let is_inline_buffer =
-                runtime_sources::storage_class_should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
+            let is_inline_buffer = storage_class_config.should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
 
             let shard_file_size = erasure.shard_file_size(put_object_size);
             let shard_size = erasure.shard_size();
@@ -1946,7 +1946,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let inline_data = fi.inline_data();
 
             for fi in metas.iter_mut() {
-                if fi.is_valid() {
+                if fi.has_valid_erasure_geometry() {
                     fi.metadata = (*src_info.user_defined).clone();
                     if let Some(etag) = &src_info.etag {
                         fi.metadata.insert("etag".to_owned(), etag.clone());
@@ -3402,14 +3402,15 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    pub(in crate::set_disk::ops) async fn make_formatted_local_disk(
+    async fn make_formatted_local_disk_for_pool(
         disk_idx: usize,
+        pool_index: usize,
         format: &FormatV3,
     ) -> (TempDir, Endpoint, DiskStore) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let mut endpoint =
             Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
-        endpoint.set_pool_index(0);
+        endpoint.set_pool_index(pool_index);
         endpoint.set_set_index(0);
         endpoint.set_disk_index(disk_idx);
 
@@ -3433,6 +3434,14 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     }
 
     pub(in crate::set_disk::ops) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+        hermetic_set_disks_for_pool_with_default_parity(disk_count, 0, disk_count / 2).await
+    }
+
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks_for_pool_with_default_parity(
+        disk_count: usize,
+        pool_index: usize,
+        default_parity_count: usize,
+    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
         let mut temp_dirs = Vec::with_capacity(disk_count);
@@ -3441,7 +3450,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         let mut disks = Vec::with_capacity(disk_count);
 
         for disk_idx in 0..disk_count {
-            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_pool(disk_idx, pool_index, &format).await;
             temp_dirs.push(temp_dir);
             endpoints.push(endpoint);
             disk_stores.push(disk.clone());
@@ -3452,9 +3461,9 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             "hermetic-ops-test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
             disk_count,
-            disk_count / 2,
+            default_parity_count,
             0,
-            0,
+            pool_index,
             endpoints,
             format,
             Vec::new(),
@@ -3589,7 +3598,7 @@ mod metadata_mutation_generation_tests {
 mod transition_commit_failure_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
-    use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+    use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions};
     use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
     use crate::services::tier::tier::TierConfigMgr;
@@ -3802,6 +3811,89 @@ mod transition_commit_failure_tests {
             "cancelled transition must clean up with the old driver"
         );
         assert_eq!(old_backend.object_count().await, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_restore_cleanup_does_not_overwrite_concurrent_unversioned_put() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-cas-bucket";
+        let object = "object.bin";
+        let original_payload = b"old transitioned body".repeat(1024);
+        let replacement_payload = b"new visible unversioned body".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(original_payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should transition before restore");
+
+        let get_barrier = backend.arm_failing_get_barrier().await;
+        let restore_set = Arc::clone(&set_disks);
+        let restore = tokio::spawn(async move {
+            let mut opts = ObjectOptions::default();
+            opts.transition.restore_request.days = Some(1);
+            restore_set.restore_transitioned_object(bucket, object, &opts).await
+        });
+        get_barrier.wait_until_paused().await;
+
+        let mut replacement_reader = PutObjReader::from_vec(replacement_payload.clone());
+        let replacement = set_disks
+            .put_object(bucket, object, &mut replacement_reader, &ObjectOptions::default())
+            .await
+            .expect("concurrent unversioned PUT should commit while restore GET is paused");
+        get_barrier.release();
+        restore
+            .await
+            .expect("restore task should join")
+            .expect_err("injected tier GET failure should surface");
+
+        let visible = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("replacement metadata should remain visible");
+        assert_eq!(visible.etag, replacement.etag, "stale restore cleanup must not republish the old ETag");
+        assert_ne!(
+            visible.transitioned_object.status, TRANSITION_COMPLETE,
+            "replacement object must not regain stale transition metadata"
+        );
+        let mut body = Vec::new();
+        set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("replacement object should be readable")
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("replacement body should drain");
+        assert_eq!(
+            body, replacement_payload,
+            "stale restore cleanup must not make the old remote body current again"
+        );
     }
 
     #[tokio::test]
@@ -4198,6 +4290,61 @@ mod transition_source_identity_matrix_tests {
                 assert_eq!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod heterogeneous_pool_put_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity;
+    use super::*;
+    use crate::config::storageclass::lookup_config_for_pools_without_env;
+    use crate::disk::{DiskAPI as _, ReadOptions};
+    use rustfs_config::server_config::KVS;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn second_pool_regular_put_uses_its_own_layout_and_round_trips() {
+        // Deliberately inject the first pool's invalid scalar fallback. The
+        // test can pass only if the production PUT uses the held [4, 2]
+        // storage-class snapshot and resolves pool 1 to parity 1.
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(2, 1, 2).await;
+        set_disks.set_test_storage_class_config(
+            lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("heterogeneous pool storage class should resolve"),
+        );
+
+        let bucket = "regular-put-second-pool-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let payload = vec![0x3c; 4096];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("second-pool regular PUT should encode without zero data shards");
+
+        for (disk_index, disk) in disk_stores.iter().enumerate() {
+            let file_info = disk
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .unwrap_or_else(|err| panic!("disk {disk_index} should persist valid second-pool metadata: {err}"));
+            assert_eq!(file_info.erasure.data_blocks, 1);
+            assert_eq!(file_info.erasure.parity_blocks, 1);
+        }
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("second-pool regular PUT should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("second-pool regular PUT should stream");
+        assert_eq!(restored, payload);
     }
 }
 
