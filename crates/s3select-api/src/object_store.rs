@@ -1069,6 +1069,15 @@ where
             remaining -= bytes.len();
             y.yield_ok(bytes).await;
         }
+        if remaining > 0 {
+            return Err(o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("object stream ended with {remaining} bytes remaining"),
+                )),
+            });
+        }
         Ok(())
     })
 }
@@ -1322,6 +1331,28 @@ mod test {
 
         assert_eq!(chunks, vec![Bytes::from_static(b"abcd")]);
         assert_eq!(poll_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bytes_stream_rejects_early_eof() {
+        let source = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))]);
+        let output = bytes_stream(source, 4);
+        futures::pin_mut!(output);
+
+        assert_eq!(output.next().await.expect("first stream item").expect("first chunk"), b"ab"[..]);
+        let err = output
+            .next()
+            .await
+            .expect("early EOF error")
+            .expect_err("short stream must fail");
+        let object_store::Error::Generic { store, source } = err else {
+            panic!("expected generic object store error");
+        };
+        assert_eq!(store, "EcObjectStore");
+        let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
+        assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(source.to_string().contains("2 bytes remaining"));
+        assert!(output.next().await.is_none());
     }
 
     /// A JSON array is split into one NDJSON line per element.
