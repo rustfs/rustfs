@@ -176,12 +176,28 @@ pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
     }
 }
 
+fn endpoint_rpc_authority(endpoint: &Endpoint) -> Option<String> {
+    let host = endpoint.url.host_str()?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Some(match endpoint.url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
 pub(super) async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, port: &String) {
     let mut peer_set = Vec::new();
     endpoint_pools.as_ref().iter().for_each(|endpoints| {
         endpoints.endpoints.as_ref().iter().for_each(|endpoint| {
-            if endpoint.get_type() == EndpointType::Url && endpoint.is_local && endpoint.url.has_host() {
-                peer_set.push(endpoint.url.host_str().unwrap().to_string());
+            if endpoint.get_type() == EndpointType::Url
+                && endpoint.is_local
+                && let Some(authority) = endpoint_rpc_authority(endpoint)
+            {
+                peer_set.push(authority);
             }
         });
     });
@@ -232,6 +248,37 @@ mod tests {
             cmd_line: "instance-ctx-disk-registry-test".to_string(),
             platform: "test".to_string(),
         }])
+    }
+
+    #[test]
+    fn endpoint_rpc_authority_preserves_port_and_ipv6_brackets() {
+        let endpoint = Endpoint::try_from("https://127.0.0.1:9001/d1").expect("URL endpoint");
+        assert_eq!(endpoint_rpc_authority(&endpoint).as_deref(), Some("127.0.0.1:9001"));
+
+        let endpoint = Endpoint::try_from("https://[::1]:9002/d1").expect("IPv6 URL endpoint");
+        assert_eq!(endpoint_rpc_authority(&endpoint).as_deref(), Some("[::1]:9002"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_local_peer_publishes_complete_rpc_authority() {
+        let previous = rustfs_common::get_global_local_node_name().await;
+        let mut endpoint = Endpoint::try_from("https://127.0.0.1:9001/d1").expect("URL endpoint");
+        endpoint.is_local = true;
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint]),
+            cmd_line: "rpc-authority-test".to_string(),
+            platform: "test".to_string(),
+        }]);
+
+        let host = String::new();
+        let port = "9000".to_string();
+        init_local_peer(&endpoint_pools, &host, &port).await;
+        assert_eq!(rustfs_common::try_get_global_local_node_name().as_deref(), Some("127.0.0.1:9001"));
+        rustfs_common::set_global_local_node_name(&previous).await;
     }
 
     // Phase 5 follow-up (backlog#1052): registering local disks through the

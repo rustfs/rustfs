@@ -462,9 +462,12 @@ pub(crate) mod ecstore_rio {
 }
 
 pub(crate) mod ecstore_rpc {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::gen_tonic_signature_headers;
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, verify_rpc_signature,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_rpc_signature,
+        verify_tonic_rpc_signature,
     };
 }
 
@@ -518,6 +521,18 @@ pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNA
 pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = ecstore_rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
 pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
 pub(crate) const TONIC_RPC_PREFIX: &str = ecstore_rpc::TONIC_RPC_PREFIX;
+
+pub(crate) fn normalize_tonic_rpc_audience(value: &str) -> std::io::Result<String> {
+    ecstore_rpc::normalize_tonic_rpc_audience(value)
+}
+
+pub(crate) fn try_current_local_node_name() -> Option<String> {
+    crate::storage::runtime_sources::try_current_local_node_name()
+}
+
+#[cfg(test)]
+pub(crate) use ecstore_rpc::gen_tonic_signature_headers;
+
 #[cfg(test)]
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
 
@@ -1382,6 +1397,10 @@ pub(crate) async fn collect_local_metrics(
 
 pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &http::HeaderMap) -> std::io::Result<()> {
     ecstore_rpc::verify_rpc_signature(url, method, headers)
+}
+
+pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &http::HeaderMap) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_rpc_signature(audience, path, headers)
 }
 
 pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {

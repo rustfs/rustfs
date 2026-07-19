@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
+use crate::cluster::rpc::http_auth::RPC_CONTENT_SHA256_HEADER;
+use crate::cluster::rpc::{gen_tonic_signature_headers, normalize_tonic_rpc_audience};
 use crate::disk::error::{DiskError, Error as DiskErrorType};
 use crate::runtime::sources as runtime_sources;
-use http::Method;
+use http::Uri;
 use rustfs_protos::{
     ChannelClass, create_new_channel, get_channel_for_class, proto_gen::node_service::node_service_client::NodeServiceClient,
 };
@@ -47,6 +48,7 @@ pub async fn node_service_time_out_client_for_class(
     interceptor: TonicInterceptor,
     class: ChannelClass,
 ) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
+    let interceptor = interceptor.with_rpc_audience(addr)?;
     let channel = match class {
         ChannelClass::Control => match runtime_sources::cached_node_channel(addr).await {
             Some(channel) => {
@@ -111,11 +113,25 @@ pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {
     }
 }
 
-pub struct TonicSignatureInterceptor;
+pub struct TonicSignatureInterceptor {
+    audience: Option<String>,
+}
 
 impl tonic::service::Interceptor for TonicSignatureInterceptor {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET)
+        let method = req
+            .extensions()
+            .get::<tonic::GrpcMethod<'_>>()
+            .ok_or_else(|| tonic::Status::unauthenticated("Missing gRPC method metadata"))?;
+        let audience = self
+            .audience
+            .as_deref()
+            .ok_or_else(|| tonic::Status::unauthenticated("Missing gRPC audience"))?;
+        let content_sha256 = req
+            .metadata()
+            .get(RPC_CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let headers = gen_tonic_signature_headers(audience, method.service(), method.method(), content_sha256)
             .map_err(|_| tonic::Status::unauthenticated("No valid auth token"))?;
         req.metadata_mut().as_mut().extend(headers);
         inject_trace_context_into_metadata(req.metadata_mut());
@@ -125,7 +141,7 @@ impl tonic::service::Interceptor for TonicSignatureInterceptor {
 }
 
 pub fn gen_tonic_signature_interceptor() -> TonicSignatureInterceptor {
-    TonicSignatureInterceptor
+    TonicSignatureInterceptor { audience: None }
 }
 
 pub struct NoOpInterceptor;
@@ -139,6 +155,22 @@ impl tonic::service::Interceptor for NoOpInterceptor {
 pub enum TonicInterceptor {
     Signature(TonicSignatureInterceptor),
     NoOp(NoOpInterceptor),
+}
+
+impl TonicInterceptor {
+    fn with_rpc_audience(mut self, addr: &str) -> std::io::Result<Self> {
+        if let Self::Signature(interceptor) = &mut self {
+            let uri = addr
+                .parse::<Uri>()
+                .map_err(|_| std::io::Error::other("Invalid gRPC peer URI"))?;
+            let audience = uri
+                .authority()
+                .map(|authority| normalize_tonic_rpc_audience(authority.as_str()))
+                .ok_or_else(|| std::io::Error::other("Missing gRPC peer authority"))?;
+            interceptor.audience = Some(audience?);
+        }
+        Ok(self)
+    }
 }
 
 impl tonic::service::Interceptor for TonicInterceptor {
@@ -163,6 +195,20 @@ mod tests {
 
     fn ensure_test_rpc_secret() {
         runtime_sources::ensure_test_rpc_secret();
+    }
+
+    fn test_request() -> tonic::Request<()> {
+        let mut request = tonic::Request::new(());
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("node_service.NodeService", "Ping"));
+        request
+    }
+
+    fn test_interceptor() -> TonicSignatureInterceptor {
+        TonicSignatureInterceptor {
+            audience: Some("node-a:9000".to_string()),
+        }
     }
 
     fn with_trace_parent<F>(trace_id_hex: &str, f: F)
@@ -192,20 +238,55 @@ mod tests {
     #[test]
     fn test_signature_interceptor_keeps_auth_headers() {
         ensure_test_rpc_secret();
-        let mut interceptor = TonicSignatureInterceptor;
-        let req = tonic::Request::new(());
+        let mut interceptor = test_interceptor();
+        let req = test_request();
 
         let req = interceptor.call(req).expect("interceptor call should succeed");
 
         assert!(req.metadata().contains_key("x-rustfs-signature"));
         assert!(req.metadata().contains_key("x-rustfs-timestamp"));
+        assert!(req.metadata().contains_key("x-rustfs-rpc-signature-v2"));
+        assert!(req.metadata().contains_key("x-rustfs-rpc-nonce"));
+        assert!(
+            crate::cluster::rpc::verify_tonic_rpc_signature(
+                "node-a:9000",
+                "/node_service.NodeService/Ping",
+                req.metadata().as_ref(),
+            )
+            .is_ok(),
+            "interceptor signature should bind the configured peer audience and generated method"
+        );
+    }
+
+    #[test]
+    fn test_signature_interceptor_binds_audience_from_peer_uri() {
+        let interceptor = TonicInterceptor::Signature(gen_tonic_signature_interceptor())
+            .with_rpc_audience("http://node-a:9000")
+            .expect("peer URI should provide an audience");
+        let TonicInterceptor::Signature(interceptor) = interceptor else {
+            panic!("signature interceptor variant should be preserved");
+        };
+
+        assert_eq!(interceptor.audience.as_deref(), Some("node-a:9000"));
+    }
+
+    #[test]
+    fn test_signature_interceptor_requires_generated_method_metadata() {
+        ensure_test_rpc_secret();
+        let mut interceptor = test_interceptor();
+        let error = interceptor
+            .call(tonic::Request::new(()))
+            .expect_err("requests without an exact generated method must fail closed");
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "Missing gRPC method metadata");
     }
 
     #[test]
     fn test_signature_interceptor_may_inject_request_id() {
         ensure_test_rpc_secret();
-        let mut interceptor = TonicSignatureInterceptor;
-        let req = tonic::Request::new(());
+        let mut interceptor = test_interceptor();
+        let req = test_request();
 
         let span = tracing::info_span!("grpc-rpc-test-span");
         let _guard = span.enter();
@@ -219,8 +300,8 @@ mod tests {
     #[test]
     fn test_signature_interceptor_injects_traceparent_metadata() {
         ensure_test_rpc_secret();
-        let mut interceptor = TonicSignatureInterceptor;
-        let req = tonic::Request::new(());
+        let mut interceptor = test_interceptor();
+        let req = test_request();
 
         with_trace_parent("4bf92f3577b34da6a3ce929d0e0e4736", || {
             let req = interceptor.call(req).expect("interceptor call should succeed");
