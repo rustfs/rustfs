@@ -649,6 +649,7 @@ message GetAllBucketStatsResponse {
 
 message LoadBucketMetadataRequest {
   string bucket = 1;
+  bool scanner_maintenance_change = 2;
 }
 
 message LoadBucketMetadataResponse {
@@ -754,6 +755,14 @@ message SignalServiceRequest {
 message SignalServiceResponse {
   bool success = 1;
   optional string error_info = 2;
+}
+
+message ScannerActivityRequest {}
+
+message ScannerActivityResponse {
+  string instance_id = 1;
+  uint64 namespace_generation = 2;
+  uint64 maintenance_generation = 3;
 }
 
 message BackgroundHealStatusRequest {}
@@ -956,6 +965,7 @@ service NodeService {
   // rpc VerifyBinary() returns () {};
   // rpc CommitBinary() returns () {};
   rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {};
+  rpc ScannerActivity(ScannerActivityRequest) returns (ScannerActivityResponse) {};
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {};
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {};
   rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {};

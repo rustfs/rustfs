@@ -70,6 +70,38 @@ sleep multiplier, maximum wait, and cycle interval. Use `scanner.delay`,
 `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis
 needs a precise override.
 
+## Single-disk clean-idle scheduling
+
+An erasure single-disk deployment using the built-in cycle and bitrot defaults
+automatically backs off repeated clean idle scans instead of walking the same
+unchanged namespace every minute. Each successful timer-driven cycle that
+finds no dirty usage or unresolved maintenance work doubles the next interval.
+The status endpoint reports the effective interval and multiplier.
+
+The backoff is reset to the base interval by object or bucket mutations,
+lifecycle or replication configuration changes, partial or failed cycles,
+usage persistence failures, and unresolved scanner-originated heal or bitrot
+work. Active lifecycle or replication rules keep the base cadence. An explicit
+cycle, a non-default persisted speed, any environment speed or start-delay
+override, an environment bitrot override, or a non-default persisted active
+bitrot cycle also keeps the configured cadence rather than applying the
+automatic policy. Persisting `scanner.speed=default` or the default bitrot cycle
+is normalized to the built-in default and therefore keeps automatic scheduling
+enabled.
+
+Lifecycle and replication configuration inspection is bounded so a slow
+metadata read cannot stall scanner startup or scheduling. A failed or timed-out
+inspection keeps the base cadence and is retried after 5 minutes, doubling up
+to a maximum of 60 minutes while failures continue. A lifecycle or replication
+configuration change wakes the scanner and retries inspection immediately.
+
+With the default 30-day bitrot cycle, the clean-idle interval is capped at the
+bitrot cycle divided by the object selection window. With the default selection
+window this is about 42 minutes, which preserves the intended wall-clock bitrot
+coverage. If periodic bitrot is disabled, the clean-idle policy cap is 24 hours.
+The effective interval is jittered by up to 10 percent to avoid synchronized
+scanner starts.
+
 ## Status Endpoint
 
 The scanner status route is:
@@ -79,9 +111,12 @@ GET /v3/scanner/status
 ```
 
 The request must be authenticated with an admin identity that has
-`ServerInfoAdminAction`. The JSON response has two top-level objects:
+`ServerInfoAdminAction`. The JSON response has three scanner-specific top-level
+objects:
 
 - `runtime_config`: the effective runtime controls and their value sources.
+- `cycle_schedule`: the current effective cycle interval and clean-idle
+  backoff state.
 - `metrics`: scanner work, pressure, checkpoint, lifecycle, replication, heal,
   bitrot, and alert counters.
 
@@ -93,6 +128,9 @@ runtime_config.delay.value
 runtime_config.max_wait_seconds.value
 runtime_config.cycle_interval_seconds.value
 runtime_config.bitrot_cycle_seconds.value
+cycle_schedule.effective_interval_seconds
+cycle_schedule.clean_idle_backoff_enabled
+cycle_schedule.clean_idle_backoff_multiplier
 metrics.pacing_pressure.primary_pressure
 metrics.pacing_pressure.last_cycle_budget_limited
 metrics.lifecycle_transition.current_queued

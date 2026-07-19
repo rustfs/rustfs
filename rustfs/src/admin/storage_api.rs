@@ -110,6 +110,7 @@ pub(crate) type Result<T> = core::result::Result<T, Error>;
 pub(crate) type TierConfig = ecstore_tier::tier_config::TierConfig;
 pub(crate) type TierCreds = ecstore_tier::tier_admin::TierCreds;
 pub(crate) type TierType = ecstore_tier::tier_config::TierType;
+pub(crate) type TierConfigUpdateError = crate::storage::storage_api::TierConfigUpdateError;
 
 pub(crate) mod runtime_sources {
     pub(crate) type DailyAllTierStats = super::DailyAllTierStats;
@@ -245,11 +246,11 @@ pub(crate) mod metadata_sys {
     }
 
     pub(crate) async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
-        super::ecstore_bucket::metadata_sys::update(bucket, config_file, data).await
+        crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
 
     pub(crate) async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
-        super::ecstore_bucket::metadata_sys::delete(bucket, config_file).await
+        crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
     }
 
     pub(crate) async fn get_bucket_policy(bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
@@ -376,15 +377,24 @@ pub(crate) mod versioning_sys {
 }
 
 pub(crate) mod storageclass {
+    #[cfg(test)]
+    pub(crate) const CLASS_STANDARD: &str = super::ecstore_config::storageclass::CLASS_STANDARD;
     pub(crate) const INLINE_BLOCK_ENV: &str = super::ecstore_config::storageclass::INLINE_BLOCK_ENV;
     pub(crate) const OPTIMIZE_ENV: &str = super::ecstore_config::storageclass::OPTIMIZE_ENV;
+    #[cfg(test)]
+    pub(crate) const RRS: &str = super::ecstore_config::storageclass::RRS;
     pub(crate) const RRS_ENV: &str = super::ecstore_config::storageclass::RRS_ENV;
+    #[cfg(test)]
+    pub(crate) const STANDARD: &str = super::ecstore_config::storageclass::STANDARD;
     pub(crate) const STANDARD_ENV: &str = super::ecstore_config::storageclass::STANDARD_ENV;
 
     pub(crate) type Config = super::ecstore_config::storageclass::Config;
 
-    pub(crate) fn lookup_config(kvs: &rustfs_config::server_config::KVS, set_drive_count: usize) -> super::Result<Config> {
-        super::ecstore_config::storageclass::lookup_config(kvs, set_drive_count)
+    pub(crate) fn lookup_config_for_pools(
+        kvs: &rustfs_config::server_config::KVS,
+        set_drive_counts: &[usize],
+    ) -> super::Result<Config> {
+        super::ecstore_config::storageclass::lookup_config_for_pools(kvs, set_drive_counts)
     }
 }
 
@@ -456,27 +466,16 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
 
-    pub(crate) async fn refresh_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
-        bucket_name: &str,
-    ) -> Result<rustfs_data_usage::BucketUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::refresh_bucket_usage_from_object_layer(
-            store,
-            data_usage_info,
-            bucket_name,
-        )
-        .await
-    }
-
     pub(crate) async fn load_data_usage_from_backend(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend(store).await
     }
 
-    pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
-        crate::storage::storage_api::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
+    pub(crate) async fn load_data_usage_from_backend_cached(
+        store: Arc<crate::storage::storage_api::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend_cached(store).await
     }
 }
 
@@ -586,6 +585,6 @@ pub(crate) mod tier {
     pub(crate) use super::{
         AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
         ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-        ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierCreds, TierType,
+        ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierConfigUpdateError, TierCreds, TierType,
     };
 }

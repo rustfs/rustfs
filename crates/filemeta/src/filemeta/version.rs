@@ -29,9 +29,10 @@ use super::*;
 use crate::ChecksumInfo;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
-    SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
-    contains_key_bytes, get_bytes, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
+    RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID,
+    SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes, get_consistent_bytes, get_str,
+    has_internal_suffix, insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
 };
 
 const MSGPACK_EXT8: u8 = 0xc7;
@@ -246,6 +247,27 @@ fn parse_legacy_uuid_bytes(bytes: &[u8], field: &str) -> Result<Option<Uuid>> {
 
     let id = Uuid::from_slice(bytes).map_err(Error::from)?;
     Ok((!id.is_nil()).then_some(id))
+}
+
+/// Decode a stored transitioned-version-id from a version's `meta_sys`.
+///
+/// RustFS writes it as 16 raw UUID bytes; MinIO-migrated tiered objects store
+/// the remote tier's version id as a UUID *string*. Accept both, and treat any
+/// absent / nil / otherwise-unparseable value as "no tier version" (matching the
+/// tolerant pre-hardening behavior) rather than failing the whole object read —
+/// a malformed tier id must not make an otherwise-readable object unreadable.
+fn transitioned_version_id_from_meta_sys(meta_sys: &HashMap<String, Vec<u8>>) -> Option<Uuid> {
+    let value = get_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)?;
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(id) = Uuid::from_slice(&value) {
+        return (!id.is_nil()).then_some(id);
+    }
+    std::str::from_utf8(&value)
+        .ok()
+        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+        .filter(|id| !id.is_nil())
 }
 
 fn parse_legacy_erasure_algo(value: &str) -> ErasureAlgo {
@@ -806,7 +828,7 @@ impl TryFrom<LegacyMetaV2Version> for FileMetaVersion {
 
 impl From<FileInfo> for FileMetaVersion {
     fn from(value: FileInfo) -> Self {
-        if value.deleted {
+        if value.is_storage_delete_marker() {
             FileMetaVersion {
                 version_type: VersionType::Delete,
                 legacy_object: None,
@@ -816,6 +838,22 @@ impl From<FileInfo> for FileMetaVersion {
                 uses_legacy_checksum: false,
             }
         } else {
+            // A `deleted` FileInfo that is not a canonical delete marker is only
+            // legitimate as a purge-pending payload, which carries real erasure
+            // geometry and is intentionally serialized as an Object. A `deleted`
+            // FileInfo with neither a canonical-marker shape nor valid erasure
+            // geometry would silently serialize as a zero-geometry MetaObject that
+            // later fails `validate_for_metadata_read`. Write paths validate first
+            // (`validate_for_erasure_write` / `validate_for_metadata_read`), so this
+            // is a caller bug — surface it rather than writing malformed metadata
+            // silently. (`From` is infallible, so this cannot return an error.)
+            if value.deleted && !value.has_valid_erasure_geometry() {
+                tracing::warn!(
+                    event = "filemeta_non_canonical_deleted_fileinfo_as_object",
+                    component = "filemeta",
+                    "serializing a deleted FileInfo that is neither a canonical delete marker nor a valid erasure payload as an Object version; upstream validation should have rejected it"
+                );
+            }
             FileMetaVersion {
                 version_type: VersionType::Object,
                 legacy_object: None,
@@ -2360,9 +2398,7 @@ impl MetaObject {
         let transitioned_objname = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
-        let transition_version_id = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
-            .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
-            .filter(|u| !u.is_nil());
+        let transition_version_id = transitioned_version_id_from_meta_sys(&self.meta_sys);
         let transition_tier = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER)
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
@@ -2403,6 +2439,9 @@ impl MetaObject {
             );
         }
         insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER, fi.transition_tier.as_bytes().to_vec());
+        if let Some(destination_id) = get_str(&fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID) {
+            insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, destination_id.into_bytes());
+        }
     }
 
     pub fn remove_restore_hdrs(&mut self) {
@@ -2466,6 +2505,16 @@ impl MetaObject {
                 if let Some(v) = get_bytes(&self.meta_sys, suffix) {
                     insert_bytes(&mut delete_marker.meta_sys, suffix, v);
                 }
+            }
+            if contains_key_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID) {
+                let destination_id = get_consistent_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID)
+                    .filter(|value| value.len() == 64 && value.iter().all(u8::is_ascii_hexdigit))
+                    .ok_or(Error::FileCorrupt)?;
+                insert_bytes(
+                    &mut delete_marker.meta_sys,
+                    SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                    destination_id.to_vec(),
+                );
             }
             return Ok((free_entry, true));
         }
@@ -2657,9 +2706,7 @@ impl MetaDeleteMarker {
                 .map(|v| String::from_utf8_lossy(&v).to_string())
                 .unwrap_or_default();
 
-            fi.transition_version_id = get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
-                .and_then(|v| Uuid::from_slice(v.as_slice()).ok())
-                .filter(|u| !u.is_nil());
+            fi.transition_version_id = transitioned_version_id_from_meta_sys(&self.meta_sys);
         }
 
         fi
@@ -2774,10 +2821,54 @@ impl MetaDeleteMarker {
 
 impl From<FileInfo> for MetaDeleteMarker {
     fn from(value: FileInfo) -> Self {
+        let mut meta_sys = HashMap::new();
+        let mut durable_metadata: HashMap<String, (&str, bool)> = HashMap::new();
+        for (key, metadata_value) in &value.metadata {
+            if !is_internal_key(key) || is_skip_meta_key(key) {
+                continue;
+            }
+            let Some(suffix) = strip_internal_prefix(key) else {
+                continue;
+            };
+            let rustfs_preferred = key
+                .get(..RUSTFS_INTERNAL_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RUSTFS_INTERNAL_PREFIX));
+            match durable_metadata.entry(suffix) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((metadata_value, rustfs_preferred));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) if rustfs_preferred && !entry.get().1 => {
+                    entry.insert((metadata_value, true));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+        for (suffix, (metadata_value, _)) in durable_metadata {
+            insert_bytes(&mut meta_sys, &suffix, metadata_value.as_bytes().to_vec());
+        }
+        if value.tier_free_version() {
+            insert_bytes(&mut meta_sys, SUFFIX_FREE_VERSION, vec![]);
+        }
+        if !value.transition_status.is_empty() {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_STATUS, value.transition_status.as_bytes().to_vec());
+        }
+        if !value.transitioned_objname.is_empty() {
+            insert_bytes(
+                &mut meta_sys,
+                SUFFIX_TRANSITIONED_OBJECTNAME,
+                value.transitioned_objname.as_bytes().to_vec(),
+            );
+        }
+        if let Some(version_id) = value.transition_version_id {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, version_id.as_bytes().to_vec());
+        }
+        if !value.transition_tier.is_empty() {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
+        }
         Self {
             version_id: value.version_id,
             mod_time: value.mod_time,
-            meta_sys: HashMap::new(),
+            meta_sys,
         }
     }
 }
@@ -3309,6 +3400,31 @@ pub fn read_xl_meta_no_data_sync<R: std::io::Read>(reader: &mut R, size: usize) 
 mod tests {
     use super::*;
     use serde::Serialize;
+
+    #[test]
+    fn delete_marker_conversion_preserves_only_durable_internal_metadata() {
+        let mut marker = FileInfo::default();
+        marker
+            .metadata
+            .insert("x-minio-internal-purgestatus".to_string(), "pending".to_string());
+        marker
+            .metadata
+            .insert("x-rustfs-internal-healing".to_string(), "true".to_string());
+        marker.metadata.insert("content-type".to_string(), "text/plain".to_string());
+        let remote_version_id = Uuid::new_v4();
+        marker.transition_version_id = Some(remote_version_id);
+
+        let converted = MetaDeleteMarker::from(marker);
+
+        assert_eq!(converted.meta_sys.get("x-rustfs-internal-purgestatus"), Some(&b"pending".to_vec()));
+        assert_eq!(converted.meta_sys.get("x-minio-internal-purgestatus"), Some(&b"pending".to_vec()));
+        assert_eq!(
+            get_bytes(&converted.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID),
+            Some(remote_version_id.as_bytes().to_vec())
+        );
+        assert!(!converted.meta_sys.contains_key("x-rustfs-internal-healing"));
+        assert!(!converted.meta_sys.contains_key("content-type"));
+    }
 
     #[derive(Serialize)]
     enum LegacyDeleteVersionTypeFixture {
@@ -3984,6 +4100,32 @@ mod tests {
     }
 
     #[test]
+    fn meta_object_transition_version_id_unparseable_stays_readable_as_none() {
+        // A non-UUID / non-16-byte tier version id must NOT make the object
+        // unreadable; it is tolerated as "no tier version" (compat with
+        // pre-hardening behavior and foreign/edge metadata).
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("unparseable transition version id must not fail the object read");
+        assert_eq!(fi.transition_version_id, None);
+    }
+
+    #[test]
+    fn meta_object_transition_version_id_minio_string_form_is_recovered() {
+        // MinIO-migrated tiered objects store the remote tier's version id as a
+        // UUID string, not 16 raw bytes; recover it instead of dropping it.
+        let id = sample_version_id();
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.to_string().into_bytes());
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("string-form transition version id must decode");
+        assert_eq!(fi.transition_version_id, Some(id));
+    }
+
+    #[test]
     fn delete_marker_free_version_transition_version_id_nil_uuid_yields_none() {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
@@ -4009,6 +4151,47 @@ mod tests {
             meta_sys: sys,
         }
         .into_fileinfo("b", "k", false);
+        assert_eq!(fi.transition_version_id, Some(id));
+    }
+
+    #[test]
+    fn delete_marker_free_version_transition_version_id_unparseable_stays_readable() {
+        // A malformed tier version id must not make a free-version record corrupt:
+        // it decodes to None and stays readable. Otherwise free-version expiry
+        // fails and the remote-tier object leaks.
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, b"not-a-uuid".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_TIER, b"WARM".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_OBJECTNAME, b"remote-object".to_vec());
+        let fi = MetaDeleteMarker {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
+
+        assert_eq!(fi.transition_version_id, None);
+        fi.validate_for_metadata_read()
+            .expect("free-version record with an unparseable tier id must remain readable");
+    }
+
+    #[test]
+    fn delete_marker_free_version_transition_version_id_minio_string_form_is_recovered() {
+        // MinIO stores the tier version id as a UUID string; recover it.
+        let id = sample_version_id();
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_FREE_VERSION, vec![]);
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.to_string().into_bytes());
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_TIER, b"WARM".to_vec());
+        insert_bytes(&mut sys, SUFFIX_TRANSITIONED_OBJECTNAME, b"remote-object".to_vec());
+        let fi = MetaDeleteMarker {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            meta_sys: sys,
+        }
+        .into_fileinfo("b", "k", false);
+
         assert_eq!(fi.transition_version_id, Some(id));
     }
 
@@ -4202,6 +4385,111 @@ mod tests {
             .expect_err("invalid free-version UUID should return an error instead of panicking");
 
         assert!(matches!(err, Error::UuidParse(_)));
+    }
+
+    #[test]
+    fn meta_object_init_free_version_preserves_transition_destination_identity() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        let identity = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity.clone());
+        let obj = make_meta_object_with_sys(sys);
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+        let (free_version, created) = obj
+            .init_free_version(&fi)
+            .expect("free-version initialization should succeed");
+        let meta_sys = &free_version
+            .delete_marker
+            .expect("free-version should be a delete marker")
+            .meta_sys;
+
+        assert!(created);
+        assert_eq!(get_bytes(meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID), Some(identity));
+        assert!(meta_sys.contains_key(&format!(
+            "{}{}",
+            rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX,
+            SUFFIX_TRANSITION_TIER_DESTINATION_ID
+        )));
+        assert!(meta_sys.contains_key(&format!(
+            "{}{}",
+            rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+            SUFFIX_TRANSITION_TIER_DESTINATION_ID
+        )));
+    }
+
+    #[test]
+    fn meta_object_init_free_version_accepts_single_prefix_transition_destination_identity() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        let identity = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        sys.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+                SUFFIX_TRANSITION_TIER_DESTINATION_ID
+            ),
+            identity.clone(),
+        );
+        let obj = make_meta_object_with_sys(sys);
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+        let (free_version, created) = obj
+            .init_free_version(&fi)
+            .expect("single-prefix legacy destination identity should remain compatible");
+        let meta_sys = &free_version
+            .delete_marker
+            .expect("free-version should be a delete marker")
+            .meta_sys;
+
+        assert!(created);
+        assert_eq!(
+            get_consistent_bytes(meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID),
+            Some(identity.as_slice())
+        );
+    }
+
+    #[test]
+    fn meta_object_init_free_version_rejects_conflicting_or_invalid_transition_destination_identity() {
+        let valid_identity = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        for (rustfs_identity, minio_identity) in [
+            (
+                valid_identity,
+                b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_vec(),
+            ),
+            (b"not-hex".to_vec(), b"not-hex".to_vec()),
+            (Vec::new(), Vec::new()),
+        ] {
+            let mut sys = HashMap::new();
+            insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+            sys.insert(
+                format!(
+                    "{}{}",
+                    rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX,
+                    SUFFIX_TRANSITION_TIER_DESTINATION_ID
+                ),
+                rustfs_identity,
+            );
+            sys.insert(
+                format!(
+                    "{}{}",
+                    rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+                    SUFFIX_TRANSITION_TIER_DESTINATION_ID
+                ),
+                minio_identity,
+            );
+            let obj = make_meta_object_with_sys(sys);
+            let mut fi = FileInfo::new("object", 2, 2);
+            fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+            assert_eq!(
+                obj.init_free_version(&fi)
+                    .expect_err("unsafe destination identity must fail closed"),
+                Error::FileCorrupt
+            );
+        }
     }
 
     #[test]

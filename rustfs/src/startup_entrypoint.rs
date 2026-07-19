@@ -82,6 +82,9 @@ async fn async_main() -> Result<()> {
             return Ok(());
         }
         CommandResult::Tls(opts) => return crate::tls::execute_tls(&opts),
+        // Diagnose short-circuits before observability init on purpose:
+        // the report goes to stdout and must not be wrapped by the JSON logger.
+        CommandResult::Diagnose(opts) => return crate::diagnose::execute_diagnose(&opts),
         CommandResult::Server(config) => config,
     };
 

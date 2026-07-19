@@ -40,6 +40,7 @@ struct ObjectDataCacheEnvValues {
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectDataCacheAdapter {
     cache: Arc<ObjectDataCache>,
+    cold_fill: Arc<super::ColdFillCoordinator>,
 }
 
 impl ObjectDataCacheAdapter {
@@ -49,9 +50,10 @@ impl ObjectDataCacheAdapter {
     /// in-memory GET fill limits so a `max_entry_bytes` above them is not
     /// reported as eligible while fill could never materialize the body.
     pub(crate) fn new(config: ObjectDataCacheConfig) -> Result<Self, ObjectDataCacheConfigError> {
-        let fill_ceiling = resolve_fill_ceiling_bytes(config.max_entry_bytes);
+        let fill_ceiling = resolve_fill_ceiling_bytes(config.mode, config.max_entry_bytes, config.max_bytes);
         Ok(Self {
             cache: Arc::new(ObjectDataCache::new(config)?.with_fill_ceiling_bytes(fill_ceiling)),
+            cold_fill: Arc::new(super::ColdFillCoordinator::default()),
         })
     }
 
@@ -78,6 +80,7 @@ impl ObjectDataCacheAdapter {
     pub(crate) fn disabled() -> Self {
         Self {
             cache: Arc::new(ObjectDataCache::disabled()),
+            cold_fill: Arc::new(super::ColdFillCoordinator::default()),
         }
     }
 
@@ -107,14 +110,45 @@ impl ObjectDataCacheAdapter {
         self.cache.plan_get(request)
     }
 
+    /// Rebuilds a plan for producer identity revalidation without counting a
+    /// second request-level planning decision.
+    pub(crate) fn plan_get_untracked(&self, request: ObjectDataCacheGetRequest<'_>) -> ObjectDataCacheGetPlan {
+        self.cache.plan_get_untracked(request)
+    }
+
     /// Executes an engine-level cache lookup.
     pub(crate) async fn lookup_body(&self, plan: &ObjectDataCacheGetPlan) -> ObjectDataCacheLookup {
         self.cache.lookup_body(plan).await
     }
 
+    /// Rechecks a completed cold fill without counting a second lookup for the
+    /// same GET request.
+    pub(crate) async fn peek_body_untracked(&self, plan: &ObjectDataCacheGetPlan) -> ObjectDataCacheLookup {
+        self.cache.peek_body_untracked(plan).await
+    }
+
     /// Executes an engine-level cache fill.
     pub(crate) async fn fill_body(&self, plan: &ObjectDataCacheGetPlan, bytes: Bytes) -> ObjectDataCacheFillResult {
         self.cache.fill_body(plan, bytes).await
+    }
+
+    pub(crate) fn cold_fill_coordinator(&self) -> Arc<super::ColdFillCoordinator> {
+        Arc::clone(&self.cold_fill)
+    }
+
+    pub(crate) fn reserve_body(
+        &self,
+        plan: &ObjectDataCacheGetPlan,
+    ) -> Option<rustfs_object_data_cache::ObjectDataCacheBodyReservation> {
+        self.cache.reserve_body(plan)
+    }
+
+    pub(crate) async fn fill_reserved_body(
+        &self,
+        plan: &ObjectDataCacheGetPlan,
+        body: rustfs_object_data_cache::ObjectDataCacheReservedBody,
+    ) -> ObjectDataCacheFillResult {
+        self.cache.fill_reserved_body(plan, body).await
     }
 
     /// Executes an engine-level object invalidation.
@@ -165,12 +199,13 @@ impl ObjectDataCacheAdapter {
     fn from_config_or_disabled(config: ObjectDataCacheConfig, source: &str) -> Arc<Self> {
         let mode = config.mode;
         let max_entry_bytes = config.max_entry_bytes;
+        let max_bytes = config.max_bytes;
         // `Self::new` applies the ODC-24 fill-ceiling clamp; this startup path
         // only adds the resolved-config logging on top.
         match Self::new(config) {
             Ok(adapter) => {
                 if !adapter.is_disabled() {
-                    let ceiling = resolve_fill_ceiling_bytes(max_entry_bytes);
+                    let ceiling = resolve_fill_ceiling_bytes(mode, max_entry_bytes, max_bytes);
                     // ODC-19: log the resolved mode at startup, and warn when the
                     // operator explicitly selected the never-filling HitOnly mode.
                     tracing::info!(source, ?mode, "object data cache enabled");
@@ -211,7 +246,14 @@ impl ObjectDataCacheAdapter {
 /// (backlog#1129 / ODC-24). The concurrency-driven shrink of the fill threshold
 /// is dynamic and cannot be captured here, so this static ceiling is the
 /// conservative floor.
-fn resolve_fill_ceiling_bytes(max_entry_bytes: u64) -> u64 {
+fn resolve_fill_ceiling_bytes(mode: ObjectDataCacheMode, max_entry_bytes: u64, max_bytes: u64) -> u64 {
+    if mode == ObjectDataCacheMode::FillMaterializeEnabled {
+        return if max_bytes == 0 {
+            max_entry_bytes
+        } else {
+            max_entry_bytes.min(max_bytes)
+        };
+    }
     let seek_threshold = crate::app::object_usecase::object_seek_support_threshold() as u64;
     let hard_cap = u64::try_from(crate::app::object_usecase::MAX_GET_OBJECT_MEMORY_BUFFER_BYTES).unwrap_or(u64::MAX);
     max_entry_bytes.min(seek_threshold).min(hard_cap)
@@ -481,7 +523,7 @@ mod tests {
         // ODC-24 (backlog#1129): a max_entry_bytes above the in-memory GET fill
         // limits is clamped down; the ceiling never exceeds the 64 MiB hard cap.
         let huge = 512 * 1024 * 1024;
-        let ceiling = super::resolve_fill_ceiling_bytes(huge);
+        let ceiling = super::resolve_fill_ceiling_bytes(ObjectDataCacheMode::FillBufferedOnly, huge, huge);
         assert!(ceiling < huge, "a huge max_entry_bytes must be clamped down");
         assert!(
             ceiling <= u64::try_from(crate::app::object_usecase::MAX_GET_OBJECT_MEMORY_BUFFER_BYTES).unwrap(),
@@ -493,7 +535,7 @@ mod tests {
     fn resolve_fill_ceiling_leaves_small_max_entry_bytes_untouched() {
         // A small max_entry_bytes is already below the fill limits, so it is the
         // binding constraint and passes through unchanged.
-        assert_eq!(super::resolve_fill_ceiling_bytes(4096), 4096);
+        assert_eq!(super::resolve_fill_ceiling_bytes(ObjectDataCacheMode::FillBufferedOnly, 4096, 8192), 4096);
     }
 
     #[test]
@@ -526,6 +568,48 @@ mod tests {
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         assert_eq!(plan, rustfs_object_data_cache::ObjectDataCacheGetPlan::SkipTooLarge);
+    }
+
+    #[test]
+    fn materialize_mode_allows_384_mib_when_capacity_is_two_gib() {
+        let adapter = ObjectDataCacheAdapter::from_config_or_disabled(
+            ObjectDataCacheConfig {
+                mode: ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 2 * 1024 * 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 512 * 1024 * 1024,
+                ..ObjectDataCacheConfig::default()
+            },
+            "test",
+        );
+
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "bucket",
+            object: "object",
+            version_id: None,
+            etag: "etag",
+            size: 384 * 1024 * 1024,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        assert!(matches!(plan, rustfs_object_data_cache::ObjectDataCacheGetPlan::Cacheable { .. }));
+    }
+
+    #[test]
+    fn materialize_mode_keeps_entry_weight_capacity_validation() {
+        let adapter = ObjectDataCacheAdapter::from_config_or_disabled(
+            ObjectDataCacheConfig {
+                mode: ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 512 * 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 512 * 1024 * 1024,
+                ..ObjectDataCacheConfig::default()
+            },
+            "test",
+        );
+
+        assert!(adapter.is_disabled());
     }
 
     #[test]

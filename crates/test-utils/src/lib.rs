@@ -23,6 +23,8 @@
 //! Single-process integration scope only — multi-node / chaos harnesses are
 //! out of scope (backlog#1100).
 
+#[cfg(test)]
+mod data_usage_snapshot_tests;
 mod ecstore_test_compat;
 
 use std::path::PathBuf;

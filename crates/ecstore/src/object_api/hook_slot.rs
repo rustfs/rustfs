@@ -61,8 +61,7 @@ impl<T: ?Sized> HookSlot<T> {
         self.inner.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
-    /// Clears the slot. Test-only: production never unregisters a hook.
-    #[cfg(test)]
+    /// Clears the slot during feature disable or test cleanup.
     pub(crate) fn clear(&self) {
         *self.inner.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }

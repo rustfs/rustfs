@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::ObjectDataCacheConfigError;
-use crate::memory::{MemoryBasis, resolve_effective_memory};
+use crate::memory::{EffectiveMemory, MemoryBasis, resolve_effective_memory};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -142,13 +142,21 @@ impl ObjectDataCacheConfig {
     /// Resolves the effective max capacity in bytes for the cache.
     pub fn resolved_max_bytes(&self) -> Result<u64, ObjectDataCacheConfigError> {
         if self.max_bytes > 0 {
+            validate_entry_fits_capacity(
+                self.max_bytes,
+                self.max_entry_bytes,
+                ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes,
+            )?;
             return Ok(self.max_bytes);
         }
 
         // Resolve capacity from the effective (container-aware) total memory so
         // a pod with a cgroup limit far below the node RAM does not size the
         // cache to the node.
-        let effective = resolve_effective_memory();
+        self.resolved_max_bytes_for_effective_memory(resolve_effective_memory())
+    }
+
+    fn resolved_max_bytes_for_effective_memory(&self, effective: EffectiveMemory) -> Result<u64, ObjectDataCacheConfigError> {
         let total_memory = effective.total_bytes;
         let derived = total_memory.saturating_mul(u64::from(self.max_memory_percent)) / 100;
         let resolved = clamp_derived_max_bytes(derived, total_memory);
@@ -159,10 +167,9 @@ impl ObjectDataCacheConfig {
 
         // The derived capacity is no longer floored by `max_entry_bytes` (that
         // used to silently inflate the cache above the safety clamp). If a
-        // single entry cannot fit, reject rather than inflate.
-        if self.max_entry_bytes > resolved {
-            return Err(ObjectDataCacheConfigError::MaxEntryBytesExceedsCapacity);
-        }
+        // single entry plus its weight overhead cannot fit, reject rather than
+        // inflate.
+        validate_entry_fits_capacity(resolved, self.max_entry_bytes, ObjectDataCacheConfigError::MaxEntryBytesExceedsCapacity)?;
 
         log_resolved_capacity_once(resolved, total_memory, effective.basis);
 
@@ -186,8 +193,12 @@ impl ObjectDataCacheConfig {
         // An explicit capacity must leave room for a full entry plus the
         // weigher overhead, otherwise moka can never retain the entry while
         // fills still report success.
-        if self.max_bytes > 0 && self.max_bytes < self.max_entry_bytes.saturating_add(ENTRY_WEIGHT_OVERHEAD_BYTES) {
-            return Err(ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes);
+        if self.max_bytes > 0 {
+            validate_entry_fits_capacity(
+                self.max_bytes,
+                self.max_entry_bytes,
+                ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes,
+            )?;
         }
 
         if self.ttl.is_zero() {
@@ -249,6 +260,17 @@ impl ObjectDataCacheConfig {
     }
 }
 
+fn validate_entry_fits_capacity(
+    capacity: u64,
+    max_entry_bytes: u64,
+    error: ObjectDataCacheConfigError,
+) -> Result<(), ObjectDataCacheConfigError> {
+    match max_entry_bytes.checked_add(ENTRY_WEIGHT_OVERHEAD_BYTES) {
+        Some(required_capacity) if required_capacity <= capacity => Ok(()),
+        _ => Err(error),
+    }
+}
+
 fn clamp_derived_max_bytes(derived: u64, total_memory: u64) -> u64 {
     let percent_cap = total_memory.saturating_mul(DEFAULT_DERIVED_MAX_MEMORY_PERCENT_CAP) / 100;
     let safe_cap = percent_cap.min(DEFAULT_DERIVED_MAX_BYTES_CAP);
@@ -269,8 +291,12 @@ fn log_resolved_capacity_once(resolved_max_bytes: u64, effective_total_bytes: u6
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_DERIVED_MAX_BYTES_CAP, ObjectDataCacheConfig, ObjectDataCacheMode, clamp_derived_max_bytes};
+    use super::{
+        DEFAULT_DERIVED_MAX_BYTES_CAP, ENTRY_WEIGHT_OVERHEAD_BYTES, ObjectDataCacheConfig, ObjectDataCacheMode,
+        clamp_derived_max_bytes,
+    };
     use crate::error::ObjectDataCacheConfigError;
+    use crate::memory::{EffectiveMemory, MemoryBasis};
     use std::time::Duration;
 
     #[test]
@@ -457,6 +483,87 @@ mod tests {
             .expect_err("entry cap above the derived capacity must be rejected");
 
         assert_eq!(err, ObjectDataCacheConfigError::MaxEntryBytesExceedsCapacity);
+    }
+
+    #[test]
+    fn derived_capacity_rejects_entry_equal_to_capacity() {
+        const CAPACITY: u64 = 8 * 1024;
+        let config = ObjectDataCacheConfig {
+            max_bytes: 0,
+            max_memory_percent: 10,
+            max_entry_bytes: CAPACITY,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .resolved_max_bytes_for_effective_memory(EffectiveMemory {
+                total_bytes: CAPACITY * 10,
+                available_bytes: CAPACITY * 10,
+                basis: MemoryBasis::Host,
+            })
+            .expect_err("an entry equal to derived capacity leaves no room for its weight overhead");
+
+        assert_eq!(err, ObjectDataCacheConfigError::MaxEntryBytesExceedsCapacity);
+    }
+
+    #[test]
+    fn explicit_and_derived_capacity_share_entry_margin_matrix() {
+        const CAPACITY: u64 = 8 * 1024;
+        let effective_memory = EffectiveMemory {
+            total_bytes: CAPACITY * 10,
+            available_bytes: CAPACITY * 10,
+            basis: MemoryBasis::Host,
+        };
+
+        for (max_entry_bytes, fits) in [
+            (CAPACITY - ENTRY_WEIGHT_OVERHEAD_BYTES, true),
+            (CAPACITY - ENTRY_WEIGHT_OVERHEAD_BYTES + 1, false),
+            (CAPACITY - 1, false),
+            (CAPACITY, false),
+        ] {
+            let explicit = ObjectDataCacheConfig {
+                max_bytes: CAPACITY,
+                max_memory_percent: 0,
+                max_entry_bytes,
+                ..ObjectDataCacheConfig::default()
+            };
+            let derived = ObjectDataCacheConfig {
+                max_bytes: 0,
+                max_memory_percent: 10,
+                max_entry_bytes,
+                ..ObjectDataCacheConfig::default()
+            };
+
+            if fits {
+                assert_eq!(explicit.validate(), Ok(()), "explicit max_entry_bytes={max_entry_bytes}");
+                assert_eq!(
+                    explicit.resolved_max_bytes(),
+                    Ok(CAPACITY),
+                    "explicit resolved max_entry_bytes={max_entry_bytes}"
+                );
+                assert_eq!(
+                    derived.resolved_max_bytes_for_effective_memory(effective_memory),
+                    Ok(CAPACITY),
+                    "derived max_entry_bytes={max_entry_bytes}"
+                );
+            } else {
+                assert_eq!(
+                    explicit.validate(),
+                    Err(ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes),
+                    "explicit max_entry_bytes={max_entry_bytes}"
+                );
+                assert_eq!(
+                    explicit.resolved_max_bytes(),
+                    Err(ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes),
+                    "explicit resolved max_entry_bytes={max_entry_bytes}"
+                );
+                assert_eq!(
+                    derived.resolved_max_bytes_for_effective_memory(effective_memory),
+                    Err(ObjectDataCacheConfigError::MaxEntryBytesExceedsCapacity),
+                    "derived max_entry_bytes={max_entry_bytes}"
+                );
+            }
+        }
     }
 
     #[test]

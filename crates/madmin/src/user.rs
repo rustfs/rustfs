@@ -406,10 +406,17 @@ pub struct AccountInfo {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BucketAccessInfo {
     pub name: String,
-    pub size: u64,
-    pub objects: u64,
-    pub object_sizes_histogram: HashMap<String, u64>,
-    pub object_versions_histogram: HashMap<String, u64>,
+    // Usage stats are absent (not zero) when no scanner snapshot covers the
+    // bucket yet, so clients can distinguish "unknown" from "empty"
+    // (rustfs/backlog#1306).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objects: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_sizes_histogram: Option<HashMap<String, u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_versions_histogram: Option<HashMap<String, u64>>,
     pub details: Option<BucketDetails>,
     pub prefix_usage: HashMap<String, u64>,
     #[serde(rename = "expiration", with = "time::serde::rfc3339::option")]
@@ -727,6 +734,70 @@ mod tests {
     use time::OffsetDateTime;
     use time::macros::datetime;
 
+    /// Wire pin (rustfs/backlog#1306): usage stats without a scanner snapshot
+    /// must be omitted from the JSON, not serialized as zeros.
+    #[test]
+    fn bucket_access_info_omits_absent_usage_stats() {
+        let info = BucketAccessInfo {
+            name: "no-snapshot".to_string(),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(!obj.contains_key("size"));
+        assert!(!obj.contains_key("objects"));
+        assert!(!obj.contains_key("object_sizes_histogram"));
+        assert!(!obj.contains_key("object_versions_histogram"));
+    }
+
+    /// Wire pin (rustfs/backlog#1306): populated usage stats keep their
+    /// existing snake_case keys and numeric values.
+    #[test]
+    fn bucket_access_info_serializes_present_usage_stats() {
+        let info = BucketAccessInfo {
+            name: "snapshot".to_string(),
+            size: Some(1024),
+            objects: Some(7),
+            object_sizes_histogram: Some(HashMap::from([("1MiB-10MiB".to_string(), 7)])),
+            object_versions_histogram: Some(HashMap::from([("SINGLE_VERSION".to_string(), 7)])),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["size"], 1024);
+        assert_eq!(value["objects"], 7);
+        assert_eq!(value["object_sizes_histogram"]["1MiB-10MiB"], 7);
+        assert_eq!(value["object_versions_histogram"]["SINGLE_VERSION"], 7);
+    }
+
+    /// Wire pin (rustfs/backlog#1306): a scanned-but-empty bucket carries
+    /// Some(0) usage stats that must serialize as zeros, staying distinct from
+    /// the no-snapshot (None) case that is omitted. Guards against replacing
+    /// `Option::is_none` with a predicate that also skips zero values.
+    #[test]
+    fn bucket_access_info_serializes_zero_usage_stats() {
+        let info = BucketAccessInfo {
+            name: "empty-snapshot".to_string(),
+            size: Some(0),
+            objects: Some(0),
+            object_sizes_histogram: Some(HashMap::new()),
+            object_versions_histogram: Some(HashMap::new()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("size"));
+        assert!(obj.contains_key("objects"));
+        assert!(obj.contains_key("object_sizes_histogram"));
+        assert!(obj.contains_key("object_versions_histogram"));
+        assert_eq!(value.get("size"), Some(&serde_json::json!(0)));
+        assert_eq!(value["objects"], 0);
+        assert_eq!(value["object_sizes_histogram"], serde_json::json!({}));
+        assert_eq!(value["object_versions_histogram"], serde_json::json!({}));
+    }
+
     #[test]
     fn test_account_status_try_from_invalid() {
         let result = AccountStatus::try_from("invalid");
@@ -1029,10 +1100,10 @@ mod tests {
 
         let bucket_info = BucketAccessInfo {
             name: "test-bucket".to_string(),
-            size: 6000000,
-            objects: 150,
-            object_sizes_histogram: sizes_histogram,
-            object_versions_histogram: versions_histogram,
+            size: Some(6000000),
+            objects: Some(150),
+            object_sizes_histogram: Some(sizes_histogram),
+            object_versions_histogram: Some(versions_histogram),
             details: Some(BucketDetails {
                 versioning: true,
                 versioning_suspended: false,
@@ -1049,10 +1120,10 @@ mod tests {
         };
 
         assert_eq!(bucket_info.name, "test-bucket");
-        assert_eq!(bucket_info.size, 6000000);
-        assert_eq!(bucket_info.objects, 150);
-        assert_eq!(bucket_info.object_sizes_histogram.len(), 2);
-        assert_eq!(bucket_info.object_versions_histogram.len(), 2);
+        assert_eq!(bucket_info.size, Some(6000000));
+        assert_eq!(bucket_info.objects, Some(150));
+        assert_eq!(bucket_info.object_sizes_histogram.as_ref().map(HashMap::len), Some(2));
+        assert_eq!(bucket_info.object_versions_histogram.as_ref().map(HashMap::len), Some(2));
         assert!(bucket_info.details.is_some());
         assert_eq!(bucket_info.prefix_usage.len(), 2);
         assert!(bucket_info.created.is_some());

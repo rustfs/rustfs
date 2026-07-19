@@ -26,6 +26,7 @@ pub mod storageclass;
 
 use crate::error::Result;
 use crate::store::ECStore;
+use arc_swap::ArcSwap;
 use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate_with_recovery};
 use rustfs_config::HEAL_SUB_SYS;
 use rustfs_config::audit::{
@@ -39,11 +40,12 @@ use rustfs_config::notify::{
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use rustfs_config::server_config::{register_default_kvs, set_global_server_config};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::{Arc, RwLock};
+use tracing::warn;
 
-pub static GLOBAL_STORAGE_CLASS: LazyLock<RwLock<storageclass::Config>> =
-    LazyLock::new(|| RwLock::new(storageclass::Config::default()));
+pub static GLOBAL_STORAGE_CLASS: LazyLock<ArcSwap<storageclass::Config>> =
+    LazyLock::new(|| ArcSwap::from_pointee(storageclass::Config::default()));
 pub static GLOBAL_CONFIG_SYS: LazyLock<ConfigSys> = LazyLock::new(ConfigSys::new);
 
 pub static RUSTFS_CONFIG_PREFIX: &str = "config";
@@ -63,7 +65,7 @@ impl ConfigSys {
     pub async fn init(&self, api: Arc<ECStore>) -> Result<()> {
         let mut cfg = read_config_without_migrate_with_recovery(api.clone()).await?;
 
-        lookup_configs(&mut cfg, api).await;
+        lookup_configs(&mut cfg, api).await?;
 
         set_global_server_config(cfg);
 
@@ -72,12 +74,166 @@ impl ConfigSys {
 }
 
 pub fn get_global_storage_class() -> Option<storageclass::Config> {
-    GLOBAL_STORAGE_CLASS.read().ok().map(|guard| (*guard).clone())
+    Some(GLOBAL_STORAGE_CLASS.load().as_ref().clone())
+}
+
+pub(crate) fn get_global_storage_class_snapshot() -> Arc<storageclass::Config> {
+    GLOBAL_STORAGE_CLASS.load_full()
+}
+
+fn publish_storage_class_config(target: &ArcSwap<storageclass::Config>, cfg: storageclass::Config) {
+    let cfg = Arc::new(cfg);
+    target.store(cfg.clone());
+
+    for (pool_index, drives_per_set) in cfg.automatic_zero_parity_pools() {
+        warn!(
+            event = "storage_class_zero_redundancy",
+            component = "ecstore",
+            subsystem = "storage_class",
+            state = "degraded",
+            pool_index,
+            drives_per_set,
+            parity = 0,
+            "automatic storage class has no parity"
+        );
+    }
 }
 
 pub fn set_global_storage_class(cfg: storageclass::Config) {
-    if let Ok(mut guard) = GLOBAL_STORAGE_CLASS.write() {
-        *guard = cfg;
+    publish_storage_class_config(&GLOBAL_STORAGE_CLASS, cfg);
+}
+
+#[cfg(test)]
+mod storage_class_publish_tests {
+    use super::publish_storage_class_config;
+    use crate::config::storageclass::{self, CLASS_STANDARD, STANDARD, lookup_config_for_pools_without_env};
+    use arc_swap::ArcSwap;
+    use rustfs_config::server_config::KVS;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        output: Arc<Mutex<Vec<u8>>>,
+        published: Option<Arc<ArcSwap<storageclass::Config>>>,
+    }
+
+    struct CapturedWriter(CapturedLogs);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(published) = &self.0.published {
+                assert_eq!(
+                    published.load_full().parities_for_sc(STANDARD),
+                    Some(vec![2, 0]),
+                    "warning must be emitted after the new snapshot is visible"
+                );
+            }
+            self.0.output.lock().expect("log buffer lock poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(self.clone())
+        }
+    }
+
+    impl CapturedLogs {
+        fn observing(published: Arc<ArcSwap<storageclass::Config>>) -> Self {
+            Self {
+                published: Some(published),
+                ..Default::default()
+            }
+        }
+
+        fn output(&self) -> String {
+            String::from_utf8(self.output.lock().expect("log buffer lock poisoned").clone()).expect("logs should be UTF-8")
+        }
+    }
+
+    #[test]
+    fn automatic_single_disk_publish_emits_structured_warning() {
+        let cfg = lookup_config_for_pools_without_env(&KVS::new(), &[4, 1]).expect("automatic config should resolve");
+        let target = Arc::new(ArcSwap::from_pointee(Default::default()));
+        let logs = CapturedLogs::observing(target.clone());
+        let subscriber = tracing_subscriber::fmt().json().with_writer(logs.clone()).finish();
+
+        tracing::subscriber::with_default(subscriber, || publish_storage_class_config(&target, cfg));
+
+        assert_eq!(target.load_full().parities_for_sc(STANDARD), Some(vec![2, 0]));
+        let output = logs.output();
+        assert_eq!(
+            output.matches("storage_class_zero_redundancy").count(),
+            1,
+            "unexpected warning count: {output}"
+        );
+        assert!(output.contains("\"level\":\"WARN\""), "unexpected warning level: {output}");
+        assert!(output.contains("\"pool_index\":1"), "missing pool index: {output}");
+        assert!(output.contains("\"drives_per_set\":1"), "missing drive count: {output}");
+        assert!(output.contains("\"parity\":0"), "missing parity: {output}");
+    }
+
+    #[test]
+    fn explicit_zero_parity_publish_does_not_emit_automatic_warning() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:0".to_string());
+        let cfg = lookup_config_for_pools_without_env(&kvs, &[1]).expect("explicit EC:0 should resolve");
+        let target = ArcSwap::from_pointee(Default::default());
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt().json().with_writer(logs.clone()).finish();
+
+        tracing::subscriber::with_default(subscriber, || publish_storage_class_config(&target, cfg));
+
+        assert_eq!(target.load_full().parities_for_sc(STANDARD), Some(vec![0]));
+        assert!(!logs.output().contains("storage_class_zero_redundancy"));
+    }
+
+    #[test]
+    fn storage_class_arc_swap_never_exposes_mixed_pool_state() {
+        let automatic = lookup_config_for_pools_without_env(&KVS::new(), &[4, 6]).expect("automatic config should resolve");
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:1".to_string());
+        let explicit = lookup_config_for_pools_without_env(&kvs, &[4, 6]).expect("explicit config should resolve");
+        let target = Arc::new(ArcSwap::from_pointee(automatic.clone()));
+        let old_snapshot = target.load_full();
+
+        let writer_target = target.clone();
+        let writer = std::thread::spawn(move || {
+            for index in 0..2_000 {
+                let next = if index % 2 == 0 { automatic.clone() } else { explicit.clone() };
+                writer_target.store(Arc::new(next));
+            }
+        });
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let reader_target = target.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        let pair = reader_target
+                            .load_full()
+                            .parities_for_sc(STANDARD)
+                            .expect("published config must have pool topology");
+                        assert!(pair == [2, 3] || pair == [1, 1], "mixed pool snapshot: {pair:?}");
+                    }
+                })
+            })
+            .collect();
+
+        writer.join().expect("writer thread should complete");
+        for reader in readers {
+            reader.join().expect("reader thread should complete");
+        }
+        assert_eq!(old_snapshot.parities_for_sc(STANDARD), Some(vec![2, 3]));
     }
 }
 

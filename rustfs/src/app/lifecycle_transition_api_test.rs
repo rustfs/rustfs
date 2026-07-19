@@ -25,7 +25,7 @@ use super::storage_api::test::contract::{
 };
 use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
-use super::storage_api::test::runtime::{MockWarmBackend, register_mock_tier as register_mock_tier_util};
+use super::storage_api::test::runtime::{MockWarmBackend, MockWarmOp, register_mock_tier as register_mock_tier_util};
 use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
     StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
@@ -866,9 +866,6 @@ async fn get_transitioned_object_uses_remote_codec_fallback_path() {
             .collect();
 
         create_test_bucket(&ecstore, bucket.as_str()).await;
-        set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
-            .await
-            .expect("Failed to set lifecycle configuration");
 
         let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
         let transition_opts = ObjectOptions {
@@ -899,6 +896,284 @@ async fn get_transitioned_object_uses_remote_codec_fallback_path() {
 
         let actual = read_object_bytes(&ecstore, bucket.as_str(), object).await;
         assert_eq!(actual, payload);
+    })
+    .await;
+}
+
+/// Regression test for rustfs/rustfs#4827: a duplicate transition task that runs
+/// after the winning transition completed must return early without a second
+/// tier upload and without clobbering the winner's remote object / metadata.
+///
+/// The duplicate models the residual race left after the in-flight enqueue dedup
+/// (#4839): a stale-snapshot task admitted after the winner released its claim.
+/// On an unversioned bucket the duplicate's metadata re-read is eligible for the
+/// GET metadata cache; before the fix the cache still held the pre-transition
+/// entry (transition_object never invalidated it after persisting), so the
+/// TRANSITION_COMPLETE early-return never fired and the duplicate streamed the
+/// already-deleted local data to the tier again (NotFound reader errors +
+/// rejected duplicate tier PUT).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn duplicate_transition_task_skips_already_transitioned_version() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+
+    let bucket = format!("test-api-dup-transition-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/duplicate-transition.txt";
+    let payload = b"duplicate transition tasks must not re-upload";
+
+    // Unversioned bucket: the duplicate's re-read goes through the GET metadata
+    // cache (versioned reads bypass it), which is the stale-read window under test.
+    (*ecstore)
+        .make_bucket(bucket.as_str(), &MakeBucketOptions::default())
+        .await
+        .expect("Failed to create unversioned test bucket");
+
+    let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
+    let transition_opts = ObjectOptions {
+        transition: lifecycle::lifecycle_contract::TransitionOptions {
+            status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+            tier: tier_name.clone(),
+            etag: uploaded.etag.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        version_id: uploaded.version_id.map(|version| version.to_string()),
+        mod_time: uploaded.mod_time,
+        ..Default::default()
+    };
+
+    // Winner: transitions the object, persists transition_status=complete, and
+    // deletes the local data.
+    ecstore
+        .transition_object(bucket.as_str(), object, &transition_opts)
+        .await
+        .expect("winning transition should succeed");
+
+    let puts_after_winner: Vec<String> = backend
+        .op_log()
+        .await
+        .into_iter()
+        .filter_map(|op| match op {
+            MockWarmOp::Put { object, .. } => Some(object),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(puts_after_winner.len(), 1, "winner must upload exactly one tier object");
+    let winner_remote_object = puts_after_winner[0].clone();
+
+    // Duplicate task with the same stale snapshot (same mod_time / etag), run
+    // immediately so the pre-fix stale metadata-cache entry is still live. It
+    // must observe transition_status=complete and return Ok without uploading.
+    ecstore
+        .transition_object(bucket.as_str(), object, &transition_opts)
+        .await
+        .expect("duplicate transition must return early without error");
+
+    let puts_after_duplicate = backend
+        .op_log()
+        .await
+        .into_iter()
+        .filter(|op| matches!(op, MockWarmOp::Put { .. }))
+        .count();
+    assert_eq!(puts_after_duplicate, 1, "duplicate transition must not attempt a second tier upload");
+
+    // The winner's remote object and local metadata must be intact.
+    assert!(backend.contains(&winner_remote_object).await);
+    let info = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+        .await
+        .expect("object must remain transitioned after duplicate task");
+    assert_eq!(info.transitioned_object.status, "complete");
+    assert_eq!(info.transitioned_object.tier, tier_name);
+    assert_eq!(
+        info.transitioned_object.name, winner_remote_object,
+        "duplicate transition must not repoint metadata at a new remote object"
+    );
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn transition_rejects_stale_etag_before_remote_upload() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+    let bucket = format!("test-api-transition-stale-etag-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/transition-stale-etag.txt";
+    (*ecstore)
+        .make_bucket(bucket.as_str(), &MakeBucketOptions::default())
+        .await
+        .expect("unversioned test bucket should be created");
+    let original = upload_test_object(&ecstore, bucket.as_str(), object, b"original transition candidate").await;
+    let replacement_payload = b"replacement committed before the stale transition starts";
+    let replacement = upload_test_object(&ecstore, bucket.as_str(), object, replacement_payload).await;
+    let transition_opts = ObjectOptions {
+        transition: lifecycle::lifecycle_contract::TransitionOptions {
+            status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+            tier: tier_name,
+            etag: original.etag.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        version_id: replacement.version_id.map(|version| version.to_string()),
+        mod_time: replacement.mod_time,
+        ..Default::default()
+    };
+
+    ecstore
+        .transition_object(bucket.as_str(), object, &transition_opts)
+        .await
+        .expect_err("stale ETag must reject the transition before remote upload");
+    assert_eq!(backend.put_count().await, 0, "rejected stale work must not upload a remote candidate");
+    assert_eq!(
+        read_object_bytes(&ecstore, bucket.as_str(), object).await,
+        replacement_payload,
+        "the replacement object must remain local and readable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn transition_commit_rejects_replaced_source() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&tier_name).await;
+    let bucket = format!("test-api-transition-replace-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/transition-replaced-source.txt";
+    let original_payload = b"transition source that must not replace a concurrent overwrite";
+    let replacement_payload = b"concurrent replacement must remain the authoritative local object";
+
+    (*ecstore)
+        .make_bucket(bucket.as_str(), &MakeBucketOptions::default())
+        .await
+        .expect("unversioned test bucket should be created");
+    let original = upload_test_object(&ecstore, bucket.as_str(), object, original_payload).await;
+    let transition_opts = ObjectOptions {
+        transition: lifecycle::lifecycle_contract::TransitionOptions {
+            status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+            tier: tier_name.clone(),
+            etag: original.etag.clone().unwrap_or_default(),
+            ..Default::default()
+        },
+        version_id: original.version_id.map(|version| version.to_string()),
+        mod_time: original.mod_time,
+        ..Default::default()
+    };
+
+    let put_barrier = backend.arm_put_barrier().await;
+    let transition_store = Arc::clone(&ecstore);
+    let transition_bucket = bucket.clone();
+    let transition = tokio::spawn(async move {
+        transition_store
+            .transition_object(&transition_bucket, object, &transition_opts)
+            .await
+    });
+    put_barrier.wait_until_paused().await;
+
+    upload_test_object(&ecstore, bucket.as_str(), object, replacement_payload).await;
+    put_barrier.release();
+
+    transition
+        .await
+        .expect("transition task should not panic")
+        .expect_err("transition must reject a source replaced during remote upload");
+    assert_eq!(
+        backend.put_count().await,
+        1,
+        "the stale transition should upload exactly one remote candidate"
+    );
+    assert_eq!(
+        backend.remove_count().await,
+        1,
+        "the uncommitted remote candidate must be removed after identity revalidation fails"
+    );
+    assert_eq!(
+        backend.remove_versions().await,
+        backend.put_versions().await,
+        "cleanup must delete the exact object version returned by the tier PUT"
+    );
+    assert_eq!(
+        backend.object_count().await,
+        0,
+        "the rejected transition must not leave a remote candidate"
+    );
+    assert_eq!(
+        read_object_bytes(&ecstore, bucket.as_str(), object).await,
+        replacement_payload,
+        "the replacement object must remain readable and unmodified"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn cancelled_transition_waiting_for_prepared_reader_cleans_remote() {
+    temp_env::async_with_vars([(ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+        let bucket = format!("test-api-transition-reader-lock-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object = "test/transition-reader-lock.txt";
+        let payload = b"prepared reader must keep transition commit behind the namespace lock".repeat(1024);
+
+        (*ecstore)
+            .make_bucket(bucket.as_str(), &MakeBucketOptions::default())
+            .await
+            .expect("unversioned test bucket should be created");
+        let original = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+        let transition_opts = ObjectOptions {
+            transition: lifecycle::lifecycle_contract::TransitionOptions {
+                status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let put_barrier = backend.arm_put_barrier().await;
+        let transition_store = Arc::clone(&ecstore);
+        let transition_bucket = bucket.clone();
+        let mut transition = tokio::spawn(async move {
+            transition_store
+                .transition_object(&transition_bucket, object, &transition_opts)
+                .await
+        });
+        put_barrier.wait_until_paused().await;
+
+        let prepared_reader = ecstore
+            .prepare_get_object_reader(bucket.as_str(), object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("prepared reader should resolve while the local source still exists");
+        put_barrier.release();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut transition)
+                .await
+                .is_err(),
+            "transition commit must wait while a prepared reader owns the namespace read lock"
+        );
+
+        transition.abort();
+        assert!(
+            transition
+                .await
+                .expect_err("transition task should be cancelled")
+                .is_cancelled(),
+            "transition cancellation should not be reported as a task panic"
+        );
+        drop(prepared_reader);
+        assert_eq!(backend.put_count().await, 1, "the transition should upload exactly one remote candidate");
+        assert!(
+            backend.wait_for_object_count(0, TRANSITION_WAIT_TIMEOUT).await,
+            "cancelling while the commit waits for the namespace lock must clean the exact uploaded candidate"
+        );
+        assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+        assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, payload);
     })
     .await;
 }

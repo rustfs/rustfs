@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
 use crate::client::transition_api::{ReadCloser, ReaderImpl};
@@ -140,7 +140,43 @@ pub struct MockStoredObject {
 struct MockWarmBackendInner {
     objects: Mutex<HashMap<String, MockStoredObject>>,
     faults: Mutex<FaultConfig>,
+    put_read_limit: Mutex<Option<usize>>,
+    put_remote_version: Mutex<Option<String>>,
     op_log: Mutex<Vec<MockWarmOp>>,
+    put_versions: Mutex<Vec<(String, String)>>,
+    remove_versions: Mutex<Vec<(String, String)>>,
+    put_barrier: Mutex<Option<Arc<MockPutBarrierState>>>,
+}
+
+#[derive(Default)]
+struct MockPutBarrierState {
+    arrived: Notify,
+    release: Notify,
+}
+
+/// One-shot barrier that pauses a mock tier PUT after storing its remote body.
+pub struct MockPutBarrier {
+    state: Arc<MockPutBarrierState>,
+}
+
+impl MockPutBarrier {
+    /// Wait until the remote body is stored and the PUT is paused before returning.
+    pub async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("mock tier PUT should reach the deterministic barrier");
+    }
+
+    /// Release the paused PUT.
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+impl Drop for MockPutBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+    }
 }
 
 /// In-memory [`WarmBackend`] for lifecycle / tiering integration tests.
@@ -157,6 +193,13 @@ impl MockWarmBackend {
     /// Create an empty backend with no faults injected.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Arm a one-shot pause after the next tier PUT stores its remote body.
+    pub async fn arm_put_barrier(&self) -> MockPutBarrier {
+        let state = Arc::new(MockPutBarrierState::default());
+        *self.inner.put_barrier.lock().await = Some(Arc::clone(&state));
+        MockPutBarrier { state }
     }
 
     // ---- fault injection -------------------------------------------------
@@ -189,6 +232,18 @@ impl MockWarmBackend {
     /// Clear all injected faults, restoring healthy behaviour.
     pub async fn clear_faults(&self) {
         *self.inner.faults.lock().await = FaultConfig::default();
+    }
+
+    /// Limit how many body bytes a successful mock PUT consumes. `None` drains
+    /// the complete body. This models a backend that incorrectly accepts a
+    /// truncated stream while still returning success.
+    pub async fn set_put_read_limit(&self, limit: Option<usize>) {
+        *self.inner.put_read_limit.lock().await = limit;
+    }
+
+    /// Override the remote version returned by subsequent successful PUTs.
+    pub async fn set_put_remote_version(&self, remote_version: Option<String>) {
+        *self.inner.put_remote_version.lock().await = remote_version;
     }
 
     async fn precondition(&self) -> Result<(), std::io::Error> {
@@ -230,6 +285,16 @@ impl MockWarmBackend {
             .iter()
             .filter(|op| matches!(op, MockWarmOp::Remove { .. }))
             .count()
+    }
+
+    /// Return the exact object/version pairs produced by successful tier PUTs.
+    pub async fn put_versions(&self) -> Vec<(String, String)> {
+        self.inner.put_versions.lock().await.clone()
+    }
+
+    /// Return the exact object/version pairs passed to successful tier removes.
+    pub async fn remove_versions(&self) -> Vec<(String, String)> {
+        self.inner.remove_versions.lock().await.clone()
     }
 
     /// Number of `get` calls recorded — useful to assert restore reads hit the
@@ -328,7 +393,13 @@ impl MockWarmBackend {
     // ---- internal helpers -----------------------------------------------
 
     async fn put_bytes(&self, object: &str, bytes: Vec<u8>, metadata: HashMap<String, String>) -> String {
-        let remote_version_id = Uuid::new_v4().to_string();
+        let remote_version_id = self
+            .inner
+            .put_remote_version
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         self.inner.objects.lock().await.insert(
             object.to_string(),
             MockStoredObject {
@@ -341,11 +412,18 @@ impl MockWarmBackend {
     }
 
     async fn read_bytes(&self, reader: ReaderImpl) -> Result<Vec<u8>, std::io::Error> {
+        let limit = *self.inner.put_read_limit.lock().await;
         match reader {
-            ReaderImpl::Body(bytes) => Ok(bytes.to_vec()),
+            ReaderImpl::Body(bytes) => Ok(bytes.slice(..limit.unwrap_or(bytes.len()).min(bytes.len())).to_vec()),
             ReaderImpl::ObjectBody(mut reader) => {
                 let mut buf = Vec::new();
-                reader.stream.read_to_end(&mut buf).await?;
+                if let Some(limit) = limit {
+                    let limit =
+                        u64::try_from(limit).map_err(|_| std::io::Error::other("mock PUT read limit exceeds u64::MAX"))?;
+                    reader.stream.take(limit).read_to_end(&mut buf).await?;
+                } else {
+                    reader.stream.read_to_end(&mut buf).await?;
+                }
                 Ok(buf)
             }
         }
@@ -358,6 +436,11 @@ impl WarmBackend for MockWarmBackend {
         self.precondition().await?;
         let bytes = self.read_bytes(r).await?;
         let version = self.put_bytes(object, bytes, HashMap::new()).await;
+        self.inner
+            .put_versions
+            .lock()
+            .await
+            .push((object.to_string(), version.clone()));
         self.record(MockWarmOp::Put {
             object: object.to_string(),
         })
@@ -398,6 +481,16 @@ impl WarmBackend for MockWarmBackend {
             metadata.insert("x-amz-object-lock-legal-hold".to_string(), opts.legalhold.as_str().to_string());
         }
         let version = self.put_bytes(object, bytes, metadata).await;
+        self.inner
+            .put_versions
+            .lock()
+            .await
+            .push((object.to_string(), version.clone()));
+        let barrier = self.inner.put_barrier.lock().await.take();
+        if let Some(barrier) = barrier {
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+        }
         self.record(MockWarmOp::Put {
             object: object.to_string(),
         })
@@ -427,9 +520,22 @@ impl WarmBackend for MockWarmBackend {
         Ok(tokio::io::BufReader::new(Cursor::new(bytes[start.min(bytes.len())..end].to_vec())))
     }
 
-    async fn remove(&self, object: &str, _rv: &str) -> Result<(), std::io::Error> {
+    async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         self.precondition().await?;
-        self.inner.objects.lock().await.remove(object);
+        let mut objects = self.inner.objects.lock().await;
+        if let Some(stored) = objects.get(object)
+            && !rv.is_empty()
+            && stored.remote_version_id != rv
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "NoSuchVersion"));
+        }
+        objects.remove(object);
+        drop(objects);
+        self.inner
+            .remove_versions
+            .lock()
+            .await
+            .push((object.to_string(), rv.to_string()));
         self.record(MockWarmOp::Remove {
             object: object.to_string(),
         })
@@ -440,7 +546,7 @@ impl WarmBackend for MockWarmBackend {
     async fn in_use(&self) -> Result<bool, std::io::Error> {
         self.precondition().await?;
         self.record(MockWarmOp::InUse).await;
-        Ok(false)
+        Ok(!self.inner.objects.lock().await.is_empty())
     }
 }
 
@@ -479,7 +585,9 @@ pub async fn register_mock_tier_backend(handle: &Arc<RwLock<TierConfigMgr>>, tie
             ..Default::default()
         },
     );
-    tier_config_mgr.driver_cache.insert(tier_name.to_string(), Box::new(backend));
+    tier_config_mgr
+        .install_test_driver(tier_name, Box::new(backend))
+        .expect("mock tier driver should install");
 }
 
 /// The transition-state tuple read from an on-disk `xl.meta`, plus the object's
