@@ -469,8 +469,12 @@ pub(crate) mod ecstore_rpc {
 }
 
 pub(crate) mod ecstore_object {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        GetObjectBodyCacheHook, ObjectMutationHook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, ObjectMutationHook, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
 }
 

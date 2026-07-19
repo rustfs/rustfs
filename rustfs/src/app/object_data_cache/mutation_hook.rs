@@ -20,7 +20,9 @@
 //! dead bytes resident until TTL (ODC-26, backlog#1131).
 
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
-use crate::storage::storage_api::ecstore_object::{ObjectMutationHook, register_object_mutation_hook};
+use crate::storage::storage_api::ecstore_object::{
+    ObjectMutationHook, register_object_mutation_hook, unregister_object_mutation_hook,
+};
 use rustfs_object_data_cache::{ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason};
 use std::sync::Arc;
 
@@ -29,11 +31,11 @@ pub(crate) struct ObjectDataCacheMutationHook {
     adapter: Arc<ObjectDataCacheAdapter>,
 }
 
-/// Registers the mutation hook into ecstore. No-op for a disabled cache so the
-/// delete paths keep a single `None` branch when the feature is off, matching
-/// [`register_object_data_cache_body_hook`](super::register_object_data_cache_body_hook).
+/// Registers the mutation hook into ecstore, or removes the previous hook when
+/// a config reload disables caching.
 pub(crate) fn register_object_data_cache_mutation_hook(adapter: Arc<ObjectDataCacheAdapter>) {
     if adapter.is_disabled() {
+        unregister_object_mutation_hook();
         return;
     }
     register_object_mutation_hook(Arc::new(ObjectDataCacheMutationHook { adapter }));
@@ -98,5 +100,23 @@ mod tests {
         hook.after_object_mutation("b", "k").await;
 
         assert!(matches!(adapter.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+    }
+
+    #[test]
+    #[serial_test::serial(object_mutation_hook)]
+    fn disabled_reload_unregisters_and_releases_previous_adapter() {
+        let adapter = fill_enabled_adapter();
+        let weak = Arc::downgrade(&adapter);
+        register_object_data_cache_mutation_hook(adapter);
+
+        let disabled = Arc::new(ObjectDataCacheAdapter::disabled());
+        let disabled_weak = Arc::downgrade(&disabled);
+        register_object_data_cache_mutation_hook(disabled);
+
+        assert!(weak.upgrade().is_none());
+        assert!(
+            disabled_weak.upgrade().is_none(),
+            "disabled reload must clear the mutation-hook slot instead of registering the disabled adapter"
+        );
     }
 }

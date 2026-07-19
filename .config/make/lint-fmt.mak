@@ -60,6 +60,11 @@ body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fai
 	@echo "🧱 Checking body-cache whitelist guard..."
 	./scripts/check_body_cache_whitelist.sh
 
+.PHONY: log-analyzer-rules-check
+log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source
+	@echo "🩺 Checking log-analyzer rule anchors..."
+	./scripts/check_log_analyzer_rules.sh
+
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check
 	@echo "🔨 Running compilation check..."

@@ -56,7 +56,7 @@ pub(super) const LONG_VERSION: &str = concat!(
 );
 
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
-pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls"];
+pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose"];
 
 /// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
 /// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
@@ -114,6 +114,59 @@ pub enum Commands {
     Info(InfoOpts),
     /// Inspect TLS certificate directory layout and parsing status
     Tls(TlsOpts),
+    /// Analyze RustFS log files and report probable failure causes
+    Diagnose(DiagnoseOpts),
+}
+
+/// Diagnose report output format
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnoseFormat {
+    /// Terminal text report
+    Text,
+    /// Machine-readable JSON (stable schema_version)
+    Json,
+    /// Markdown, pasteable into a support ticket
+    Md,
+}
+
+/// Diagnose subcommand options
+#[derive(Args, Clone)]
+pub struct DiagnoseOpts {
+    /// Log inputs: files, directories, archives (.zip/.tar/.tar.gz/.zst/.gz), or "-" for stdin
+    #[arg(required = true)]
+    pub paths: Vec<String>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = DiagnoseFormat::Text)]
+    pub format: DiagnoseFormat,
+
+    /// Only consider events at/after this time (RFC-3339, or relative like "30m", "24h", "7d")
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// Only consider events at/before this time (same syntax as --since)
+    #[arg(long)]
+    pub until: Option<String>,
+
+    /// Minimum level to analyze (trace|debug|info|warn|error)
+    #[arg(long)]
+    pub min_level: Option<String>,
+
+    /// Hash bucket/object/key/IP values in the report (safe to forward)
+    #[arg(long)]
+    pub redact: bool,
+
+    /// Extra rules file (JSON; same-id rules override built-ins)
+    #[arg(long)]
+    pub rules: Option<std::path::PathBuf>,
+
+    /// Max unmatched error patterns to list
+    #[arg(long, default_value_t = 20)]
+    pub top: usize,
+
+    /// Max sample lines per finding
+    #[arg(long, default_value_t = 3)]
+    pub samples: usize,
 }
 
 /// Information type to display
@@ -313,6 +366,8 @@ pub enum CommandResult {
     Info(InfoOpts),
     /// TLS command with options
     Tls(TlsOpts),
+    /// Diagnose command with options
+    Diagnose(DiagnoseOpts),
 }
 
 /// Create default ServerOpts from environment variables

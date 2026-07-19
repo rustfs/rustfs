@@ -238,6 +238,14 @@ pub(crate) fn ensure_test_rpc_secret() {
     let _ = rustfs_credentials::set_global_rpc_secret(TEST_RPC_SECRET.to_owned());
 }
 
+pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
+    get_global_storage_class_snapshot().get_parity_for_sc(storage_class.unwrap_or_default())
+}
+
+pub(crate) fn storage_class_should_inline(shard_size: i64, versioned: bool) -> bool {
+    get_global_storage_class_snapshot().should_inline(shard_size, versioned)
+}
+
 pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
     base64_simd::URL_SAFE_NO_PAD
         .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes())
@@ -312,6 +320,21 @@ pub(crate) fn storage_class_config() -> Option<storageclass::Config> {
 
 pub(crate) fn storage_class_config_snapshot() -> Arc<storageclass::Config> {
     get_global_storage_class_snapshot()
+}
+
+/// Scalar STANDARD / RRS parity for backend-info reporting.
+///
+/// Retained for the rebalance/backend-info path. `get_parity_for_sc` returns
+/// `None` when the runtime config is uninitialized or (post per-pool support)
+/// when pools disagree, so STANDARD falls back to the caller's default and RRS
+/// stays `None` — matching the pre-per-pool scalar reporting.
+pub(crate) fn backend_storage_class_parities(default_standard_parity: usize) -> (Option<usize>, Option<usize>) {
+    let sc = get_global_storage_class_snapshot();
+    let standard = sc
+        .get_parity_for_sc(storageclass::CLASS_STANDARD)
+        .or(Some(default_standard_parity));
+    let reduced_redundancy = sc.get_parity_for_sc(storageclass::RRS);
+    (standard, reduced_redundancy)
 }
 
 pub(crate) fn set_storage_class_config(config: storageclass::Config) {

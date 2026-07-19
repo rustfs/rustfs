@@ -37,17 +37,15 @@ fn startup_pool_drive_counts(endpoint_pools: &EndpointServerPools) -> Vec<usize>
 }
 
 fn resolve_startup_pool_defaults(endpoint_pools: &EndpointServerPools) -> Result<Vec<usize>> {
-    resolve_startup_pool_defaults_with(endpoint_pools, |drive_counts| {
-        storageclass::lookup_config_for_pools(&KVS::new(), drive_counts).map(|_| ())
-    })
+    resolve_startup_pool_defaults_with(endpoint_pools, ECStore::validate_startup_storage_class)
 }
 
 fn resolve_startup_pool_defaults_with(
     endpoint_pools: &EndpointServerPools,
-    validate: impl FnOnce(&[usize]) -> Result<()>,
+    validate: impl FnOnce(&EndpointServerPools) -> Result<()>,
 ) -> Result<Vec<usize>> {
+    validate(endpoint_pools)?;
     let drive_counts = startup_pool_drive_counts(endpoint_pools);
-    validate(&drive_counts)?;
     drive_counts.into_iter().map(ec_drives_no_config).collect()
 }
 
@@ -212,10 +210,10 @@ impl ECStore {
     ) -> Result<Arc<Self>> {
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
-        // Validate environment overrides before opening any disk, while keeping
-        // each set's metadata/delete-marker fallback on its topology majority.
-        // Payload writes use the runtime storage-class snapshot published before
-        // the store is marked ready.
+        // Validate topology and environment overrides before opening any disk.
+        // The values stored on SetDisks remain pure per-pool topology defaults;
+        // payload writes use the runtime storage-class snapshot published later
+        // from config before the store is marked ready.
         let default_pool_parities = resolve_startup_pool_defaults(&endpoint_pools)?;
 
         let mut deployment_id = None;
@@ -834,8 +832,9 @@ mod tests {
 
     #[test]
     fn startup_pool_defaults_are_resolved_per_pool() {
-        let validate = |drive_counts: &[usize]| {
-            crate::config::storageclass::lookup_config_for_pools_without_env(&KVS::new(), drive_counts).map(|_| ())
+        let validate = |pools: &EndpointServerPools| {
+            let drive_counts: Vec<_> = pools.as_ref().iter().map(|pool| pool.drives_per_set).collect();
+            crate::config::storageclass::lookup_config_for_pools_without_env(&KVS::new(), &drive_counts).map(|_| ())
         };
         let defaults = resolve_startup_pool_defaults_with(&endpoint_pools_with_drive_counts(&[4, 2]), validate)
             .expect("heterogeneous topology should resolve");
@@ -848,12 +847,13 @@ mod tests {
 
     #[test]
     fn startup_pool_defaults_validate_explicit_environment_for_every_pool() {
-        let resolve = |drive_counts: &[usize]| {
+        let validate = |pools: &EndpointServerPools| {
+            let drive_counts: Vec<_> = pools.as_ref().iter().map(|pool| pool.drives_per_set).collect();
             let mut kvs = KVS::new();
             kvs.insert(crate::config::storageclass::CLASS_STANDARD.to_string(), "EC:2".to_string());
-            crate::config::storageclass::lookup_config_for_pools_without_env(&kvs, drive_counts).map(|_| ())
+            crate::config::storageclass::lookup_config_for_pools_without_env(&kvs, &drive_counts).map(|_| ())
         };
-        let err = resolve_startup_pool_defaults_with(&endpoint_pools_with_drive_counts(&[4, 2]), resolve)
+        let err = resolve_startup_pool_defaults_with(&endpoint_pools_with_drive_counts(&[4, 2]), validate)
             .expect_err("explicit EC:2 must fail before any two-drive pool I/O");
         assert!(err.to_string().contains("pool 1") && err.to_string().contains("2 drives"));
     }

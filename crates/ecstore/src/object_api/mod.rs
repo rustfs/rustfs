@@ -60,9 +60,14 @@ mod types;
 
 #[cfg(test)]
 pub(crate) use body_cache_hook::clear_get_object_body_cache_hook;
-pub(crate) use body_cache_hook::get_object_body_cache_hook;
-pub use body_cache_hook::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
+pub use body_cache_hook::{
+    GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook,
+    register_get_object_body_cache_hook, unregister_get_object_body_cache_hook,
+};
+pub(crate) use body_cache_hook::{
+    get_object_body_cache_hook, get_object_body_cache_hook_suppressed, without_get_object_body_cache_hook,
+};
 pub(crate) use object_mutation_hook::notify_object_mutation;
-pub use object_mutation_hook::{ObjectMutationHook, register_object_mutation_hook};
+pub use object_mutation_hook::{ObjectMutationHook, register_object_mutation_hook, unregister_object_mutation_hook};
 pub use readers::*;
 pub use types::*;

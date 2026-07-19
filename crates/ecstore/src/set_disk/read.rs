@@ -20,21 +20,22 @@ use crate::diagnostics::get::{
     GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
     GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_NUMBER,
-    GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID,
-    GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, GET_METADATA_CACHE_REASON_VERSIONED,
-    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
-    GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
-    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
-    GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
-    GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
-    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
-    GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
-    GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
-    GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
+    GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
+    GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED,
+    GET_METADATA_CACHE_REASON_VERSIONED, GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA,
+    GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, GET_METADATA_EARLY_STOP_REASON_ERROR,
+    GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, GET_METADATA_EARLY_STOP_REASON_NOT_FOUND,
+    GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND,
+    GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
+    GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
+    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP,
+    GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GET_STAGE_READER_SETUP_DROP_PENDING,
+    GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM, GET_STAGE_READER_TASK_BITROT_READER_INIT,
+    GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION, GetObjectFailureReason, classify_disk_error,
+    get_stage_timer_if_enabled, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
@@ -60,6 +61,7 @@ use super::core::io_primitives::*;
 
 impl SetDisks {
     async fn get_object_metadata_cache_bypass_reason(
+        &self,
         bucket: &str,
         opts: &ObjectOptions,
         read_data: bool,
@@ -67,7 +69,8 @@ impl SetDisks {
         if let Some(reason) = get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data) {
             return Some(reason);
         }
-        runtime_sources::setup_is_dist_erasure()
+        self.ctx
+            .is_dist_erasure()
             .await
             .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
@@ -80,11 +83,28 @@ impl SetDisks {
     }
 
     async fn lookup_cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> MetadataCacheLookup {
-        let key = GetObjectMetadataCacheKey::new(bucket, object);
+        self.lookup_cached_get_object_fileinfo_after_get(bucket, object, || {}).await
+    }
+
+    async fn lookup_cached_get_object_fileinfo_after_get(
+        &self,
+        bucket: &str,
+        object: &str,
+        after_get: impl FnOnce(),
+    ) -> MetadataCacheLookup {
+        let Some(generation) = self.get_object_metadata_cache_generation(bucket, object) else {
+            return MetadataCacheLookup::Miss;
+        };
+        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
         // moka handles TTL expiry automatically; no is_fresh() check needed
         let Some(entry) = self.get_object_metadata_cache.get(&key).await else {
             return MetadataCacheLookup::Miss;
         };
+        after_get();
+        if !self.is_get_object_metadata_cache_generation_current(generation) {
+            self.get_object_metadata_cache.invalidate(&key).await;
+            return MetadataCacheLookup::Miss;
+        }
         if entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum {
             MetadataCacheLookup::Hit(entry)
         } else {
@@ -94,8 +114,8 @@ impl SetDisks {
 
     async fn cache_get_object_fileinfo(
         &self,
-        bucket: &str,
-        object: &str,
+        identity: (&str, &str),
+        generation: Option<GetObjectMetadataCacheGeneration>,
         fi: &FileInfo,
         parts_metadata: &[FileInfo],
         online_disks: &[Option<DiskStore>],
@@ -104,21 +124,49 @@ impl SetDisks {
         if fi.deleted || !fi.has_valid_erasure_geometry() {
             return;
         }
+        let (bucket, object) = identity;
 
-        let key = GetObjectMetadataCacheKey::new(bucket, object);
-        // moka handles capacity eviction (LRU) automatically
-        self.get_object_metadata_cache
-            .insert(
-                key,
-                Arc::new(GetObjectMetadataCacheEntry {
-                    created_at: Instant::now(),
-                    fi: fi.clone(),
-                    parts_metadata: parts_metadata.to_vec(),
-                    online_disks: online_disks.to_vec(),
-                    read_quorum,
-                }),
-            )
+        let Some(generation) = generation.filter(|generation| self.is_get_object_metadata_cache_generation_current(*generation))
+        else {
+            rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                GET_OBJECT_PATH_SET_DISK,
+                GET_METADATA_CACHE_DECISION_REJECT,
+                GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
+            );
+            return;
+        };
+
+        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        let entry = Arc::new(GetObjectMetadataCacheEntry {
+            created_at: Instant::now(),
+            fi: fi.clone(),
+            parts_metadata: parts_metadata.to_vec(),
+            online_disks: online_disks.to_vec(),
+            read_quorum,
+        });
+        self.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {})
             .await;
+    }
+
+    async fn insert_get_object_metadata_cache_entry_after_insert(
+        &self,
+        key: GetObjectMetadataCacheKey,
+        generation: GetObjectMetadataCacheGeneration,
+        entry: Arc<GetObjectMetadataCacheEntry>,
+        after_insert: impl FnOnce(),
+    ) {
+        self.get_object_metadata_cache.insert(key.clone(), entry).await;
+        after_insert();
+        if self.is_get_object_metadata_cache_generation_current(generation) {
+            return;
+        }
+
+        self.get_object_metadata_cache.invalidate(&key).await;
+        rustfs_io_metrics::record_get_object_metadata_cache_decision(
+            GET_OBJECT_PATH_SET_DISK,
+            GET_METADATA_CACHE_DECISION_REJECT,
+            GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
+        );
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -193,7 +241,7 @@ impl SetDisks {
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
         let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let cache_bypass_reason = Self::get_object_metadata_cache_bypass_reason(bucket, opts, read_data).await;
+        let cache_bypass_reason = self.get_object_metadata_cache_bypass_reason(bucket, opts, read_data).await;
         let use_metadata_cache = cache_bypass_reason.is_none();
         if let Some(reason) = cache_bypass_reason {
             rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -237,6 +285,10 @@ impl SetDisks {
             GET_STAGE_METADATA_CACHE_LOOKUP,
             metadata_cache_lookup_start,
         );
+
+        let metadata_cache_generation = use_metadata_cache
+            .then(|| self.get_object_metadata_cache_generation(bucket, object))
+            .flatten();
 
         let disks = self.disks.read().await;
 
@@ -311,8 +363,17 @@ impl SetDisks {
             )
             .await;
         } else if use_metadata_cache && metadata_fanout_complete {
-            self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum)
-                .await;
+            #[cfg(test)]
+            metadata_cache_tests::wait_before_metadata_cache_publish(bucket, object).await;
+            self.cache_get_object_fileinfo(
+                (bucket, object),
+                metadata_cache_generation,
+                &fi,
+                &parts_metadata,
+                &op_online_disks,
+                read_quorum,
+            )
+            .await;
         }
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
         // debug!("get_object_fileinfo pick fi {:?}", &fi);
@@ -1719,13 +1780,81 @@ mod metadata_cache_tests {
     use super::*;
     use rustfs_common::heal_channel::HealAdmissionDropReason;
     use serial_test::serial;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::Notify;
 
     static SLOW_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DROPPED_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static CAPTURED_READ_REPAIR_PRIORITY: Mutex<Option<HealChannelPriority>> = Mutex::new(None);
     static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static METADATA_CACHE_PUBLISH_BARRIER: OnceLock<Mutex<Option<Arc<MetadataCachePublishBarrierState>>>> = OnceLock::new();
+
+    struct MetadataCachePublishBarrierState {
+        bucket: String,
+        object: String,
+        arrived: Notify,
+        release: Notify,
+    }
+
+    struct MetadataCachePublishBarrier {
+        state: Arc<MetadataCachePublishBarrierState>,
+    }
+
+    impl MetadataCachePublishBarrier {
+        fn install(bucket: &str, object: &str) -> Self {
+            let state = Arc::new(MetadataCachePublishBarrierState {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                arrived: Notify::new(),
+                release: Notify::new(),
+            });
+            let mut slot = METADATA_CACHE_PUBLISH_BARRIER
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("metadata publish barrier mutex should not poison");
+            assert!(slot.is_none(), "metadata publish barrier must be installed by one test at a time");
+            *slot = Some(Arc::clone(&state));
+            Self { state }
+        }
+
+        async fn wait_until_paused(&self) {
+            tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+                .await
+                .expect("metadata publication should reach the deterministic barrier");
+        }
+
+        fn release(&self) {
+            self.state.release.notify_one();
+        }
+    }
+
+    impl Drop for MetadataCachePublishBarrier {
+        fn drop(&mut self) {
+            self.state.release.notify_one();
+            let mut slot = METADATA_CACHE_PUBLISH_BARRIER
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("metadata publish barrier mutex should not poison");
+            if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+                *slot = None;
+            }
+        }
+    }
+
+    pub(super) async fn wait_before_metadata_cache_publish(bucket: &str, object: &str) {
+        let barrier = METADATA_CACHE_PUBLISH_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("metadata publish barrier mutex should not poison")
+            .as_ref()
+            .filter(|state| state.bucket == bucket && state.object == object)
+            .cloned();
+        if let Some(barrier) = barrier {
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+        }
+    }
 
     fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
         SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1752,7 +1881,11 @@ mod metadata_cache_tests {
     }
 
     async fn new_metadata_cache_test_set() -> Arc<SetDisks> {
-        SetDisks::new(
+        new_metadata_cache_test_set_with_ctx(Arc::new(crate::runtime::instance::InstanceContext::new())).await
+    }
+
+    async fn new_metadata_cache_test_set_with_ctx(ctx: Arc<crate::runtime::instance::InstanceContext>) -> Arc<SetDisks> {
+        SetDisks::new_with_instance_ctx(
             "metadata-cache-test".to_string(),
             Arc::new(RwLock::new(Vec::new())),
             4,
@@ -1762,6 +1895,7 @@ mod metadata_cache_tests {
             Vec::new(),
             FormatV3::new(1, 4),
             Vec::new(),
+            ctx,
         )
         .await
     }
@@ -2320,7 +2454,8 @@ mod metadata_cache_tests {
         let parts_metadata = vec![fi.clone()];
         let online_disks = Vec::new();
 
-        set.cache_get_object_fileinfo("bucket", "object", &fi, &parts_metadata, &online_disks, 0)
+        let generation = set.get_object_metadata_cache_generation("bucket", "object");
+        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, &parts_metadata, &online_disks, 0)
             .await;
 
         let cached = set
@@ -2339,7 +2474,8 @@ mod metadata_cache_tests {
 
         let mut deleted = valid_test_fileinfo("deleted-object");
         deleted.deleted = true;
-        set.cache_get_object_fileinfo("bucket", "deleted-object", &deleted, &[deleted.clone()], &[], 0)
+        let generation = set.get_object_metadata_cache_generation("bucket", "deleted-object");
+        set.cache_get_object_fileinfo(("bucket", "deleted-object"), generation, &deleted, &[deleted.clone()], &[], 0)
             .await;
         assert!(
             set.cached_get_object_fileinfo("bucket", "deleted-object").await.is_none(),
@@ -2347,7 +2483,8 @@ mod metadata_cache_tests {
         );
 
         let invalid = FileInfo::default();
-        set.cache_get_object_fileinfo("bucket", "invalid-object", &invalid, std::slice::from_ref(&invalid), &[], 0)
+        let generation = set.get_object_metadata_cache_generation("bucket", "invalid-object");
+        set.cache_get_object_fileinfo(("bucket", "invalid-object"), generation, &invalid, std::slice::from_ref(&invalid), &[], 0)
             .await;
         assert!(
             set.cached_get_object_fileinfo("bucket", "invalid-object").await.is_none(),
@@ -2362,7 +2499,12 @@ mod metadata_cache_tests {
 
         set.get_object_metadata_cache
             .insert(
-                GetObjectMetadataCacheKey::new("bucket", "object"),
+                GetObjectMetadataCacheKey::new(
+                    "bucket",
+                    "object",
+                    set.get_object_metadata_cache_generation("bucket", "object")
+                        .expect("metadata cache generation should be active"),
+                ),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
                     fi: fi.clone(),
@@ -2387,7 +2529,8 @@ mod metadata_cache_tests {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
 
-        set.cache_get_object_fileinfo("bucket", "object", &fi, std::slice::from_ref(&fi), &[], 0)
+        let generation = set.get_object_metadata_cache_generation("bucket", "object");
+        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
             .await;
 
         assert!(
@@ -2401,7 +2544,8 @@ mod metadata_cache_tests {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
 
-        set.cache_get_object_fileinfo("bucket", "object", &fi, std::slice::from_ref(&fi), &[], 0)
+        let generation = set.get_object_metadata_cache_generation("bucket", "object");
+        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
             .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
 
@@ -2413,13 +2557,201 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    #[serial(metadata_cache_publish_barrier)]
+    async fn metadata_cache_production_fanout_cannot_publish_after_invalidation() {
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(4, 2).await;
+        let bucket = "metadata-cache-production-fence";
+        let object = "object";
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().flatten() {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(vec![7u8; 1024]);
+        set.put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("test object should be written");
+
+        let barrier = MetadataCachePublishBarrier::install(bucket, object);
+        let stale_generation = set
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("metadata cache generation should be active");
+        let reader_set = Arc::clone(&set);
+        let read = tokio::spawn(async move {
+            reader_set
+                .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                .await
+        });
+        barrier.wait_until_paused().await;
+        set.invalidate_get_object_metadata_cache(bucket, object).await;
+        barrier.release();
+        read.await
+            .expect("metadata read task should not panic")
+            .expect("metadata fanout should still return its selected FileInfo");
+
+        assert!(
+            set.get_object_metadata_cache
+                .get(&GetObjectMetadataCacheKey::new(bucket, object, stale_generation))
+                .await
+                .is_none(),
+            "production stale publication must not remain under its retired generation key"
+        );
+        assert!(
+            set.cached_get_object_fileinfo(bucket, object).await.is_none(),
+            "the production fanout token captured before invalidation must not publish afterward"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_lookup_rechecks_generation_after_get() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let generation = set.get_object_metadata_cache_generation("bucket", "object");
+        let generation_index = generation.expect("metadata cache generation should be active").index;
+        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+
+        let lookup = set
+            .lookup_cached_get_object_fileinfo_after_get("bucket", "object", || {
+                set.get_object_metadata_cache_generations[generation_index].fetch_add(1, Ordering::AcqRel);
+            })
+            .await;
+
+        assert!(
+            matches!(lookup, MetadataCacheLookup::Miss),
+            "a hit overlapping invalidation must be rejected after the second generation read"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_publication_rechecks_generation_after_insert() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("metadata cache generation should be active");
+        let generation_index = generation.index;
+        let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+        let entry = Arc::new(GetObjectMetadataCacheEntry {
+            created_at: Instant::now(),
+            fi: fi.clone(),
+            parts_metadata: vec![fi],
+            online_disks: Vec::new(),
+            read_quorum: 0,
+        });
+
+        set.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {
+            set.get_object_metadata_cache_generations[generation_index].fetch_add(1, Ordering::AcqRel);
+        })
+        .await;
+        assert!(
+            set.get_object_metadata_cache
+                .get(&GetObjectMetadataCacheKey::new("bucket", "object", generation))
+                .await
+                .is_none(),
+            "post-insert generation change must withdraw the retired entry"
+        );
+        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_generation_advances_monotonically() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let initial = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("initial generation should be active");
+
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        let first = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("first generation should be active");
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        let second = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("second generation should be active");
+
+        assert_eq!(first.value, initial.value + 1);
+        assert_eq!(second.value, first.value + 1);
+        set.cache_get_object_fileinfo(("bucket", "object"), Some(first), &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_distribution_bypass_uses_set_instance_context() {
+        let distributed_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        distributed_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+            .await;
+        let standalone_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        standalone_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+            .await;
+        let distributed = new_metadata_cache_test_set_with_ctx(distributed_ctx).await;
+        let standalone = new_metadata_cache_test_set_with_ctx(standalone_ctx).await;
+
+        assert_eq!(
+            distributed
+                .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
+                .await,
+            Some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
+        );
+        assert_eq!(
+            standalone
+                .get_object_metadata_cache_bypass_reason("bucket", &ObjectOptions::default(), true)
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_generation_overflow_fails_closed() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let generation_index = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("metadata cache generation should be active")
+            .index;
+        set.get_object_metadata_cache_generations[generation_index].store(u64::MAX - 1, Ordering::Release);
+        let last_generation = set.get_object_metadata_cache_generation("bucket", "object");
+        assert_eq!(last_generation.map(|generation| generation.value), Some(u64::MAX - 1));
+
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+
+        assert_eq!(set.get_object_metadata_cache_generation("bucket", "object"), None);
+        set.cache_get_object_fileinfo(("bucket", "object"), last_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        assert_eq!(
+            set.get_object_metadata_cache_generations[generation_index].load(Ordering::Acquire),
+            u64::MAX,
+            "overflow must permanently disable publication instead of wrapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_invalidate_all_fences_late_insert() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let stale_generation = set.get_object_metadata_cache_generation("bucket", "object");
+
+        set.invalidate_all_get_object_metadata_cache();
+
+        set.cache_get_object_fileinfo(("bucket", "object"), stale_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
+    }
+
+    #[tokio::test]
     async fn get_object_metadata_cache_prunes_when_capacity_is_reached() {
         // moka handles capacity eviction automatically via the configured max_capacity.
         // This test verifies that the cache can hold entries and that insertion works.
         let set = new_metadata_cache_test_set().await;
         let fresh_fi = valid_test_fileinfo("fresh-object");
 
-        set.cache_get_object_fileinfo("bucket", "fresh-object", &fresh_fi, std::slice::from_ref(&fresh_fi), &[], 0)
+        let generation = set.get_object_metadata_cache_generation("bucket", "fresh-object");
+        set.cache_get_object_fileinfo(("bucket", "fresh-object"), generation, &fresh_fi, std::slice::from_ref(&fresh_fi), &[], 0)
             .await;
 
         assert!(

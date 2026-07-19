@@ -1202,7 +1202,7 @@ fi
       if (/^\s*(?!\/\/).*\bErasure::new(?:_with_options)?\s*\(/) {
         print "$ARGV:$line:$_";
       }
-    ' || true
+      ' || true
 ) >"$ERASURE_PANICKING_CONSTRUCTOR_ALL_HITS_FILE"
 
 grep -Fv "$ERASURE_GUARD_FIXTURE:" "$ERASURE_PANICKING_CONSTRUCTOR_ALL_HITS_FILE" \

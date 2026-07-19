@@ -39,10 +39,34 @@ pub(crate) enum GetObjectBodyCachePlan {
     Cacheable(ObjectDataCacheGetPlan),
 }
 
+impl GetObjectBodyCachePlan {
+    pub(crate) fn key(&self) -> Option<&rustfs_object_data_cache::ObjectDataCacheKey> {
+        match self {
+            Self::Cacheable(plan) => plan.key(),
+            Self::Disabled | Self::Skip => None,
+        }
+    }
+}
+
 /// Builds a conservative body-cache plan for a GET request.
 pub(crate) fn build_get_object_body_cache_plan(
     adapter: &ObjectDataCacheAdapter,
     request: GetObjectBodyCacheRequest<'_>,
+) -> GetObjectBodyCachePlan {
+    build_get_object_body_cache_plan_inner(adapter, request, true)
+}
+
+pub(crate) fn build_get_object_body_cache_plan_for_revalidation(
+    adapter: &ObjectDataCacheAdapter,
+    request: GetObjectBodyCacheRequest<'_>,
+) -> GetObjectBodyCachePlan {
+    build_get_object_body_cache_plan_inner(adapter, request, false)
+}
+
+fn build_get_object_body_cache_plan_inner(
+    adapter: &ObjectDataCacheAdapter,
+    request: GetObjectBodyCacheRequest<'_>,
+    record_metric: bool,
 ) -> GetObjectBodyCachePlan {
     if adapter.is_disabled() {
         return GetObjectBodyCachePlan::Disabled;
@@ -51,6 +75,7 @@ pub(crate) fn build_get_object_body_cache_plan(
     if request.has_range
         || request.part_number.is_some()
         || request.encryption_applied
+        || request.info.is_encrypted()
         || request.info.delete_marker
         || request.info.version_only
         || request.info.metadata_only
@@ -105,7 +130,12 @@ pub(crate) fn build_get_object_body_cache_plan(
         body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
     };
 
-    match adapter.plan_get(engine_request) {
+    let engine_plan = if record_metric {
+        adapter.plan_get(engine_request)
+    } else {
+        adapter.plan_get_untracked(engine_request)
+    };
+    match engine_plan {
         ObjectDataCacheGetPlan::Disabled | ObjectDataCacheGetPlan::SkipTooLarge => GetObjectBodyCachePlan::Skip,
         plan @ ObjectDataCacheGetPlan::Cacheable { .. } => GetObjectBodyCachePlan::Cacheable(plan),
     }
@@ -113,8 +143,13 @@ pub(crate) fn build_get_object_body_cache_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{GetObjectBodyCachePlan, GetObjectBodyCacheRequest, build_get_object_body_cache_plan};
+    use super::{
+        GetObjectBodyCachePlan, GetObjectBodyCacheRequest, build_get_object_body_cache_plan,
+        build_get_object_body_cache_plan_for_revalidation,
+    };
     use crate::app::object_data_cache::ObjectDataCacheAdapter;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_object_data_cache::{ObjectDataCacheConfig, ObjectDataCacheMode};
 
     fn enabled_adapter() -> ObjectDataCacheAdapter {
@@ -152,6 +187,63 @@ mod tests {
     }
 
     #[test]
+    fn revalidation_plan_does_not_count_a_second_get() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let adapter = enabled_adapter();
+            let info = crate::storage::storage_api::StorageObjectInfo {
+                etag: Some("etag".to_string()),
+                size: 4,
+                actual_size: 4,
+                ..Default::default()
+            };
+            let request = GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "object",
+                info: &info,
+                response_content_length: 4,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            };
+            assert!(matches!(
+                build_get_object_body_cache_plan(&adapter, request),
+                GetObjectBodyCachePlan::Cacheable(_)
+            ));
+            assert!(matches!(
+                build_get_object_body_cache_plan_for_revalidation(&adapter, request),
+                GetObjectBodyCachePlan::Cacheable(_)
+            ));
+            assert!(matches!(
+                build_get_object_body_cache_plan_for_revalidation(
+                    &adapter,
+                    GetObjectBodyCacheRequest {
+                        response_content_length: 9 * 1024 * 1024,
+                        ..request
+                    }
+                ),
+                GetObjectBodyCachePlan::Skip
+            ));
+        });
+
+        let plans = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                (composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_object_data_cache_plan_total")
+                    .then_some(value)
+            })
+            .map(|value| match value {
+                DebugValue::Counter(value) => value,
+                _ => panic!("plan metric must be a counter"),
+            })
+            .sum::<u64>();
+        assert_eq!(plans, 1);
+    }
+
+    #[test]
     fn plan_skips_range_requests() {
         let adapter = enabled_adapter();
         let info = crate::storage::storage_api::StorageObjectInfo {
@@ -174,6 +266,102 @@ mod tests {
         );
 
         assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+    }
+
+    #[test]
+    fn cold_fill_bypass_variants_never_join_session() {
+        let adapter = enabled_adapter();
+        let coordinator = adapter.cold_fill_coordinator();
+        let info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            ..Default::default()
+        };
+
+        for (has_range, part_number, encryption_applied) in [(true, None, false), (false, Some(1), false), (false, None, true)] {
+            let plan = build_get_object_body_cache_plan(
+                &adapter,
+                GetObjectBodyCacheRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    info: &info,
+                    response_content_length: 4,
+                    has_range,
+                    part_number,
+                    encryption_applied,
+                },
+            );
+            assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+            assert_eq!(coordinator.active_session_count_for_test(), 0);
+        }
+
+        let mut remote = info;
+        remote.transitioned_object.status = "complete".to_string();
+        let remote_plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "object",
+                info: &remote,
+                response_content_length: 4,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+        assert!(matches!(remote_plan, GetObjectBodyCachePlan::Skip));
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+
+        let encrypted = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            user_defined: std::sync::Arc::new(std::collections::HashMap::from([(
+                "x-amz-server-side-encryption".to_string(),
+                "AES256".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let encrypted_plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "object",
+                info: &encrypted,
+                response_content_length: 4,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+        assert!(matches!(encrypted_plan, GetObjectBodyCachePlan::Skip));
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+
+        let compressed = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            user_defined: std::sync::Arc::new(std::collections::HashMap::from([(
+                rustfs_utils::http::SUFFIX_COMPRESSION.to_string(),
+                "klauspost/compress/s2".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let compressed_plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "compressed-object",
+                info: &compressed,
+                response_content_length: 4,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+        assert!(
+            matches!(compressed_plan, GetObjectBodyCachePlan::Cacheable(_)),
+            "a decoded full-object compressed read must remain cacheable"
+        );
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
     }
 
     #[test]

@@ -356,6 +356,8 @@ mod tests {
     };
     use std::sync::Arc;
 
+    // The erasure-set-drive-count env var name, kept local to this test to avoid
+    // reaching across the storage facade boundary for a bare string constant.
     const ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT: &str = "RUSTFS_ERASURE_SET_DRIVE_COUNT";
 
     #[test]

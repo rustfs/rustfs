@@ -56,6 +56,14 @@ pub fn register_object_mutation_hook(hook: Arc<dyn ObjectMutationHook>) {
     );
 }
 
+/// Unregister the process-wide object mutation hook.
+///
+/// Config reloads use this when body caching becomes disabled so the previous
+/// adapter and its cached plaintext bodies are not retained until their TTL.
+pub fn unregister_object_mutation_hook() {
+    OBJECT_MUTATION_HOOK.clear();
+}
+
 /// The registered hook, if any.
 fn object_mutation_hook() -> Option<Arc<dyn ObjectMutationHook>> {
     OBJECT_MUTATION_HOOK.get()
@@ -69,13 +77,6 @@ pub(crate) async fn notify_object_mutation(bucket: &str, object: &str) {
     if let Some(hook) = object_mutation_hook() {
         hook.after_object_mutation(bucket, object).await;
     }
-}
-
-/// Test-only: unregister the hook so tests can register and clear the slot
-/// deterministically without leaking a hook into unrelated tests.
-#[cfg(test)]
-pub(crate) fn clear_object_mutation_hook() {
-    OBJECT_MUTATION_HOOK.clear();
 }
 
 #[cfg(test)]
@@ -97,7 +98,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(object_mutation_hook)]
     async fn notify_invokes_registered_hook_with_identity() {
-        clear_object_mutation_hook();
+        unregister_object_mutation_hook();
         let calls = Arc::new(Mutex::new(Vec::new()));
         register_object_mutation_hook(Arc::new(RecordingHook {
             calls: Arc::clone(&calls),
@@ -106,14 +107,35 @@ mod tests {
         notify_object_mutation("bucket", "photos/a.jpg").await;
 
         assert_eq!(&*calls.lock().unwrap(), &[("bucket".to_string(), "photos/a.jpg".to_string())]);
-        clear_object_mutation_hook();
+        unregister_object_mutation_hook();
     }
 
     #[tokio::test]
     #[serial_test::serial(object_mutation_hook)]
-    async fn notify_without_registered_hook_is_noop() {
-        clear_object_mutation_hook();
-        // Must not panic when no hook is installed (the cache feature is off).
+    async fn unregister_prevents_later_notifications() {
+        unregister_object_mutation_hook();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_object_mutation_hook(Arc::new(RecordingHook {
+            calls: Arc::clone(&calls),
+        }));
+        unregister_object_mutation_hook();
+
         notify_object_mutation("bucket", "object").await;
+
+        assert!(calls.lock().unwrap().is_empty(), "an unregistered hook must receive no mutation callback");
+    }
+
+    #[test]
+    #[serial_test::serial(object_mutation_hook)]
+    fn unregister_releases_the_previous_hook() {
+        unregister_object_mutation_hook();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let hook = Arc::new(RecordingHook { calls });
+        let weak = Arc::downgrade(&hook);
+        register_object_mutation_hook(hook);
+
+        assert!(weak.upgrade().is_some());
+        unregister_object_mutation_hook();
+        assert!(weak.upgrade().is_none());
     }
 }
