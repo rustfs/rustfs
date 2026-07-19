@@ -15,10 +15,10 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_deployment_id, current_endpoints_handle, current_iam_handle, current_object_store_handle, current_oidc_handle,
-    current_outbound_tls_generation, current_outbound_tls_state, current_region, current_replication_pool_handle,
-    current_replication_stats_handle, current_runtime_port, current_server_config, current_token_signing_key,
-    object_store_from_req,
+    current_deployment_id, current_endpoints_handle, current_federated_identity_service, current_iam_handle,
+    current_object_store_handle, current_outbound_tls_generation, current_outbound_tls_state, current_region,
+    current_replication_pool_handle, current_replication_stats_handle, current_runtime_port, current_server_config,
+    current_token_signing_key, object_store_from_req,
 };
 use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
@@ -3013,13 +3013,13 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
 
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
-    if let Some(oidc) = current_oidc_handle() {
-        let providers = oidc.list_providers();
+    if let Some(federation) = current_federated_identity_service() {
+        let providers = federation.list_providers();
         settings.open_id.enabled = !providers.is_empty();
         settings.open_id.region = current_region().map(|region| region.to_string()).unwrap_or_default();
 
         for provider in providers {
-            let Some(config) = oidc.get_provider_config(&provider.provider_id) else {
+            let Some(config) = federation.get_provider_config(&provider.provider_id) else {
                 continue;
             };
             let provider_settings = OpenIDProviderSettings {

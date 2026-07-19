@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub(crate) mod federated_identity;
-pub(crate) mod session_policy;
-pub mod site_replication;
+mod claims;
+mod config;
+mod discovery;
+mod flow;
+mod http;
+
+pub use flow::StandardOidcAdapter;

@@ -5962,12 +5962,13 @@ impl DiskAPI for LocalDisk {
         };
 
         let erasure = &fi.erasure;
-        let codec_erasure = coding::Erasure::new_with_options(
+        let codec_erasure = coding::Erasure::try_new_with_options(
             erasure.data_blocks,
             erasure.parity_blocks,
             erasure.block_size,
             fi.uses_legacy_checksum,
-        );
+        )
+        .map_err(DiskError::from)?;
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -13598,6 +13599,32 @@ mod test {
         assert!(is_bitrot_verification_error(&io::Error::other("bitrot shard file size mismatch")));
         assert!(is_bitrot_verification_error(&io::Error::other("bitrot hash mismatch")));
         assert!(!is_bitrot_verification_error(&io::Error::other("unrelated io failure")));
+    }
+
+    #[tokio::test]
+    async fn local_disk_verify_file_preserves_erasure_construction_error() {
+        use crate::erasure::coding::ErasureConstructionError;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "verify-volume";
+        ensure_test_volume(&disk, volume).await;
+
+        let mut file_info = FileInfo::new("invalid.bin", 2, 2);
+        file_info.erasure.block_size = 0;
+        let error = match disk.verify_file(volume, "invalid.bin", &file_info).await {
+            Ok(_) => panic!("invalid local-disk erasure metadata must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("block_size must be greater than zero"));
+        let io_source = std::error::Error::source(&error).expect("DiskError::Io must expose its io::Error source");
+        let construction_source = io_source
+            .source()
+            .expect("io::Error must expose the erasure construction error");
+        assert!(construction_source.is::<ErasureConstructionError>());
     }
 
     #[tokio::test]

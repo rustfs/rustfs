@@ -247,7 +247,8 @@ pub mod config {
             CLASS_RRS, CLASS_STANDARD, Config, DEEP_ARCHIVE, DEFAULT_INLINE_BLOCK, DEFAULT_KVS, DEFAULT_RRS_PARITY,
             EXPRESS_ONEZONE, GLACIER, GLACIER_IR, INLINE_BLOCK, INLINE_BLOCK_ENV, INTELLIGENT_TIERING, MIN_PARITY_DRIVES,
             ONEZONE_IA, OPTIMIZE, OPTIMIZE_ENV, OUTPOSTS, RRS, RRS_ENV, SCHEME_PREFIX, SNOW, STANDARD, STANDARD_ENV, STANDARD_IA,
-            StorageClass, default_parity_count, lookup_config, parse_storage_class, validate_parity, validate_parity_inner,
+            StorageClass, default_parity_count, lookup_config, lookup_config_for_pools, parse_storage_class, validate_parity,
+            validate_parity_inner,
         };
     }
 
@@ -310,8 +311,8 @@ pub mod error {
 
 pub mod erasure {
     pub use crate::erasure::coding::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ReedSolomonEncoder, calc_shard_size,
-        calc_shard_size_legacy,
+        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError, ReedSolomonEncoder,
+        calc_shard_size, calc_shard_size_legacy,
     };
 }
 
