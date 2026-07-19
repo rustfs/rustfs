@@ -28,7 +28,6 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
-use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -39,12 +38,8 @@ use s3s::header::{
 use s3s::s3_error;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
-use std::task::ready;
 use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
 
@@ -516,23 +511,12 @@ impl ObjectStore for EcObjectStore {
                 stream
             };
             GetResultPayload::Stream(convert_field_delimiter_stream(stream, self.need_convert.then(|| self.delimiter.clone())))
-        } else if self.need_convert {
-            let stream = bytes_stream(
-                ReaderStream::with_capacity(
-                    ConvertStream::new(reader.stream, self.delimiter.clone()),
-                    SELECT_DEFAULT_READ_BUFFER_SIZE,
-                ),
-                original_size as usize,
-            )
-            .boxed();
-            GetResultPayload::Stream(stream)
         } else {
             let stream = bytes_stream(
                 ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
                 original_size as usize,
-            )
-            .boxed();
-            GetResultPayload::Stream(stream)
+            );
+            GetResultPayload::Stream(convert_field_delimiter_stream(stream, self.need_convert.then(|| self.delimiter.clone())))
         };
 
         let meta = ObjectMeta {
@@ -573,61 +557,6 @@ impl ObjectStore for EcObjectStore {
 
     async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> Result<()> {
         Err(unsupported_store_error("copy_opts"))
-    }
-}
-
-pin_project! {
-    struct ConvertStream<R> {
-        inner: R,
-        converter: DelimiterConverter,
-        read_buf: Vec<u8>,
-        pending: Vec<u8>,
-        pending_pos: usize,
-        eof: bool,
-    }
-}
-
-impl<R> ConvertStream<R> {
-    fn new(inner: R, delimiter: String) -> Self {
-        ConvertStream {
-            inner,
-            converter: DelimiterConverter::new(delimiter.into_bytes()),
-            read_buf: vec![0; SELECT_DEFAULT_READ_BUFFER_SIZE],
-            pending: Vec::new(),
-            pending_pos: 0,
-            eof: false,
-        }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for ConvertStream<R> {
-    #[tracing::instrument(level = "debug", skip_all)]
-    fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let this = self.project();
-        loop {
-            if drain_pending(this.pending, this.pending_pos, buf) || *this.eof {
-                return Poll::Ready(Ok(()));
-            }
-
-            let read_len = SELECT_DEFAULT_READ_BUFFER_SIZE.min(buf.remaining().max(1));
-            let bytes_read = {
-                let mut read_buf = ReadBuf::new(&mut this.read_buf[..read_len]);
-                ready!(Pin::new(&mut *this.inner).poll_read(cx, &mut read_buf))?;
-                read_buf.filled().len()
-            };
-            if bytes_read == 0 {
-                *this.eof = true;
-                *this.pending = this.converter.finish();
-                *this.pending_pos = 0;
-                continue;
-            }
-
-            *this.pending = this.converter.convert_chunk(&this.read_buf[..bytes_read]);
-            *this.pending_pos = 0;
-        }
     }
 }
 
@@ -678,26 +607,6 @@ impl DelimiterConverter {
         self.carry.clear();
         converted
     }
-}
-
-fn drain_pending(pending: &mut Vec<u8>, pending_pos: &mut usize, buf: &mut ReadBuf<'_>) -> bool {
-    if *pending_pos >= pending.len() {
-        pending.clear();
-        *pending_pos = 0;
-        return false;
-    }
-    if buf.remaining() == 0 {
-        return false;
-    }
-
-    let len = buf.remaining().min(pending.len() - *pending_pos);
-    buf.put_slice(&pending[*pending_pos..*pending_pos + len]);
-    *pending_pos += len;
-    if *pending_pos >= pending.len() {
-        pending.clear();
-        *pending_pos = 0;
-    }
-    true
 }
 
 fn replace_symbol(delimiter: &[u8], slice: &[u8]) -> Vec<u8> {
@@ -1085,12 +994,15 @@ where
 #[cfg(test)]
 mod test {
     use super::{
-        ConvertStream, SelectScanRange, bytes_stream, convert_field_delimiter_stream, extract_json_sub_path_from_expression,
-        find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range, replace_symbol, scan_range_from_bounds,
+        SelectScanRange, bytes_stream, convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter,
+        flatten_json_document_to_ndjson, http_range_spec_from_get_range, replace_symbol, scan_range_from_bounds,
         scan_range_read_start, scan_range_stream, select_read_headers,
     };
+    use crate::storage_api::SelectPutObjReader;
+    use crate::storage_api::object_store::ObjectIO as _;
     use bytes::Bytes;
     use datafusion::object_store::{self, GetRange};
+    use datafusion::object_store::{GetOptions, GetResultPayload, ObjectStore as _, path::Path};
     use futures::{StreamExt, TryStreamExt, stream};
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
@@ -1104,39 +1016,11 @@ mod test {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::io::AsyncReadExt;
-    use tokio_util::io::StreamReader;
 
     #[test]
     fn test_replace() {
         let result = replace_symbol(b"&&", b"dandan&&is&&best");
         assert_eq!(result, b"dandan,is,best");
-    }
-
-    #[tokio::test]
-    async fn test_convert_stream_replaces_delimiter_across_chunks() {
-        let chunks = stream::iter(vec![
-            Ok::<_, std::io::Error>(Bytes::from_static(b"a&")),
-            Ok::<_, std::io::Error>(Bytes::from_static(b"&b&&c")),
-        ]);
-        let reader = StreamReader::new(chunks);
-        let mut reader = ConvertStream::new(reader, "&&".to_string());
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).await.unwrap();
-        assert_eq!(output, b"a,b,c");
-    }
-
-    #[tokio::test]
-    async fn test_convert_stream_replaces_delimiter_at_stream_end() {
-        let chunks = stream::iter(vec![
-            Ok::<_, std::io::Error>(Bytes::from_static(b"a&")),
-            Ok::<_, std::io::Error>(Bytes::from_static(b"&")),
-        ]);
-        let reader = StreamReader::new(chunks);
-        let mut reader = ConvertStream::new(reader, "&&".to_string());
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).await.unwrap();
-        assert_eq!(output, b"a,");
     }
 
     #[tokio::test]
@@ -1308,6 +1192,69 @@ mod test {
             output.extend_from_slice(&bytes.unwrap());
         }
         assert_eq!(output, b"a,");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_opts_validates_raw_length_before_delimiter_conversion() {
+        let temp_root = tempfile::tempdir().expect("create s3select test temp root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_root.path())
+            .build()
+            .await;
+        let bucket = "s3select-multi-byte-delimiter";
+        let object = "input.csv";
+        let input_bytes = b"a&&1\n";
+        env.make_bucket(bucket, false).await;
+        let mut reader = SelectPutObjReader::from_vec(input_bytes.to_vec());
+        env.ecstore
+            .put_object(bucket, object, &mut reader, &Default::default())
+            .await
+            .expect("put multi-byte-delimited test object");
+
+        let input = Arc::new(SelectObjectContentInput {
+            bucket: bucket.to_string(),
+            expected_bucket_owner: None,
+            key: object.to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM s3object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput {
+                        field_delimiter: Some("&&".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        });
+        let store = super::EcObjectStore {
+            input,
+            need_convert: true,
+            delimiter: "&&".to_string(),
+            is_json_document: false,
+            json_sub_path: None,
+            store: env.ecstore,
+        };
+
+        let result = store
+            .get_opts(&Path::from(object), GetOptions::default())
+            .await
+            .expect("read multi-byte-delimited test object");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming object payload");
+        };
+        let chunks: Vec<Bytes> = stream.try_collect().await.expect("collect converted object stream");
+
+        assert_eq!(chunks.concat(), b"a,1\n");
     }
 
     #[tokio::test]
