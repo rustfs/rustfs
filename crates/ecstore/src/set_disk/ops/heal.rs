@@ -163,12 +163,13 @@ impl SetDisks {
 
                         let erasure = if !latest_meta.deleted && !latest_meta.is_remote() {
                             // Initialize erasure coding; use legacy mode for old-version files
-                            coding::Erasure::new_with_options(
+                            coding::Erasure::try_new_with_options(
                                 latest_meta.erasure.data_blocks,
                                 latest_meta.erasure.parity_blocks,
                                 latest_meta.erasure.block_size,
                                 latest_meta.uses_legacy_checksum,
                             )
+                            .map_err(DiskError::from)?
                         } else {
                             coding::Erasure::default()
                         };

@@ -26,7 +26,6 @@ use crate::{
     layout::endpoints::Endpoints,
 };
 use futures::future::join_all;
-use rustfs_config::server_config::KVS;
 use std::collections::{HashMap, hash_map::Entry};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -476,8 +475,21 @@ pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3
 }
 
 pub fn ec_drives_no_config(set_drive_count: usize) -> Result<usize> {
-    let sc = storageclass::lookup_config(&KVS::new(), set_drive_count)?;
-    Ok(sc.get_parity_for_sc(storageclass::STANDARD).unwrap_or_default())
+    let parity = storageclass::default_parity_count(set_drive_count);
+    storageclass::validate_parity(parity, set_drive_count)?;
+    Ok(parity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ec_drives_no_config_uses_topology_defaults() {
+        assert_eq!(ec_drives_no_config(1).expect("single-drive topology should resolve"), 0);
+        assert_eq!(ec_drives_no_config(2).expect("two-drive topology should resolve"), 1);
+        assert_eq!(ec_drives_no_config(6).expect("six-drive topology should resolve"), 3);
+    }
 }
 
 // #[derive(Debug, PartialEq, thiserror::Error)]
