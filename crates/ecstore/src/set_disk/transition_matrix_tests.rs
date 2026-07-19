@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions};
 use crate::ecstore_validation_blackbox::make_local_set_disks;
 use crate::services::tier::test_util::register_mock_tier;
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
@@ -101,4 +101,103 @@ async fn transition_and_restore_reclaim_prior_metadata_generations() {
         .expect("restored body should drain");
     assert_eq!(restored, payload);
     assert_eq!(backend.get_count().await, 1, "restored GET should use the local copy");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn prepared_snapshot_transition_duplicate_and_late_get_use_committed_remote_generation() {
+    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+    let bucket = "transition-prepared-combo-bucket";
+    let object = "object.bin";
+    let payload = b"prepared metadata must not revive the released transition source".repeat(32_768);
+    set_disks
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("bucket should be created");
+    let mut reader = PutObjReader::from_vec(payload.clone());
+    let original = set_disks
+        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+        .await
+        .expect("source object should be written");
+
+    let stale_generation = prime_metadata_generation(&set_disks, bucket, object).await;
+    let stale_prepared = set_disks
+        .prepare_get_object_metadata(bucket, object, &ObjectOptions::default())
+        .await
+        .expect("prepared metadata snapshot should resolve before transition");
+    assert_ne!(
+        stale_prepared.object_info().transitioned_object.status,
+        TRANSITION_COMPLETE,
+        "prepared snapshot must represent the pre-transition local source"
+    );
+
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&set_disks.instance_ctx().tier_config_mgr(), &tier_name).await;
+    let transition_opts = ObjectOptions {
+        transition: TransitionOptions {
+            status: TRANSITION_PENDING.to_string(),
+            tier: tier_name,
+            etag: original.etag.clone().expect("source ETag should be present"),
+            ..Default::default()
+        },
+        version_id: original.version_id.map(|version| version.to_string()),
+        mod_time: original.mod_time,
+        ..Default::default()
+    };
+
+    set_disks
+        .transition_object(bucket, object, &transition_opts)
+        .await
+        .expect("first transition should commit");
+    assert_generation_reclaimed(&set_disks, &stale_generation).await;
+    assert_eq!(backend.put_count().await, 1, "the winning transition should upload one remote candidate");
+    let put_versions = backend.put_versions().await;
+    assert_eq!(put_versions.len(), 1, "the winner should expose exactly one remote object/version");
+    let remote_object = put_versions[0].0.clone();
+    assert_eq!(
+        backend
+            .bytes(&remote_object)
+            .await
+            .expect("winning remote object should remain stored"),
+        payload,
+        "the committed remote candidate must contain the exact source body"
+    );
+
+    set_disks
+        .transition_object(bucket, object, &transition_opts)
+        .await
+        .expect("duplicate transition should observe the committed transition and return success");
+    assert_eq!(
+        backend.put_count().await,
+        1,
+        "duplicate transition must not stream the already-released local source into a second remote PUT"
+    );
+    assert_eq!(
+        backend.remove_count().await,
+        0,
+        "committed transition data must not be cleaned up by the duplicate"
+    );
+
+    let info = set_disks
+        .get_object_info(bucket, object, &ObjectOptions::default())
+        .await
+        .expect("transitioned metadata should be visible after duplicate transition");
+    assert_eq!(info.transitioned_object.status, TRANSITION_COMPLETE);
+    assert_eq!(info.transitioned_object.name, remote_object);
+
+    let mut restored = Vec::new();
+    set_disks
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("late GET should open the committed transitioned object")
+        .stream
+        .read_to_end(&mut restored)
+        .await
+        .expect("late GET should drain the remote body");
+    assert_eq!(restored, payload, "late GET must read the committed remote body byte-for-byte");
+    assert_eq!(
+        backend.get_count().await,
+        1,
+        "late GET must route to the remote generation instead of reopening the released local source"
+    );
 }
