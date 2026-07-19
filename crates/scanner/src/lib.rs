@@ -58,8 +58,11 @@ pub use data_usage_define::*;
 pub use error::ScannerError;
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_common::last_minute;
-pub use scanner::init_data_scanner;
-pub use scanner_io::{clear_dirty_usage_bucket, record_dirty_usage_bucket};
+pub use scanner::{ScannerCycleScheduleStatus, init_data_scanner, scanner_cycle_schedule_status};
+pub use scanner_io::{
+    clear_dirty_usage_bucket, record_dirty_usage_bucket, record_scanner_maintenance_change, scanner_activity_epoch,
+    scanner_maintenance_generation,
+};
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use storage_api::ScannerReplicationConfig as ReplicationConfig;

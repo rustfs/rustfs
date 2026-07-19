@@ -31,6 +31,61 @@ use std::{
 };
 use tokio::io::{AsyncRead, ReadBuf};
 
+/// A GET whose object identity has been resolved while its namespace read lock
+/// remains held, but whose body reader has not been constructed yet.
+///
+/// The application can evaluate request preconditions and cache coordination
+/// against [`Self::object_info`] before consuming this value. Dropping it
+/// releases the read lock without constructing a body reader.
+pub struct PreparedGetObjectReader {
+    pool: Arc<Sets>,
+    bucket: String,
+    object: String,
+    range: Option<HTTPRangeSpec>,
+    headers: HeaderMap,
+    opts: ObjectOptions,
+    metadata: crate::set_disk::PreparedGetObjectMetadata,
+    read_lock_guard: Option<ObjectLockDiagGuard>,
+}
+
+impl PreparedGetObjectReader {
+    /// Returns the fresh metadata snapshot protected by this prepared read.
+    pub fn object_info(&self) -> &ObjectInfo {
+        self.metadata.object_info()
+    }
+
+    /// Finishes a metadata-only decision without constructing a body reader.
+    pub fn into_object_info(mut self) -> ObjectInfo {
+        self.metadata.take_object_info()
+    }
+
+    /// Replaces the headers used when this prepared value constructs its body reader.
+    #[must_use]
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Constructs the body reader while retaining the metadata snapshot's read
+    /// lock, then transfers that lock to the returned stream as usual. The
+    /// staged caller already performed the authoritative app-layer cache probe,
+    /// so the nested set-disk reader must not probe the same hook again.
+    pub async fn into_reader(self) -> Result<GetObjectReader> {
+        let mut reader =
+            crate::object_api::without_get_object_body_cache_hook(self.pool.get_object_reader_with_prepared_metadata(
+                &self.bucket,
+                &self.object,
+                self.range,
+                self.headers,
+                &self.opts,
+                self.metadata,
+            ))
+            .await?;
+        reader.body_source = crate::object_api::GetObjectBodySource::HookMissed;
+        Ok(ECStore::attach_read_lock_guard(reader, self.read_lock_guard))
+    }
+}
+
 struct LockGuardedReader {
     inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
     guard: Option<ObjectLockDiagGuard>,
@@ -394,6 +449,56 @@ fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
 }
 
 impl ECStore {
+    /// Resolves a GET's object identity without constructing its body reader.
+    ///
+    /// This is an additive two-stage counterpart to `get_object_reader`. The
+    /// existing method remains the compatibility path for callers that do not
+    /// need a pre-reader decision point.
+    pub async fn prepare_get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        headers: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<PreparedGetObjectReader> {
+        check_get_obj_args(bucket, object)?;
+
+        let object = encode_dir_object(object);
+        let mut opts = opts.clone();
+        let read_lock_guard = self
+            .acquire_object_read_lock_if_needed("prepare_get_object", bucket, &object, &mut opts)
+            .await?;
+
+        let (metadata, pool) = if self.single_pool() {
+            let pool = Arc::clone(&self.pools[0]);
+            let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
+            (metadata, pool)
+        } else {
+            let (_, pool_idx) = self
+                .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+                .await?;
+            let pool = self
+                .pools
+                .get(pool_idx)
+                .cloned()
+                .ok_or_else(|| Error::other(format!("resolved GET pool index {pool_idx} is out of bounds")))?;
+            let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
+            (metadata, pool)
+        };
+
+        Ok(PreparedGetObjectReader {
+            pool,
+            bucket: bucket.to_owned(),
+            object,
+            range,
+            headers,
+            opts,
+            metadata,
+            read_lock_guard,
+        })
+    }
+
     fn map_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
         match err {
             rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
@@ -1484,14 +1589,42 @@ mod tests {
         ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta, replication_statuses_map,
         version_purge_statuses_map,
     };
+    use crate::ecstore_validation_blackbox::make_local_set_disks;
     use crate::layout::{
         endpoints::{Endpoints, PoolEndpoints},
         format::FormatV3,
     };
+    use crate::object_api::{
+        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource, clear_get_object_body_cache_hook,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+    };
+    use crate::set_disk::SetDisks;
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use bytes::Bytes;
     use std::io::Cursor;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
+
+    struct CountingMissHook {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GetObjectBodyCacheHook for CountingMissHook {
+        async fn lookup(&self, _bucket: &str, _object: &str, _info: &ObjectInfo) -> Option<Bytes> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    struct BodyCacheHookGuard;
+
+    impl Drop for BodyCacheHookGuard {
+        fn drop(&mut self) {
+            clear_get_object_body_cache_hook();
+        }
+    }
 
     #[test]
     fn delete_marker_data_movement_falls_back_when_only_source_pool_has_object() {
@@ -2093,6 +2226,244 @@ mod tests {
             pool_meta_save_gate: Mutex::new(()),
             ctx: crate::runtime::instance::bootstrap_ctx(),
         }
+    }
+
+    async fn new_prepared_reader_test_store(set_disks: &[Arc<SetDisks>]) -> ECStore {
+        let mut pool_configs = Vec::with_capacity(set_disks.len());
+        let mut pools = Vec::with_capacity(set_disks.len());
+
+        for (pool_idx, set_disks) in set_disks.iter().enumerate() {
+            let mut endpoints = Endpoints::from(set_disks.set_endpoints.clone());
+            for endpoint in endpoints.as_mut() {
+                endpoint.set_pool_index(pool_idx);
+            }
+            let pool_config = PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: set_disks.set_drive_count,
+                endpoints,
+                cmd_line: format!("prepared-reader-test-pool-{pool_idx}"),
+                platform: "test".to_string(),
+            };
+            let disks = set_disks.disks.read().await.clone();
+            let pool = Sets::new(disks, &pool_config, &set_disks.format, pool_idx, set_disks.default_parity_count)
+                .await
+                .expect("prepared-reader test pool should be created from local disks");
+            pool_configs.push(pool_config);
+            pools.push(pool);
+        }
+
+        let endpoint_pools = EndpointServerPools::from(pool_configs);
+        ECStore {
+            id: Uuid::new_v4(),
+            disk_map: HashMap::new(),
+            pools,
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+            ctx: crate::runtime::instance::bootstrap_ctx(),
+        }
+    }
+
+    async fn assert_prepared_reader_blocks_writer(store: &ECStore, bucket: &str, object: &str) {
+        let manager = Arc::clone(store.pools[0].disk_set[0].local_lock_manager_for_test());
+        let lock = rustfs_lock::NamespaceLock::with_local_manager("prepared-reader-writer".to_string(), manager);
+        let err = lock
+            .get_write_lock(rustfs_lock::ObjectKey::new(bucket, object), "competing-writer", Duration::from_millis(50))
+            .await
+            .expect_err("prepared read lock should block the writer");
+        assert!(matches!(err, rustfs_lock::LockError::Timeout { .. }));
+    }
+
+    async fn acquire_prepared_reader_writer(store: &ECStore, bucket: &str, object: &str) -> rustfs_lock::NamespaceLockGuard {
+        let manager = Arc::clone(store.pools[0].disk_set[0].local_lock_manager_for_test());
+        let lock = rustfs_lock::NamespaceLock::with_local_manager("prepared-reader-writer".to_string(), manager);
+        lock.get_write_lock(rustfs_lock::ObjectKey::new(bucket, object), "competing-writer", Duration::from_secs(1))
+            .await
+            .expect("prepared read lock should have been released")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_uses_authoritative_hook_miss_once_and_streams_full_body() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[set_disks]).await;
+        let bucket = "prepared-reader-hook-miss";
+        let object = "object.bin";
+        let payload = b"prepared-reader-hook-miss-payload-".repeat(40_000);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        store.pools[0]
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[0]
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        clear_get_object_body_cache_hook();
+        let hook = Arc::new(CountingMissHook {
+            calls: AtomicUsize::new(0),
+        });
+        register_get_object_body_cache_hook(Arc::clone(&hook) as Arc<dyn GetObjectBodyCacheHook>);
+        let _hook_guard = BodyCacheHookGuard;
+
+        let prepared = store
+            .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("prepared reader metadata should resolve");
+        assert!(matches!(
+            lookup_get_object_body_cache_hook(bucket, object, &None, &opts, prepared.object_info()).await,
+            GetObjectBodyCacheHookLookup::Miss
+        ));
+        assert_eq!(hook.calls.load(Ordering::Relaxed), 1, "the authoritative probe should call the hook once");
+
+        let mut reader = prepared.into_reader().await.expect("prepared body reader should open");
+        assert_eq!(reader.body_source, GetObjectBodySource::HookMissed);
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("prepared body should stream");
+
+        assert_eq!(restored, payload);
+        assert_eq!(hook.calls.load(Ordering::Relaxed), 1, "reader construction must not probe the hook again");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_holds_namespace_lock_until_eof_or_drop() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
+            let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+            let store = new_prepared_reader_test_store(&[set_disks]).await;
+            let bucket = "prepared-reader-lock-lifetime";
+            let object = "object.bin";
+            let payload = b"prepared-reader-lock-lifetime-payload-".repeat(40_000);
+            let put_opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+
+            store.pools[0]
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            store.pools[0]
+                .put_object(bucket, object, &mut put_reader, &put_opts)
+                .await
+                .expect("object should be written");
+
+            let prepared = store
+                .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("prepared reader metadata should resolve");
+            assert!(prepared.read_lock_guard.is_some());
+            assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+
+            let mut reader = prepared.into_reader().await.expect("prepared body reader should open");
+            assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+            let mut restored = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("prepared body should stream");
+            assert_eq!(restored, payload);
+            drop(acquire_prepared_reader_writer(&store, bucket, object).await);
+
+            let prepared = store
+                .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("second prepared reader metadata should resolve");
+            let reader = prepared.into_reader().await.expect("second prepared body reader should open");
+            assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+            drop(reader);
+            drop(acquire_prepared_reader_writer(&store, bucket, object).await);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_object_info_releases_namespace_lock_immediately() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[set_disks]).await;
+        let bucket = "prepared-object-info-lock-release";
+        let object = "object.bin";
+        let payload = b"prepared-object-info-lock-release".to_vec();
+        let put_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        store.pools[0]
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[0]
+            .put_object(bucket, object, &mut put_reader, &put_opts)
+            .await
+            .expect("object should be written");
+
+        let prepared = store
+            .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("prepared reader metadata should resolve");
+        assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+        assert_eq!(prepared.into_object_info().size, payload.len() as i64);
+
+        drop(acquire_prepared_reader_writer(&store, bucket, object).await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn prepared_reader_resolves_object_from_second_pool() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let bucket = "prepared-reader-second-pool";
+        let object = "object.bin";
+        let payload = b"prepared-reader-second-pool-payload-".repeat(40_000);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[1]
+            .put_object(bucket, object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written only to the second pool");
+
+        let prepared = store
+            .prepare_get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("prepared reader should resolve the second-pool object");
+        assert_eq!(prepared.object_info().size, payload.len() as i64);
+        let mut reader = prepared.into_reader().await.expect("prepared body reader should open");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("prepared body should stream");
+        assert_eq!(restored, payload);
     }
 
     // Phase 5 Slice 2 (backlog#939): the instance context flows down the whole

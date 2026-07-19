@@ -238,6 +238,23 @@ impl Clone for TierConfig {
 
 #[allow(dead_code)]
 impl TierConfig {
+    pub(crate) fn clone_with_credentials(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            tier_type: self.tier_type.clone(),
+            name: self.name.clone(),
+            s3: self.s3.clone(),
+            aliyun: self.aliyun.clone(),
+            tencent: self.tencent.clone(),
+            huaweicloud: self.huaweicloud.clone(),
+            azure: self.azure.clone(),
+            gcs: self.gcs.clone(),
+            r2: self.r2.clone(),
+            rustfs: self.rustfs.clone(),
+            minio: self.minio.clone(),
+        }
+    }
+
     fn endpoint(&self) -> String {
         match self.tier_type {
             TierType::S3 => self.s3.as_ref().map(|s| s.endpoint.clone()).unwrap_or_default(),

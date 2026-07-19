@@ -392,10 +392,14 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_data_usage_from_backend,
-        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
-        refresh_bucket_usage_from_object_layer, remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info,
-        store_compression_total_in_backend,
+        load_data_usage_from_backend_cached, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
+        record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        record_bucket_object_write_unknown_previous_memory, remove_bucket_usage_from_backend, store_compression_total_in_backend,
+    };
+    // Test-only observables for the rustfs/backlog#1306 revert detector.
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::data_usage::{
+        compute_bucket_usage, live_bucket_usage_computations, store_data_usage_in_backend,
     };
 }
 
@@ -479,8 +483,12 @@ pub(crate) mod ecstore_rpc {
 }
 
 pub(crate) mod ecstore_object {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        GetObjectBodyCacheHook, ObjectMutationHook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, ObjectMutationHook, get_object_body_cache_plaintext_len,
+        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
 }
 
@@ -498,7 +506,7 @@ pub(crate) mod ecstore_storage {
 }
 
 pub(crate) mod ecstore_tier {
-    pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
+    pub(crate) use rustfs_ecstore::api::tier::tier::{TierConfigMgr, TierConfigUpdateError};
     pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers};
     // Shared lifecycle/tier test utilities behind ecstore's `test-util` feature
     // (rustfs/backlog#1148 ilm-6). Only linked into test builds.
@@ -600,6 +608,7 @@ pub(crate) type ReplicationStatusType = ecstore_bucket::replication::Replication
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
+pub(crate) type TierConfigUpdateError = ecstore_tier::TierConfigUpdateError;
 pub(crate) use ecstore_disk::validate_batch_read_version_item_count;
 pub(crate) type TransitionState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::TransitionState;
 pub(crate) type Error = ecstore_error::Error;
@@ -1196,7 +1205,9 @@ pub(crate) fn get_global_bucket_metadata_sys() -> Option<Arc<tokio::sync::RwLock
 }
 
 pub(crate) async fn delete_bucket_metadata_config(bucket: &str, config_file: &str) -> Result<time::OffsetDateTime> {
-    ecstore_bucket::metadata_sys::delete(bucket, config_file).await
+    let updated_at = ecstore_bucket::metadata_sys::delete(bucket, config_file).await?;
+    record_scanner_maintenance_config_change(bucket, config_file);
+    Ok(updated_at)
 }
 
 pub(crate) async fn get_bucket_metadata(bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -1268,7 +1279,22 @@ pub(crate) async fn update_bucket_metadata_config(
     config_file: &str,
     data: Vec<u8>,
 ) -> Result<time::OffsetDateTime> {
-    ecstore_bucket::metadata_sys::update(bucket, config_file, data).await
+    let updated_at = ecstore_bucket::metadata_sys::update(bucket, config_file, data).await?;
+    record_scanner_maintenance_config_change(bucket, config_file);
+    Ok(updated_at)
+}
+
+fn record_scanner_maintenance_config_change(bucket: &str, config_file: &str) {
+    if scanner_maintenance_config_file(config_file) {
+        rustfs_scanner::record_scanner_maintenance_change(bucket);
+    }
+}
+
+fn scanner_maintenance_config_file(config_file: &str) -> bool {
+    matches!(
+        config_file,
+        ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG | ecstore_bucket::metadata::BUCKET_REPLICATION_CONFIG
+    )
 }
 
 pub(crate) fn add_object_lock_years(dt: time::OffsetDateTime, years: i32) -> time::OffsetDateTime {
@@ -1457,7 +1483,8 @@ pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
 }
 
 pub(crate) async fn reload_transition_tier_config(api: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_runtime::global_tier_config_mgr().write().await.reload(api).await
+    let handle = api.tier_config_mgr();
+    TierConfigMgr::reload_handle(&handle, api).await
 }
 
 pub(crate) async fn all_local_disk_path() -> Vec<String> {
@@ -1505,7 +1532,9 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 
 #[cfg(test)]
 mod tests {
-    use super::{bucket_targets_metadata_lock_shard, lock_bucket_targets_metadata};
+    use super::{
+        bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata, scanner_maintenance_config_file,
+    };
     use std::time::Duration;
 
     #[tokio::test]
@@ -1533,5 +1562,12 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn scanner_maintenance_config_only_includes_scanner_owned_work() {
+        assert!(scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG));
+        assert!(scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_REPLICATION_CONFIG));
+        assert!(!scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_POLICY_CONFIG));
     }
 }

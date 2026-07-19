@@ -20,13 +20,18 @@
 //! saves the erasure read/decode.
 
 use crate::app::object_data_cache::{
-    GetObjectBodyCacheLookup, GetObjectBodyCacheRequest, ObjectDataCacheAdapter, build_get_object_body_cache_plan,
-    lookup_get_object_body_cache_hit,
+    GetObjectBodyCacheLookup, GetObjectBodyCachePlan, GetObjectBodyCacheRequest, ObjectDataCacheAdapter,
+    build_get_object_body_cache_plan, lookup_get_object_body_cache_hit,
 };
 use crate::app::storage_api::object_usecase::StorageObjectInfo;
+use crate::app::storage_api::object_usecase::StorageObjectOptions;
+use crate::app::storage_api::object_usecase::contract::range::HTTPRangeSpec;
 use crate::storage::sse::contains_managed_encryption_metadata;
 use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps as _;
-use crate::storage::storage_api::ecstore_object::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
+use crate::storage::storage_api::ecstore_object::{
+    GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+    unregister_get_object_body_cache_hook,
+};
 use bytes::Bytes;
 use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
 use std::sync::Arc;
@@ -36,10 +41,38 @@ pub(crate) struct ObjectDataCacheBodyHook {
     adapter: Arc<ObjectDataCacheAdapter>,
 }
 
-/// Registers the body-cache hook into ecstore. No-op for a disabled cache so
-/// the hot path keeps a single `None` branch when the feature is off.
+#[derive(Clone)]
+struct PreplannedLookup {
+    adapter: Arc<ObjectDataCacheAdapter>,
+    plan: GetObjectBodyCachePlan,
+}
+
+tokio::task_local! {
+    static PREPLANNED_LOOKUP: PreplannedLookup;
+}
+
+pub(crate) async fn lookup_preplanned_get_object_body_cache_hook(
+    adapter: Arc<ObjectDataCacheAdapter>,
+    plan: GetObjectBodyCachePlan,
+    bucket: &str,
+    object: &str,
+    range: &Option<HTTPRangeSpec>,
+    opts: &StorageObjectOptions,
+    info: &StorageObjectInfo,
+) -> GetObjectBodyCacheHookLookup {
+    PREPLANNED_LOOKUP
+        .scope(
+            PreplannedLookup { adapter, plan },
+            lookup_get_object_body_cache_hook(bucket, object, range, opts, info),
+        )
+        .await
+}
+
+/// Registers the body-cache hook into ecstore, or removes the previous hook
+/// when a config reload disables caching.
 pub(crate) fn register_object_data_cache_body_hook(adapter: Arc<ObjectDataCacheAdapter>) {
     if adapter.is_disabled() {
+        unregister_get_object_body_cache_hook();
         return;
     }
     register_get_object_body_cache_hook(Arc::new(ObjectDataCacheBodyHook { adapter }));
@@ -58,18 +91,24 @@ impl GetObjectBodyCacheHook for ObjectDataCacheBodyHook {
         if info.is_remote() || object_metadata_indicates_encryption(&info.user_defined) {
             return None;
         }
-        let response_content_length = info.get_actual_size().ok()?;
-        let request = GetObjectBodyCacheRequest {
-            bucket,
-            key: object,
-            info,
-            response_content_length,
-            has_range: false,
-            part_number: None,
-            encryption_applied: false,
+        let preplanned = PREPLANNED_LOOKUP.try_with(Clone::clone).ok();
+        let (adapter, plan) = match preplanned {
+            Some(preplanned) => (preplanned.adapter, preplanned.plan),
+            None => {
+                let response_content_length = info.get_actual_size().ok()?;
+                let request = GetObjectBodyCacheRequest {
+                    bucket,
+                    key: object,
+                    info,
+                    response_content_length,
+                    has_range: false,
+                    part_number: None,
+                    encryption_applied: false,
+                };
+                (Arc::clone(&self.adapter), build_get_object_body_cache_plan(&self.adapter, request))
+            }
         };
-        let plan = build_get_object_body_cache_plan(&self.adapter, request);
-        match lookup_get_object_body_cache_hit(&self.adapter, &plan).await {
+        match lookup_get_object_body_cache_hit(&adapter, &plan).await {
             GetObjectBodyCacheLookup::Hit(bytes) => Some(bytes),
             GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => None,
         }
@@ -79,6 +118,8 @@ impl GetObjectBodyCacheHook for ObjectDataCacheBodyHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_object_data_cache::{ObjectDataCacheConfig, ObjectDataCacheMode};
 
     fn hit_only_adapter() -> Arc<ObjectDataCacheAdapter> {
@@ -127,6 +168,99 @@ mod tests {
         };
         let hit = hook.lookup("b", "k", &info).await.expect("cache hit");
         assert_eq!(hit, body);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn preplanned_hook_lookup_records_one_plan_for_one_get() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("hook metric runtime must build");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let adapter = hit_only_adapter();
+                let info = plain_info(5);
+                let plan = build_get_object_body_cache_plan(
+                    &adapter,
+                    GetObjectBodyCacheRequest {
+                        bucket: "b",
+                        key: "k",
+                        info: &info,
+                        response_content_length: 5,
+                        has_range: false,
+                        part_number: None,
+                        encryption_applied: false,
+                    },
+                );
+                register_get_object_body_cache_hook(Arc::new(ObjectDataCacheBodyHook {
+                    adapter: Arc::clone(&adapter),
+                }));
+                let result = lookup_preplanned_get_object_body_cache_hook(
+                    adapter,
+                    plan,
+                    "b",
+                    "k",
+                    &None,
+                    &StorageObjectOptions::default(),
+                    &info,
+                )
+                .await;
+                assert!(matches!(result, GetObjectBodyCacheHookLookup::Miss));
+                unregister_get_object_body_cache_hook();
+            });
+        });
+
+        let plans = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                (composite.kind() == MetricKind::Counter && composite.key().name() == "rustfs_object_data_cache_plan_total")
+                    .then_some(value)
+            })
+            .map(|value| match value {
+                DebugValue::Counter(value) => value,
+                _ => panic!("plan metric must be a counter"),
+            })
+            .sum::<u64>();
+        assert_eq!(plans, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disabled_reload_unregisters_previous_enabled_hook() {
+        let adapter = hit_only_adapter();
+        let info = plain_info(5);
+        let plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "b",
+                key: "k",
+                info: &info,
+                response_content_length: 5,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+        let body = Bytes::from_static(b"hello");
+        let _ = crate::app::object_data_cache::fill_get_object_body_cache_from_buffered_body(&adapter, &plan, &body).await;
+        register_object_data_cache_body_hook(adapter);
+        assert!(matches!(
+            lookup_get_object_body_cache_hook("b", "k", &None, &StorageObjectOptions::default(), &info).await,
+            GetObjectBodyCacheHookLookup::Hit(_)
+        ));
+
+        let disabled = Arc::new(ObjectDataCacheAdapter::new(ObjectDataCacheConfig::default()).expect("disabled adapter"));
+        register_object_data_cache_body_hook(disabled);
+
+        assert!(matches!(
+            lookup_get_object_body_cache_hook("b", "k", &None, &StorageObjectOptions::default(), &info).await,
+            GetObjectBodyCacheHookLookup::Absent
+        ));
     }
 
     #[tokio::test]

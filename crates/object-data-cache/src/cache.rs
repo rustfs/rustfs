@@ -14,8 +14,10 @@
 
 use crate::backend::ObjectDataCacheBackendKind;
 use crate::config::ObjectDataCacheConfig;
+use crate::entry::projected_weight;
 use crate::error::ObjectDataCacheConfigError;
 use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheIdentity, ObjectDataCacheKey};
+use crate::memory::ObjectDataCacheMemoryReservation;
 use crate::metrics::{
     describe_metrics_once, publish_cache_state, record_fill_result, record_hit_bytes, record_invalidation, record_lookup_result,
     record_plan_decision,
@@ -27,6 +29,52 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use tokio::sync::OwnedSemaphorePermit;
+
+/// Admission token for one body allocation performed before a cold cache fill.
+#[derive(Debug)]
+pub struct ObjectDataCacheBodyReservation {
+    pub(crate) memory: ObjectDataCacheMemoryReservation,
+    pub(crate) permit: OwnedSemaphorePermit,
+    pub(crate) fill_generation: crate::moka_backend::FillGenerationGuard,
+    pub(crate) key: ObjectDataCacheKey,
+    pub(crate) expected_size: u64,
+}
+
+/// A materialized body whose allocation owns its memory claim until the last
+/// `Bytes` clone is dropped.
+#[derive(Debug)]
+pub struct ObjectDataCacheReservedBody {
+    pub(crate) bytes: Bytes,
+    pub(crate) permit: OwnedSemaphorePermit,
+    pub(crate) fill_generation: crate::moka_backend::FillGenerationGuard,
+    pub(crate) key: ObjectDataCacheKey,
+    pub(crate) expected_size: u64,
+}
+
+impl ObjectDataCacheBodyReservation {
+    /// Attaches this reservation to a newly materialized body.
+    pub fn wrap_bytes(self, bytes: Bytes) -> ObjectDataCacheReservedBody {
+        ObjectDataCacheReservedBody {
+            bytes: self.memory.wrap_bytes(bytes),
+            permit: self.permit,
+            fill_generation: self.fill_generation,
+            key: self.key,
+            expected_size: self.expected_size,
+        }
+    }
+}
+
+impl ObjectDataCacheReservedBody {
+    /// Returns a clone that shares the reservation-owning allocation.
+    pub fn bytes(&self) -> Bytes {
+        self.bytes.clone()
+    }
+
+    pub(crate) fn into_parts(self) -> (Bytes, OwnedSemaphorePermit, crate::moka_backend::FillGenerationGuard) {
+        (self.bytes, self.permit, self.fill_generation)
+    }
+}
 
 /// Minimum spacing between cache-state gauge publishes. Moka's `entry_count`
 /// and `weighted_size` are cross-segment approximations that only settle after
@@ -45,6 +93,9 @@ pub struct ObjectDataCache {
     backend: ObjectDataCacheBackendKind,
     config: Arc<ObjectDataCacheConfig>,
     stats: Arc<ObjectDataCacheStats>,
+    /// Resolved Moka weighted capacity used by the planner's exact key-aware
+    /// admission check. Zero for the disabled backend.
+    max_capacity: u64,
     /// Effective fill ceiling in bytes: a body larger than this is planned
     /// `SkipTooLarge` even when it fits `max_entry_bytes`. The app layer sets it
     /// to `min(max_entry_bytes, seek-support threshold, 64 MiB buffer cap)` so a
@@ -72,6 +123,7 @@ impl ObjectDataCache {
             backend: ObjectDataCacheBackendKind::Noop(NoopBackend),
             config,
             stats,
+            max_capacity: 0,
             fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
@@ -83,16 +135,19 @@ impl ObjectDataCache {
         describe_metrics_once();
         config.validate()?;
         let stats = Arc::new(ObjectDataCacheStats::default());
-        let backend = if config.is_disabled() {
-            ObjectDataCacheBackendKind::Noop(NoopBackend)
+        let (backend, max_capacity) = if config.is_disabled() {
+            (ObjectDataCacheBackendKind::Noop(NoopBackend), 0)
         } else {
-            ObjectDataCacheBackendKind::Moka(Box::new(MokaBackend::new(&config, Arc::clone(&stats))?))
+            let backend = MokaBackend::new(&config, Arc::clone(&stats))?;
+            let max_capacity = backend.max_capacity();
+            (ObjectDataCacheBackendKind::Moka(Box::new(backend)), max_capacity)
         };
 
         Ok(Self {
             backend,
             config: Arc::new(config),
             stats,
+            max_capacity,
             fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
@@ -121,14 +176,26 @@ impl ObjectDataCache {
 
     /// Produces a lightweight GET plan from request metadata.
     pub fn plan_get(&self, request: ObjectDataCacheGetRequest<'_>) -> ObjectDataCacheGetPlan {
+        self.plan_get_inner(request, true)
+    }
+
+    /// Rebuilds a plan for identity revalidation without counting another GET.
+    #[doc(hidden)]
+    pub fn plan_get_untracked(&self, request: ObjectDataCacheGetRequest<'_>) -> ObjectDataCacheGetPlan {
+        self.plan_get_inner(request, false)
+    }
+
+    fn plan_get_inner(&self, request: ObjectDataCacheGetRequest<'_>, record_metric: bool) -> ObjectDataCacheGetPlan {
         if self.config.is_disabled() {
-            record_plan_decision(
-                self.backend.as_metric_label(),
-                self.config.mode,
-                "disabled",
-                "mode_disabled",
-                request.size,
-            );
+            if record_metric {
+                record_plan_decision(
+                    self.backend.as_metric_label(),
+                    self.config.mode,
+                    "disabled",
+                    "mode_disabled",
+                    request.size,
+                );
+            }
             return ObjectDataCacheGetPlan::Disabled;
         }
 
@@ -137,24 +204,34 @@ impl ObjectDataCache {
         // in-memory GET fill limits could never fill, so admitting it here would
         // report it "eligible" while it kept a permanent 0% hit rate.
         if request.size > self.effective_size_ceiling() {
-            record_plan_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
+            if record_metric {
+                record_plan_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
+            }
             return ObjectDataCacheGetPlan::SkipTooLarge;
         }
 
-        record_plan_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
-
-        ObjectDataCacheGetPlan::Cacheable {
-            key: ObjectDataCacheKey::with_write_anchors(
-                request.bucket,
-                request.object,
-                request.version_id.as_deref(),
-                request.etag,
-                request.size,
-                request.data_dir_u128,
-                request.mod_time_unix_nanos,
-                request.body_variant,
-            ),
+        let key = ObjectDataCacheKey::with_write_anchors(
+            request.bucket,
+            request.object,
+            request.version_id.as_deref(),
+            request.etag,
+            request.size,
+            request.data_dir_u128,
+            request.mod_time_unix_nanos,
+            request.body_variant,
+        );
+        if projected_weight(&key, request.size) > self.max_capacity {
+            if record_metric {
+                record_plan_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
+            }
+            return ObjectDataCacheGetPlan::SkipTooLarge;
         }
+
+        if record_metric {
+            record_plan_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
+        }
+
+        ObjectDataCacheGetPlan::Cacheable { key }
     }
 
     /// Looks up an object body from the configured backend.
@@ -190,6 +267,61 @@ impl ObjectDataCache {
         }
 
         lookup
+    }
+
+    /// Performs an internal second-chance lookup without recording another
+    /// request lookup. Callers must have already performed the authoritative
+    /// lookup for the current GET.
+    #[doc(hidden)]
+    pub async fn peek_body_untracked(&self, plan: &ObjectDataCacheGetPlan) -> ObjectDataCacheLookup {
+        match &self.backend {
+            ObjectDataCacheBackendKind::Noop(backend) => backend.lookup_body(plan).await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.lookup_body(plan).await,
+        }
+    }
+
+    /// Reserves memory and a fill slot before allocating a cold-fill body.
+    pub fn reserve_body(&self, plan: &ObjectDataCacheGetPlan) -> Option<ObjectDataCacheBodyReservation> {
+        if !self.config.fill_enabled() {
+            return None;
+        }
+        match &self.backend {
+            ObjectDataCacheBackendKind::Noop(_) => None,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.reserve_body(plan),
+        }
+    }
+
+    /// Fills from a body admitted before allocation.
+    pub async fn fill_reserved_body(
+        &self,
+        plan: &ObjectDataCacheGetPlan,
+        body: ObjectDataCacheReservedBody,
+    ) -> ObjectDataCacheFillResult {
+        let fill_bytes = u64::try_from(body.bytes.len()).unwrap_or(u64::MAX);
+        let fill_start = Instant::now();
+        let result = match &self.backend {
+            ObjectDataCacheBackendKind::Noop(_) => ObjectDataCacheFillResult::SkippedDisabled,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.fill_reserved_body(plan, body).await,
+        };
+        let (recorded_bytes, duration) = match result {
+            ObjectDataCacheFillResult::Inserted => {
+                self.stats.record_fill();
+                self.refresh_entry_count();
+                (fill_bytes, Some(fill_start.elapsed().as_secs_f64()))
+            }
+            ObjectDataCacheFillResult::SkippedInvalidationRace | ObjectDataCacheFillResult::SkippedIdentityOverflow => {
+                (fill_bytes, Some(fill_start.elapsed().as_secs_f64()))
+            }
+            _ => (0, None),
+        };
+        record_fill_result(
+            self.backend.as_metric_label(),
+            self.config.mode,
+            result.as_metric_label(),
+            recorded_bytes,
+            duration,
+        );
+        result
     }
 
     /// Attempts to fill the cache body for the current plan.
@@ -432,6 +564,16 @@ pub enum ObjectDataCacheGetPlan {
         /// Stable cache key for the request.
         key: ObjectDataCacheKey,
     },
+}
+
+impl ObjectDataCacheGetPlan {
+    /// Returns the stable cache key for a cacheable plan.
+    pub fn key(&self) -> Option<&ObjectDataCacheKey> {
+        match self {
+            Self::Cacheable { key } => Some(key),
+            Self::Disabled | Self::SkipTooLarge => None,
+        }
+    }
 }
 
 /// Result of a cache lookup attempt.
@@ -863,6 +1005,80 @@ mod tests {
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
     }
 
+    #[tokio::test]
+    async fn reserved_body_is_bound_to_origin_cache_and_plan() {
+        let cache_a = fill_enabled_cache();
+        let cache_b = fill_enabled_cache();
+        let plan = cache_a.plan_get(plain_request("bucket", "object", "etag", 5));
+        let wrong_plan = cache_a.plan_get(plain_request("bucket", "other", "etag", 5));
+
+        let wrong_plan_body = cache_a
+            .reserve_body(&plan)
+            .expect("the original plan should be admitted")
+            .wrap_bytes(Bytes::from_static(b"hello"));
+        assert_eq!(
+            cache_a.fill_reserved_body(&wrong_plan, wrong_plan_body).await,
+            ObjectDataCacheFillResult::SkippedNotCacheable
+        );
+
+        let cross_cache_body = cache_a
+            .reserve_body(&plan)
+            .expect("the original cache should admit another reservation")
+            .wrap_bytes(Bytes::from_static(b"hello"));
+        assert_eq!(
+            cache_b.fill_reserved_body(&plan, cross_cache_body).await,
+            ObjectDataCacheFillResult::SkippedNotCacheable
+        );
+
+        let wrong_size_body = cache_a
+            .reserve_body(&plan)
+            .expect("the original plan should still be admitted")
+            .wrap_bytes(Bytes::from_static(b"oops"));
+        assert_eq!(
+            cache_a.fill_reserved_body(&plan, wrong_size_body).await,
+            ObjectDataCacheFillResult::SkippedSizeMismatch
+        );
+        assert_eq!(cache_a.stats().fills, 0, "rejected reservations must not count as successful fills");
+        assert!(matches!(cache_a.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(cache_a.lookup_body(&wrong_plan).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(cache_b.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+
+        let body = cache_a
+            .reserve_body(&plan)
+            .expect("the matching reservation should be admitted")
+            .wrap_bytes(Bytes::from_static(b"hello"));
+        assert_eq!(cache_a.fill_reserved_body(&plan, body).await, ObjectDataCacheFillResult::Inserted);
+        assert_eq!(cache_a.stats().fills, 1);
+        assert_eq!(cache_a.lookup_body(&plan).await, ObjectDataCacheLookup::Hit(Bytes::from_static(b"hello")));
+    }
+
+    #[test]
+    fn reserved_size_mismatch_records_fill_outcome_without_bytes() {
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "object", "etag", 5));
+            let body = cache
+                .reserve_body(&plan)
+                .expect("the plan should be admitted before materialization")
+                .wrap_bytes(Bytes::from_static(b"oops"));
+            assert_eq!(
+                cache.fill_reserved_body(&plan, body).await,
+                ObjectDataCacheFillResult::SkippedSizeMismatch
+            );
+        });
+
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_fill_total",
+            ("result", "skipped_size_mismatch")
+        ));
+        assert_eq!(
+            counter_total(&metrics, "rustfs_object_data_cache_fill_bytes_total"),
+            None,
+            "a rejected reserved body must not record filled bytes"
+        );
+    }
+
     #[test]
     fn plan_clamps_size_eligibility_to_fill_ceiling() {
         // ODC-24 (backlog#1129): a body in the gap between `max_entry_bytes` and
@@ -891,6 +1107,34 @@ mod tests {
         );
         assert_eq!(
             cache.plan_get(plain_request("bucket", "object", "etag", 16 * 1024 * 1024)),
+            ObjectDataCacheGetPlan::SkipTooLarge
+        );
+    }
+
+    #[test]
+    fn planner_rejects_key_whose_projected_weight_exceeds_capacity() {
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 8 * 1024,
+            max_memory_percent: 0,
+            max_entry_bytes: 4 * 1024,
+            ..ObjectDataCacheConfig::default()
+        };
+        let cache = ObjectDataCache::new(config).expect("capacity test config should initialize");
+        // Body (4096) + fixed fields (bucket=1, version=null=4, etag=1) +
+        // object (4026) + entry overhead (64) = 8192, exactly capacity.
+        let boundary_object = "o".repeat(4026);
+        assert!(matches!(
+            cache.plan_get(plain_request("b", &boundary_object, "e", 4 * 1024)),
+            ObjectDataCacheGetPlan::Cacheable { .. }
+        ));
+
+        // Body (4096) + fixed fields (bucket=1, version=null=4, etag=1) +
+        // object (4027) + entry overhead (64) = 8193, one byte over capacity.
+        let overweight_object = "o".repeat(4027);
+
+        assert_eq!(
+            cache.plan_get(plain_request("b", &overweight_object, "e", 4 * 1024)),
             ObjectDataCacheGetPlan::SkipTooLarge
         );
     }

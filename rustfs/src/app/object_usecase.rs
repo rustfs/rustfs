@@ -74,6 +74,11 @@ use super::storage_api::object_usecase::error::{
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use super::storage_api::object_usecase::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
+#[cfg(test)]
+use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
+#[cfg(test)]
+use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cache_hook;
+use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
@@ -191,22 +196,175 @@ use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
-    StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions, StorageObjectOptions as ObjectOptions,
-    StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+    GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions,
+    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
-    GetObjectBodyCacheLookup, GetObjectBodyCachePlan, GetObjectBodyCacheRequest, ObjectDataCacheAdapter,
-    build_get_object_body_cache_plan, fill_get_object_body_cache_from_buffered_body,
-    fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
-    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
-    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
-    invalidate_object_data_cache_objects_before_mutation, invalidate_object_data_cache_prefix_after_delete,
-    invalidate_object_data_cache_prefix_before_mutation, lookup_get_object_body_cache_hit,
+    ColdFillCoordinateOutcome, ColdFillDiskPermitOwner, ColdFillError, ColdFillProducer, GetObjectBodyCacheLookup,
+    GetObjectBodyCachePlan, GetObjectBodyCacheRequest, ObjectDataCacheAdapter, build_get_object_body_cache_plan,
+    build_get_object_body_cache_plan_for_revalidation, coordinate_cold_fill, current_cold_fill_disk_permit_owner,
+    fill_get_object_body_cache_from_buffered_body, fill_get_object_body_cache_from_materialized_body,
+    invalidate_object_data_cache_after_copy_success, invalidate_object_data_cache_after_delete_success,
+    invalidate_object_data_cache_after_put_success, invalidate_object_data_cache_before_mutation,
+    invalidate_object_data_cache_objects_after_delete_success, invalidate_object_data_cache_objects_before_mutation,
+    invalidate_object_data_cache_prefix_after_delete, invalidate_object_data_cache_prefix_before_mutation,
+    lookup_get_object_body_cache_hit, lookup_preplanned_get_object_body_cache_hook,
 };
+#[cfg(test)]
+use crate::app::object_data_cache::{ColdFillRole, ColdFillWaitOutcome, scope_cold_fill_disk_permit_owner_for_test};
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+struct ColdFillDiskPermitMetric {
+    owner: ColdFillDiskPermitOwner,
+    metric_recorded: bool,
+}
+
+#[cfg(test)]
+static COLD_FILL_FOLLOWER_DISK_PERMITS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+struct ColdFillPublicationBarrier {
+    reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+type ColdFillPublicationBarrierState = Option<(rustfs_object_data_cache::ObjectDataCacheKey, Arc<ColdFillPublicationBarrier>)>;
+
+#[cfg(test)]
+static COLD_FILL_PUBLICATION_BARRIER: OnceLock<Mutex<ColdFillPublicationBarrierState>> = OnceLock::new();
+
+#[cfg(test)]
+type ColdFillReaderOpenProbeState = Option<(rustfs_object_data_cache::ObjectDataCacheKey, Arc<AtomicU64>)>;
+
+#[cfg(test)]
+static COLD_FILL_READER_OPEN_PROBE: OnceLock<Mutex<ColdFillReaderOpenProbeState>> = OnceLock::new();
+
+fn adjust_cold_fill_disk_permit_metric(owner: ColdFillDiskPermitOwner, acquired: bool) {
+    macro_rules! adjust_gauge {
+        ($name:literal) => {{
+            #[cfg(not(test))]
+            let gauge = {
+                static HANDLE: std::sync::LazyLock<metrics::Gauge> = std::sync::LazyLock::new(|| metrics::gauge!($name));
+                &*HANDLE
+            };
+            #[cfg(test)]
+            let gauge = metrics::gauge!($name);
+            if acquired {
+                gauge.increment(1.0);
+            } else {
+                gauge.decrement(1.0);
+            }
+        }};
+    }
+
+    match owner {
+        ColdFillDiskPermitOwner::Producer => {
+            adjust_gauge!("rustfs_object_data_cache_cold_fill_producer_disk_permits");
+        }
+        ColdFillDiskPermitOwner::Follower => {
+            adjust_gauge!("rustfs_object_data_cache_cold_fill_follower_disk_permits");
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_cold_fill_publication_barrier(plan: &rustfs_object_data_cache::ObjectDataCacheGetPlan) {
+    let Some(key) = plan.key() else {
+        return;
+    };
+    let barrier = COLD_FILL_PUBLICATION_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(barrier_key, _)| barrier_key == key)
+        .map(|(_, barrier)| Arc::clone(barrier));
+    if let Some(barrier) = barrier {
+        barrier.reached.add_permits(1);
+        if let Ok(permit) = barrier.release.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_cold_fill_reader_open_for_test(plan: &rustfs_object_data_cache::ObjectDataCacheGetPlan) {
+    let Some(key) = plan.key() else {
+        return;
+    };
+    let probe = COLD_FILL_READER_OPEN_PROBE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(probe_key, _)| probe_key == key)
+        .map(|(_, count)| Arc::clone(count));
+    if let Some(count) = probe {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl ColdFillDiskPermitMetric {
+    fn new(owner: ColdFillDiskPermitOwner) -> Self {
+        let metric_recorded = rustfs_io_metrics::metrics_enabled();
+        if metric_recorded {
+            adjust_cold_fill_disk_permit_metric(owner, true);
+        }
+        #[cfg(test)]
+        if matches!(owner, ColdFillDiskPermitOwner::Follower) {
+            COLD_FILL_FOLLOWER_DISK_PERMITS_FOR_TEST.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { owner, metric_recorded }
+    }
+}
+
+impl Drop for ColdFillDiskPermitMetric {
+    fn drop(&mut self) {
+        if self.metric_recorded {
+            adjust_cold_fill_disk_permit_metric(self.owner, false);
+        }
+        #[cfg(test)]
+        if matches!(self.owner, ColdFillDiskPermitOwner::Follower) {
+            COLD_FILL_FOLLOWER_DISK_PERMITS_FOR_TEST.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct GetObjectDiskPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    metric: Option<ColdFillDiskPermitMetric>,
+}
+
+impl GetObjectDiskPermit {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            permit: Some(permit),
+            metric: current_cold_fill_disk_permit_owner().map(ColdFillDiskPermitMetric::new),
+        }
+    }
+
+    fn release(&mut self) {
+        self.permit.take();
+        self.metric.take();
+    }
+}
+
+impl From<OwnedSemaphorePermit> for GetObjectDiskPermit {
+    fn from(permit: OwnedSemaphorePermit) -> Self {
+        Self::new(permit)
+    }
+}
+
+impl Drop for GetObjectDiskPermit {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 const ACCEPT_RANGES_BYTES: &str = "bytes";
+const COLD_FILL_HARD_MAX_DURATION: Duration = Duration::from_secs(10 * 60);
 pub(crate) const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
 const MEDIUM_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
@@ -428,10 +586,16 @@ struct GetObjectBootstrap {
 
 struct GetObjectIoPlanning {
     /// `None` when inline fast path skips disk I/O semaphore.
-    disk_permit: Option<OwnedSemaphorePermit>,
+    disk_permit: Option<GetObjectDiskPermit>,
     permit_wait_duration: Duration,
     queue_status: concurrency::IoQueueStatus,
     queue_utilization: f64,
+}
+
+#[derive(Clone, Copy)]
+struct GetObjectRequestTimeout<'a> {
+    wrapper: &'a RequestTimeoutWrapper,
+    policy: &'a GetObjectTimeoutPolicy,
 }
 
 struct GetObjectRequestContext {
@@ -453,6 +617,7 @@ struct GetObjectReadSetup {
     /// ODC-16: the cache hook probed this read (served or missed), so the app
     /// layer must skip its own lookup.
     cache_hook_probed: bool,
+    cache_fill_allowed: bool,
     rs: Option<HTTPRangeSpec>,
     content_type: Option<ContentType>,
     last_modified: Option<Timestamp>,
@@ -592,10 +757,11 @@ async fn enqueue_transitioned_delete_cleanup(
             &existing.transitioned_object,
         )
     };
-    let Some(je) = je else {
+    let Some(mut je) = je else {
         return Ok(());
     };
 
+    tier_delete_journal::record_tier_delete_journal_backend_identity(&mut je, &existing.user_defined)?;
     tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
     let expiry_state = current_expiry_state_handle();
@@ -681,12 +847,12 @@ pin_project! {
     struct DiskReadPermitReader<R> {
         #[pin]
         inner: R,
-        disk_permit: Option<OwnedSemaphorePermit>,
+        disk_permit: Option<GetObjectDiskPermit>,
     }
 }
 
 impl<R> DiskReadPermitReader<R> {
-    fn new(inner: R, disk_permit: OwnedSemaphorePermit) -> Self {
+    fn new(inner: R, disk_permit: GetObjectDiskPermit) -> Self {
         Self {
             inner,
             disk_permit: Some(disk_permit),
@@ -705,8 +871,12 @@ where
         let poll = this.inner.poll_read(cx, buf);
         // EOF: no more disk reads can happen through this stream, so release
         // the permit instead of holding it until the client drops the body.
-        if had_capacity && matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before {
-            this.disk_permit.take();
+        if had_capacity
+            && matches!(poll, Poll::Ready(Ok(())))
+            && buf.filled().len() == filled_before
+            && let Some(mut disk_permit) = this.disk_permit.take()
+        {
+            disk_permit.release();
         }
         poll
     }
@@ -865,7 +1035,7 @@ enum StrictMaterializeError {
 impl std::fmt::Display for StrictMaterializeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LengthMismatch { expected, actual } => {
+            Self::LengthMismatch { expected, actual, .. } => {
                 write!(f, "materialized length mismatch: expected {expected}, got {actual}")
             }
             Self::Read { consumed, source } => {
@@ -876,17 +1046,17 @@ impl std::fmt::Display for StrictMaterializeError {
 }
 
 impl StrictMaterializeError {
-    fn into_s3_error(self, response_content_length: i64) -> S3Error {
+    fn into_storage_error(self) -> StorageError {
         match self {
-            Self::LengthMismatch { expected, actual } => ApiError::from(StorageError::other(format!(
-                "GET object materialized length mismatch: declared content length {response_content_length}, expected {expected}, got {actual}"
-            )))
-            .into(),
-            Self::Read { consumed, source } => ApiError::from(StorageError::other(format!(
-                "Failed to read object body into memory after {consumed} bytes: {source}"
-            )))
-            .into(),
+            Self::LengthMismatch { expected, actual, .. } if actual < expected => StorageError::LessData,
+            Self::LengthMismatch { .. } => StorageError::MoreData,
+            Self::Read { source, .. } if source.kind() == std::io::ErrorKind::TimedOut => StorageError::Timeout,
+            Self::Read { source, .. } => StorageError::Io(std::io::Error::new(source.kind(), "object body read failed")),
         }
+    }
+
+    fn into_s3_error(self, _response_content_length: i64) -> S3Error {
+        ApiError::from(self.into_storage_error()).into()
     }
 }
 
@@ -912,28 +1082,256 @@ async fn strict_materialize_object_body<R>(
 where
     R: AsyncRead + Unpin,
 {
+    // Stop filling before the Vec reaches capacity. Calling `read_to_end` on a
+    // bounded reader can still reserve beyond `expected` before observing EOF.
+    // The over-long probe below stays outside this Vec so the admitted body
+    // allocation remains exactly `expected` bytes.
     let mut buf = Vec::with_capacity(expected);
-    // Read one byte past the declared length so an over-long stream is detected
-    // rather than silently truncated to `Content-Length`.
-    let mut bounded = tokio::io::AsyncReadExt::take(reader, expected as u64 + 1);
+    let mut reader = reader;
     let read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-    let read_result = tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut buf).await;
+    let read_result = loop {
+        if buf.len() == expected {
+            break Ok(());
+        }
+        match tokio::io::AsyncReadExt::read_buf(&mut reader, &mut buf).await {
+            Ok(0) => break Ok(()),
+            Ok(_) => {}
+            Err(source) => break Err(source),
+        }
+    };
+    let actual = buf.len();
+    let probe_result = if read_result.is_ok() && actual == expected {
+        let mut probe = [0_u8; 1];
+        tokio::io::AsyncReadExt::read(&mut reader, &mut probe).await
+    } else {
+        Ok(0)
+    };
     record_get_object_s3_handler_stage_duration(stage, read_start);
-    match read_result {
-        Ok(_) => {
-            if buf.len() == expected {
+    match (read_result, probe_result) {
+        (Ok(_), Ok(extra)) => {
+            let actual = actual.saturating_add(extra);
+            if actual == expected {
                 Ok(buf)
             } else {
-                Err(StrictMaterializeError::LengthMismatch {
-                    expected,
-                    actual: buf.len(),
-                })
+                Err(StrictMaterializeError::LengthMismatch { expected, actual })
             }
         }
-        Err(source) => Err(StrictMaterializeError::Read {
-            consumed: buf.len(),
+        (Err(source), _) | (_, Err(source)) => Err(StrictMaterializeError::Read {
+            consumed: actual,
             source,
         }),
+    }
+}
+
+struct ColdFillProducerExecution {
+    expected: usize,
+    deadline: Option<tokio::time::Instant>,
+    adapter: Arc<ObjectDataCacheAdapter>,
+    engine_plan: rustfs_object_data_cache::ObjectDataCacheGetPlan,
+}
+
+enum ColdFillStartupWaitError {
+    Cancelled,
+    DeadlineExceeded,
+}
+
+async fn await_cold_fill_startup<F>(
+    future: F,
+    cancellation: &tokio_util::sync::CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<F::Output, ColdFillStartupWaitError>
+where
+    F: Future,
+{
+    tokio::pin!(future);
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(ColdFillStartupWaitError::Cancelled),
+                result = tokio::time::timeout_at(deadline, &mut future) => {
+                    result.map_err(|_| ColdFillStartupWaitError::DeadlineExceeded)
+                }
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(ColdFillStartupWaitError::Cancelled),
+                result = &mut future => Ok(result),
+            }
+        }
+    }
+}
+
+async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenReaderFuture>(
+    producer: ColdFillProducer,
+    reservation: Option<rustfs_object_data_cache::ObjectDataCacheBodyReservation>,
+    acquire_io: AcquireIo,
+    open_reader: OpenReader,
+    execution: ColdFillProducerExecution,
+) where
+    AcquireIo: FnOnce() -> AcquireIoFuture,
+    AcquireIoFuture: Future<Output = Result<GetObjectIoPlanning, ColdFillError>>,
+    OpenReader: FnOnce() -> OpenReaderFuture,
+    OpenReaderFuture: Future<Output = Result<GetObjectReader, StorageError>>,
+{
+    let ColdFillProducerExecution {
+        expected,
+        deadline,
+        adapter,
+        engine_plan,
+    } = execution;
+    let hard_deadline = tokio::time::Instant::now() + COLD_FILL_HARD_MAX_DURATION;
+    let deadline = deadline.map_or(hard_deadline, |request_deadline| request_deadline.min(hard_deadline));
+    let cancellation = producer.cancellation_token();
+    let Some(reservation) = reservation else {
+        producer.bypass();
+        return;
+    };
+    let acquire = acquire_io();
+    tokio::pin!(acquire);
+    let producer_io = tokio::select! {
+        _ = cancellation.cancelled() => {
+            producer.finish(Err(StorageError::OperationCanceled));
+            return;
+        }
+        result = tokio::time::timeout_at(deadline, &mut acquire) => match result {
+            Ok(result) => result,
+            Err(_) => {
+                producer.relinquish_or_finish(ColdFillError::Storage(StorageError::Timeout));
+                return;
+            }
+        }
+    };
+    let producer_io = match producer_io {
+        Ok(io) => io,
+        Err(err) => {
+            producer.relinquish_or_finish(err);
+            return;
+        }
+    };
+
+    let open = open_reader();
+    tokio::pin!(open);
+    let reader = match tokio::select! {
+        _ = cancellation.cancelled() => Err(StorageError::OperationCanceled),
+        result = tokio::time::timeout_at(deadline, &mut open) => {
+            result.unwrap_or(Err(StorageError::Timeout))
+        }
+    } {
+        Ok(reader) => reader,
+        Err(err) => {
+            producer.relinquish_or_finish(ColdFillError::Storage(err));
+            return;
+        }
+    };
+    producer.mark_reader_started();
+    let materialize = async move {
+        let GetObjectReader {
+            stream, buffered_body, ..
+        } = reader;
+        let body = if let Some(body) = buffered_body {
+            if body.len() == expected {
+                body
+            } else {
+                return Err(StorageError::other(format!(
+                    "cold-fill buffered body length mismatch: expected {expected}, got {}",
+                    body.len()
+                )));
+            }
+        } else {
+            let stream = if let Some(permit) = producer_io.disk_permit {
+                wrap_reader(DiskReadPermitReader::new(stream, permit))
+            } else {
+                stream
+            };
+            Bytes::from(
+                strict_materialize_object_body(stream, expected, GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ)
+                    .await
+                    .map_err(StrictMaterializeError::into_storage_error)?,
+            )
+        };
+        Ok::<_, StorageError>((body, reservation))
+    };
+    let materialized = tokio::select! {
+            _ = cancellation.cancelled() => Err(StorageError::OperationCanceled),
+            result = tokio::time::timeout_at(deadline, materialize) => {
+                result.unwrap_or(Err(StorageError::Timeout))
+            }
+    };
+    let result = match materialized {
+        Ok((body, reservation)) => {
+            if cancellation.is_cancelled() {
+                producer.finish(Err(StorageError::OperationCanceled));
+                return;
+            }
+            if deadline <= tokio::time::Instant::now() {
+                producer.finish(Err(StorageError::Timeout));
+                return;
+            }
+            let reserved = reservation.wrap_bytes(body);
+            let shared = reserved.bytes();
+            let publish = async {
+                #[cfg(test)]
+                wait_cold_fill_publication_barrier(&engine_plan).await;
+                adapter.fill_reserved_body(&engine_plan, reserved).await
+            };
+            tokio::pin!(publish);
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(StorageError::OperationCanceled),
+                _ = tokio::time::sleep_until(deadline) => {
+                    Err(StorageError::Timeout)
+                }
+                _ = &mut publish => Ok(shared),
+            }
+        }
+        Err(err) => Err(err),
+    };
+    producer.finish(result);
+}
+
+fn cold_fill_deadline(
+    wrapper: &RequestTimeoutWrapper,
+    timeout_config: &GetObjectTimeoutPolicy,
+    response_size: u64,
+) -> Option<tokio::time::Instant> {
+    if !timeout_config.is_timeout_enabled() {
+        return None;
+    }
+    Some(tokio::time::Instant::now() + wrapper.remaining_time_for_size(Some(response_size)).unwrap_or(Duration::ZERO))
+}
+
+fn cold_fill_producer_deadline(timeout_config: &GetObjectTimeoutPolicy, response_size: u64) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    let hard_deadline = now + COLD_FILL_HARD_MAX_DURATION;
+    if timeout_config.is_timeout_enabled() {
+        (now + timeout_config.calculate_timeout_for_size(response_size)).min(hard_deadline)
+    } else {
+        hard_deadline
+    }
+}
+
+async fn lookup_cold_fill_second_chance(
+    adapter: &ObjectDataCacheAdapter,
+    plan: &rustfs_object_data_cache::ObjectDataCacheGetPlan,
+) -> Option<Bytes> {
+    match adapter.peek_body_untracked(plan).await {
+        rustfs_object_data_cache::ObjectDataCacheLookup::Hit(body) => Some(body),
+        _ => None,
+    }
+}
+
+fn retain_cold_fill_producer_for_matching_plan(
+    producer: ColdFillProducer,
+    current: &GetObjectBodyCachePlan,
+    expected: &rustfs_object_data_cache::ObjectDataCacheGetPlan,
+) -> Option<ColdFillProducer> {
+    if current == &GetObjectBodyCachePlan::Cacheable(expected.clone()) {
+        Some(producer)
+    } else {
+        producer.bypass();
+        None
     }
 }
 
@@ -2866,6 +3264,11 @@ impl DefaultObjectUsecase {
         Ok(())
     }
 
+    fn validate_get_object_before_cold_fill(headers: &HeaderMap, part_number: Option<usize>, info: &ObjectInfo) -> S3Result<()> {
+        check_preconditions(headers, info)?;
+        Self::validate_get_object_part_number(part_number, info)
+    }
+
     /// How long a GET waits for a disk read permit before degrading to a
     /// permit-less read. Cached: consulted per GET. Zero disables the bound.
     fn disk_permit_wait_timeout() -> Duration {
@@ -2880,8 +3283,7 @@ impl DefaultObjectUsecase {
 
     async fn acquire_get_object_io_planning(
         manager: &ConcurrencyManager,
-        wrapper: &RequestTimeoutWrapper,
-        timeout_config: &GetObjectTimeoutPolicy,
+        request_timeout: Option<GetObjectRequestTimeout<'_>>,
         bucket: &str,
         key: &str,
     ) -> S3Result<GetObjectIoPlanning> {
@@ -2929,13 +3331,15 @@ impl DefaultObjectUsecase {
         };
         let permit_wait_duration = permit_wait_start.elapsed();
 
-        Self::ensure_get_object_not_timed_out(
-            wrapper,
-            timeout_config,
-            bucket,
-            key,
-            GetObjectTimeoutStage::DiskPermitWait { permit_wait_duration },
-        )?;
+        if let Some(timeout) = request_timeout {
+            Self::ensure_get_object_not_timed_out(
+                timeout.wrapper,
+                timeout.policy,
+                bucket,
+                key,
+                GetObjectTimeoutStage::DiskPermitWait { permit_wait_duration },
+            )?;
+        }
 
         let queue_status = manager.io_queue_status();
         let queue_snapshot = GetObjectQueueSnapshot::from_available_permits(
@@ -2963,14 +3367,48 @@ impl DefaultObjectUsecase {
             }
         }
 
-        Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
+        if let Some(timeout) = request_timeout {
+            Self::ensure_get_object_not_timed_out(
+                timeout.wrapper,
+                timeout.policy,
+                bucket,
+                key,
+                GetObjectTimeoutStage::BeforeRead,
+            )?;
+        }
 
         Ok(GetObjectIoPlanning {
-            disk_permit,
+            disk_permit: disk_permit.map(GetObjectDiskPermit::new),
             permit_wait_duration,
             queue_status,
             queue_utilization,
         })
+    }
+
+    async fn acquire_cold_fill_io_planning(
+        manager: &'static ConcurrencyManager,
+        bucket: &str,
+        key: &str,
+    ) -> Result<GetObjectIoPlanning, ColdFillError> {
+        match Self::acquire_get_object_io_planning(manager, None, bucket, key).await {
+            Ok(io) => Ok(io),
+            Err(err) if err.code() == &S3ErrorCode::SlowDown => Err(ColdFillError::Storage(StorageError::SlowDown)),
+            Err(_) => Err(ColdFillError::DiskAdmissionClosed),
+        }
+    }
+
+    fn get_object_io_planning_without_disk(manager: &ConcurrencyManager) -> GetObjectIoPlanning {
+        let queue_status = manager.io_queue_status();
+        let queue_snapshot = GetObjectQueueSnapshot::from_available_permits(
+            queue_status.total_permits,
+            queue_status.total_permits.saturating_sub(queue_status.permits_in_use),
+        );
+        GetObjectIoPlanning {
+            disk_permit: None,
+            permit_wait_duration: Duration::ZERO,
+            queue_utilization: queue_snapshot.utilization_percent(),
+            queue_status,
+        }
     }
 
     async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
@@ -3006,8 +3444,9 @@ impl DefaultObjectUsecase {
     }
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read_execution(
+        &self,
         req: &S3Request<GetObjectInput>,
-        manager: &ConcurrencyManager,
+        manager: &'static ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
         timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
@@ -3016,8 +3455,6 @@ impl DefaultObjectUsecase {
         opts: &ObjectOptions,
         part_number: Option<usize>,
     ) -> S3Result<GetObjectPreparedRead> {
-        let h = req.headers.clone();
-
         // SF05: Store lookup first (cached via SF01 moka cache).
         let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let store = get_validated_store(bucket).await?;
@@ -3029,52 +3466,338 @@ impl DefaultObjectUsecase {
             );
         }
 
-        // Acquire the GET disk permit before ECStore reader setup. Reader setup
-        // may perform metadata fanout, materialize direct-memory bodies, or
-        // start legacy duplex background reads; all of that work belongs inside
-        // the admission boundary. Fully materialized bodies release the permit
-        // when the unused wrapped reader is dropped during body construction,
-        // while streaming bodies keep it until EOF or client drop.
-        let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
-
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
-        let read_setup = Self::prepare_get_object_read(
-            req,
-            &store,
-            manager,
-            bucket,
-            key,
-            rs,
-            h,
-            opts,
-            part_number,
-            read_start,
-            read_stage_start,
-        )
-        .await?;
+        let cache_adapter = self.object_data_cache();
+        if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
+            let io_planning = Self::acquire_get_object_io_planning(
+                manager,
+                Some(GetObjectRequestTimeout {
+                    wrapper,
+                    policy: timeout_config,
+                }),
+                bucket,
+                key,
+            )
+            .await?;
+            let reader = store
+                .get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts)
+                .await
+                .map_err(map_get_object_reader_error)?;
+            let read_setup =
+                Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
+            return Ok(GetObjectPreparedRead { io_planning, read_setup });
+        }
 
-        Ok(GetObjectPreparedRead { io_planning, read_setup })
-    }
+        // Preserve the legacy metadata-fanout bound without making followers
+        // hold a body-transfer permit while they wait on the cold-fill session.
+        let mut metadata_admission = Some(
+            Self::acquire_get_object_io_planning(
+                manager,
+                Some(GetObjectRequestTimeout {
+                    wrapper,
+                    policy: timeout_config,
+                }),
+                bucket,
+                key,
+            )
+            .await?,
+        );
+        let mut prepared = Some(
+            store
+                .prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts)
+                .await
+                .map_err(map_get_object_reader_error)?,
+        );
+        let mut cache_fill_allowed = true;
+        let mut legacy_hook_missed = false;
+        'snapshot: {
+            let info = prepared
+                .as_ref()
+                .ok_or_else(|| s3_error!(InternalError, "prepared metadata snapshot is unavailable"))?
+                .object_info();
+            // Preconditions, cache planning, and the authoritative hook lookup all
+            // run against one namespace-locked metadata snapshot. Cacheable misses
+            // release both the lock and short admission before joining cold fill.
+            let Some(response_content_length) = get_object_body_cache_plaintext_len(&rs, opts, info) else {
+                break 'snapshot;
+            };
+            let cache_plan = build_get_object_body_cache_plan(
+                &cache_adapter,
+                GetObjectBodyCacheRequest {
+                    bucket,
+                    key,
+                    info,
+                    response_content_length,
+                    has_range: rs.is_some(),
+                    part_number,
+                    encryption_applied: info.is_encrypted(),
+                },
+            );
 
-    #[allow(clippy::too_many_arguments)]
-    async fn prepare_get_object_read(
-        req: &S3Request<GetObjectInput>,
-        store: &ECStore,
-        manager: &ConcurrencyManager,
-        bucket: &str,
-        key: &str,
-        mut rs: Option<HTTPRangeSpec>,
-        h: HeaderMap,
-        opts: &ObjectOptions,
-        part_number: Option<usize>,
-        read_start: std::time::Instant,
-        read_stage_start: Option<std::time::Instant>,
-    ) -> S3Result<GetObjectReadSetup> {
-        let reader = store
-            .get_object_reader(bucket, key, rs.clone(), h, opts)
-            .await
-            .map_err(map_get_object_reader_error)?;
+            // The legacy hook is evaluated once, before cold-fill coordination.
+            // In-session producer retries never re-enter this snapshot block.
+            let legacy_probe = lookup_preplanned_get_object_body_cache_hook(
+                Arc::clone(&cache_adapter),
+                cache_plan.clone(),
+                bucket,
+                key,
+                &rs,
+                opts,
+                info,
+            )
+            .await;
+            if matches!(legacy_probe, GetObjectBodyCacheHookLookup::Ineligible) {
+                break 'snapshot;
+            }
+            Self::validate_get_object_before_cold_fill(&req.headers, part_number, info)?;
+            if let GetObjectBodyCacheHookLookup::Hit(body) = legacy_probe {
+                drop(metadata_admission.take());
+                let info = prepared
+                    .take()
+                    .ok_or_else(|| s3_error!(InternalError, "prepared cache-hit reader is unavailable"))?
+                    .into_object_info();
+                let reader = GetObjectReader::from_cache_body(info, body).map_err(ApiError::from)?;
+                let read_setup =
+                    Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
+                return Ok(GetObjectPreparedRead {
+                    io_planning: Self::get_object_io_planning_without_disk(manager),
+                    read_setup,
+                });
+            }
+            if matches!(legacy_probe, GetObjectBodyCacheHookLookup::Miss) {
+                legacy_hook_missed = true;
+            }
+            if !legacy_hook_missed
+                && let GetObjectBodyCacheLookup::Hit(body) = lookup_get_object_body_cache_hit(&cache_adapter, &cache_plan).await
+            {
+                drop(metadata_admission.take());
+                let info = prepared
+                    .take()
+                    .ok_or_else(|| s3_error!(InternalError, "prepared cache-hit reader is unavailable"))?
+                    .into_object_info();
+                let reader = GetObjectReader::from_cache_body(info, body).map_err(ApiError::from)?;
+                let read_setup =
+                    Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true).await?;
+                return Ok(GetObjectPreparedRead {
+                    io_planning: Self::get_object_io_planning_without_disk(manager),
+                    read_setup,
+                });
+            }
+
+            let GetObjectBodyCachePlan::Cacheable(engine_plan) = &cache_plan else {
+                break 'snapshot;
+            };
+            let Some(cache_key) = cache_plan.key().cloned() else {
+                break 'snapshot;
+            };
+            let expected = usize::try_from(response_content_length)
+                .map_err(|_| s3_error!(InternalError, "cold-fill body length is not representable"))?;
+            let response_size = u64::try_from(response_content_length)
+                .map_err(|_| s3_error!(InternalError, "cold-fill body length is negative"))?;
+            let waiter_deadline = cold_fill_deadline(wrapper, timeout_config, response_size);
+            let proposed_producer_deadline = cold_fill_producer_deadline(timeout_config, response_size);
+            let coordinator = cache_adapter.cold_fill_coordinator();
+            let info = prepared
+                .take()
+                .ok_or_else(|| s3_error!(InternalError, "prepared cold-fill reader is unavailable"))?
+                .into_object_info();
+            drop(metadata_admission.take());
+            let outcome = coordinate_cold_fill(&coordinator, cache_key, waiter_deadline, Some(proposed_producer_deadline), {
+                let adapter = &cache_adapter;
+                let headers = &req.headers;
+                let store = &store;
+                let range = &rs;
+                move |producer| {
+                    let adapter = Arc::clone(adapter);
+                    let engine_plan = engine_plan.clone();
+                    let h = headers.clone();
+                    let store = Arc::clone(store);
+                    let range = range.clone();
+                    let bucket = bucket.to_owned();
+                    let key = key.to_owned();
+                    let opts = opts.clone();
+                    async move {
+                        let producer_deadline = producer.deadline();
+                        let cancellation = producer.cancellation_token();
+                        let second_chance = match await_cold_fill_startup(
+                            lookup_cold_fill_second_chance(&adapter, &engine_plan),
+                            &cancellation,
+                            producer_deadline,
+                        )
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err(ColdFillStartupWaitError::Cancelled) => {
+                                producer.finish(Err(StorageError::OperationCanceled));
+                                return;
+                            }
+                            Err(ColdFillStartupWaitError::DeadlineExceeded) => {
+                                producer.relinquish_or_finish(ColdFillError::Storage(StorageError::Timeout));
+                                return;
+                            }
+                        };
+                        if let Some(body) = second_chance {
+                            producer.finish_shared(Ok(body));
+                            return;
+                        }
+
+                        let acquire = Self::acquire_cold_fill_io_planning(manager, &bucket, &key);
+                        let producer_io = match await_cold_fill_startup(acquire, &cancellation, producer_deadline).await {
+                            Ok(result) => result,
+                            Err(ColdFillStartupWaitError::Cancelled) => {
+                                producer.finish(Err(StorageError::OperationCanceled));
+                                return;
+                            }
+                            Err(ColdFillStartupWaitError::DeadlineExceeded) => {
+                                producer.relinquish_or_finish(ColdFillError::Storage(StorageError::Timeout));
+                                return;
+                            }
+                        };
+                        let producer_io = match producer_io {
+                            Ok(io) => io,
+                            Err(err) => {
+                                producer.finish_shared(Err(err));
+                                return;
+                            }
+                        };
+
+                        let prepare = store.prepare_get_object_reader(&bucket, &key, range.clone(), HeaderMap::new(), &opts);
+                        let prepared = match match await_cold_fill_startup(prepare, &cancellation, producer_deadline).await {
+                            Ok(result) => result,
+                            Err(ColdFillStartupWaitError::Cancelled) => {
+                                producer.finish(Err(StorageError::OperationCanceled));
+                                return;
+                            }
+                            Err(ColdFillStartupWaitError::DeadlineExceeded) => {
+                                producer.relinquish_or_finish(ColdFillError::Storage(StorageError::Timeout));
+                                return;
+                            }
+                        } {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                producer.relinquish_or_finish(ColdFillError::Storage(err));
+                                return;
+                            }
+                        };
+                        let current_info = prepared.object_info();
+                        let current_length = match current_info.get_actual_size() {
+                            Ok(length) => length,
+                            Err(err) => {
+                                let _ = err;
+                                producer.finish_shared(Err(ColdFillError::Storage(StorageError::FileCorrupt)));
+                                return;
+                            }
+                        };
+                        let current_plan = build_get_object_body_cache_plan_for_revalidation(
+                            &adapter,
+                            GetObjectBodyCacheRequest {
+                                bucket: &bucket,
+                                key: &key,
+                                info: current_info,
+                                response_content_length: current_length,
+                                has_range: range.is_some(),
+                                part_number,
+                                encryption_applied: current_info.is_encrypted(),
+                            },
+                        );
+                        let Some(producer) = retain_cold_fill_producer_for_matching_plan(producer, &current_plan, &engine_plan)
+                        else {
+                            return;
+                        };
+
+                        let reservation = adapter.reserve_body(&engine_plan);
+                        #[cfg(test)]
+                        let reader_open_plan = engine_plan.clone();
+                        start_cold_fill_producer(
+                            producer,
+                            reservation,
+                            || async move { Ok(producer_io) },
+                            || {
+                                #[cfg(test)]
+                                record_cold_fill_reader_open_for_test(&reader_open_plan);
+                                prepared.with_headers(h).into_reader()
+                            },
+                            ColdFillProducerExecution {
+                                expected,
+                                deadline: producer_deadline,
+                                adapter,
+                                engine_plan,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            })
+            .await;
+
+            match outcome {
+                ColdFillCoordinateOutcome::Ready(result) => {
+                    let body = match result {
+                        Ok(body) => body,
+                        Err(ColdFillError::Storage(err)) => return Err(map_get_object_reader_error(err).into()),
+                        Err(ColdFillError::DiskAdmissionClosed) => {
+                            return Err(s3_error!(InternalError, "disk read semaphore closed"));
+                        }
+                    };
+                    let reader = GetObjectReader::from_cache_body(info, body).map_err(ApiError::from)?;
+                    let read_setup =
+                        Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, true)
+                            .await?;
+                    return Ok(GetObjectPreparedRead {
+                        io_planning: Self::get_object_io_planning_without_disk(manager),
+                        read_setup,
+                    });
+                }
+                ColdFillCoordinateOutcome::Bypass => {
+                    cache_fill_allowed = false;
+                    break 'snapshot;
+                }
+                ColdFillCoordinateOutcome::Rejected => return Err(ApiError::from(StorageError::SlowDown).into()),
+            }
+        }
+
+        let (io_planning, reader) = if let Some(prepared) = prepared.take() {
+            let io_planning = metadata_admission
+                .take()
+                .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
+            let reader = prepared
+                .with_headers(req.headers.clone())
+                .into_reader()
+                .await
+                .map_err(map_get_object_reader_error)?;
+            (io_planning, reader)
+        } else {
+            let io_planning = Self::acquire_get_object_io_planning(
+                manager,
+                Some(GetObjectRequestTimeout {
+                    wrapper,
+                    policy: timeout_config,
+                }),
+                bucket,
+                key,
+            )
+            .await?;
+            let reader = if legacy_hook_missed {
+                store
+                    .prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts)
+                    .await
+                    .map_err(map_get_object_reader_error)?
+                    .with_headers(req.headers.clone())
+                    .into_reader()
+                    .await
+                    .map_err(map_get_object_reader_error)?
+            } else {
+                store
+                    .get_object_reader(bucket, key, rs.clone(), req.headers.clone(), opts)
+                    .await
+                    .map_err(map_get_object_reader_error)?
+            };
+            (io_planning, reader)
+        };
+        let read_setup =
+            Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, cache_fill_allowed)
+                .await?;
         if let Some(read_stage_start) = read_stage_start {
             rustfs_io_metrics::record_get_object_stage_duration(
                 "s3_handler",
@@ -3082,7 +3805,21 @@ impl DefaultObjectUsecase {
                 read_stage_start.elapsed().as_secs_f64(),
             );
         }
+        Ok(GetObjectPreparedRead { io_planning, read_setup })
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_get_object_read(
+        req: &S3Request<GetObjectInput>,
+        manager: &ConcurrencyManager,
+        bucket: &str,
+        key: &str,
+        mut rs: Option<HTTPRangeSpec>,
+        part_number: Option<usize>,
+        read_start: std::time::Instant,
+        reader: GetObjectReader,
+        cache_fill_allowed: bool,
+    ) -> S3Result<GetObjectReadSetup> {
         // ODC-16: capture whether the ecstore cache hook already probed this
         // read, so the app layer does not repeat the lookup it ran after fresh
         // metadata resolution.
@@ -3203,6 +3940,7 @@ impl DefaultObjectUsecase {
             buffered_body,
             cache_hook_served,
             cache_hook_probed,
+            cache_fill_allowed,
             rs,
             content_type,
             last_modified,
@@ -3493,6 +4231,7 @@ impl DefaultObjectUsecase {
         buffered_body: Option<Bytes>,
         cache_hook_served: bool,
         cache_hook_probed: bool,
+        cache_fill_allowed: bool,
         bucket: &str,
         key: &str,
         mut lifecycle: GetObjectBodyLifecycle,
@@ -3500,6 +4239,37 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        // ODC-16 (backlog#1121): when the ecstore hook or shared cold fill
+        // already supplied this body, the request-level plan was built before
+        // the authoritative lookup. Serve it without planning a second time.
+        if cache_hook_served && let Some(bytes) = buffered_body.clone() {
+            return Ok(Self::build_memory_bytes_blob(
+                bytes,
+                response_content_length,
+                GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                lifecycle,
+            ));
+        }
+
+        if !cache_fill_allowed {
+            return Self::build_get_object_body(
+                final_stream,
+                info,
+                response_content_length,
+                optimal_buffer_size,
+                enable_readahead,
+                concurrent_requests,
+                part_number,
+                has_range,
+                encryption_applied,
+                buffered_body,
+                bucket,
+                key,
+                lifecycle,
+            )
+            .await;
+        }
+
         let cache_request = GetObjectBodyCacheRequest {
             bucket,
             key,
@@ -3510,19 +4280,6 @@ impl DefaultObjectUsecase {
             encryption_applied,
         };
         let cache_plan = build_get_object_body_cache_plan(cache_adapter, cache_request);
-
-        // ODC-16 (backlog#1121): when the ecstore hook already served this body
-        // from the cache, serve it straight through as the object-data-cache
-        // source. Re-running the lookup here would record a second hit, double
-        // the hit_bytes, and do redundant moka work for one hook-served GET.
-        if cache_hook_served && let Some(bytes) = buffered_body.clone() {
-            return Ok(Self::build_memory_bytes_blob(
-                bytes,
-                response_content_length,
-                GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
-                lifecycle,
-            ));
-        }
 
         // ODC-16: only look up when the hook did not probe this read. When it did
         // probe (a served body handled above, or a miss), its result is
@@ -3548,14 +4305,14 @@ impl DefaultObjectUsecase {
             // detached task (Bytes is a cheap clone) and return immediately. For
             // a non-cacheable plan the fill is a pure metric-only skip with no
             // I/O, so record it inline to preserve observability.
-            if matches!(cache_plan, GetObjectBodyCachePlan::Cacheable(_)) {
+            if cache_fill_allowed && matches!(cache_plan, GetObjectBodyCachePlan::Cacheable(_)) {
                 let cache_adapter = cache_adapter.clone();
                 let cache_plan = cache_plan.clone();
                 let fill_bytes = buffered_body.clone();
                 tokio::spawn(async move {
                     let _ = fill_get_object_body_cache_from_buffered_body(&cache_adapter, &cache_plan, &fill_bytes).await;
                 });
-            } else {
+            } else if cache_fill_allowed {
                 let _ = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
             }
 
@@ -3568,6 +4325,7 @@ impl DefaultObjectUsecase {
         }
 
         let should_materialize_for_cache = cache_adapter.materialize_fill_enabled()
+            && cache_fill_allowed
             && matches!(cache_plan, GetObjectBodyCachePlan::Cacheable(_))
             && should_materialize_get_object_body_for_cache(
                 info,
@@ -4430,6 +5188,7 @@ impl DefaultObjectUsecase {
         buffered_body: Option<Bytes>,
         cache_hook_served: bool,
         cache_hook_probed: bool,
+        cache_fill_allowed: bool,
         rs: Option<HTTPRangeSpec>,
         content_type: Option<ContentType>,
         last_modified: Option<Timestamp>,
@@ -4484,6 +5243,7 @@ impl DefaultObjectUsecase {
             buffered_body,
             cache_hook_served,
             cache_hook_probed,
+            cache_fill_allowed,
             bucket,
             key,
             lifecycle,
@@ -4620,18 +5380,9 @@ impl DefaultObjectUsecase {
 
         let manager = get_concurrency_manager();
 
-        let prepared_read = match Self::prepare_get_object_read_execution(
-            &req,
-            manager,
-            &wrapper,
-            &timeout_config,
-            &bucket,
-            &key,
-            rs,
-            &opts,
-            part_number,
-        )
-        .await
+        let prepared_read = match self
+            .prepare_get_object_read_execution(&req, manager, &wrapper, &timeout_config, &bucket, &key, rs, &opts, part_number)
+            .await
         {
             Ok(prepared_read) => prepared_read,
             Err(err) => {
@@ -4653,6 +5404,7 @@ impl DefaultObjectUsecase {
             buffered_body,
             cache_hook_served,
             cache_hook_probed,
+            cache_fill_allowed,
             rs,
             content_type,
             last_modified,
@@ -4687,6 +5439,7 @@ impl DefaultObjectUsecase {
                 buffered_body,
                 cache_hook_served,
                 cache_hook_probed,
+                cache_fill_allowed,
                 rs,
                 content_type,
                 last_modified,
@@ -4989,6 +5742,7 @@ impl DefaultObjectUsecase {
             object_lock_mode,
             object_lock_retain_until_date,
             storage_class,
+            checksum_algorithm,
             ..
         } = req.input.clone();
         let (src_bucket, src_key, version_id) = match copy_source {
@@ -5136,6 +5890,25 @@ impl DefaultObjectUsecase {
 
         let mut src_info = gr.object_info.clone();
 
+        // Capture the version actually read from the source before src_info is mutated/consumed
+        // below. This is the exact source version copied (issue #4976): the response must echo it
+        // via x-amz-copy-source-version-id, distinct from the destination version_id.
+        let src_resolved_version_id = src_info.version_id;
+
+        // Source object's existing checksum, if any. When the copy does not request a new
+        // algorithm, AWS preserves the source object's checksum on the destination (#4996); the
+        // copy does not transform the plaintext, so we carry the stored value over unchanged
+        // rather than re-hashing every byte.
+        let src_checksum = src_info.checksum.as_ref().and_then(|bytes| {
+            let (pairs, _) = rustfs_rio::read_checksums(bytes.as_ref(), 0);
+            pairs.into_iter().find_map(|(k, v)| {
+                rustfs_rio::ChecksumType::from_string(&k)
+                    .is_s3s_typed()
+                    .then(|| rustfs_rio::Checksum::new_from_string(&k, &v))
+                    .flatten()
+            })
+        });
+
         // Validate copy source conditions
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
@@ -5233,6 +6006,26 @@ impl DefaultObjectUsecase {
             HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
         };
 
+        // Give the destination object a checksum so CopyObject returns it and a later checksum-mode
+        // HEAD/GET matches (#4996). When the caller requests an algorithm, compute it fresh over the
+        // copied plaintext (the hasher sits on the innermost reader so it digests plaintext). When
+        // none is requested, carry the source object's stored checksum over unchanged — the copy
+        // does not alter the plaintext, so re-hashing would be wasted work and would flatten a
+        // multipart composite value.
+        match checksum_algorithm.as_ref() {
+            Some(algo) => {
+                let ct = rustfs_rio::ChecksumType::from_string(algo.as_str());
+                if ct.is_set() {
+                    reader.add_calculated_checksum(ct).map_err(ApiError::from)?;
+                }
+            }
+            None => {
+                if let Some(cs) = src_checksum {
+                    reader.add_non_trailing_checksum(Some(cs), true).map_err(ApiError::from)?;
+                }
+            }
+        }
+
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -5293,16 +6086,47 @@ impl DefaultObjectUsecase {
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
         let dest_version = if dest_versioned { raw_dest_version } else { None };
 
+        // Echo the source version that was copied via x-amz-copy-source-version-id (issue #4976).
+        // AWS/MinIO return this whenever the source bucket carries versioning (enabled or
+        // suspended); render the null version as "null" like GET/HEAD do. This is the exact source
+        // version, kept distinct from the destination version_id above.
+        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await
+            || BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
+        let copy_source_version_id = if src_versioned {
+            src_resolved_version_id.map(|vid| {
+                if vid == Uuid::nil() {
+                    "null".to_string()
+                } else {
+                    vid.to_string()
+                }
+            })
+        } else {
+            None
+        };
+
+        // Report the destination object's checksum in the response, decoded the same way GetObject
+        // / HeadObject do so the value is identical to a later checksum-mode HEAD/GET (#4996).
+        let response_checksums = oi
+            .decrypt_checksums(0, &req.headers)
+            .map(|(pairs, _)| classify_response_checksums(pairs))
+            .unwrap_or_default();
+
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
         let copy_object_result = CopyObjectResult {
             e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
-            ..Default::default()
+            checksum_crc32: response_checksums.crc32,
+            checksum_crc32c: response_checksums.crc32c,
+            checksum_sha1: response_checksums.sha1,
+            checksum_sha256: response_checksums.sha256,
+            checksum_crc64nvme: response_checksums.crc64nvme,
+            checksum_type: response_checksums.checksum_type,
         };
 
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
+            copy_source_version_id,
             server_side_encryption: effective_sse,
             ssekms_key_id: effective_kms_key_id,
             sse_customer_algorithm,
@@ -7129,6 +7953,34 @@ mod tests {
         assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS + 1), None);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cold_fill_disk_admission_preserves_slow_down() {
+        let manager = Box::leak(Box::new(ConcurrencyManager::with_disk_read_caps_for_test(1, 1)));
+        let primary = match manager.admit_disk_read(Duration::from_millis(1)).await.unwrap() {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("expected primary admission, got {other:?}"),
+        };
+        let degraded = match manager.admit_disk_read(Duration::from_millis(1)).await.unwrap() {
+            DiskReadAdmission::Degraded(permit) => permit,
+            other => panic!("expected degraded admission, got {other:?}"),
+        };
+
+        let result = DefaultObjectUsecase::acquire_cold_fill_io_planning(manager, "bucket", "object").await;
+        assert!(matches!(result, Err(ColdFillError::Storage(StorageError::SlowDown))));
+
+        drop(degraded);
+        drop(primary);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_closed_disk_admission_is_not_slow_down() {
+        let manager = Box::leak(Box::new(ConcurrencyManager::with_disk_read_caps_for_test(1, 1)));
+        manager.close_disk_read_admission_for_test();
+
+        let result = DefaultObjectUsecase::acquire_cold_fill_io_planning(manager, "bucket", "object").await;
+        assert!(matches!(result, Err(ColdFillError::DiskAdmissionClosed)));
+    }
+
     // classify_response_checksums is the single point that splits decrypted checksum
     // pairs into the five s3s-typed fields and the additional-algorithm `extra`
     // headers, replacing five copies of the loop. Lock its behaviour (#1252).
@@ -7677,6 +8529,37 @@ mod tests {
         data: std::io::Cursor<Vec<u8>>,
     }
 
+    struct ColdFillMatrixReader {
+        inner: tokio::io::DuplexStream,
+        first_poll_recorded: bool,
+        completion_recorded: bool,
+        first_polls: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ColdFillMatrixReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if !self.first_poll_recorded {
+                self.first_poll_recorded = true;
+                self.first_polls.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let before = buf.filled().len();
+            match Pin::new(&mut self.inner).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    let read = buf.filled().len().saturating_sub(before);
+                    self.bytes_read.fetch_add(read, AtomicOrdering::Relaxed);
+                    if read == 0 && !self.completion_recorded {
+                        self.completion_recorded = true;
+                        self.completed.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
     impl AsyncRead for DataProbeReader {
         fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
             self.reads.fetch_add(1, AtomicOrdering::Relaxed);
@@ -7756,12 +8639,46 @@ mod tests {
             .await
             .expect("exact-length read must materialize");
         assert_eq!(buf, b"hello");
+        assert_eq!(buf.capacity(), 5, "exact materialization must allocate only the declared body length");
+
+        let exact_large = vec![7_u8; 64 * 1024];
+        let buf = strict_materialize_object_body(
+            std::io::Cursor::new(exact_large.clone()),
+            exact_large.len(),
+            GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ,
+        )
+        .await
+        .expect("64 KiB exact-length read must materialize");
+        assert_eq!(buf.capacity(), exact_large.len());
+
+        let mut overlong_large = exact_large;
+        overlong_large.push(9);
+        let overlong = strict_materialize_object_body(
+            std::io::Cursor::new(overlong_large),
+            64 * 1024,
+            GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ,
+        )
+        .await;
+        assert!(matches!(
+            overlong,
+            Err(StrictMaterializeError::LengthMismatch {
+                expected: 65_536,
+                actual: 65_537
+            })
+        ));
 
         // Short read (actual = expected - 1): a clean EOF before the declared
         // length must be a hard error, never a truncated served body.
         let short = strict_materialize_object_body(cursor_reader(b"hell"), 5, GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ).await;
         assert!(
-            matches!(short, Err(StrictMaterializeError::LengthMismatch { expected: 5, actual: 4 })),
+            matches!(
+                short,
+                Err(StrictMaterializeError::LengthMismatch {
+                    expected: 5,
+                    actual: 4,
+                    ..
+                })
+            ),
             "short read must fail with a length mismatch, got {short:?}",
             short = short.as_ref().map(|b| b.len())
         );
@@ -7787,6 +8704,1572 @@ mod tests {
             matches!(errored, Err(StrictMaterializeError::Read { consumed: 3, .. })),
             "a mid-stream read error must be reported as a read failure"
         );
+    }
+
+    #[test]
+    fn cold_fill_zero_timeout_policy_disables_deadline() {
+        let policy = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::ZERO,
+            ..GetObjectTimeoutPolicy::default()
+        };
+        let wrapper = RequestTimeoutWrapper::with_request_id(policy.clone(), "cold-fill-zero-timeout");
+        assert!(cold_fill_deadline(&wrapper, &policy, 1).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_fill_producer_deadline_is_capped_at_ten_minutes() {
+        let disabled = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::ZERO,
+            ..GetObjectTimeoutPolicy::default()
+        };
+        let now = tokio::time::Instant::now();
+        assert_eq!(cold_fill_producer_deadline(&disabled, 1) - now, Duration::from_secs(600));
+
+        let long = GetObjectTimeoutPolicy {
+            get_object_timeout: Duration::from_secs(3600),
+            enable_dynamic_timeout: false,
+            ..GetObjectTimeoutPolicy::default()
+        };
+        let now = tokio::time::Instant::now();
+        assert_eq!(cold_fill_producer_deadline(&long, 1) - now, Duration::from_secs(600));
+    }
+
+    #[tokio::test]
+    async fn cold_fill_startup_wait_stops_when_last_consumer_cancels() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let waiting = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { await_cold_fill_startup(std::future::pending::<()>(), &cancellation, None).await }
+        });
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("startup wait must observe cancellation")
+            .expect("startup wait task must not panic");
+        assert!(matches!(result, Err(ColdFillStartupWaitError::Cancelled)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_fill_startup_wait_with_deadline_still_observes_cancellation() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let waiting = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { await_cold_fill_startup(std::future::pending::<()>(), &cancellation, Some(deadline)).await }
+        });
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+
+        let result = waiting.await.expect("startup wait task must not panic");
+        assert!(matches!(result, Err(ColdFillStartupWaitError::Cancelled)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_fill_startup_wait_reports_deadline_exceeded() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1);
+
+        let result = await_cold_fill_startup(std::future::pending::<()>(), &cancellation, Some(deadline)).await;
+
+        assert!(matches!(result, Err(ColdFillStartupWaitError::DeadlineExceeded)));
+    }
+
+    #[tokio::test]
+    async fn cold_fill_late_miss_second_chance_hits_without_reader() {
+        let adapter = ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+            mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+            max_bytes: 1024 * 1024,
+            max_memory_percent: 0,
+            max_entry_bytes: 1024,
+            min_free_memory_percent: 0,
+            fill_concurrency_max: 1,
+            ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+        })
+        .expect("second-chance cache config must be valid");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "late-bucket",
+            object: "late-object",
+            version_id: None,
+            etag: "late-etag",
+            size: 4,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        assert!(matches!(
+            adapter.lookup_body(&plan).await,
+            rustfs_object_data_cache::ObjectDataCacheLookup::Miss
+        ));
+        let request_lookups = adapter.cache().stats().lookups;
+        assert_eq!(request_lookups, 1, "the authoritative request lookup must be counted once");
+
+        let reservation = adapter.reserve_body(&plan).expect("late producer must reserve");
+        let reserved = reservation.wrap_bytes(Bytes::from_static(b"body"));
+        let _ = adapter.fill_reserved_body(&plan, reserved).await;
+        let coordinator = adapter.cold_fill_coordinator();
+        let cache_key = plan.key().cloned().expect("late plan must be cacheable");
+        let adapter = Arc::new(adapter);
+        let readers = Arc::new(AtomicUsize::new(0));
+        let outcome = coordinate_cold_fill(&coordinator, cache_key, None, None, {
+            let adapter = Arc::clone(&adapter);
+            let readers = Arc::clone(&readers);
+            move |producer| {
+                let adapter = Arc::clone(&adapter);
+                let plan = plan.clone();
+                let readers = Arc::clone(&readers);
+                async move {
+                    if let Some(body) = lookup_cold_fill_second_chance(&adapter, &plan).await {
+                        producer.finish_shared(Ok(body));
+                        return;
+                    }
+                    readers.fetch_add(1, AtomicOrdering::Relaxed);
+                    producer.bypass();
+                }
+            }
+        })
+        .await;
+        let ColdFillCoordinateOutcome::Ready(Ok(body)) = outcome else {
+            panic!("late request must observe the completed fill, got {outcome:?}");
+        };
+        assert_eq!(body, Bytes::from_static(b"body"));
+        assert_eq!(
+            adapter.cache().stats().lookups,
+            request_lookups,
+            "the producer second chance must not count another request lookup"
+        );
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_timeout_is_shared_and_releases_resources() {
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("timeout cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "timeout-bucket",
+            object: "timeout-object",
+            version_id: None,
+            etag: "timeout-etag",
+            size: 1,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let key = plan.key().cloned().expect("timeout body must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let ColdFillRole::Produce(mut producer) = coordinator.join(key.clone()) else {
+            panic!("first timeout request must produce");
+        };
+        let leader = producer.waiter();
+        let reservation = adapter.reserve_body(&plan);
+        let disk_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let disk_gate = Arc::clone(&disk_permits);
+        let readers = Arc::new(AtomicUsize::new(0));
+        let reader_count = Arc::clone(&readers);
+        let producer_task = tokio::spawn(start_cold_fill_producer(
+            producer,
+            reservation,
+            move || async move {
+                let permit = disk_gate
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ColdFillError::DiskAdmissionClosed)?;
+                let mut io = DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager());
+                io.disk_permit = Some(permit.into());
+                Ok(io)
+            },
+            move || async move {
+                reader_count.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(GetObjectReader {
+                    stream: Box::new(PendingReader),
+                    object_info: ObjectInfo {
+                        size: 1,
+                        actual_size: 1,
+                        ..Default::default()
+                    },
+                    buffered_body: None,
+                    body_source: GetObjectBodySource::HookMissed,
+                })
+            },
+            ColdFillProducerExecution {
+                expected: 1,
+                deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+                adapter: Arc::clone(&adapter),
+                engine_plan: plan.clone(),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while readers.load(AtomicOrdering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer reader must open");
+        let ColdFillRole::Wait(follower) = coordinator.join(key.clone()) else {
+            panic!("second timeout request must follow");
+        };
+
+        let (leader_result, follower_result) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(leader.wait(), follower.wait()) })
+                .await
+                .expect("typed timeout must wake all waiters");
+        assert!(matches!(
+            leader_result,
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        assert!(matches!(
+            follower_result,
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(disk_permits.available_permits(), 1);
+        assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+        assert!(matches!(
+            adapter.lookup_body(&plan).await,
+            rustfs_object_data_cache::ObjectDataCacheLookup::Miss
+        ));
+        producer_task.await.expect("producer task must join");
+        assert!(adapter.reserve_body(&plan).is_some(), "timeout must release the body reservation");
+        let ColdFillRole::Produce(successor) = coordinator.join(key) else {
+            panic!("timeout must release the session for a successor");
+        };
+        drop(successor);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_survives_leader_request_cancellation_without_second_producer() {
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("cancellation cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "cancel-bucket",
+            object: "cancel-object",
+            version_id: None,
+            etag: "cancel-etag",
+            size: 4,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let key = plan.key().cloned().expect("cancellation body must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let ColdFillRole::Produce(mut producer) = coordinator.join(key.clone()) else {
+            panic!("first cancellation request must produce");
+        };
+        let leader = producer.waiter();
+        let reservation = adapter.reserve_body(&plan);
+        let readers = Arc::new(AtomicUsize::new(0));
+        let reader_count = Arc::clone(&readers);
+        let writer_slot = Arc::new(Mutex::new(None));
+        let writer_output = Arc::clone(&writer_slot);
+        let producer_task = tokio::spawn(start_cold_fill_producer(
+            producer,
+            reservation,
+            || async { Ok(DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager())) },
+            move || async move {
+                reader_count.fetch_add(1, AtomicOrdering::Relaxed);
+                let (writer, reader) = tokio::io::duplex(16);
+                *writer_output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(writer);
+                Ok(GetObjectReader {
+                    stream: Box::new(reader),
+                    object_info: ObjectInfo {
+                        size: 4,
+                        actual_size: 4,
+                        ..Default::default()
+                    },
+                    buffered_body: None,
+                    body_source: GetObjectBodySource::HookMissed,
+                })
+            },
+            ColdFillProducerExecution {
+                expected: 4,
+                deadline: None,
+                adapter: Arc::clone(&adapter),
+                engine_plan: plan.clone(),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while readers.load(AtomicOrdering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation producer reader must open");
+        let ColdFillRole::Wait(follower) = coordinator.join(key.clone()) else {
+            panic!("second cancellation request must follow");
+        };
+        drop(leader);
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 1);
+        let ColdFillRole::Wait(late) = coordinator.join(key) else {
+            panic!("leader cancellation must not open a successor session");
+        };
+        drop(late);
+
+        let mut writer = writer_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("reader factory must publish writer");
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"body")
+            .await
+            .expect("body write must succeed");
+        tokio::io::AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .expect("body writer must close");
+        let ColdFillWaitOutcome::Ready(result) = follower.wait().await else {
+            panic!("follower must receive producer result");
+        };
+        assert_eq!(result.expect("surviving producer must succeed"), Bytes::from_static(b"body"));
+        producer_task.await.expect("producer task must join");
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_reservation_rejection_streams_without_materializing() {
+        let coordinator = Arc::new(crate::app::object_data_cache::ColdFillCoordinator::default());
+        let plan = rustfs_object_data_cache::ObjectDataCacheGetPlan::Disabled;
+        let ColdFillRole::Produce(mut producer) = coordinator.join(rustfs_object_data_cache::ObjectDataCacheKey::new(
+            "bucket",
+            "object",
+            None,
+            "etag",
+            4,
+            rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        )) else {
+            panic!("first rejected reservation request must produce");
+        };
+        let leader = producer.waiter();
+        let permits = Arc::new(AtomicUsize::new(0));
+        let readers = Arc::new(AtomicUsize::new(0));
+        let permit_count = Arc::clone(&permits);
+        let reader_count = Arc::clone(&readers);
+        start_cold_fill_producer(
+            producer,
+            None,
+            move || async move {
+                permit_count.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager()))
+            },
+            move || async move {
+                reader_count.fetch_add(1, AtomicOrdering::Relaxed);
+                Err(StorageError::other("reader must not open"))
+            },
+            ColdFillProducerExecution {
+                expected: 4,
+                deadline: None,
+                adapter: Arc::new(ObjectDataCacheAdapter::disabled()),
+                engine_plan: plan,
+            },
+        )
+        .await;
+        assert!(matches!(leader.wait().await, ColdFillWaitOutcome::Bypass));
+        assert_eq!(permits.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 0);
+
+        let fallback_reads = Arc::new(AtomicUsize::new(0));
+        let fallback_reader = DataProbeReader {
+            reads: Arc::clone(&fallback_reads),
+            data: std::io::Cursor::new(b"body".to_vec()),
+        };
+        let info = ObjectInfo {
+            size: 4,
+            actual_size: 4,
+            ..Default::default()
+        };
+        let mut fallback_body = DefaultObjectUsecase::build_get_object_body(
+            fallback_reader,
+            &info,
+            4,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "bucket",
+            "object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await
+        .expect("reservation bypass must construct the normal streaming fallback");
+        let chunk = fallback_body
+            .next()
+            .await
+            .expect("fallback stream must yield a body chunk")
+            .expect("fallback stream must not fail");
+        assert_eq!(chunk, Bytes::from_static(b"body"));
+        assert!(fallback_reads.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 0, "cold-fill materialization must remain unopened");
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_internal_movement_and_restore_reads_never_join_sessions() {
+        let coordinator = Arc::new(crate::app::object_data_cache::ColdFillCoordinator::default());
+        let info = ObjectInfo {
+            size: 4,
+            actual_size: 4,
+            ..Default::default()
+        };
+        let mut restore = ObjectOptions::default();
+        restore.transition.restore_request.days = Some(1);
+        let cases = [
+            ObjectOptions {
+                raw_data_movement_read: true,
+                ..Default::default()
+            },
+            ObjectOptions {
+                data_movement: true,
+                ..Default::default()
+            },
+            restore,
+        ];
+
+        for opts in &cases {
+            assert!(matches!(
+                lookup_get_object_body_cache_hook("bucket", "object", &None, opts, &info).await,
+                GetObjectBodyCacheHookLookup::Ineligible
+            ));
+            assert_eq!(coordinator.active_session_count_for_test(), 0);
+        }
+
+        let delete_marker = ObjectInfo {
+            delete_marker: true,
+            etag: Some("delete-marker-etag".to_string()),
+            ..Default::default()
+        };
+        let delete_marker_part = ObjectOptions {
+            part_number: Some(2),
+            ..Default::default()
+        };
+        assert!(matches!(
+            lookup_get_object_body_cache_hook("bucket", "object", &None, &delete_marker_part, &delete_marker).await,
+            GetObjectBodyCacheHookLookup::Ineligible
+        ));
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_generation_change_bypasses_before_opening_body() {
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("generation retry cache config must be valid"),
+        );
+        let request = |data_dir_u128| rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "generation-bucket",
+            object: "generation-object",
+            version_id: None,
+            etag: "generation-etag",
+            size: 4,
+            data_dir_u128: Some(data_dir_u128),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        };
+        let initial_plan = adapter.plan_get(request(1));
+        let changed_plan = GetObjectBodyCachePlan::Cacheable(adapter.plan_get(request(2)));
+        let cache_key = initial_plan.key().cloned().expect("initial generation must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let body_opens = Arc::new(AtomicUsize::new(0));
+        let producer_attempts = Arc::new(AtomicUsize::new(0));
+
+        let outcome = coordinate_cold_fill(&coordinator, cache_key, None, None, {
+            let body_opens = Arc::clone(&body_opens);
+            let producer_attempts = Arc::clone(&producer_attempts);
+            move |producer| {
+                let body_opens = Arc::clone(&body_opens);
+                let producer_attempts = Arc::clone(&producer_attempts);
+                let changed_plan = changed_plan.clone();
+                let initial_plan = initial_plan.clone();
+                async move {
+                    producer_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                    let Some(producer) = retain_cold_fill_producer_for_matching_plan(producer, &changed_plan, &initial_plan)
+                    else {
+                        return;
+                    };
+                    body_opens.fetch_add(1, AtomicOrdering::Relaxed);
+                    producer.bypass();
+                }
+            }
+        })
+        .await;
+
+        assert!(matches!(outcome, ColdFillCoordinateOutcome::Bypass));
+        assert_eq!(producer_attempts.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(body_opens.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    async fn real_cold_fill_test_context() -> (Arc<ECStore>, Arc<AppContext>) {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("real cold-fill tests require an ambient AppContext");
+        let context = temp_env::with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, Some("true")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MODE, Some("fill_materialize_enabled")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES, Some("8388608")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES, Some("2097152")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT, Some("0")),
+            ],
+            || Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms())),
+        );
+        assert!(context.object_data_cache().materialize_fill_enabled());
+        (store, context)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_delete_cleanup_persists_identity_bound_and_legacy_journals() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let identity = [11_u8; 32];
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity),
+        );
+        let mut current = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        current.transitioned_object.status = lifecycle::TRANSITION_COMPLETE.to_string();
+        current.transitioned_object.tier = "WARM".to_string();
+        current.transitioned_object.name = "remote/identity-bound".to_string();
+        current.transitioned_object.version_id = "remote-version".to_string();
+
+        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>| {
+            use sha2::{Digest, Sha256};
+
+            let mut hasher = Sha256::new();
+            hasher.update(b"WARM");
+            hasher.update([0]);
+            hasher.update(remote_object.as_bytes());
+            hasher.update([0]);
+            hasher.update(b"remote-version");
+            if let Some(backend_identity) = backend_identity {
+                hasher.update([0]);
+                hasher.update(backend_identity);
+            }
+            format!("ilm/tier-delete-journal/{}.json", rustfs_utils::crypto::hex(hasher.finalize().as_slice()))
+        };
+
+        enqueue_transitioned_delete_cleanup(store.clone(), "bucket", "identity-bound", &ObjectOptions::default(), Some(&current))
+            .await
+            .expect("normal transitioned delete should persist an identity-bound journal");
+        let mut identity_bound = store
+            .get_object_reader(
+                ".rustfs.sys",
+                &journal_name("remote/identity-bound", Some(identity)),
+                None,
+                http::HeaderMap::new(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("identity-bound journal should be readable");
+        let mut identity_bound_data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut identity_bound.stream, &mut identity_bound_data)
+            .await
+            .expect("identity-bound journal body should be readable");
+        let identity_bound: serde_json::Value =
+            serde_json::from_slice(&identity_bound_data).expect("identity-bound journal should decode as JSON");
+        assert_eq!(identity_bound["version"], serde_json::json!(2));
+        assert_eq!(identity_bound["backend_identity"], serde_json::json!(identity));
+
+        current.user_defined = Arc::new(HashMap::new());
+        current.transitioned_object.name = "remote/legacy".to_string();
+        enqueue_transitioned_delete_cleanup(
+            store.clone(),
+            "bucket",
+            "legacy",
+            &ObjectOptions {
+                delete_prefix: true,
+                ..Default::default()
+            },
+            Some(&current),
+        )
+        .await
+        .expect("legacy force-delete cleanup should persist a fail-closed v1 journal");
+        let mut legacy = store
+            .get_object_reader(
+                ".rustfs.sys",
+                &journal_name("remote/legacy", None),
+                None,
+                http::HeaderMap::new(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("legacy journal should be readable");
+        let mut legacy_data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut legacy.stream, &mut legacy_data)
+            .await
+            .expect("legacy journal body should be readable");
+        let legacy: serde_json::Value = serde_json::from_slice(&legacy_data).expect("legacy journal should decode as JSON");
+        assert_eq!(legacy["version"], serde_json::json!(1));
+        assert_eq!(legacy["backend_identity"], serde_json::Value::Null);
+    }
+
+    async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
+        let mut reader = PutObjReader::from_vec(body.to_vec());
+        store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("real cold-fill test object must be written")
+    }
+
+    fn real_cold_fill_plan(
+        adapter: &ObjectDataCacheAdapter,
+        bucket: &str,
+        object: &str,
+        info: &ObjectInfo,
+    ) -> rustfs_object_data_cache::ObjectDataCacheGetPlan {
+        let length = info
+            .get_actual_size()
+            .expect("real cold-fill test metadata must expose plaintext size");
+        let GetObjectBodyCachePlan::Cacheable(plan) = build_get_object_body_cache_plan(
+            adapter,
+            GetObjectBodyCacheRequest {
+                bucket,
+                key: object,
+                info,
+                response_content_length: length,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        ) else {
+            panic!("real cold-fill test object must be cacheable");
+        };
+        plan
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn execute_get_object_rejects_conditions_before_joining_cold_fill() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_cold_fill_test_context().await;
+        let bucket = format!("cold-condition-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("real cold-fill condition bucket must be created");
+        let body = vec![b'a'; 1_300_000];
+        let info = put_real_cold_fill_object(&store, &bucket, object, &body).await;
+        let adapter = context.object_data_cache();
+        let plan = real_cold_fill_plan(&adapter, &bucket, object, &info);
+        let coordinator = adapter.cold_fill_coordinator();
+        let ColdFillRole::Produce(producer) =
+            coordinator.join(plan.key().cloned().expect("real cold-fill plan must expose its key"))
+        else {
+            panic!("test must reserve the initial cold-fill producer");
+        };
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket)
+            .key(object.to_string())
+            .build()
+            .expect("real cold-fill GET input must build");
+        let mut req = build_request(input, Method::GET);
+        let etag = info.etag.expect("real cold-fill test object must have an ETag");
+        req.headers.insert(
+            http::header::IF_NONE_MATCH,
+            HeaderValue::from_str(&format!("\"{etag}\"")).expect("ETag header must be valid"),
+        );
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_get_object(req))
+            .await
+            .expect("conditional GET must not wait for the reserved cold-fill session")
+            .expect_err("matching If-None-Match must reject the GET");
+
+        assert_eq!(result.code(), &S3ErrorCode::NotModified);
+        assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+        drop(producer);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn execute_get_object_maps_cold_fill_session_rejection_to_slow_down_without_opening_reader() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_cold_fill_test_context().await;
+        let bucket = format!("cold-rejected-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("real cold-fill rejection bucket must be created");
+        let body = vec![b'a'; 1_300_000];
+        let info = put_real_cold_fill_object(&store, &bucket, object, &body).await;
+        let adapter = context.object_data_cache();
+        let plan = real_cold_fill_plan(&adapter, &bucket, object, &info);
+        let cache_key = plan.key().cloned().expect("real cold-fill plan must expose its key");
+        let coordinator = adapter.cold_fill_coordinator();
+        let mut held_producers = Vec::new();
+        for index in 0..2048 {
+            let saturation_key = rustfs_object_data_cache::ObjectDataCacheKey::new(
+                "cold-fill-saturation",
+                format!("object-{index}"),
+                None,
+                "etag",
+                4,
+                rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+            );
+            match coordinator.join(saturation_key) {
+                ColdFillRole::Produce(producer) => held_producers.push(producer),
+                ColdFillRole::Rejected => break,
+                ColdFillRole::Wait(_) | ColdFillRole::Bypass => panic!("unique saturation keys must produce or reject"),
+            }
+        }
+        assert_eq!(coordinator.active_session_count_for_test(), held_producers.len());
+        assert!(!held_producers.is_empty(), "saturation must reserve cold-fill sessions");
+
+        let reader_opens = Arc::new(AtomicU64::new(0));
+        *COLD_FILL_READER_OPEN_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((cache_key, Arc::clone(&reader_opens)));
+        let input = GetObjectInput::builder()
+            .bucket(bucket)
+            .key(object.to_string())
+            .build()
+            .expect("real cold-fill rejection GET input must build");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_get_object(build_request(input, Method::GET)))
+            .await
+            .expect("rejected real GET must not wait for a cold-fill session")
+            .expect_err("rejected real GET must return an S3 error");
+        *COLD_FILL_READER_OPEN_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        assert_eq!(result.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "rejected GET must not open its body reader");
+        assert_eq!(coordinator.active_session_count_for_test(), held_producers.len());
+        drop(held_producers);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn execute_get_object_generation_change_bypasses_old_cold_fill_plan() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_cold_fill_test_context().await;
+        let bucket = format!("cold-generation-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("real cold-fill generation bucket must be created");
+        let initial_body = vec![b'a'; 1_300_000];
+        let changed_body = vec![b'b'; initial_body.len()];
+        let initial_info = put_real_cold_fill_object(&store, &bucket, object, &initial_body).await;
+        let adapter = context.object_data_cache();
+        let initial_plan = real_cold_fill_plan(&adapter, &bucket, object, &initial_info);
+        let coordinator = adapter.cold_fill_coordinator();
+        let ColdFillRole::Produce(producer) =
+            coordinator.join(initial_plan.key().cloned().expect("real cold-fill plan must expose its key"))
+        else {
+            panic!("test must reserve the initial cold-fill producer");
+        };
+
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("real cold-fill GET input must build");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let request = tokio::spawn(async move { usecase.execute_get_object(build_request(input, Method::GET)).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while coordinator.global_waiter_count_for_test() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real GET must join the reserved cold-fill session");
+
+        let changed_info = put_real_cold_fill_object(&store, &bucket, object, &changed_body).await;
+        assert_ne!(initial_info.etag, changed_info.etag);
+        producer.relinquish_or_finish(ColdFillError::Storage(StorageError::Timeout));
+
+        let mut response = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("generation-changing GET must complete")
+            .expect("generation-changing GET task must join")
+            .expect("generation-changing GET must fall back successfully");
+        let mut response_body = response.output.body.take().expect("GET response must include a body");
+        let mut actual = Vec::with_capacity(changed_body.len());
+        while let Some(chunk) = response_body.next().await {
+            actual.extend_from_slice(&chunk.expect("fallback body chunk must be readable"));
+        }
+
+        assert_eq!(actual, changed_body);
+        assert!(matches!(
+            adapter.lookup_body(&initial_plan).await,
+            rustfs_object_data_cache::ObjectDataCacheLookup::Miss
+        ));
+        assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_open_error_retries_once_then_single_successor_succeeds() {
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("open retry cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "open-retry-bucket",
+            object: "open-retry-object",
+            version_id: None,
+            etag: "open-retry-etag",
+            size: 4,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let cache_key = plan.key().cloned().expect("open retry plan must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts_for_start = Arc::clone(&open_attempts);
+
+        let outcome = coordinate_cold_fill(&coordinator, cache_key, None, None, move |producer| {
+            let reservation = adapter.reserve_body(&plan);
+            let adapter = Arc::clone(&adapter);
+            let plan = plan.clone();
+            let open_attempts = Arc::clone(&open_attempts_for_start);
+            async move {
+                start_cold_fill_producer(
+                    producer,
+                    reservation,
+                    || async { Ok(DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager())) },
+                    move || async move {
+                        let attempt = open_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                        if attempt == 0 {
+                            return Err(StorageError::other("first open fails"));
+                        }
+                        Ok(GetObjectReader {
+                            stream: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                            object_info: ObjectInfo {
+                                size: 4,
+                                actual_size: 4,
+                                ..Default::default()
+                            },
+                            buffered_body: Some(Bytes::from_static(b"body")),
+                            body_source: GetObjectBodySource::HookMissed,
+                        })
+                    },
+                    ColdFillProducerExecution {
+                        expected: 4,
+                        deadline: None,
+                        adapter,
+                        engine_plan: plan,
+                    },
+                )
+                .await
+            }
+        })
+        .await;
+
+        let ColdFillCoordinateOutcome::Ready(Ok(body)) = outcome else {
+            panic!("the unique successor must publish the body");
+        };
+        assert_eq!(body, Bytes::from_static(b"body"));
+        assert_eq!(open_attempts.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_open_timeout_retries_once_then_is_terminal() {
+        tokio::time::pause();
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("open timeout cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "open-timeout-bucket",
+            object: "open-timeout-object",
+            version_id: None,
+            etag: "open-timeout-etag",
+            size: 4,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let cache_key = plan.key().cloned().expect("open timeout plan must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let task = tokio::spawn({
+            let adapter = Arc::clone(&adapter);
+            let coordinator = Arc::clone(&coordinator);
+            let plan = plan.clone();
+            let open_attempts = Arc::clone(&open_attempts);
+            async move {
+                coordinate_cold_fill(&coordinator, cache_key, None, Some(deadline), move |producer| {
+                    let adapter = Arc::clone(&adapter);
+                    let plan = plan.clone();
+                    let open_attempts = Arc::clone(&open_attempts);
+                    let reservation = adapter.reserve_body(&plan);
+                    let producer_deadline = producer.deadline();
+                    async move {
+                        start_cold_fill_producer(
+                            producer,
+                            reservation,
+                            || async { Ok(DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager())) },
+                            move || async move {
+                                open_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                                std::future::pending::<Result<GetObjectReader, StorageError>>().await
+                            },
+                            ColdFillProducerExecution {
+                                expected: 4,
+                                deadline: producer_deadline,
+                                adapter,
+                                engine_plan: plan,
+                            },
+                        )
+                        .await
+                    }
+                })
+                .await
+            }
+        });
+        while open_attempts.load(AtomicOrdering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(11)).await;
+        let outcome = task.await.expect("open timeout task must join");
+        assert!(matches!(
+            outcome,
+            ColdFillCoordinateOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+
+        assert_eq!(open_attempts.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn cold_fill_pre_reader_failure_promotes_one_of_two_thousand_waiters() {
+        const REQUESTS: usize = 2000;
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("successor cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "successor-bucket",
+            object: "successor-object",
+            version_id: None,
+            etag: "successor-etag",
+            size: 4,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let cache_key = plan.key().cloned().expect("successor plan must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let admission_attempts = Arc::new(AtomicUsize::new(0));
+        let open_attempts = Arc::new(AtomicUsize::new(0));
+        let first_open_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..REQUESTS {
+            let adapter = Arc::clone(&adapter);
+            let coordinator = Arc::clone(&coordinator);
+            let cache_key = cache_key.clone();
+            let plan = plan.clone();
+            let admission_attempts = Arc::clone(&admission_attempts);
+            let open_attempts = Arc::clone(&open_attempts);
+            let first_open_release = Arc::clone(&first_open_release);
+            tasks.spawn(async move {
+                coordinate_cold_fill(&coordinator, cache_key, None, None, move |producer| {
+                    let reservation = adapter.reserve_body(&plan);
+                    let adapter = Arc::clone(&adapter);
+                    let plan = plan.clone();
+                    let admission_attempts = Arc::clone(&admission_attempts);
+                    let open_attempts = Arc::clone(&open_attempts);
+                    let first_open_release = Arc::clone(&first_open_release);
+                    async move {
+                        start_cold_fill_producer(
+                            producer,
+                            reservation,
+                            move || async move {
+                                admission_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                                Ok(DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager()))
+                            },
+                            move || async move {
+                                if open_attempts.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                                    first_open_release
+                                        .acquire()
+                                        .await
+                                        .expect("first open release gate must remain open")
+                                        .forget();
+                                    return Err(StorageError::other("first open fails"));
+                                }
+                                Ok(GetObjectReader {
+                                    stream: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                                    object_info: ObjectInfo {
+                                        size: 4,
+                                        actual_size: 4,
+                                        ..Default::default()
+                                    },
+                                    buffered_body: Some(Bytes::from_static(b"body")),
+                                    body_source: GetObjectBodySource::HookMissed,
+                                })
+                            },
+                            ColdFillProducerExecution {
+                                expected: 4,
+                                deadline: None,
+                                adapter,
+                                engine_plan: plan,
+                            },
+                        )
+                        .await
+                    }
+                })
+                .await
+            });
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if coordinator.global_waiter_count_for_test() == REQUESTS - 1 && open_attempts.load(AtomicOrdering::Relaxed) == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all followers must join before the first open fails");
+        first_open_release.add_permits(1);
+
+        while let Some(result) = tasks.join_next().await {
+            let ColdFillCoordinateOutcome::Ready(Ok(body)) = result.expect("successor request task must join") else {
+                panic!("all followers must receive the successor body");
+            };
+            assert_eq!(body, Bytes::from_static(b"body"));
+        }
+        assert_eq!(admission_attempts.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(open_attempts.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+    }
+
+    fn install_cold_fill_publication_barrier(
+        plan: &rustfs_object_data_cache::ObjectDataCacheGetPlan,
+    ) -> Arc<ColdFillPublicationBarrier> {
+        let barrier = Arc::new(ColdFillPublicationBarrier {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let key = plan.key().cloned().expect("publication barrier plan must be cacheable");
+        *COLD_FILL_PUBLICATION_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((key, Arc::clone(&barrier)));
+        barrier
+    }
+
+    fn clear_cold_fill_publication_barrier() {
+        *COLD_FILL_PUBLICATION_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn publication_test_adapter() -> Arc<ObjectDataCacheAdapter> {
+        Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("publication cache config must be valid"),
+        )
+    }
+
+    fn publication_test_plan(adapter: &ObjectDataCacheAdapter, object: &str) -> rustfs_object_data_cache::ObjectDataCacheGetPlan {
+        adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "publication-bucket",
+            object,
+            version_id: None,
+            etag: "publication-etag",
+            size: 4,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        })
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cold_fill_publication_barrier)]
+    async fn cold_fill_last_consumer_cancel_releases_session_before_publication_barrier() {
+        let adapter = publication_test_adapter();
+        let plan = publication_test_plan(&adapter, "cancel");
+        let barrier = install_cold_fill_publication_barrier(&plan);
+        let coordinator = adapter.cold_fill_coordinator();
+        let key = plan.key().cloned().expect("publication plan must be cacheable");
+        let ColdFillRole::Produce(mut producer) = coordinator.join(key) else {
+            panic!("publication request must produce");
+        };
+        let leader = producer.waiter();
+        let reservation = adapter.reserve_body(&plan);
+        let disk_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let disk_gate = Arc::clone(&disk_permits);
+        let producer_task = tokio::spawn(scope_cold_fill_disk_permit_owner_for_test(
+            ColdFillDiskPermitOwner::Producer,
+            start_cold_fill_producer(
+                producer,
+                reservation,
+                move || async move {
+                    let permit = disk_gate
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ColdFillError::DiskAdmissionClosed)?;
+                    let mut io = DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager());
+                    io.disk_permit = Some(permit.into());
+                    Ok(io)
+                },
+                || async {
+                    Ok(GetObjectReader {
+                        stream: Box::new(std::io::Cursor::new(b"body".to_vec())),
+                        object_info: ObjectInfo {
+                            size: 4,
+                            actual_size: 4,
+                            ..Default::default()
+                        },
+                        buffered_body: None,
+                        body_source: GetObjectBodySource::HookMissed,
+                    })
+                },
+                ColdFillProducerExecution {
+                    expected: 4,
+                    deadline: None,
+                    adapter: Arc::clone(&adapter),
+                    engine_plan: plan.clone(),
+                },
+            ),
+        ));
+
+        let reached = barrier.reached.acquire().await.expect("publication barrier must remain open");
+        reached.forget();
+        assert_eq!(
+            disk_permits.available_permits(),
+            1,
+            "the producer disk permit and its gauge guard must end before publication"
+        );
+        let clear_adapter = Arc::clone(&adapter);
+        let clear = tokio::spawn(async move {
+            clear_adapter
+                .clear(rustfs_object_data_cache::ObjectDataCacheInvalidationReason::Manual)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!clear.is_finished(), "clear must wait while publication owns its reservation");
+        drop(leader);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while coordinator.active_session_count_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last-consumer cancellation must release the session immediately");
+        tokio::time::timeout(Duration::from_secs(1), clear)
+            .await
+            .expect("clear must finish after publication cancellation")
+            .expect("clear task must join");
+        producer_task.await.expect("producer task must join");
+
+        barrier.release.add_permits(1);
+        clear_cold_fill_publication_barrier();
+        drop(adapter.reserve_body(&plan).expect("publication reservation must be released"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(cold_fill_publication_barrier)]
+    async fn cold_fill_hard_deadline_releases_session_at_publication_barrier() {
+        let adapter = publication_test_adapter();
+        let plan = publication_test_plan(&adapter, "deadline");
+        let barrier = install_cold_fill_publication_barrier(&plan);
+        let coordinator = adapter.cold_fill_coordinator();
+        let key = plan.key().cloned().expect("publication plan must be cacheable");
+        let ColdFillRole::Produce(mut producer) = coordinator.join(key) else {
+            panic!("publication request must produce");
+        };
+        let leader = producer.waiter();
+        let reservation = adapter.reserve_body(&plan);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let producer_task = tokio::spawn(start_cold_fill_producer(
+            producer,
+            reservation,
+            || async { Ok(DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager())) },
+            || async {
+                Ok(GetObjectReader {
+                    stream: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                    object_info: ObjectInfo {
+                        size: 4,
+                        actual_size: 4,
+                        ..Default::default()
+                    },
+                    buffered_body: Some(Bytes::from_static(b"body")),
+                    body_source: GetObjectBodySource::HookMissed,
+                })
+            },
+            ColdFillProducerExecution {
+                expected: 4,
+                deadline: Some(deadline),
+                adapter: Arc::clone(&adapter),
+                engine_plan: plan.clone(),
+            },
+        ));
+
+        let reached = barrier.reached.acquire().await.expect("publication barrier must remain open");
+        reached.forget();
+        tokio::time::advance(Duration::from_millis(20)).await;
+        assert!(matches!(
+            leader.wait().await,
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+        producer_task.await.expect("producer task must join");
+
+        barrier.release.add_permits(1);
+        clear_cold_fill_publication_barrier();
+        drop(
+            adapter
+                .reserve_body(&plan)
+                .expect("deadline must release the publication reservation"),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            adapter.clear(rustfs_object_data_cache::ObjectDataCacheInvalidationReason::Manual),
+        )
+        .await
+        .expect("clear must complete after publication deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_fill_without_request_timeout_stops_at_ten_minute_hard_cap() {
+        let adapter = publication_test_adapter();
+        let plan = publication_test_plan(&adapter, "hard-cap");
+        let coordinator = adapter.cold_fill_coordinator();
+        let key = plan.key().cloned().expect("hard-cap plan must be cacheable");
+        let ColdFillRole::Produce(mut producer) = coordinator.join(key) else {
+            panic!("hard-cap request must produce");
+        };
+        let leader = producer.waiter();
+        let reservation = adapter.reserve_body(&plan);
+        let producer_task = tokio::spawn(start_cold_fill_producer(
+            producer,
+            reservation,
+            || async { Ok(DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager())) },
+            || async {
+                Ok(GetObjectReader {
+                    stream: Box::new(PendingReader),
+                    object_info: ObjectInfo {
+                        size: 4,
+                        actual_size: 4,
+                        ..Default::default()
+                    },
+                    buffered_body: None,
+                    body_source: GetObjectBodySource::HookMissed,
+                })
+            },
+            ColdFillProducerExecution {
+                expected: 4,
+                deadline: None,
+                adapter: Arc::clone(&adapter),
+                engine_plan: plan.clone(),
+            },
+        ));
+        let wait = tokio::spawn(async move { leader.wait().await });
+
+        tokio::time::advance(Duration::from_secs(599)).await;
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "hard cap must not fire before 600 seconds");
+        assert!(adapter.reserve_body(&plan).is_none(), "reservation must remain owned before the hard cap");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            wait.await.expect("hard-cap waiter must join"),
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        producer_task.await.expect("producer task must join");
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+        drop(
+            adapter
+                .reserve_body(&plan)
+                .expect("hard cap must release the body reservation"),
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_same_key_cold_fill_consumes_one_reader() {
+        const REQUESTS: usize = 2000;
+        const BODY_BYTES: usize = 64 * 1024;
+        const BODY_BYTES_U64: u64 = 64 * 1024;
+        const BODY_BYTES_I64: i64 = 64 * 1024;
+
+        for key_count in [1_usize, 4, 32] {
+            let adapter = Arc::new(
+                ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                    mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                    max_bytes: 128 * 1024 * 1024,
+                    max_memory_percent: 0,
+                    max_entry_bytes: 1024 * 1024,
+                    min_free_memory_percent: 0,
+                    fill_concurrency_per_cpu: 64,
+                    fill_concurrency_max: 64,
+                    ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+                })
+                .expect("matrix cache config must be valid"),
+            );
+            let coordinator = adapter.cold_fill_coordinator();
+            let disk_permits = Arc::new(tokio::sync::Semaphore::new(key_count));
+            let writers = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(key_count)));
+            let permit_acquires = Arc::new(AtomicUsize::new(0));
+            let reader_factories = Arc::new(AtomicUsize::new(0));
+            let first_polls = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let bytes_read = Arc::new(AtomicUsize::new(0));
+            let mut tasks = tokio::task::JoinSet::new();
+
+            for request in 0..REQUESTS {
+                let key_index = request % key_count;
+                let object = format!("matrix-object-{key_index}");
+                let engine_plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+                    bucket: "matrix-bucket",
+                    object: &object,
+                    version_id: None,
+                    etag: "matrix-etag",
+                    size: BODY_BYTES_U64,
+                    data_dir_u128: Some(u128::try_from(key_index).unwrap_or(u128::MAX) + 1),
+                    mod_time_unix_nanos: 1,
+                    body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+                });
+                let cache_key = engine_plan.key().cloned().expect("matrix body must be cacheable");
+                let adapter = Arc::clone(&adapter);
+                let coordinator = Arc::clone(&coordinator);
+                let disk_permits = Arc::clone(&disk_permits);
+                let writers = Arc::clone(&writers);
+                let permit_acquires = Arc::clone(&permit_acquires);
+                let reader_factories = Arc::clone(&reader_factories);
+                let first_polls = Arc::clone(&first_polls);
+                let completed = Arc::clone(&completed);
+                let bytes_read = Arc::clone(&bytes_read);
+                tasks.spawn(async move {
+                    let outcome = coordinate_cold_fill(&coordinator, cache_key, None, None, move |producer| {
+                        let reservation = adapter.reserve_body(&engine_plan);
+                        let adapter = Arc::clone(&adapter);
+                        let disk_permits = Arc::clone(&disk_permits);
+                        let writers = Arc::clone(&writers);
+                        let permit_acquires = Arc::clone(&permit_acquires);
+                        let reader_factories = Arc::clone(&reader_factories);
+                        let first_polls = Arc::clone(&first_polls);
+                        let completed = Arc::clone(&completed);
+                        let bytes_read = Arc::clone(&bytes_read);
+                        let fill_plan = engine_plan.clone();
+                        async move {
+                            start_cold_fill_producer(
+                                producer,
+                                reservation,
+                                || async move {
+                                    permit_acquires.fetch_add(1, AtomicOrdering::Relaxed);
+                                    let permit = disk_permits
+                                        .acquire_owned()
+                                        .await
+                                        .map_err(|_| ColdFillError::DiskAdmissionClosed)?;
+                                    let mut io =
+                                        DefaultObjectUsecase::get_object_io_planning_without_disk(get_concurrency_manager());
+                                    io.disk_permit = Some(permit.into());
+                                    Ok(io)
+                                },
+                                || async move {
+                                    reader_factories.fetch_add(1, AtomicOrdering::Relaxed);
+                                    let (writer, reader) = tokio::io::duplex(BODY_BYTES * 2);
+                                    writers.lock().await.push(writer);
+                                    Ok(GetObjectReader {
+                                        stream: Box::new(ColdFillMatrixReader {
+                                            inner: reader,
+                                            first_poll_recorded: false,
+                                            completion_recorded: false,
+                                            first_polls,
+                                            completed,
+                                            bytes_read,
+                                        }),
+                                        object_info: ObjectInfo {
+                                            size: BODY_BYTES_I64,
+                                            actual_size: BODY_BYTES_I64,
+                                            ..Default::default()
+                                        },
+                                        buffered_body: None,
+                                        body_source: GetObjectBodySource::HookMissed,
+                                    })
+                                },
+                                ColdFillProducerExecution {
+                                    expected: BODY_BYTES,
+                                    deadline: None,
+                                    adapter,
+                                    engine_plan: fill_plan,
+                                },
+                            )
+                            .await
+                        }
+                    })
+                    .await;
+                    let ColdFillCoordinateOutcome::Ready(Ok(body)) = outcome else {
+                        panic!("matrix request must receive the shared body, got {outcome:?}");
+                    };
+                    assert_eq!(body.len(), BODY_BYTES);
+                    assert!(body.iter().all(|byte| *byte == 7));
+                    (key_index, body.as_ptr() as usize)
+                });
+            }
+
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if writers.lock().await.len() == key_count
+                        && coordinator.global_waiter_count_for_test() == REQUESTS - key_count
+                        && first_polls.load(AtomicOrdering::Relaxed) == key_count
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all matrix followers must join before releasing bodies");
+
+            let mut body_writers = std::mem::take(&mut *writers.lock().await);
+            let body = vec![7_u8; BODY_BYTES];
+            for writer in &mut body_writers {
+                tokio::io::AsyncWriteExt::write_all(writer, &body)
+                    .await
+                    .expect("matrix body write must succeed");
+                tokio::io::AsyncWriteExt::shutdown(writer)
+                    .await
+                    .expect("matrix body writer must close");
+            }
+            let mut backing_pointers = std::collections::HashMap::<usize, std::collections::HashSet<usize>>::new();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while let Some(result) = tasks.join_next().await {
+                    let (key_index, body_pointer) = result.expect("matrix GET task must complete");
+                    backing_pointers.entry(key_index).or_default().insert(body_pointer);
+                }
+            })
+            .await
+            .expect("matrix GET tasks must complete before the watchdog");
+
+            assert_eq!(permit_acquires.load(AtomicOrdering::Relaxed), key_count);
+            assert_eq!(reader_factories.load(AtomicOrdering::Relaxed), key_count);
+            assert_eq!(first_polls.load(AtomicOrdering::Relaxed), key_count);
+            assert_eq!(completed.load(AtomicOrdering::Relaxed), key_count);
+            assert_eq!(bytes_read.load(AtomicOrdering::Relaxed), key_count * BODY_BYTES);
+            assert_eq!(backing_pointers.len(), key_count);
+            assert!(
+                backing_pointers.values().all(|pointers| pointers.len() == 1),
+                "all followers of one key must share one backing allocation"
+            );
+            assert_eq!(
+                backing_pointers
+                    .values()
+                    .flatten()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                key_count
+            );
+            assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+            assert_eq!(coordinator.active_session_count_for_test(), 0);
+            assert_eq!(disk_permits.available_permits(), key_count);
+
+            for key_index in 0..key_count {
+                let object = format!("matrix-object-{key_index}");
+                let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+                    bucket: "matrix-bucket",
+                    object: &object,
+                    version_id: None,
+                    etag: "matrix-etag",
+                    size: BODY_BYTES_U64,
+                    data_dir_u128: Some(u128::try_from(key_index).unwrap_or(u128::MAX) + 1),
+                    mod_time_unix_nanos: 1,
+                    body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+                });
+                assert!(matches!(
+                    adapter.lookup_body(&plan).await,
+                    rustfs_object_data_cache::ObjectDataCacheLookup::Hit(_)
+                ));
+            }
+        }
     }
 
     // #1324: the in-memory (buffered/cache) source is guarded by
@@ -8043,11 +10526,114 @@ mod tests {
             .await
             .expect("test semaphore should grant owned permit");
 
-        let reader = DiskReadPermitReader::new(std::io::Cursor::new(Vec::<u8>::new()), permit);
+        let reader = DiskReadPermitReader::new(std::io::Cursor::new(Vec::<u8>::new()), permit.into());
         assert_eq!(semaphore.available_permits(), 0);
 
         drop(reader);
         assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cold_fill_metrics_gate)]
+    async fn cold_fill_follower_disk_permit_metric_tracks_actual_permit_lifetime() {
+        COLD_FILL_FOLLOWER_DISK_PERMITS_FOR_TEST.store(0, Ordering::Relaxed);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        scope_cold_fill_disk_permit_owner_for_test(ColdFillDiskPermitOwner::Follower, async {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("follower test semaphore must grant an owned permit");
+            let tracked = GetObjectDiskPermit::new(permit);
+            assert_eq!(semaphore.available_permits(), 0);
+            assert_eq!(COLD_FILL_FOLLOWER_DISK_PERMITS_FOR_TEST.load(Ordering::Relaxed), 1);
+
+            drop(tracked);
+            assert_eq!(semaphore.available_permits(), 1);
+            assert_eq!(COLD_FILL_FOLLOWER_DISK_PERMITS_FOR_TEST.load(Ordering::Relaxed), 0);
+        })
+        .await;
+    }
+
+    #[test]
+    #[serial_test::serial(cold_fill_metrics_gate)]
+    fn cold_fill_disk_permit_metrics_obey_gate_and_return_to_zero() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let metrics_was_enabled = rustfs_io_metrics::metrics_enabled();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("metric test runtime must build");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                rustfs_io_metrics::set_metrics_enabled(false);
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+                scope_cold_fill_disk_permit_owner_for_test(ColdFillDiskPermitOwner::Follower, async {
+                    let permit = semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("metric test permit must be available");
+                    let tracked = GetObjectDiskPermit::new(permit);
+                    rustfs_io_metrics::set_metrics_enabled(true);
+                    drop(tracked);
+                })
+                .await;
+                assert!(
+                    snapshotter.snapshot().into_vec().into_iter().all(|(composite, _, _, _)| {
+                        !composite.key().name().starts_with("rustfs_object_data_cache_cold_fill_")
+                    }),
+                    "a permit acquired while metrics were disabled must not record an unmatched decrement"
+                );
+
+                scope_cold_fill_disk_permit_owner_for_test(ColdFillDiskPermitOwner::Producer, async {
+                    let permit = semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("metric test permit must be available");
+                    let tracked = GetObjectDiskPermit::new(permit);
+                    rustfs_io_metrics::set_metrics_enabled(false);
+                    drop(tracked);
+                })
+                .await;
+                rustfs_io_metrics::set_metrics_enabled(true);
+                scope_cold_fill_disk_permit_owner_for_test(ColdFillDiskPermitOwner::Follower, async {
+                    let permit = semaphore.acquire_owned().await.expect("metric test permit must be available");
+                    let tracked = GetObjectDiskPermit::new(permit);
+                    let _replacement = crate::app::object_data_cache::ColdFillCoordinator::default();
+                    drop(tracked);
+                })
+                .await;
+            });
+        });
+
+        let values = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                composite
+                    .key()
+                    .name()
+                    .starts_with("rustfs_object_data_cache_cold_fill_")
+                    .then_some((composite.key().name().to_string(), value))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values.len(), 2);
+        for name in [
+            "rustfs_object_data_cache_cold_fill_producer_disk_permits",
+            "rustfs_object_data_cache_cold_fill_follower_disk_permits",
+        ] {
+            let DebugValue::Gauge(value) = values.get(name).unwrap_or_else(|| panic!("missing {name} gauge")) else {
+                panic!("{name} must be a gauge");
+            };
+            assert_eq!(value.into_inner(), 0.0, "{name} must return to zero after permit drop");
+        }
+        rustfs_io_metrics::set_metrics_enabled(metrics_was_enabled);
     }
 
     #[tokio::test]
@@ -8206,6 +10792,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8266,6 +10853,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8325,6 +10913,7 @@ mod tests {
             Some(Bytes::from_static(b"hello")),
             false,
             false,
+            true,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8350,6 +10939,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8414,6 +11004,7 @@ mod tests {
             Some(Bytes::from_static(b"oops")),
             false,
             false,
+            true,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8495,6 +11086,7 @@ mod tests {
             Some(hit_body),
             /* cache_hook_served */ true,
             /* cache_hook_probed */ true,
+            /* cache_fill_allowed */ true,
             "test-bucket",
             "hook-served",
             GetObjectBodyLifecycle::disabled(),
@@ -8552,6 +11144,7 @@ mod tests {
             Some(Bytes::from_static(b"hello")),
             /* cache_hook_served */ false,
             /* cache_hook_probed */ true,
+            /* cache_fill_allowed */ true,
             "test-bucket",
             "hook-missed",
             GetObjectBodyLifecycle::disabled(),
@@ -8611,6 +11204,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8636,6 +11230,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8695,6 +11290,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "mismatch-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8747,6 +11343,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "short-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8797,6 +11394,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "partial-read-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8927,6 +11525,7 @@ mod tests {
             None,
             false,
             false,
+            true,
             "test-bucket",
             "too-large-object",
             GetObjectBodyLifecycle::disabled(),
@@ -9277,7 +11876,7 @@ mod tests {
         let permit = semaphore.clone().acquire_owned().await.expect("acquire permit");
         assert_eq!(semaphore.available_permits(), 0);
 
-        let mut reader = DiskReadPermitReader::new(std::io::Cursor::new(b"hello".to_vec()), permit);
+        let mut reader = DiskReadPermitReader::new(std::io::Cursor::new(b"hello".to_vec()), permit.into());
         let mut body = Vec::new();
         reader.read_to_end(&mut body).await.expect("read body");
         assert_eq!(body, b"hello");
@@ -9676,6 +12275,7 @@ mod tests {
                 None,
                 false,
                 false,
+                true,
                 None,
                 None,
                 None,
@@ -9746,6 +12346,53 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
         assert!(DefaultObjectUsecase::validate_get_object_part_number(Some(1), &info).is_ok());
+    }
+
+    #[test]
+    fn cold_fill_conditions_fail_before_phase_probe_advances() {
+        fn run_phase_probe(headers: &HeaderMap, info: &ObjectInfo) -> (S3Result<()>, [usize; 3]) {
+            let coordination = AtomicUsize::new(0);
+            let permit = AtomicUsize::new(0);
+            let reader = AtomicUsize::new(0);
+            let result = DefaultObjectUsecase::validate_get_object_before_cold_fill(headers, None, info);
+            if result.is_ok() {
+                coordination.fetch_add(1, AtomicOrdering::Relaxed);
+                permit.fetch_add(1, AtomicOrdering::Relaxed);
+                reader.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            (
+                result,
+                [
+                    coordination.load(AtomicOrdering::Relaxed),
+                    permit.load(AtomicOrdering::Relaxed),
+                    reader.load(AtomicOrdering::Relaxed),
+                ],
+            )
+        }
+
+        let info = ObjectInfo {
+            etag: Some("phase-etag".to_string()),
+            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let mut not_modified = HeaderMap::new();
+        not_modified.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"phase-etag\""));
+        let (result, phases) = run_phase_probe(&not_modified, &info);
+        assert_eq!(result.expect_err("matching If-None-Match must reject").code(), &S3ErrorCode::NotModified);
+        assert_eq!(phases, [0, 0, 0]);
+
+        let mut precondition_failed = HeaderMap::new();
+        precondition_failed.insert(http::header::IF_MATCH, HeaderValue::from_static("\"other-etag\""));
+        let (result, phases) = run_phase_probe(&precondition_failed, &info);
+        assert_eq!(
+            result.expect_err("mismatched If-Match must reject").code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        assert_eq!(phases, [0, 0, 0]);
     }
 
     #[tokio::test]

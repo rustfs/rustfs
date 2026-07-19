@@ -307,9 +307,9 @@ impl ObjectInfo {
     /// The inline fast path decodes erasure-coded data entirely in memory,
     /// bypassing disk I/O, duplex pipes, and the disk-read semaphore.
     ///
-    /// The `inlined` flag is the primary signal — it is set during PUT by
-    /// `storage_class_should_inline()` which already applies the correct
-    /// version-aware threshold (128 KiB non-versioned, 16 KiB versioned).
+    /// The `inlined` flag is the primary signal — PUT sets it through the
+    /// captured storage-class snapshot's `Config::should_inline`, which applies
+    /// the correct version-aware threshold (128 KiB non-versioned, 16 KiB versioned).
     /// The size check below is a safety net using the same thresholds.
     ///
     /// Additional conditions:

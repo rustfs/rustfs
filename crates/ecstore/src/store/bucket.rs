@@ -317,11 +317,12 @@ mod tests {
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
     use crate::error::StorageError;
     use crate::object_api::{ObjectOptions, PutObjReader};
+    use crate::runtime::instance::InstanceContext;
     use crate::storage_api_contracts::{
         bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp},
         object::{ObjectIO as _, ObjectOperations as _},
     };
-    use crate::store::{ECStore, init_local_disks};
+    use crate::store::{ECStore, init_local_disks_with_instance_ctx};
     use crate::{
         disk::endpoint::Endpoint,
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
@@ -373,17 +374,30 @@ mod tests {
                     platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
                 }]);
 
-                init_local_disks(endpoint_pools.clone())
+                let instance_ctx = Arc::new(InstanceContext::new());
+                init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
                     .await
                     .expect("local disks should initialize");
-                let ecstore =
-                    ECStore::new("127.0.0.1:0".parse().expect("test address"), endpoint_pools, CancellationToken::new())
-                        .await
-                        .expect("ECStore should initialize");
-
-                if metadata_sys::get_global_bucket_metadata_sys().is_none() {
-                    metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
+                let ecstore = ECStore::new_with_instance_ctx(
+                    "127.0.0.1:0".parse().expect("test address"),
+                    endpoint_pools,
+                    CancellationToken::new(),
+                    instance_ctx,
+                )
+                .await
+                .expect("ECStore should initialize");
+                let storage_class = crate::config::storageclass::lookup_config_for_pools_without_env(
+                    &rustfs_config::server_config::KVS::new(),
+                    &[4],
+                )
+                .expect("bucket test storage class should match its four-disk pool");
+                for pool in &ecstore.pools {
+                    for set in &pool.disk_set {
+                        set.set_test_storage_class_config(storage_class.clone());
+                    }
                 }
+
+                metadata_sys::init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
 
                 (disk_paths, ecstore)
             })
@@ -392,16 +406,28 @@ mod tests {
     }
 
     async fn create_bucket_with_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str) {
+        let generation_before_make = ecstore.scanner_namespace_mutation_generation();
         ecstore
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_make.saturating_add(1),
+            "successful bucket creation should advance scanner namespace activity"
+        );
 
+        let generation_before_put = ecstore.scanner_namespace_mutation_generation();
         let mut reader = PutObjReader::from_vec(b"delete bucket semantics".to_vec());
         ecstore
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("object should be written");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_put.saturating_add(1),
+            "successful object creation should advance scanner namespace activity"
+        );
         ecstore
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
@@ -478,17 +504,8 @@ mod tests {
         );
     }
 
-    // #[serial] with the crate-wide default key: these tests drive make_bucket /
-    // delete_bucket through the process-global local-disk registry and lock
-    // client (see crates/ecstore/src/runtime/global.rs), and through Sets::new
-    // which reads the process-global erasure mode. Running them concurrently with
-    // other tests that touch those globals races make_bucket into
-    // InsufficientWriteQuorum under `cargo test` (single process). serial_test
-    // serializes them across the
-    // in-process suite; nextest's per-test processes are covered separately by the
-    // ecstore-serial-flaky test-group in .config/nextest.toml (backlog #937).
-    // Full instance-level isolation is blocked on the InstanceContext migration
-    // (backlog #939) and is not attempted here.
+    // These tests share one isolated instance and mutate its bucket metadata;
+    // serialize them so their assertions cannot observe each other's operations.
     #[tokio::test]
     #[serial]
     async fn bucket_delete_mark_delete_marks_metadata_deleted_without_physical_object_delete() {
@@ -497,8 +514,9 @@ mod tests {
         let object = "object.txt";
 
         create_bucket_with_object(&ecstore, &bucket, object).await;
-        assert!(metadata_sys::get(&bucket).await.is_ok());
+        assert!(metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_ok());
 
+        let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
         ecstore
             .delete_bucket(
                 &bucket,
@@ -509,6 +527,11 @@ mod tests {
             )
             .await
             .expect("MarkDelete should not reject non-empty bucket data");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_delete.saturating_add(1),
+            "successful bucket deletion should advance scanner namespace activity"
+        );
 
         assert!(
             any_disk_has_object_metadata(&disk_paths, &bucket).await,
@@ -519,7 +542,7 @@ mod tests {
             "MarkDelete should persist the deleted-bucket marker"
         );
         assert!(
-            metadata_sys::get(&bucket).await.is_err(),
+            metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_err(),
             "deleted bucket metadata must be removed from the local cache"
         );
     }
@@ -536,6 +559,7 @@ mod tests {
         write_bucket_metadata_marker(&disk_paths, &metadata_prefix).await;
         assert!(any_disk_path_exists(&disk_paths, &metadata_prefix).await);
 
+        let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
         ecstore
             .delete_bucket(
                 &bucket,
@@ -547,6 +571,11 @@ mod tests {
             )
             .await
             .expect("Purge should force-delete bucket data");
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_delete.saturating_add(1),
+            "successful bucket purge should advance scanner namespace activity"
+        );
 
         assert!(!any_disk_path_exists(&disk_paths, &bucket).await, "Purge should remove the bucket volume");
         assert!(
@@ -554,7 +583,7 @@ mod tests {
             "Purge should remove bucket metadata prefix"
         );
         assert!(
-            metadata_sys::get(&bucket).await.is_err(),
+            metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_err(),
             "purged bucket metadata must be removed from the local cache"
         );
     }
@@ -568,18 +597,24 @@ mod tests {
 
         create_bucket_with_object(&ecstore, &bucket, object).await;
 
+        let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
         let err = ecstore
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect_err("default S3 DeleteBucket should reject non-empty buckets");
 
         assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
+        assert_eq!(
+            ecstore.scanner_namespace_mutation_generation(),
+            generation_before_delete,
+            "failed bucket deletion must not advance scanner namespace activity"
+        );
         assert!(
             any_disk_has_object_metadata(&disk_paths, &bucket).await,
             "failed default S3 DeleteBucket must keep object data"
         );
         assert!(
-            metadata_sys::get(&bucket).await.is_ok(),
+            metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_ok(),
             "failed default S3 DeleteBucket must keep metadata cache"
         );
     }

@@ -20,4 +20,4 @@ pub mod erasure;
 pub mod heal;
 pub use bitrot::*;
 
-pub use erasure::{Erasure, ReedSolomonEncoder, calc_shard_size, calc_shard_size_legacy};
+pub use erasure::{Erasure, ErasureConstructionError, ReedSolomonEncoder, calc_shard_size, calc_shard_size_legacy};

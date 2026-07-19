@@ -193,6 +193,12 @@ impl ConcurrencyManager {
         manager
     }
 
+    #[cfg(test)]
+    pub(crate) fn close_disk_read_admission_for_test(&self) {
+        self.disk_read_semaphore.close();
+        self.degraded_read_semaphore.close();
+    }
+
     /// Track a GetObject request
     pub fn track_request() -> GetObjectGuard {
         GetObjectGuard::new()
