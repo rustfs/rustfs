@@ -16,8 +16,8 @@ readonly REQUESTS=2000
 readonly KEY_MATRIX="1 4 32"
 readonly REQUIRED_MEMORY_BYTES=$((28 * 1024 * 1024 * 1024))
 readonly OBJECT_SIZE=$((384 * 1024 * 1024))
-readonly READER_BYTES_QUERY='sum(rustfs_io_get_object_reader_bytes_total) or vector(0)'
-readonly FOLLOWER_PERMIT_QUERY='sum(rustfs_object_data_cache_cold_fill_follower_disk_permits)'
+readonly READER_BYTES_METRIC='rustfs_io_get_object_reader_bytes_total'
+readonly FOLLOWER_PERMIT_METRIC='rustfs_object_data_cache_cold_fill_follower_disk_permits'
 
 RUN=0
 SELF_TEST=0
@@ -35,6 +35,7 @@ RESET_COMMAND=""
 CACHE_OFF_COMMAND=""
 CACHE_ON_COMMAND=""
 SERVER_PID=""
+SERVER_PID_COMMAND=""
 CGROUP_PATH=""
 SAMPLE_INTERVAL="0.25"
 METRICS_SETTLE_SECONDS="5"
@@ -49,7 +50,8 @@ Usage:
     --expected-sha256 HEX --prometheus-query-url URL \
     --prometheus-scrape-seconds SECONDS \
     --reset-command COMMAND --cache-off-command COMMAND \
-    --cache-on-command COMMAND --server-pid PID [--cgroup-path PATH] [options]
+    --cache-on-command COMMAND \
+    (--server-pid PID | --server-pid-command COMMAND) [--cgroup-path PATH] [options]
 
 Required run contract:
   * N is fixed at 2000; K is fixed at 1, 4, and 32; each K runs >= 3 rounds.
@@ -59,17 +61,17 @@ Required run contract:
   * The RustFS process must be isolated from unrelated traffic and run in a
     dedicated cgroup v2 with memory.max exactly 28 GiB.
   * The built-in first-party reader-byte counter and follower-permit gauge must
-    each return exactly one Prometheus vector sample.
-  * Cache switch commands must return only after the mode is effective and must
-    keep the same RustFS PID inside the dedicated cgroup.
+    each return one value vector and one raw-scrape timestamp vector.
+  * Cache switch commands must return only after the mode is effective. A dynamic
+    PID resolver may observe a restarted RustFS process, but every process must
+    remain inside the same dedicated cgroup.
   * Every response must match SHA-256, ETag, Content-Length, and its per-key
     stable header contract. Date, x-amz-id-2, x-amz-request-id,
     x-minio-request-id, x-rustfs-request-id, Connection, Keep-Alive, and
     Transfer-Encoding are explicitly excluded as volatile/transport headers.
 
-Built-in PromQL:
-  reader bytes:     sum(rustfs_io_get_object_reader_bytes_total) or vector(0)
-  follower permits: sum(rustfs_object_data_cache_cold_fill_follower_disk_permits)
+Built-in PromQL observes each metric value together with max(timestamp(metric));
+the HTTP API evaluation timestamp is never treated as a scrape timestamp.
 
 Options:
   --self-test                  Validate the follower sample append/check chain locally
@@ -79,6 +81,7 @@ Options:
   --prometheus-scrape-seconds N Configured scrape interval; required
   --metrics-settle-seconds N   Wait for final Prometheus scrape (default: 5)
   --load-timeout-seconds N     Per-round load timeout (default: 1800)
+  --server-pid-command COMMAND Resolve the live RustFS PID after every operator command
   --out-dir PATH               Artifact directory (default: temporary)
   --strict                     Missing prerequisite is FAIL instead of SKIP
   -h, --help                   Show this help
@@ -135,14 +138,75 @@ run_operator_command() {
     bash -c "$command"
 }
 
+parse_server_pid() {
+  local output=$1
+  [[ $output =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+resolve_server_pid() {
+  local output
+  if [[ -n $SERVER_PID_COMMAND ]]; then
+    output=$(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN bash -c "$SERVER_PID_COMMAND") || return 1
+    parse_server_pid "$output"
+  else
+    parse_server_pid "$SERVER_PID"
+  fi
+}
+
+parse_prometheus_observation() {
+  python3 -c '
+import json, math, sys
+doc = json.load(sys.stdin)
+if doc.get("status") != "success":
+    raise SystemExit("Prometheus query was not successful")
+result = doc.get("data", {}).get("result", [])
+if len(result) != 2:
+    raise SystemExit(f"expected value and sample_timestamp vectors, got {len(result)}")
+observations = {}
+for item in result:
+    kind = item.get("metric", {}).get("__rustfs_probe_kind")
+    pair = item.get("value")
+    if kind not in ("value", "sample_timestamp") or not isinstance(pair, list) or len(pair) != 2:
+        raise SystemExit("invalid Prometheus observation shape")
+    evaluation_timestamp = float(pair[0])
+    observed_value = float(pair[1])
+    if not math.isfinite(evaluation_timestamp) or not math.isfinite(observed_value):
+        raise SystemExit("Prometheus observation is not finite")
+    if kind in observations:
+        raise SystemExit(f"duplicate Prometheus observation kind: {kind}")
+    observations[kind] = observed_value
+if set(observations) != {"value", "sample_timestamp"}:
+    raise SystemExit("Prometheus observation is incomplete")
+if observations["value"] < 0 or observations["sample_timestamp"] <= 0:
+    raise SystemExit("Prometheus observation is outside the accepted range")
+print(format(observations["sample_timestamp"], ".17g"), format(observations["value"], ".17g"))
+'
+}
+
 follower_samples_self_test() (
   command -v python3 >/dev/null 2>&1 || fail "python3 is required for --self-test"
-  local temp_dir samples_file ready_file result sample
+  local temp_dir samples_file ready_file result sample stale_response fresh_response
   temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/rustfs-follower-samples.XXXXXX")
   trap 'rm -rf -- "$temp_dir"' EXIT
   samples_file="$temp_dir/follower.samples"
   ready_file="$temp_dir/ready"
   printf '999\n' >"$ready_file"
+
+  stale_response='{"status":"success","data":{"result":[{"metric":{"__rustfs_probe_kind":"value"},"value":[2000,"0"]},{"metric":{"__rustfs_probe_kind":"sample_timestamp"},"value":[2000,"900"]}]}}'
+  sample=$(parse_prometheus_observation <<<"$stale_response") || fail "self-test could not parse stale Prometheus observation"
+  [[ $sample == '900 0' ]] || fail "Prometheus evaluation timestamp was mistaken for scrape timestamp: $sample"
+  fresh_response='{"status":"success","data":{"result":[{"metric":{"__rustfs_probe_kind":"sample_timestamp"},"value":[2000,"1000"]},{"metric":{"__rustfs_probe_kind":"value"},"value":[2000,"0"]}]}}'
+  sample=$(parse_prometheus_observation <<<"$fresh_response") || fail "self-test could not parse fresh Prometheus observation"
+  [[ $sample == '1000 0' ]] || fail "Prometheus scrape timestamp was not preserved: $sample"
+
+  [[ $(parse_server_pid '101') == 101 ]] || fail "single-line PID output was not accepted"
+  if parse_server_pid '101 102' >/dev/null 2>&1; then
+    fail "multi-value PID output unexpectedly passed"
+  fi
+  if parse_server_pid $'101\n102' >/dev/null 2>&1; then
+    fail "multi-line PID output unexpectedly passed"
+  fi
 
   : >"$samples_file"
   for sample in '1000 0' '1000 0' '1000 0'; do
@@ -197,6 +261,7 @@ while (($#)); do
     --cache-off-command) need_value "$@"; CACHE_OFF_COMMAND=$2; shift ;;
     --cache-on-command) need_value "$@"; CACHE_ON_COMMAND=$2; shift ;;
     --server-pid) need_value "$@"; SERVER_PID=$2; shift ;;
+    --server-pid-command) need_value "$@"; SERVER_PID_COMMAND=$2; shift ;;
     --cgroup-path) need_value "$@"; CGROUP_PATH=$2; shift ;;
     --rounds) need_value "$@"; ROUNDS=$2; shift ;;
     --sample-interval) need_value "$@"; SAMPLE_INTERVAL=$2; shift ;;
@@ -251,7 +316,13 @@ import sys
 raise SystemExit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)
 PY
 
-[[ $SERVER_PID =~ ^[0-9]+$ ]] || skip_or_fail "--server-pid is required to bind OOM evidence to RustFS"
+if [[ -n $SERVER_PID && -n $SERVER_PID_COMMAND ]]; then
+  fail "--server-pid and --server-pid-command are mutually exclusive"
+fi
+if [[ -z $SERVER_PID && -z $SERVER_PID_COMMAND ]]; then
+  skip_or_fail "--server-pid or --server-pid-command is required to bind OOM evidence to RustFS"
+fi
+SERVER_PID=$(resolve_server_pid) || skip_or_fail "could not resolve exactly one RustFS PID"
 [[ -r /proc/$SERVER_PID/cgroup ]] || skip_or_fail "cannot read /proc/$SERVER_PID/cgroup"
 if [[ -z $CGROUP_PATH ]]; then
   cgroup_relative=$(awk -F: '$1 == "0" { print $3; exit }' "/proc/$SERVER_PID/cgroup")
@@ -271,6 +342,18 @@ server_in_cgroup() {
     "$CGROUP_PATH/cgroup.procs"
 }
 server_in_cgroup || skip_or_fail "RustFS PID $SERVER_PID is not in $CGROUP_PATH"
+
+refresh_server_pid() {
+  local previous_pid=$SERVER_PID
+  local resolved
+  resolved=$(resolve_server_pid) || fail "could not resolve exactly one live RustFS PID"
+  [[ -r /proc/$resolved/cgroup ]] || fail "cannot read /proc/$resolved/cgroup"
+  SERVER_PID=$resolved
+  server_in_cgroup || fail "RustFS PID $SERVER_PID is not in $CGROUP_PATH"
+  if [[ $previous_pid != "$SERVER_PID" ]] && grep -Fxq -- "$previous_pid" "$CGROUP_PATH/cgroup.procs"; then
+    fail "replaced RustFS PID $previous_pid is still running in $CGROUP_PATH"
+  fi
+}
 
 nofile_limit=$(ulimit -n)
 [[ $nofile_limit =~ ^[0-9]+$ ]] || skip_or_fail "unable to determine the open-file limit"
@@ -294,31 +377,39 @@ cleanup_load() {
 trap cleanup_load EXIT
 
 prometheus_sample() {
-  local query=$1
+  local metric=$1
+  local query
   local response
+  query="label_replace(sum($metric), \"__rustfs_probe_kind\", \"value\", \"__name__\", \".*\") or label_replace(max(timestamp($metric)), \"__rustfs_probe_kind\", \"sample_timestamp\", \"__name__\", \".*\")"
   response=$(curl --fail --silent --show-error --get \
     --data-urlencode "query=$query" "$PROMETHEUS_QUERY_URL") || return 1
-  python3 -c '
-import json, math, sys
-doc = json.load(sys.stdin)
-if doc.get("status") != "success":
-    raise SystemExit("Prometheus query was not successful")
-result = doc.get("data", {}).get("result", [])
-if len(result) != 1 or "value" not in result[0]:
-    raise SystemExit(f"expected exactly one vector sample, got {len(result)}")
-timestamp = float(result[0]["value"][0])
-value = float(result[0]["value"][1])
-if not math.isfinite(timestamp) or not math.isfinite(value) or value < 0:
-    raise SystemExit(f"invalid metric value: {value}")
-print(format(timestamp, ".17g"), format(value, ".17g"))
-' <<<"$response"
+  parse_prometheus_observation <<<"$response"
 }
 
-prometheus_value() {
+prometheus_value_after() {
+  local metric=$1
+  local minimum_epoch=$2
   local timestamp value
-  read -r timestamp value < <(prometheus_sample "$1") || return 1
-  [[ -n $timestamp && -n $value ]] || return 1
-  printf '%s\n' "$value"
+  local attempts
+  attempts=$(python3 - "$METRICS_SETTLE_SECONDS" "$PROMETHEUS_SCRAPE_SECONDS" "$SAMPLE_INTERVAL" <<'PY'
+import math, sys
+settle, scrape, poll = map(float, sys.argv[1:])
+print(max(1, math.ceil((settle + 2 * scrape) / poll)))
+PY
+  ) || return 1
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if read -r timestamp value < <(prometheus_sample "$metric") \
+      && python3 - "$timestamp" "$minimum_epoch" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)
+PY
+    then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    sleep "$SAMPLE_INTERVAL"
+  done
+  return 1
 }
 
 cgroup_event() {
@@ -565,6 +656,9 @@ switch_cache_mode() {
   local key_count=$4
   run_operator_command "$mode" "$round" "$key_count" "$command" \
     || fail "cache-$mode command failed for round=$round K=$key_count"
+  if [[ -n $SERVER_PID_COMMAND ]]; then
+    refresh_server_pid
+  fi
   server_in_cgroup || fail "cache-$mode command moved RustFS PID $SERVER_PID out of $CGROUP_PATH"
 }
 
@@ -574,6 +668,9 @@ reset_cache() {
   local key_count=$3
   run_operator_command "$mode" "$round" "$key_count" "$RESET_COMMAND" \
     || fail "reset command failed for mode=$mode round=$round K=$key_count"
+  if [[ -n $SERVER_PID_COMMAND ]]; then
+    refresh_server_pid
+  fi
   server_in_cgroup || fail "reset command moved RustFS PID $SERVER_PID out of $CGROUP_PATH"
 }
 
@@ -594,14 +691,15 @@ for ((round = 1; round <= ROUNDS; round++)); do
     printf 'INFO: K=%d round=%d: switching cache off for one request per key baseline\n' "$key_count" "$round"
     switch_cache_mode off "$CACHE_OFF_COMMAND" "$round" "$key_count"
     reset_cache off "$round" "$key_count"
-    baseline_reader_before=$(prometheus_value "$READER_BYTES_QUERY") || fail "reader query failed before cache-off K=$key_count round=$round"
+    baseline_start_epoch=$(python3 -c 'import time; print(format(time.time(), ".17g"))')
+    baseline_reader_before=$(prometheus_value_after "$READER_BYTES_METRIC" "$baseline_start_epoch") || fail "fresh reader query failed before cache-off K=$key_count round=$round"
     baseline_oom_before=$(cgroup_event oom) || fail "cannot read oom before baseline"
     baseline_oom_kill_before=$(cgroup_event oom_kill) || fail "cannot read oom_kill before baseline"
     baseline_peak_before=$(cat "$CGROUP_PATH/memory.peak" 2>/dev/null || printf 'NA')
 
     run_load "$key_count" "$key_count" "$baseline_summary" "$baseline_ready"
-    sleep "$METRICS_SETTLE_SECONDS"
-    baseline_reader_after=$(prometheus_value "$READER_BYTES_QUERY") || fail "reader query failed after cache-off K=$key_count round=$round"
+    baseline_finished_epoch=$(python3 -c 'import time; print(format(time.time(), ".17g"))')
+    baseline_reader_after=$(prometheus_value_after "$READER_BYTES_METRIC" "$baseline_finished_epoch") || fail "fresh reader query failed after cache-off K=$key_count round=$round"
     baseline_reader_delta=$(numeric_positive_delta "$baseline_reader_before" "$baseline_reader_after") \
       || fail "cache-off reader baseline is invalid for K=$key_count round=$round"
     baseline_oom_after=$(cgroup_event oom) || fail "cannot read oom after baseline"
@@ -629,7 +727,8 @@ for ((round = 1; round <= ROUNDS; round++)); do
     switch_cache_mode on "$CACHE_ON_COMMAND" "$round" "$key_count"
     reset_cache on "$round" "$key_count"
 
-    reader_before=$(prometheus_value "$READER_BYTES_QUERY") || fail "reader query failed before K=$key_count round=$round"
+    round_start_epoch=$(python3 -c 'import time; print(format(time.time(), ".17g"))')
+    reader_before=$(prometheus_value_after "$READER_BYTES_METRIC" "$round_start_epoch") || fail "fresh reader query failed before K=$key_count round=$round"
     oom_before=$(cgroup_event oom) || fail "cannot read oom before round"
     oom_kill_before=$(cgroup_event oom_kill) || fail "cannot read oom_kill before round"
     memory_peak_before=$(cat "$CGROUP_PATH/memory.peak" 2>/dev/null || printf 'NA')
@@ -639,7 +738,7 @@ for ((round = 1; round <= ROUNDS; round++)); do
     LOAD_PID=$load_pid
     while kill -0 "$load_pid" 2>/dev/null; do
       if [[ -e $ready_file ]]; then
-        if sample=$(prometheus_sample "$FOLLOWER_PERMIT_QUERY" 2>/dev/null); then
+        if sample=$(prometheus_sample "$FOLLOWER_PERMIT_METRIC" 2>/dev/null); then
           append_follower_sample "$follower_file" "$sample" || fail "invalid follower sample for K=$key_count round=$round"
         fi
       fi
@@ -648,8 +747,8 @@ for ((round = 1; round <= ROUNDS; round++)); do
     wait "$load_pid" || fail "load or SHA-256 validation failed for K=$key_count round=$round (see $summary_file)"
     LOAD_PID=""
 
-    sleep "$METRICS_SETTLE_SECONDS"
-    reader_after=$(prometheus_value "$READER_BYTES_QUERY") || fail "reader query failed after K=$key_count round=$round"
+    round_finished_epoch=$(python3 -c 'import time; print(format(time.time(), ".17g"))')
+    reader_after=$(prometheus_value_after "$READER_BYTES_METRIC" "$round_finished_epoch") || fail "fresh reader query failed after K=$key_count round=$round"
     expected_reader_bytes=$(((baseline_reader_delta * 90) / 100))
     reader_limit=$(((baseline_reader_delta * 110 + 99) / 100))
     reader_delta=$(numeric_delta_check "$reader_before" "$reader_after" \
