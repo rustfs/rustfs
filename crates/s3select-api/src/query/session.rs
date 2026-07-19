@@ -106,7 +106,7 @@ impl SessionCtxFactory {
                     .to_vec()
             } else {
                 b"id,name,age,department,salary
-                1,Alice,25,HR,5000
+                1,Alice,25,HR,05000
                 2,Bob,30,IT,6000
                 3,Charlie,35,Finance,7000
                 4,Diana,22,Marketing,4500

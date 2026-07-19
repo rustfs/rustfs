@@ -170,8 +170,34 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_csv_values_remain_strings() {
+        let sql = "SELECT salary FROM S3Object LIMIT 1";
+        let input = create_test_input(sql);
+        let db = get_global_db(input.clone(), true).await.expect("create CSV test database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let batches = db
+            .execute(&query)
+            .await
+            .expect("execute CSV query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect CSV query output");
+        let salaries = batches
+            .first()
+            .expect("CSV query should return one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("CSV column should use UTF-8 string values");
+
+        assert_eq!(salaries.value(0), "05000");
+    }
+
+    #[tokio::test]
     async fn test_select_with_where_clause() {
-        let sql = "SELECT name, age FROM S3Object WHERE age > 30";
+        let sql = "SELECT name, age FROM S3Object WHERE CAST(age AS INT) > 30";
         let input = create_test_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
