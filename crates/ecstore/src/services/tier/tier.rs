@@ -2220,6 +2220,19 @@ impl TierConfigMgr {
         Ok(lease)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn active_operation_lease_count(handle: &Arc<RwLock<Self>>, tier_name: &str) -> usize {
+        let manager = handle.read().await;
+        let Some(runtime) = registered_tier_driver_runtime(&manager) else {
+            return 0;
+        };
+        lock_unpoisoned(&runtime)
+            .generations
+            .get(tier_name)
+            .map(|generation| generation.active_leases.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
     fn replace_driver(&mut self, tier_name: &str, driver: WarmBackendImpl) -> std::result::Result<(), AdminError> {
         let Some(runtime) = registered_tier_driver_runtime(self) else {
             self.driver_cache.insert(tier_name.to_string(), driver);
