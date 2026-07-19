@@ -3399,6 +3399,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
 
     use super::*;
     use crate::store::init_format::save_format_file;
+    use rustfs_lock::client::LockClient;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
@@ -3442,6 +3443,15 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         pool_index: usize,
         default_parity_count: usize,
     ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+        hermetic_set_disks_with_lockers(disk_count, pool_index, default_parity_count, Vec::new()).await
+    }
+
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks_with_lockers(
+        disk_count: usize,
+        pool_index: usize,
+        default_parity_count: usize,
+        lockers: Vec<Arc<dyn LockClient>>,
+    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
         let mut temp_dirs = Vec::with_capacity(disk_count);
@@ -3466,7 +3476,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             pool_index,
             endpoints,
             format,
-            Vec::new(),
+            lockers,
         )
         .await;
 
@@ -4036,14 +4046,83 @@ mod transition_commit_failure_tests {
 
 #[cfg(all(test, feature = "test-util"))]
 mod transition_upload_integrity_tests {
-    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::hermetic_set_disks_support::{hermetic_set_disks, hermetic_set_disks_with_lockers};
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
     use crate::disk::DiskAPI as _;
+    use crate::layout::endpoints::SetupType;
     use crate::services::tier::test_util::register_mock_tier;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
+    use rustfs_lock::client::local::LocalClient;
+    use rustfs_lock::{LockClient, LockError, LockInfo, LockResponse, LockStats};
     use std::path::PathBuf;
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = runtime_sources::current_setup_type().await;
+            runtime_sources::set_setup_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    runtime_sources::set_setup_type(previous).await;
+                });
+            });
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingLockClient;
+
+    #[async_trait::async_trait]
+    impl LockClient for FailingLockClient {
+        async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            Err(LockError::internal("simulated transition commit lock client failure"))
+        }
+
+        async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
 
     async fn assert_local_source_intact(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, payload: &[u8]) {
         let mut restored = Vec::new();
@@ -4190,6 +4269,58 @@ mod transition_upload_integrity_tests {
             "the nil UUID response is the backend's unversioned sentinel and must not become an S3 versionId"
         );
         assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn commit_lock_acquire_failure_cleans_remote_candidate_and_preserves_source() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let lockers: Vec<Arc<dyn LockClient>> = vec![Arc::new(LocalClient::with_manager(manager)), Arc::new(FailingLockClient)];
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "transition-lock-acquire-failure-bucket";
+        let object = "object.bin";
+        let payload = b"transition commit lock failure must clean the remote candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let mut opts = transition_options(&original, tier_name);
+        opts.no_lock = false;
+
+        let error = set_disks
+            .transition_object(bucket, object, &opts)
+            .await
+            .expect_err("transition must fail when the commit namespace write lock cannot reach quorum");
+        assert!(
+            matches!(
+                error,
+                StorageError::NamespaceLockQuorumUnavailable { .. }
+                    | StorageError::Lock(LockError::QuorumNotReached { .. })
+                    | StorageError::Lock(LockError::Internal { .. })
+            ),
+            "unexpected transition lock-acquire error: {error:?}"
+        );
+        assert_eq!(
+            backend.put_count().await,
+            1,
+            "remote candidate must be uploaded before commit lock failure"
+        );
+        assert_eq!(
+            backend.remove_count().await,
+            1,
+            "known remote candidate must be removed when commit lock acquisition fails"
+        );
+        assert_eq!(
+            backend.remove_versions().await,
+            backend.put_versions().await,
+            "lock-acquire cleanup must target the exact remote version returned by PUT"
+        );
+        assert_eq!(
+            backend.object_count().await,
+            0,
+            "commit lock failure must not leave an orphan remote candidate"
+        );
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
