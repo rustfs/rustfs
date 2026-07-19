@@ -10,6 +10,7 @@ use datafusion::arrow::{
     json::{WriterBuilder as JsonWriterBuilder, writer::LineDelimited},
     record_batch::RecordBatch,
 };
+use datafusion::common::DataFusionError;
 use futures::StreamExt;
 use http::{StatusCode, header::RANGE};
 use rustfs_s3select_api::{
@@ -490,8 +491,14 @@ fn map_query_error_to_s3(err: QueryError) -> S3Error {
     let message = err.to_string();
     match err {
         QueryError::Parser { .. } => parse_select_failure(message),
-        QueryError::MultiStatement { .. } => S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message),
+        QueryError::MultiStatement { .. } | QueryError::UnsupportedSqlStructure { .. } => {
+            S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message)
+        }
         QueryError::NotImplemented { .. } => S3Error::with_message(S3ErrorCode::NotImplemented, message),
+        QueryError::QueryConcurrencyLimit => S3Error::with_message(S3ErrorCode::SlowDown, message),
+        QueryError::QueryTimeout { .. } => S3Error::with_message(S3ErrorCode::Busy, message),
+        QueryError::Datafusion { source } if is_query_timeout(&source) => S3Error::with_message(S3ErrorCode::Busy, message),
+        QueryError::Datafusion { source } if is_resource_exhausted(&source) => S3Error::with_message(S3ErrorCode::Busy, message),
         QueryError::Datafusion { .. } if looks_like_invalid_scan_range(&message) => {
             S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
         }
@@ -518,6 +525,28 @@ fn map_query_error_to_s3(err: QueryError) -> S3Error {
 
 fn looks_like_bucket_not_found(message: &str) -> bool {
     message.contains("NoSuchBucket") || message.contains("bucket not found") || message.contains("BucketNotFound")
+}
+
+fn is_resource_exhausted(err: &DataFusionError) -> bool {
+    match err {
+        DataFusionError::ResourcesExhausted(_) => true,
+        DataFusionError::Context(_, source) => is_resource_exhausted(source),
+        DataFusionError::External(source) => source.downcast_ref::<DataFusionError>().is_some_and(is_resource_exhausted),
+        _ => false,
+    }
+}
+
+fn is_query_timeout(err: &DataFusionError) -> bool {
+    match err {
+        DataFusionError::Context(_, source) => is_query_timeout(source),
+        DataFusionError::External(source) => {
+            source
+                .downcast_ref::<QueryError>()
+                .is_some_and(|err| matches!(err, QueryError::QueryTimeout { .. }))
+                || source.downcast_ref::<DataFusionError>().is_some_and(is_query_timeout)
+        }
+        _ => false,
+    }
 }
 
 fn looks_like_object_not_found(message: &str) -> bool {
@@ -609,6 +638,30 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::Custom("ParseSelectFailure".into()));
         assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
         assert_eq!(err.message(), Some("sql parser error: syntax error"));
+    }
+
+    #[test]
+    fn map_query_policy_errors_to_s3_errors() {
+        let unsupported = map_query_error_to_s3(QueryError::UnsupportedSqlStructure {
+            message: "JOIN is not supported".to_string(),
+        });
+        let saturated = map_query_error_to_s3(QueryError::QueryConcurrencyLimit);
+        let timed_out = map_query_error_to_s3(QueryError::QueryTimeout { seconds: 300 });
+        let stream_timed_out = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::External(Box::new(QueryError::QueryTimeout { seconds: 300 }))),
+        });
+        let exhausted = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::Context(
+                "execute S3 Select query".to_string(),
+                Box::new(DataFusionError::ResourcesExhausted("memory limit".to_string())),
+            )),
+        });
+
+        assert_eq!(unsupported.code(), &S3ErrorCode::UnsupportedSqlStructure);
+        assert_eq!(saturated.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(timed_out.code(), &S3ErrorCode::Busy);
+        assert_eq!(stream_timed_out.code(), &S3ErrorCode::Busy);
+        assert_eq!(exhausted.code(), &S3ErrorCode::Busy);
     }
 
     #[test]

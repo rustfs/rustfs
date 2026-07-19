@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use std::{
+    future::Future,
     ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -49,6 +51,10 @@ use rustfs_s3select_api::{
 };
 use s3s::dto::{FileHeaderInfo, SelectObjectContentInput};
 use std::sync::LazyLock;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{Instant, Sleep, sleep_until, timeout_at},
+};
 
 use crate::{
     dispatcher::parquet_table::ParquetSelectTable,
@@ -72,20 +78,41 @@ pub struct SimpleQueryDispatcher {
     // get query execution factory
     query_execution_factory: QueryExecutionFactoryRef,
     func_manager: FuncMetaManagerRef,
+    query_admission: Arc<Semaphore>,
+    query_timeout: Duration,
 }
 
 #[async_trait]
 impl QueryDispatcher for SimpleQueryDispatcher {
     async fn execute_query(&self, query: &Query) -> QueryResult<Output> {
-        let query_state_machine = { self.build_query_state_machine(query.clone()).await? };
+        let permit = self
+            .query_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| QueryError::QueryConcurrencyLimit)?;
+        let deadline = Instant::now() + self.query_timeout;
+        let output = timeout_at(deadline, async {
+            let query_state_machine = self.build_query_state_machine(query.clone()).await?;
+            let logical_plan = self.build_logical_plan(query_state_machine.clone()).await?;
+            let Some(logical_plan) = logical_plan else {
+                return Ok(Output::Nil(()));
+            };
+            self.execute_logical_plan(logical_plan, query_state_machine).await
+        })
+        .await
+        .map_err(|_| QueryError::QueryTimeout {
+            seconds: self.query_timeout.as_secs(),
+        })??;
 
-        let logical_plan = self.build_logical_plan(query_state_machine.clone()).await?;
-        let logical_plan = match logical_plan {
-            Some(plan) => plan,
-            None => return Ok(Output::Nil(())),
-        };
-        let result = self.execute_logical_plan(logical_plan, query_state_machine).await?;
-        Ok(result)
+        match output {
+            Output::StreamData(stream) => Ok(Output::StreamData(Box::pin(TrackedRecordBatchStream::new(
+                stream,
+                permit,
+                deadline,
+                self.query_timeout.as_secs(),
+            )))),
+            Output::Nil(()) => Ok(Output::Nil(())),
+        }
     }
 
     async fn build_logical_plan(&self, query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Option<Plan>> {
@@ -156,11 +183,7 @@ impl SimpleQueryDispatcher {
             .create_query_execution(logical_plan, query_state_machine.clone())
             .await?;
 
-        match execution.start().await {
-            Ok(Output::StreamData(stream)) => Ok(Output::StreamData(Box::pin(TrackedRecordBatchStream { inner: stream }))),
-            Ok(nil @ Output::Nil(_)) => Ok(nil),
-            Err(err) => Err(err),
-        }
+        execution.start().await
     }
 
     async fn build_scheme_provider(&self, session: &SessionCtx) -> QueryResult<MetadataProvider> {
@@ -287,12 +310,31 @@ impl SimpleQueryDispatcher {
 }
 
 pub struct TrackedRecordBatchStream {
-    inner: SendableRecordBatchStream,
+    inner: Option<SendableRecordBatchStream>,
+    schema: SchemaRef,
+    permit: Option<OwnedSemaphorePermit>,
+    deadline: Pin<Box<Sleep>>,
+    timeout_seconds: u64,
+    done: bool,
+}
+
+impl TrackedRecordBatchStream {
+    fn new(inner: SendableRecordBatchStream, permit: OwnedSemaphorePermit, deadline: Instant, timeout_seconds: u64) -> Self {
+        let schema = inner.schema();
+        Self {
+            inner: Some(inner),
+            schema,
+            permit: Some(permit),
+            deadline: Box::pin(sleep_until(deadline)),
+            timeout_seconds,
+            done: false,
+        }
+    }
 }
 
 impl RecordBatchStream for TrackedRecordBatchStream {
     fn schema(&self) -> SchemaRef {
-        self.inner.schema()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -300,7 +342,30 @@ impl Stream for TrackedRecordBatchStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.poll_next_unpin(cx)
+        if self.done {
+            return Poll::Ready(None);
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.done = true;
+            self.inner.take();
+            self.permit.take();
+            return Poll::Ready(Some(Err(datafusion::common::DataFusionError::External(Box::new(
+                QueryError::QueryTimeout {
+                    seconds: self.timeout_seconds,
+                },
+            )))));
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            self.done = true;
+            return Poll::Ready(None);
+        };
+        let poll = inner.poll_next_unpin(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.done = true;
+            self.inner.take();
+            self.permit.take();
+        }
+        poll
     }
 }
 
@@ -314,6 +379,8 @@ pub struct SimpleQueryDispatcherBuilder {
     query_execution_factory: Option<QueryExecutionFactoryRef>,
 
     func_manager: Option<FuncMetaManagerRef>,
+    query_admission: Option<Arc<Semaphore>>,
+    query_timeout: Option<Duration>,
 }
 
 impl SimpleQueryDispatcherBuilder {
@@ -346,6 +413,16 @@ impl SimpleQueryDispatcherBuilder {
         self
     }
 
+    pub fn with_query_admission(mut self, query_admission: Arc<Semaphore>) -> Self {
+        self.query_admission = Some(query_admission);
+        self
+    }
+
+    pub fn with_query_timeout(mut self, query_timeout: Duration) -> Self {
+        self.query_timeout = Some(query_timeout);
+        self
+    }
+
     pub fn build(self) -> QueryResult<Arc<SimpleQueryDispatcher>> {
         let input = self.input.ok_or_else(|| QueryError::BuildQueryDispatcher {
             err: "lost of input".to_string(),
@@ -371,6 +448,14 @@ impl SimpleQueryDispatcherBuilder {
             err: "lost of default_table_provider".to_string(),
         })?;
 
+        let query_admission = self.query_admission.ok_or_else(|| QueryError::BuildQueryDispatcher {
+            err: "lost of query_admission".to_string(),
+        })?;
+
+        let query_timeout = self.query_timeout.ok_or_else(|| QueryError::BuildQueryDispatcher {
+            err: "lost of query_timeout".to_string(),
+        })?;
+
         let dispatcher = Arc::new(SimpleQueryDispatcher {
             input,
             _default_table_provider: default_table_provider,
@@ -378,8 +463,226 @@ impl SimpleQueryDispatcherBuilder {
             parser,
             query_execution_factory,
             func_manager,
+            query_admission,
+            query_timeout,
         });
 
         Ok(dispatcher)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SimpleQueryDispatcher, SimpleQueryDispatcherBuilder, TrackedRecordBatchStream};
+    use crate::{
+        execution::{
+            factory::{QueryExecutionFactoryRef, SqlQueryExecutionFactory},
+            scheduler::local::LocalScheduler,
+        },
+        function::simple_func_manager::SimpleFunctionMetadataManager,
+        metadata::base_table::BaseTableProvider,
+        sql::{optimizer::CascadeOptimizerBuilder, parser::DefaultParser},
+    };
+    use async_trait::async_trait;
+    use datafusion::{
+        arrow::{datatypes::Schema, record_batch::RecordBatch},
+        common::DataFusionError,
+        physical_plan::stream::RecordBatchStreamAdapter,
+    };
+    use futures::{StreamExt, stream};
+    use rustfs_s3select_api::{
+        QueryError, QueryResult,
+        query::{
+            Context as QueryContext, Query,
+            dispatcher::QueryDispatcher,
+            execution::{QueryExecutionFactory, QueryExecutionRef, QueryStateMachineRef},
+            logical_planner::Plan,
+            session::SessionCtxFactory,
+        },
+    };
+    use s3s::dto::{
+        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, OutputSerialization, SelectObjectContentInput,
+        SelectObjectContentRequest,
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::Poll,
+        time::Duration,
+    };
+    use tokio::{sync::Semaphore, time::Instant};
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingQueryExecutionFactory;
+
+    #[async_trait]
+    impl QueryExecutionFactory for PendingQueryExecutionFactory {
+        async fn create_query_execution(
+            &self,
+            _plan: Plan,
+            _query_state_machine: QueryStateMachineRef,
+        ) -> QueryResult<QueryExecutionRef> {
+            std::future::pending().await
+        }
+    }
+
+    fn test_input() -> SelectObjectContentInput {
+        SelectObjectContentInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "test.csv".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM S3Object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput {
+                        file_header_info: Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        }
+    }
+
+    fn test_dispatcher(
+        admission: Arc<Semaphore>,
+        query_timeout: Duration,
+    ) -> (Arc<SimpleQueryDispatcher>, Arc<SelectObjectContentInput>) {
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let scheduler = Arc::new(LocalScheduler {});
+        test_dispatcher_with_factory(admission, query_timeout, Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler)))
+    }
+
+    fn test_dispatcher_with_factory(
+        admission: Arc<Semaphore>,
+        query_timeout: Duration,
+        query_execution_factory: QueryExecutionFactoryRef,
+    ) -> (Arc<SimpleQueryDispatcher>, Arc<SelectObjectContentInput>) {
+        let input = Arc::new(test_input());
+        let dispatcher = SimpleQueryDispatcherBuilder::default()
+            .with_input(Arc::clone(&input))
+            .with_default_table_provider(Arc::new(BaseTableProvider::default()))
+            .with_session_factory(Arc::new(SessionCtxFactory::new(true)))
+            .with_parser(Arc::new(DefaultParser::default()))
+            .with_query_execution_factory(query_execution_factory)
+            .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
+            .with_query_admission(admission)
+            .with_query_timeout(query_timeout)
+            .build()
+            .expect("query dispatcher should build");
+        (dispatcher, input)
+    }
+
+    #[tokio::test]
+    async fn rejects_query_when_admission_is_saturated() {
+        let admission = Arc::new(Semaphore::new(1));
+        let _held_permit = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("admission permit should be available");
+        let (dispatcher, input) = test_dispatcher(admission, Duration::from_secs(300));
+        let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_string());
+
+        let result = dispatcher.execute_query(&query).await;
+
+        assert!(matches!(result, Err(QueryError::QueryConcurrencyLimit)));
+    }
+
+    #[tokio::test]
+    async fn times_out_during_query_setup() {
+        let admission = Arc::new(Semaphore::new(1));
+        let (dispatcher, input) = test_dispatcher_with_factory(
+            Arc::clone(&admission),
+            Duration::from_millis(1),
+            Arc::new(PendingQueryExecutionFactory),
+        );
+        let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_string());
+
+        let result = tokio::time::timeout(Duration::from_secs(1), dispatcher.execute_query(&query))
+            .await
+            .expect("dispatcher should enforce its query setup timeout");
+
+        match result {
+            Err(QueryError::QueryTimeout { seconds: 0 }) => {}
+            Err(err) => panic!("unexpected query result: {err:?}"),
+            Ok(_) => panic!("query setup unexpectedly completed"),
+        }
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_stream_releases_permit_after_timeout() {
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("admission permit should be available");
+        let inner_dropped = Arc::new(AtomicBool::new(false));
+        let drop_signal = DropSignal(Arc::clone(&inner_dropped));
+        let inner = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            stream::poll_fn(move |_| {
+                let _drop_signal = &drop_signal;
+                Poll::Pending::<Option<Result<RecordBatch, DataFusionError>>>
+            }),
+        ));
+        let mut output = Box::pin(TrackedRecordBatchStream::new(inner, permit, Instant::now(), 300));
+
+        let err = output
+            .next()
+            .await
+            .expect("timeout error")
+            .expect_err("expired query must fail");
+        let DataFusionError::External(source) = err else {
+            panic!("expected external query error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<QueryError>(),
+            Some(QueryError::QueryTimeout { seconds: 300 })
+        ));
+        assert!(inner_dropped.load(Ordering::SeqCst));
+        assert_eq!(admission.available_permits(), 1);
+        assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_stream_releases_permit_after_completion() {
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("admission permit should be available");
+        let inner = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            stream::empty::<Result<RecordBatch, DataFusionError>>(),
+        ));
+        let mut output = Box::pin(TrackedRecordBatchStream::new(
+            inner,
+            permit,
+            Instant::now() + Duration::from_secs(300),
+            300,
+        ));
+
+        assert!(output.next().await.is_none());
+        assert_eq!(admission.available_permits(), 1);
     }
 }

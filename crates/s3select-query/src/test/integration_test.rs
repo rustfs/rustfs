@@ -291,22 +291,15 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_select_with_aggregation() {
+    async fn test_rejects_group_by() {
         let sql = "SELECT department, COUNT(*) as count FROM S3Object GROUP BY department";
         let input = create_test_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await;
-        // Aggregation queries might fail due to lack of actual data, which is acceptable
-        match result {
-            Ok(_) => {
-                // If successful, that's great
-            }
-            Err(_) => {
-                // Expected to fail due to no actual data source
-            }
-        }
+
+        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
     }
 
     #[tokio::test]
@@ -380,14 +373,14 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_query_with_order_by() {
+    async fn test_rejects_order_by() {
         let sql = "SELECT name, age FROM S3Object ORDER BY age DESC";
         let input = create_test_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await;
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
     }
 
     #[tokio::test]
@@ -581,22 +574,15 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_select_with_aggregation_json() {
+    async fn test_rejects_group_by_json() {
         let sql = "SELECT department, COUNT(*) as count FROM S3Object GROUP BY department";
         let input = create_test_json_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await;
-        // Aggregation queries may fail due to lack of actual data, which is acceptable
-        match result {
-            Ok(_) => {
-                // If successful, that's great
-            }
-            Err(_) => {
-                // Expected to fail due to no actual data source
-            }
-        }
+
+        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
     }
 
     #[tokio::test]
@@ -666,14 +652,14 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_query_with_order_by_json() {
+    async fn test_rejects_order_by_json() {
         let sql = "SELECT name, age FROM S3Object ORDER BY age DESC";
         let input = create_test_json_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await;
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
     }
 
     #[tokio::test]

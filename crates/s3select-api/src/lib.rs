@@ -42,11 +42,20 @@ pub enum QueryError {
     #[error("Multi-statement not allow, found num:{num}, sql:{sql}")]
     MultiStatement { num: usize, sql: String },
 
+    #[error("Unsupported S3 Select SQL structure: {message}")]
+    UnsupportedSqlStructure { message: String },
+
     #[error("Failed to build QueryDispatcher. err: {err}")]
     BuildQueryDispatcher { err: String },
 
     #[error("The query has been canceled")]
     Cancel,
+
+    #[error("S3 Select query concurrency limit reached")]
+    QueryConcurrencyLimit,
+
+    #[error("S3 Select query exceeded the {seconds}-second execution limit")]
+    QueryTimeout { seconds: u64 },
 
     #[error("{source}")]
     Parser {
@@ -116,8 +125,19 @@ mod tests {
         };
         assert_eq!(err.to_string(), "Multi-statement not allow, found num:2, sql:SELECT 1; SELECT 2;");
 
+        let err = QueryError::UnsupportedSqlStructure {
+            message: "JOIN is not supported".to_string(),
+        };
+        assert_eq!(err.to_string(), "Unsupported S3 Select SQL structure: JOIN is not supported");
+
         let err = QueryError::Cancel;
         assert_eq!(err.to_string(), "The query has been canceled");
+
+        assert_eq!(QueryError::QueryConcurrencyLimit.to_string(), "S3 Select query concurrency limit reached");
+        assert_eq!(
+            QueryError::QueryTimeout { seconds: 300 }.to_string(),
+            "S3 Select query exceeded the 300-second execution limit"
+        );
 
         let err = QueryError::FunctionNotExists {
             name: "my_func".to_string(),

@@ -49,18 +49,29 @@ pub struct SessionCtxDesc {
 pub struct SessionCtxFactory {
     pub is_test: bool,
     pub target_partitions: usize,
+    pub memory_limit_bytes: usize,
 }
+
+const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 impl SessionCtxFactory {
     pub fn new(is_test: bool) -> Self {
         Self {
             is_test,
             target_partitions: 0,
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
         }
     }
 
     pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
         self.target_partitions = target_partitions;
+        self
+    }
+
+    pub fn with_memory_limit_bytes(mut self, memory_limit_bytes: usize) -> Self {
+        if memory_limit_bytes > 0 {
+            self.memory_limit_bytes = memory_limit_bytes;
+        }
         self
     }
 
@@ -76,7 +87,9 @@ impl SessionCtxFactory {
     async fn build_df_session_context(&self, context: &Context) -> QueryResult<SessionContext> {
         let path = format!("s3://{}", context.input.bucket);
         let store_url = url::Url::parse(&path).unwrap();
-        let rt = RuntimeEnvBuilder::new().build()?;
+        let rt = RuntimeEnvBuilder::new()
+            .with_memory_limit(self.memory_limit_bytes, 1.0)
+            .build()?;
         let config = SessionConfig::new().with_target_partitions(self.target_partitions);
         let df_session_state = SessionStateBuilder::new()
             .with_config(config)
@@ -197,6 +210,7 @@ fn test_parquet_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::execution::memory_pool::MemoryLimit;
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
         SelectObjectContentRequest,
@@ -249,5 +263,19 @@ mod tests {
             .expect("session should be created with default target partitions");
 
         assert_eq!(session.inner().config().target_partitions(), SessionConfig::new().target_partitions());
+    }
+
+    #[tokio::test]
+    async fn session_factory_applies_memory_limit() {
+        let factory = SessionCtxFactory::new(true).with_memory_limit_bytes(1024);
+        let session = factory
+            .create_session_ctx(&test_context())
+            .await
+            .expect("session should be created with a bounded memory pool");
+
+        assert!(matches!(
+            session.inner().runtime_env().memory_pool.memory_limit(),
+            MemoryLimit::Finite(1024)
+        ));
     }
 }
