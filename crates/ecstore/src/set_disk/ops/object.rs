@@ -3598,7 +3598,7 @@ mod metadata_mutation_generation_tests {
 mod transition_commit_failure_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
-    use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+    use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions};
     use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
     use crate::services::tier::tier::TierConfigMgr;
@@ -3811,6 +3811,89 @@ mod transition_commit_failure_tests {
             "cancelled transition must clean up with the old driver"
         );
         assert_eq!(old_backend.object_count().await, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_restore_cleanup_does_not_overwrite_concurrent_unversioned_put() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-cas-bucket";
+        let object = "object.bin";
+        let original_payload = b"old transitioned body".repeat(1024);
+        let replacement_payload = b"new visible unversioned body".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(original_payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should transition before restore");
+
+        let get_barrier = backend.arm_failing_get_barrier().await;
+        let restore_set = Arc::clone(&set_disks);
+        let restore = tokio::spawn(async move {
+            let mut opts = ObjectOptions::default();
+            opts.transition.restore_request.days = Some(1);
+            restore_set.restore_transitioned_object(bucket, object, &opts).await
+        });
+        get_barrier.wait_until_paused().await;
+
+        let mut replacement_reader = PutObjReader::from_vec(replacement_payload.clone());
+        let replacement = set_disks
+            .put_object(bucket, object, &mut replacement_reader, &ObjectOptions::default())
+            .await
+            .expect("concurrent unversioned PUT should commit while restore GET is paused");
+        get_barrier.release();
+        restore
+            .await
+            .expect("restore task should join")
+            .expect_err("injected tier GET failure should surface");
+
+        let visible = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("replacement metadata should remain visible");
+        assert_eq!(visible.etag, replacement.etag, "stale restore cleanup must not republish the old ETag");
+        assert_ne!(
+            visible.transitioned_object.status, TRANSITION_COMPLETE,
+            "replacement object must not regain stale transition metadata"
+        );
+        let mut body = Vec::new();
+        set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("replacement object should be readable")
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("replacement body should drain");
+        assert_eq!(
+            body, replacement_payload,
+            "stale restore cleanup must not make the old remote body current again"
+        );
     }
 
     #[tokio::test]
