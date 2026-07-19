@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::bucket::lifecycle::bucket_lifecycle_ops::enqueue_recovered_free_version;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
 use crate::object_api::ObjectInfo;
@@ -31,9 +34,77 @@ use rustfs_filemeta::FileInfo;
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
 const DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT: usize = 10_000;
 const BACKGROUND_WALKDIR_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, crate::error::Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+#[cfg(test)]
+pub(super) enum RecoveryWalkTestAction {
+    SendItemsThenError(Vec<ObjectInfo>, crate::error::Error),
+    SendItemsThenHang(Vec<ObjectInfo>, Arc<tokio::sync::Notify>),
+    SendItemsUntilReceiverCloses(Arc<tokio::sync::Notify>),
+    ReturnError(crate::error::Error),
+    WaitForCancellation(Arc<tokio::sync::Notify>),
+}
+
+#[cfg(test)]
+type RecoveryWalkTestHook = Box<dyn Fn(&str) -> Option<RecoveryWalkTestAction> + Send + Sync>;
+
+#[cfg(test)]
+static RECOVERY_WALK_TEST_HOOK: Mutex<Option<RecoveryWalkTestHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static RECOVERY_BUCKET_LIST_WAIT_HOOK: Mutex<Option<Arc<tokio::sync::Notify>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(super) struct RecoveryWalkHookGuard;
+
+#[cfg(test)]
+impl Drop for RecoveryWalkHookGuard {
+    fn drop(&mut self) {
+        let mut hook = RECOVERY_WALK_TEST_HOOK
+            .lock()
+            .expect("recovery walk test hook lock should not poison");
+        *hook = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_recovery_walk_test_hook(
+    hook_fn: impl Fn(&str) -> Option<RecoveryWalkTestAction> + Send + Sync + 'static,
+) -> RecoveryWalkHookGuard {
+    let mut hook = RECOVERY_WALK_TEST_HOOK
+        .lock()
+        .expect("recovery walk test hook lock should not poison");
+    *hook = Some(Box::new(hook_fn));
+    RecoveryWalkHookGuard
+}
+
+#[cfg(test)]
+pub(super) struct RecoveryBucketListWaitHookGuard;
+
+#[cfg(test)]
+impl Drop for RecoveryBucketListWaitHookGuard {
+    fn drop(&mut self) {
+        let mut hook = RECOVERY_BUCKET_LIST_WAIT_HOOK
+            .lock()
+            .expect("recovery bucket-list test hook lock should not poison");
+        *hook = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_recovery_bucket_list_wait_hook(started: Arc<tokio::sync::Notify>) -> RecoveryBucketListWaitHookGuard {
+    let mut hook = RECOVERY_BUCKET_LIST_WAIT_HOOK
+        .lock()
+        .expect("recovery bucket-list test hook lock should not poison");
+    *hook = Some(started);
+    RecoveryBucketListWaitHookGuard
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeVersionRecoveryStats {
@@ -69,11 +140,21 @@ pub async fn recover_tier_free_versions(
     bucket_marker: Option<String>,
     object_marker: Option<String>,
 ) -> Result<FreeVersionRecoveryStats> {
+    recover_tier_free_versions_with_cancel(api, limit, bucket_marker, object_marker, CancellationToken::new()).await
+}
+
+pub(super) async fn recover_tier_free_versions_with_cancel(
+    api: Arc<ECStore>,
+    limit: usize,
+    bucket_marker: Option<String>,
+    object_marker: Option<String>,
+    cancel_token: CancellationToken,
+) -> Result<FreeVersionRecoveryStats> {
     if limit == 0 {
         return Err(std::io::Error::other("free-version recovery limit must be greater than zero").into());
     }
 
-    let page = list_tier_free_versions(api, limit, bucket_marker.clone(), object_marker.clone()).await?;
+    let page = list_tier_free_versions(api, limit, bucket_marker.clone(), object_marker.clone(), cancel_token.clone()).await?;
     let mut stats = FreeVersionRecoveryStats {
         scanned: 0,
         enqueued: 0,
@@ -87,8 +168,11 @@ pub async fn recover_tier_free_versions(
 
     let mut retry_cursor = RetryCursor::new(bucket_marker, object_marker);
     for oi in page.items {
+        if cancel_token.is_cancelled() {
+            return Err(tier_free_version_recovery_cancelled());
+        }
         retry_cursor.visit(&oi);
-        if !record_recovered_free_version_enqueue(&mut stats, queue_recovered_free_version(oi).await) {
+        if !record_recovered_free_version_enqueue(&mut stats, enqueue_recovered_free_version(oi).await) {
             let (bucket_marker, object_marker) = retry_cursor.retry_markers();
             stats.truncated = true;
             stats.next_bucket_marker = bucket_marker;
@@ -100,6 +184,18 @@ pub async fn recover_tier_free_versions(
     Ok(stats)
 }
 
+fn tier_free_version_recovery_cancelled() -> crate::error::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version recovery cancelled").into()
+}
+
+fn tier_free_version_recovery_walk_shutdown_timed_out() -> crate::error::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "tier free-version recovery walk did not stop after cancellation",
+    )
+    .into()
+}
+
 fn record_recovered_free_version_enqueue(stats: &mut FreeVersionRecoveryStats, queued: bool) -> bool {
     stats.scanned += 1;
     if queued {
@@ -109,10 +205,6 @@ fn record_recovered_free_version_enqueue(stats: &mut FreeVersionRecoveryStats, q
         stats.failed += 1;
         false
     }
-}
-
-async fn queue_recovered_free_version(oi: ObjectInfo) -> bool {
-    crate::bucket::lifecycle::bucket_lifecycle_ops::enqueue_recovered_free_version(oi).await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,11 +252,12 @@ impl RetryCursor {
     }
 }
 
-async fn list_tier_free_versions(
+pub(super) async fn list_tier_free_versions(
     api: Arc<ECStore>,
     limit: usize,
     bucket_marker: Option<String>,
     object_marker: Option<String>,
+    cancel_token: CancellationToken,
 ) -> Result<FreeVersionRecoveryPage> {
     let mut page = FreeVersionRecoveryPage {
         items: Vec::new(),
@@ -179,21 +272,42 @@ async fn list_tier_free_versions(
         return Ok(page);
     }
 
-    let buckets = api.list_bucket(&BucketOptions::default()).await?;
+    let bucket_options = BucketOptions::default();
+    let list_buckets = async {
+        #[cfg(test)]
+        let wait_hook = RECOVERY_BUCKET_LIST_WAIT_HOOK
+            .lock()
+            .expect("recovery bucket-list test hook lock should not poison")
+            .clone();
+        #[cfg(test)]
+        if let Some(started) = wait_hook {
+            started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        api.list_bucket(&bucket_options).await
+    };
+    tokio::pin!(list_buckets);
+    let buckets = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Err(tier_free_version_recovery_cancelled()),
+        result = &mut list_buckets => result?,
+    };
     let mut bucket_seen = bucket_marker.is_none();
     let mut truncated_after: Option<RecoveryCursor> = None;
     let walk_scan_limit = recovery_walk_scan_limit(limit);
 
     for bucket in buckets {
+        if cancel_token.is_cancelled() {
+            return Err(tier_free_version_recovery_cancelled());
+        }
         if bucket.name == RUSTFS_META_BUCKET {
             continue;
         }
         if !bucket_seen {
-            if bucket_marker.as_deref() == Some(bucket.name.as_str()) {
-                bucket_seen = true;
-            } else {
+            if bucket_marker.as_deref().is_some_and(|marker| bucket.name.as_str() < marker) {
                 continue;
             }
+            bucket_seen = true;
         }
 
         page.buckets_scanned += 1;
@@ -204,16 +318,94 @@ async fn list_tier_free_versions(
         };
 
         let (tx, mut rx) = mpsc::channel::<ObjectInfoOrErr>(100);
-        let cancel = CancellationToken::new();
+        let cancel = cancel_token.child_token();
         let mut draining_after_truncation = false;
+        let mut drain_deadline = None;
         let mut last_seen_object: Option<String> = None;
         let mut scanned_objects = 0usize;
-        let walk = tokio::spawn({
+        let mut walk = tokio::spawn({
             let api = api.clone();
             let bucket_name = bucket.name.clone();
             let object_marker = bucket_object_marker.clone();
             let cancel = cancel.clone();
             async move {
+                #[cfg(test)]
+                let test_action = {
+                    let hook = RECOVERY_WALK_TEST_HOOK
+                        .lock()
+                        .expect("recovery walk test hook lock should not poison");
+                    hook.as_ref().and_then(|hook| hook(&bucket_name))
+                };
+                #[cfg(test)]
+                if let Some(action) = test_action {
+                    match action {
+                        RecoveryWalkTestAction::SendItemsThenError(items, err) => {
+                            for item in items {
+                                if tx
+                                    .send(ObjectInfoOrErr {
+                                        item: Some(item),
+                                        err: None,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            let _ = tx
+                                .send(ObjectInfoOrErr {
+                                    item: None,
+                                    err: Some(err),
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                        RecoveryWalkTestAction::SendItemsThenHang(items, started) => {
+                            for item in items {
+                                if tx
+                                    .send(ObjectInfoOrErr {
+                                        item: Some(item),
+                                        err: None,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            started.notify_one();
+                            return std::future::pending().await;
+                        }
+                        RecoveryWalkTestAction::SendItemsUntilReceiverCloses(started) => {
+                            started.notify_one();
+                            let mut index = 0usize;
+                            loop {
+                                if tx
+                                    .send(ObjectInfoOrErr {
+                                        item: Some(ObjectInfo {
+                                            bucket: bucket_name.clone(),
+                                            name: format!("nonrecoverable-{index:08}"),
+                                            ..Default::default()
+                                        }),
+                                        err: None,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                                index = index.saturating_add(1);
+                            }
+                        }
+                        RecoveryWalkTestAction::ReturnError(err) => return Err(err),
+                        RecoveryWalkTestAction::WaitForCancellation(started) => {
+                            started.notify_one();
+                            cancel.cancelled().await;
+                            return Err(tier_free_version_recovery_cancelled());
+                        }
+                    }
+                }
+
                 api.walk(
                     cancel,
                     &bucket_name,
@@ -231,47 +423,88 @@ async fn list_tier_free_versions(
             }
         });
 
-        while let Some(item) = rx.recv().await {
+        let mut receive_error = None;
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    cancel.cancel();
+                    receive_error = Some(tier_free_version_recovery_cancelled());
+                    break;
+                }
+                _ = async {
+                    if let Some(deadline) = drain_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if drain_deadline.is_some() => {
+                    receive_error = Some(tier_free_version_recovery_walk_shutdown_timed_out());
+                    break;
+                }
+                item = rx.recv() => match item {
+                    Some(item) => item,
+                    None => break,
+                },
+            };
             page.scanned_entries += 1;
-            if draining_after_truncation {
-                continue;
-            }
             if let Some(err) = item.err {
                 cancel.cancel();
-                walk.await.map_err(|err| std::io::Error::other(err.to_string()))??;
-                return Err(err);
+                receive_error = Some(err);
+                break;
+            }
+            if draining_after_truncation {
+                continue;
             }
             let Some(oi) = item.item else {
                 continue;
             };
             record_scanned_object(&mut last_seen_object, &mut scanned_objects, &oi.name);
             if let Some(cursor) = &truncated_after
-                && cursor.object != oi.name
+                && (cursor.bucket.as_str() != bucket.name.as_str() || cursor.object.as_str() != oi.name.as_str())
             {
                 page.truncated = true;
                 cancel.cancel();
                 draining_after_truncation = true;
+                drain_deadline = Some(tokio::time::Instant::now() + BACKGROUND_WALK_SHUTDOWN_TIMEOUT);
                 continue;
             }
             if is_recoverable_tier_free_version(&oi) {
-                let cursor = RecoveryCursor {
+                let current_cursor = RecoveryCursor {
                     bucket: bucket.name.clone(),
                     object: oi.name.clone(),
                 };
                 page.items.push(oi);
-                page.next_bucket_marker = Some(cursor.bucket.clone());
-                page.next_object_marker = Some(cursor.object.clone());
+                page.next_bucket_marker = Some(current_cursor.bucket.clone());
+                page.next_object_marker = Some(current_cursor.object.clone());
                 if page.items.len() >= limit && truncated_after.is_none() {
-                    truncated_after = Some(cursor);
+                    truncated_after = Some(current_cursor);
                 }
             }
         }
 
-        walk.await.map_err(|err| std::io::Error::other(err.to_string()))??;
+        drop(rx);
+        let walk_shutdown_timeout = drain_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(BACKGROUND_WALK_SHUTDOWN_TIMEOUT);
+        let walk_result = match tokio::time::timeout(walk_shutdown_timeout, &mut walk).await {
+            Ok(result) => result.map_err(|err| std::io::Error::other(err.to_string()))?,
+            Err(_) => {
+                walk.abort();
+                let _ = walk.await;
+                if let Some(err) = receive_error {
+                    return Err(err);
+                }
+                return Err(tier_free_version_recovery_walk_shutdown_timed_out());
+            }
+        };
+        if let Some(err) = receive_error {
+            return Err(err);
+        }
+        walk_result?;
         mark_scan_truncated_if_needed(&mut page, scanned_objects, walk_scan_limit, &bucket.name, last_seen_object.as_deref());
 
         if page.truncated {
-            page.next_bucket_marker = Some(bucket.name.clone());
             break;
         }
     }

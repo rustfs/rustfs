@@ -515,6 +515,9 @@ impl FileMeta {
             if ver.header.version_id != vid {
                 continue;
             }
+            if fi.tier_free_version() && !ver.header.free_version() {
+                return Err(Error::FileVersionNotFound);
+            }
 
             match ver.header.version_type {
                 VersionType::Invalid | VersionType::Legacy => return Err(Error::other("invalid file meta version")),
