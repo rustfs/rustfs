@@ -58,6 +58,9 @@ pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
 #[cfg(test)]
 pub(crate) use context::install_test_app_context;
 
+#[cfg(test)]
+pub(crate) use context::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
+
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     context::get_global_app_context()
 }

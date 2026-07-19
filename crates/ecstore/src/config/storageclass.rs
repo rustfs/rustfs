@@ -69,6 +69,8 @@ pub const MIN_PARITY_DRIVES: usize = 0;
 
 // Default RRS parity is always minimum parity.
 pub const DEFAULT_RRS_PARITY: usize = 1;
+const DEFAULT_RRS_STORAGE_CLASS: &str = "EC:1";
+const ZERO_SET_DRIVE_COUNT_ERROR: &str = "set drive count must be greater than zero";
 
 pub static DEFAULT_INLINE_BLOCK: usize = 128 * 1024;
 
@@ -81,7 +83,7 @@ pub static DEFAULT_KVS: LazyLock<KVS> = LazyLock::new(|| {
         },
         KV {
             key: CLASS_RRS.to_owned(),
-            value: "EC:1".to_owned(),
+            value: DEFAULT_RRS_STORAGE_CLASS.to_owned(),
             hidden_if_empty: false,
         },
         KV {
@@ -314,7 +316,7 @@ fn rrs_policy(kvs: &KVS, value: Option<String>) -> Result<ParityPolicy> {
         Some(value) => Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity)),
         None => {
             let value = kvs.get(CLASS_RRS);
-            if value.is_empty() || value == "EC:1" {
+            if value.is_empty() || value == DEFAULT_RRS_STORAGE_CLASS {
                 Ok(ParityPolicy::LegacyRrs)
             } else {
                 Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity))
@@ -442,7 +444,7 @@ pub fn validate_parity(ss_parity: usize, set_drive_count: usize) -> Result<()> {
     // }
 
     if set_drive_count == 0 {
-        return Err(Error::other("set drive count must be greater than zero"));
+        return Err(Error::other(ZERO_SET_DRIVE_COUNT_ERROR));
     }
 
     if ss_parity > set_drive_count / 2 {
@@ -475,7 +477,7 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
     // }
 
     if set_drive_count == 0 {
-        return Err(Error::other("set drive count must be greater than zero"));
+        return Err(Error::other(ZERO_SET_DRIVE_COUNT_ERROR));
     }
 
     if ss_parity > set_drive_count / 2 {

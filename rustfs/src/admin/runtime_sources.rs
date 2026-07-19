@@ -29,6 +29,8 @@ pub(crate) use crate::runtime_sources::{
     current_region, current_replication_pool_handle, current_replication_stats_handle, current_server_config_for_context,
     current_token_signing_key,
 };
+#[cfg(test)]
+pub(crate) use crate::runtime_sources::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
 use rustfs_config::server_config::Config;
 use rustfs_kms::KmsServiceManager;
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
