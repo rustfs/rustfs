@@ -1083,11 +1083,12 @@ mod tests {
     use tokio::io::ReadBuf;
 
     fn erasure_with_invalid_dimensions(data_shards: usize, parity_shards: usize, block_size: usize) -> Erasure {
-        let mut erasure = Erasure::default();
-        erasure.data_shards = data_shards;
-        erasure.parity_shards = parity_shards;
-        erasure.block_size = block_size;
-        erasure
+        Erasure {
+            data_shards,
+            parity_shards,
+            block_size,
+            ..Default::default()
+        }
     }
 
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
