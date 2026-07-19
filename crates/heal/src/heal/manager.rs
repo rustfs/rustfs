@@ -19,7 +19,7 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use metrics::{counter, gauge};
-use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult, HealRequestSource};
+use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionReceipt, HealAdmissionResult, HealRequestSource};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
 use rustfs_madmin::heal_commands::HealResultItem;
 #[cfg(test)]
@@ -67,6 +67,17 @@ struct RetryOwnershipTestHook {
 static RETRY_OWNERSHIP_TEST_HOOK: LazyLock<Mutex<Option<Arc<RetryOwnershipTestHook>>>> = LazyLock::new(|| Mutex::new(None));
 
 #[cfg(test)]
+struct DuplicateAdmissionTestHook {
+    request_id: String,
+    active_lock_reached: Notify,
+    active_lock_release: Notify,
+}
+
+#[cfg(test)]
+static DUPLICATE_ADMISSION_TEST_HOOK: LazyLock<Mutex<Option<Arc<DuplicateAdmissionTestHook>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
 async fn pause_retry_ownership_transition(task_id: &str, to_queue: bool) {
     let hook = RETRY_OWNERSHIP_TEST_HOOK.lock().await.clone();
     let Some(hook) = hook.filter(|hook| hook.task_id == task_id) else {
@@ -79,6 +90,16 @@ async fn pause_retry_ownership_transition(task_id: &str, to_queue: bool) {
         hook.active_to_retrying_reached.notify_one();
         hook.active_to_retrying_release.notified().await;
     }
+}
+
+#[cfg(test)]
+async fn pause_duplicate_admission_after_active_lock(request_id: &str) {
+    let hook = DUPLICATE_ADMISSION_TEST_HOOK.lock().await.clone();
+    let Some(hook) = hook.filter(|hook| hook.request_id == request_id) else {
+        return;
+    };
+    hook.active_lock_reached.notify_one();
+    hook.active_lock_release.notified().await;
 }
 
 type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
@@ -1423,110 +1444,47 @@ impl HealManager {
     }
 
     /// Submit heal request
-    pub async fn submit_heal_request(&self, request: HealRequest) -> Result<HealAdmissionResult> {
+    pub async fn submit_heal_request_with_receipt(&self, request: HealRequest) -> Result<HealAdmissionReceipt> {
+        self.submit_heal_request_with_receipt_and_alias(request, false).await
+    }
+
+    pub(crate) async fn submit_heal_request_with_receipt_and_alias(
+        &self,
+        request: HealRequest,
+        preserve_alias: bool,
+    ) -> Result<HealAdmissionReceipt> {
         let config = self.config.read().await;
         let dedup_key = PriorityHealQueue::make_dedup_key(&request);
 
-        // Keep this lock order aligned with the scheduler so a request cannot
-        // slip between queued and active states while duplicate admission runs.
-        let active_duplicate = {
-            let active_heals = self.active_heals.lock().await;
-            (!request.force_start)
-                .then(|| active_heal_for_dedup_key(&active_heals, &dedup_key))
-                .flatten()
-        };
-        if let Some((merged_task_id, _)) = active_duplicate {
-            let admission = Self::duplicate_admission_for_request(&request, &config);
-
-            match admission {
-                HealAdmissionResult::Merged => {
-                    self.insert_task_alias(&request.id, &merged_task_id).await;
-                    info!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        merged_task_id = %merged_task_id,
-                        priority = ?request.priority,
-                        result = "merged_active_duplicate",
-                        "Heal queue admission decided"
-                    );
-                }
-                HealAdmissionResult::Dropped(reason) => {
-                    warn!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        priority = ?request.priority,
-                        reason = reason.as_str(),
-                        result = "dropped_active_duplicate",
-                        "Heal queue admission decided"
-                    );
-                }
-                HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
-            }
-
-            return Ok(admission);
-        }
-
-        let retrying_duplicate = {
-            let retrying_heals = self.retrying_heals.lock().await;
-            (!request.force_start)
-                .then(|| retrying_heal_for_dedup_key(&retrying_heals, &dedup_key))
-                .flatten()
-        };
-        if let Some((merged_task_id, _)) = retrying_duplicate {
-            let admission = Self::duplicate_admission_for_request(&request, &config);
-
-            match admission {
-                HealAdmissionResult::Merged => {
-                    self.insert_task_alias(&request.id, &merged_task_id).await;
-                    info!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        merged_task_id = %merged_task_id,
-                        priority = ?request.priority,
-                        result = "merged_retrying_duplicate",
-                        "Heal queue admission decided"
-                    );
-                }
-                HealAdmissionResult::Dropped(reason) => {
-                    warn!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        priority = ?request.priority,
-                        reason = reason.as_str(),
-                        result = "dropped_retrying_duplicate",
-                        "Heal queue admission decided"
-                    );
-                }
-                HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
-            }
-
-            return Ok(admission);
-        }
-
+        // Match the scheduler's active -> queue order and keep retry ownership
+        // in the same atomic view. Otherwise queue -> active and
+        // active -> retrying transitions can slip between duplicate checks.
+        let active_heals = self.active_heals.lock().await;
+        #[cfg(test)]
+        pause_duplicate_admission_after_active_lock(&request.id).await;
         let mut queue = self.heal_queue.lock().await;
-
-        let queued_duplicate = (!request.force_start)
-            .then(|| queue.request_for_dedup_key(&dedup_key).map(|queued| queued.id.clone()))
-            .flatten();
-        if let Some(merged_task_id) = queued_duplicate {
+        let retrying_heals = self.retrying_heals.lock().await;
+        let duplicate = (!request.force_start).then(|| {
+            active_heal_for_dedup_key(&active_heals, &dedup_key)
+                .map(|(task_id, _)| (task_id, "active"))
+                .or_else(|| {
+                    queue
+                        .request_for_dedup_key(&dedup_key)
+                        .map(|queued| (queued.id.clone(), "queued"))
+                })
+                .or_else(|| retrying_heal_for_dedup_key(&retrying_heals, &dedup_key).map(|(task_id, _)| (task_id, "retrying")))
+        });
+        if let Some((merged_task_id, duplicate_state)) = duplicate.flatten() {
             let admission = Self::duplicate_admission_for_request(&request, &config);
+            drop(retrying_heals);
             drop(queue);
+            drop(active_heals);
 
             match admission {
                 HealAdmissionResult::Merged => {
-                    self.insert_task_alias(&request.id, &merged_task_id).await;
+                    if preserve_alias {
+                        self.insert_task_alias(&request.id, &merged_task_id).await;
+                    }
                     debug!(
                         target: "rustfs::heal::manager",
                         event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -1535,8 +1493,9 @@ impl HealManager {
                         request_id = %request.id,
                         merged_task_id = %merged_task_id,
                         priority = ?request.priority,
+                        duplicate_state,
                         result = "merged_duplicate",
-                        "Heal queue request merged"
+                        "Heal queue admission decided"
                     );
                 }
                 HealAdmissionResult::Dropped(reason) => {
@@ -1548,25 +1507,45 @@ impl HealManager {
                         request_id = %request.id,
                         priority = ?request.priority,
                         reason = reason.as_str(),
+                        duplicate_state,
                         result = "dropped_duplicate",
-                        "Heal queue request dropped"
+                        "Heal queue admission decided"
                     );
                 }
                 HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
             }
 
-            return Ok(admission);
+            return Ok(HealAdmissionReceipt {
+                result: admission,
+                task_id: merged_task_id,
+            });
         }
 
+        let mut task_id = request.id.clone();
         let admission = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
+        if admission == HealAdmissionResult::Merged
+            && let Some(queued) = queue.request_for_dedup_key(&dedup_key)
+        {
+            task_id.clone_from(&queued.id);
+        }
         let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
+        drop(retrying_heals);
         drop(queue);
+        drop(active_heals);
 
         if should_notify {
             self.notify.notify_one();
         }
 
-        Ok(admission)
+        Ok(HealAdmissionReceipt {
+            result: admission,
+            task_id,
+        })
+    }
+
+    /// Submit heal request.
+    pub async fn submit_heal_request(&self, request: HealRequest) -> Result<HealAdmissionResult> {
+        Ok(self.submit_heal_request_with_receipt_and_alias(request, true).await?.result)
     }
 
     /// Get task status
@@ -3552,6 +3531,103 @@ mod tests {
                 .expect("duplicate request should produce admission result"),
             HealAdmissionResult::Merged
         );
+    }
+
+    #[tokio::test]
+    async fn test_admin_duplicate_receipt_returns_canonical_task_without_alias() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+        let mut original = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        original.source = HealRequestSource::Admin;
+        let original_id = original.id.clone();
+        let mut duplicate = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        duplicate.source = HealRequestSource::Admin;
+        let duplicate_id = duplicate.id.clone();
+
+        let accepted = manager
+            .submit_heal_request_with_receipt(original)
+            .await
+            .expect("first request should be accepted");
+        let merged = manager
+            .submit_heal_request_with_receipt(duplicate)
+            .await
+            .expect("duplicate request should merge");
+
+        assert_eq!(accepted.result, HealAdmissionResult::Accepted);
+        assert_eq!(accepted.task_id, original_id);
+        assert_eq!(merged.result, HealAdmissionResult::Merged);
+        assert_eq!(merged.task_id, original_id);
+        assert_eq!(manager.canonical_task_id(&duplicate_id).await, duplicate_id);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_admission_is_atomic_with_queue_to_active_transition() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = Arc::new(HealManager::new(storage.clone(), None));
+        let mut original = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        original.source = HealRequestSource::Admin;
+        let original_id = original.id.clone();
+        assert_eq!(
+            manager
+                .submit_heal_request(original)
+                .await
+                .expect("original request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+
+        let mut duplicate = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+        duplicate.source = HealRequestSource::Admin;
+        let hook = Arc::new(DuplicateAdmissionTestHook {
+            request_id: duplicate.id.clone(),
+            active_lock_reached: Notify::new(),
+            active_lock_release: Notify::new(),
+        });
+        *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = Some(hook.clone());
+
+        let duplicate_manager = manager.clone();
+        let duplicate_task = tokio::spawn(async move { duplicate_manager.submit_heal_request_with_receipt(duplicate).await });
+        tokio::time::timeout(Duration::from_secs(1), hook.active_lock_reached.notified())
+            .await
+            .expect("duplicate admission should reach the active lock hook");
+
+        let transition_manager = manager.clone();
+        let transition_storage = storage.clone();
+        let (attempting_active_tx, attempting_active_rx) = tokio::sync::oneshot::channel();
+        let (active_acquired_tx, mut active_acquired_rx) = tokio::sync::oneshot::channel();
+        let transition = tokio::spawn(async move {
+            let _ = attempting_active_tx.send(());
+            let mut active = transition_manager.active_heals.lock().await;
+            let _ = active_acquired_tx.send(());
+            let mut queue = transition_manager.heal_queue.lock().await;
+            let request = queue.pop_next().expect("original request should remain queued");
+            let task = Arc::new(HealTask::from_request(request, transition_storage));
+            active.insert(task.id.clone(), task);
+        });
+        tokio::time::timeout(Duration::from_secs(1), attempting_active_rx)
+            .await
+            .expect("transition should attempt the active lock")
+            .expect("transition attempt signal should be delivered");
+        assert!(matches!(
+            active_acquired_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        hook.active_lock_release.notify_one();
+        let receipt = tokio::time::timeout(Duration::from_secs(1), duplicate_task)
+            .await
+            .expect("duplicate admission should not hang")
+            .expect("duplicate task should join")
+            .expect("duplicate admission should succeed");
+        tokio::time::timeout(Duration::from_secs(1), transition)
+            .await
+            .expect("queue to active transition should not hang")
+            .expect("queue to active transition should join");
+        *DUPLICATE_ADMISSION_TEST_HOOK.lock().await = None;
+
+        assert_eq!(receipt.result, HealAdmissionResult::Merged);
+        assert_eq!(receipt.task_id, original_id);
+        assert_eq!(manager.get_queue_length().await, 0);
+        assert_eq!(manager.get_active_task_count().await, 1);
     }
 
     #[tokio::test]
