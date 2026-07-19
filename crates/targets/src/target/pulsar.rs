@@ -25,7 +25,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store, redacted_secret,
+        persist_queued_payload_to_store, redacted_secret, sanitize_queue_dir_component,
     },
 };
 use async_trait::async_trait;
@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, instrument};
 use url::Url;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PulsarArgs {
@@ -154,6 +155,15 @@ pub fn validate_pulsar_broker(broker: &str) -> Result<Url, TargetError> {
     }
 
     Ok(url)
+}
+
+fn pulsar_producer_name(target_id: &TargetID, target_type: TargetType, nonce: Uuid) -> String {
+    let target_type = match target_type {
+        TargetType::NotifyEvent => "notify",
+        TargetType::AuditLog => "audit",
+    };
+
+    format!("rustfs-{target_type}-pulsar-{}-{nonce}", sanitize_queue_dir_component(&target_id.id))
 }
 
 pub async fn connect_pulsar(args: &PulsarArgs) -> Result<Pulsar<TokioExecutor>, TargetError> {
@@ -307,7 +317,7 @@ where
         let producer = client
             .producer()
             .with_topic(self.args.topic.clone())
-            .with_name(self.id.id.clone())
+            .with_name(pulsar_producer_name(&self.id, self.args.target_type, Uuid::new_v4()))
             .build()
             .await
             .map_err(|e| TargetError::Network(format!("Failed to create Pulsar producer: {e}")))?;
@@ -572,5 +582,71 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn pulsar_producer_name_keeps_target_context_and_unique_suffix() {
+        let id = TargetID::new("test2".to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let nonce = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+
+        let name = pulsar_producer_name(&id, TargetType::NotifyEvent, nonce);
+
+        assert_eq!(name, "rustfs-notify-pulsar-test2-12345678-90ab-cdef-1234-567890abcdef");
+    }
+
+    #[test]
+    fn pulsar_producer_name_includes_target_type() {
+        let id = TargetID::new("audit-target".to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let nonce = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+
+        let name = pulsar_producer_name(&id, TargetType::AuditLog, nonce);
+
+        assert_eq!(name, "rustfs-audit-pulsar-audit-target-12345678-90ab-cdef-1234-567890abcdef");
+    }
+
+    #[test]
+    fn pulsar_producer_name_sanitizes_target_id() {
+        let raw_target_id = "tenant:alpha/beta";
+        let id = TargetID::new(raw_target_id.to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let nonce = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+
+        let name = pulsar_producer_name(&id, TargetType::NotifyEvent, nonce);
+
+        assert!(!name.contains(':'));
+        assert!(!name.contains('/'));
+        assert_eq!(
+            name,
+            format!(
+                "rustfs-notify-pulsar-{}-12345678-90ab-cdef-1234-567890abcdef",
+                sanitize_queue_dir_component(raw_target_id)
+            )
+        );
+    }
+
+    #[test]
+    fn pulsar_producer_name_changes_for_each_producer_generation() {
+        let id = TargetID::new("test".to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let first = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+        let second = Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321);
+
+        assert_ne!(
+            pulsar_producer_name(&id, TargetType::NotifyEvent, first),
+            pulsar_producer_name(&id, TargetType::NotifyEvent, second)
+        );
+    }
+
+    #[test]
+    fn init_producer_uses_generated_unique_producer_name_contract() {
+        let source = include_str!("pulsar.rs");
+        let expected_name_call = [
+            ".with_name(",
+            "pulsar_producer_name(&self.id, self.args.target_type, Uuid::new_v4())",
+            ")",
+        ]
+        .concat();
+        let forbidden_target_id_call = [".with_name(", "self.id.id.clone()", ")"].concat();
+
+        assert!(source.contains(&expected_name_call));
+        assert!(!source.contains(&forbidden_target_id_call));
     }
 }
