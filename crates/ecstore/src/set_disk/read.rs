@@ -2540,20 +2540,27 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
-    async fn get_object_metadata_cache_invalidation_removes_object_entry() {
+    async fn metadata_cache_per_key_invalidation_physically_reclaims_retired_generation() {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
 
-        let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("metadata cache generation should be active");
+        let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
             .await;
+        set.get_object_metadata_cache.run_pending_tasks().await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 1);
 
         set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        set.get_object_metadata_cache.run_pending_tasks().await;
         assert!(
-            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
-            "explicit invalidation must remove the cached object metadata"
+            set.get_object_metadata_cache.get(&retired_key).await.is_none(),
+            "per-key invalidation must physically remove the retired generation"
         );
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
     }
 
     #[tokio::test]
@@ -2705,6 +2712,77 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    async fn metadata_cache_generation_isolated_between_set_instances() {
+        let first = new_metadata_cache_test_set().await;
+        let second = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let first_generation = first.get_object_metadata_cache_generation("bucket", "object");
+        let second_generation = second.get_object_metadata_cache_generation("bucket", "object");
+        first
+            .cache_get_object_fileinfo(("bucket", "object"), first_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        second
+            .cache_get_object_fileinfo(("bucket", "object"), second_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+
+        first.invalidate_get_object_metadata_cache("bucket", "object").await;
+
+        assert!(first.cached_get_object_fileinfo("bucket", "object").await.is_none());
+        assert!(second.cached_get_object_fileinfo("bucket", "object").await.is_some());
+        assert_eq!(second.get_object_metadata_cache_generation("bucket", "object"), second_generation);
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_cached_hash_collision_preserves_full_identity() {
+        let set = new_metadata_cache_test_set().await;
+        let generation = set
+            .get_object_metadata_cache_generation("bucket-a", "object-a")
+            .expect("metadata cache generation should be active");
+        let first_key = GetObjectMetadataCacheKey::new("bucket-a", "object-a", generation);
+        let second_key = GetObjectMetadataCacheKey {
+            bucket: Arc::from("bucket-b"),
+            object: Arc::from("object-b"),
+            generation: generation.value,
+            hash: generation.hash,
+        };
+        let first_fi = valid_test_fileinfo("object-a");
+        let second_fi = valid_test_fileinfo("object-b");
+        let entry = |fi: FileInfo| {
+            Arc::new(GetObjectMetadataCacheEntry {
+                created_at: Instant::now(),
+                parts_metadata: vec![fi.clone()],
+                fi,
+                online_disks: Vec::new(),
+                read_quorum: 0,
+            })
+        };
+
+        set.get_object_metadata_cache.insert(first_key.clone(), entry(first_fi)).await;
+        set.get_object_metadata_cache
+            .insert(second_key.clone(), entry(second_fi))
+            .await;
+
+        assert_eq!(
+            set.get_object_metadata_cache
+                .get(&first_key)
+                .await
+                .expect("first colliding entry should remain addressable")
+                .fi
+                .name,
+            "object-a"
+        );
+        assert_eq!(
+            set.get_object_metadata_cache
+                .get(&second_key)
+                .await
+                .expect("second colliding entry should remain addressable")
+                .fi
+                .name,
+            "object-b"
+        );
+    }
+
+    #[tokio::test]
     async fn metadata_cache_generation_overflow_fails_closed() {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
@@ -2741,6 +2819,62 @@ mod metadata_cache_tests {
         set.cache_get_object_fileinfo(("bucket", "object"), stale_generation, &fi, std::slice::from_ref(&fi), &[], 0)
             .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_invalidate_all_physically_reclaims_retired_generations() {
+        let set = new_metadata_cache_test_set().await;
+        let mut retired_keys = Vec::new();
+        for object in ["object-a", "object-b", "object-c"] {
+            let fi = valid_test_fileinfo(object);
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", object)
+                .expect("metadata cache generation should be active");
+            retired_keys.push(GetObjectMetadataCacheKey::new("bucket", object, generation));
+            set.cache_get_object_fileinfo(("bucket", object), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
+                .await;
+        }
+        set.get_object_metadata_cache.run_pending_tasks().await;
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 3);
+
+        set.invalidate_all_get_object_metadata_cache();
+        set.get_object_metadata_cache.run_pending_tasks().await;
+
+        for key in retired_keys {
+            assert!(
+                set.get_object_metadata_cache.get(&key).await.is_none(),
+                "invalidate-all must physically remove every retired generation"
+            );
+        }
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_invalidate_all_at_max_fails_closed_and_clears_entries() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("metadata cache generation should be active");
+        let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        for fence in set.get_object_metadata_cache_generations.iter() {
+            fence.store(u64::MAX, Ordering::Release);
+        }
+
+        set.invalidate_all_get_object_metadata_cache();
+        set.get_object_metadata_cache.run_pending_tasks().await;
+
+        assert!(
+            set.get_object_metadata_cache_generations
+                .iter()
+                .all(|fence| fence.load(Ordering::Acquire) == u64::MAX),
+            "invalidate-all must not wrap a saturated fence"
+        );
+        assert_eq!(set.get_object_metadata_cache_generation("bucket", "object"), None);
+        assert!(set.get_object_metadata_cache.get(&retired_key).await.is_none());
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
     }
 
     #[tokio::test]

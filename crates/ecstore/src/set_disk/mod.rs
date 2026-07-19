@@ -628,6 +628,8 @@ pub(crate) use ops::object::body_cache_plaintext_len;
 mod read;
 mod replication;
 pub(crate) mod shard_source;
+#[cfg(all(test, feature = "test-util"))]
+mod transition_matrix_tests;
 
 pub use ops::heal_walk::HealWalkVersion;
 

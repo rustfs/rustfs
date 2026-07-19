@@ -3465,6 +3465,126 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     }
 }
 
+#[cfg(test)]
+mod metadata_mutation_generation_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::DiskAPI as _;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+    async fn put_and_prime(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        payload: &[u8],
+    ) -> (ObjectInfo, GetObjectMetadataCacheKey) {
+        let mut reader = PutObjReader::from_vec(payload.to_vec());
+        let info = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("test object should be written");
+        set_disks
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+            .expect("test object metadata should resolve");
+        let generation = set_disks
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("metadata cache generation should be active");
+        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        assert!(
+            set_disks.get_object_metadata_cache.get(&key).await.is_some(),
+            "metadata priming should publish the current generation"
+        );
+        (info, key)
+    }
+
+    async fn assert_retired(set_disks: &SetDisks, key: &GetObjectMetadataCacheKey) {
+        set_disks.get_object_metadata_cache.run_pending_tasks().await;
+        assert!(
+            set_disks.get_object_metadata_cache.get(key).await.is_none(),
+            "the mutation must physically retire the prior metadata generation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(metadata_cache_invalidation_probe)]
+    async fn metadata_semantic_mutation_generation_matrix_retires_cached_snapshot() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "metadata-mutation-generation-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let put_object = "put-object";
+        let (_, put_key) = put_and_prime(&set_disks, bucket, put_object, b"initial PUT body").await;
+        let put_probe = MetadataCacheInvalidationProbe::install(bucket, put_object);
+        let mut replacement = PutObjReader::from_vec(b"replacement PUT body".to_vec());
+        set_disks
+            .put_object(bucket, put_object, &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("replacement PUT should succeed");
+        assert_eq!(put_probe.count(), 2, "PUT must invalidate before mutation and after commit");
+        assert_retired(&set_disks, &put_key).await;
+        drop(put_probe);
+
+        let delete_object = "delete-object";
+        let (_, delete_key) = put_and_prime(&set_disks, bucket, delete_object, b"DELETE body").await;
+        let delete_probe = MetadataCacheInvalidationProbe::install(bucket, delete_object);
+        set_disks
+            .delete_object(bucket, delete_object, ObjectOptions::default())
+            .await
+            .expect("DELETE should succeed");
+        assert_eq!(delete_probe.count(), 2, "DELETE must invalidate before mutation and after commit");
+        assert_retired(&set_disks, &delete_key).await;
+        drop(delete_probe);
+
+        let copy_object = "copy-object";
+        let (mut copy_info, copy_key) = put_and_prime(&set_disks, bucket, copy_object, b"COPY body").await;
+        copy_info.metadata_only = true;
+        Arc::make_mut(&mut copy_info.user_defined).insert("x-amz-meta-copy".to_string(), "updated".to_string());
+        let copy_probe = MetadataCacheInvalidationProbe::install(bucket, copy_object);
+        set_disks
+            .copy_object(
+                bucket,
+                copy_object,
+                bucket,
+                copy_object,
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("metadata COPY should succeed");
+        assert_eq!(
+            copy_probe.count(),
+            4,
+            "metadata COPY must retain both outer and update-object-meta fences"
+        );
+        assert_retired(&set_disks, &copy_key).await;
+        drop(copy_probe);
+
+        let metadata_object = "metadata-object";
+        let (_, metadata_key) = put_and_prime(&set_disks, bucket, metadata_object, b"metadata body").await;
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-meta-updated".to_string(), "true".to_string());
+        let metadata_opts = ObjectOptions {
+            eval_metadata: Some(metadata),
+            ..Default::default()
+        };
+        let metadata_probe = MetadataCacheInvalidationProbe::install(bucket, metadata_object);
+        set_disks
+            .put_object_metadata(bucket, metadata_object, &metadata_opts)
+            .await
+            .expect("metadata PUT should succeed");
+        assert_eq!(
+            metadata_probe.count(),
+            4,
+            "metadata PUT must retain both outer and update-object-meta fences"
+        );
+        assert_retired(&set_disks, &metadata_key).await;
+    }
+}
+
 #[cfg(all(test, feature = "test-util"))]
 mod transition_commit_failure_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
@@ -3951,6 +4071,133 @@ mod transition_upload_integrity_tests {
         assert_eq!(removed_versions[0].1, "opaque-version-token");
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod transition_source_identity_matrix_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+    use crate::disk::DiskAPI as _;
+    use crate::services::tier::test_util::register_mock_tier;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transition_source_identity_field_matrix_rejects_single_field_drift() {
+        #[derive(Clone, Copy, Debug)]
+        enum IdentityField {
+            VersionId,
+            DataDir,
+            ModTime,
+            Size,
+            Etag,
+        }
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-identity-matrix-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+
+        for (index, field) in [
+            IdentityField::VersionId,
+            IdentityField::DataDir,
+            IdentityField::ModTime,
+            IdentityField::Size,
+            IdentityField::Etag,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let object = format!("identity-{index}.bin");
+            let payload = vec![u8::try_from(index + 1).expect("matrix index should fit u8"); 1024 * 1024];
+            let mut reader = PutObjReader::from_vec(payload);
+            let original = set_disks
+                .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("source object should be written");
+            let (source, _, _) = set_disks
+                .get_object_fileinfo(bucket, &object, &ObjectOptions::default(), true, false)
+                .await
+                .expect("source metadata should resolve");
+            let opts = ObjectOptions {
+                no_lock: true,
+                transition: TransitionOptions {
+                    status: TRANSITION_PENDING.to_string(),
+                    tier: tier_name.clone(),
+                    etag: original.etag.clone().unwrap_or_default(),
+                    ..Default::default()
+                },
+                version_id: original.version_id.map(|version| version.to_string()),
+                mod_time: original.mod_time,
+                ..Default::default()
+            };
+            let put_barrier = backend.arm_put_barrier().await;
+            let transition_set = Arc::clone(&set_disks);
+            let transition_object = object.clone();
+            let transition =
+                tokio::spawn(async move { transition_set.transition_object(bucket, &transition_object, &opts).await });
+            put_barrier.wait_until_paused().await;
+
+            let mut changed = source.clone();
+            match field {
+                IdentityField::VersionId => changed.version_id = Some(Uuid::new_v4()),
+                IdentityField::DataDir => changed.data_dir = Some(Uuid::new_v4()),
+                IdentityField::ModTime => {
+                    changed.mod_time = changed.mod_time.map(|value| value + time::Duration::nanoseconds(1));
+                }
+                IdentityField::Size => changed.size += 1,
+                IdentityField::Etag => {
+                    changed.metadata.insert("etag".to_string(), format!("changed-{index}"));
+                }
+            }
+            for disk in &disk_stores {
+                disk.write_metadata("", bucket, &object, changed.clone())
+                    .await
+                    .expect("single-field metadata drift should be written");
+            }
+            put_barrier.release();
+
+            transition
+                .await
+                .expect("transition task should not panic")
+                .expect_err("transition must reject a source whose identity changed after upload");
+            let expected_attempts = index + 1;
+            assert_eq!(backend.put_count().await, expected_attempts);
+            assert_eq!(backend.remove_count().await, expected_attempts);
+            assert_eq!(
+                backend.remove_versions().await,
+                backend.put_versions().await,
+                "rejected identity drift must remove the exact uploaded version"
+            );
+
+            match field {
+                IdentityField::VersionId => assert_ne!(source.version_id, changed.version_id),
+                IdentityField::DataDir => assert_ne!(source.data_dir, changed.data_dir),
+                IdentityField::ModTime => assert_ne!(source.mod_time, changed.mod_time),
+                IdentityField::Size => assert_ne!(source.size, changed.size),
+                IdentityField::Etag => assert_ne!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata)),
+            }
+            if !matches!(field, IdentityField::VersionId) {
+                assert_eq!(source.version_id, changed.version_id);
+            }
+            if !matches!(field, IdentityField::DataDir) {
+                assert_eq!(source.data_dir, changed.data_dir);
+            }
+            if !matches!(field, IdentityField::ModTime) {
+                assert_eq!(source.mod_time, changed.mod_time);
+            }
+            if !matches!(field, IdentityField::Size) {
+                assert_eq!(source.size, changed.size);
+            }
+            if !matches!(field, IdentityField::Etag) {
+                assert_eq!(get_raw_etag(&source.metadata), get_raw_etag(&changed.metadata));
+            }
+        }
     }
 }
 
