@@ -228,6 +228,16 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
     filter
 }
 
+/// Build the filter used exclusively by the OTLP trace exporter.
+///
+/// Trace collection must not depend on the log sink's severity: production
+/// deployments commonly run with `RUST_LOG=warn` or `error` while still
+/// expecting request spans to be exported. RustFS operation spans are emitted
+/// at `info`, so retain that level regardless of `RUST_LOG`.
+pub(super) fn build_trace_filter() -> EnvFilter {
+    EnvFilter::new("info")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +351,13 @@ mod tests {
                 "expected EnvFilter to reflect RUST_LOG=warn; got `{}`",
                 filter_str
             );
+        });
+    }
+
+    #[test]
+    fn trace_filter_ignores_rust_log_severity() {
+        temp_env::with_var("RUST_LOG", Some("error"), || {
+            assert_eq!(build_trace_filter().to_string(), "info");
         });
     }
 

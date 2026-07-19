@@ -65,6 +65,7 @@ mod global;
 mod logging;
 pub mod metrics;
 pub mod semconv;
+mod task;
 mod telemetry;
 
 pub use cleaner::*;
@@ -79,7 +80,8 @@ pub use metrics::{
     MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_runtime,
     metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
 };
-pub use semconv::{ErrorClass, Operation, ResultClass, Stage, observe_operation, stage_span};
+pub use semconv::{ErrorClass, Operation, ResultClass, Stage, StreamDirection, observe_operation, stage_span, stream_span};
+pub use task::spawn_traced;
 pub use telemetry::{OtelGuard, Recorder};
 
 // Dial9 Tokio runtime telemetry

@@ -338,6 +338,7 @@ impl DefaultMultipartUsecase {
         // abort operations to avoid leaking information about upload_id format requirements.
         match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcWrite))
             .await
         {
             Ok(_) => {
@@ -382,7 +383,11 @@ impl DefaultMultipartUsecase {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
             };
 
-            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+            match store
+                .get_object_info(&bucket, &key, &ObjectOptions::default())
+                .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::Metadata))
+                .await
+            {
                 Ok(info) => {
                     if !info.delete_marker {
                         if let Some(ifmatch) = if_match
@@ -448,7 +453,11 @@ impl DefaultMultipartUsecase {
                 .await
                 .map_err(ApiError::from)?,
         );
-        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+        let previous_current_size = match store
+            .get_object_info(&bucket, &key, &current_opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::Metadata))
+            .await
+        {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info, &current_opts)?;
                 Some(existing_obj_info.size.max(0) as u64)
@@ -463,6 +472,7 @@ impl DefaultMultipartUsecase {
 
         let multipart_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::Metadata))
             .await
             .map_err(ApiError::from)?;
         let cache_adapter = self.object_data_cache();
@@ -756,6 +766,7 @@ impl DefaultMultipartUsecase {
             checksum_type,
         } = store
             .new_multipart_upload(&bucket, &key, &opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::Metadata))
             .await
             .map_err(ApiError::from)?;
 
@@ -827,6 +838,7 @@ impl DefaultMultipartUsecase {
         let mut opts = ObjectOptions::default();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::Metadata))
             .await
             .map_err(ApiError::from)?;
 
@@ -969,6 +981,7 @@ impl DefaultMultipartUsecase {
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
             .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcWrite))
+            .instrument(rustfs_obs::stream_span(rustfs_obs::StreamDirection::Ingress, actual_size, buffer_size))
             .await
             .map_err(ApiError::from)?;
 
@@ -1134,6 +1147,7 @@ impl DefaultMultipartUsecase {
 
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::Metadata))
             .await
             .map_err(ApiError::from)?;
 
@@ -1154,6 +1168,7 @@ impl DefaultMultipartUsecase {
 
         let src_reader = store
             .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcRead))
             .await
             .map_err(map_get_object_reader_error)?;
 
@@ -1210,6 +1225,7 @@ impl DefaultMultipartUsecase {
 
         let src_reader = store
             .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcRead))
             .await
             .map_err(map_get_object_reader_error)?;
         let src_stream = src_reader.stream;
@@ -1335,7 +1351,8 @@ impl DefaultMultipartUsecase {
 
         let part_info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &dst_opts)
-            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcRead))
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcWrite))
+            .instrument(rustfs_obs::stream_span(rustfs_obs::StreamDirection::Copy, actual_size, 0))
             .await
             .map_err(ApiError::from)?;
 

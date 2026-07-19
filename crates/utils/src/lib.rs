@@ -52,6 +52,7 @@ pub mod crypto;
 pub mod compress;
 
 pub mod logging;
+pub mod trace_attributes;
 
 #[cfg(feature = "path")]
 pub mod dirs;

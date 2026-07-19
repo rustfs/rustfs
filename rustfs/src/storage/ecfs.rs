@@ -1589,6 +1589,6 @@ impl S3 for FS {
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         record_s3_op(S3Operation::UploadPartCopy);
         let usecase = s3_api::multipart_usecase_for(self);
-        Box::pin(usecase.execute_upload_part_copy(req)).await
+        observe_operation(ObsOperation::UploadPartCopy, Box::pin(usecase.execute_upload_part_copy(req))).await
     }
 }

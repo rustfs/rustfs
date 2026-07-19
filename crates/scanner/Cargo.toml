@@ -52,6 +52,7 @@ rand = { workspace = true }
 s3s = { workspace = true }
 metrics = { workspace = true }
 rustfs-data-usage = { workspace = true }
+rustfs-obs = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

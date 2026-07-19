@@ -786,7 +786,7 @@ impl ScannerIO for ECStore {
                 let (tx, mut rx) = mpsc::channel::<DataUsageCache>(1);
 
                 // Spawn task to receive and store results
-                let receiver_fut = tokio::spawn(async move {
+                let receiver_fut = rustfs_obs::spawn_traced(async move {
                     while let Some(result) = rx.recv().await {
                         let mut results = results_mutex_clone.lock().await;
                         results[results_index_clone] = result;
@@ -797,7 +797,7 @@ impl ScannerIO for ECStore {
                 let scan_plan =
                     ScannerBucketScanPlan::new(all_buckets.clone(), dirty_usage_buckets.clone(), failed_dirty_buckets.clone());
                 // Spawn task to run the scanner
-                let scanner_fut = tokio::spawn(async move {
+                let scanner_fut = rustfs_obs::spawn_traced(async move {
                     let permit_wait = child_token_clone.clone();
                     let permit_wait_start = Instant::now();
                     let _permit = tokio::select! {
@@ -871,7 +871,7 @@ impl ScannerIO for ECStore {
         let budget_for_updates = budget.clone();
         let child_token_for_updates = child_token.clone();
         let dirty_usage_buckets_for_updates = dirty_usage_buckets.clone();
-        tokio::spawn(async move {
+        rustfs_obs::spawn_traced(async move {
             let mut last_update = SystemTime::UNIX_EPOCH;
             let mut has_sent_once = false;
 
@@ -1089,7 +1089,7 @@ impl ScannerIOCache for SetDisks {
         let ctx_clone = ctx.clone();
         let completed_bucket_count = Arc::new(AtomicUsize::new(0));
         let completed_bucket_count_clone = completed_bucket_count.clone();
-        let collect_bucket_results_fut = tokio::spawn(async move {
+        let collect_bucket_results_fut = rustfs_obs::spawn_traced(async move {
             let mut cancelled = false;
 
             loop {
@@ -1127,7 +1127,7 @@ impl ScannerIOCache for SetDisks {
             let pool_label_clone = pool_label.clone();
             let set_label_clone = set_label.clone();
             let failed_dirty_buckets_clone = failed_dirty_buckets.clone();
-            futs.push(tokio::spawn(async move {
+            futs.push(rustfs_obs::spawn_traced(async move {
                 loop {
                     let Some(bucket) = bucket_rx_mutex_clone.lock().await.recv().await else {
                         break;

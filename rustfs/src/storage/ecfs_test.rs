@@ -35,15 +35,21 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, FilterRule, FilterRuleName,
-        GetBucketAclInput, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput,
-        LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
-        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
-        PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput, PutObjectLockConfigurationInput, PutObjectRetentionInput,
-        PutObjectTaggingInput, QueueConfiguration, S3KeyFilter, Tag, Tagging, TopicConfiguration,
+        CORSConfiguration, CORSRule, CopySource, DefaultRetention, DeleteObjectTaggingInput, Delimiter, FilterRule,
+        FilterRuleName, GetBucketAclInput, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput,
+        GetObjectTaggingInput, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration,
+        ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode,
+        ObjectLockRule, PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput, PutObjectLockConfigurationInput,
+        PutObjectRetentionInput, PutObjectTaggingInput, QueueConfiguration, S3KeyFilter, Tag, Tagging, TopicConfiguration,
+        UploadPartCopyInput,
     };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+    use tracing_subscriber::{Layer, Registry, layer::SubscriberExt};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -56,6 +62,27 @@ mod tests {
             region: None,
             service: None,
             trailing_headers: None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct OperationSpanLayer {
+        seen: Arc<AtomicBool>,
+    }
+
+    impl<S> Layer<S> for OperationSpanLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _: &tracing::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "rustfs.s3.operation" {
+                self.seen.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -86,6 +113,30 @@ mod tests {
 
         // Both should be equivalent (since FS is currently empty)
         assert_eq!(format!("{fs:?}"), format!("{cloned_fs:?}"));
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_starts_an_operation_span() {
+        let seen = Arc::new(AtomicBool::new(false));
+        let subscriber = Registry::default().with(OperationSpanLayer { seen: seen.clone() });
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let fs = FS::new();
+        let input = UploadPartCopyInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .copy_source(CopySource::Bucket {
+                bucket: "src-bucket".into(),
+                key: "src-object".into(),
+                version_id: None,
+            })
+            .part_number(1)
+            .upload_id("upload-id".to_string())
+            .build()
+            .expect("valid UploadPartCopy request");
+
+        let _ = fs.upload_part_copy(build_request(input, Method::PUT)).await;
+
+        assert!(seen.load(Ordering::Relaxed));
     }
 
     #[test]

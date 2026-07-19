@@ -24,6 +24,7 @@ use super::super::*;
 use std::future::Future;
 use std::time::Duration;
 use tokio::task::JoinSet;
+use tracing::Instrument as _;
 
 fn map_upload_id_metadata_error(bucket: &str, object: &str, upload_id: &str, err: DiskError) -> Error {
     if err == DiskError::FileNotFound {
@@ -353,6 +354,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
+        let ec_write_span = tracing::info_span!(
+            "rustfs.ec.write",
+            event = "rustfs_ec_write",
+            component = "ecstore",
+            "rustfs.ec.data_shards" = fi.erasure.data_blocks,
+            "rustfs.ec.parity_shards" = fi.erasure.parity_blocks,
+            "rustfs.ec.write_quorum" = write_quorum,
+            "rustfs.ec.block_bytes" = fi.erasure.block_size,
+            "rustfs.distribution.targets" = shuffle_disks.len(),
+            "rustfs.distribution.transport" = "erasure"
+        );
         let result: Result<PartInfo> = async {
             let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
@@ -436,19 +448,29 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             rustfs_io_metrics::record_put_object_path(write_path.multipart_metric_label());
             let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-            let (reader, w_size) = match write_path {
-                SmallWritePath::SingleBlockNonInline => {
-                    Arc::new(erasure)
-                        .encode_single_block_non_inline(stream, &mut writers, write_quorum)
-                        .await?
+            let (reader, w_size) = async {
+                match write_path {
+                    SmallWritePath::SingleBlockNonInline => {
+                        Arc::new(erasure)
+                            .encode_single_block_non_inline(stream, &mut writers, write_quorum)
+                            .await
+                    }
+                    SmallWritePath::PipelineBatchedLarge => {
+                        Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await
+                    }
+                    SmallWritePath::Inline | SmallWritePath::Pipeline => {
+                        Arc::new(erasure).encode(stream, &mut writers, write_quorum).await
+                    }
                 }
-                SmallWritePath::PipelineBatchedLarge => {
-                    Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await?
-                }
-                SmallWritePath::Inline | SmallWritePath::Pipeline => {
-                    Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
-                }
-            };
+            }
+            .instrument(tracing::info_span!(
+                "rustfs.ec.distribute",
+                event = "rustfs_ec_distribute",
+                component = "ecstore",
+                "rustfs.distribution.targets" = shuffle_disks.len(),
+                "rustfs.distribution.transport" = "erasure"
+            ))
+            .await?;
 
             if let Some(stage_start) = encode_stage_start {
                 rustfs_io_metrics::record_put_object_stage_duration(
@@ -576,6 +598,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             Ok(ret)
         }
+        .instrument(ec_write_span)
         .await;
 
         if result.is_err()
@@ -1512,8 +1535,37 @@ mod tests {
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use rustfs_lock::{LockClient, client::local::LocalClient};
     use serial_test::serial;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use tempfile::TempDir;
     use tokio::sync::RwLock;
+    use tracing_subscriber::{Layer, Registry, layer::SubscriberExt};
+
+    const EC_WRITE_SPAN_SEEN: u8 = 1;
+    const EC_DISTRIBUTE_SPAN_SEEN: u8 = 2;
+
+    #[derive(Clone)]
+    struct EcWriteSpanLayer {
+        seen: Arc<AtomicU8>,
+    }
+
+    impl<S> Layer<S> for EcWriteSpanLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _: &tracing::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let flag = match attrs.metadata().name() {
+                "rustfs.ec.write" => EC_WRITE_SPAN_SEEN,
+                "rustfs.ec.distribute" => EC_DISTRIBUTE_SPAN_SEEN,
+                _ => return,
+            };
+            self.seen.fetch_or(flag, Ordering::Relaxed);
+        }
+    }
 
     async fn non_trash_tmp_entries(temp_dirs: &[TempDir]) -> Vec<String> {
         let mut leftovers = Vec::new();
@@ -1742,6 +1794,9 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_part_failure_cleans_tmp_workspace_inline() {
+        let seen = Arc::new(AtomicU8::new(0));
+        let dispatch = tracing::Dispatch::new(Registry::default().with(EcWriteSpanLayer { seen: Arc::clone(&seen) }));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "multipart-tmp-clean-bucket";
         let object = "object";
@@ -1764,6 +1819,12 @@ mod tests {
             .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
             .await
             .expect_err("short multipart stream should fail");
+
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            EC_WRITE_SPAN_SEEN | EC_DISTRIBUTE_SPAN_SEEN,
+            "multipart write must create EC write and distribution spans"
+        );
 
         let leftovers = non_trash_tmp_entries(&temp_dirs).await;
         assert!(

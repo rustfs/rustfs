@@ -188,7 +188,7 @@ pub fn spawn_traced<F>(fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(tracing::Instrument::instrument(fut, tracing::Span::current()));
+    rustfs_obs::spawn_traced(fut);
 }
 
 #[cfg(test)]

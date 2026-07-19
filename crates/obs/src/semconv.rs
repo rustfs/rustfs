@@ -6,6 +6,7 @@
 
 use metrics::{Gauge, counter, gauge, histogram};
 use opentelemetry::trace::Status;
+use rustfs_utils::trace_attributes;
 use std::future::Future;
 use std::time::Instant;
 use tracing::Instrument;
@@ -41,6 +42,7 @@ pub enum Operation {
     DeleteObject,
     CreateMultipartUpload,
     UploadPart,
+    UploadPartCopy,
     CompleteMultipartUpload,
     AbortMultipartUpload,
 }
@@ -60,6 +62,7 @@ impl Operation {
             Self::DeleteObject => "delete_object",
             Self::CreateMultipartUpload => "create_multipart_upload",
             Self::UploadPart => "upload_part",
+            Self::UploadPartCopy => "upload_part_copy",
             Self::CompleteMultipartUpload => "complete_multipart_upload",
             Self::AbortMultipartUpload => "abort_multipart_upload",
         }
@@ -77,6 +80,22 @@ pub enum Stage {
     Response,
     ReplicationDispatch,
     ReplicationRemote,
+}
+
+/// Bounded direction for a stream traversing the object pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamDirection {
+    Ingress,
+    Copy,
+}
+
+impl StreamDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingress => trace_attributes::stream_direction::INGRESS,
+            Self::Copy => trace_attributes::stream_direction::COPY,
+        }
+    }
 }
 
 impl Stage {
@@ -146,7 +165,25 @@ impl ErrorClass {
 
 /// Create a child span for a bounded internal stage.
 pub fn stage_span(stage: Stage) -> tracing::Span {
-    tracing::info_span!("rustfs.stage", event = "rustfs_stage", component = "storage", stage = stage.as_str())
+    tracing::info_span!(
+        "rustfs.stage",
+        event = "rustfs_stage",
+        component = "storage",
+        stage = stage.as_str(),
+        "rustfs.stage" = stage.as_str()
+    )
+}
+
+/// Create a child span for a request stream without exposing payload contents.
+pub fn stream_span(direction: StreamDirection, expected_bytes: i64, buffer_bytes: usize) -> tracing::Span {
+    tracing::info_span!(
+        "rustfs.stream",
+        event = "rustfs_stream",
+        component = "storage",
+        "rustfs.stream.direction" = direction.as_str(),
+        "rustfs.stream.expected_bytes" = expected_bytes,
+        "rustfs.stream.buffer_bytes" = buffer_bytes
+    )
 }
 
 /// Observe a complete S3 operation without exposing request data.
@@ -159,7 +196,8 @@ where
         "rustfs.s3.operation",
         event = "s3_operation",
         component = "storage",
-        operation = operation_name
+        operation = operation_name,
+        "rustfs.operation" = operation_name
     );
     let in_flight = gauge!(METRIC_REQUESTS_IN_FLIGHT, "operation" => operation_name);
     in_flight.increment(1.0);
@@ -218,8 +256,10 @@ mod tests {
     #[test]
     fn operation_names_are_stable_and_bounded() {
         assert_eq!(Operation::PutObject.as_str(), "put_object");
+        assert_eq!(Operation::UploadPartCopy.as_str(), "upload_part_copy");
         assert_eq!(Operation::CompleteMultipartUpload.as_str(), "complete_multipart_upload");
         assert_eq!(Stage::ReplicationRemote.as_str(), "replication_remote");
+        assert_eq!(StreamDirection::Ingress.as_str(), trace_attributes::stream_direction::INGRESS);
         assert_eq!(ErrorClass::Quorum.as_str(), "quorum_failed");
     }
 

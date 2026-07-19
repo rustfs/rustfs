@@ -3676,7 +3676,10 @@ impl DefaultObjectUsecase {
             );
             let previous_current_info = {
                 crate::hp_guard!("S3::put_object_prelookup");
-                store.get_object_info(&bucket, &key, &current_opts).await
+                store
+                    .get_object_info(&bucket, &key, &current_opts)
+                    .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::Metadata))
+                    .await
             };
             Some(match previous_current_info {
                 Ok(existing_obj_info) => {
@@ -3877,6 +3880,8 @@ impl DefaultObjectUsecase {
 
         let (obj_info, backfilled_old_current_size) = match store
             .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcWrite))
+            .instrument(rustfs_obs::stream_span(rustfs_obs::StreamDirection::Ingress, actual_size, buffer_size))
             .await
             .map_err(ApiError::from)
         {

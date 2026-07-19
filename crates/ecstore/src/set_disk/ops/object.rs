@@ -23,6 +23,7 @@ use super::super::*;
 
 use crate::disk::OldCurrentSize;
 use crate::object_api::GetObjectBodySource;
+use tracing::Instrument as _;
 
 /// Length of the full plaintext body when — and only when — this read's output
 /// is exactly the object's complete plaintext, so the app-layer body cache may
@@ -740,6 +741,17 @@ impl SetDisks {
 
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
+        let ec_write_span = tracing::info_span!(
+            "rustfs.ec.write",
+            event = "rustfs_ec_write",
+            component = "ecstore",
+            "rustfs.ec.data_shards" = data_drives,
+            "rustfs.ec.parity_shards" = parity_drives,
+            "rustfs.ec.write_quorum" = write_quorum,
+            "rustfs.ec.block_bytes" = fi.erasure.block_size,
+            "rustfs.distribution.targets" = shuffle_disks.len(),
+            "rustfs.distribution.transport" = "erasure"
+        );
         let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = async {
             let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
@@ -789,7 +801,15 @@ impl SetDisks {
                     }
                 })
                 .collect();
-            let writer_results = join_all(writer_futs).await;
+            let writer_results = join_all(writer_futs)
+                .instrument(tracing::info_span!(
+                    "rustfs.ec.distribute",
+                    event = "rustfs_ec_distribute",
+                    component = "ecstore",
+                    "rustfs.distribution.targets" = shuffle_disks.len(),
+                    "rustfs.distribution.transport" = "erasure"
+                ))
+                .await;
             let mut writers = Vec::with_capacity(writer_results.len());
             let mut errors = Vec::with_capacity(writer_results.len());
             for (w, e) in writer_results {
@@ -1139,6 +1159,7 @@ impl SetDisks {
                 old_current_size,
             ))
         }
+        .instrument(ec_write_span)
         .await;
 
         if issue3031_diag_enabled()

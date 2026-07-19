@@ -1,7 +1,45 @@
 {
     "version": "0.2.0",
     "configurations": [
-          {
+        {
+            "name": "Debug RustFS observability (OTLP)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=rustfs",
+                    "--package=rustfs"
+                ],
+                "filter": {
+                    "name": "rustfs",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "rustfs=debug,ecstore=info,s3s=info,iam=info",
+                "RUST_BACKTRACE": "full",
+                "RUSTFS_ACCESS_KEY": "rustfsadmin",
+                "RUSTFS_SECRET_KEY": "rustfsadmin",
+                "RUSTFS_VOLUMES": "./target/observability/data{1...4}",
+                "RUSTFS_ADDRESS": ":9000",
+                "RUSTFS_CONSOLE_ENABLE": "true",
+                "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
+                "RUSTFS_UNSAFE_BYPASS_DISK_CHECK": "true",
+                "RUSTFS_OBS_ENDPOINT": "http://127.0.0.1:4318",
+                "RUSTFS_OBS_TRACES_EXPORT_ENABLED": "true",
+                "RUSTFS_OBS_METRICS_EXPORT_ENABLED": "true",
+                "RUSTFS_OBS_LOGS_EXPORT_ENABLED": "true",
+                "RUSTFS_OBS_USE_STDOUT": "true",
+                "RUSTFS_OBS_LOG_DIRECTORY": "./target/observability/logs",
+                "RUSTFS_OBS_METER_INTERVAL": "5",
+                "RUSTFS_OBS_SERVICE_NAME": "rustfs-observability-local",
+                "RUSTFS_OBS_ENVIRONMENT": "development"
+            }
+        },
+        {
             "type": "lldb",
             "request": "launch",
             "name": "Debug(only) executable 'rustfs'",

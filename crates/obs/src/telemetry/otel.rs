@@ -39,7 +39,7 @@
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
-use crate::telemetry::filter::build_env_filter;
+use crate::telemetry::filter::{build_env_filter, build_trace_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
@@ -241,8 +241,10 @@ pub(super) fn init_observability_http(
     // ── Tracing subscriber registry ───────────────────────────────────────────
     let tracer_layer = tracer_provider
         .as_ref()
-        .map(|p| OpenTelemetryLayer::new(p.tracer(service_name.to_string())));
-    let metrics_layer = meter_provider.as_ref().map(|p| MetricsLayer::new(p.clone()));
+        .map(|p| OpenTelemetryLayer::new(p.tracer(service_name.to_string())).with_filter(build_trace_filter()));
+    let metrics_layer = meter_provider
+        .as_ref()
+        .map(|p| MetricsLayer::new(p.clone()).with_filter(build_env_filter(logger_level, None)));
 
     // Optional stdout mirror (matching init_file_logging_internal logic)
     // This is separate from OTLP stdout logic. If file logging is enabled, we honor its stdout rules.
@@ -253,12 +255,11 @@ pub(super) fn init_observability_http(
     }
     let local_file_fallback_enabled = file_layer_opt.is_some();
     let stdout_mirror_enabled = stdout_guard.is_some();
-    let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
-        .with(filter)
+        .with(build_trace_filter())
         .with(ErrorLayer::default())
-        .with(file_layer_opt)
-        .with(stdout_layer_opt)
+        .with(file_layer_opt.map(|layer| layer.with_filter(build_env_filter(logger_level, None))))
+        .with(stdout_layer_opt.map(|layer| layer.with_filter(build_env_filter(logger_level, None))))
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
