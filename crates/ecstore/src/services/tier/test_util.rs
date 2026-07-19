@@ -519,7 +519,7 @@ impl WarmBackend for MockWarmBackend {
     async fn in_use(&self) -> Result<bool, std::io::Error> {
         self.precondition().await?;
         self.record(MockWarmOp::InUse).await;
-        Ok(false)
+        Ok(!self.inner.objects.lock().await.is_empty())
     }
 }
 
@@ -558,7 +558,9 @@ pub async fn register_mock_tier_backend(handle: &Arc<RwLock<TierConfigMgr>>, tie
             ..Default::default()
         },
     );
-    tier_config_mgr.driver_cache.insert(tier_name.to_string(), Box::new(backend));
+    tier_config_mgr
+        .install_test_driver(tier_name, Box::new(backend))
+        .expect("mock tier driver should install");
 }
 
 /// The transition-state tuple read from an on-disk `xl.meta`, plus the object's

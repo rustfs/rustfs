@@ -21,9 +21,10 @@
 
 use super::super::*;
 
-use crate::bucket::lifecycle::tier_sweeper::delete_object_from_remote_tier_idempotent;
+use crate::bucket::lifecycle::tier_sweeper::delete_object_from_remote_tier_with_lease_idempotent;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
+use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 
 fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
     coding::Erasure::try_new_with_options(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size, uses_legacy)
@@ -401,7 +402,16 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             if object_info.parts.len() == 1 {
                 opts.part_number = Some(1);
             }
-            let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
+            let gr = get_transitioned_object_reader_with_tier_manager(
+                bucket,
+                object,
+                &range,
+                &h,
+                &object_info,
+                &opts,
+                &self.ctx.tier_config_mgr(),
+            )
+            .await?;
             return Ok(finish_set_disk_read_lock(
                 gr,
                 read_lock_guard.take(),
@@ -1242,10 +1252,11 @@ impl SetDisks {
     }
 }
 
-async fn cleanup_uncommitted_transition_upload(tier: &str, object: &str, remote_version: &str) {
-    if let Err(err) = delete_object_from_remote_tier_idempotent(object, remote_version, tier).await {
+async fn cleanup_uncommitted_transition_upload(lease: &TierOperationLease, object: &str, remote_version: &str) {
+    if let Err(err) = delete_object_from_remote_tier_with_lease_idempotent(object, remote_version, lease).await {
         warn!(
-            tier,
+            tier = lease.tier_name(),
+            tier_generation = lease.generation(),
             object,
             remote_version,
             error = ?err,
@@ -1255,16 +1266,16 @@ async fn cleanup_uncommitted_transition_upload(tier: &str, object: &str, remote_
 }
 
 struct TransitionUploadCleanup {
-    tier: String,
+    lease: TierOperationLease,
     object: String,
     remote_version: String,
     armed: bool,
 }
 
 impl TransitionUploadCleanup {
-    fn new(tier: &str, object: &str, remote_version: &str) -> Self {
+    fn new(lease: TierOperationLease, object: &str, remote_version: &str) -> Self {
         Self {
-            tier: tier.to_string(),
+            lease,
             object: object.to_string(),
             remote_version: remote_version.to_string(),
             armed: true,
@@ -1272,7 +1283,7 @@ impl TransitionUploadCleanup {
     }
 
     async fn cleanup(&mut self) {
-        cleanup_uncommitted_transition_upload(&self.tier, &self.object, &self.remote_version).await;
+        cleanup_uncommitted_transition_upload(&self.lease, &self.object, &self.remote_version).await;
         self.armed = false;
     }
 
@@ -1286,21 +1297,41 @@ impl Drop for TransitionUploadCleanup {
         if !self.armed {
             return;
         }
-        let tier = self.tier.clone();
+        let lease = match self.lease.try_clone() {
+            Ok(lease) => lease,
+            Err(err) => {
+                warn!(
+                    tier = self.lease.tier_name(),
+                    tier_generation = self.lease.generation(),
+                    object = self.object,
+                    error = ?err,
+                    "unable to retain tier lease for cancelled transition cleanup"
+                );
+                return;
+            }
+        };
         let object = self.object.clone();
         let remote_version = self.remote_version.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                cleanup_uncommitted_transition_upload(&tier, &object, &remote_version).await;
+                cleanup_uncommitted_transition_upload(&lease, &object, &remote_version).await;
             });
         }
     }
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransitionCommitPause {
+    BeforeLeaseCheck,
+    AfterLeaseCheck,
+}
+
+#[cfg(test)]
 struct TransitionCommitBarrierState {
     bucket: String,
     object: String,
+    pause: TransitionCommitPause,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -1317,9 +1348,18 @@ static TRANSITION_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Ar
 #[cfg(test)]
 impl TransitionCommitBarrier {
     fn install(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, TransitionCommitPause::BeforeLeaseCheck)
+    }
+
+    fn install_after_lease_check(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, TransitionCommitPause::AfterLeaseCheck)
+    }
+
+    fn install_at(bucket: &str, object: &str, pause: TransitionCommitPause) -> Self {
         let state = Arc::new(TransitionCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
+            pause,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -1359,13 +1399,13 @@ impl Drop for TransitionCommitBarrier {
 }
 
 #[cfg(test)]
-async fn pause_transition_before_local_commit(bucket: &str, object: &str) {
+async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCommitPause) {
     let barrier = TRANSITION_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("transition commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause == pause)
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -2391,9 +2431,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-        let mut tier_config_mgr = tier_config_mgr.write().await;
-        let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
+        let tier_config_mgr = self.ctx.tier_config_mgr();
+        let tgt_client = match TierConfigMgr::acquire_operation_lease(&tier_config_mgr, &opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
                 return Err(Error::other(format!("remote tier error: {err}")));
@@ -2525,17 +2564,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return Err(StorageError::Io(err));
         }
         let rv = rv?;
-        drop(tier_config_mgr);
-
         let transition_version_id = match parse_transition_version_id(&rv) {
             Ok(version_id) => version_id,
             Err(err) => {
-                cleanup_uncommitted_transition_upload(&opts.transition.tier, &dest_obj, &rv).await;
+                cleanup_uncommitted_transition_upload(&tgt_client, &dest_obj, &rv).await;
                 return Err(err.into());
             }
         };
         let cleanup_remote_version = transition_cleanup_remote_version(&rv, transition_version_id);
-        let mut upload_cleanup = TransitionUploadCleanup::new(&opts.transition.tier, &dest_obj, cleanup_remote_version);
+        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, cleanup_remote_version);
 
         let mut commit_opts = opts.clone();
         commit_opts.no_lock = true;
@@ -2580,6 +2617,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         current_fi.transitioned_objname = dest_obj;
         current_fi.transition_tier = opts.transition.tier.clone();
         current_fi.transition_version_id = transition_version_id;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut current_fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(upload_cleanup.lease.backend_identity()),
+        );
         fi = current_fi;
         let event_name = EventName::LifecycleTransition.as_str();
 
@@ -2595,7 +2637,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             });
         }
         #[cfg(test)]
-        pause_transition_before_local_commit(bucket, object).await;
+        pause_transition_commit(bucket, object, TransitionCommitPause::BeforeLeaseCheck).await;
+        if !upload_cleanup.lease.is_current_generation() {
+            drop(transition_lock_guard);
+            upload_cleanup.cleanup().await;
+            return Err(Error::other("remote tier configuration changed during transition"));
+        }
+        #[cfg(test)]
+        pause_transition_commit(bucket, object, TransitionCommitPause::AfterLeaseCheck).await;
         upload_cleanup.disarm();
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             warn!(
@@ -2687,7 +2736,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let mut opts = opts.clone();
             opts.part_number = Some(1);
             let rs: Option<HTTPRangeSpec> = None;
-            let gr = get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &opts).await;
+            let gr = get_transitioned_object_reader_with_tier_manager(
+                bucket,
+                object,
+                &rs,
+                &HeaderMap::new(),
+                &oi,
+                &opts,
+                &self_.ctx.tier_config_mgr(),
+            )
+            .await;
             if let Err(err) = gr {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
             }
@@ -2754,7 +2812,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     .await;
                 }
             };
-            let gr = match get_transitioned_object_reader(bucket, object, &rs, &HeaderMap::new(), &oi, &part_opts).await {
+            let gr = match get_transitioned_object_reader_with_tier_manager(
+                bucket,
+                object,
+                &rs,
+                &HeaderMap::new(),
+                &oi,
+                &part_opts,
+                &self_.ctx.tier_config_mgr(),
+            )
+            .await
+            {
                 Ok(reader) => reader,
                 Err(err) => {
                     return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
@@ -3024,7 +3092,8 @@ mod transition_commit_failure_tests {
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
     use crate::disk::DiskAPI as _;
-    use crate::services::tier::test_util::register_mock_tier;
+    use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
+    use crate::services::tier::tier::TierConfigMgr;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
     use tokio::io::AsyncReadExt;
@@ -3135,6 +3204,241 @@ mod transition_commit_failure_tests {
             .read_to_end(&mut restored)
             .await
             .expect("the local source body should drain");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn production_transition_replacement_revokes_commit_and_cleans_with_old_driver() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-generation-fence-bucket";
+        let object = "object.bin";
+        let payload = b"generation replacement must fence the local transition commit".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(payload);
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let manager = runtime_sources::global_tier_config_mgr();
+        let old_backend = register_mock_tier(&manager, &tier_name).await;
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.clone(),
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(old_backend.put_count().await, 1, "remote candidate must exist before replacement");
+
+        let replacement_backend = MockWarmBackend::new();
+        let replacement_manager = Arc::new(RwLock::new(TierConfigMgr {
+            driver_cache: HashMap::new(),
+            tiers: manager.read().await.tiers.clone(),
+            last_refreshed_at: OffsetDateTime::now_utc(),
+        }));
+        {
+            let mut replacement = replacement_manager.write().await;
+            replacement
+                .tiers
+                .get_mut(&tier_name)
+                .and_then(|tier| tier.minio.as_mut())
+                .expect("replacement tier should exist")
+                .prefix = "replacement/".to_string();
+            replacement
+                .install_test_driver(&tier_name, Box::new(replacement_backend))
+                .expect("replacement driver should install");
+        }
+        let replacement = match Arc::try_unwrap(replacement_manager) {
+            Ok(manager) => manager.into_inner(),
+            Err(_) => panic!("replacement manager should have one owner"),
+        };
+        let publish_handle = manager.clone();
+        let publish_tier = tier_name.clone();
+        let publish =
+            tokio::spawn(
+                async move { TierConfigMgr::publish_candidate(&publish_handle, replacement, Some(&publish_tier)).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match TierConfigMgr::acquire_operation_lease(&manager, &tier_name).await {
+                    Err(err) if err.message.contains("being replaced") => break,
+                    Ok(lease) => drop(lease),
+                    Err(err) => panic!("unexpected lease error while replacement drains: {err}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement should revoke the in-flight generation");
+        assert!(!publish.is_finished(), "replacement must wait for the production transition lease");
+
+        barrier.release();
+        transition
+            .await
+            .expect("transition task should join")
+            .expect_err("revoked generation must not commit tier-name metadata");
+        publish
+            .await
+            .expect("replacement task should join")
+            .expect("replacement should finish after old cleanup releases its lease");
+        assert_eq!(
+            old_backend.remove_count().await,
+            1,
+            "cancelled transition must clean up with the old driver"
+        );
+        assert_eq!(old_backend.object_count().await, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_reload_rejects_route_change_after_local_transition_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-post-check-fence-bucket";
+        let object = "object.bin";
+        let payload = b"the operation lease must cover the local transition commit".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let manager = runtime_sources::global_tier_config_mgr();
+        let old_backend = register_mock_tier(&manager, &tier_name).await;
+        let old_prefix = manager.read().await.tiers[&tier_name]
+            .minio
+            .as_ref()
+            .expect("old tier route should exist")
+            .prefix
+            .clone();
+        let old_identity = TierConfigMgr::acquire_operation_lease(&manager, &tier_name)
+            .await
+            .expect("old tier identity should be available")
+            .backend_identity();
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.clone(),
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install_after_lease_check(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(old_backend.put_count().await, 1, "remote candidate must exist before replacement");
+
+        let replacement_manager = Arc::new(RwLock::new(TierConfigMgr {
+            driver_cache: HashMap::new(),
+            tiers: manager.read().await.tiers.clone(),
+            last_refreshed_at: OffsetDateTime::now_utc(),
+        }));
+        {
+            let mut replacement = replacement_manager.write().await;
+            replacement
+                .tiers
+                .get_mut(&tier_name)
+                .and_then(|tier| tier.minio.as_mut())
+                .expect("replacement tier should exist")
+                .prefix = "replacement/".to_string();
+        }
+        let replacement = match Arc::try_unwrap(replacement_manager) {
+            Ok(manager) => manager.into_inner(),
+            Err(_) => panic!("replacement manager should have one owner"),
+        };
+        let publish_handle = manager.clone();
+        let publish = tokio::spawn(async move { publish_handle.write().await.publish_legacy_reload(replacement).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy reload should hold the manager guard while the checked generation drains");
+        assert!(
+            !publish.is_finished(),
+            "replacement must wait until the local transition commit releases its lease"
+        );
+
+        barrier.release();
+        transition
+            .await
+            .expect("transition task should join")
+            .expect("a transition linearized before replacement should commit");
+        publish
+            .await
+            .expect("replacement task should join")
+            .expect_err("replacement must not rebind a tier name referenced by the committed transition");
+        assert_eq!(old_backend.remove_count().await, 0, "committed transition data must not be cleaned up");
+        assert_eq!(old_backend.object_count().await, 1);
+        let transitioned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("transitioned metadata should resolve");
+        let expected_identity = rustfs_utils::crypto::hex(old_identity);
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_str(
+                &transitioned.user_defined,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            )
+            .as_deref(),
+            Some(expected_identity.as_str())
+        );
+        assert_eq!(
+            manager
+                .read()
+                .await
+                .tiers
+                .get(&tier_name)
+                .and_then(|tier| tier.minio.as_ref())
+                .expect("old tier route should remain configured")
+                .prefix,
+            old_prefix
+        );
+
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the transitioned object must remain routed through the old generation")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the transitioned object body should drain");
         assert_eq!(restored, payload);
     }
 }

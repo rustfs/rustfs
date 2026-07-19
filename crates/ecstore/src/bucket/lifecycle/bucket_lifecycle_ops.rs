@@ -29,7 +29,7 @@ use crate::bucket::lifecycle::replication_sink::{
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
+use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -38,7 +38,10 @@ use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
-use crate::services::tier::warm_backend::WarmBackendGetOpts;
+use crate::services::tier::{
+    tier::{TierConfigMgr, tier_destination_id_from_metadata},
+    warm_backend::WarmBackendGetOpts,
+};
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::storage_api_contracts::{
     lifecycle::ExpirationOptions,
@@ -402,6 +405,36 @@ impl ExpiryOp for FreeVersionTask {
     }
 }
 
+async fn delete_free_version_remote_object(
+    oi: &ObjectInfo,
+    tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+) -> Result<(), std::io::Error> {
+    let identity = tier_destination_id_from_metadata(&oi.user_defined)?
+        .ok_or_else(|| std::io::Error::other("tier free-version has no durable backend identity"))?;
+    delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+        &oi.transitioned_object.name,
+        &oi.transitioned_object.version_id,
+        &oi.transitioned_object.tier,
+        identity,
+        tier_config_mgr,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_free_version_remote_object_then<T, F, Fut>(
+    oi: &ObjectInfo,
+    tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+    delete_local: F,
+) -> Result<T, std::io::Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    delete_free_version_remote_object(oi, tier_config_mgr).await?;
+    Ok(delete_local().await)
+}
+
 struct NewerNoncurrentTask {
     bucket: String,
     versions: Vec<ObjectToDelete>,
@@ -680,13 +713,60 @@ impl ExpiryState {
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("FreeVersionTask downcast failed");
                         let oi = v.0.clone();
-                        if let Err(err) = delete_object_from_remote_tier_idempotent(
-                            &oi.transitioned_object.name,
-                            &oi.transitioned_object.version_id,
-                            &oi.transitioned_object.tier,
-                        )
-                        .await
-                        {
+                        let cleanup = delete_free_version_remote_object_then(&oi, &api.tier_config_mgr(), || async {
+                            let mut fi = FileInfo {
+                                name: oi.name.clone(),
+                                version_id: oi.version_id,
+                                deleted: true,
+                                ..Default::default()
+                            };
+                            fi.set_tier_free_version();
+
+                            let mut deleted_locally = false;
+                            for pool in api.pools.iter() {
+                                let set = pool.get_disks_by_key(&oi.name);
+                                match set.delete_object_version(&oi.bucket, &oi.name, &fi, false).await {
+                                    Ok(()) => {
+                                        deleted_locally = true;
+                                        break;
+                                    }
+                                    Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
+                                    Err(err) => {
+                                        debug!(
+                                            event = EVENT_LIFECYCLE_WORKER_STATE,
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                            bucket = %oi.bucket,
+                                            object = %oi.name,
+                                            remote_object = %oi.transitioned_object.name,
+                                            remote_version_id = %oi.transitioned_object.version_id,
+                                            tier = %oi.transitioned_object.tier,
+                                            error = ?err,
+                                            reason = "local_free_version_delete_failed",
+                                            "Lifecycle worker failed local free-version cleanup"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !deleted_locally {
+                                debug!(
+                                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                    bucket = %oi.bucket,
+                                    object = %oi.name,
+                                    remote_object = %oi.transitioned_object.name,
+                                    remote_version_id = %oi.transitioned_object.version_id,
+                                    tier = %oi.transitioned_object.tier,
+                                    reason = "local_free_version_missing",
+                                    "Lifecycle worker could not find transitioned free version locally"
+                                );
+                            }
+                        })
+                        .await;
+                        if let Err(err) = cleanup {
                             debug!(
                                 bucket = %oi.bucket,
                                 object = %oi.name,
@@ -701,57 +781,6 @@ impl ExpiryState {
                                 "Lifecycle worker skipped remote tier delete"
                             );
                             continue;
-                        }
-
-                        let mut fi = FileInfo {
-                            name: oi.name.clone(),
-                            version_id: oi.version_id,
-                            deleted: true,
-                            ..Default::default()
-                        };
-                        fi.set_tier_free_version();
-
-                        let mut deleted_locally = false;
-                        for pool in api.pools.iter() {
-                            let set = pool.get_disks_by_key(&oi.name);
-                            match set.delete_object_version(&oi.bucket, &oi.name, &fi, false).await {
-                                Ok(()) => {
-                                    deleted_locally = true;
-                                    break;
-                                }
-                                Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
-                                Err(err) => {
-                                    debug!(
-                                        event = EVENT_LIFECYCLE_WORKER_STATE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                        bucket = %oi.bucket,
-                                        object = %oi.name,
-                                        remote_object = %oi.transitioned_object.name,
-                                        remote_version_id = %oi.transitioned_object.version_id,
-                                        tier = %oi.transitioned_object.tier,
-                                        error = ?err,
-                                        reason = "local_free_version_delete_failed",
-                                        "Lifecycle worker failed local free-version cleanup"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !deleted_locally {
-                            debug!(
-                                event = EVENT_LIFECYCLE_WORKER_STATE,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                bucket = %oi.bucket,
-                                object = %oi.name,
-                                remote_object = %oi.transitioned_object.name,
-                                remote_version_id = %oi.transitioned_object.version_id,
-                                tier = %oi.transitioned_object.tier,
-                                reason = "local_free_version_missing",
-                                "Lifecycle worker could not find transitioned free version locally"
-                            );
                         }
                     }
                     else {
@@ -2444,8 +2473,27 @@ pub async fn get_transitioned_object_reader(
     opts: &ObjectOptions,
 ) -> Result<GetObjectReader, std::io::Error> {
     let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-    let mut tier_config_mgr = tier_config_mgr.write().await;
-    let tgt_client = match tier_config_mgr.get_driver(&oi.transitioned_object.tier).await {
+    get_transitioned_object_reader_with_tier_manager(bucket, object, rs, h, oi, opts, &tier_config_mgr).await
+}
+
+pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
+    bucket: &str,
+    object: &str,
+    rs: &Option<HTTPRangeSpec>,
+    h: &HeaderMap,
+    oi: &ObjectInfo,
+    opts: &ObjectOptions,
+    tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+) -> Result<GetObjectReader, std::io::Error> {
+    let expected_identity = tier_destination_id_from_metadata(&oi.user_defined)?;
+    let lease = match expected_identity {
+        Some(identity) => {
+            TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, &oi.transitioned_object.tier, identity)
+                .await
+        }
+        None => TierConfigMgr::acquire_operation_lease(tier_config_mgr, &oi.transitioned_object.tier).await,
+    };
+    let tgt_client = match lease {
         Ok(d) => d,
         Err(err) => return Err(std::io::Error::other(err)),
     };
@@ -3081,6 +3129,8 @@ mod tests {
         select_restore_s3_location, should_defer_date_expiry_for_recent_config_update,
         should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
     };
+    #[cfg(feature = "test-util")]
+    use super::{delete_free_version_remote_object_then, get_transitioned_object_reader_with_tier_manager};
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
@@ -3120,6 +3170,233 @@ mod tests {
     use tokio::fs;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn free_version_remote_delete_requires_persisted_destination_identity() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        let old_backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let mut conflicting_sys = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_bytes(
+            &mut conflicting_sys,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_STATUS,
+            crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.as_bytes().to_vec(),
+        );
+        conflicting_sys.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID
+            ),
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec(),
+        );
+        conflicting_sys.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID
+            ),
+            b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_vec(),
+        );
+        let conflicting_meta = rustfs_filemeta::MetaObject {
+            meta_sys: conflicting_sys,
+            ..Default::default()
+        };
+        let mut free_version_info = rustfs_filemeta::FileInfo::new("object", 2, 2);
+        free_version_info.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        assert_eq!(
+            conflicting_meta
+                .init_free_version(&free_version_info)
+                .expect_err("conflicting persisted identities must not create an executable free-version"),
+            rustfs_filemeta::Error::FileCorrupt
+        );
+        assert_eq!(old_backend.remove_count().await, 0);
+
+        let old_identity = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("old tier lease should be available")
+            .backend_identity();
+        let mut oi = ObjectInfo::default();
+        oi.transitioned_object.tier = "WARM".to_string();
+        oi.transitioned_object.name = "remote/object".to_string();
+        oi.transitioned_object.version_id = "remote-version".to_string();
+        let local_delete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let legacy_err = delete_free_version_remote_object_then(&oi, &manager, {
+            let local_delete_calls = Arc::clone(&local_delete_calls);
+            move || async move {
+                local_delete_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .await
+        .expect_err("legacy free-version without identity must be retained");
+        assert!(legacy_err.to_string().contains("no durable backend identity"));
+        assert_eq!(local_delete_calls.load(Ordering::Relaxed), 0);
+
+        let mut invalid_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut invalid_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "not-a-backend-identity".to_string(),
+        );
+        oi.user_defined = Arc::new(invalid_metadata);
+        let invalid_err = delete_free_version_remote_object_then(&oi, &manager, {
+            let local_delete_calls = Arc::clone(&local_delete_calls);
+            move || async move {
+                local_delete_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .await
+        .expect_err("free-version with an invalid identity must be retained");
+        assert!(invalid_err.to_string().contains("invalid length"));
+        assert_eq!(local_delete_calls.load(Ordering::Relaxed), 0);
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(old_identity),
+        );
+        oi.user_defined = Arc::new(metadata.clone());
+        delete_free_version_remote_object_then(&oi, &manager, {
+            let local_delete_calls = Arc::clone(&local_delete_calls);
+            move || async move {
+                local_delete_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .await
+        .expect("matching destination identity should allow idempotent remote cleanup");
+        assert_eq!(old_backend.remove_count().await, 1);
+        assert_eq!(local_delete_calls.load(Ordering::Relaxed), 1);
+
+        let mut single_prefix_metadata = HashMap::new();
+        single_prefix_metadata.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID
+            ),
+            rustfs_utils::crypto::hex(old_identity),
+        );
+        oi.user_defined = Arc::new(single_prefix_metadata);
+        delete_free_version_remote_object_then(&oi, &manager, {
+            let local_delete_calls = Arc::clone(&local_delete_calls);
+            move || async move {
+                local_delete_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .await
+        .expect("single-prefix legacy identity should remain compatible");
+        assert_eq!(old_backend.remove_count().await, 2);
+        assert_eq!(local_delete_calls.load(Ordering::Relaxed), 2);
+
+        let new_backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let new_identity = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("rebound tier lease should be available")
+            .backend_identity();
+
+        let mut conflicting_metadata = HashMap::from([(
+            rustfs_utils::http::metadata_compat::internal_key_rustfs(
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            ),
+            rustfs_utils::crypto::hex(new_identity),
+        )]);
+        conflicting_metadata.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID
+            ),
+            rustfs_utils::crypto::hex(old_identity),
+        );
+        oi.user_defined = Arc::new(conflicting_metadata);
+        let conflict_err = delete_free_version_remote_object_then(&oi, &manager, {
+            let local_delete_calls = Arc::clone(&local_delete_calls);
+            move || async move {
+                local_delete_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .await
+        .expect_err("conflicting compatibility identities must retain the free-version");
+        assert!(conflict_err.to_string().contains("compatibility keys conflict"));
+        assert_eq!(new_backend.remove_count().await, 0);
+        assert_eq!(local_delete_calls.load(Ordering::Relaxed), 2);
+
+        oi.user_defined = Arc::new(metadata);
+        let rebound_err = delete_free_version_remote_object_then(&oi, &manager, {
+            let local_delete_calls = Arc::clone(&local_delete_calls);
+            move || async move {
+                local_delete_calls.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .await
+        .expect_err("same-name tier rebind must retain the old free-version");
+        assert!(rebound_err.to_string().contains("identity no longer matches"));
+        assert_eq!(new_backend.remove_count().await, 0);
+        assert_eq!(local_delete_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_same_name_rebind_before_remote_io() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let old_identity = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("old tier lease should be available")
+            .backend_identity();
+        let new_backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(old_identity),
+        );
+        let mut oi = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        oi.transitioned_object.tier = "WARM".to_string();
+        oi.transitioned_object.name = "remote/object".to_string();
+        oi.transitioned_object.version_id = "remote-version".to_string();
+
+        let err = match get_transitioned_object_reader_with_tier_manager(
+            "bucket",
+            "object",
+            &None,
+            &http::HeaderMap::new(),
+            &oi,
+            &ObjectOptions::default(),
+            &manager,
+        )
+        .await
+        {
+            Ok(_) => panic!("identity-bound GET must reject a same-name tier rebind"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("identity no longer matches"));
+        assert_eq!(new_backend.get_count().await, 0);
+
+        oi.user_defined = Arc::new(HashMap::new());
+        let err = match get_transitioned_object_reader_with_tier_manager(
+            "bucket",
+            "object",
+            &None,
+            &http::HeaderMap::new(),
+            &oi,
+            &ObjectOptions::default(),
+            &manager,
+        )
+        .await
+        {
+            Ok(_) => panic!("missing remote legacy object should return an error"),
+            Err(err) => err,
+        };
+        assert!(!err.to_string().is_empty());
+        assert_eq!(new_backend.get_count().await, 1);
+    }
 
     /// Pins the expiry-event routing for transitioned objects
     /// (rustfs/backlog#1302): restore-expiry events must set
@@ -3192,6 +3469,7 @@ mod tests {
             obj_name: "remote/object".to_string(),
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
+            backend_identity: Some([1; 32]),
         };
 
         let err = state
@@ -3279,6 +3557,7 @@ mod tests {
             obj_name: "remote/object".to_string(),
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
+            backend_identity: Some([1; 32]),
         };
 
         state

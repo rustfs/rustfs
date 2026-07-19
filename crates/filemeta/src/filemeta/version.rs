@@ -30,8 +30,9 @@ use crate::ChecksumInfo;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PURGESTATUS, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
-    SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
-    contains_key_bytes, get_bytes, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
+    SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID, SUFFIX_TRANSITIONED_OBJECTNAME,
+    SUFFIX_TRANSITIONED_VERSION_ID, contains_key_bytes, get_bytes, get_consistent_bytes, get_str, has_internal_suffix,
+    insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix,
 };
 
 const MSGPACK_EXT8: u8 = 0xc7;
@@ -2403,6 +2404,9 @@ impl MetaObject {
             );
         }
         insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER, fi.transition_tier.as_bytes().to_vec());
+        if let Some(destination_id) = get_str(&fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID) {
+            insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, destination_id.into_bytes());
+        }
     }
 
     pub fn remove_restore_hdrs(&mut self) {
@@ -2466,6 +2470,16 @@ impl MetaObject {
                 if let Some(v) = get_bytes(&self.meta_sys, suffix) {
                     insert_bytes(&mut delete_marker.meta_sys, suffix, v);
                 }
+            }
+            if contains_key_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID) {
+                let destination_id = get_consistent_bytes(&self.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID)
+                    .filter(|value| value.len() == 64 && value.iter().all(u8::is_ascii_hexdigit))
+                    .ok_or(Error::FileCorrupt)?;
+                insert_bytes(
+                    &mut delete_marker.meta_sys,
+                    SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                    destination_id.to_vec(),
+                );
             }
             return Ok((free_entry, true));
         }
@@ -4202,6 +4216,111 @@ mod tests {
             .expect_err("invalid free-version UUID should return an error instead of panicking");
 
         assert!(matches!(err, Error::UuidParse(_)));
+    }
+
+    #[test]
+    fn meta_object_init_free_version_preserves_transition_destination_identity() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        let identity = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity.clone());
+        let obj = make_meta_object_with_sys(sys);
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+        let (free_version, created) = obj
+            .init_free_version(&fi)
+            .expect("free-version initialization should succeed");
+        let meta_sys = &free_version
+            .delete_marker
+            .expect("free-version should be a delete marker")
+            .meta_sys;
+
+        assert!(created);
+        assert_eq!(get_bytes(meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID), Some(identity));
+        assert!(meta_sys.contains_key(&format!(
+            "{}{}",
+            rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX,
+            SUFFIX_TRANSITION_TIER_DESTINATION_ID
+        )));
+        assert!(meta_sys.contains_key(&format!(
+            "{}{}",
+            rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+            SUFFIX_TRANSITION_TIER_DESTINATION_ID
+        )));
+    }
+
+    #[test]
+    fn meta_object_init_free_version_accepts_single_prefix_transition_destination_identity() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        let identity = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        sys.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+                SUFFIX_TRANSITION_TIER_DESTINATION_ID
+            ),
+            identity.clone(),
+        );
+        let obj = make_meta_object_with_sys(sys);
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+        let (free_version, created) = obj
+            .init_free_version(&fi)
+            .expect("single-prefix legacy destination identity should remain compatible");
+        let meta_sys = &free_version
+            .delete_marker
+            .expect("free-version should be a delete marker")
+            .meta_sys;
+
+        assert!(created);
+        assert_eq!(
+            get_consistent_bytes(meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID),
+            Some(identity.as_slice())
+        );
+    }
+
+    #[test]
+    fn meta_object_init_free_version_rejects_conflicting_or_invalid_transition_destination_identity() {
+        let valid_identity = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_vec();
+        for (rustfs_identity, minio_identity) in [
+            (
+                valid_identity,
+                b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_vec(),
+            ),
+            (b"not-hex".to_vec(), b"not-hex".to_vec()),
+            (Vec::new(), Vec::new()),
+        ] {
+            let mut sys = HashMap::new();
+            insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+            sys.insert(
+                format!(
+                    "{}{}",
+                    rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX,
+                    SUFFIX_TRANSITION_TIER_DESTINATION_ID
+                ),
+                rustfs_identity,
+            );
+            sys.insert(
+                format!(
+                    "{}{}",
+                    rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+                    SUFFIX_TRANSITION_TIER_DESTINATION_ID
+                ),
+                minio_identity,
+            );
+            let obj = make_meta_object_with_sys(sys);
+            let mut fi = FileInfo::new("object", 2, 2);
+            fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+
+            assert_eq!(
+                obj.init_free_version(&fi)
+                    .expect_err("unsafe destination identity must fail closed"),
+                Error::FileCorrupt
+            );
+        }
     }
 
     #[test]
