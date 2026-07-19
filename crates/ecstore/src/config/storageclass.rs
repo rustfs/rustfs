@@ -15,7 +15,7 @@
 use crate::error::{Error, Result};
 use rustfs_config::server_config::{KV, KVS};
 use serde::{Deserialize, Serialize};
-use std::env;
+use std::env::{self, VarError};
 use std::sync::LazyLock;
 use tracing::warn;
 
@@ -105,6 +105,13 @@ pub struct StorageClass {
     parity: usize,
 }
 
+#[derive(Debug, Clone)]
+struct PoolParity {
+    drives_per_set: usize,
+    parity: usize,
+    automatic: bool,
+}
+
 // Config storage class configuration
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Config {
@@ -113,35 +120,87 @@ pub struct Config {
     optimize: Option<String>,
     inline_block: usize,
     initialized: bool,
+    #[serde(skip)]
+    standard_parities: Vec<PoolParity>,
+    #[serde(skip)]
+    rrs_parities: Vec<PoolParity>,
 }
 
 impl Config {
-    pub fn get_parity_for_sc(&self, sc: &str) -> Option<usize> {
+    fn storage_class(&self, sc: &str) -> (&StorageClass, &[PoolParity]) {
         match sc.trim() {
-            RRS => {
-                if self.initialized {
-                    Some(self.rrs.parity)
-                } else {
-                    None
-                }
-            }
-            // All these storage classes use standard parity configuration
-            STANDARD | DEEP_ARCHIVE | EXPRESS_ONEZONE | GLACIER | GLACIER_IR | INTELLIGENT_TIERING | ONEZONE_IA | OUTPOSTS
-            | SNOW | STANDARD_IA => {
-                if self.initialized {
-                    Some(self.standard.parity)
-                } else {
-                    None
-                }
-            }
-            _ => {
-                if self.initialized {
-                    Some(self.standard.parity)
-                } else {
-                    None
-                }
-            }
+            RRS => (&self.rrs, &self.rrs_parities),
+            _ => (&self.standard, &self.standard_parities),
         }
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn get_parity_for_sc(&self, sc: &str) -> Option<usize> {
+        if !self.initialized {
+            return None;
+        }
+
+        let (storage_class, pools) = self.storage_class(sc);
+        let Some(first) = pools.first() else {
+            return Some(storage_class.parity);
+        };
+
+        pools.iter().all(|pool| pool.parity == first.parity).then_some(first.parity)
+    }
+
+    /// Returns the resolved parity for a pool topology.
+    ///
+    /// A topology-bound lookup fails closed for unknown drive counts and for
+    /// deserialized legacy configurations that have no pool topology. Legacy
+    /// callers retain scalar compatibility through [`Self::get_parity_for_sc`].
+    pub(crate) fn parity_for_sc(&self, sc: &str, drives_per_set: usize) -> Option<usize> {
+        if !self.initialized {
+            return None;
+        }
+
+        let (_, pools) = self.storage_class(sc);
+
+        pools
+            .iter()
+            .find(|pool| pool.drives_per_set == drives_per_set)
+            .map(|pool| pool.parity)
+    }
+
+    pub(crate) fn parity_for_pool(&self, sc: &str, pool_index: usize, drives_per_set: usize) -> Option<usize> {
+        if !self.initialized {
+            return None;
+        }
+
+        let (_, pools) = self.storage_class(sc);
+
+        pools
+            .get(pool_index)
+            .filter(|pool| pool.drives_per_set == drives_per_set)
+            .map(|pool| pool.parity)
+    }
+
+    pub fn parities_for_sc(&self, sc: &str) -> Option<Vec<usize>> {
+        if !self.initialized {
+            return None;
+        }
+
+        let (_, pools) = self.storage_class(sc);
+        if pools.is_empty() {
+            return None;
+        }
+
+        Some(pools.iter().map(|pool| pool.parity).collect())
+    }
+
+    pub(crate) fn automatic_zero_parity_pools(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.standard_parities
+            .iter()
+            .enumerate()
+            .filter(|(_, pool)| pool.automatic && pool.parity == 0)
+            .map(|(pool_index, pool)| (pool_index, pool.drives_per_set))
     }
 
     pub fn should_inline(&self, shard_size: i64, versioned: bool) -> bool {
@@ -180,72 +239,173 @@ impl Config {
     }
 }
 
-pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
-    let standard = {
-        let ssc_str = {
-            if let Ok(ssc_str) = env::var(STANDARD_ENV) {
-                ssc_str
-            } else {
-                kvs.get(CLASS_STANDARD)
-            }
-        };
+#[derive(Debug, Default)]
+struct StorageClassEnvOverrides {
+    standard: Option<String>,
+    rrs: Option<String>,
+    optimize: Option<String>,
+    inline_block: Option<String>,
+}
 
-        if !ssc_str.is_empty() {
-            parse_storage_class(&ssc_str)?
-        } else {
-            StorageClass {
-                parity: default_parity_count(set_drive_count),
-            }
-        }
-    };
+impl StorageClassEnvOverrides {
+    fn from_process() -> Result<Self> {
+        Ok(Self {
+            standard: read_optional_env(STANDARD_ENV)?,
+            rrs: read_optional_env(RRS_ENV)?,
+            optimize: read_optional_env(OPTIMIZE_ENV)?,
+            inline_block: read_optional_env(INLINE_BLOCK_ENV)?,
+        })
+    }
+}
 
-    let rrs = {
-        let ssc_str = {
-            if let Ok(ssc_str) = env::var(RRS_ENV) {
-                ssc_str
-            } else {
-                kvs.get(CLASS_RRS)
-            }
-        };
+fn read_optional_env(name: &str) -> Result<Option<String>> {
+    parse_optional_env(name, env::var(name))
+}
 
-        if !ssc_str.is_empty() {
-            parse_storage_class(&ssc_str)?
-        } else {
-            StorageClass {
-                parity: { if set_drive_count == 1 { 0 } else { DEFAULT_RRS_PARITY } },
-            }
-        }
-    };
+fn parse_optional_env(name: &str, value: std::result::Result<String, VarError>) -> Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(Error::other(format!("{name} contains non-Unicode data"))),
+    }
+}
 
-    validate_parity_inner(standard.parity, rrs.parity, set_drive_count)?;
+#[derive(Debug, Clone, Copy)]
+enum ParityPolicy {
+    AutomaticStandard,
+    LegacyRrs,
+    Explicit(usize),
+}
 
-    let optimize = { env::var(OPTIMIZE_ENV).ok() };
-
-    let inline_block = {
-        if let Ok(ev) = env::var(INLINE_BLOCK_ENV) {
-            if let Ok(block) = ev.parse::<bytesize::ByteSize>() {
-                if block.as_u64() as usize > DEFAULT_INLINE_BLOCK {
-                    warn!(
-                        "inline block value bigger than recommended max of 128KiB -> {}, performance may degrade for PUT please benchmark the changes",
-                        block
-                    );
+impl ParityPolicy {
+    fn resolve(self, drives_per_set: usize) -> usize {
+        match self {
+            Self::AutomaticStandard => default_parity_count(drives_per_set),
+            Self::LegacyRrs => {
+                if drives_per_set == 1 {
+                    0
+                } else {
+                    DEFAULT_RRS_PARITY
                 }
-                block.as_u64() as usize
-            } else {
-                return Err(Error::other(format!("parse {INLINE_BLOCK_ENV} format failed")));
             }
-        } else {
-            DEFAULT_INLINE_BLOCK
+            Self::Explicit(parity) => parity,
         }
+    }
+}
+
+fn standard_policy(kvs: &KVS, value: Option<String>) -> Result<ParityPolicy> {
+    match value {
+        Some(value) if value.is_empty() => Ok(ParityPolicy::AutomaticStandard),
+        Some(value) => Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity)),
+        None => {
+            let value = kvs.get(CLASS_STANDARD);
+            if value.is_empty() {
+                Ok(ParityPolicy::AutomaticStandard)
+            } else {
+                Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity))
+            }
+        }
+    }
+}
+
+fn rrs_policy(kvs: &KVS, value: Option<String>) -> Result<ParityPolicy> {
+    match value {
+        Some(value) if value.is_empty() => Ok(ParityPolicy::LegacyRrs),
+        Some(value) => Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity)),
+        None => {
+            let value = kvs.get(CLASS_RRS);
+            if value.is_empty() || value == "EC:1" {
+                Ok(ParityPolicy::LegacyRrs)
+            } else {
+                Ok(ParityPolicy::Explicit(parse_storage_class(&value)?.parity))
+            }
+        }
+    }
+}
+
+pub fn lookup_config_for_pools(kvs: &KVS, set_drive_counts: &[usize]) -> Result<Config> {
+    lookup_config_for_pools_with_env(kvs, set_drive_counts, StorageClassEnvOverrides::from_process()?)
+}
+
+fn lookup_config_for_pools_with_env(
+    kvs: &KVS,
+    set_drive_counts: &[usize],
+    overrides: StorageClassEnvOverrides,
+) -> Result<Config> {
+    if set_drive_counts.is_empty() {
+        return Err(Error::other("storage class requires at least one pool"));
+    }
+
+    let standard_policy = standard_policy(kvs, overrides.standard)?;
+    let rrs_policy = rrs_policy(kvs, overrides.rrs)?;
+    let mut standard_parities = Vec::with_capacity(set_drive_counts.len());
+    let mut rrs_parities = Vec::with_capacity(set_drive_counts.len());
+
+    for (pool_index, &drives_per_set) in set_drive_counts.iter().enumerate() {
+        let standard_parity = standard_policy.resolve(drives_per_set);
+        let rrs_parity = rrs_policy.resolve(drives_per_set);
+        validate_parity_inner(standard_parity, rrs_parity, drives_per_set).map_err(|err| {
+            Error::other(format!(
+                "storage class validation failed for pool {pool_index} ({drives_per_set} drives): {err}"
+            ))
+        })?;
+        standard_parities.push(PoolParity {
+            drives_per_set,
+            parity: standard_parity,
+            automatic: matches!(standard_policy, ParityPolicy::AutomaticStandard),
+        });
+        rrs_parities.push(PoolParity {
+            drives_per_set,
+            parity: rrs_parity,
+            automatic: matches!(rrs_policy, ParityPolicy::LegacyRrs),
+        });
+    }
+
+    let optimize = overrides.optimize;
+    let inline_block = if let Some(value) = overrides.inline_block {
+        let block = value
+            .parse::<bytesize::ByteSize>()
+            .map_err(|_| Error::other(format!("parse {INLINE_BLOCK_ENV} format failed")))?;
+        let inline_block = usize::try_from(block.as_u64())
+            .map_err(|_| Error::other(format!("{INLINE_BLOCK_ENV} exceeds the platform size limit")))?;
+        if inline_block > DEFAULT_INLINE_BLOCK {
+            warn!(
+                event = "storage_class_inline_block_large",
+                component = "ecstore",
+                subsystem = "storage_class",
+                state = "configured",
+                inline_block,
+                recommended_max = DEFAULT_INLINE_BLOCK,
+                "storage class inline block exceeds recommendation"
+            );
+        }
+        inline_block
+    } else {
+        DEFAULT_INLINE_BLOCK
     };
 
     Ok(Config {
-        standard,
-        rrs,
+        standard: StorageClass {
+            parity: standard_parities[0].parity,
+        },
+        rrs: StorageClass {
+            parity: rrs_parities[0].parity,
+        },
         optimize,
         inline_block,
         initialized: true,
+        standard_parities,
+        rrs_parities,
     })
+}
+
+pub fn lookup_config(kvs: &KVS, set_drive_count: usize) -> Result<Config> {
+    lookup_config_for_pools(kvs, &[set_drive_count])
+}
+
+#[cfg(test)]
+pub(crate) fn lookup_config_for_pools_without_env(kvs: &KVS, set_drive_counts: &[usize]) -> Result<Config> {
+    lookup_config_for_pools_with_env(kvs, set_drive_counts, StorageClassEnvOverrides::default())
 }
 
 pub fn parse_storage_class(env: &str) -> Result<StorageClass> {
@@ -281,6 +441,10 @@ pub fn validate_parity(ss_parity: usize, set_drive_count: usize) -> Result<()> {
     //     )));
     // }
 
+    if set_drive_count == 0 {
+        return Err(Error::other("set drive count must be greater than zero"));
+    }
+
     if ss_parity > set_drive_count / 2 {
         return Err(Error::other(format!(
             "parity {} should be less than or equal to {}",
@@ -310,22 +474,24 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
     //     )));
     // }
 
-    if set_drive_count > 2 {
-        if ss_parity > set_drive_count / 2 {
-            return Err(Error::other(format!(
-                "Standard storage class parity {} should be less than or equal to {}",
-                ss_parity,
-                set_drive_count / 2
-            )));
-        }
+    if set_drive_count == 0 {
+        return Err(Error::other("set drive count must be greater than zero"));
+    }
 
-        if rrs_parity > set_drive_count / 2 {
-            return Err(Error::other(format!(
-                "Reduced redundancy storage class parity {} should be less than or equal to {}",
-                rrs_parity,
-                set_drive_count / 2
-            )));
-        }
+    if ss_parity > set_drive_count / 2 {
+        return Err(Error::other(format!(
+            "Standard storage class parity {} should be less than or equal to {}",
+            ss_parity,
+            set_drive_count / 2
+        )));
+    }
+
+    if rrs_parity > set_drive_count / 2 {
+        return Err(Error::other(format!(
+            "Reduced redundancy storage class parity {} should be less than or equal to {}",
+            rrs_parity,
+            set_drive_count / 2
+        )));
     }
 
     if ss_parity > 0 && rrs_parity > 0 && ss_parity < rrs_parity {
@@ -340,6 +506,171 @@ pub fn validate_parity_inner(ss_parity: usize, rrs_parity: usize, set_drive_coun
 mod tests {
     use super::*;
 
+    fn no_env_overrides() -> StorageClassEnvOverrides {
+        StorageClassEnvOverrides::default()
+    }
+
+    #[test]
+    fn automatic_parity_is_resolved_per_pool() {
+        let cfg = lookup_config_for_pools_with_env(&KVS::new(), &[4, 2], no_env_overrides())
+            .expect("automatic storage class should support heterogeneous pools");
+
+        assert_eq!(cfg.parity_for_sc(STANDARD, 4), Some(2));
+        assert_eq!(cfg.parity_for_sc(STANDARD, 2), Some(1));
+        assert_eq!(cfg.parity_for_sc(RRS, 4), Some(1));
+        assert_eq!(cfg.parity_for_sc(RRS, 2), Some(1));
+        assert_eq!(cfg.get_parity_for_sc(STANDARD), None, "heterogeneous parity has no truthful scalar");
+
+        let cfg = lookup_config_for_pools_with_env(&KVS::new(), &[4, 6], no_env_overrides())
+            .expect("automatic parity should be valid for both pools");
+        assert_eq!(cfg.parity_for_sc(STANDARD, 4), Some(2));
+        assert_eq!(cfg.parity_for_sc(STANDARD, 6), Some(3));
+    }
+
+    #[test]
+    fn automatic_single_disk_pool_uses_zero_parity() {
+        let cfg = lookup_config_for_pools_with_env(&KVS::new(), &[4, 1], no_env_overrides())
+            .expect("automatic single-disk storage should remain supported");
+
+        assert_eq!(cfg.parity_for_sc(STANDARD, 4), Some(2));
+        assert_eq!(cfg.parity_for_sc(STANDARD, 1), Some(0));
+        assert_eq!(cfg.parity_for_sc(RRS, 1), Some(0));
+    }
+
+    #[test]
+    fn explicit_standard_parity_is_validated_against_every_pool() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
+
+        let err = lookup_config_for_pools_with_env(&kvs, &[4, 2], no_env_overrides())
+            .expect_err("EC:2 must be rejected by the two-drive pool");
+        assert!(
+            err.to_string().contains("pool 1") && err.to_string().contains("2 drives"),
+            "error must identify the rejecting pool: {err}"
+        );
+
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:1".to_string());
+        let cfg = lookup_config_for_pools_with_env(&kvs, &[4, 2], no_env_overrides()).expect("EC:1 is valid for both pools");
+        assert_eq!(cfg.parity_for_sc(STANDARD, 4), Some(1));
+        assert_eq!(cfg.parity_for_sc(STANDARD, 2), Some(1));
+        assert_eq!(cfg.get_parity_for_sc(STANDARD), Some(1));
+    }
+
+    #[test]
+    fn environment_rrs_value_is_explicit_but_persisted_default_is_legacy() {
+        let persisted_default = lookup_config_for_pools_with_env(&DEFAULT_KVS, &[1], no_env_overrides())
+            .expect("persisted default RRS EC:1 should retain single-disk compatibility");
+        assert_eq!(persisted_default.parity_for_sc(RRS, 1), Some(0));
+
+        let env = StorageClassEnvOverrides {
+            rrs: Some("EC:1".to_string()),
+            ..Default::default()
+        };
+        let err = lookup_config_for_pools_with_env(&DEFAULT_KVS, &[1], env)
+            .expect_err("environment RRS EC:1 is explicit and must fail on a single disk");
+        assert!(err.to_string().contains("pool 0") && err.to_string().contains("1 drives"));
+    }
+
+    #[test]
+    fn explicit_environment_standard_parity_is_not_clamped() {
+        let env = StorageClassEnvOverrides {
+            standard: Some("EC:2".to_string()),
+            ..Default::default()
+        };
+        let err = lookup_config_for_pools_with_env(&KVS::new(), &[4, 2], env)
+            .expect_err("explicit environment parity must not be clamped for a smaller pool");
+        assert!(err.to_string().contains("pool 1") && err.to_string().contains("2 drives"));
+    }
+
+    #[test]
+    fn empty_environment_values_retain_automatic_semantics() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
+        kvs.insert(CLASS_RRS.to_string(), "EC:2".to_string());
+        let env = StorageClassEnvOverrides {
+            standard: Some(String::new()),
+            rrs: Some(String::new()),
+            ..Default::default()
+        };
+
+        let cfg = lookup_config_for_pools_with_env(&kvs, &[4, 2], env)
+            .expect("empty environment values should override persisted parity with automatic defaults");
+        assert_eq!(cfg.parities_for_sc(STANDARD), Some(vec![2, 1]));
+        assert_eq!(cfg.parities_for_sc(RRS), Some(vec![1, 1]));
+    }
+
+    #[test]
+    fn explicit_zero_parity_is_not_reported_as_automatic() {
+        let env = StorageClassEnvOverrides {
+            standard: Some("EC:0".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = lookup_config_for_pools_with_env(&KVS::new(), &[1], env)
+            .expect("explicit zero parity should remain valid for a single-drive pool");
+        assert_eq!(cfg.parities_for_sc(STANDARD), Some(vec![0]));
+        assert_eq!(cfg.automatic_zero_parity_pools().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_environment_value_fails_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let err = parse_optional_env(STANDARD_ENV, Err(VarError::NotUnicode(OsString::from_vec(vec![0xff]))))
+            .expect_err("non-Unicode parity must fail closed");
+        assert!(err.to_string().contains(STANDARD_ENV));
+    }
+
+    #[test]
+    fn environment_standard_override_can_rescue_persisted_config() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
+        let env = StorageClassEnvOverrides {
+            standard: Some("EC:1".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = lookup_config_for_pools_with_env(&kvs, &[4, 2], env)
+            .expect("environment override should replace the persisted parity before validation");
+        assert_eq!(cfg.parity_for_pool(STANDARD, 0, 4), Some(1));
+        assert_eq!(cfg.parity_for_pool(STANDARD, 1, 2), Some(1));
+    }
+
+    #[test]
+    fn invalid_or_unknown_pool_topology_fails_closed() {
+        assert!(lookup_config_for_pools_with_env(&KVS::new(), &[], no_env_overrides()).is_err());
+
+        let err = lookup_config_for_pools_with_env(&KVS::new(), &[4, 0], no_env_overrides())
+            .expect_err("zero-drive pools must be rejected");
+        assert!(err.to_string().contains("pool 1") && err.to_string().contains("0 drives"));
+
+        let cfg =
+            lookup_config_for_pools_with_env(&KVS::new(), &[4, 2], no_env_overrides()).expect("valid topology should resolve");
+        assert_eq!(cfg.parity_for_pool(STANDARD, 2, 6), None);
+        assert_eq!(cfg.parity_for_pool(STANDARD, 1, 6), None);
+        assert_eq!(cfg.parity_for_pool(STANDARD, 0, 2), None);
+        assert_eq!(cfg.parity_for_pool(STANDARD, 1, 4), None);
+        assert_eq!(cfg.parity_for_sc(STANDARD, 6), None);
+    }
+
+    #[test]
+    fn resolved_pool_state_is_not_serialized() {
+        let cfg =
+            lookup_config_for_pools_with_env(&KVS::new(), &[4, 2], no_env_overrides()).expect("valid topology should resolve");
+        let encoded = serde_json::to_string(&cfg).expect("config should serialize");
+        assert!(!encoded.contains("standard_parities"));
+        assert!(!encoded.contains("rrs_parities"));
+
+        let decoded: Config = serde_json::from_str(&encoded).expect("legacy scalar config should deserialize");
+        assert_eq!(decoded.get_parity_for_sc(STANDARD), Some(2));
+        assert_eq!(decoded.parity_for_pool(STANDARD, 0, 4), None);
+        assert_eq!(decoded.parity_for_sc(STANDARD, 4), None);
+        assert_eq!(decoded.parities_for_sc(STANDARD), None);
+        assert!(validate_parity(0, 0).is_err());
+    }
+
     #[test]
     fn lookup_config_reads_rrs_from_class_rrs_key() {
         // Regression: kvs.get(RRS) used RRS="REDUCED_REDUNDANCY" instead of
@@ -348,7 +679,7 @@ mod tests {
         kvs.insert(CLASS_STANDARD.to_string(), "EC:4".to_string());
         kvs.insert(CLASS_RRS.to_string(), "EC:2".to_string());
 
-        let cfg = lookup_config(&kvs, 8).expect("lookup should succeed");
+        let cfg = lookup_config_for_pools_without_env(&kvs, &[8]).expect("lookup should succeed");
         assert_eq!(cfg.standard.parity, 4, "standard parity should be 4");
         assert_eq!(cfg.rrs.parity, 2, "rrs parity should be 2");
     }
@@ -360,7 +691,7 @@ mod tests {
         kvs.insert(CLASS_STANDARD.to_string(), "EC:4".to_string());
         kvs.insert(RRS.to_string(), "EC:2".to_string());
 
-        let cfg = lookup_config(&kvs, 8).expect("lookup should succeed");
+        let cfg = lookup_config_for_pools_without_env(&kvs, &[8]).expect("lookup should succeed");
         assert_eq!(cfg.standard.parity, 4);
         assert_eq!(
             cfg.rrs.parity, DEFAULT_RRS_PARITY,

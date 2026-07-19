@@ -12,7 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub(crate) mod federated_identity;
-pub(crate) mod session_policy;
-pub mod site_replication;
+use super::FederatedIdentityProvider;
+use std::sync::Arc;
+
+/// Immutable registry of built-in federation adapters.
+pub struct FederatedIdentityRegistry {
+    standard_oidc: Arc<dyn FederatedIdentityProvider>,
+}
+
+impl FederatedIdentityRegistry {
+    pub fn new(standard_oidc: Arc<dyn FederatedIdentityProvider>) -> Self {
+        Self { standard_oidc }
+    }
+
+    pub(crate) fn standard_oidc(&self) -> &dyn FederatedIdentityProvider {
+        self.standard_oidc.as_ref()
+    }
+}

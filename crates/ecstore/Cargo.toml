@@ -61,6 +61,7 @@ rustfs-kms.workspace = true
 rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
 rustfs-object-capacity.workspace = true
+arc-swap.workspace = true
 async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 byteorder = { workspace = true }

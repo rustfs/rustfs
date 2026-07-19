@@ -12,7 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub(crate) mod federated_identity;
-pub(crate) mod session_policy;
-pub mod site_replication;
+mod binding;
+mod error;
+mod model;
+pub mod oidc;
+mod provider;
+mod registry;
+mod transaction;
+
+pub use binding::FederatedSessionBinding;
+pub use error::{FederatedSessionBindingError, FederationError, Result};
+pub use model::{
+    FederatedAuthorization, FederatedClaims, FederatedCodeExchange, FederatedLoginSession, FederatedSession,
+    FederatedSessionTransaction,
+};
+pub use provider::FederatedIdentityProvider;
+pub use registry::FederatedIdentityRegistry;
+pub use transaction::FederatedIdentityService;

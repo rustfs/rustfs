@@ -38,7 +38,7 @@ use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
-use rustfs_iam::{error::Error as IamError, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{error::Error as IamError, federation::FederatedIdentityService, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::{KmsServiceManager, ObjectEncryptionService};
 use rustfs_lock::LockClient;
@@ -88,14 +88,14 @@ pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
     resolve_iam_handle_with(get_global_app_context())
 }
 
-/// Resolve OIDC system handle using AppContext-first precedence.
-pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
-    resolve_oidc_handle_with(get_global_app_context())
+/// Resolve the federated identity service using AppContext-first precedence.
+pub fn resolve_federated_identity_service() -> Option<Arc<FederatedIdentityService>> {
+    resolve_federated_identity_service_with(get_global_app_context())
 }
 
-/// Publish the initialized OIDC system handle into the global AppContext.
-pub fn publish_oidc_handle(oidc: Arc<OidcSys>) -> bool {
-    publish_oidc_handle_with(get_global_app_context(), oidc)
+/// Publish the initialized federated identity service into the global AppContext.
+pub fn publish_federated_identity_service(service: Arc<FederatedIdentityService>) -> bool {
+    handles::publish_default_federated_identity_service(service)
 }
 
 /// Resolve a ready IAM system handle using AppContext-first precedence.
@@ -329,12 +329,13 @@ fn resolve_iam_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<IamSy
     context.map(|context| context.iam().handle())
 }
 
-fn resolve_oidc_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<OidcSys>> {
-    context.and_then(|context| context.oidc().handle())
+fn resolve_federated_identity_service_with(context: Option<Arc<AppContext>>) -> Option<Arc<FederatedIdentityService>> {
+    context.and_then(|context| context.federated_identity().handle())
 }
 
-fn publish_oidc_handle_with(context: Option<Arc<AppContext>>, oidc: Arc<OidcSys>) -> bool {
-    context.is_some_and(|context| context.publish_oidc_handle(oidc))
+#[cfg(test)]
+fn publish_federated_identity_service_with(context: Option<Arc<AppContext>>, service: Arc<FederatedIdentityService>) -> bool {
+    context.is_some_and(|context| context.publish_federated_identity_service(service))
 }
 
 fn resolve_ready_iam_handle_with(context: Arc<AppContext>) -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
@@ -509,14 +510,19 @@ mod tests {
     };
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface,
-        EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
-        LockClientInterface, LockClientsInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
-        RegionInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
+        EndpointsInterface, FederatedIdentityInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
+        KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, OutboundTlsRuntimeInterface,
+        PerformanceMetricsInterface, RegionInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface,
+        ScannerMetricsInterface, ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
-    use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
+    use rustfs_iam::{
+        federation::{FederatedIdentityRegistry, FederatedIdentityService, oidc::StandardOidcAdapter},
+        oidc::OidcSys,
+        store::object::ObjectStore,
+        sys::IamSys,
+    };
     use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
     use rustfs_lock::{LocalClient, LockClient};
     use rustfs_s3select_api::{
@@ -552,30 +558,35 @@ mod tests {
         }
     }
 
-    struct TestOidcInterface {
-        oidc: StdRwLock<Option<Arc<OidcSys>>>,
+    struct TestFederatedIdentityInterface {
+        service: StdRwLock<Option<Arc<FederatedIdentityService>>>,
     }
 
-    impl TestOidcInterface {
-        fn new(oidc: Option<Arc<OidcSys>>) -> Self {
+    impl TestFederatedIdentityInterface {
+        fn new(service: Option<Arc<FederatedIdentityService>>) -> Self {
             Self {
-                oidc: StdRwLock::new(oidc),
+                service: StdRwLock::new(service),
             }
         }
     }
 
-    impl OidcInterface for TestOidcInterface {
-        fn handle(&self) -> Option<Arc<rustfs_iam::oidc::OidcSys>> {
-            self.oidc.read().ok().and_then(|oidc| oidc.as_ref().cloned())
+    impl FederatedIdentityInterface for TestFederatedIdentityInterface {
+        fn handle(&self) -> Option<Arc<FederatedIdentityService>> {
+            self.service.read().ok().and_then(|service| service.as_ref().cloned())
         }
 
-        fn publish_handle(&self, oidc: Arc<rustfs_iam::oidc::OidcSys>) -> bool {
-            let Ok(mut published_oidc) = self.oidc.write() else {
+        fn publish_handle(&self, service: Arc<FederatedIdentityService>) -> bool {
+            let Ok(mut published_service) = self.service.write() else {
                 return false;
             };
-            *published_oidc = Some(oidc);
+            *published_service = Some(service);
             true
         }
+    }
+
+    fn test_federated_identity_service(oidc: OidcSys) -> Arc<FederatedIdentityService> {
+        let adapter = Arc::new(StandardOidcAdapter::new(Arc::new(oidc)));
+        Arc::new(FederatedIdentityService::new(FederatedIdentityRegistry::new(adapter)))
     }
 
     struct TestKmsInterface {
@@ -1001,8 +1012,8 @@ mod tests {
             Ok(sys) => sys,
             Err(err) => unreachable!("test OIDC fallback sys should initialize: {err}"),
         };
-        let context_oidc = Arc::new(context_oidc_sys);
-        let fallback_oidc = Arc::new(fallback_oidc_sys);
+        let context_oidc = test_federated_identity_service(context_oidc_sys);
+        let fallback_oidc = test_federated_identity_service(fallback_oidc_sys);
         let context_token_signing_key = "context-token-signing-key".to_string();
 
         let context = Arc::new(AppContext::with_test_interfaces(
@@ -1012,7 +1023,7 @@ mod tests {
                     ready: true,
                     token_signing_key: Some(context_token_signing_key.clone()),
                 }),
-                oidc: Arc::new(TestOidcInterface::new(Some(context_oidc.clone()))),
+                federated_identity: Arc::new(TestFederatedIdentityInterface::new(None)),
                 kms: Arc::new(TestKmsInterface {
                     kms: context_kms.clone(),
                 }),
@@ -1112,10 +1123,12 @@ mod tests {
             context_outbound_tls_state.generation
         );
         assert!(resolve_iam_ready_with(Some(context.clone())).expect("context IAM ready"));
-        let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()));
+        assert!(resolve_federated_identity_service_with(Some(context.clone())).is_none());
+        assert!(publish_federated_identity_service_with(Some(context.clone()), context_oidc.clone()));
+        let resolved_oidc = resolve_federated_identity_service_with(Some(context.clone()));
         assert!(resolved_oidc.as_ref().is_some_and(|oidc| Arc::ptr_eq(oidc, &context_oidc)));
-        assert!(publish_oidc_handle_with(Some(context.clone()), fallback_oidc.clone()));
-        let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()));
+        assert!(publish_federated_identity_service_with(Some(context.clone()), fallback_oidc.clone()));
+        let resolved_oidc = resolve_federated_identity_service_with(Some(context.clone()));
         assert!(resolved_oidc.as_ref().is_some_and(|oidc| Arc::ptr_eq(oidc, &fallback_oidc)));
         assert_eq!(
             resolve_token_signing_key_with(Some(context.clone())).as_deref(),
@@ -1236,10 +1249,10 @@ mod tests {
         assert!(resolve_outbound_tls_state_with(None).await.is_none());
         assert!(resolve_iam_ready_with(None).is_none());
         assert!(resolve_iam_handle_with(None).is_none());
-        assert!(resolve_oidc_handle_with(None).is_none());
+        assert!(resolve_federated_identity_service_with(None).is_none());
         assert!(resolve_token_signing_key_with(None).is_none());
         assert!(resolve_notify_interface_for_context(None).is_none());
-        assert!(!publish_oidc_handle_with(None, context_oidc));
+        assert!(!publish_federated_identity_service_with(None, context_oidc));
         assert!(resolve_bucket_metadata_handle_with(None).is_none());
         assert!(resolve_bucket_monitor_handle_with(None).is_none());
         assert!(resolve_replication_pool_handle_with(None).is_none());

@@ -20,18 +20,18 @@ use super::super::storage_api::context::runtime::{
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
-    DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
-    KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface,
-    NotifyInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
-    ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
+    DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, FederatedIdentityInterface, IamInterface,
+    InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
+    LockClientsInterface, NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
+    RegionInterface, ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface,
+    ScannerMetricsInterface, ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
 };
 use super::runtime_sources;
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
-use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{federation::FederatedIdentityService, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
@@ -42,7 +42,7 @@ use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use s3s::dto::SelectObjectContentInput;
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock as StdRwLock},
+    sync::{Arc, OnceLock, RwLock as StdRwLock},
     time::SystemTime,
 };
 use tokio::sync::RwLock;
@@ -76,35 +76,35 @@ impl IamInterface for IamHandle {
     }
 }
 
-/// Default OIDC interface adapter.
-pub struct OidcHandle {
-    oidc: StdRwLock<Option<Arc<OidcSys>>>,
+/// Default federated identity service interface adapter.
+pub struct FederatedIdentityHandle {
+    service: StdRwLock<Option<Arc<FederatedIdentityService>>>,
 }
 
-impl OidcHandle {
-    pub fn new(oidc: Option<Arc<OidcSys>>) -> Self {
+impl FederatedIdentityHandle {
+    pub fn new(service: Option<Arc<FederatedIdentityService>>) -> Self {
         Self {
-            oidc: StdRwLock::new(oidc),
+            service: StdRwLock::new(service),
         }
     }
 }
 
-impl Default for OidcHandle {
+impl Default for FederatedIdentityHandle {
     fn default() -> Self {
         Self::new(None)
     }
 }
 
-impl OidcInterface for OidcHandle {
-    fn handle(&self) -> Option<Arc<OidcSys>> {
-        self.oidc.read().ok().and_then(|oidc| oidc.as_ref().cloned())
+impl FederatedIdentityInterface for FederatedIdentityHandle {
+    fn handle(&self) -> Option<Arc<FederatedIdentityService>> {
+        self.service.read().ok().and_then(|service| service.as_ref().cloned())
     }
 
-    fn publish_handle(&self, oidc: Arc<OidcSys>) -> bool {
-        let Ok(mut published_oidc) = self.oidc.write() else {
+    fn publish_handle(&self, service: Arc<FederatedIdentityService>) -> bool {
+        let Ok(mut published_service) = self.service.write() else {
             return false;
         };
-        *published_oidc = Some(oidc);
+        *published_service = Some(service);
         true
     }
 }
@@ -556,12 +556,24 @@ pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterfac
     Arc::new(ActionCredentialHandle::default())
 }
 
-pub fn default_oidc_interface() -> Arc<dyn OidcInterface> {
-    Arc::new(OidcHandle::default())
+static DEFAULT_FEDERATED_IDENTITY_HANDLE: OnceLock<Arc<FederatedIdentityHandle>> = OnceLock::new();
+
+fn default_federated_identity_handle() -> Arc<FederatedIdentityHandle> {
+    DEFAULT_FEDERATED_IDENTITY_HANDLE
+        .get_or_init(|| Arc::new(FederatedIdentityHandle::default()))
+        .clone()
 }
 
-pub fn oidc_interface(oidc: Option<Arc<OidcSys>>) -> Arc<dyn OidcInterface> {
-    Arc::new(OidcHandle::new(oidc))
+pub fn default_federated_identity_interface() -> Arc<dyn FederatedIdentityInterface> {
+    default_federated_identity_handle()
+}
+
+pub fn publish_default_federated_identity_service(service: Arc<FederatedIdentityService>) -> bool {
+    default_federated_identity_handle().publish_handle(service)
+}
+
+pub fn federated_identity_interface(service: Option<Arc<FederatedIdentityService>>) -> Arc<dyn FederatedIdentityInterface> {
+    Arc::new(FederatedIdentityHandle::new(service))
 }
 
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {
@@ -594,10 +606,69 @@ pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerConfigHandle, runtime_sources};
+    use super::{
+        ServerConfigHandle, default_federated_identity_interface, federated_identity_interface,
+        publish_default_federated_identity_service, runtime_sources,
+    };
     use crate::app::context::interfaces::ServerConfigInterface;
     use rustfs_config::server_config::Config;
+    use rustfs_iam::{
+        federation::{FederatedIdentityRegistry, FederatedIdentityService, oidc::StandardOidcAdapter},
+        oidc::OidcSys,
+    };
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_federated_identity_service() -> Arc<FederatedIdentityService> {
+        let oidc = OidcSys::empty().expect("empty OIDC configuration should be valid");
+        let adapter = Arc::new(StandardOidcAdapter::new(Arc::new(oidc)));
+        Arc::new(FederatedIdentityService::new(FederatedIdentityRegistry::new(adapter)))
+    }
+
+    #[test]
+    fn federated_identity_handle_preserves_early_publish_and_allows_replacement() {
+        let first = test_federated_identity_service();
+        let second = test_federated_identity_service();
+        let interface = federated_identity_interface(Some(first.clone()));
+
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &first))
+        );
+
+        assert!(interface.publish_handle(second.clone()));
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &second))
+        );
+    }
+
+    #[test]
+    fn default_federated_identity_handle_shares_early_publish_and_replacement() {
+        let first = test_federated_identity_service();
+        let second = test_federated_identity_service();
+
+        assert!(publish_default_federated_identity_service(first.clone()));
+        let interface = default_federated_identity_interface();
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &first))
+        );
+
+        assert!(publish_default_federated_identity_service(second.clone()));
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &second))
+        );
+    }
 
     // backlog#1052 S3: each context's server-config handle keeps its own copy,
     // so two handles that both published stay isolated even though the shared

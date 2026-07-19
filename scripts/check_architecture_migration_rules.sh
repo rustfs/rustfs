@@ -140,6 +140,7 @@ ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/ecstore_storage_api_root
 ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/ecstore_storage_api_root_consumer_hits.txt"
 ECSTORE_TEST_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_test_direct_api_hits.txt"
 ECSTORE_BENCH_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_bench_direct_api_hits.txt"
+ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE="${TMP_DIR}/erasure_panicking_constructor_hits.txt"
 LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE="${TMP_DIR}/local_storage_api_raw_contract_path_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
@@ -1149,6 +1150,54 @@ fi
 
 if [[ -s "$ECSTORE_BENCH_DIRECT_API_HITS_FILE" ]]; then
   report_failure "ECStore benches must route ECStore and storage-api symbols through crates/ecstore/benches/storage_api/mod.rs: $(paste -sd '; ' "$ECSTORE_BENCH_DIRECT_API_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find rustfs/src crates -type f -name '*.rs' -print0 |
+    xargs -0 perl -ne '
+      next unless $ARGV =~ m{^(?:rustfs/src/|crates/[^/]+/src/)};
+      if (!defined $current_file || $ARGV ne $current_file) {
+        $current_file = $ARGV;
+        $line = 0;
+        $pending_test_item = 0;
+        $in_test_item = 0;
+        $test_indent = "";
+      }
+      $line++;
+      if ($in_test_item) {
+        $in_test_item = 0 if /^(\s*)}\s*[\]),;]*\s*(?:\/\/.*)?$/ && $1 eq $test_indent;
+        next;
+      }
+      if (/^(\s*)#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*(.*)$/) {
+        $test_indent = $1;
+        my $item = $2;
+        if ($item =~ /^\s*(?:\/\/.*)?$/) {
+          $pending_test_item = 1;
+        } elsif ($item !~ /;\s*(?:\/\/.*)?$/ && $item =~ /\{/ && $item !~ /}\s*(?:\/\/.*)?$/) {
+          $in_test_item = 1;
+        } elsif ($item !~ /;\s*(?:\/\/.*)?$/ && $item !~ /\{/) {
+          $pending_test_item = 1;
+        }
+        next;
+      }
+      if ($pending_test_item) {
+        if (/;\s*(?:\/\/.*)?$/) {
+          $pending_test_item = 0;
+        } elsif (/\{/) {
+          $pending_test_item = 0;
+          $in_test_item = 1 unless /}\s*(?:\/\/.*)?$/;
+        }
+        next;
+      }
+      if (/^\s*(?!\/\/).*\bErasure::new(?:_with_options)?\s*\(/) {
+        print "$ARGV:$line:$_";
+      }
+    ' || true
+) >"$ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE"
+
+if [[ -s "$ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE" ]]; then
+  report_failure "production code must use fallible Erasure constructors: $(paste -sd '; ' "$ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE")"
 fi
 
 (
