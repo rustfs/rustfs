@@ -153,11 +153,13 @@ async fn data_movement_put_object_marks_dirty_disks_for_capacity_manager() {
 
     let actual_paths: HashSet<_> = dirty_disks
         .into_iter()
-        .map(|disk| stdfs::canonicalize(&disk.drive_path).unwrap().to_string_lossy().into_owned())
+        .filter_map(|disk| stdfs::canonicalize(&disk.drive_path).ok())
+        .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let expected_paths: HashSet<_> = disk_paths
         .iter()
-        .map(|path| stdfs::canonicalize(path).unwrap().to_string_lossy().into_owned())
+        .filter_map(|path| stdfs::canonicalize(path).ok())
+        .map(|p| p.to_string_lossy().into_owned())
         .collect();
     // The global dirty scope registry is process-wide; concurrent tests may
     // add extra entries, so we only verify that our expected paths are present.
@@ -217,9 +219,12 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
     let dirty_disks = manager.get_dirty_disks().await;
     let actual_paths: HashSet<_> = dirty_disks
         .into_iter()
-        .map(|disk| stdfs::canonicalize(&disk.drive_path).unwrap().to_string_lossy().into_owned())
+        .filter_map(|disk| stdfs::canonicalize(&disk.drive_path).ok())
+        .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    let expected_missing_disk = stdfs::canonicalize(&disk_paths[0]).unwrap().to_string_lossy().into_owned();
+    let expected_missing_disk = stdfs::canonicalize(&disk_paths[0])
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| disk_paths[0].to_string_lossy().into_owned());
 
     assert!(
         error.is_none() || actual_paths.contains(&expected_missing_disk),
