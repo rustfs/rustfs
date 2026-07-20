@@ -246,6 +246,14 @@ impl MockWarmBackend {
         MockGetBarrier { state }
     }
 
+    /// Arm a one-shot pause before the next tier GET, then continue normally
+    /// after the test releases it.
+    pub async fn arm_get_barrier(&self) -> MockGetBarrier {
+        let state = Arc::new(MockGetBarrierState::default());
+        *self.inner.get_barrier.lock().await = Some(Arc::clone(&state));
+        MockGetBarrier { state }
+    }
+
     // ---- fault injection -------------------------------------------------
 
     /// Replace the entire fault configuration.

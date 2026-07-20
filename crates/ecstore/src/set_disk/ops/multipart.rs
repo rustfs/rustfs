@@ -1038,7 +1038,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        if expected_restore_operation_id.is_some() {
+            rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_OPERATION_ID);
+        }
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
@@ -1420,6 +1424,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 achieved: 0,
             });
         }
+
+        self.require_current_restore_operation_id(
+            bucket,
+            object,
+            opts,
+            expected_restore_operation_id,
+            "complete_multipart_upload_commit",
+        )
+        .await?;
 
         let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
