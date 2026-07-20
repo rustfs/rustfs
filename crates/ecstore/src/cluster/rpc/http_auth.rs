@@ -53,6 +53,7 @@ const RPC_SIGNATURE_V2_HEADER: &str = "x-rustfs-rpc-signature-v2";
 const RPC_NONCE_HEADER: &str = "x-rustfs-rpc-nonce";
 pub(crate) const RPC_CONTENT_SHA256_HEADER: &str = "x-rustfs-content-sha256";
 const RPC_AUTH_VERSION_V2: &str = "2";
+const RPC_RESPONSE_PROOF_DOMAIN: &[u8] = b"rustfs-rpc-response-proof-v1\0";
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
@@ -136,6 +137,30 @@ fn get_shared_secret() -> std::io::Result<String> {
         });
         err
     })
+}
+
+fn rpc_response_proof_mac(canonical_body: &[u8]) -> std::io::Result<HmacSha256> {
+    let secret = get_shared_secret()?;
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    mac.update(RPC_RESPONSE_PROOF_DOMAIN);
+    mac.update(
+        &u64::try_from(canonical_body.len())
+            .map_err(|_| std::io::Error::other("RPC response proof length cannot be represented"))?
+            .to_be_bytes(),
+    );
+    mac.update(canonical_body);
+    Ok(mac)
+}
+
+pub fn sign_tonic_rpc_response_proof(canonical_body: &[u8]) -> std::io::Result<Vec<u8>> {
+    Ok(rpc_response_proof_mac(canonical_body)?.finalize().into_bytes().to_vec())
+}
+
+pub fn verify_tonic_rpc_response_proof(canonical_body: &[u8], proof: &[u8]) -> std::io::Result<()> {
+    rpc_response_proof_mac(canonical_body)?
+        .verify_slice(proof)
+        .map_err(|_| std::io::Error::other("Invalid RPC response proof"))
 }
 
 /// Build the canonical payload covered by the RPC HMAC.

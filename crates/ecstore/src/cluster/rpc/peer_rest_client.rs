@@ -15,7 +15,7 @@
 use crate::cluster::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, heal_control_time_out_client, node_service_time_out_client,
 };
-use crate::cluster::rpc::set_tonic_canonical_body_digest;
+use crate::cluster::rpc::{set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
 use crate::{
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
@@ -92,6 +92,11 @@ fn decode_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerP
         namespace_generation: response.namespace_generation,
         maintenance_generation: response.maintenance_generation,
     })
+}
+
+fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) -> Result<()> {
+    verify_tonic_rpc_response_proof(canonical_ack, proof)
+        .map_err(|_| Error::other("peer returned an invalid heal control capability proof"))
 }
 
 #[derive(Clone, Debug)]
@@ -762,6 +767,24 @@ impl PeerRestClient {
         .await
     }
 
+    /// Confirms that a peer supports heal-control v1 and has the same storage
+    /// topology. Every non-success response is an error so old or divergent
+    /// peers cannot be mistaken for compatible ones.
+    pub async fn probe_heal_control(&self, topology_fingerprint: String) -> Result<()> {
+        let nonce = uuid::Uuid::new_v4();
+        let probe = rustfs_protos::heal_control_capability_probe(nonce.as_bytes());
+        let canonical_ack = rustfs_protos::canonical_heal_control_capability_ack(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &topology_fingerprint,
+            &probe,
+        )
+        .map_err(|_| Error::other("heal control capability acknowledgement length cannot be represented"))?;
+        let proof = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        validate_heal_control_capability_proof(&canonical_ack, &proof)
+    }
+
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
         self.finalize_result(
             async {
@@ -1372,6 +1395,16 @@ mod tests {
 
         assert!(err.to_string().contains("exceeds size limit"));
         assert!(!client.offline.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn heal_control_capability_proof_must_authenticate_exact_ack() {
+        runtime_sources::ensure_test_rpc_secret();
+        let proof = crate::cluster::rpc::sign_tonic_rpc_response_proof(b"expected").expect("test proof should sign");
+        assert!(validate_heal_control_capability_proof(b"expected", &proof).is_ok());
+        let err = validate_heal_control_capability_proof(b"different", &proof)
+            .expect_err("a proof for a different acknowledgement must fail closed");
+        assert!(err.to_string().contains("invalid heal control capability proof"));
     }
 
     #[tokio::test]

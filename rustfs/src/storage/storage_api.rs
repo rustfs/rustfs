@@ -247,7 +247,14 @@ pub(crate) mod rpc_consumer {
 
 pub(crate) mod runtime_sources_consumer {
     pub(crate) type ECStore = super::ECStore;
+    pub(crate) type EndpointServerPools = super::EndpointServerPools;
     pub(crate) use crate::storage::runtime_sources;
+}
+
+pub(crate) mod heal_control_startup_consumer {
+    #[cfg(test)]
+    pub(crate) use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
+    pub(crate) use crate::storage::rpc::node_service::initialize_heal_topology_fingerprint;
 }
 
 pub(crate) mod s3_api_consumer {
@@ -319,7 +326,9 @@ pub(crate) mod timeout_wrapper_consumer {
 }
 
 pub(crate) mod tonic_service_consumer {
-    pub(crate) use super::super::tonic_service::{make_heal_control_server, make_server};
+    #[cfg(test)]
+    pub(crate) use super::super::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
+    pub(crate) use super::super::tonic_service::{make_heal_control_server_with_cache, make_server};
 }
 
 #[cfg(test)]
@@ -464,11 +473,13 @@ pub(crate) mod ecstore_rio {
 pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_rpc_signature,
-        verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, sign_tonic_rpc_response_proof,
+        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::rpc::{gen_tonic_signature_headers, set_tonic_canonical_body_digest};
+    pub(crate) use rustfs_ecstore::api::rpc::{
+        gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
+    };
 }
 
 pub(crate) mod ecstore_object {
@@ -532,6 +543,9 @@ pub(crate) fn try_current_local_node_name() -> Option<String> {
 
 #[cfg(test)]
 pub(crate) use ecstore_rpc::gen_tonic_signature_headers;
+pub(crate) use ecstore_rpc::sign_tonic_rpc_response_proof;
+#[cfg(test)]
+pub(crate) use ecstore_rpc::verify_tonic_rpc_response_proof;
 
 #[cfg(test)]
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
