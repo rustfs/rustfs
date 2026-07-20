@@ -21,8 +21,8 @@ use crate::admin::runtime_sources::{
     current_token_signing_key, object_store_from_req,
 };
 use crate::admin::site_replication_identity::{
-    canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
-    site_identity_key,
+    canonical_endpoint, deployment_id_for_endpoint, mark_unknown_peer_sync_enabled, normalize_peer_map_by_identity_with,
+    same_identity_endpoint, site_identity_key,
 };
 use crate::admin::storage_api::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -119,6 +119,7 @@ const SITE_REPL_MAX_NETPERF_DURATION: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
+const SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT: usize = 32;
 const MAX_PEER_CA_CERT_PEM_SIZE: usize = 256 * 1024;
 const ALLOW_LOOPBACK_REPLICATION_TARGET_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
 const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
@@ -427,6 +428,8 @@ struct SiteReplicationState {
     pending_endpoint_refresh: Option<PendingEndpointRefresh>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retry_queue: Vec<SiteReplicationRetryEvent>,
+    #[serde(default)]
+    sync_state_initialized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -519,6 +522,57 @@ struct SiteReplicationBootstrapPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SRPeerJoinResponse {
     peer: PeerInfo,
+    #[serde(rename = "initialSyncErrorMessage", default, skip_serializing_if = "String::is_empty")]
+    initial_sync_error_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SRPeerJoinEnvelope {
+    #[serde(flatten)]
+    request: SRPeerJoinReq,
+    #[serde(rename = "deferSyncStateEnable", default, skip_serializing_if = "std::ops::Not::not")]
+    defer_sync_state_enable: bool,
+}
+
+#[derive(Debug, Default)]
+struct SiteReplicationErrorSummary {
+    entries: Vec<String>,
+    total: usize,
+}
+
+impl SiteReplicationErrorSummary {
+    fn push(&mut self, error: impl AsRef<str>) {
+        self.total = self.total.saturating_add(1);
+        if self.entries.len() < SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT {
+            self.entries.push(summarize_peer_error_detail(error.as_ref()));
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.total = self.total.saturating_add(other.total);
+        let remaining = SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT.saturating_sub(self.entries.len());
+        self.entries.extend(other.entries.into_iter().take(remaining));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn reported(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn render(&self) -> String {
+        let mut message = self.entries.join("; ");
+        let omitted = self.total.saturating_sub(self.entries.len());
+        if omitted > 0 {
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            message.push_str(&format!("{omitted} additional error(s) omitted"));
+        }
+        message
+    }
 }
 
 const GO_GOB_SITE_NETPERF_SCHEMA: &[u8] = &[
@@ -838,6 +892,12 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
             let mut state: SiteReplicationState = serde_json::from_slice(&data)
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
             state.peers = normalize_peer_map_by_identity(state.peers);
+            if !state.sync_state_initialized {
+                if state.enabled() {
+                    mark_unknown_peer_sync_enabled(&mut state.peers);
+                }
+                state.sync_state_initialized = true;
+            }
             Ok(state)
         }
         Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
@@ -2112,21 +2172,6 @@ fn build_join_peers(
     normalize_peer_map_by_identity(peers)
 }
 
-/// Promote each peer's persisted `sync_state` from `Unknown` to `Enable` once site
-/// replication has been established for it. The persisted value is a static
-/// "configured & enabled" signal so that the `replicate info` endpoint (and the
-/// console, which read the persisted peer map verbatim) do not report `Unknown` for a
-/// healthy peer. `build_status_info` still refines this to `Disable`/`Unknown` from
-/// live health signals at query time for the `replicate status` endpoint. A peer that
-/// has been explicitly marked `Disable` is left untouched.
-fn mark_peers_sync_enabled(peers: &mut BTreeMap<String, PeerInfo>) {
-    for peer in peers.values_mut() {
-        if peer.sync_state == SyncStatus::Unknown {
-            peer.sync_state = SyncStatus::Enable;
-        }
-    }
-}
-
 fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String, PeerInfo>) -> BTreeMap<String, PeerInfo> {
     let mut normalized = BTreeMap::new();
 
@@ -2146,6 +2191,12 @@ fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String,
     }
 
     normalize_peer_map_by_identity(normalized)
+}
+
+fn initialize_join_peer_sync_state(peers: &mut BTreeMap<String, PeerInfo>, defer_sync_state_enable: bool) {
+    if !defer_sync_state_enable {
+        mark_unknown_peer_sync_enabled(peers);
+    }
 }
 
 fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_peer: PeerInfo) -> SiteReplicationState {
@@ -2698,27 +2749,25 @@ async fn bootstrap_existing_metadata_after_add(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
-) -> Vec<String> {
+) -> SiteReplicationErrorSummary {
     let info = match build_sr_info(state, local_peer).await {
         Ok(info) => info,
         Err(err) => {
-            return vec![format!(
-                "local snapshot failed: {}",
-                summarize_peer_error_detail(&err.to_string())
-            )];
+            let mut errors = SiteReplicationErrorSummary::default();
+            errors.push(format!("local snapshot failed: {err}"));
+            return errors;
         }
     };
     let plan = match site_replication_bootstrap_plan(&info) {
         Ok(plan) => plan,
         Err(err) => {
-            return vec![format!(
-                "bootstrap plan failed: {}",
-                summarize_peer_error_detail(&err.to_string())
-            )];
+            let mut errors = SiteReplicationErrorSummary::default();
+            errors.push(format!("bootstrap plan failed: {err}"));
+            return errors;
         }
     };
 
-    let mut errors = Vec::new();
+    let mut errors = SiteReplicationErrorSummary::default();
     for peer in state.peers.values() {
         if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
@@ -2741,17 +2790,6 @@ async fn bootstrap_existing_metadata_after_add(
     }
 
     errors
-}
-
-/// Combine the metadata-bootstrap and object-back-fill failure lists into the single
-/// `initial_sync_error_message` surfaced by `mc admin replicate add`, so an operator can
-/// see exactly which buckets did not propagate instead of receiving an unqualified success.
-fn compose_initial_sync_error_message(bootstrap_errors: Vec<String>, backfill_errors: Vec<String>) -> String {
-    bootstrap_errors
-        .into_iter()
-        .chain(backfill_errors)
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
@@ -5405,10 +5443,10 @@ async fn backfill_existing_buckets_after_add(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     bootstrap_token: Option<&str>,
-) -> Vec<String> {
-    let mut errors = Vec::new();
+) -> SiteReplicationErrorSummary {
+    let mut errors = SiteReplicationErrorSummary::default();
     let Some(store) = current_object_store_handle() else {
-        errors.push("object store not initialized; pre-existing buckets were not backfilled".to_string());
+        errors.push("object store not initialized; pre-existing buckets were not backfilled");
         return errors;
     };
     let buckets = match store.list_bucket(&BucketOptions::default()).await {
@@ -5422,7 +5460,7 @@ async fn backfill_existing_buckets_after_add(
                 error = ?err,
                 "admin site replication state"
             );
-            errors.push(format!("list buckets failed: {}", summarize_peer_error_detail(&err.to_string())));
+            errors.push(format!("list buckets failed: {err}"));
             return errors;
         }
     };
@@ -5441,10 +5479,7 @@ async fn backfill_existing_buckets_after_add(
                 error = ?err,
                 "admin site replication state"
             );
-            errors.push(format!(
-                "{name}: versioning setup failed: {}",
-                summarize_peer_error_detail(&err.to_string())
-            ));
+            errors.push(format!("{name}: versioning setup failed: {err}"));
             continue;
         }
         match ensure_site_replication_bucket_setup(name).await {
@@ -5474,7 +5509,7 @@ async fn backfill_existing_buckets_after_add(
                     error = ?err,
                     "admin site replication state"
                 );
-                errors.push(format!("{name}: bucket setup failed: {}", summarize_peer_error_detail(&err.to_string())));
+                errors.push(format!("{name}: bucket setup failed: {err}"));
             }
         }
         // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
@@ -5506,10 +5541,7 @@ async fn backfill_existing_buckets_after_add(
                 error = ?err,
                 "admin site replication state"
             );
-            errors.push(format!(
-                "{name}: make-bucket broadcast failed: {}",
-                summarize_peer_error_detail(&err.to_string())
-            ));
+            errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
         }
         // Kick a resync toward every remote peer so existing objects travel across.
         for peer in state.peers.values() {
@@ -5528,11 +5560,7 @@ async fn backfill_existing_buckets_after_add(
                     detail = %result.err_detail,
                     "admin site replication state"
                 );
-                errors.push(format!(
-                    "{name} -> {}: resync kick failed: {}",
-                    peer.endpoint,
-                    summarize_peer_error_detail(&result.err_detail)
-                ));
+                errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
             }
         }
     }
@@ -6216,17 +6244,22 @@ impl Operation for SiteReplicationAddHandler {
             cred.access_key.clone(),
             replicate_ilm_expiry,
         );
-        let join_req = SRPeerJoinReq {
-            svc_acct_access_key: service_account_access_key,
-            svc_acct_secret_key: service_account_secret_key.clone(),
-            svc_acct_parent: String::new(),
-            peers: state.peers.clone(),
-            updated_at: state.updated_at,
+        state.sync_state_initialized = true;
+        let join_req = SRPeerJoinEnvelope {
+            request: SRPeerJoinReq {
+                svc_acct_access_key: service_account_access_key,
+                svc_acct_secret_key: service_account_secret_key.clone(),
+                svc_acct_parent: String::new(),
+                peers: state.peers.clone(),
+                updated_at: state.updated_at,
+            },
+            defer_sync_state_enable: true,
         };
         let peer_join_path =
             with_site_replication_bootstrap_token(SITE_REPLICATION_PEER_JOIN_PATH, &add_in_progress_guard.token.to_string());
 
         let mut joined_endpoints = HashSet::new();
+        let mut initial_sync_errors = SiteReplicationErrorSummary::default();
         for site in &sites {
             if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
                 || !joined_endpoints.insert(site_identity_key(&site.endpoint))
@@ -6235,7 +6268,7 @@ impl Operation for SiteReplicationAddHandler {
             }
 
             let mut peer_join_req = join_req.clone();
-            peer_join_req.svc_acct_parent = site.access_key.clone();
+            peer_join_req.request.svc_acct_parent = site.access_key.clone();
             let connection = PeerConnection::try_from(site)?;
             let body =
                 send_peer_admin_request(&connection, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req).await?;
@@ -6246,6 +6279,9 @@ impl Operation for SiteReplicationAddHandler {
                     format!("parse peer join response from {} failed: {e}", site.endpoint),
                 )
             })?;
+            if !join_response.initial_sync_error_message.is_empty() {
+                initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+            }
             state = reconcile_peer_with_actual_identity(state, join_response.peer);
             let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
                 S3Error::with_message(
@@ -6261,22 +6297,49 @@ impl Operation for SiteReplicationAddHandler {
             })?;
         }
 
-        // BUG1: persist a real sync_state so `mc admin replicate info` and the console report
-        // Enable for healthy peers instead of Unknown. build_status_info still refines this from
-        // live health for the `replicate status` endpoint.
-        mark_peers_sync_enabled(&mut state.peers);
+        mark_unknown_peer_sync_enabled(&mut state.peers);
         persist_site_replication_state(&state).await?;
-        let bootstrap_errors = bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await;
+
+        for target in state.peers.values() {
+            if target.deployment_id == local_peer.deployment_id || same_identity_endpoint(&target.endpoint, &local_peer.endpoint)
+            {
+                continue;
+            }
+            let transport = match PeerTransport::for_runtime_peer(target).await {
+                Ok(transport) => transport,
+                Err(err) => {
+                    initial_sync_errors.push(format!("{}: finalize peer sync state failed: {err}", target.endpoint));
+                    continue;
+                }
+            };
+            for peer in state.peers.values() {
+                if let Err(err) = send_peer_admin_request_with_client(
+                    &transport.client,
+                    &transport.connection,
+                    SITE_REPLICATION_PEER_EDIT_PATH,
+                    &state.service_account_access_key,
+                    &service_account_secret_key,
+                    peer,
+                )
+                .await
+                {
+                    initial_sync_errors
+                        .push(format!("{}: finalize sync state for {} failed: {err}", target.endpoint, peer.endpoint));
+                }
+            }
+        }
+
+        initial_sync_errors.extend(bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await);
 
         // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
         // are not silently left out of replication. Per-bucket failures are surfaced in the add
         // response below (BUG2) rather than swallowed; they do not abort the overall add.
-        let backfill_errors = backfill_existing_buckets_after_add(&state, &local_peer, None).await;
+        initial_sync_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, None).await);
 
         json_response(&ReplicateAddStatus {
             success: true,
             status: SITE_REPL_ADD_SUCCESS.to_string(),
-            initial_sync_error_message: compose_initial_sync_error_message(bootstrap_errors, backfill_errors),
+            initial_sync_error_message: initial_sync_errors.render(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         })
@@ -6504,18 +6567,22 @@ impl Operation for SRPeerJoinHandler {
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        let join_req: SRPeerJoinReq = read_site_replication_json(req, &cred.secret_key, true).await?;
+        let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
+        let defer_sync_state_enable = join_envelope.defer_sync_state_enable;
+        let join_req = join_envelope.request;
         validate_join_peer_snapshot(&join_req.peers)?;
 
         if let Some(current_updated_at) = state.updated_at {
             let Some(incoming_updated_at) = join_req.updated_at else {
                 return json_response(&SRPeerJoinResponse {
                     peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                    ..Default::default()
                 });
             };
             if incoming_updated_at <= current_updated_at {
                 return json_response(&SRPeerJoinResponse {
                     peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                    ..Default::default()
                 });
             }
         }
@@ -6574,9 +6641,8 @@ impl Operation for SRPeerJoinHandler {
         state.service_account_parent = join_req.svc_acct_parent;
         state.updated_at = join_req.updated_at.or_else(|| Some(OffsetDateTime::now_utc()));
         state.peers = normalize_join_peers_for_local(&local_peer, join_req.peers);
-        // BUG1: persist Enable on the joining side too, so its `replicate info` endpoint reports a
-        // real sync state rather than Unknown.
-        mark_peers_sync_enabled(&mut state.peers);
+        initialize_join_peer_sync_state(&mut state.peers, defer_sync_state_enable);
+        state.sync_state_initialized = true;
         state.name = state
             .peers
             .get(&local_peer.deployment_id)
@@ -6594,12 +6660,14 @@ impl Operation for SRPeerJoinHandler {
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                 result = "join_backfill_incomplete",
-                errors = %backfill_errors.join("; "),
+                error_count = backfill_errors.total,
+                reported_error_count = backfill_errors.reported(),
                 "admin site replication state"
             );
         }
         json_response(&SRPeerJoinResponse {
             peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+            initial_sync_error_message: backfill_errors.render(),
         })
     }
 }
@@ -7298,7 +7366,7 @@ impl Operation for SiteReplicationRepairHandler {
             } else {
                 "Partial".to_string()
             },
-            err_detail: repair_errors.join("; "),
+            err_detail: repair_errors.render(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         })
     }
@@ -11065,7 +11133,7 @@ mod tests {
             peers.values().all(|p| p.sync_state == SyncStatus::Unknown),
             "freshly constructed peers default to Unknown"
         );
-        mark_peers_sync_enabled(&mut peers);
+        mark_unknown_peer_sync_enabled(&mut peers);
         assert!(
             !peers.is_empty() && peers.values().all(|p| p.sync_state == SyncStatus::Enable),
             "add/join must persist Enable so the info endpoint reports a real sync state"
@@ -11092,9 +11160,33 @@ mod tests {
                 ..peer("b", "https://b.example.com")
             },
         );
-        mark_peers_sync_enabled(&mut peers);
+        mark_unknown_peer_sync_enabled(&mut peers);
         assert_eq!(peers["a"].sync_state, SyncStatus::Enable, "Unknown must be promoted to Enable");
         assert_eq!(peers["b"].sync_state, SyncStatus::Disable, "explicit Disable must be preserved");
+    }
+
+    #[test]
+    fn test_join_peer_sync_state_waits_for_deferred_commit() {
+        let mut peers = BTreeMap::from([("a".to_string(), peer("a", "https://a.example.com"))]);
+
+        initialize_join_peer_sync_state(&mut peers, true);
+        assert_eq!(peers["a"].sync_state, SyncStatus::Unknown);
+
+        initialize_join_peer_sync_state(&mut peers, false);
+        assert_eq!(peers["a"].sync_state, SyncStatus::Enable);
+    }
+
+    #[test]
+    fn test_join_deferred_sync_state_flag_is_wire_compatible() {
+        let legacy: SRPeerJoinEnvelope = serde_json::from_value(serde_json::json!({})).expect("parse legacy peer join request");
+        assert!(!legacy.defer_sync_state_enable);
+
+        let value = serde_json::to_value(SRPeerJoinEnvelope {
+            defer_sync_state_enable: true,
+            ..Default::default()
+        })
+        .expect("serialize peer join request");
+        assert_eq!(value.get("deferSyncStateEnable"), Some(&Value::Bool(true)));
     }
 
     // BUG2: pre-existing-bucket back-fill failures must be surfaced in the add response's
@@ -11106,7 +11198,11 @@ mod tests {
             "test78787: replication setup skipped (site replication runtime unavailable)".to_string(),
             "test78787 -> https://peer.example.com: resync kick failed: timeout".to_string(),
         ];
-        let msg = compose_initial_sync_error_message(bootstrap_errors, backfill_errors);
+        let mut errors = SiteReplicationErrorSummary::default();
+        for error in bootstrap_errors.into_iter().chain(backfill_errors) {
+            errors.push(error);
+        }
+        let msg = errors.render();
         assert!(msg.contains("peer-x: metadata sync failed"), "bootstrap errors must be surfaced");
         assert!(
             msg.contains("test78787: replication setup skipped"),
@@ -11116,8 +11212,34 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_initial_sync_error_message_empty_on_success() {
-        assert_eq!(compose_initial_sync_error_message(Vec::new(), Vec::new()), "");
+    fn test_initial_sync_error_summary_is_bounded() {
+        let mut errors = SiteReplicationErrorSummary::default();
+        for index in 0..(SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT + 5) {
+            errors.push(format!("bucket-{index}: {}", "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT + 32)));
+        }
+
+        let message = errors.render();
+
+        assert_eq!(errors.reported(), SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT);
+        assert!(message.contains("5 additional error(s) omitted"));
+        assert!(message.chars().count() <= SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT * 258 + 64);
+    }
+
+    #[test]
+    fn test_peer_join_response_error_summary_is_wire_compatible() {
+        let response: SRPeerJoinResponse = serde_json::from_value(serde_json::json!({
+            "peer": peer("remote", "https://remote.example.com")
+        }))
+        .expect("parse legacy peer join response");
+
+        assert!(response.initial_sync_error_message.is_empty());
+
+        let value = serde_json::to_value(SRPeerJoinResponse {
+            peer: peer("remote", "https://remote.example.com"),
+            initial_sync_error_message: "bucket setup failed".to_string(),
+        })
+        .expect("serialize peer join response");
+        assert_eq!(value.get("initialSyncErrorMessage").and_then(Value::as_str), Some("bucket setup failed"));
     }
 
     // Fix 5: remove --all must purge local state unconditionally even when peer errors occur
