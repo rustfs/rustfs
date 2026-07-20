@@ -1074,6 +1074,17 @@ mod tests {
     }
 
     #[test]
+    fn tonic_v2_signature_is_bound_to_exact_service() {
+        ensure_test_rpc_secret();
+        let headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "Ping", None)
+            .expect("tonic auth headers should build");
+
+        let error = verify_tonic_rpc_signature("node-a:9000", "/other.NodeService/Ping", &headers)
+            .expect_err("signature replayed to a different service must fail");
+        assert_eq!(error.to_string(), "Invalid RPC v2 signature");
+    }
+
+    #[test]
     fn tonic_v2_signature_is_bound_to_destination_audience() {
         ensure_test_rpc_secret();
         let headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "Ping", None)

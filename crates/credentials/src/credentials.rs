@@ -260,13 +260,10 @@ fn resolve_rpc_secret(env_secret: Option<&str>, global_access: Option<&str>, glo
 
     match (global_access, global_secret) {
         (Some(access_key), Some(secret_key)) => {
-            // Fail closed: never derive the RPC secret while the default secret
-            // key is in effect. The derivation uses `secret_key` as the HMAC key,
-            // so a public default secret yields a publicly computable RPC secret
-            // that any network peer can use to forge internode RPC signatures.
-            // Operators running with default credentials must configure
-            // RUSTFS_RPC_SECRET (or set a non-default RUSTFS_SECRET_KEY) instead.
-            if secret_key.trim() == DEFAULT_SECRET_KEY {
+            // Fail closed when either half of the active credential pair still
+            // uses the public default. Operators must configure both custom
+            // credentials or provide RUSTFS_RPC_SECRET explicitly.
+            if access_key.trim() == DEFAULT_ACCESS_KEY || secret_key.trim() == DEFAULT_SECRET_KEY {
                 return None;
             }
             derive_rpc_secret(access_key, secret_key)
@@ -589,18 +586,11 @@ mod tests {
     fn test_resolve_rpc_secret_rejects_default_credentials_for_derivation() {
         assert!(resolve_rpc_secret(None, None, None).is_none());
 
-        // Fail closed: the default secret key must not yield a derivable RPC
-        // secret, otherwise the derived value is publicly computable and any
-        // network peer can forge internode RPC signatures.
+        // Fail closed when either half of the credential pair uses the public
+        // default.
         assert!(resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).is_none());
-
-        // A default access key paired with a non-default secret key is still
-        // safe to derive: the HMAC key (the secret key) is not public.
-        let expected = derive_rpc_secret(DEFAULT_ACCESS_KEY, "custom-global-secret").expect("secret should derive");
-        assert_eq!(
-            resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some("custom-global-secret")).as_deref(),
-            Some(expected.as_str())
-        );
+        assert!(resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some("custom-global-secret")).is_none());
+        assert!(resolve_rpc_secret(None, Some("custom-access"), Some(DEFAULT_SECRET_KEY)).is_none());
 
         assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-access"), Some("custom-global-secret")).is_none());
     }
@@ -633,6 +623,10 @@ mod tests {
     fn test_resolve_rpc_secret_accepts_non_default_secret() {
         assert_eq!(
             resolve_rpc_secret(Some("custom-rpc-secret"), None, None).as_deref(),
+            Some("custom-rpc-secret")
+        );
+        assert_eq!(
+            resolve_rpc_secret(Some("custom-rpc-secret"), Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).as_deref(),
             Some("custom-rpc-secret")
         );
         let expected = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");

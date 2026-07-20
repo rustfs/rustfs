@@ -146,12 +146,20 @@ struct MockWarmBackendInner {
     put_versions: Mutex<Vec<(String, String)>>,
     remove_versions: Mutex<Vec<(String, String)>>,
     put_barrier: Mutex<Option<Arc<MockPutBarrierState>>>,
+    get_barrier: Mutex<Option<Arc<MockGetBarrierState>>>,
 }
 
 #[derive(Default)]
 struct MockPutBarrierState {
     arrived: Notify,
     release: Notify,
+}
+
+#[derive(Default)]
+struct MockGetBarrierState {
+    arrived: Notify,
+    release: Notify,
+    fail_after_release: bool,
 }
 
 /// One-shot barrier that pauses a mock tier PUT after storing its remote body.
@@ -179,6 +187,31 @@ impl Drop for MockPutBarrier {
     }
 }
 
+/// One-shot barrier that pauses a mock tier GET before it reads remote bytes.
+pub struct MockGetBarrier {
+    state: Arc<MockGetBarrierState>,
+}
+
+impl MockGetBarrier {
+    /// Wait until the GET has reached the deterministic pause point.
+    pub async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("mock tier GET should reach the deterministic barrier");
+    }
+
+    /// Release the paused GET.
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+impl Drop for MockGetBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+    }
+}
+
 /// In-memory [`WarmBackend`] for lifecycle / tiering integration tests.
 ///
 /// Cloning shares the same underlying storage, fault configuration, and
@@ -200,6 +233,17 @@ impl MockWarmBackend {
         let state = Arc::new(MockPutBarrierState::default());
         *self.inner.put_barrier.lock().await = Some(Arc::clone(&state));
         MockPutBarrier { state }
+    }
+
+    /// Arm a one-shot pause before the next tier GET, then return an error
+    /// after the test releases it.
+    pub async fn arm_failing_get_barrier(&self) -> MockGetBarrier {
+        let state = Arc::new(MockGetBarrierState {
+            fail_after_release: true,
+            ..Default::default()
+        });
+        *self.inner.get_barrier.lock().await = Some(Arc::clone(&state));
+        MockGetBarrier { state }
     }
 
     // ---- fault injection -------------------------------------------------
@@ -500,6 +544,14 @@ impl WarmBackend for MockWarmBackend {
 
     async fn get(&self, object: &str, _rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         self.precondition().await?;
+        let barrier = self.inner.get_barrier.lock().await.take();
+        if let Some(barrier) = barrier {
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+            if barrier.fail_after_release {
+                return Err(std::io::Error::other("mock warm backend GET failed after barrier"));
+            }
+        }
         self.record(MockWarmOp::Get {
             object: object.to_string(),
         })
