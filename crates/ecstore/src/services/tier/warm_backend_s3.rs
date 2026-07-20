@@ -25,9 +25,9 @@ use url::Url;
 use crate::client::{
     api_get_options::GetObjectOptions,
     api_put_object::PutObjectOptions,
-    api_remove::RemoveObjectOptions,
+    api_remove::{RemoveObjectOptions, RemoveObjectResult},
     credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, TransitionClient, TransitionCore},
+    transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
 use crate::error::ErrorResponse;
@@ -36,6 +36,7 @@ use crate::services::tier::{
     tier_config::TierS3,
     warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
 };
+use http::HeaderMap;
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::path::SLASH_SEPARATOR;
 
@@ -48,7 +49,15 @@ pub struct WarmBackendS3 {
 }
 
 impl WarmBackendS3 {
-    pub async fn new(conf: &TierS3, tier: &str) -> Result<Self, std::io::Error> {
+    pub async fn new(conf: &TierS3, _tier: &str) -> Result<Self, std::io::Error> {
+        Self::new_with_bucket_lookup(conf, BucketLookupType::BucketLookupAuto, "s3").await
+    }
+
+    pub(crate) async fn new_with_bucket_lookup(
+        conf: &TierS3,
+        bucket_lookup: BucketLookupType,
+        tier_type: &str,
+    ) -> Result<Self, std::io::Error> {
         let u = match Url::parse(&conf.endpoint) {
             Ok(u) => u,
             Err(err) => {
@@ -94,12 +103,13 @@ impl WarmBackendS3 {
             creds,
             secure: u.scheme() == "https",
             region: conf.region.clone(),
+            bucket_lookup,
             ..Default::default()
         };
         let host = u
             .host()
             .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
-        let client = TransitionClient::new(&host.to_string(), opts, "s3").await?;
+        let client = TransitionClient::new(&host.to_string(), opts, tier_type).await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -118,6 +128,36 @@ impl WarmBackendS3 {
             dest_obj = format!("{}/{}", &self.prefix, object);
         }
         return dest_obj;
+    }
+
+    pub(crate) async fn remove_with_result(&self, object: &str, rv: &str) -> Result<RemoveObjectResult, std::io::Error> {
+        let mut opts = RemoveObjectOptions::default();
+        if !rv.is_empty() {
+            opts.version_id = rv.to_string();
+        }
+        self.client
+            .remove_object_inner(&self.bucket, &self.get_dest(object), opts)
+            .await
+    }
+
+    pub(crate) async fn get_with_headers(
+        &self,
+        object: &str,
+        rv: &str,
+        opts: WarmBackendGetOpts,
+    ) -> Result<(HeaderMap, ReadCloser), std::io::Error> {
+        let mut gopts = GetObjectOptions::default();
+
+        if !rv.is_empty() {
+            gopts.version_id = rv.to_string();
+        }
+        if opts.start_offset >= 0 && opts.length > 0 {
+            gopts
+                .set_range(opts.start_offset, opts.start_offset + opts.length - 1)
+                .map_err(std::io::Error::other)?;
+        }
+        let (_, headers, reader) = self.core.get_object(&self.bucket, &self.get_dest(object), &gopts).await?;
+        Ok((headers, reader))
     }
 }
 
@@ -168,32 +208,11 @@ impl WarmBackend for WarmBackendS3 {
     }
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let mut gopts = GetObjectOptions::default();
-
-        if rv != "" {
-            gopts.version_id = rv.to_string();
-        }
-        if opts.start_offset >= 0 && opts.length > 0 {
-            if let Err(err) = gopts.set_range(opts.start_offset, opts.start_offset + opts.length - 1) {
-                return Err(std::io::Error::other(err));
-            }
-        }
-        let c = TransitionCore(Arc::clone(&self.client));
-        let (_, _, r) = c.get_object(&self.bucket, &self.get_dest(object), &gopts).await?;
-
-        Ok(r)
+        self.get_with_headers(object, rv, opts).await.map(|(_, reader)| reader)
     }
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
-        let mut ropts = RemoveObjectOptions::default();
-        if rv != "" {
-            ropts.version_id = rv.to_string();
-        }
-        let client = self.client.clone();
-        match client.remove_object(&self.bucket, &self.get_dest(object), ropts).await {
-            None => Ok(()),
-            Some(err) => Err(std::io::Error::other(err)),
-        }
+        self.remove_with_result(object, rv).await.map(|_| ())
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {

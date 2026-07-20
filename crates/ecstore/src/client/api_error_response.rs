@@ -103,7 +103,7 @@ pub fn http_resp_to_error_response(
     object_name: &str,
 ) -> ErrorResponse {
     let err_body = String::from_utf8_lossy(&b).to_string();
-    if h.is_empty() || resp_status.is_client_error() || resp_status.is_server_error() {
+    if h.is_empty() || !(resp_status.is_client_error() || resp_status.is_server_error()) {
         return ErrorResponse {
             status_code: resp_status,
             code: S3ErrorCode::ResponseInterrupted,
@@ -328,5 +328,22 @@ mod tests {
         let value = serde_json::to_value(response).expect("error response should serialize");
         assert_eq!(value["RequestId"], Value::String("req-xml-123".to_string()));
         assert!(value.get("request_id").is_none(), "external error contract must not expose request_id");
+    }
+
+    #[test]
+    fn parses_s3_error_code_from_client_error_response() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-request-id", "request-id".parse().expect("request ID header should parse"));
+
+        let response = http_resp_to_error_response(
+            StatusCode::NOT_FOUND,
+            &headers,
+            b"<Error><Code>NoSuchVersion</Code><Message>remote detail</Message></Error>".to_vec(),
+            "bucket",
+            "object",
+        );
+
+        assert_eq!(response.code, S3ErrorCode::NoSuchVersion);
+        assert_eq!(response.status_code, StatusCode::NOT_FOUND);
     }
 }

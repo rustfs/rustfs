@@ -426,7 +426,7 @@ pub mod tier {
     pub mod tier_config {
         pub use crate::services::tier::tier_config::{
             ServicePrincipalAuth, TierAliyun, TierAzure, TierConfig, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS,
-            TierS3, TierTencent, TierType,
+            TierS3, TierTencent, TierType, TierWasabi,
         };
     }
 

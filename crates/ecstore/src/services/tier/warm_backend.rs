@@ -37,6 +37,7 @@ use crate::services::tier::{
     warm_backend_rustfs::WarmBackendRustFS,
     warm_backend_s3::WarmBackendS3,
     warm_backend_tencent::WarmBackendTencent,
+    warm_backend_wasabi::WarmBackendWasabi,
 };
 use bytes::Bytes;
 use http::StatusCode;
@@ -235,6 +236,27 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                 });
             }
         }
+        TierType::Wasabi => {
+            if let Some(wasabi_config) = tier.wasabi.as_ref() {
+                match WarmBackendWasabi::new(wasabi_config, &tier.name).await {
+                    Ok(backend) => d = Some(Box::new(backend)),
+                    Err(err) => {
+                        warn!("{}", err);
+                        return Err(AdminError {
+                            code: "XRustFSAdminTierInvalidConfig".to_string(),
+                            message: format!("Unable to setup remote tier, check tier configuration: {err}"),
+                            status_code: StatusCode::BAD_REQUEST,
+                        });
+                    }
+                }
+            } else {
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: "Wasabi tier configuration not found".to_string(),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+        }
         TierType::RustFS => {
             if let Some(rustfs_config) = tier.rustfs.as_ref() {
                 let dd = WarmBackendRustFS::new(rustfs_config, &tier.name).await;
@@ -400,16 +422,22 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
         }
     }
 
-    d.ok_or_else(|| AdminError {
+    let d = d.ok_or_else(|| AdminError {
         code: "XRustFSAdminTierInvalidConfig".to_string(),
         message: "Tier backend not initialized".to_string(),
         status_code: StatusCode::BAD_REQUEST,
-    })
+    })?;
+
+    if probe {
+        d.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
+    }
+    Ok(d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::tier::tier_config::TierWasabi;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -640,6 +668,37 @@ mod tests {
         assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
         assert_eq!(get_versions.lock().await.as_slice(), [PROBE_VERSION]);
         assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn new_wasabi_backend_honors_probe_flag() {
+        let tier = TierConfig {
+            name: "WASABI".to_string(),
+            tier_type: TierType::Wasabi,
+            wasabi: Some(TierWasabi {
+                name: "WASABI".to_string(),
+                access_key: "invalid\naccess-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                bucket: "tier-bucket".to_string(),
+                prefix: "archive".to_string(),
+                region: "us-east-1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let backend = new_warm_backend(&tier, false)
+            .await
+            .expect("valid Wasabi config should initialize without probing the remote service");
+
+        assert!(backend.validate_remote_version_id("").is_ok());
+        assert!(backend.validate_remote_version_id("unexpected-version").is_err());
+
+        let err = match new_warm_backend(&tier, true).await {
+            Ok(_) => panic!("probing a Wasabi backend must validate its credentials"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
     }
 
     #[test]
