@@ -33,4 +33,4 @@ documentation impact. Use N/A when there is no expected impact.
 
 ---
 
-Thank you for your contribution! Please ensure your PR follows the community standards ([CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)). If this is your first contribution, review the [CLA document](https://github.com/rustfs/cla/blob/main/cla/v1.md) and sign it by commenting `I have read and agree to the CLA.` on the PR.
+Thank you for your contribution! Please ensure your PR follows the community standards ([CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)). If this is your first contribution, review the [CLA document](https://github.com/rustfs/cla/blob/main/cla/v2.md) and sign it by commenting `I have read and agree to the CLA.` on the PR.

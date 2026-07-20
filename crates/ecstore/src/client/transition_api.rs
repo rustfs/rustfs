@@ -31,6 +31,7 @@ use crate::client::{
     },
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
+    provider_versions::{BucketVersioningState, ProviderVersionCapabilities},
     signer_error,
 };
 use crate::{client::checksum::ChecksumMode, object_api::GetObjectReader};
@@ -307,6 +308,14 @@ impl TransitionClient {
 
     fn endpoint_url(&self) -> Url {
         self.endpoint_url.clone()
+    }
+
+    pub(crate) fn provider_version_capabilities(&self) -> ProviderVersionCapabilities {
+        ProviderVersionCapabilities::for_tier_type(&self.tier_type)
+    }
+
+    pub(crate) fn raw_version_id<'a>(&self, headers: &'a HeaderMap) -> Result<Option<&'a str>, std::io::Error> {
+        self.provider_version_capabilities().raw_version_id(headers)
     }
 
     fn trace_errors_only_off(&self) {
@@ -1153,6 +1162,15 @@ impl Default for UploadInfo {
 /// This function parses various S3 response headers to construct an ObjectInfo struct
 /// containing metadata about an S3 object.
 pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Result<ObjectInfo, std::io::Error> {
+    to_object_info_for_provider(bucket_name, object_name, h, ProviderVersionCapabilities::for_tier_type("s3"))
+}
+
+pub(crate) fn to_object_info_for_provider(
+    bucket_name: &str,
+    object_name: &str,
+    h: &HeaderMap,
+    version_capabilities: ProviderVersionCapabilities,
+) -> Result<ObjectInfo, std::io::Error> {
     // Helper function to get header value as string
     let get_header = |name: &str| -> String { h.get(name).and_then(|val| val.to_str().ok()).unwrap_or("").to_string() };
 
@@ -1270,14 +1288,11 @@ pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Re
     };
 
     // Extract version ID
-    let version_id = {
-        let version_id_str = get_header("x-amz-version-id");
-        if !version_id_str.is_empty() {
-            Some(Uuid::parse_str(&version_id_str).unwrap_or_else(|_| Uuid::nil()))
-        } else {
-            None
-        }
-    };
+    let version_id = version_capabilities
+        .remote_version(h, BucketVersioningState::Unknown)?
+        .exact_id()
+        .and_then(|version_id| Uuid::parse_str(version_id).ok())
+        .filter(|version_id| !version_id.is_nil());
 
     // Check if it's a delete marker
     let is_delete_marker = get_header("x-amz-delete-marker") == "true";
@@ -1392,8 +1407,13 @@ pub struct CreateBucketConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{SignatureType, build_tls_config, signer_error_to_io_error, validate_header_values, with_rustls_init_guard};
+    use super::{
+        SignatureType, build_tls_config, signer_error_to_io_error, to_object_info_for_provider, validate_header_values,
+        with_rustls_init_guard,
+    };
+    use crate::client::provider_versions::ProviderVersionCapabilities;
     use http::{HeaderMap, HeaderValue};
+    use uuid::Uuid;
 
     #[test]
     fn rustls_guard_converts_panics_to_io_errors() {
@@ -1474,5 +1494,40 @@ mod tests {
         );
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("x-amz-meta-invalid"));
+    }
+
+    #[test]
+    fn object_info_uses_provider_version_header_without_uuid_coercion() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cos-version-id", HeaderValue::from_static("opaque.version_01"));
+
+        let info =
+            to_object_info_for_provider("bucket", "object", &headers, ProviderVersionCapabilities::for_tier_type("tencent"))
+                .expect("opaque provider version should parse");
+
+        assert_eq!(info.version_id, None);
+        assert_eq!(
+            info.metadata.get("x-cos-version-id").and_then(|value| value.to_str().ok()),
+            Some("opaque.version_01")
+        );
+    }
+
+    #[test]
+    fn object_info_keeps_s3_uuid_version_id_and_filters_nil() {
+        let version_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(&version_id.to_string()).expect("uuid header should be valid"),
+        );
+
+        let info = to_object_info_for_provider("bucket", "object", &headers, ProviderVersionCapabilities::for_tier_type("s3"))
+            .expect("s3 uuid version should parse");
+        assert_eq!(info.version_id, Some(version_id));
+
+        headers.insert("x-amz-version-id", HeaderValue::from_static("00000000-0000-0000-0000-000000000000"));
+        let info = to_object_info_for_provider("bucket", "object", &headers, ProviderVersionCapabilities::for_tier_type("s3"))
+            .expect("nil s3 uuid version should parse");
+        assert_eq!(info.version_id, None);
     }
 }

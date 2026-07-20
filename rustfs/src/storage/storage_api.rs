@@ -319,7 +319,7 @@ pub(crate) mod timeout_wrapper_consumer {
 }
 
 pub(crate) mod tonic_service_consumer {
-    pub(crate) use super::super::tonic_service::make_server;
+    pub(crate) use super::super::tonic_service::{make_heal_control_server, make_server};
 }
 
 #[cfg(test)]
@@ -462,13 +462,13 @@ pub(crate) mod ecstore_rio {
 }
 
 pub(crate) mod ecstore_rpc {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::rpc::gen_tonic_signature_headers;
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
         SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_rpc_signature,
-        verify_tonic_rpc_signature,
+        verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::{gen_tonic_signature_headers, set_tonic_canonical_body_digest};
 }
 
 pub(crate) mod ecstore_object {
@@ -571,6 +571,8 @@ pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
 pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerContextSlot;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
+#[cfg(test)]
+pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
@@ -1401,6 +1403,15 @@ pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &h
 
 pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &http::HeaderMap) -> std::io::Result<()> {
     ecstore_rpc::verify_tonic_rpc_signature(audience, path, headers)
+}
+
+pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_canonical_body_digest(request, canonical_body)
+}
+
+#[cfg(test)]
+pub(crate) fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    ecstore_rpc::set_tonic_canonical_body_digest(request, canonical_body)
 }
 
 pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {

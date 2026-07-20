@@ -102,7 +102,7 @@ pub(crate) mod server {
         }
 
         #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::gen_tonic_signature_headers;
+        pub(crate) use crate::storage::storage_api::{PeerRestClient, gen_tonic_signature_headers};
 
         pub(crate) mod ecfs {
             pub(crate) type FS = crate::storage::storage_api::FS;
@@ -128,7 +128,7 @@ pub(crate) mod server {
         }
 
         pub(crate) mod tonic_service {
-            pub(crate) use crate::storage::storage_api::tonic_service_consumer::make_server;
+            pub(crate) use crate::storage::storage_api::tonic_service_consumer::{make_heal_control_server, make_server};
         }
     }
 

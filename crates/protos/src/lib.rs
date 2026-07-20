@@ -140,6 +140,64 @@ pub fn internode_rpc_max_message_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, DEFAULT_GRPC_SERVER_MESSAGE_LEN)
 }
 
+pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = 65 * 1024;
+
+/// Builds the stable byte representation authenticated for a heal-control request.
+///
+/// This deliberately does not reuse protobuf encoding: mixed-version peers may
+/// retain unknown protobuf fields, which must not change the signed contract.
+pub fn canonical_heal_control_request_body(
+    version: u32,
+    topology_fingerprint: &str,
+    command: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-v1\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(command.len())?.to_be_bytes());
+    body.extend_from_slice(command);
+    Ok(body)
+}
+
+#[cfg(test)]
+mod heal_control_tests {
+    use super::canonical_heal_control_request_body;
+
+    #[test]
+    fn canonical_heal_control_body_binds_every_field_and_boundary() {
+        let baseline = canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode");
+        let mut golden = b"rustfs-heal-control-v1\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&2_u64.to_be_bytes());
+        golden.extend_from_slice(b"ab");
+        golden.extend_from_slice(&1_u64.to_be_bytes());
+        golden.extend_from_slice(b"c");
+        assert_eq!(baseline, golden);
+
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(2, "ab", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ac", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ab", b"d").expect("small request should encode")
+        );
+        assert_ne!(
+            canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode"),
+            canonical_heal_control_request_body(1, "a", b"bc").expect("small request should encode")
+        );
+    }
+}
+
 /// Whether internode metadata RPCs should send only the msgpack `_bin` payloads and leave the JSON
 /// compatibility strings empty (grpc-optimization P2-1). Shared by the client (`remote_disk`) and
 /// server (`node_service`) send paths. Defaults to `false` (dual-write); see
