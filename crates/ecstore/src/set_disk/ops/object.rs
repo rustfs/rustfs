@@ -3831,6 +3831,97 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn local_commit_post_apply_error_rolls_back_the_errored_disk() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-post-apply-rollback-bucket";
+        let object = "object.bin";
+        let payload = b"post-apply delete errors must still roll back the changed disk".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install_after_lease_check(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(backend.put_count().await, 1, "remote candidate must exist before local commit");
+
+        crate::disk::local::set_delete_version_fail_after_commit(disk_stores[0].path().as_path(), object);
+        let saved_disk = {
+            let mut disks = set_disks.disks.write().await;
+            let saved = disks[1].take();
+            assert!(saved.is_some(), "test setup should start with the second disk online");
+            saved
+        };
+        barrier.release();
+        let result = transition.await.expect("transition task should not panic");
+
+        result.expect_err("post-apply disk error plus one offline disk must fail write quorum");
+        let errored_disk_fi = disk_stores[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("rollback must restore metadata on the disk that returned the post-apply error");
+        assert_ne!(
+            errored_disk_fi.transition_status, TRANSITION_COMPLETE,
+            "rollback must not skip the disk that applied delete_version but returned an error"
+        );
+        disk_stores[0]
+            .check_parts(bucket, object, &errored_disk_fi)
+            .await
+            .expect("rollback must restore the errored disk's staged data directory");
+
+        set_disks.disks.write().await[1] = saved_disk;
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "ambiguous local commit failure must retain the remote candidate for reconciliation"
+        );
+        assert_eq!(backend.object_count().await, 1);
+
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source must remain readable after rolling back the post-apply error")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the local source body should drain");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn production_transition_replacement_revokes_commit_and_cleans_with_old_driver() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-generation-fence-bucket";

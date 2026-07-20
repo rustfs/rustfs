@@ -1471,6 +1471,8 @@ static RENAME_DATA_FAIL_COMMIT_RENAME: std::sync::Mutex<Option<String>> = std::s
 static LOCAL_INLINE_ROLLBACK_HARDLINK_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static DELETE_VERSION_FAIL_AFTER_DATA_STAGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static DELETE_VERSION_FAIL_AFTER_COMMIT: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
@@ -1506,6 +1508,14 @@ fn set_delete_version_fail_after_data_staged(path: &str) {
         .lock()
         .expect("test failpoint lock should not be poisoned")
         .push(path.to_string());
+}
+
+#[cfg(test)]
+pub(crate) fn set_delete_version_fail_after_commit(root: &Path, path: &str) {
+    DELETE_VERSION_FAIL_AFTER_COMMIT
+        .lock()
+        .expect("test failpoint lock should not be poisoned")
+        .push((root.to_path_buf(), path.to_string()));
 }
 
 #[cfg(test)]
@@ -1573,6 +1583,22 @@ fn should_fail_after_delete_data_staged(path: &str) -> bool {
     }
 }
 
+#[cfg(test)]
+fn should_fail_after_delete_commit(root: &Path, path: &str) -> bool {
+    let mut targets = DELETE_VERSION_FAIL_AFTER_COMMIT
+        .lock()
+        .expect("test failpoint lock should not be poisoned");
+    if let Some(index) = targets
+        .iter()
+        .position(|(target_root, target_path)| target_root == root && target_path == path)
+    {
+        targets.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(not(test))]
 fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
     false
@@ -1595,6 +1621,11 @@ fn should_fail_local_inline_rollback_hardlink(_dst_path: &Path) -> bool {
 
 #[cfg(not(test))]
 fn should_fail_after_delete_data_staged(_path: &str) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn should_fail_after_delete_commit(_root: &Path, _path: &str) -> bool {
     false
 }
 
@@ -7832,6 +7863,10 @@ impl DiskAPI for LocalDisk {
                 err,
             )
             .await);
+        }
+
+        if should_fail_after_delete_commit(self.root.as_path(), path) {
+            return Err(DiskError::Unexpected);
         }
 
         Ok(())
