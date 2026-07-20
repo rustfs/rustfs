@@ -140,6 +140,121 @@ pub fn internode_rpc_max_message_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, DEFAULT_GRPC_SERVER_MESSAGE_LEN)
 }
 
+pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = 65 * 1024;
+pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v1\0";
+
+pub fn heal_control_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_heal_control_capability_probe(command: &[u8]) -> bool {
+    command.len() == HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + 16 && command.starts_with(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX)
+}
+
+/// Builds the stable byte representation authenticated for a heal-control request.
+///
+/// This deliberately does not reuse protobuf encoding: mixed-version peers may
+/// retain unknown protobuf fields, which must not change the signed contract.
+pub fn canonical_heal_control_request_body(
+    version: u32,
+    topology_fingerprint: &str,
+    command: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-v1\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(command.len())?.to_be_bytes());
+    body.extend_from_slice(command);
+    Ok(body)
+}
+
+/// Builds the exact acknowledgement expected from a peer that supports the
+/// heal-control protocol and agrees with the caller's storage topology.
+pub fn canonical_heal_control_capability_ack(
+    version: u32,
+    topology_fingerprint: &str,
+    probe: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v1\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(probe.len())?.to_be_bytes());
+    body.extend_from_slice(probe);
+    Ok(body)
+}
+
+#[cfg(test)]
+mod heal_control_tests {
+    use super::{
+        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, canonical_heal_control_capability_ack, canonical_heal_control_request_body,
+        heal_control_capability_probe, is_heal_control_capability_probe,
+    };
+
+    #[test]
+    fn canonical_heal_control_body_binds_every_field_and_boundary() {
+        let baseline = canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode");
+        let mut golden = b"rustfs-heal-control-v1\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&2_u64.to_be_bytes());
+        golden.extend_from_slice(b"ab");
+        golden.extend_from_slice(&1_u64.to_be_bytes());
+        golden.extend_from_slice(b"c");
+        assert_eq!(baseline, golden);
+
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(2, "ab", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ac", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ab", b"d").expect("small request should encode")
+        );
+        assert_ne!(
+            canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode"),
+            canonical_heal_control_request_body(1, "a", b"bc").expect("small request should encode")
+        );
+    }
+
+    #[test]
+    fn canonical_capability_ack_binds_version_and_topology() {
+        let probe = heal_control_capability_probe(&[7; 16]);
+        let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
+        let mut golden = b"rustfs-heal-control-capability-ack-v1\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&2_u64.to_be_bytes());
+        golden.extend_from_slice(b"ab");
+        golden.extend_from_slice(&u64::try_from(probe.len()).unwrap().to_be_bytes());
+        golden.extend_from_slice(&probe);
+        assert_eq!(ack, golden);
+        assert_ne!(ack, canonical_heal_control_capability_ack(2, "ab", &probe).unwrap());
+        assert_ne!(ack, canonical_heal_control_capability_ack(1, "ac", &probe).unwrap());
+        assert_ne!(
+            ack,
+            canonical_heal_control_capability_ack(1, "ab", &heal_control_capability_probe(&[8; 16])).unwrap()
+        );
+        assert!(is_heal_control_capability_probe(&probe));
+        assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+    }
+}
+
 /// Whether internode metadata RPCs should send only the msgpack `_bin` payloads and leave the JSON
 /// compatibility strings empty (grpc-optimization P2-1). Shared by the client (`remote_disk`) and
 /// server (`node_service`) send paths. Defaults to `false` (dual-write); see

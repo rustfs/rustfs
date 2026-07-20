@@ -257,6 +257,11 @@ impl ECStore {
         runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into())
     }
 
+    /// Get this store instance's endpoint topology without consulting process globals.
+    pub fn instance_endpoints(&self) -> Option<EndpointServerPools> {
+        self.ctx.endpoints()
+    }
+
     /// Get the global region
     pub fn region(&self) -> Option<s3s::region::Region> {
         runtime_sources::region()
@@ -897,6 +902,22 @@ mod tests {
         let ctx_b = Arc::new(InstanceContext::new());
         ctx_a.update_erasure_type(SetupType::DistErasure).await;
         ctx_b.update_erasure_type(SetupType::ErasureSD).await;
+        ctx_a.set_endpoints(EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::default(),
+            cmd_line: "instance-a".to_string(),
+            platform: String::new(),
+        }]));
+        ctx_b.set_endpoints(EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: true,
+            set_count: 2,
+            drives_per_set: 2,
+            endpoints: Endpoints::default(),
+            cmd_line: "instance-b".to_string(),
+            platform: String::new(),
+        }]));
 
         let store_a = build_store_with_ctx(ctx_a);
         let store_b = build_store_with_ctx(ctx_b);
@@ -910,6 +931,12 @@ mod tests {
         assert!(store_b.setup_is_erasure_sd().await);
         assert!(!store_b.setup_is_erasure().await);
         assert!(!store_b.setup_is_dist_erasure().await);
+        let endpoints_a = store_a.instance_endpoints().expect("instance A endpoints");
+        let endpoints_b = store_b.instance_endpoints().expect("instance B endpoints");
+        assert_eq!(endpoints_a.as_ref()[0].set_count, 1);
+        assert_eq!(endpoints_b.as_ref()[0].set_count, 2);
+        assert!(!endpoints_a.as_ref()[0].legacy);
+        assert!(endpoints_b.as_ref()[0].legacy);
     }
 
     // The production/test constructors ADOPT the process bootstrap context

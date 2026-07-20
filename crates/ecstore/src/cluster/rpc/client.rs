@@ -18,7 +18,8 @@ use crate::disk::error::{DiskError, Error as DiskErrorType};
 use crate::runtime::sources as runtime_sources;
 use http::Uri;
 use rustfs_protos::{
-    ChannelClass, create_new_channel, get_channel_for_class, proto_gen::node_service::node_service_client::NodeServiceClient,
+    ChannelClass, create_new_channel, get_channel_for_class,
+    proto_gen::node_service::{heal_control_service_client::HealControlServiceClient, node_service_client::NodeServiceClient},
 };
 use std::{error::Error, io::ErrorKind};
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
@@ -35,6 +36,21 @@ pub async fn node_service_time_out_client(
     // Default to the latency-sensitive control channel; bulk `bytes` RPCs opt in via the
     // `_for_class` variant below (grpc-optimization P1).
     node_service_time_out_client_for_class(addr, interceptor, ChannelClass::Control).await
+}
+
+pub async fn heal_control_time_out_client(
+    addr: &str,
+    interceptor: TonicInterceptor,
+) -> Result<HealControlServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
+    let interceptor = interceptor.with_rpc_audience(addr)?;
+    let channel = match runtime_sources::cached_node_channel(addr).await {
+        Some(channel) => channel,
+        None => create_new_channel(addr).await?,
+    };
+    let max_message_size = rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE;
+    Ok(HealControlServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size))
 }
 
 /// Build a `NodeServiceClient` bound to the [`ChannelClass`]-appropriate channel for `addr`.
