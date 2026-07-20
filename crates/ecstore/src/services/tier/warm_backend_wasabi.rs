@@ -484,10 +484,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_remote_version_get_rejects_versioned_response() {
-        for response_headers in [
-            "ETag: \"etag\"\r\nx-amz-version-id: unexpected-version\r\n",
-            "ETag: \"etag\"\r\nx-amz-version-id:\r\n",
-            "ETag: \"etag\"\r\nx-amz-delete-marker: true\r\n",
+        // An empty `x-amz-version-id` is rejected one layer down by the shared remote-version
+        // validator, so it fails closed with that validator's message instead of the drift message.
+        for (response_headers, expected_error) in [
+            ("ETag: \"etag\"\r\nx-amz-version-id: unexpected-version\r\n", "bucket versioning changed"),
+            ("ETag: \"etag\"\r\nx-amz-version-id:\r\n", "empty object version id header"),
+            ("ETag: \"etag\"\r\nx-amz-delete-marker: true\r\n", "bucket versioning changed"),
         ] {
             let Some((backend, request_task)) = backend_with_responses(vec![TestResponse {
                 status: "200 OK",
@@ -505,7 +507,7 @@ mod tests {
                 .expect_err("a versioned GET response must not return a possibly newer object");
             let requests = request_task.await.expect("GET request task should finish");
 
-            assert!(err.to_string().contains("bucket versioning changed"), "{err}");
+            assert!(err.to_string().contains(expected_error), "{err}");
             assert_eq!(requests.len(), 1);
             assert!(requests[0].head.starts_with("GET "));
             assert_eq!(request_target(&requests[0]), "/tier-bucket/archive/remote-object");
@@ -790,7 +792,9 @@ mod tests {
         assert!(request_target(&requests[0]).contains("versioning"));
         assert!(requests[1].head.starts_with("GET "));
         let target = request_target(&requests[1]);
-        assert!(target.starts_with("/tier-bucket?"), "{target}");
+        // Path-style bucket-level listing addresses the bucket root, so the target keeps the
+        // trailing slash before the query string.
+        assert!(target.starts_with("/tier-bucket/?"), "{target}");
         assert!(target.contains("list-type=2"), "{target}");
         assert!(target.contains("prefix=archive"), "{target}");
         assert!(target.contains("max-keys=1"), "{target}");
