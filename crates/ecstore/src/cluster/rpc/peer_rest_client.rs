@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::cluster::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, heal_control_time_out_client, node_service_time_out_client,
+};
+use crate::cluster::rpc::{set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
 use crate::{
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
@@ -29,14 +32,14 @@ use rustfs_madmin::{
 };
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::{
-    CancelDecommissionRequest, ClearDecommissionRequest, DeleteBucketMetadataRequest, DeletePolicyRequest,
-    DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest, GetMetricsRequest,
-    GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest,
-    GetSysErrorsRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
-    LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ScannerActivityRequest,
-    ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, StartDecommissionRequest, StartProfilingRequest,
-    StopRebalanceRequest, node_service_client::NodeServiceClient,
+    BackgroundHealStatusRequest, CancelDecommissionRequest, ClearDecommissionRequest, DeleteBucketMetadataRequest,
+    DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest,
+    GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
+    GetSysConfigRequest, GetSysErrorsRequest, HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+    LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+    LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest,
+    ReloadSiteReplicationConfigRequest, ScannerActivityRequest, ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest,
+    StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, node_service_client::NodeServiceClient,
 };
 use rustfs_utils::XHost;
 use serde::{Deserialize, Serialize as _};
@@ -60,6 +63,9 @@ pub const PEER_RESTSUB_SYS: &str = "sub-sys";
 pub const PEER_RESTDRY_RUN: &str = "dry-run";
 pub const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = 1;
 pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
+const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const HEAL_CONTROL_FINGERPRINT_MAX_SIZE: usize = 256;
+const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
@@ -86,6 +92,16 @@ fn decode_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerP
         namespace_generation: response.namespace_generation,
         maintenance_generation: response.maintenance_generation,
     })
+}
+
+fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) -> Result<()> {
+    verify_tonic_rpc_response_proof(canonical_ack, proof)
+        .map_err(|_| Error::other("peer returned an invalid heal control capability proof"))
+}
+
+fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8]) -> Result<()> {
+    verify_tonic_rpc_response_proof(canonical_response, proof)
+        .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +175,29 @@ impl PeerRestClient {
             .await
             .map_err(|err| {
                 let storage_err = Error::other(format!("can not get client, err: {err}"));
+                if Self::is_network_like_error(&storage_err) {
+                    self.mark_offline_and_spawn_recovery();
+                }
+                storage_err
+            })
+    }
+
+    async fn get_heal_control_client(
+        &self,
+    ) -> Result<
+        rustfs_protos::proto_gen::node_service::heal_control_service_client::HealControlServiceClient<
+            InterceptedService<Channel, TonicInterceptor>,
+        >,
+    > {
+        if self.offline.load(Ordering::Acquire) {
+            self.mark_offline_and_spawn_recovery();
+            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+        }
+
+        heal_control_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| {
+                let storage_err = Error::other(format!("can not get heal control client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
@@ -662,6 +701,106 @@ impl PeerRestClient {
     pub async fn get_all_bucket_stats(&self) -> Result<()> {
         warn!("get_all_bucket_stats is not implemented in PeerRestClient");
         Err(Error::NotImplemented)
+    }
+
+    pub async fn background_heal_status(&self) -> Result<Option<Vec<u8>>> {
+        self.finalize_result(
+            async {
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE);
+                let response = match client
+                    .background_heal_status(Request::new(BackgroundHealStatusRequest::default()))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        // RUSTFS_COMPAT_TODO(heal-status-rpc-v1): accept old peers without node heal snapshots. Remove after the minimum supported RustFS peer version implements BackgroundHealStatus.
+                        return Ok(None);
+                    }
+                    Err(status) => return Err(status.into()),
+                };
+                if !response.success {
+                    return Err(Error::other(
+                        response
+                            .error_info
+                            .unwrap_or_else(|| "peer background heal status failed without an error".to_string()),
+                    ));
+                }
+                Ok(Some(response.bg_heal_state.to_vec()))
+            }
+            .await,
+        )
+        .await
+    }
+
+    pub async fn heal_control(&self, version: u32, topology_fingerprint: String, command: Vec<u8>) -> Result<Vec<u8>> {
+        if topology_fingerprint.len() > HEAL_CONTROL_FINGERPRINT_MAX_SIZE {
+            return Err(Error::other("heal control topology fingerprint exceeds size limit"));
+        }
+        if command.len() > HEAL_CONTROL_PAYLOAD_MAX_SIZE {
+            return Err(Error::other("heal control command exceeds size limit"));
+        }
+        let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
+        self.finalize_result(
+            async {
+                let mut client = self
+                    .get_heal_control_client()
+                    .await?
+                    .max_encoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE)
+                    .max_decoding_message_size(rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE);
+                let canonical_body = rustfs_protos::canonical_heal_control_request_body(version, &topology_fingerprint, &command)
+                    .map_err(|_| Error::other("heal control request length cannot be represented"))?;
+                let mut request = Request::new(HealControlRequest {
+                    version,
+                    topology_fingerprint: topology_fingerprint.clone(),
+                    command: command.clone().into(),
+                });
+                request.set_timeout(rustfs_protos::heal_control_execution_timeout());
+                set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
+                let response = client.heal_control(request).await?.into_inner();
+                if !response.success {
+                    return Err(Error::other(
+                        response
+                            .error_info
+                            .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
+                    ));
+                }
+                if !capability_probe {
+                    let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+                        version,
+                        &topology_fingerprint,
+                        &command,
+                        &response.result,
+                    )
+                    .map_err(|_| Error::other("heal control response length cannot be represented"))?;
+                    validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
+                }
+                Ok(response.result.to_vec())
+            }
+            .await,
+        )
+        .await
+    }
+
+    /// Confirms that a peer supports the current heal-control coordination
+    /// contract and has the same storage
+    /// topology. Every non-success response is an error so old or divergent
+    /// peers cannot be mistaken for compatible ones.
+    pub async fn probe_heal_control(&self, topology_fingerprint: String) -> Result<()> {
+        let nonce = uuid::Uuid::new_v4();
+        let probe = rustfs_protos::heal_control_capability_probe(nonce.as_bytes());
+        let canonical_ack = rustfs_protos::canonical_heal_control_capability_ack(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &topology_fingerprint,
+            &probe,
+        )
+        .map_err(|_| Error::other("heal control capability acknowledgement length cannot be represented"))?;
+        let proof = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        validate_heal_control_capability_proof(&canonical_ack, &proof)
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
@@ -1262,6 +1401,46 @@ mod tests {
             .expect_err("offline peer should fast-fail before dialing");
 
         assert!(err.to_string().contains("temporarily offline"));
+    }
+
+    #[tokio::test]
+    async fn peer_rest_client_rejects_oversized_heal_control_before_dialing() {
+        let client = test_peer_client();
+        let err = client
+            .heal_control(1, "fingerprint".to_string(), vec![0; HEAL_CONTROL_PAYLOAD_MAX_SIZE + 1])
+            .await
+            .expect_err("oversized heal control payload must fail locally");
+
+        assert!(err.to_string().contains("exceeds size limit"));
+        assert!(!client.offline.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn heal_control_capability_proof_must_authenticate_exact_ack() {
+        runtime_sources::ensure_test_rpc_secret();
+        let proof = crate::cluster::rpc::sign_tonic_rpc_response_proof(b"expected").expect("test proof should sign");
+        assert!(validate_heal_control_capability_proof(b"expected", &proof).is_ok());
+        let err = validate_heal_control_capability_proof(b"different", &proof)
+            .expect_err("a proof for a different acknowledgement must fail closed");
+        assert!(err.to_string().contains("invalid heal control capability proof"));
+    }
+
+    #[test]
+    fn heal_control_response_proof_binds_command_and_result() {
+        runtime_sources::ensure_test_rpc_secret();
+        let canonical = rustfs_protos::canonical_heal_control_response_body(2, "fingerprint", b"query", b"result")
+            .expect("small response should encode");
+        let proof = crate::cluster::rpc::sign_tonic_rpc_response_proof(&canonical).expect("test proof should sign");
+        assert!(validate_heal_control_response_proof(&canonical, &proof).is_ok());
+
+        for tampered in [
+            rustfs_protos::canonical_heal_control_response_body(2, "fingerprint", b"cancel", b"result").unwrap(),
+            rustfs_protos::canonical_heal_control_response_body(2, "fingerprint", b"query", b"tampered").unwrap(),
+        ] {
+            let err = validate_heal_control_response_proof(&tampered, &proof)
+                .expect_err("proof must not authenticate a different command or result");
+            assert!(err.to_string().contains("invalid heal control response proof"));
+        }
     }
 
     #[tokio::test]

@@ -979,6 +979,7 @@ impl RustFSTestClusterEnvironment {
         }
 
         let mut extra_env = Vec::new();
+        extra_env.push(("RUSTFS_RPC_SECRET".to_string(), String::new()));
         if multidrive {
             extra_env.push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
         }
@@ -986,8 +987,8 @@ impl RustFSTestClusterEnvironment {
         Ok(Self {
             nodes,
             temp_dir,
-            access_key: DEFAULT_ACCESS_KEY.to_string(),
-            secret_key: DEFAULT_SECRET_KEY.to_string(),
+            access_key: "rustfs-cluster-test-access".to_string(),
+            secret_key: "rustfs-cluster-test-secret".to_string(),
             extra_env,
             topology,
         })

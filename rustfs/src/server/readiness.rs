@@ -489,61 +489,92 @@ fn disk_is_online_for_readiness(disk: &Disk) -> bool {
     state_is_acceptable
 }
 
-fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
+fn pool_erasure_layout(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> Option<(usize, usize)> {
     if set_drive_count == 0 {
-        return 1;
+        return None;
     }
 
-    let data_drives = info
-        .backend
-        .standard_sc_data
-        .get(pool_idx)
-        .copied()
-        .filter(|count| *count > 0)
-        .unwrap_or_else(|| (set_drive_count / 2).max(1));
+    if !info.backend.drives_per_set.is_empty() {
+        if info.backend.drives_per_set.get(pool_idx).copied() != Some(set_drive_count) {
+            return None;
+        }
+        if (!info.backend.standard_sc_data.is_empty() && info.backend.standard_sc_data.len() != info.backend.drives_per_set.len())
+            || (!info.backend.standard_sc_parities.is_empty()
+                && info.backend.standard_sc_parities.len() != info.backend.drives_per_set.len())
+        {
+            return None;
+        }
+    }
 
-    let parity_drives = if let Some(drives_per_set) = info.backend.drives_per_set.get(pool_idx).copied() {
-        drives_per_set.saturating_sub(data_drives)
-    } else if let Some(parity) = info.backend.standard_sc_parities.get(pool_idx).copied() {
-        parity
-    } else if let Some(parity) = info.backend.standard_sc_parity {
-        parity
-    } else {
-        set_drive_count.saturating_sub(data_drives)
+    let has_data = !info.backend.standard_sc_data.is_empty();
+    let has_parities = !info.backend.standard_sc_parities.is_empty();
+    let (data_drives, parity_drives) = match (has_data, has_parities) {
+        (true, true) => (
+            info.backend.standard_sc_data.get(pool_idx).copied()?,
+            info.backend.standard_sc_parities.get(pool_idx).copied()?,
+        ),
+        (true, false) => {
+            let data = info.backend.standard_sc_data.get(pool_idx).copied()?;
+            // The per-pool data vector is exact. A legacy scalar may be stale
+            // for a heterogeneous topology, so derive the matching parity from
+            // the pool drive count instead of combining two representations.
+            let parity = set_drive_count.checked_sub(data)?;
+            (data, parity)
+        }
+        (false, true) => {
+            let parity = info.backend.standard_sc_parities.get(pool_idx).copied()?;
+            (set_drive_count.checked_sub(parity)?, parity)
+        }
+        (false, false) => {
+            let parity = info.backend.standard_sc_parity?;
+            (set_drive_count.checked_sub(parity)?, parity)
+        }
     };
 
-    let mut write_quorum = data_drives;
-    if data_drives == parity_drives {
-        write_quorum += 1;
+    if data_drives == 0 || parity_drives > data_drives || data_drives.checked_add(parity_drives) != Some(set_drive_count) {
+        return None;
     }
-    write_quorum.max(1)
+
+    Some((data_drives, parity_drives))
 }
 
-fn pool_read_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
-    if set_drive_count == 0 {
-        return 1;
+fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> Option<usize> {
+    let (data_drives, parity_drives) = pool_erasure_layout(info, pool_idx, set_drive_count)?;
+    if data_drives == parity_drives {
+        data_drives.checked_add(1)
+    } else {
+        Some(data_drives)
+    }
+}
+
+fn pool_read_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> Option<usize> {
+    pool_erasure_layout(info, pool_idx, set_drive_count).map(|(data_drives, _)| data_drives)
+}
+
+fn configured_readiness_topology(info: &StorageInfo) -> Option<(&[usize], &[usize])> {
+    if info.backend.total_sets.is_empty()
+        || info.backend.total_sets.len() != info.backend.drives_per_set.len()
+        || info.backend.total_sets.contains(&0)
+        || info.backend.drives_per_set.contains(&0)
+    {
+        return None;
     }
 
-    info.backend
-        .standard_sc_data
-        .get(pool_idx)
-        .copied()
-        .filter(|count| *count > 0)
-        .unwrap_or_else(|| (set_drive_count / 2).max(1))
-        .max(1)
+    Some((&info.backend.total_sets, &info.backend.drives_per_set))
 }
 
 fn storage_ready_from_runtime_state_with_quorum<F>(info: &StorageInfo, quorum_for_set: F) -> bool
 where
-    F: Fn(&StorageInfo, usize, usize) -> usize,
+    F: Fn(&StorageInfo, usize, usize) -> Option<usize>,
 {
     if info.disks.is_empty() {
         return false;
     }
 
+    let configured_topology_present = !info.backend.total_sets.is_empty() || !info.backend.drives_per_set.is_empty();
     let mut total_online = 0usize;
     let mut set_online_counts: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut set_drive_counts: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut observed_set_drive_counts: HashMap<(usize, usize), usize> = HashMap::new();
     let mut seen_disks: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
 
     for disk in &info.disks {
@@ -565,7 +596,9 @@ where
         let pool_idx = disk.pool_index as usize;
         let set_idx = disk.set_index as usize;
         let key = (pool_idx, set_idx);
-        *set_drive_counts.entry(key).or_default() += 1;
+        if !configured_topology_present {
+            *observed_set_drive_counts.entry(key).or_default() += 1;
+        }
 
         if disk_is_online_for_readiness(disk) {
             total_online += 1;
@@ -573,15 +606,43 @@ where
         }
     }
 
-    if total_online == 0 || set_drive_counts.is_empty() {
+    if total_online == 0 {
         return false;
     }
 
-    set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
-        let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
-        let quorum = quorum_for_set(info, pool_idx, set_drive_count);
-        online >= quorum
-    })
+    if configured_topology_present {
+        let Some((total_sets, drives_per_set)) = configured_readiness_topology(info) else {
+            return false;
+        };
+
+        return total_sets
+            .iter()
+            .zip(drives_per_set)
+            .enumerate()
+            .all(|(pool_idx, (&set_count, &configured_drive_count))| {
+                (0..set_count).all(|set_idx| {
+                    let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
+                    quorum_for_set(info, pool_idx, configured_drive_count).is_some_and(|quorum| online >= quorum)
+                })
+            });
+    }
+
+    if observed_set_drive_counts.is_empty() {
+        return false;
+    }
+
+    observed_set_drive_counts
+        .into_iter()
+        .all(|((pool_idx, set_idx), observed_drive_count)| {
+            let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
+            let layout_drive_count = info
+                .backend
+                .drives_per_set
+                .get(pool_idx)
+                .copied()
+                .unwrap_or(observed_drive_count);
+            quorum_for_set(info, pool_idx, layout_drive_count).is_some_and(|quorum| online >= quorum)
+        })
 }
 
 fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
@@ -954,6 +1015,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temp_env::{async_with_vars, with_var};
 
+    fn online_readiness_disks(set_idx: i32, count: i32) -> Vec<Disk> {
+        (0..count)
+            .map(|disk_index| Disk {
+                endpoint: format!("node-{set_idx}-{disk_index}:9000"),
+                drive_path: format!("/set{set_idx}/data{disk_index}"),
+                pool_index: 0,
+                set_index: set_idx,
+                disk_index,
+                state: "ok".to_string(),
+                runtime_state: Some("online".to_string()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
     #[test]
     fn startup_runtime_readiness_wait_constants_are_ordered() {
         assert!(STARTUP_RUNTIME_READINESS_MAX_WAIT > STARTUP_RUNTIME_READINESS_POLL_INTERVAL);
@@ -1270,10 +1346,214 @@ mod tests {
     }
 
     #[test]
+    fn pool_quorum_uses_exact_heterogeneous_backend_layout() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2, 1],
+                standard_sc_parities: vec![2, 1],
+                // Deliberately stale: exact per-pool vectors must take precedence.
+                standard_sc_parity: Some(2),
+                drives_per_set: vec![4, 2],
+                ..Default::default()
+            },
+            disks: Vec::new(),
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 4), Some((2, 2)));
+        assert_eq!(pool_erasure_layout(&info, 1, 2), Some((1, 1)));
+        assert_eq!(pool_write_quorum(&info, 0, 4), Some(3));
+        assert_eq!(pool_write_quorum(&info, 1, 2), Some(2));
+        assert_eq!(pool_read_quorum(&info, 0, 4), Some(2));
+        assert_eq!(pool_read_quorum(&info, 1, 2), Some(1));
+    }
+
+    #[test]
+    fn pool_write_quorum_does_not_fall_back_to_half_when_exact_data_exists() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![6],
+                standard_sc_parities: vec![2],
+                drives_per_set: vec![8],
+                ..Default::default()
+            },
+            disks: Vec::new(),
+        };
+
+        assert_eq!(pool_write_quorum(&info, 0, 8), Some(6));
+    }
+
+    #[test]
+    fn exact_data_vector_ignores_stale_scalar_for_runtime_readiness() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![6],
+                // Deliberately stale: the exact data vector and topology imply
+                // parity 2, so this legacy scalar must not make readiness fail.
+                standard_sc_parity: Some(4),
+                total_sets: vec![1],
+                drives_per_set: vec![8],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 8),
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 8), Some((6, 2)));
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn exact_data_vector_with_invalid_geometry_fails_closed() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![9],
+                standard_sc_parity: Some(1),
+                total_sets: vec![1],
+                drives_per_set: vec![8],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 8),
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 8), None);
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn pool_quorum_accepts_valid_legacy_scalar_layout() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: Vec::new(),
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 4), Some((3, 1)));
+        assert_eq!(pool_write_quorum(&info, 0, 4), Some(3));
+        assert_eq!(pool_read_quorum(&info, 0, 4), Some(3));
+    }
+
+    #[test]
+    fn legacy_payload_without_topology_uses_observed_sets_and_scalar_layout() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 3), Some((2, 1)));
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn configured_topology_uses_configured_drive_count_when_rows_are_missing() {
+        let backend = BackendInfo {
+            standard_sc_data: vec![2],
+            standard_sc_parities: vec![2],
+            total_sets: vec![1],
+            drives_per_set: vec![4],
+            ..Default::default()
+        };
+        let three_online = StorageInfo {
+            backend: backend.clone(),
+            disks: online_readiness_disks(0, 3),
+        };
+        let two_online = StorageInfo {
+            backend,
+            disks: online_readiness_disks(0, 2),
+        };
+
+        assert!(storage_read_ready_from_runtime_state(&three_online));
+        assert!(storage_ready_from_runtime_state(&three_online));
+        assert!(storage_read_ready_from_runtime_state(&two_online));
+        assert!(!storage_ready_from_runtime_state(&two_online));
+    }
+
+    #[test]
+    fn configured_topology_requires_sets_with_no_disk_rows() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                standard_sc_parities: vec![2],
+                total_sets: vec![2],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+        };
+
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn configured_topology_fails_closed_with_only_total_sets() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                total_sets: vec![1],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+        };
+
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn configured_topology_fails_closed_with_only_drives_per_set() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                drives_per_set: vec![3],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+        };
+
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn storage_readiness_fails_closed_when_backend_layout_is_empty() {
+        let disks = (0..4)
+            .map(|disk_index| Disk {
+                endpoint: format!("127.0.0.1:900{disk_index}"),
+                drive_path: format!("/data{disk_index}"),
+                pool_index: 0,
+                set_index: 0,
+                disk_index,
+                state: "ok".to_string(),
+                runtime_state: Some("online".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        let info = StorageInfo {
+            backend: BackendInfo {
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks,
+        };
+
+        assert!(!storage_ready_from_runtime_state(&info));
+        assert!(!storage_read_ready_from_runtime_state(&info));
+    }
+
+    #[test]
     fn storage_ready_from_runtime_state_returns_false_when_all_disks_faulty() {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![1],
                 drives_per_set: vec![1],
                 ..Default::default()
             },
@@ -1294,6 +1574,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![1],
                 drives_per_set: vec![1],
                 ..Default::default()
             },
@@ -1326,6 +1607,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![2],
+                total_sets: vec![1],
                 drives_per_set: vec![4],
                 ..Default::default()
             },
@@ -1350,8 +1632,9 @@ mod tests {
         };
         let info = StorageInfo {
             backend: BackendInfo {
-                standard_sc_data: vec![2],
-                drives_per_set: vec![4],
+                standard_sc_data: vec![1],
+                total_sets: vec![1],
+                drives_per_set: vec![2],
                 ..Default::default()
             },
             disks: vec![duplicate_disk.clone(), duplicate_disk],
@@ -1375,6 +1658,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![2],
                 drives_per_set: vec![2],
                 ..Default::default()
             },
@@ -1390,7 +1674,17 @@ mod tests {
                     ..Default::default()
                 },
                 Disk {
-                    endpoint: "127.0.0.1:9000".to_string(),
+                    endpoint: "127.0.0.1:9001".to_string(),
+                    drive_path: "/set0d1".to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 1,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                },
+                Disk {
+                    endpoint: "127.0.0.1:9002".to_string(),
                     drive_path: "/set1d0".to_string(),
                     pool_index: 0,
                     set_index: 1,

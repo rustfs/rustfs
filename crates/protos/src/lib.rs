@@ -16,6 +16,7 @@
 // scoped to that module so generated internals do not relax lints elsewhere.
 #[allow(unsafe_code)]
 mod generated;
+pub mod heal_control;
 mod runtime_sources;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
@@ -96,10 +97,31 @@ fn internode_http2_keep_alive_timeout() -> Duration {
 }
 
 fn internode_rpc_timeout() -> Duration {
-    Duration::from_secs(rustfs_utils::get_env_u64(
+    normalize_internode_rpc_timeout(Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_INTERNODE_RPC_TIMEOUT_SECS,
         rustfs_config::DEFAULT_INTERNODE_RPC_TIMEOUT_SECS,
-    ))
+    )))
+}
+
+fn normalize_internode_rpc_timeout(timeout: Duration) -> Duration {
+    timeout.max(Duration::from_secs(1))
+}
+
+/// Budget for one heal-control execution, kept below the transport timeout so
+/// the coordinator stops waiting for admission before the caller gives up.
+pub fn heal_control_execution_timeout() -> Duration {
+    heal_control_execution_timeout_for(internode_rpc_timeout())
+}
+
+fn heal_control_execution_timeout_for(transport_timeout: Duration) -> Duration {
+    const TRANSPORT_GUARD: Duration = Duration::from_secs(1);
+    let transport_timeout = transport_timeout.max(Duration::from_secs(1));
+    transport_timeout
+        .saturating_sub(TRANSPORT_GUARD.min(transport_timeout / 2))
+        .max(Duration::from_millis(1))
+        .min(Duration::from_millis(
+            u64::try_from(heal_control::MAX_LIFETIME_MS).expect("positive heal control lifetime must fit u64"),
+        ))
 }
 
 fn internode_rpc_tcp_nodelay() -> bool {
@@ -138,6 +160,207 @@ fn internode_rpc_http2_conn_window() -> Option<u32> {
 /// [`DEFAULT_GRPC_SERVER_MESSAGE_LEN`] (100 MiB) when the env var is unset.
 pub fn internode_rpc_max_message_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, DEFAULT_GRPC_SERVER_MESSAGE_LEN)
+}
+
+pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
+pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+
+pub fn heal_control_coordinator_epoch(topology_fingerprint: &str) -> Result<u64, &'static str> {
+    let prefix = topology_fingerprint
+        .get(..16)
+        .ok_or("heal control topology fingerprint is too short")?;
+    let epoch = u64::from_str_radix(prefix, 16).map_err(|_| "heal control topology fingerprint is not hexadecimal")?;
+    if epoch == 0 {
+        return Err("heal control topology epoch is zero");
+    }
+    Ok(epoch)
+}
+
+pub fn heal_control_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_heal_control_capability_probe(command: &[u8]) -> bool {
+    command.len() == HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + 16 && command.starts_with(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX)
+}
+
+/// Builds the stable byte representation authenticated for a heal-control request.
+///
+/// This deliberately does not reuse protobuf encoding: mixed-version peers may
+/// retain unknown protobuf fields, which must not change the signed contract.
+pub fn canonical_heal_control_request_body(
+    version: u32,
+    topology_fingerprint: &str,
+    command: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-v2\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(command.len())?.to_be_bytes());
+    body.extend_from_slice(command);
+    Ok(body)
+}
+
+/// Builds the exact acknowledgement expected from a peer that supports the
+/// heal-control protocol and agrees with the caller's storage topology.
+pub fn canonical_heal_control_capability_ack(
+    version: u32,
+    topology_fingerprint: &str,
+    probe: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v2\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(probe.len())?.to_be_bytes());
+    body.extend_from_slice(probe);
+    Ok(body)
+}
+
+pub fn canonical_heal_control_response_body(
+    version: u32,
+    topology_fingerprint: &str,
+    command: &[u8],
+    result: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-response-v2\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len() + 8 + result.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(command.len())?.to_be_bytes());
+    body.extend_from_slice(command);
+    body.extend_from_slice(&u64::try_from(result.len())?.to_be_bytes());
+    body.extend_from_slice(result);
+    Ok(body)
+}
+
+#[cfg(test)]
+mod heal_control_tests {
+    use super::{
+        HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION, canonical_heal_control_capability_ack,
+        canonical_heal_control_request_body, canonical_heal_control_response_body, heal_control_capability_probe,
+        heal_control_coordinator_epoch, heal_control_execution_timeout, heal_control_execution_timeout_for,
+        internode_rpc_timeout, is_heal_control_capability_probe, normalize_internode_rpc_timeout,
+    };
+    use crate::heal_control;
+    use std::time::Duration;
+
+    #[test]
+    fn canonical_heal_control_body_binds_every_field_and_boundary() {
+        let baseline = canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode");
+        let mut golden = b"rustfs-heal-control-v2\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&2_u64.to_be_bytes());
+        golden.extend_from_slice(b"ab");
+        golden.extend_from_slice(&1_u64.to_be_bytes());
+        golden.extend_from_slice(b"c");
+        assert_eq!(baseline, golden);
+
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(2, "ab", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ac", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ab", b"d").expect("small request should encode")
+        );
+        assert_ne!(
+            canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode"),
+            canonical_heal_control_request_body(1, "a", b"bc").expect("small request should encode")
+        );
+    }
+
+    #[test]
+    fn canonical_capability_ack_binds_version_and_topology() {
+        assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 2);
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v2"));
+        let probe = heal_control_capability_probe(&[7; 16]);
+        let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
+        let mut golden = b"rustfs-heal-control-capability-ack-v2\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&2_u64.to_be_bytes());
+        golden.extend_from_slice(b"ab");
+        golden.extend_from_slice(&u64::try_from(probe.len()).unwrap().to_be_bytes());
+        golden.extend_from_slice(&probe);
+        assert_eq!(ack, golden);
+        assert_ne!(ack, canonical_heal_control_capability_ack(2, "ab", &probe).unwrap());
+        assert_ne!(ack, canonical_heal_control_capability_ack(1, "ac", &probe).unwrap());
+        assert_ne!(
+            ack,
+            canonical_heal_control_capability_ack(1, "ab", &heal_control_capability_probe(&[8; 16])).unwrap()
+        );
+        assert!(is_heal_control_capability_probe(&probe));
+        assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn canonical_response_binds_request_and_result() {
+        let baseline = canonical_heal_control_response_body(2, "abcdef", b"query", b"result").unwrap();
+        assert_ne!(baseline, canonical_heal_control_response_body(1, "abcdef", b"query", b"result").unwrap());
+        assert_ne!(baseline, canonical_heal_control_response_body(2, "bbcdef", b"query", b"result").unwrap());
+        assert_ne!(baseline, canonical_heal_control_response_body(2, "abcdef", b"cancel", b"result").unwrap());
+        assert_ne!(
+            baseline,
+            canonical_heal_control_response_body(2, "abcdef", b"query", b"tampered").unwrap()
+        );
+    }
+
+    #[test]
+    fn coordinator_epoch_is_stable_and_rejects_invalid_fingerprints() {
+        assert_eq!(heal_control_coordinator_epoch("0123456789abcdefextra"), Ok(0x0123_4567_89ab_cdef));
+        assert_eq!(
+            heal_control_coordinator_epoch("0000000000000000"),
+            Err("heal control topology epoch is zero")
+        );
+        assert_eq!(
+            heal_control_coordinator_epoch("short"),
+            Err("heal control topology fingerprint is too short")
+        );
+        assert_eq!(
+            heal_control_coordinator_epoch("not-hex-value!!!!"),
+            Err("heal control topology fingerprint is not hexadecimal")
+        );
+    }
+
+    #[test]
+    fn execution_budget_precedes_transport_timeout() {
+        let execution = heal_control_execution_timeout();
+        assert!(!execution.is_zero());
+        assert!(execution < internode_rpc_timeout());
+        assert!(execution <= std::time::Duration::from_millis(heal_control::MAX_LIFETIME_MS as u64));
+    }
+
+    #[test]
+    fn execution_budget_is_nonzero_for_zero_transport_configuration() {
+        let normalized_transport = Duration::from_secs(1);
+        assert_eq!(normalize_internode_rpc_timeout(Duration::ZERO), normalized_transport);
+        for configured_transport in [Duration::ZERO, normalized_transport] {
+            let execution = heal_control_execution_timeout_for(configured_transport);
+            assert!(execution > Duration::ZERO);
+            assert!(execution < normalized_transport);
+        }
+    }
 }
 
 /// Whether internode metadata RPCs should send only the msgpack `_bin` payloads and leave the JSON

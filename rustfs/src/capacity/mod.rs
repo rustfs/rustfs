@@ -54,5 +54,4 @@ pub mod service;
 
 pub use service::{
     capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks, record_capacity_write,
-    refresh_or_join_admin_disks, resolve_admin_used_capacity, spawn_refresh_if_needed_admin_disks,
 };

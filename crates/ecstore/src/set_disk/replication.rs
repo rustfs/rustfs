@@ -13,6 +13,34 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_utils::http::headers::{AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RestoreCleanupIdentity {
+    version_id: Option<Uuid>,
+    data_dir: Option<Uuid>,
+    mod_time: Option<OffsetDateTime>,
+    size: i64,
+}
+
+impl RestoreCleanupIdentity {
+    fn from_object_info(obj_info: &ObjectInfo) -> Self {
+        Self {
+            version_id: obj_info.version_id,
+            data_dir: obj_info.data_dir,
+            mod_time: obj_info.mod_time,
+            size: obj_info.size,
+        }
+    }
+
+    fn matches_file_info(&self, fi: &FileInfo, expected_etag: &str) -> bool {
+        self.version_id == fi.version_id
+            && self.data_dir == fi.data_dir
+            && self.mod_time == fi.mod_time
+            && self.size == fi.size
+            && expected_etag == get_raw_etag(&fi.metadata)
+    }
+}
 
 impl SetDisks {
     pub async fn update_restore_metadata(
@@ -20,29 +48,46 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         obj_info: &ObjectInfo,
-        _opts: &ObjectOptions,
+        opts: &ObjectOptions,
     ) -> Result<()> {
-        let mut oi = obj_info.clone();
-        oi.metadata_only = true;
-        Arc::make_mut(&mut oi.user_defined).remove(X_AMZ_RESTORE.as_str());
-        let version_id = oi.version_id.map(|v| v.to_string());
-        let _obj = self
-            .copy_object(
-                bucket,
-                object,
-                bucket,
-                object,
-                &mut oi,
-                &ObjectOptions {
-                    version_id: version_id.clone(),
-                    ..Default::default()
-                },
-                &ObjectOptions {
-                    version_id,
-                    ..Default::default()
-                },
+        if obj_info.bucket.is_empty() || obj_info.name.is_empty() {
+            return Ok(());
+        }
+        let expected = RestoreCleanupIdentity::from_object_info(obj_info);
+        let expected_etag = obj_info
+            .etag
+            .clone()
+            .unwrap_or_else(|| get_raw_etag(obj_info.user_defined.as_ref()));
+        let version_id = expected.version_id.map(|v| v.to_string());
+        let lock_guard = if !opts.no_lock {
+            Some(
+                self.acquire_write_lock_diag("restore_cleanup_metadata", bucket, object)
+                    .await?,
             )
+        } else {
+            None
+        };
+        let read_opts = ObjectOptions {
+            version_id,
+            versioned: opts.versioned,
+            version_suspended: opts.version_suspended,
+            ..Default::default()
+        };
+        let (mut fi, _, disks) = self
+            .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
             .await?;
+        if !expected.matches_file_info(&fi, &expected_etag) {
+            return Ok(());
+        }
+        fi.metadata.remove(X_AMZ_RESTORE.as_str());
+        fi.metadata.remove(AMZ_RESTORE_EXPIRY_DAYS);
+        fi.metadata.remove(AMZ_RESTORE_REQUEST_DATE);
+        if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(Error::other("restore cleanup lock lost before metadata update".to_string()));
+        }
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        self.update_object_meta(bucket, object, fi, disks.as_slice()).await?;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
         Ok(())
     }
 }

@@ -33,6 +33,7 @@ use rustfs_targets::config::{
     validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result};
+use std::future::Future;
 use tracing::warn;
 use url::Url;
 
@@ -42,6 +43,12 @@ pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
         STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS | SCANNER_SUB_SYS | HEAL_SUB_SYS
     )
 }
+
+pub(crate) const FULL_CONFIG_WORKER_SUBSYSTEMS: [&str; 2] = [AUDIT_WEBHOOK_SUB_SYS, SCANNER_SUB_SYS];
+pub(crate) const EVENT_CONFIG_WORKER_RELOAD_FAILED: &str = "config_worker_reload_failed";
+pub(crate) const LOG_COMPONENT_ADMIN: &str = "admin";
+pub(crate) const LOG_SUBSYSTEM_CONFIG: &str = "config";
+pub(crate) const CONFIG_WORKER_RELOAD_FAILURE_STATE: &str = "best_effort_reload_failed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DynamicConfigWorkerMutation {
@@ -71,39 +78,87 @@ fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3R
     current_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
 }
 
-async fn apply_storage_class_runtime_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
-    let store = resolve_runtime_config_store_for_context(context)?;
-
-    let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
-    let set_drive_count = StorageAdminApi::set_drive_counts(store.as_ref())
-        .into_iter()
-        .next()
-        .unwrap_or(1);
-    let parsed = storageclass::lookup_config(&kvs, set_drive_count)
-        .map_err(|err| internal_error(format!("failed to apply storage class config: {err}")))?;
-    publish_storage_class_config(parsed);
-    Ok(())
+#[derive(Debug, Default)]
+pub(crate) struct PreparedRuntimeConfig {
+    storage_class: Option<storageclass::Config>,
 }
 
-fn validate_storage_class_kvs(kvs: &KVS, set_drive_counts: &[usize]) -> S3Result<()> {
-    for count in set_drive_counts {
-        storageclass::lookup_config(kvs, *count)
-            .map_err(|err| invalid_request(format!("invalid storage class config: {err}")))?;
+impl PreparedRuntimeConfig {
+    fn publish_storage_class_with(self, publish: impl FnOnce(storageclass::Config)) -> bool {
+        let Some(config) = self.storage_class else {
+            return false;
+        };
+
+        publish(config);
+        true
     }
 
-    Ok(())
+    fn publish_storage_class_for_context_with(
+        self,
+        context: Option<&AppContext>,
+        publish_fallback: impl FnOnce(storageclass::Config),
+    ) -> S3Result<()> {
+        if self.publish_storage_class_with(|config| {
+            if let Some(context) = context {
+                context.storage_class().set(config);
+            } else {
+                publish_fallback(config);
+            }
+        }) {
+            Ok(())
+        } else {
+            Err(internal_error("prepared storage class candidate is missing"))
+        }
+    }
+
+    fn publish_storage_class_for_context(self, context: Option<&AppContext>) -> S3Result<()> {
+        self.publish_storage_class_for_context_with(context, publish_storage_class_config)
+    }
+
+    pub(crate) fn publish_storage_class(self) -> S3Result<()> {
+        let context = current_app_context();
+        self.publish_storage_class_for_context(context.as_deref())
+    }
 }
 
-async fn validate_storage_class_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
-    let store = resolve_runtime_config_store_for_context(context)?;
+fn publish_server_config_for_context(context: Option<&AppContext>, config: ServerConfig) {
+    if let Some(context) = context {
+        context.server_config().set(config);
+    } else {
+        publish_server_config(config);
+    }
+}
 
+fn prepare_storage_class_kvs(kvs: &KVS, set_drive_counts: &[usize]) -> S3Result<storageclass::Config> {
+    storageclass::lookup_config_for_pools(kvs, set_drive_counts)
+        .map_err(|err| invalid_request(format!("invalid storage class config: {err}")))
+}
+
+async fn prepare_storage_class_runtime_config_for_context(
+    context: Option<&AppContext>,
+    config: &ServerConfig,
+) -> S3Result<storageclass::Config> {
+    let store = resolve_runtime_config_store_for_context(context)?;
     let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
     let set_drive_counts = StorageAdminApi::set_drive_counts(store.as_ref());
-    if set_drive_counts.is_empty() {
-        return validate_storage_class_kvs(&kvs, &[1]);
-    }
 
-    validate_storage_class_kvs(&kvs, &set_drive_counts)
+    prepare_storage_class_kvs(&kvs, &set_drive_counts)
+}
+
+async fn apply_storage_class_runtime_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
+    let parsed = prepare_storage_class_runtime_config_for_context(context, config)
+        .await
+        .map_err(|err| internal_error(format!("failed to apply storage class config: {err}")))?;
+    PreparedRuntimeConfig {
+        storage_class: Some(parsed),
+    }
+    .publish_storage_class_for_context(context)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_storage_class_kvs(kvs: &KVS, set_drive_counts: &[usize]) -> S3Result<()> {
+    prepare_storage_class_kvs(kvs, set_drive_counts).map(|_| ())
 }
 
 fn target_enabled(kvs: &KVS) -> bool {
@@ -248,23 +303,27 @@ fn validate_identity_openid_config(config: &ServerConfig) -> S3Result<()> {
     Ok(())
 }
 
-pub async fn validate_server_config_for_context(
+pub(crate) async fn prepare_server_config_for_context(
     context: Option<&AppContext>,
     config: &ServerConfig,
     sub_system: Option<&str>,
-) -> S3Result<()> {
+) -> S3Result<PreparedRuntimeConfig> {
+    let mut prepared = PreparedRuntimeConfig::default();
+
     match sub_system {
-        Some(STORAGE_CLASS_SUB_SYS) => validate_storage_class_config_for_context(context, config).await,
-        Some(NOTIFY_WEBHOOK_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS),
-        Some(NOTIFY_MQTT_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS),
-        Some(AUDIT_WEBHOOK_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS),
-        Some(AUDIT_MQTT_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS),
-        Some(IDENTITY_OPENID_SUB_SYS) => validate_identity_openid_config(config),
+        Some(STORAGE_CLASS_SUB_SYS) => {
+            prepared.storage_class = Some(prepare_storage_class_runtime_config_for_context(context, config).await?);
+        }
+        Some(NOTIFY_WEBHOOK_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS)?,
+        Some(NOTIFY_MQTT_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS)?,
+        Some(AUDIT_WEBHOOK_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?,
+        Some(AUDIT_MQTT_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS)?,
+        Some(IDENTITY_OPENID_SUB_SYS) => validate_identity_openid_config(config)?,
         Some(SCANNER_SUB_SYS | HEAL_SUB_SYS) => rustfs_scanner::validate_scanner_runtime_config(config)
-            .map_err(|err| invalid_request(format!("invalid scanner config: {err}"))),
-        Some(_) => Ok(()),
+            .map_err(|err| invalid_request(format!("invalid scanner config: {err}")))?,
+        Some(_) => {}
         None => {
-            validate_storage_class_config_for_context(context, config).await?;
+            prepared.storage_class = Some(prepare_storage_class_runtime_config_for_context(context, config).await?);
             validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS)?;
             validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS)?;
             validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?;
@@ -272,9 +331,25 @@ pub async fn validate_server_config_for_context(
             validate_identity_openid_config(config)?;
             rustfs_scanner::validate_scanner_runtime_config(config)
                 .map_err(|err| invalid_request(format!("invalid scanner config: {err}")))?;
-            Ok(())
         }
     }
+
+    Ok(prepared)
+}
+
+pub async fn validate_server_config_for_context(
+    context: Option<&AppContext>,
+    config: &ServerConfig,
+    sub_system: Option<&str>,
+) -> S3Result<()> {
+    prepare_server_config_for_context(context, config, sub_system)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn prepare_server_config(config: &ServerConfig, sub_system: Option<&str>) -> S3Result<PreparedRuntimeConfig> {
+    let context = current_app_context();
+    prepare_server_config_for_context(context.as_deref(), config, sub_system).await
 }
 
 pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&str>) -> S3Result<()> {
@@ -317,7 +392,6 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
     }
 
     let store = resolve_runtime_config_store_for_context(context)?;
-
     let config = read_admin_config_without_migrate(store).await.map_err(|err| {
         warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
         internal_error(format!("failed to load server config: {err}"))
@@ -336,30 +410,81 @@ pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<(
     reload_dynamic_config_runtime_state_for_context(context.as_deref(), sub_system).await
 }
 
+async fn reload_runtime_config_snapshot_with<ReadFuture, Prepare, PrepareFuture, Publish, ApplyWorkers, ApplyWorkersFuture>(
+    read: ReadFuture,
+    prepare: Prepare,
+    publish: Publish,
+    apply_workers: ApplyWorkers,
+) -> S3Result<()>
+where
+    ReadFuture: Future<Output = S3Result<ServerConfig>>,
+    Prepare: FnOnce(ServerConfig) -> PrepareFuture,
+    PrepareFuture: Future<Output = S3Result<(ServerConfig, PreparedRuntimeConfig)>>,
+    Publish: FnOnce(&ServerConfig, PreparedRuntimeConfig) -> S3Result<()>,
+    ApplyWorkers: FnOnce(ServerConfig) -> ApplyWorkersFuture,
+    ApplyWorkersFuture: Future<Output = S3Result<()>>,
+{
+    let config = read.await?;
+    let (config, prepared) = prepare(config).await?;
+    publish(&config, prepared)?;
+
+    // Worker reloads mutate live state and have no rollback contract. They are
+    // therefore best-effort after the validated storage/server snapshots are
+    // published; a transient worker failure must not leave this peer on stale
+    // erasure geometry.
+    if let Err(err) = apply_workers(config).await {
+        warn!(
+            event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
+            error = ?err,
+            "Runtime config snapshot was published but a worker reload failed"
+        );
+    }
+    Ok(())
+}
+
 pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppContext>) -> S3Result<()> {
     let store = resolve_runtime_config_store_for_context(context)?;
 
-    let config = read_admin_config_without_migrate(store).await.map_err(|err| {
-        warn!("peer reload_runtime_config_snapshot: failed to load server config: {err}");
-        internal_error(format!("failed to load server config: {err}"))
-    })?;
-
-    // Re-apply dynamic subsystems before publishing the snapshot, so that
-    // runtime state (e.g. GLOBAL_STORAGE_CLASS) is refreshed on this peer.
-    for sub_system in [
-        STORAGE_CLASS_SUB_SYS,
-        AUDIT_WEBHOOK_SUB_SYS,
-        AUDIT_MQTT_SUB_SYS,
-        SCANNER_SUB_SYS,
-        HEAL_SUB_SYS,
-    ] {
-        if let Err(err) = apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system).await {
-            warn!("peer reload_runtime_config_snapshot: failed to apply {sub_system}: {err}");
-        }
-    }
-
-    publish_server_config(config);
-    Ok(())
+    reload_runtime_config_snapshot_with(
+        async move {
+            read_admin_config_without_migrate(store).await.map_err(|err| {
+                warn!("peer reload_runtime_config_snapshot: failed to load server config: {err}");
+                internal_error(format!("failed to load server config: {err}"))
+            })
+        },
+        |config| async move {
+            let prepared = prepare_server_config_for_context(context, &config, None).await.map_err(|_| {
+                warn!("peer reload_runtime_config_snapshot: failed to prepare server config");
+                internal_error("failed to prepare server config")
+            })?;
+            Ok((config, prepared))
+        },
+        |config, prepared| {
+            prepared.publish_storage_class_for_context(context)?;
+            publish_server_config_for_context(context, config.clone());
+            Ok(())
+        },
+        |config| async move {
+            for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
+                if let Err(err) = apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system).await {
+                    warn!(
+                        event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_CONFIG,
+                        config_subsystem = sub_system,
+                        state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
+                        error = ?err,
+                        "Peer runtime config snapshot was published but a subsystem worker reload failed"
+                    );
+                }
+            }
+            Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
@@ -408,14 +533,335 @@ pub async fn signal_config_snapshot_reload() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::runtime_sources::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
     use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+    use crate::admin::storage_api::config::save_admin_server_config;
+    use crate::storage_api::cluster::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::storage_api::startup::storage::{init_local_disks_with_instance_ctx, new_instance_ctx};
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
+    use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+    use rustfs_kms::KmsServiceManager;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     const LIFECYCLE_RELOAD_LABEL: &str = "lifecycle";
     const REPLICATION_RELOAD_LABEL: &str = "replication";
+
+    fn without_storage_class_env<R>(f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars_unset(
+            [
+                storageclass::STANDARD_ENV,
+                storageclass::RRS_ENV,
+                storageclass::OPTIMIZE_ENV,
+                storageclass::INLINE_BLOCK_ENV,
+            ],
+            f,
+        )
+    }
+
+    struct TestIamInterface;
+
+    impl IamInterface for TestIamInterface {
+        fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+            unreachable!("runtime config reload tests do not use IAM")
+        }
+
+        fn is_ready(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestKmsInterface {
+        manager: Arc<KmsServiceManager>,
+    }
+
+    impl KmsInterface for TestKmsInterface {
+        fn handle(&self) -> Arc<KmsServiceManager> {
+            self.manager.clone()
+        }
+    }
+
+    struct TestServerConfigInterface {
+        snapshot: Arc<Mutex<Option<ServerConfig>>>,
+        set_calls: Arc<AtomicUsize>,
+    }
+
+    impl ServerConfigInterface for TestServerConfigInterface {
+        fn get(&self) -> Option<ServerConfig> {
+            self.snapshot.lock().expect("server config snapshot lock").clone()
+        }
+
+        fn set(&self, config: ServerConfig) {
+            self.set_calls.fetch_add(1, Ordering::SeqCst);
+            *self.snapshot.lock().expect("server config snapshot lock") = Some(config);
+        }
+    }
+
+    struct TestStorageClassInterface {
+        snapshot: Arc<Mutex<Arc<storageclass::Config>>>,
+        set_calls: Arc<AtomicUsize>,
+    }
+
+    impl StorageClassInterface for TestStorageClassInterface {
+        fn set(&self, config: storageclass::Config) {
+            self.set_calls.fetch_add(1, Ordering::SeqCst);
+            *self.snapshot.lock().expect("storage class snapshot lock") = Arc::new(config);
+        }
+    }
+
+    struct RuntimeConfigReloadFixture {
+        _temp_dir: TempDir,
+        context: AppContext,
+        baseline_server: ServerConfig,
+        baseline_storage_class: Arc<storageclass::Config>,
+        server_snapshot: Arc<Mutex<Option<ServerConfig>>>,
+        storage_class_snapshot: Arc<Mutex<Arc<storageclass::Config>>>,
+        server_set_calls: Arc<AtomicUsize>,
+        storage_class_set_calls: Arc<AtomicUsize>,
+    }
+
+    impl RuntimeConfigReloadFixture {
+        fn assert_snapshots_unchanged(&self) {
+            assert_eq!(self.server_set_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(self.storage_class_set_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *self.server_snapshot.lock().expect("server config result lock"),
+                Some(self.baseline_server.clone())
+            );
+            let storage_class_snapshot = self.storage_class_snapshot.lock().expect("storage class result lock");
+            assert!(Arc::ptr_eq(&*storage_class_snapshot, &self.baseline_storage_class));
+            for storage_class in [storageclass::STANDARD, storageclass::RRS] {
+                assert_eq!(
+                    storage_class_snapshot.parities_for_sc(storage_class),
+                    self.baseline_storage_class.parities_for_sc(storage_class),
+                    "{storage_class} snapshot changed"
+                );
+            }
+        }
+    }
+
+    fn storage_class_server_config(standard: &str) -> ServerConfig {
+        let mut config = ServerConfig::new();
+        let mut kvs = KVS::new();
+        kvs.insert(storageclass::CLASS_STANDARD.to_string(), standard.to_string());
+        config
+            .0
+            .insert(STORAGE_CLASS_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
+        config
+    }
+
+    async fn build_isolated_heterogeneous_store(temp_dir: &Path) -> Arc<ECStore> {
+        let mut pools = Vec::new();
+        for (pool_index, drives_per_set) in [4, 2].into_iter().enumerate() {
+            let mut endpoints = Vec::new();
+            for disk_index in 0..drives_per_set {
+                let disk_path = temp_dir.join(format!("pool{pool_index}/disk{disk_index}"));
+                tokio::fs::create_dir_all(&disk_path)
+                    .await
+                    .expect("create test disk directory");
+                let mut endpoint = Endpoint::try_from(disk_path.to_str().expect("utf-8 test disk path")).expect("local endpoint");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_index);
+                endpoints.push(endpoint);
+            }
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("runtime-config-pool-{pool_index}"),
+                platform: "test".to_string(),
+            });
+        }
+
+        let endpoint_pools = EndpointServerPools::from(pools);
+        let instance_ctx = new_instance_ctx();
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("register isolated test disks");
+        ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            endpoint_pools,
+            CancellationToken::new(),
+            instance_ctx,
+        )
+        .await
+        .expect("build isolated heterogeneous store")
+    }
+
+    async fn runtime_config_reload_fixture() -> RuntimeConfigReloadFixture {
+        let temp_dir = TempDir::new().expect("runtime config reload temp dir");
+        let store = build_isolated_heterogeneous_store(temp_dir.path()).await;
+        assert_eq!(StorageAdminApi::set_drive_counts(store.as_ref()), vec![4, 2]);
+
+        let rejected_server = storage_class_server_config("EC:2");
+        save_admin_server_config(store.clone(), &rejected_server)
+            .await
+            .expect("persist rejected storage class config");
+
+        let baseline_server = storage_class_server_config("EC:1");
+        let baseline_kvs = baseline_server
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("baseline storage class KVS");
+        let baseline_storage_class = Arc::new(prepare_storage_class_kvs(&baseline_kvs, &[4, 2]).expect("baseline storage class"));
+        let server_snapshot = Arc::new(Mutex::new(Some(baseline_server.clone())));
+        let storage_class_snapshot = Arc::new(Mutex::new(baseline_storage_class.clone()));
+        let server_set_calls = Arc::new(AtomicUsize::new(0));
+        let storage_class_set_calls = Arc::new(AtomicUsize::new(0));
+        let context = AppContext::new(
+            store,
+            Arc::new(TestIamInterface),
+            Arc::new(TestKmsInterface {
+                manager: Arc::new(KmsServiceManager::new()),
+            }),
+        )
+        .with_test_runtime_config_interfaces(
+            Arc::new(TestServerConfigInterface {
+                snapshot: server_snapshot.clone(),
+                set_calls: server_set_calls.clone(),
+            }),
+            Arc::new(TestStorageClassInterface {
+                snapshot: storage_class_snapshot.clone(),
+                set_calls: storage_class_set_calls.clone(),
+            }),
+        );
+
+        RuntimeConfigReloadFixture {
+            _temp_dir: temp_dir,
+            context,
+            baseline_server,
+            baseline_storage_class,
+            server_snapshot,
+            storage_class_snapshot,
+            server_set_calls,
+            storage_class_set_calls,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn peer_dynamic_reload_rejects_later_pool_without_publishing() {
+        temp_env::async_with_vars(
+            [
+                (storageclass::STANDARD_ENV, None::<&str>),
+                (storageclass::RRS_ENV, None::<&str>),
+                (storageclass::OPTIMIZE_ENV, None::<&str>),
+                (storageclass::INLINE_BLOCK_ENV, None::<&str>),
+            ],
+            async {
+                let fixture = runtime_config_reload_fixture().await;
+                let err = reload_dynamic_config_runtime_state_for_context(Some(&fixture.context), STORAGE_CLASS_SUB_SYS)
+                    .await
+                    .expect_err("later pool parity must reject peer dynamic reload");
+
+                assert!(
+                    err.message()
+                        .is_some_and(|message| message.contains("storage class validation failed for pool 1")),
+                    "unexpected dynamic reload error: {err:?}"
+                );
+                fixture.assert_snapshots_unchanged();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn peer_dynamic_reload_publishes_valid_per_pool_storage_snapshot() {
+        temp_env::async_with_vars(
+            [
+                (storageclass::STANDARD_ENV, None::<&str>),
+                (storageclass::RRS_ENV, None::<&str>),
+                (storageclass::OPTIMIZE_ENV, None::<&str>),
+                (storageclass::INLINE_BLOCK_ENV, None::<&str>),
+            ],
+            async {
+                let fixture = runtime_config_reload_fixture().await;
+                let candidate = storage_class_server_config("");
+                save_admin_server_config(fixture.context.object_store(), &candidate)
+                    .await
+                    .expect("persist valid automatic storage class config");
+
+                reload_dynamic_config_runtime_state_for_context(Some(&fixture.context), STORAGE_CLASS_SUB_SYS)
+                    .await
+                    .expect("valid peer dynamic reload must publish its prepared storage snapshot");
+
+                assert_eq!(fixture.server_set_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.storage_class_set_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    *fixture.server_snapshot.lock().expect("server config result lock"),
+                    Some(fixture.baseline_server.clone()),
+                    "dynamic reload must not replace the server-config snapshot"
+                );
+                let storage_class = fixture.storage_class_snapshot.lock().expect("storage class result lock");
+                assert_eq!(storage_class.parities_for_sc(storageclass::STANDARD), Some(vec![2, 1]));
+                assert_eq!(storage_class.parities_for_sc(storageclass::RRS), Some(vec![1, 1]));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn peer_full_reload_rejects_later_pool_without_publishing() {
+        temp_env::async_with_vars(
+            [
+                (storageclass::STANDARD_ENV, None::<&str>),
+                (storageclass::RRS_ENV, None::<&str>),
+                (storageclass::OPTIMIZE_ENV, None::<&str>),
+                (storageclass::INLINE_BLOCK_ENV, None::<&str>),
+            ],
+            async {
+                let fixture = runtime_config_reload_fixture().await;
+                let err = reload_runtime_config_snapshot_for_context(Some(&fixture.context))
+                    .await
+                    .expect_err("later pool parity must reject peer full reload");
+
+                assert_eq!(err.message(), Some("failed to prepare server config"));
+                fixture.assert_snapshots_unchanged();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn full_reload_publishes_snapshots_before_best_effort_worker_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let publish_events = events.clone();
+        let worker_events = events.clone();
+
+        reload_runtime_config_snapshot_with(
+            async { Ok(ServerConfig::new()) },
+            |config| async { Ok((config, PreparedRuntimeConfig::default())) },
+            move |_config, _prepared| {
+                publish_events.lock().expect("reload event lock").push("publish");
+                Ok(())
+            },
+            move |_config| async move {
+                let mut events = worker_events.lock().expect("reload event lock");
+                events.push("worker-1-applied");
+                events.push("worker-2-failed");
+                Err(internal_error("injected worker reload failure"))
+            },
+        )
+        .await
+        .expect("worker failure must not roll back validated storage/server snapshots");
+
+        assert_eq!(
+            *events.lock().expect("reload result lock"),
+            ["publish", "worker-1-applied", "worker-2-failed"]
+        );
+    }
 
     #[test]
     fn dynamic_config_subsystems_match_runtime_apply_support() {
@@ -426,6 +872,11 @@ mod tests {
         assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
         assert!(!is_dynamic_config_subsystem("notify_webhook"));
+    }
+
+    #[test]
+    fn full_config_worker_reload_uses_one_representative_per_worker_family() {
+        assert_eq!(FULL_CONFIG_WORKER_SUBSYSTEMS, [AUDIT_WEBHOOK_SUB_SYS, SCANNER_SUB_SYS]);
     }
 
     #[test]
@@ -454,12 +905,112 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(storage_class_env)]
     fn validate_storage_class_kvs_rejects_invalid_parity() {
         let mut kvs = KVS::new();
         kvs.insert("standard".to_string(), "EC:5".to_string());
 
-        let err = validate_storage_class_kvs(&kvs, &[4]).expect_err("invalid parity should fail");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        without_storage_class_env(|| {
+            let err = validate_storage_class_kvs(&kvs, &[4]).expect_err("invalid parity should fail");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn prepare_storage_class_kvs_keeps_all_pool_geometry() {
+        without_storage_class_env(|| {
+            let prepared = prepare_storage_class_kvs(&KVS::new(), &[4, 2]).expect("prepare heterogeneous pools");
+
+            assert_eq!(prepared.parities_for_sc(storageclass::STANDARD), Some(vec![2, 1]));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn prepare_storage_class_kvs_rejects_explicit_parity_for_later_pool() {
+        let mut kvs = KVS::new();
+        kvs.insert(storageclass::CLASS_STANDARD.to_string(), "EC:2".to_string());
+
+        without_storage_class_env(|| {
+            let err = prepare_storage_class_kvs(&kvs, &[4, 2]).expect_err("second pool must reject parity equal to its width");
+
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert!(err.message().unwrap_or_default().contains("pool 1 (2 drives)"));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn prepare_storage_class_kvs_rejects_empty_topology() {
+        without_storage_class_env(|| {
+            let err = prepare_storage_class_kvs(&KVS::new(), &[]).expect_err("empty topology must fail closed");
+
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert!(err.message().unwrap_or_default().contains("at least one pool"));
+        });
+    }
+
+    #[test]
+    fn missing_prepared_storage_class_fails_without_publishing() {
+        let publish_calls = std::cell::Cell::new(0);
+
+        let err = PreparedRuntimeConfig::default()
+            .publish_storage_class_for_context(None)
+            .expect_err("production publisher must reject a missing candidate");
+        let injected_err = PreparedRuntimeConfig::default()
+            .publish_storage_class_for_context_with(None, |_| publish_calls.set(publish_calls.get() + 1))
+            .expect_err("missing candidate must fail closed");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(injected_err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(publish_calls.get(), 0);
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn prepared_storage_class_publishes_exact_candidate_without_reparse() {
+        let candidate = without_storage_class_env(|| prepare_storage_class_kvs(&KVS::new(), &[4, 2]).expect("prepare candidate"));
+        let mut published = None;
+
+        temp_env::with_vars([(storageclass::STANDARD_ENV, Some("EC:2"))], || {
+            PreparedRuntimeConfig {
+                storage_class: Some(candidate),
+            }
+            .publish_storage_class_with(|storage_class| published = Some(storage_class));
+        });
+
+        assert_eq!(
+            published.and_then(|storage_class| storage_class.parities_for_sc(storageclass::STANDARD)),
+            Some(vec![2, 1])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn rejected_storage_class_candidate_does_not_publish() {
+        without_storage_class_env(|| {
+            let mut published = prepare_storage_class_kvs(&KVS::new(), &[4, 4]).expect("prepare baseline");
+            let mut invalid_kvs = KVS::new();
+            invalid_kvs.insert(storageclass::CLASS_STANDARD.to_string(), "EC:2".to_string());
+
+            let rejected = match prepare_storage_class_kvs(&invalid_kvs, &[4, 2]) {
+                Ok(storage_class) => {
+                    PreparedRuntimeConfig {
+                        storage_class: Some(storage_class),
+                    }
+                    .publish_storage_class_with(|storage_class| published = storage_class);
+                    false
+                }
+                Err(err) => {
+                    assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                    true
+                }
+            };
+
+            assert!(rejected);
+            assert_eq!(published.parities_for_sc(storageclass::STANDARD), Some(vec![2, 2]));
+        });
     }
 
     #[test]

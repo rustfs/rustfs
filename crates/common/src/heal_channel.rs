@@ -243,6 +243,19 @@ pub enum HealAdmissionResult {
     Dropped(HealAdmissionDropReason),
 }
 
+/// Admission decision together with the canonical task identifier.
+///
+/// A merged request must return the identifier of the task that already owns
+/// the work instead of exposing the discarded request identifier as a new
+/// client token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealAdmissionReceipt {
+    /// Admission decision for the submitted request.
+    pub result: HealAdmissionResult,
+    /// Canonical identifier of the accepted or merged task.
+    pub task_id: String,
+}
+
 impl HealAdmissionResult {
     pub fn result_label(self) -> &'static str {
         match self {
@@ -382,8 +395,25 @@ pub type HealChannelSender = mpsc::UnboundedSender<HealChannelCommand>;
 /// Heal channel receiver
 pub type HealChannelReceiver = mpsc::UnboundedReceiver<HealChannelCommand>;
 
+/// Canonical-receipt start command kept separate from the legacy public enum.
+#[derive(Debug)]
+pub struct HealReceiptCommand {
+    /// Heal request to admit.
+    pub request: HealChannelRequest,
+    /// Completion channel for the admission receipt.
+    pub response_tx: oneshot::Sender<Result<HealAdmissionReceipt, String>>,
+}
+
+/// Canonical-receipt command receiver.
+pub type HealReceiptReceiver = mpsc::UnboundedReceiver<HealReceiptCommand>;
+
+struct HealChannelSenders {
+    command: HealChannelSender,
+    receipt: mpsc::UnboundedSender<HealReceiptCommand>,
+}
+
 /// Global heal channel sender
-static GLOBAL_HEAL_CHANNEL_SENDER: OnceLock<HealChannelSender> = OnceLock::new();
+static GLOBAL_HEAL_CHANNEL_SENDERS: OnceLock<HealChannelSenders> = OnceLock::new();
 
 type HealResponseSender = broadcast::Sender<HealChannelResponse>;
 
@@ -392,17 +422,24 @@ static GLOBAL_HEAL_RESPONSE_SENDER: OnceLock<HealResponseSender> = OnceLock::new
 
 /// Initialize global heal channel
 pub fn init_heal_channel() -> Result<HealChannelReceiver, &'static str> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    if GLOBAL_HEAL_CHANNEL_SENDER.set(tx).is_ok() {
-        Ok(rx)
-    } else {
-        Err("Heal channel sender already initialized")
-    }
+    let (receiver, receipt_receiver) = init_heal_channels()?;
+    drop(receipt_receiver);
+    Ok(receiver)
+}
+
+/// Initialize the legacy command and canonical-receipt channels atomically.
+pub fn init_heal_channels() -> Result<(HealChannelReceiver, HealReceiptReceiver), &'static str> {
+    let (command, command_receiver) = mpsc::unbounded_channel();
+    let (receipt, receipt_receiver) = mpsc::unbounded_channel();
+    GLOBAL_HEAL_CHANNEL_SENDERS
+        .set(HealChannelSenders { command, receipt })
+        .map_err(|_| "Heal channel sender already initialized")?;
+    Ok((command_receiver, receipt_receiver))
 }
 
 /// Get global heal channel sender
 pub fn get_heal_channel_sender() -> Option<&'static HealChannelSender> {
-    GLOBAL_HEAL_CHANNEL_SENDER.get()
+    GLOBAL_HEAL_CHANNEL_SENDERS.get().map(|senders| &senders.command)
 }
 
 /// Send heal command through global channel
@@ -434,6 +471,21 @@ pub fn publish_heal_response(response: HealChannelResponse) -> Result<(), broadc
 /// Subscribe to heal responses.
 pub fn subscribe_heal_responses() -> broadcast::Receiver<HealChannelResponse> {
     heal_response_sender().subscribe()
+}
+
+/// Send heal start request and wait for structured admission feedback.
+pub async fn send_heal_request_with_receipt(request: HealChannelRequest) -> Result<HealAdmissionReceipt, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let senders = GLOBAL_HEAL_CHANNEL_SENDERS
+        .get()
+        .ok_or_else(|| "Heal channel not initialized".to_string())?;
+    senders
+        .receipt
+        .send(HealReceiptCommand { request, response_tx })
+        .map_err(|err| format!("Failed to send heal receipt command: {err}"))?;
+    response_rx
+        .await
+        .map_err(|e| format!("Failed to receive heal admission response: {e}"))?
 }
 
 /// Send heal start request and wait for structured admission feedback.

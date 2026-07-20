@@ -757,10 +757,11 @@ async fn enqueue_transitioned_delete_cleanup(
             &existing.transitioned_object,
         )
     };
-    let Some(je) = je else {
+    let Some(mut je) = je else {
         return Ok(());
     };
 
+    tier_delete_journal::record_tier_delete_journal_backend_identity(&mut je, &existing.user_defined)?;
     tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
     let expiry_state = current_expiry_state_handle();
@@ -9248,6 +9249,100 @@ mod tests {
         );
         assert!(context.object_data_cache().materialize_fill_enabled());
         (store, context)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transitioned_delete_cleanup_persists_identity_bound_and_legacy_journals() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let identity = [11_u8; 32];
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(identity),
+        );
+        let mut current = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        current.transitioned_object.status = lifecycle::TRANSITION_COMPLETE.to_string();
+        current.transitioned_object.tier = "WARM".to_string();
+        current.transitioned_object.name = "remote/identity-bound".to_string();
+        current.transitioned_object.version_id = "remote-version".to_string();
+
+        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>| {
+            use sha2::{Digest, Sha256};
+
+            let mut hasher = Sha256::new();
+            hasher.update(b"WARM");
+            hasher.update([0]);
+            hasher.update(remote_object.as_bytes());
+            hasher.update([0]);
+            hasher.update(b"remote-version");
+            if let Some(backend_identity) = backend_identity {
+                hasher.update([0]);
+                hasher.update(backend_identity);
+            }
+            format!("ilm/tier-delete-journal/{}.json", rustfs_utils::crypto::hex(hasher.finalize().as_slice()))
+        };
+
+        enqueue_transitioned_delete_cleanup(store.clone(), "bucket", "identity-bound", &ObjectOptions::default(), Some(&current))
+            .await
+            .expect("normal transitioned delete should persist an identity-bound journal");
+        let mut identity_bound = store
+            .get_object_reader(
+                ".rustfs.sys",
+                &journal_name("remote/identity-bound", Some(identity)),
+                None,
+                http::HeaderMap::new(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("identity-bound journal should be readable");
+        let mut identity_bound_data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut identity_bound.stream, &mut identity_bound_data)
+            .await
+            .expect("identity-bound journal body should be readable");
+        let identity_bound: serde_json::Value =
+            serde_json::from_slice(&identity_bound_data).expect("identity-bound journal should decode as JSON");
+        assert_eq!(identity_bound["version"], serde_json::json!(2));
+        assert_eq!(identity_bound["backend_identity"], serde_json::json!(identity));
+
+        current.user_defined = Arc::new(HashMap::new());
+        current.transitioned_object.name = "remote/legacy".to_string();
+        enqueue_transitioned_delete_cleanup(
+            store.clone(),
+            "bucket",
+            "legacy",
+            &ObjectOptions {
+                delete_prefix: true,
+                ..Default::default()
+            },
+            Some(&current),
+        )
+        .await
+        .expect("legacy force-delete cleanup should persist a fail-closed v1 journal");
+        let mut legacy = store
+            .get_object_reader(
+                ".rustfs.sys",
+                &journal_name("remote/legacy", None),
+                None,
+                http::HeaderMap::new(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("legacy journal should be readable");
+        let mut legacy_data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut legacy.stream, &mut legacy_data)
+            .await
+            .expect("legacy journal body should be readable");
+        let legacy: serde_json::Value = serde_json::from_slice(&legacy_data).expect("legacy journal should decode as JSON");
+        assert_eq!(legacy["version"], serde_json::json!(1));
+        assert_eq!(legacy["backend_identity"], serde_json::Value::Null);
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {

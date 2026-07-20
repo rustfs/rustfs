@@ -48,6 +48,10 @@ pub(crate) async fn current_local_node_name() -> String {
     root_runtime_sources::current_local_node_name().await.unwrap_or_default()
 }
 
+pub(crate) fn try_current_local_node_name() -> Option<String> {
+    rustfs_common::try_get_global_local_node_name()
+}
+
 pub(crate) fn current_action_credentials() -> Option<Credentials> {
     root_runtime_sources::current_action_credentials()
 }

@@ -245,12 +245,12 @@ impl SetDisks {
                 continue;
             }
 
-            if !metadata.is_valid() {
+            if !file_info_is_valid_for_metadata(metadata) {
                 parities[index] = -1;
                 continue;
             }
 
-            if metadata.deleted || metadata.size == 0 {
+            if metadata.is_canonical_delete_marker() || metadata.size == 0 {
                 parities[index] = half;
             } else if metadata.transition_status == TRANSITION_COMPLETE {
                 let majority_metadata_parity = total_shards_i32 - (half + 1);
@@ -327,7 +327,7 @@ impl SetDisks {
                 for (i, etag_item) in etags.iter().enumerate() {
                     if let Some(etag_item) = etag_item
                         && etag_item == &etag
-                        && parts_metadata[i].is_valid()
+                        && file_info_is_valid_for_metadata(&parts_metadata[i])
                     {
                         new_disk[i].clone_from(&disks[i]);
                     }
@@ -340,7 +340,7 @@ impl SetDisks {
         let mut new_disk = vec![None; disks.len()];
 
         for (i, &t) in mod_times.iter().enumerate() {
-            if parts_metadata[i].is_valid() && mod_time == t {
+            if file_info_is_valid_for_metadata(&parts_metadata[i]) && mod_time == t {
                 new_disk[i].clone_from(&disks[i]);
             }
         }
@@ -357,7 +357,7 @@ impl SetDisks {
                 continue;
             }
 
-            if meta.is_valid() {
+            if file_info_is_valid_for_metadata(meta) {
                 usable_metadata += 1;
             }
         }
@@ -388,7 +388,7 @@ impl SetDisks {
 
         let mut identity_counts = HashMap::with_capacity(usable_metadata);
         for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
-            if err.is_some() || !meta.is_valid() {
+            if err.is_some() || !file_info_is_valid_for_metadata(meta) {
                 continue;
             }
 
@@ -613,7 +613,7 @@ impl SetDisks {
             }
         }
 
-        if !meta.deleted && meta.size != 0 {
+        if !meta.is_canonical_delete_marker() && meta.size != 0 {
             hasher.update(meta.erasure.data_blocks.to_le_bytes());
             hasher.update(meta.erasure.parity_blocks.to_le_bytes());
             hasher.update(meta.erasure.distribution.len().to_le_bytes());
@@ -626,7 +626,7 @@ impl SetDisks {
     fn latest_fileinfo_identity_groups(parts_metadata: &[FileInfo], errs: &[Option<DiskError>]) -> Vec<FileInfoIdentityGroup> {
         let mut groups: Vec<FileInfoIdentityGroup> = Vec::with_capacity(parts_metadata.len());
         for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
-            if err.is_some() || !meta.is_valid() {
+            if err.is_some() || !file_info_is_valid_for_metadata(meta) {
                 continue;
             }
 
@@ -658,7 +658,7 @@ impl SetDisks {
         let mut count = 0;
 
         for (i, ((meta, err), disk)) in parts_metadata.iter().zip(errs.iter()).zip(disks.iter()).enumerate() {
-            if err.is_some() || !meta.is_valid() || Self::file_info_quorum_hash(meta) != hash {
+            if err.is_some() || !file_info_is_valid_for_metadata(meta) || Self::file_info_quorum_hash(meta) != hash {
                 continue;
             }
 
@@ -731,7 +731,7 @@ impl SetDisks {
         let mut meta_hashes = vec![None; metas.len()];
 
         for (i, meta) in metas.iter().enumerate() {
-            if !meta.is_valid() {
+            if !file_info_is_valid_for_metadata(meta) {
                 debug!(
                     index = i,
                     valid = false,
@@ -807,7 +807,7 @@ impl SetDisks {
             if let Some(hash) = op_hash
                 && let Some(max_hash) = max_val
                 && *hash == max_hash
-                && metas[i].is_valid()
+                && file_info_is_valid_for_metadata(&metas[i])
             {
                 if !found {
                     found_fi = Some(metas[i].clone());
@@ -861,7 +861,7 @@ impl SetDisks {
 
         let mut inconsistent = 0;
         for (k, v) in parts_metadata.iter().enumerate() {
-            if disks[k].is_none() || !v.is_valid() || distribution[k] != v.erasure.index {
+            if disks[k].is_none() || !v.has_valid_erasure_geometry() || distribution[k] != v.erasure.index {
                 inconsistent += 1;
             }
         }
@@ -877,9 +877,9 @@ impl SetDisks {
                 continue;
             }
             let eligible = if use_by_index {
-                parts_metadata[k].is_valid() && distribution[k] == parts_metadata[k].erasure.index
+                parts_metadata[k].has_valid_erasure_geometry() && distribution[k] == parts_metadata[k].erasure.index
             } else {
-                init || parts_metadata[k].is_valid()
+                init || parts_metadata[k].has_valid_erasure_geometry()
             };
             if !eligible {
                 continue;
@@ -917,7 +917,7 @@ impl SetDisks {
                 continue;
             }
 
-            if !v.is_valid() {
+            if !v.has_valid_erasure_geometry() {
                 inconsistent += 1;
                 continue;
             }
@@ -963,7 +963,7 @@ impl SetDisks {
                 continue;
             }
 
-            if !init && !parts_metadata[k].is_valid() {
+            if !init && !parts_metadata[k].has_valid_erasure_geometry() {
                 continue;
             }
 
@@ -1154,6 +1154,43 @@ mod tests {
             .expect("checksums should exist")
             .insert("sha256".to_string(), "changed".to_string());
         assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+    }
+
+    #[test]
+    fn purge_pending_quorum_hash_keeps_erasure_layouts_separate() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let mut honest = FileInfo::new("bucket/object", 5, 1);
+        honest.name = "bucket/object".to_string();
+        honest.version_id = Some(version_id);
+        honest.data_dir = Some(data_dir);
+        honest.mod_time = Some(mod_time);
+        honest.size = 1;
+        honest.deleted = true;
+        honest.add_object_part(1, "part-etag".to_string(), 1, Some(mod_time), 1, None, None);
+
+        let mut parts_metadata = (1..=6)
+            .map(|index| {
+                let mut metadata = honest.clone();
+                metadata.erasure.index = index;
+                metadata
+            })
+            .collect::<Vec<_>>();
+        let mut tampered_layout = FileInfo::new("bucket/object", 3, 3).erasure;
+        tampered_layout.index = 1;
+        parts_metadata[0].erasure = tampered_layout;
+        let errs = vec![None; 6];
+
+        assert_eq!(
+            SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 3)
+                .expect("five honest EC:1 payload copies should determine object quorum"),
+            (5, 5)
+        );
+        let selected = SetDisks::find_file_info_in_quorum(&parts_metadata, &Some(mod_time), &None, 5)
+            .expect("the five matching EC:1 payload copies should determine metadata identity");
+        assert_eq!(selected.erasure.data_blocks, 5);
+        assert_eq!(selected.erasure.parity_blocks, 1);
     }
 
     #[test]

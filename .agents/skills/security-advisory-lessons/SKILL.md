@@ -60,12 +60,14 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 ### IAM and service accounts
 - Treat imported IAM payload fields as attacker-controlled: `parent`, `claims`, `accessKey`, `secretKey`, status, policy names, and groups.
 - For service account create/update/import, prove parent ownership or root/admin authority before writing credentials or claims; an action permission alone must not allow choosing root or another user as `target_user`.
+- Treat IAM export packages as credential disclosure surfaces; never include plaintext user or service-account secret keys unless the caller is allowed to recover those secrets and the export format is intentionally sealed.
 - Do not let `deny_only` or "no explicit deny" become an allow decision that skips required allow checks.
 - Test cross-user list/update/import flows with wrong, correct, self, parent, and root identities.
 
 ### STS, OIDC, and federation flows
 - Every STS endpoint must have an explicit authentication story: SigV4 where required, OIDC token verification for web identity, and role/session policy validation before issuing credentials.
 - JWT session tokens must be signed and verified by a trusted issuer/key path, not by service-account-controlled material or a reused root secret.
+- JWT verification must enforce required claims and expiration for every bearer token path; "allow missing exp" is never acceptable for user-presented credentials.
 - Public OIDC bootstrap and callback routes must treat `Host`, `X-Forwarded-Proto`, redirect targets, `state`, and callback parameters as untrusted; credential-bearing redirects require a configured, allowlisted origin.
 - OIDC discovery and validation URLs are SSRF sinks. Resolve and classify hostnames at connection time, reject rebinding to loopback/private/link-local ranges, and do not rely on literal string checks.
 
@@ -137,7 +139,9 @@ Use these prompts while reviewing a diff:
 - Does a public/default/empty config change security behavior from fail-closed to fail-open?
 - Is any attacker-controlled value later used as a path, policy condition, credential identity, log field, URL, Origin, or response body?
 - Does this response contain stored replication, remote target, or service credentials that need redaction or stricter authorization?
+- Does an IAM export/import path expose or trust plaintext credential secrets beyond the caller's intended authority?
 - Can this STS/OIDC path issue credentials without SigV4, trusted issuer validation, allowlisted redirects, or trusted-proxy host/scheme handling?
+- Can a service-account or STS token omit `exp`, forge `sessionPolicy`, or use a principal-controlled key as signing authority?
 - Does this outbound validation path resolve attacker-supplied hostnames and reject private, loopback, link-local, and rebound addresses at the actual connection boundary?
 - Is an archive entry, object key, or policy resource normalized differently between authorization and storage?
 - Is the same operation implemented in multiple paths, such as `CopyObject` vs `UploadPartCopy`, and do all paths enforce the same security contract?

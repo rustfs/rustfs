@@ -23,6 +23,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
 use crate::client::signer_error::error_chain_contains_signer_header_marker;
+use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease};
 use crate::storage_api_contracts::lifecycle::TransitionedObject;
 use crate::store::ECStore;
 use rustfs_utils::get_env_usize;
@@ -247,6 +248,7 @@ impl ObjSweeper {
                 obj_name: self.remote_object.clone(),
                 version_id: self.transition_version_id.clone(),
                 tier_name: self.transition_tier.clone(),
+                backend_identity: None,
             });
         }
         None
@@ -281,6 +283,7 @@ pub struct Jentry {
     pub(crate) obj_name: String,
     pub(crate) version_id: String,
     pub(crate) tier_name: String,
+    pub(crate) backend_identity: Option<TierDestinationId>,
 }
 
 impl ExpiryOp for Jentry {
@@ -312,6 +315,27 @@ async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_na
         return result;
     }
 
+    let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+    delete_object_from_remote_tier_raw_with_manager(obj_name, rv_id, tier_name, &tier_config_mgr).await
+}
+
+async fn delete_object_from_remote_tier_raw_with_manager(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+) -> Result<(), std::io::Error> {
+    let lease = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, tier_name)
+        .await
+        .map_err(std::io::Error::other)?;
+    delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease).await
+}
+
+async fn delete_object_from_remote_tier_raw_with_lease(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+) -> Result<(), std::io::Error> {
     if remote_delete_breaker_is_open(Instant::now()).await {
         metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
         return Err(std::io::Error::other(ERR_REMOTE_DELETE_BREAKER_OPEN));
@@ -323,13 +347,7 @@ async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_na
         .map_err(|_| std::io::Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED))?;
     let _inflight = RemoteDeleteInflightGuard::new();
 
-    let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
-    let mut config_mgr = tier_config_mgr.write().await;
-    let w = match config_mgr.get_driver(tier_name).await {
-        Ok(w) => w,
-        Err(e) => return Err(std::io::Error::other(e)),
-    };
-    w.remove(obj_name, rv_id).await
+    lease.remove(obj_name, rv_id).await
 }
 
 #[cfg(test)]
@@ -388,6 +406,36 @@ pub async fn delete_object_from_remote_tier_idempotent(
     }
 }
 
+pub(crate) async fn delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    backend_identity: TierDestinationId,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, tier_name, backend_identity)
+        .await
+        .map_err(std::io::Error::other)?;
+    delete_object_from_remote_tier_with_lease_idempotent(obj_name, rv_id, &lease).await
+}
+
+pub(crate) async fn delete_object_from_remote_tier_with_lease_idempotent(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    match delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, lease).await {
+        Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
+        Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
+        Err(err) => {
+            if should_record_remote_delete_failure(&err) {
+                record_remote_delete_failure(&err, Instant::now()).await;
+            }
+            Err(err)
+        }
+    }
+}
+
 pub(crate) fn is_remote_tier_not_found_error(err: &std::io::Error) -> bool {
     let message = err.to_string();
     message.contains("NoSuchKey")
@@ -425,6 +473,7 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
         obj_name: transitioned.name.clone(),
         version_id: transitioned.version_id.clone(),
         tier_name: transitioned.tier.clone(),
+        backend_identity: None,
     })
 }
 
@@ -434,8 +483,9 @@ mod test {
 
     use super::{
         ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, RemoteDeleteBreaker, RemoteTierDeleteOutcome,
-        delete_object_from_remote_tier_idempotent, is_remote_tier_not_found_error, is_signer_header_error,
-        set_remote_tier_delete_test_hook, should_record_remote_delete_failure,
+        delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
+        is_remote_tier_not_found_error, is_signer_header_error, set_remote_tier_delete_test_hook,
+        should_record_remote_delete_failure,
     };
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
@@ -507,6 +557,31 @@ mod test {
             .expect_err("driver lookup failure must not be idempotent success");
 
         assert!(err.to_string().contains("driver not found"));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_delete_rejects_backend_identity_mismatch() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let mut mismatched = lease.backend_identity();
+        mismatched[0] ^= 1;
+        drop(lease);
+
+        let err = delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "remote-version",
+            "WARM",
+            mismatched,
+            &manager,
+        )
+        .await
+        .expect_err("journal recovery must fail closed when the tier name was rebound");
+
+        assert!(err.to_string().contains("identity no longer matches"));
     }
 
     #[test]
