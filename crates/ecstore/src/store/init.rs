@@ -208,6 +208,8 @@ impl ECStore {
         ctx: CancellationToken,
         instance_ctx: Arc<InstanceContext>,
     ) -> Result<Arc<Self>> {
+        instance_ctx.bind_background_cancel_token(ctx.clone());
+
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         // Validate topology and environment overrides before opening any disk.
@@ -523,6 +525,21 @@ mod tests {
         resolve_startup_pool_defaults_with, resolve_store_init_stage_result, save_validated_pool_meta_for_startup,
         should_auto_start_rebalance_after_init, should_auto_start_rebalance_after_recovered_meta,
         should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+    };
+    #[cfg(feature = "test-util")]
+    use crate::{
+        bucket::lifecycle::{
+            tier_delete_journal::{
+                TIER_DELETE_JOURNAL_PREFIX, persist_tier_delete_journal_entry, recover_tier_delete_journal_entries,
+            },
+            tier_sweeper::Jentry,
+        },
+        disk::RUSTFS_META_BUCKET,
+        services::tier::{
+            test_util::{MockWarmBackend, register_mock_tier},
+            tier::TierConfigMgr,
+        },
+        storage_api_contracts::list::ListOperations as _,
     };
     use crate::{
         core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
@@ -898,7 +915,11 @@ mod tests {
         temp_dir: &std::path::Path,
         cmd_line: &str,
         pool_drive_counts: &[usize],
-    ) -> (Arc<crate::runtime::instance::InstanceContext>, Arc<crate::store::ECStore>) {
+    ) -> (
+        Arc<crate::runtime::instance::InstanceContext>,
+        Arc<crate::store::ECStore>,
+        CancellationToken,
+    ) {
         let mut pools = Vec::with_capacity(pool_drive_counts.len());
         for (pool_index, &drives_per_set) in pool_drive_counts.iter().enumerate() {
             let mut endpoints = Vec::with_capacity(drives_per_set);
@@ -927,16 +948,47 @@ mod tests {
             .await
             .expect("register local disks into the fresh context");
 
+        let shutdown = CancellationToken::new();
         let store = crate::store::ECStore::new_with_instance_ctx(
             "127.0.0.1:0".parse().expect("test address"),
             endpoint_pools,
-            CancellationToken::new(),
+            shutdown.clone(),
             instance_ctx.clone(),
         )
         .await
         .expect("store should build around the fresh context");
 
-        (instance_ctx, store)
+        (instance_ctx, store, shutdown)
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn tier_delete_journal_count(store: Arc<crate::store::ECStore>) -> usize {
+        store
+            .list_objects_v2(RUSTFS_META_BUCKET, TIER_DELETE_JOURNAL_PREFIX, None, None, 100, false, None, false)
+            .await
+            .expect("tier delete journal should be listable")
+            .objects
+            .len()
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn wait_for_tier_delete_journal_recovery(
+        store: Arc<crate::store::ECStore>,
+        backend: &MockWarmBackend,
+        expected_removes: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if backend.remove_versions().await.len() >= expected_removes
+                    && tier_delete_journal_count(store.clone()).await == 0
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tier delete journal recovery should complete");
     }
 
     // Phase 5 follow-up (backlog#1052): building a real store through the
@@ -948,7 +1000,7 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn new_with_instance_ctx_threads_context_through_store_graph() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
-        let (instance_ctx, store) =
+        let (instance_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "instance-ctx-store-graph-test", &[4])).await;
 
         assert!(
@@ -989,7 +1041,7 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn new_with_instance_ctx_applies_default_parity_to_each_real_pool() {
         let temp_dir = tempfile::tempdir().expect("create multi-pool store dir");
-        let (_, store) =
+        let (_, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "pool-parity-regression", &[4, 2])).await;
 
         assert_eq!(store.pools.len(), 2);
@@ -1008,9 +1060,9 @@ mod tests {
     async fn two_stores_initialize_their_own_bucket_metadata_sys() {
         let temp_a = tempfile::tempdir().expect("create temp store dir a");
         let temp_b = tempfile::tempdir().expect("create temp store dir b");
-        let (ctx_a, store_a) =
+        let (ctx_a, store_a, _shutdown_a) =
             without_storage_class_env(build_isolated_test_store(temp_a.path(), "bucket-metadata-isolation-a", &[4])).await;
-        let (ctx_b, store_b) =
+        let (ctx_b, store_b, _shutdown_b) =
             without_storage_class_env(build_isolated_test_store(temp_b.path(), "bucket-metadata-isolation-b", &[4])).await;
 
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
@@ -1024,5 +1076,112 @@ mod tests {
             .bucket_metadata_sys()
             .expect("store B's context must hold its metadata system");
         assert!(!Arc::ptr_eq(&sys_a, &sys_b), "each store must own a distinct bucket metadata system");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_journal_recovery_spawns_for_each_store() {
+        let temp_a = tempfile::tempdir().expect("create temp store dir a");
+        let temp_b = tempfile::tempdir().expect("create temp store dir b");
+        let (ctx_a, store_a, shutdown_a) =
+            without_storage_class_env(build_isolated_test_store(temp_a.path(), "tier-journal-recovery-a", &[4])).await;
+        let (ctx_b, store_b, shutdown_b) =
+            without_storage_class_env(build_isolated_test_store(temp_b.path(), "tier-journal-recovery-b", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_b.clone(), Vec::new()).await;
+
+        assert!(
+            !ctx_a.mark_tier_delete_journal_recovery_started(store_a.id),
+            "store A should have claimed its production recovery worker"
+        );
+        assert!(
+            !ctx_b.mark_tier_delete_journal_recovery_started(store_b.id),
+            "store B should have claimed its production recovery worker"
+        );
+        assert!(!shutdown_a.is_cancelled());
+        assert!(!shutdown_b.is_cancelled());
+
+        let tier_a = "JOURNAL-A";
+        let tier_b = "JOURNAL-B";
+        let backend_a = register_mock_tier(&ctx_a.tier_config_mgr(), tier_a).await;
+        let backend_b = register_mock_tier(&ctx_b.tier_config_mgr(), tier_b).await;
+        let identity_a = TierConfigMgr::acquire_operation_lease(&ctx_a.tier_config_mgr(), tier_a)
+            .await
+            .expect("store A tier lease should resolve")
+            .backend_identity();
+        let identity_b = TierConfigMgr::acquire_operation_lease(&ctx_b.tier_config_mgr(), tier_b)
+            .await
+            .expect("store B tier lease should resolve")
+            .backend_identity();
+        let entry_a = Jentry {
+            obj_name: "remote-a".to_string(),
+            version_id: "version-a".to_string(),
+            tier_name: tier_a.to_string(),
+            backend_identity: Some(identity_a),
+            version_id_exact: false,
+        };
+        let entry_b = Jentry {
+            obj_name: "remote-b".to_string(),
+            version_id: "version-b".to_string(),
+            tier_name: tier_b.to_string(),
+            backend_identity: Some(identity_b),
+            version_id_exact: false,
+        };
+        let remove_a = backend_a.arm_failing_remove_barrier().await;
+        persist_tier_delete_journal_entry(store_a.clone(), &entry_a)
+            .await
+            .expect("store A journal should persist");
+        persist_tier_delete_journal_entry(store_b.clone(), &entry_b)
+            .await
+            .expect("store B journal should persist");
+
+        ctx_a.wake_tier_delete_journal_recovery();
+        ctx_b.wake_tier_delete_journal_recovery();
+        remove_a.wait_until_paused().await;
+        wait_for_tier_delete_journal_recovery(store_b.clone(), &backend_b, 1).await;
+
+        shutdown_a.cancel();
+        remove_a.wait_until_operation_dropped().await;
+        assert!(
+            ctx_a
+                .background_cancel_token()
+                .expect("store A shutdown token should be bound")
+                .is_cancelled()
+        );
+        assert!(
+            !ctx_b
+                .background_cancel_token()
+                .expect("store B shutdown token should be bound")
+                .is_cancelled(),
+            "cancelling store A must not stop store B"
+        );
+        assert_eq!(tier_delete_journal_count(store_a.clone()).await, 1);
+
+        let recovered_a = recover_tier_delete_journal_entries(store_a.clone(), 100, None)
+            .await
+            .expect("the cancelled store A worker must leave its journal recoverable");
+        assert_eq!((recovered_a.scanned, recovered_a.deleted, recovered_a.failed), (1, 1, 0));
+        assert_eq!(backend_a.remove_versions().await, vec![("remote-a".to_string(), "version-a".to_string())]);
+
+        let second_entry_b = Jentry {
+            obj_name: "remote-b-2".to_string(),
+            version_id: "version-b-2".to_string(),
+            ..entry_b
+        };
+        persist_tier_delete_journal_entry(store_b.clone(), &second_entry_b)
+            .await
+            .expect("store B second journal should persist");
+        ctx_b.wake_tier_delete_journal_recovery();
+        wait_for_tier_delete_journal_recovery(store_b.clone(), &backend_b, 2).await;
+        assert_eq!(
+            backend_b.remove_versions().await,
+            vec![
+                ("remote-b".to_string(), "version-b".to_string()),
+                ("remote-b-2".to_string(), "version-b-2".to_string()),
+            ]
+        );
+
+        shutdown_b.cancel();
     }
 }

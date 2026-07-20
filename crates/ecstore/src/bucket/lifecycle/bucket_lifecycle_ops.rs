@@ -107,7 +107,6 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
-static TIER_DELETE_JOURNAL_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
@@ -419,6 +418,7 @@ async fn delete_free_version_remote_object(
         &oi.transitioned_object.tier,
         identity,
         tier_config_mgr,
+        false,
     )
     .await?;
     Ok(())
@@ -1504,12 +1504,20 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
 }
 
 fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
-    if TIER_DELETE_JOURNAL_RECOVERY_STARTED.set(()).is_err() {
+    let Some(cancel_token) = api.ctx.background_cancel_token() else {
+        error!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            store_id = %api.id,
+            "Tier delete journal recovery was not started because the store shutdown token is unavailable"
+        );
+        return;
+    };
+    if !api.ctx.mark_tier_delete_journal_recovery_started(api.id) {
         return;
     }
-
     tokio::spawn(async move {
-        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_default();
         run_tier_delete_journal_recovery_loop(api, cancel_token).await;
     });
 }
@@ -1989,7 +1997,7 @@ fn transitioned_cleanup_tuple(oi: &ObjectInfo) -> Result<(&str, &str, &str), std
     if transitioned.status != lifecycle::TRANSITION_COMPLETE {
         return Err(std::io::Error::other("transitioned object cleanup tuple is not complete"));
     }
-    if transitioned.name.is_empty() || transitioned.version_id.is_empty() || transitioned.tier.is_empty() {
+    if transitioned.name.is_empty() || transitioned.tier.is_empty() {
         return Err(std::io::Error::other("transitioned object cleanup tuple is incomplete"));
     }
     Ok((&transitioned.name, &transitioned.version_id, &transitioned.tier))
@@ -3575,6 +3583,7 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([1; 32]),
+            version_id_exact: false,
         };
 
         let err = state
@@ -3663,6 +3672,7 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([1; 32]),
+            version_id_exact: false,
         };
 
         state
@@ -3813,7 +3823,7 @@ mod tests {
     }
 
     #[test]
-    fn transitioned_cleanup_tuple_requires_remote_name_version_and_tier() {
+    fn transitioned_cleanup_tuple_preserves_versioned_remote() {
         let mut oi = ObjectInfo::default();
         oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
         oi.transitioned_object.name = "remote/object".to_string();
@@ -3826,15 +3836,29 @@ mod tests {
     }
 
     #[test]
-    fn transitioned_cleanup_tuple_rejects_missing_remote_version() {
+    fn transitioned_cleanup_tuple_accepts_unversioned_remote() {
         let mut oi = ObjectInfo::default();
         oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
         oi.transitioned_object.name = "remote/object".to_string();
         oi.transitioned_object.tier = "WARM".to_string();
 
-        let err = transitioned_cleanup_tuple(&oi).expect_err("missing version must be rejected");
+        let tuple = transitioned_cleanup_tuple(&oi).expect("an empty remote version identifies an unversioned tier bucket");
 
-        assert!(err.to_string().contains("cleanup tuple is incomplete"));
+        assert_eq!(tuple, ("remote/object", "", "WARM"));
+    }
+
+    #[test]
+    fn transitioned_cleanup_tuple_rejects_missing_remote_name_or_tier() {
+        for (name, tier) in [("", "WARM"), ("remote/object", "")] {
+            let mut oi = ObjectInfo::default();
+            oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+            oi.transitioned_object.name = name.to_string();
+            oi.transitioned_object.tier = tier.to_string();
+
+            let err = transitioned_cleanup_tuple(&oi).expect_err("remote name and tier must remain required");
+
+            assert!(err.to_string().contains("cleanup tuple is incomplete"));
+        }
     }
 
     #[test]

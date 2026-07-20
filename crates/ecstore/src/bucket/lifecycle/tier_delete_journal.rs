@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,8 +38,11 @@ const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal";
 
 pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 1_000;
+const TIER_DELETE_JOURNAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
-const TIER_DELETE_JOURNAL_PREFIX: &str = "ilm/tier-delete-journal/";
+const TIER_DELETE_JOURNAL_EXACT_VERSION: u8 = 3;
+pub(crate) const TIER_DELETE_JOURNAL_PREFIX: &str = "ilm/tier-delete-journal/";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -50,12 +53,16 @@ struct PersistedTierDeleteJournalEntry {
     tier_name: String,
     #[serde(default)]
     backend_identity: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_id_exact: Option<bool>,
 }
 
 impl PersistedTierDeleteJournalEntry {
     fn from_jentry(je: &Jentry) -> Self {
         Self {
-            version: if je.backend_identity.is_some() {
+            version: if je.version_id_exact {
+                TIER_DELETE_JOURNAL_EXACT_VERSION
+            } else if je.backend_identity.is_some() {
                 TIER_DELETE_JOURNAL_VERSION
             } else {
                 1
@@ -64,6 +71,7 @@ impl PersistedTierDeleteJournalEntry {
             version_id: je.version_id.clone(),
             tier_name: je.tier_name.clone(),
             backend_identity: je.backend_identity,
+            version_id_exact: je.version_id_exact.then_some(true),
         }
     }
 
@@ -76,12 +84,32 @@ impl PersistedTierDeleteJournalEntry {
         if self.obj_name.is_empty() || self.tier_name.is_empty() {
             return Err(Error::other("tier delete journal entry is incomplete"));
         }
-        let backend_identity = match self.version {
-            1 => None,
-            TIER_DELETE_JOURNAL_VERSION => Some(
-                self.backend_identity
-                    .ok_or_else(|| Error::other("tier delete journal v2 entry is missing its backend identity"))?,
+        if self.version != TIER_DELETE_JOURNAL_EXACT_VERSION && self.version_id_exact.unwrap_or(false) {
+            return Err(Error::other(
+                "legacy tier delete journal entry has an unsupported exact version constraint",
+            ));
+        }
+        let (backend_identity, version_id_exact) = match self.version {
+            1 => (None, false),
+            TIER_DELETE_JOURNAL_VERSION => (
+                Some(
+                    self.backend_identity
+                        .ok_or_else(|| Error::other("tier delete journal v2 entry is missing its backend identity"))?,
+                ),
+                false,
             ),
+            TIER_DELETE_JOURNAL_EXACT_VERSION => {
+                if self.version_id.is_empty() || self.version_id_exact != Some(true) {
+                    return Err(Error::other("tier delete journal v3 entry is missing its exact version constraint"));
+                }
+                (
+                    Some(
+                        self.backend_identity
+                            .ok_or_else(|| Error::other("tier delete journal v3 entry is missing its backend identity"))?,
+                    ),
+                    true,
+                )
+            }
             version => return Err(Error::other(format!("unsupported tier delete journal version {version}"))),
         };
         Ok(Jentry {
@@ -89,6 +117,7 @@ impl PersistedTierDeleteJournalEntry {
             version_id: self.version_id,
             tier_name: self.tier_name,
             backend_identity,
+            version_id_exact,
         })
     }
 }
@@ -112,6 +141,10 @@ pub(crate) fn tier_delete_journal_object_name(je: &Jentry) -> String {
     if let Some(backend_identity) = je.backend_identity {
         hasher.update([0]);
         hasher.update(backend_identity);
+    }
+    if je.version_id_exact {
+        hasher.update([0]);
+        hasher.update(b"exact-version-id");
     }
     format!(
         "{TIER_DELETE_JOURNAL_PREFIX}{}.json",
@@ -185,6 +218,7 @@ pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -
         &je.tier_name,
         backend_identity,
         &api.tier_config_mgr(),
+        je.version_id_exact,
     )
     .await?;
     remove_tier_delete_journal_entry(api, je).await
@@ -294,16 +328,31 @@ pub async fn recover_tier_delete_journal_entries(
 }
 
 pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_token: CancellationToken) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut interval = tokio::time::interval(TIER_DELETE_JOURNAL_RECOVERY_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut marker: Option<String> = None;
 
     loop {
+        #[cfg(test)]
         tokio::select! {
             _ = cancel_token.cancelled() => return,
-            _ = interval.tick() => {}
+            _ = interval.tick() => {},
+            _ = api.ctx.wait_for_tier_delete_journal_recovery() => {},
+        }
+        #[cfg(not(test))]
+        tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            _ = interval.tick() => {},
         }
 
-        match recover_tier_delete_journal_entries(api.clone(), DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, marker.clone()).await {
+        let recovery =
+            recover_tier_delete_journal_entries(api.clone(), DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, marker.clone());
+        let Some(result) =
+            await_tier_delete_journal_recovery(&cancel_token, TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT, recovery).await
+        else {
+            return;
+        };
+        match result {
             Ok(stats) => {
                 marker = stats.next_marker;
                 debug!(
@@ -332,13 +381,36 @@ pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_tok
     }
 }
 
+async fn await_tier_delete_journal_recovery<T, F>(
+    cancel_token: &CancellationToken,
+    timeout: Duration,
+    recovery: F,
+) -> Option<Result<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::select! {
+        _ = cancel_token.cancelled() => None,
+        result = tokio::time::timeout(timeout, recovery) => Some(match result {
+            Ok(result) => result,
+            Err(_) => Err(Error::other(format!(
+                "tier delete journal recovery timed out after {} seconds",
+                timeout.as_secs()
+            ))),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_tier_delete_journal_entry, encode_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
-        tier_delete_journal_object_name,
+        TIER_DELETE_JOURNAL_EXACT_VERSION, await_tier_delete_journal_recovery, decode_tier_delete_journal_entry,
+        encode_tier_delete_journal_entry, record_tier_delete_journal_backend_identity, tier_delete_journal_object_name,
     };
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
+    use crate::error::Result;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     fn journal_entry() -> Jentry {
         Jentry {
@@ -346,6 +418,7 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([7; 32]),
+            version_id_exact: false,
         }
     }
 
@@ -360,6 +433,82 @@ mod tests {
         assert_eq!(decoded.version_id, je.version_id);
         assert_eq!(decoded.tier_name, je.tier_name);
         assert_eq!(decoded.backend_identity, je.backend_identity);
+        assert_eq!(decoded.version_id_exact, je.version_id_exact);
+    }
+
+    #[test]
+    fn tier_delete_journal_roundtrips_exact_put_response_constraint() {
+        let mut exact = journal_entry();
+        exact.version_id = uuid::Uuid::nil().to_string();
+        exact.version_id_exact = true;
+        let mut normalized = exact.clone();
+        normalized.version_id_exact = false;
+
+        let encoded = encode_tier_delete_journal_entry(&exact).expect("exact journal entry should encode");
+        let persisted: serde_json::Value = serde_json::from_slice(&encoded).expect("exact journal JSON should decode");
+        let decoded = decode_tier_delete_journal_entry(&encoded).expect("exact journal entry should decode");
+
+        assert_eq!(persisted["version"], TIER_DELETE_JOURNAL_EXACT_VERSION);
+        assert_eq!(persisted["version_id_exact"], true);
+        assert!(decoded.version_id_exact);
+        assert_ne!(tier_delete_journal_object_name(&exact), tier_delete_journal_object_name(&normalized));
+    }
+
+    #[test]
+    fn tier_delete_journal_rejects_invalid_exact_version_constraints() {
+        let identity = vec![7_u8; 32];
+        let invalid = [
+            serde_json::json!({
+                "version": 1,
+                "obj_name": "remote/object",
+                "version_id": "exact-version",
+                "tier_name": "WARM",
+                "version_id_exact": true,
+            }),
+            serde_json::json!({
+                "version": 2,
+                "obj_name": "remote/object",
+                "version_id": "exact-version",
+                "tier_name": "WARM",
+                "backend_identity": identity,
+                "version_id_exact": true,
+            }),
+            serde_json::json!({
+                "version": TIER_DELETE_JOURNAL_EXACT_VERSION,
+                "obj_name": "remote/object",
+                "version_id": "",
+                "tier_name": "WARM",
+                "backend_identity": identity,
+                "version_id_exact": true,
+            }),
+            serde_json::json!({
+                "version": TIER_DELETE_JOURNAL_EXACT_VERSION,
+                "obj_name": "remote/object",
+                "version_id": "exact-version",
+                "tier_name": "WARM",
+                "backend_identity": identity,
+            }),
+            serde_json::json!({
+                "version": TIER_DELETE_JOURNAL_EXACT_VERSION,
+                "obj_name": "remote/object",
+                "version_id": "exact-version",
+                "tier_name": "WARM",
+                "backend_identity": identity,
+                "version_id_exact": false,
+            }),
+            serde_json::json!({
+                "version": TIER_DELETE_JOURNAL_EXACT_VERSION,
+                "obj_name": "remote/object",
+                "version_id": "exact-version",
+                "tier_name": "WARM",
+                "version_id_exact": true,
+            }),
+        ];
+
+        for persisted in invalid {
+            let encoded = serde_json::to_vec(&persisted).expect("invalid journal fixture should encode");
+            decode_tier_delete_journal_entry(&encoded).expect_err("invalid exact journal constraint must fail closed");
+        }
     }
 
     #[test]
@@ -475,5 +624,30 @@ mod tests {
         let err = decode_tier_delete_journal_entry(payload).expect_err("truncated journal payload should be rejected");
 
         assert!(err.to_string().contains("decode tier delete journal failed"));
+    }
+
+    #[tokio::test]
+    async fn tier_delete_journal_recovery_has_a_hard_outer_timeout() {
+        let result = await_tier_delete_journal_recovery(
+            &CancellationToken::new(),
+            Duration::from_millis(10),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect("an elapsed timeout should return a recovery error")
+        .expect_err("a permanently pending recovery must time out");
+
+        assert!(result.to_string().contains("recovery timed out"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn tier_delete_journal_recovery_drops_in_flight_work_on_shutdown() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result =
+            await_tier_delete_journal_recovery(&cancel, Duration::from_secs(30), std::future::pending::<Result<()>>()).await;
+
+        assert!(result.is_none(), "shutdown must cancel the in-flight recovery future");
     }
 }
