@@ -1657,6 +1657,32 @@ fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()>
     Ok(())
 }
 
+/// The web console's "Set Up Site Replication" flow sends only the remote peer(s) and omits the
+/// local deployment from the add payload. The add preflight requires the local deployment to be
+/// present (`validate_add_preflight_topology`), so inject the local site when the payload does not
+/// already include it. `mc admin replicate add` includes every site (matched here by endpoint
+/// identity), so this is a no-op for the CLI. The local site carries no credentials — they are not
+/// required for the local peer (`validate_add_sites` skips credential checks for it).
+fn ensure_local_site_present(sites: &mut Vec<PeerSite>, local_peer: &PeerInfo) {
+    if sites
+        .iter()
+        .any(|site| same_identity_endpoint(&site.endpoint, &local_peer.endpoint))
+    {
+        return;
+    }
+    sites.insert(
+        0,
+        PeerSite {
+            name: local_peer.name.clone(),
+            endpoint: local_peer.endpoint.clone(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            skip_tls_verify: local_peer.skip_tls_verify,
+            ca_cert_pem: local_peer.ca_cert_pem.clone(),
+        },
+    );
+}
+
 fn idp_settings_value(settings: &IDPSettings) -> S3Result<serde_json::Value> {
     serde_json::to_value(settings)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize IDP settings failed: {e}")))
@@ -6180,7 +6206,10 @@ impl Operation for SiteReplicationAddHandler {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
         }
         let local_peer = current_local_peer(&req, &current_state);
-        let sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
+        let mut sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
+        // The web console's "Set Up Site Replication" omits the local deployment from the payload;
+        // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
+        ensure_local_site_present(&mut sites, &local_peer);
         validate_add_sites(&sites, &local_peer)?;
         let mut preflight_infos = Vec::with_capacity(sites.len());
         for site in &sites {
@@ -9007,6 +9036,63 @@ mod tests {
         let err = validate_add_sites(&sites, &local_peer).expect_err("missing remote secret should fail");
 
         assert!(err.to_string().contains("secretKey is required"));
+    }
+
+    // Console fix: the web UI omits the local deployment from the add payload. ensure_local_site_present
+    // injects it so the add preflight (which requires the local deployment) succeeds.
+    #[test]
+    fn test_ensure_local_site_present_injects_when_missing() {
+        let local_peer = peer("local", "https://local.example.com");
+        let mut sites = vec![PeerSite {
+            name: "remote".to_string(),
+            endpoint: "https://remote.example.com".to_string(),
+            access_key: "remote-ak".to_string(),
+            secret_key: "remote-sk".to_string(),
+            ..Default::default()
+        }];
+
+        ensure_local_site_present(&mut sites, &local_peer);
+
+        assert_eq!(sites.len(), 2, "the local site must be injected when missing");
+        assert!(
+            sites
+                .iter()
+                .any(|s| same_identity_endpoint(&s.endpoint, &local_peer.endpoint)),
+            "an injected site must match the local endpoint"
+        );
+        // The console payload (remote-only) now validates end-to-end at the add-sites stage.
+        validate_add_sites(&sites, &local_peer).expect("add sites must validate after injecting the local site");
+    }
+
+    #[test]
+    fn test_ensure_local_site_present_noop_when_already_included() {
+        let local_peer = peer("local", "https://local.example.com");
+        let mut sites = vec![
+            PeerSite {
+                name: "local".to_string(),
+                endpoint: "https://local.example.com".to_string(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "remote".to_string(),
+                endpoint: "https://remote.example.com".to_string(),
+                access_key: "remote-ak".to_string(),
+                secret_key: "remote-sk".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        ensure_local_site_present(&mut sites, &local_peer);
+
+        assert_eq!(sites.len(), 2, "the local site must not be duplicated when already present");
+        assert_eq!(
+            sites
+                .iter()
+                .filter(|s| same_identity_endpoint(&s.endpoint, &local_peer.endpoint))
+                .count(),
+            1,
+            "exactly one local site entry"
+        );
     }
 
     fn preflight_site(name: &str, endpoint: &str, deployment_id: &str, bucket_count: usize) -> SiteReplicationAddPreflightInfo {
