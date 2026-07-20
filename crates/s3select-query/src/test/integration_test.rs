@@ -15,6 +15,7 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::{create_fresh_db, get_global_db, instance::make_rustfsms};
+    use datafusion::arrow::array::{Array, StringArray};
     use rustfs_s3select_api::{
         QueryError,
         query::{Context, Query},
@@ -189,21 +190,104 @@ mod integration_tests {
             .expect("CSV query should return one batch")
             .column(0)
             .as_any()
-            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .downcast_ref::<StringArray>()
             .expect("CSV column should use UTF-8 string values");
 
         assert_eq!(salaries.value(0), "05000");
     }
 
     #[tokio::test]
-    async fn test_select_with_where_clause() {
-        let sql = "SELECT name, age FROM S3Object WHERE CAST(age AS INT) > 30";
-        let input = create_test_input(sql);
-        let db = get_global_db(input.clone(), true).await.unwrap();
-        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+    async fn test_csv_header_modes_keep_positional_string_columns() {
+        for (header, expected) in [
+            (FileHeaderInfo::IGNORE, ["05000", "6000"]),
+            (FileHeaderInfo::NONE, ["salary", "05000"]),
+        ] {
+            let sql = "SELECT _5 FROM S3Object LIMIT 2";
+            let mut input = create_test_input(sql);
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("CSV input should be configured")
+                .file_header_info = Some(FileHeaderInfo::from_static(header));
+            let db = get_global_db(input.clone(), true).await.expect("create CSV test database");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+            let batches = db
+                .execute(&query)
+                .await
+                .expect("execute positional CSV query")
+                .result()
+                .chunk_result()
+                .await
+                .expect("collect positional CSV query output");
 
-        let result = db.execute(&query).await;
-        assert!(result.is_ok());
+            let values = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("positional CSV column should use UTF-8 strings");
+                    (0..column.len()).map(|row| column.value(row).to_string()).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                values,
+                expected.map(|value| value.to_string()),
+                "unexpected values for FileHeaderInfo={header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_csv_numeric_comparison_with_and_without_cast() {
+        for sql in [
+            "SELECT name, age FROM S3Object WHERE age > 30",
+            "SELECT name, age FROM S3Object WHERE CAST(age AS INT) > 30",
+        ] {
+            let input = create_test_input(sql);
+            let db = get_global_db(input.clone(), true).await.expect("create CSV test database");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+            let batches = db
+                .execute(&query)
+                .await
+                .expect("execute CSV numeric comparison")
+                .result()
+                .chunk_result()
+                .await
+                .expect("collect CSV numeric comparison output");
+
+            let mut rows = Vec::new();
+            for batch in &batches {
+                let names = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("CSV name column should use UTF-8 strings");
+                let ages = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("CSV age column should use UTF-8 strings");
+                for row in 0..batch.num_rows() {
+                    rows.push((names.value(row).to_string(), ages.value(row).to_string()));
+                }
+            }
+
+            assert_eq!(
+                rows,
+                [
+                    ("Charlie".to_string(), "35".to_string()),
+                    ("Frank".to_string(), "40".to_string()),
+                    ("Henry".to_string(), "32".to_string()),
+                    ("Jack".to_string(), "38".to_string()),
+                ],
+                "unexpected rows for query: {sql}"
+            );
+        }
     }
 
     #[tokio::test]

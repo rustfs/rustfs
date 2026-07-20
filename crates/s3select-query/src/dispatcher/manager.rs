@@ -22,7 +22,7 @@ use std::{
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
-        datatypes::{DataType, Schema, SchemaRef},
+        datatypes::{Schema, SchemaRef},
         record_batch::RecordBatch,
     },
     datasource::{
@@ -180,6 +180,7 @@ impl SimpleQueryDispatcher {
                 let mut need_rename_volume_name = false;
                 let mut need_ignore_volume_name = false;
                 let mut file_format = CsvFormat::default()
+                    .with_schema_infer_max_rec(0)
                     .with_comment(
                         csv.comments
                             .clone()
@@ -245,16 +246,6 @@ impl SimpleQueryDispatcher {
             };
 
         let resolve_schema = listing_options.infer_schema(session.inner(), &table_path).await?;
-        let resolve_schema = if self.input.request.input_serialization.csv.is_some() {
-            let fields = resolve_schema
-                .fields()
-                .iter()
-                .map(|field| field.deref().clone().with_data_type(DataType::Utf8))
-                .collect::<Vec<_>>();
-            Arc::new(Schema::new(fields).with_metadata(resolve_schema.metadata().clone()))
-        } else {
-            resolve_schema
-        };
         let config = if need_rename_volume_name {
             let mut new_fields = Vec::new();
             for (i, field) in resolve_schema.fields().iter().enumerate() {

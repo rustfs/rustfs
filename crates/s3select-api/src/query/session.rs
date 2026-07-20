@@ -105,17 +105,17 @@ impl SessionCtxFactory {
                    {\"id\":10,\"name\":\"Jack\",\"age\":38,\"department\":\"Finance\",\"salary\":7500}\n"
                     .to_vec()
             } else {
-                b"id,name,age,department,salary
-                1,Alice,25,HR,05000
-                2,Bob,30,IT,6000
-                3,Charlie,35,Finance,7000
-                4,Diana,22,Marketing,4500
-                5,Eve,28,IT,5500
-                6,Frank,40,Finance,8000
-                7,Grace,26,HR,5200
-                8,Henry,32,IT,6200
-                9,Ivy,24,Marketing,4800
-                10,Jack,38,Finance,7500"
+                b"id,name,age,department,salary\n\
+                  1,Alice,25,HR,05000\n\
+                  2,Bob,30,IT,6000\n\
+                  3,Charlie,35,Finance,7000\n\
+                  4,Diana,22,Marketing,4500\n\
+                  5,Eve,28,IT,5500\n\
+                  6,Frank,40,Finance,8000\n\
+                  7,Grace,26,HR,5200\n\
+                  8,Henry,32,IT,6200\n\
+                  9,Ivy,24,Marketing,4800\n\
+                  10,Jack,38,Finance,7500"
                     .to_vec()
             };
 
