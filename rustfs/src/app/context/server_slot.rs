@@ -34,6 +34,7 @@ use std::sync::{Arc, OnceLock};
 #[derive(Default)]
 pub struct ServerContextSlot {
     app_context: OnceLock<Arc<AppContext>>,
+    heal_topology_fingerprint: Arc<tokio::sync::OnceCell<String>>,
 }
 
 // Manual Debug: AppContext is not Debug, so summarize installation state.
@@ -41,6 +42,7 @@ impl std::fmt::Debug for ServerContextSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerContextSlot")
             .field("app_context_installed", &self.app_context.get().is_some())
+            .field("heal_topology_fingerprint_initialized", &self.heal_topology_fingerprint.get().is_some())
             .finish()
     }
 }
@@ -49,6 +51,7 @@ impl ServerContextSlot {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             app_context: OnceLock::new(),
+            heal_topology_fingerprint: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -69,11 +72,16 @@ impl ServerContextSlot {
     pub fn object_store(&self) -> Option<Arc<ECStore>> {
         self.app_context().map(|context| context.object_store())
     }
+
+    pub fn heal_topology_fingerprint(&self) -> Arc<tokio::sync::OnceCell<String>> {
+        Arc::clone(&self.heal_topology_fingerprint)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ServerContextSlot, get_global_app_context};
+    use std::sync::Arc;
 
     // Before anything is installed — and with no global AppContext in this
     // process (nextest runs each test in its own process) — resolution yields
@@ -84,5 +92,13 @@ mod tests {
         let slot = ServerContextSlot::new();
         assert_eq!(slot.app_context().is_some(), get_global_app_context().is_some());
         assert_eq!(slot.object_store().is_some(), get_global_app_context().is_some());
+    }
+
+    #[test]
+    fn heal_topology_cache_is_owned_by_each_server_slot() {
+        let first = ServerContextSlot::new();
+        let second = ServerContextSlot::new();
+
+        assert!(!Arc::ptr_eq(&first.heal_topology_fingerprint(), &second.heal_topology_fingerprint()));
     }
 }

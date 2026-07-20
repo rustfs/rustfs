@@ -385,7 +385,8 @@ pub mod rpc {
         SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers,
         gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
         node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
-        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
+        sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature,
     };
 }
 

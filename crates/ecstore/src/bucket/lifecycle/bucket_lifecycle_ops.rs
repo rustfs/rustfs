@@ -4339,6 +4339,43 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn queue_transition_task_dedupes_immediate_and_scanner_sources_for_same_version() {
+        let state = TransitionState::new_with_capacity(4);
+        let version_id = Uuid::new_v4();
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        let immediate = state.queue_transition_task(&object, &event, &LcEventSrc::S3PutObject).await;
+        let scanner = state.queue_transition_task(&object, &event, &LcEventSrc::Scanner).await;
+
+        assert!(immediate, "immediate transition enqueue must succeed");
+        assert!(scanner, "scanner duplicate is reported handled while already queued");
+        assert_eq!(
+            state.transition_rx.len(),
+            1,
+            "immediate transition plus scanner/backfill duplicate must queue one task"
+        );
+
+        let next_version = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            ..object
+        };
+        let queued_next_version = state.queue_transition_task(&next_version, &event, &LcEventSrc::Scanner).await;
+
+        assert!(queued_next_version, "a different version of the same object must enqueue independently");
+        assert_eq!(state.transition_rx.len(), 2, "deduplication must be scoped to the exact object version");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn transition_state_init_honors_runtime_configured_worker_count() {
         let (_paths, ecstore) = setup_test_env().await;
         let transition_state = runtime_sources::transition_state_handle();
