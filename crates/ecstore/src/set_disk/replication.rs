@@ -54,6 +54,7 @@ impl SetDisks {
             return Ok(());
         }
         let expected = RestoreCleanupIdentity::from_object_info(obj_info);
+        let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
         let expected_etag = obj_info
             .etag
             .clone()
@@ -76,17 +77,37 @@ impl SetDisks {
         let (mut fi, _, disks) = self
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
             .await?;
+        if let Some(expected_operation_id) = expected_operation_id {
+            match restore_operation_id_from_metadata(&fi.metadata)? {
+                Some(actual_operation_id) if actual_operation_id == expected_operation_id => {}
+                _ => return Ok(()),
+            }
+        }
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Ok(());
         }
         fi.metadata.remove(X_AMZ_RESTORE.as_str());
         fi.metadata.remove(AMZ_RESTORE_EXPIRY_DAYS);
         fi.metadata.remove(AMZ_RESTORE_REQUEST_DATE);
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+        );
         if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
             return Err(Error::other("restore cleanup lock lost before metadata update".to_string()));
         }
         self.invalidate_get_object_metadata_cache(bucket, object).await;
-        self.update_object_meta(bucket, object, fi, disks.as_slice()).await?;
+        self.update_object_meta_with_opts(
+            bucket,
+            object,
+            fi,
+            disks.as_slice(),
+            &UpdateMetadataOpts {
+                replace_user_metadata: true,
+                ..Default::default()
+            },
+        )
+        .await?;
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         Ok(())
     }
