@@ -78,6 +78,7 @@ pub mod capacity;
 pub mod cluster_snapshot;
 pub mod config;
 pub mod delete_tail_activity;
+pub mod diagnose;
 pub mod embedded;
 pub mod error;
 pub mod init;

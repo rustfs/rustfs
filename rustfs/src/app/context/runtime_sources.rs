@@ -25,7 +25,6 @@ use super::super::storage_api::context::runtime::{
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
-use rustfs_iam::oidc::OidcSys;
 use rustfs_io_metrics::{
     PerformanceMetrics,
     global_metrics::get_global_metrics,
@@ -62,10 +61,6 @@ pub fn set_outbound_tls_generation(generation: u64) {
 
 pub async fn outbound_tls_state() -> GlobalPublishedOutboundTlsState {
     load_global_outbound_tls_state().await
-}
-
-pub fn oidc_handle() -> Option<Arc<OidcSys>> {
-    rustfs_iam::get_oidc()
 }
 
 pub fn token_signing_key() -> Option<String> {

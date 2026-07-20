@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_app_context, current_object_store_handle_for_context, current_oidc_handle, current_server_config_for_context,
+    current_app_context, current_federated_identity_service, current_object_store_handle_for_context,
+    current_server_config_for_context,
 };
+use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
@@ -32,6 +33,7 @@ use rustfs_config::oidc::{
 };
 use rustfs_config::server_config::Config as ServerConfig;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_RUSTFS_BROWSER_REDIRECT_URL, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::egress::validate_outbound_url;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -53,6 +55,24 @@ const CONSOLE_OIDC_CALLBACK_SUFFIX: &str = "/auth/oidc-callback/";
 const CONSOLE_LOGIN_SUFFIX: &str = "/auth/login";
 const OIDC_STATE_LB_HINT: &str =
     "check load balancer session affinity for OIDC authorize/callback requests or configure RUSTFS_BROWSER_REDIRECT_URL";
+
+fn callback_federation_error(error: FederationError) -> S3Error {
+    match error {
+        FederationError::CodeExchange(message) => {
+            S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {message}"))
+        }
+        FederationError::Logout(message) => {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("logout session creation failed: {message}"))
+        }
+        FederationError::Binding(FederatedSessionBindingError::InvalidRequest(message)) => {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, message)
+        }
+        FederationError::Binding(FederatedSessionBindingError::Internal(message)) => {
+            S3Error::with_message(S3ErrorCode::InternalError, message)
+        }
+        other => S3Error::with_message(S3ErrorCode::InternalError, other.to_string()),
+    }
+}
 
 /// Validate that a provider ID contains only safe characters (alphanumeric, underscore, hyphen).
 fn is_valid_provider_id(id: &str) -> bool {
@@ -274,9 +294,9 @@ pub struct ListOidcProvidersHandler {}
 #[async_trait::async_trait]
 impl Operation for ListOidcProvidersHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
-        let providers = oidc_sys.list_visible_providers();
+        let providers = federation.list_visible_providers();
         let json_body = serde_json::to_vec(&providers)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
 
@@ -445,7 +465,7 @@ impl Operation for OidcAuthorizeHandler {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
         }
 
-        let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         // Derive the callback redirect URI from the request
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
@@ -454,7 +474,7 @@ impl Operation for OidcAuthorizeHandler {
         let redirect_after = extract_safe_redirect_after(&req.uri)?;
         let redirect_after_log = redirect_after.clone();
 
-        let auth_url = oidc_sys
+        let auth_url = federation
             .authorize_url(provider_id, &redirect_uri, redirect_after)
             .await
             .map_err(|e| {
@@ -535,35 +555,40 @@ impl Operation for OidcCallbackHandler {
         let state =
             extract_query_param(&req.uri, "state").ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
 
-        let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
-        // Exchange authorization code for tokens and extract claims
-        let (claims, actual_provider_id, session, id_token) =
-            oidc_sys.exchange_code(&state, &code, &redirect_uri).await.map_err(|e| {
-                let lb_hint = if is_invalid_oidc_state_error(&e) {
-                    OIDC_STATE_LB_HINT
-                } else {
-                    ""
-                };
-                error!(
-                    event = EVENT_ADMIN_OIDC_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_OIDC,
-                    result = "code_exchange_failed",
-                    requested_provider_id = %provider_id,
-                    redirect_uri = %redirect_uri,
-                    code = %code,
-                    state = %state,
-                    code_len = code.len(),
-                    state_len = state.len(),
-                    error = %e,
-                    lb_hint = %lb_hint,
-                    "admin oidc state"
-                );
-                S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
+        let login = federation
+            .complete_authorization_code(&state, &code, &redirect_uri, 3600, &DefaultFederatedSessionBinding)
+            .await
+            .map_err(|error| {
+                if let FederationError::CodeExchange(message) = &error {
+                    let lb_hint = if is_invalid_oidc_state_error(message) {
+                        OIDC_STATE_LB_HINT
+                    } else {
+                        ""
+                    };
+                    error!(
+                        event = EVENT_ADMIN_OIDC_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "code_exchange_failed",
+                        requested_provider_id = %provider_id,
+                        redirect_uri = %redirect_uri,
+                        code = %code,
+                        state = %state,
+                        code_len = code.len(),
+                        state_len = state.len(),
+                        error = %message,
+                        lb_hint = %lb_hint,
+                        "admin oidc state"
+                    );
+                }
+                callback_federation_error(error)
             })?;
+        let authorization = &login.session.authorization;
+        let actual_provider_id = &authorization.provider_id;
 
         debug!(
             event = EVENT_ADMIN_OIDC_STATE,
@@ -574,32 +599,20 @@ impl Operation for OidcCallbackHandler {
             "admin oidc state"
         );
 
-        // Map claims to policies and groups
-        let (policies, groups) = oidc_sys.map_claims_to_policies(&actual_provider_id, &claims);
-
         debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %actual_provider_id,
-            policy_count = policies.len(),
-            group_count = groups.len(),
-            policies = ?policies,
-            groups = ?groups,
+            policy_count = authorization.policies.len(),
+            group_count = authorization.groups.len(),
+            policies = ?authorization.policies,
+            groups = ?authorization.groups,
             state = "claims_mapped",
             "admin oidc state"
         );
 
-        // Generate STS credentials using the shared helper.
-        // Console/OIDC sessions use a fixed 1-hour duration as a security/UX choice.
-        // Longer-lived credentials (15 min to 12 hours) can be requested via CLI/SDK
-        // through AssumeRoleWithWebIdentity.
-        let new_cred = create_oidc_sts_credentials(&claims, &actual_provider_id, &policies, &groups, 3600, None).await?;
-
-        let logout_token = oidc_sys
-            .create_logout_token(&actual_provider_id, &id_token)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("logout session creation failed: {e}")))?;
+        let new_cred = &login.session.credentials;
 
         // Build redirect URL to console with credentials in the fragment
         let console_redirect = build_console_redirect(
@@ -608,8 +621,8 @@ impl Operation for OidcCallbackHandler {
             &new_cred.secret_key,
             &new_cred.session_token,
             new_cred.expiration,
-            session.redirect_after.as_deref(),
-            Some(logout_token.as_str()),
+            login.redirect_after.as_deref(),
+            Some(login.logout_token.as_str()),
         )?;
 
         let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
@@ -636,8 +649,8 @@ impl Operation for OidcLogoutHandler {
             return redirect_response(&fallback_location);
         };
 
-        let location = match current_oidc_handle() {
-            Some(oidc_sys) => match oidc_sys.build_logout_url(&logout_token, &fallback_location).await {
+        let location = match current_federated_identity_service() {
+            Some(federation) => match federation.build_logout_url(&logout_token, &fallback_location).await {
                 Ok(Some(url)) => url,
                 Ok(None) => fallback_location.clone(),
                 Err(err) => {
@@ -664,8 +677,8 @@ impl Operation for OidcLogoutHandler {
 /// from request headers. For production deployments behind a reverse proxy, configuring
 /// an explicit redirect_uri is recommended to prevent header manipulation.
 fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<String> {
-    if let Some(oidc_sys) = current_oidc_handle()
-        && let Some(config) = oidc_sys.get_provider_config(provider_id)
+    if let Some(federation) = current_federated_identity_service()
+        && let Some(config) = federation.get_provider_config(provider_id)
     {
         return derive_callback_uri_with_provider_config(req, provider_id, Some(config));
     }
@@ -1324,6 +1337,38 @@ mod tests {
         assert_eq!(extract_query_param(&uri, "code"), Some("abc123".to_string()));
         assert_eq!(extract_query_param(&uri, "state"), Some("xyz789".to_string()));
         assert_eq!(extract_query_param(&uri, "missing"), None);
+    }
+
+    #[test]
+    fn callback_errors_preserve_existing_s3_semantics() {
+        let cases = [
+            (
+                FederationError::CodeExchange("invalid state".to_string()),
+                S3ErrorCode::AccessDenied,
+                "code exchange failed: invalid state",
+            ),
+            (
+                FederationError::Logout("session unavailable".to_string()),
+                S3ErrorCode::InternalError,
+                "logout session creation failed: session unavailable",
+            ),
+            (
+                FederationError::Binding(FederatedSessionBindingError::InvalidRequest("invalid policy".to_string())),
+                S3ErrorCode::InvalidRequest,
+                "invalid policy",
+            ),
+            (
+                FederationError::Binding(FederatedSessionBindingError::Internal("failed to store temp user".to_string())),
+                S3ErrorCode::InternalError,
+                "failed to store temp user",
+            ),
+        ];
+
+        for (error, expected_code, expected_message) in cases {
+            let error = callback_federation_error(error);
+            assert_eq!(error.code(), &expected_code);
+            assert_eq!(error.message(), Some(expected_message));
+        }
     }
 
     #[test]

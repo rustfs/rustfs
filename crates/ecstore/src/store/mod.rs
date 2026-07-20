@@ -158,6 +158,7 @@ mod list;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
+pub use object::PreparedGetObjectReader;
 mod peer;
 mod rebalance;
 pub(crate) mod utils;
@@ -268,7 +269,7 @@ impl ECStore {
 
     /// Get the tier config manager
     pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::services::tier::tier::TierConfigMgr>> {
-        runtime_sources::global_tier_config_mgr()
+        self.ctx.tier_config_mgr()
     }
 
     /// Get the server configuration
@@ -322,6 +323,10 @@ impl ECStore {
     /// Whether this instance uses single-drive erasure coding.
     pub async fn setup_is_erasure_sd(&self) -> bool {
         self.ctx.is_erasure_sd().await
+    }
+
+    pub fn scanner_namespace_mutation_generation(&self) -> u64 {
+        list_objects::scanner_namespace_mutation_generation()
     }
 }
 
@@ -441,7 +446,11 @@ impl BucketOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        self.handle_make_bucket(bucket, opts).await
+        let result = self.handle_make_bucket(bucket, opts).await;
+        if result.is_ok() {
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
+        }
+        result
     }
 
     #[instrument(skip(self))]
@@ -454,7 +463,11 @@ impl BucketOperations for ECStore {
     }
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
-        self.handle_delete_bucket(bucket, opts).await
+        let result = self.handle_delete_bucket(bucket, opts).await;
+        if result.is_ok() {
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
+        }
+        result
     }
 }
 

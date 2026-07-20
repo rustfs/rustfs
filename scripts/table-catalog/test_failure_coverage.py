@@ -132,7 +132,11 @@ class FailureCoverageTest(unittest.TestCase):
 
         migration_steps = {step["name"]: step for step in phases["migration-preflight"]["steps"]}
         self.assertEqual(migration_steps["durable-backing-migration-dry-run"]["path"], "/iceberg/v1/lake/catalog/migration")
-        self.assertEqual(migration_steps["durable-backing-migration-dry-run"]["expected_behavior"], "migration blockers must be empty before cutover")
+        self.assertEqual(migration_steps["durable-backing-migration-materialize"]["method"], "POST")
+        self.assertIn(
+            "READY_TO_SNAPSHOT",
+            migration_steps["durable-backing-migration-dry-run"]["expected_behavior"],
+        )
 
         validation_steps = {step["name"]: step for step in phases["post-recovery-validation"]["steps"]}
         self.assertEqual(validation_steps["load-table-after-recovery"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders")
@@ -202,6 +206,7 @@ class FailureCoverageTest(unittest.TestCase):
 
         cutover_steps = {step["name"]: step for step in phases["durable-backing-cutover-under-load"]["steps"]}
         self.assertEqual(cutover_steps["migration-dry-run-before-cutover"]["path"], "/iceberg/v1/lake/catalog/migration")
+        self.assertEqual(cutover_steps["materialize-durable-backing-before-cutover"]["method"], "POST")
         self.assertIn("catalog-backup", cutover_steps["capture-cutover-backup"]["expected_behavior"])
 
         recovery_steps = {step["name"]: step for step in phases["recovery-rollback-import-under-load"]["steps"]}

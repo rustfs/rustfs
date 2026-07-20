@@ -38,6 +38,7 @@ pub const SUFFIX_TRANSITION_STATUS: &str = "transition-status";
 pub const SUFFIX_TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const SUFFIX_TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
+pub const SUFFIX_TRANSITION_TIER_DESTINATION_ID: &str = "transition-tier-destination-id";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
 pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";
@@ -173,6 +174,28 @@ pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+fn get_consistent_value<'a, V: AsRef<[u8]>>(map: &'a HashMap<String, V>, suffix: &str) -> Option<&'a V> {
+    let (rustfs_key, minio_key) = both_keys(suffix);
+    let mut value = None;
+    for (key, candidate) in map {
+        if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
+            continue;
+        }
+        if candidate.as_ref().is_empty() || value.is_some_and(|current: &V| current.as_ref() != candidate.as_ref()) {
+            return None;
+        }
+        value = Some(candidate);
+    }
+    value
+}
+
+/// Returns a non-empty value when every compatibility key present for `suffix` agrees.
+/// A single RustFS or MinIO key is accepted for backward compatibility; conflicting or empty
+/// values return `None` so callers at destructive boundaries can fail closed.
+pub fn get_consistent_str<'a>(map: &'a HashMap<String, String>, suffix: &str) -> Option<&'a str> {
+    get_consistent_value(map, suffix).map(String::as_str)
+}
+
 pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
     if with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.contains_key(k1)) {
         return true;
@@ -204,6 +227,11 @@ pub fn insert_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str, value: Vec
 pub fn get_bytes(map: &HashMap<String, Vec<u8>>, suffix: &str) -> Option<Vec<u8>> {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.get(k1).cloned())
         .or_else(|| with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.get(k2).cloned()))
+}
+
+/// Byte-valued counterpart of [`get_consistent_str`].
+pub fn get_consistent_bytes<'a>(map: &'a HashMap<String, Vec<u8>>, suffix: &str) -> Option<&'a [u8]> {
+    get_consistent_value(map, suffix).map(Vec::as_slice)
 }
 
 pub fn contains_key_bytes(map: &HashMap<String, Vec<u8>>, suffix: &str) -> bool {
@@ -269,6 +297,43 @@ mod tests {
         ]);
 
         assert_eq!(get_str(&metadata, SUFFIX_TRANSITION_TIER).as_deref(), Some("rustfs-tier"));
+    }
+
+    #[test]
+    fn test_consistent_str_accepts_single_or_matching_values_and_rejects_conflicts() {
+        let rustfs_key = internal_key_rustfs(SUFFIX_TRANSITION_TIER_DESTINATION_ID);
+        let minio_key = format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}");
+        let mut metadata = HashMap::from([(rustfs_key, "identity-a".to_string())]);
+        assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), Some("identity-a"));
+
+        metadata.insert(minio_key, "identity-a".to_string());
+        assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), Some("identity-a"));
+
+        metadata.insert(
+            format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}"),
+            "identity-b".to_string(),
+        );
+        assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), None);
+    }
+
+    #[test]
+    fn test_consistent_bytes_accepts_single_or_matching_values_and_rejects_conflicts() {
+        let rustfs_key = internal_key_rustfs(SUFFIX_TRANSITION_TIER_DESTINATION_ID);
+        let minio_key = format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}");
+        let mut metadata = HashMap::from([(rustfs_key, b"identity-a".to_vec())]);
+        assert_eq!(
+            get_consistent_bytes(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID),
+            Some(b"identity-a".as_slice())
+        );
+
+        metadata.insert(minio_key.clone(), b"identity-a".to_vec());
+        assert_eq!(
+            get_consistent_bytes(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID),
+            Some(b"identity-a".as_slice())
+        );
+
+        metadata.insert(minio_key, b"identity-b".to_vec());
+        assert_eq!(get_consistent_bytes(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), None);
     }
 
     #[test]

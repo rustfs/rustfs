@@ -83,6 +83,10 @@ mod security_boundary_test;
 #[cfg(test)]
 mod api_rate_limit_test;
 
+// Opt-in global connection cap on the main listener (backlog#1191 follow-up)
+#[cfg(test)]
+mod connection_cap_test;
+
 // Admin authorization gate: non-admin denial + root-credential lifecycle (backlog#1151 sec-4)
 #[cfg(test)]
 mod admin_auth_test;
@@ -185,6 +189,9 @@ mod copy_object_metadata_test;
 
 #[cfg(test)]
 mod copy_object_version_restore_test;
+
+#[cfg(test)]
+mod copy_object_checksum_test;
 
 // S3 dummy-compat bucket API tests
 #[cfg(test)]

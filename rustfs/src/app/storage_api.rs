@@ -51,28 +51,17 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
     }
 
-    pub(crate) async fn load_data_usage_from_backend(
+    pub(crate) async fn load_data_usage_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend(store).await
+        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend_cached(store).await
     }
 
-    pub(crate) async fn refresh_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
-        bucket_name: &str,
-    ) -> Result<rustfs_data_usage::BucketUsageInfo, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::refresh_bucket_usage_from_object_layer(
-            store,
-            data_usage_info,
-            bucket_name,
-        )
-        .await
-    }
-
-    pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
-        crate::storage::storage_api::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
-    }
+    // Test-only observables for the rustfs/backlog#1306 revert detector.
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::{
+        compute_bucket_usage, live_bucket_usage_computations, store_data_usage_in_backend,
+    };
 
     pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
         crate::storage::storage_api::ecstore_data_usage::record_bucket_object_delete_memory(
@@ -149,7 +138,7 @@ pub(crate) mod runtime {
     // The mock (and the tier types it used to need) now live in ecstore behind
     // the `test-util` feature.
     #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_tier::test_util::{MockWarmBackend, register_mock_tier};
+    pub(crate) use crate::storage::storage_api::ecstore_tier::test_util::{MockWarmBackend, MockWarmOp, register_mock_tier};
 
     pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
         crate::storage::storage_api::ecstore_config::set_global_storage_class(cfg);
@@ -401,6 +390,13 @@ pub(crate) mod bucket {
         pub(crate) mod tier_delete_journal {
             use std::sync::Arc;
 
+            pub(crate) fn record_tier_delete_journal_backend_identity(
+                je: &mut super::tier_sweeper::Jentry,
+                metadata: &std::collections::HashMap<String, String>,
+            ) -> std::io::Result<()> {
+                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_delete_journal::record_tier_delete_journal_backend_identity(je, metadata)
+            }
+
             pub(crate) async fn persist_tier_delete_journal_entry(
                 api: Arc<crate::storage::storage_api::ECStore>,
                 je: &super::tier_sweeper::Jentry,
@@ -484,7 +480,7 @@ pub(crate) mod bucket {
             bucket: &str,
             config_file: &str,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::delete(bucket, config_file).await
+            crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
         }
 
         pub(crate) async fn get_bucket_policy(
@@ -562,7 +558,7 @@ pub(crate) mod bucket {
             config_file: &str,
             data: Vec<u8>,
         ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::update(bucket, config_file, data).await
+            crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
         }
     }
 
@@ -936,10 +932,6 @@ pub(crate) mod s3_api {
 
 pub(crate) mod admin_usecase {
     pub(crate) mod contract {
-        pub(crate) mod bucket {
-            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
-        }
-
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
     }
 
@@ -968,6 +960,16 @@ pub(crate) mod bucket_usecase {
 }
 
 pub(crate) mod object_usecase {
+    pub(crate) mod object_cache {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_object::GetObjectBodySource;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_object::lookup_get_object_body_cache_hook;
+        pub(crate) use crate::storage::storage_api::ecstore_object::{
+            GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len,
+        };
+    }
+
     pub(crate) mod contract {
         #[cfg(test)]
         pub(crate) mod http {
@@ -992,12 +994,12 @@ pub(crate) mod object_usecase {
         object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
     pub(crate) use crate::storage::storage_api::{
-        ECStore, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo, StorageObjectLockDeleteOptions,
-        StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions, get_validated_store,
-        has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
-        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
-        validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-        wrap_response_with_cors,
+        ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
+        StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
+        get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
+        parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,
+        validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write,
+        validate_ssec_for_read, wrap_response_with_cors,
     };
 }
 
@@ -1073,7 +1075,7 @@ pub(crate) mod test {
         }
     }
 
-    pub(crate) use super::{bucket, ecfs, object_utils, runtime};
+    pub(crate) use super::{bucket, data_usage, ecfs, object_utils, runtime};
     pub(crate) use crate::storage::storage_api::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
     };

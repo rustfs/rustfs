@@ -163,12 +163,13 @@ impl SetDisks {
 
                         let erasure = if !latest_meta.deleted && !latest_meta.is_remote() {
                             // Initialize erasure coding; use legacy mode for old-version files
-                            coding::Erasure::new_with_options(
+                            coding::Erasure::try_new_with_options(
                                 latest_meta.erasure.data_blocks,
                                 latest_meta.erasure.parity_blocks,
                                 latest_meta.erasure.block_size,
                                 latest_meta.uses_legacy_checksum,
                             )
+                            .map_err(DiskError::from)?
                         } else {
                             coding::Erasure::default()
                         };
@@ -770,7 +771,7 @@ impl SetDisks {
         // A surviving valid, non-deleted, non-remote data FileInfo to rebuild from.
         let Some(surviving) = parts_metadata
             .iter()
-            .find(|fi| fi.is_valid() && !fi.deleted && !fi.is_remote())
+            .find(|fi| fi.has_valid_erasure_geometry() && !fi.deleted && !fi.is_remote())
             .cloned()
         else {
             return Ok(false);
@@ -1012,7 +1013,13 @@ impl SetDisks {
             ..Default::default()
         };
 
-        if lfi.is_valid() {
+        // Report the object's own parity only when it actually carries erasure
+        // geometry; delete markers and geometry-less versions fall back to the
+        // pool default. Uses `has_valid_erasure_geometry()` (not `is_valid()`)
+        // to stay in step with the rest of the metadata-predicate migration —
+        // `is_valid()` now requires full payload validation and returns `false`
+        // for delete markers, which would misreport their parity here.
+        if lfi.has_valid_erasure_geometry() {
             result.parity_blocks = lfi.erasure.parity_blocks;
         } else {
             result.parity_blocks = self.default_parity_count;
