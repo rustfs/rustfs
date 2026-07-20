@@ -2319,7 +2319,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn peer_rest_heal_control_uses_production_auth_and_stays_online_when_disabled() {
+    async fn peer_rest_heal_control_uses_production_auth_and_keeps_validation_errors_online() {
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
@@ -2376,11 +2376,11 @@ mod tests {
 
         for _ in 0..2 {
             let error = client
-                .heal_control(1, "fingerprint".to_string(), b"query".to_vec())
+                .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, "fingerprint".to_string(), b"query".to_vec())
                 .await
-                .expect_err("dormant heal control must report disabled");
+                .expect_err("a divergent topology must fail closed");
             let message = error.to_string();
-            assert!(message.contains("routing is not enabled"));
+            assert!(message.contains("topology does not match"));
             assert!(!message.contains("temporarily offline"));
         }
         client
@@ -2395,16 +2395,21 @@ mod tests {
         assert!(mismatch.to_string().contains("topology does not match"));
         assert!(!mismatch.to_string().contains("temporarily offline"));
 
-        let unsupported = client
-            .heal_control(
-                rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION + 1,
-                fingerprint.clone(),
-                rustfs_protos::heal_control_capability_probe(&[9; 16]),
-            )
-            .await
-            .expect_err("an unsupported protocol version must fail closed");
-        assert!(unsupported.to_string().contains("unsupported heal control protocol version"));
-        assert!(!unsupported.to_string().contains("temporarily offline"));
+        for unsupported_version in [
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION - 1,
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION + 1,
+        ] {
+            let unsupported = client
+                .heal_control(
+                    unsupported_version,
+                    fingerprint.clone(),
+                    rustfs_protos::heal_control_capability_probe(&[9; 16]),
+                )
+                .await
+                .expect_err("an unsupported protocol version must fail closed");
+            assert!(unsupported.to_string().contains("unsupported heal control protocol version"));
+            assert!(!unsupported.to_string().contains("temporarily offline"));
+        }
 
         client
             .probe_heal_control(fingerprint)

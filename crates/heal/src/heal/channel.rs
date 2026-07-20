@@ -34,6 +34,7 @@ const LOG_SUBSYSTEM_CHANNEL: &str = "channel";
 const EVENT_HEAL_CHANNEL_STATE: &str = "heal_channel_state";
 const EVENT_HEAL_CHANNEL_REQUEST: &str = "heal_channel_request";
 const EVENT_HEAL_CHANNEL_RESPONSE: &str = "heal_channel_response";
+const MAX_HEAL_STATUS_PAYLOAD_SIZE: usize = 8 * 1024 * 1024;
 
 fn admission_response(request_id: String, admission: HealAdmissionResult) -> HealChannelResponse {
     let (success, error) = match admission {
@@ -61,11 +62,56 @@ pub struct HealChannelProcessor {
 }
 
 #[derive(Serialize)]
-struct HealTaskStatusPayload {
-    summary: String,
-    items: Vec<HealResultItem>,
+struct HealTaskStatusPayload<'a> {
+    summary: &'a str,
+    items: &'a [HealResultItem],
+    truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    progress: Option<HealProgress>,
+    progress: Option<&'a HealProgress>,
+}
+
+fn encode_heal_task_status_payload(
+    summary: &str,
+    mut items: Vec<HealResultItem>,
+    progress: Option<&HealProgress>,
+    mut truncated: bool,
+) -> Result<(Vec<u8>, bool)> {
+    loop {
+        let data = serde_json::to_vec(&HealTaskStatusPayload {
+            summary,
+            items: &items,
+            truncated,
+            progress,
+        })
+        .map_err(|e| Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
+        if data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE {
+            return Ok((data, truncated));
+        }
+        if items.is_empty() {
+            return Err(Error::Serialization("heal task status metadata exceeds size limit".to_string()));
+        }
+        truncated = true;
+        items.truncate(items.len() / 2);
+    }
+}
+
+fn heal_status_detail(detail: Option<String>, truncated: bool) -> Option<String> {
+    if !truncated {
+        return detail;
+    }
+    let truncation = "heal result items were truncated";
+    Some(detail.map_or_else(|| truncation.to_string(), |detail| format!("{detail}; {truncation}")))
+}
+
+fn encode_heal_status_response(
+    summary: &str,
+    items: Vec<HealResultItem>,
+    progress: Option<&HealProgress>,
+    detail: Option<String>,
+    truncated: bool,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let (data, truncated) = encode_heal_task_status_payload(summary, items, progress, truncated)?;
+    Ok((data, heal_status_detail(detail, truncated)))
 }
 
 impl HealChannelProcessor {
@@ -77,6 +123,37 @@ impl HealChannelProcessor {
             response_sender: response_tx,
             response_receiver: response_rx,
         }
+    }
+
+    /// Execute a start directly against the manager without entering the
+    /// process-global unbounded command queue.
+    pub async fn execute_start_request(&self, request: HealChannelRequest) -> Result<HealAdmissionReceipt> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.process_start_request(request, false, true, response_tx).await?;
+        response_rx
+            .await
+            .map_err(|err| Error::other(format!("heal receipt channel closed: {err}")))?
+            .map_err(Error::other)
+    }
+
+    /// Execute a token query directly against the manager.
+    pub async fn execute_query_request(&self, heal_path: String, client_token: String) -> Result<HealChannelResponse> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.process_query_request(heal_path, client_token, response_tx).await?;
+        response_rx
+            .await
+            .map_err(|err| Error::other(format!("heal query channel closed: {err}")))?
+            .map_err(Error::other)
+    }
+
+    /// Execute cancellation directly against the manager.
+    pub async fn execute_cancel_request(&self, heal_path: String, client_token: String) -> Result<HealChannelResponse> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.process_cancel_request(heal_path, client_token, response_tx).await?;
+        response_rx
+            .await
+            .map_err(|err| Error::other(format!("heal cancel channel closed: {err}")))?
+            .map_err(Error::other)
     }
 
     /// Start processing legacy heal channel requests.
@@ -326,46 +403,66 @@ impl HealChannelProcessor {
             self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await
         };
 
-        let (summary, detail, items, progress) = match report {
+        let (summary, detail, items, truncated, progress) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
                 result_items,
+                result_items_truncated,
                 progress,
-            }) => ("running".to_string(), None, result_items, progress),
+            }) => ("running".to_string(), None, result_items, result_items_truncated, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Retrying { error, retry_attempt },
                 result_items,
+                result_items_truncated,
                 progress,
             }) => (
                 "running".to_string(),
                 Some(format!("heal task retrying after recoverable failure, attempt {retry_attempt}: {error}")),
                 result_items,
+                result_items_truncated,
                 progress,
             ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Completed,
                 result_items,
+                result_items_truncated,
                 progress,
-            }) => ("finished".to_string(), None, result_items, progress),
+            }) => ("finished".to_string(), None, result_items, result_items_truncated, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Cancelled,
                 result_items,
+                result_items_truncated,
                 progress,
-            }) => ("stopped".to_string(), Some("heal task cancelled".to_string()), result_items, progress),
+            }) => (
+                "stopped".to_string(),
+                Some("heal task cancelled".to_string()),
+                result_items,
+                result_items_truncated,
+                progress,
+            ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Timeout,
                 result_items,
+                result_items_truncated,
                 progress,
-            }) => ("stopped".to_string(), Some("heal task timed out".to_string()), result_items, progress),
+            }) => (
+                "stopped".to_string(),
+                Some("heal task timed out".to_string()),
+                result_items,
+                result_items_truncated,
+                progress,
+            ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Failed { error },
                 result_items,
+                result_items_truncated,
                 progress,
-            }) => ("stopped".to_string(), Some(error), result_items, progress),
+            }) => ("stopped".to_string(), Some(error), result_items, result_items_truncated, progress),
             Err(crate::Error::TaskNotFound { .. }) => (
                 "notFound".to_string(),
                 Some("heal task not found or expired".to_string()),
                 Vec::new(),
+                false,
                 None,
             ),
             Err(crate::Error::InvalidClientToken) => {
@@ -393,12 +490,7 @@ impl HealChannelProcessor {
             }
         };
 
-        let data = serde_json::to_vec(&HealTaskStatusPayload {
-            summary,
-            items,
-            progress,
-        })
-        .map_err(|e| crate::Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
+        let (data, detail) = encode_heal_status_response(&summary, items, progress.as_ref(), detail, truncated)?;
 
         let response = HealChannelResponse {
             request_id: client_token,
@@ -695,6 +787,22 @@ mod tests {
         // Verify processor is created successfully
         let _sender = processor.get_response_sender();
         // If we can get the sender, processor was created correctly
+    }
+
+    #[test]
+    fn oversized_status_items_are_truncated_before_transport() {
+        let items = vec![HealResultItem {
+            detail: "x".repeat(MAX_HEAL_STATUS_PAYLOAD_SIZE + 1),
+            ..Default::default()
+        }];
+
+        let (data, detail) = encode_heal_status_response("running", items, None, None, false).unwrap();
+
+        assert!(data.len() <= MAX_HEAL_STATUS_PAYLOAD_SIZE);
+        let payload: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(payload["truncated"], true);
+        assert!(payload["items"].as_array().unwrap().is_empty());
+        assert_eq!(detail.as_deref(), Some("heal result items were truncated"));
     }
 
     #[test]
@@ -1337,6 +1445,70 @@ mod tests {
             .expect("receipt processor should stop when channels close")
             .expect("receipt processor task should join")
             .expect("receipt processor should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn direct_control_execution_preserves_target_dedup_and_token_ownership() {
+        let manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(manager);
+        let original_id = uuid::Uuid::new_v4().to_string();
+        let request = HealChannelRequest {
+            id: original_id.clone(),
+            bucket: "bucket-a".to_string(),
+            object_prefix: Some("object".to_string()),
+            priority: HealChannelPriority::High,
+            source: HealRequestSource::Admin,
+            ..Default::default()
+        };
+
+        let accepted = processor
+            .execute_start_request(request.clone())
+            .await
+            .expect("first direct start should be admitted");
+        assert_eq!(accepted.result, HealAdmissionResult::Accepted);
+        assert_eq!(accepted.task_id, original_id);
+
+        let mut duplicate = request;
+        duplicate.id = uuid::Uuid::new_v4().to_string();
+        let merged = processor
+            .execute_start_request(duplicate)
+            .await
+            .expect("duplicate direct start should merge");
+        assert_eq!(merged.result, HealAdmissionResult::Merged);
+        assert_eq!(merged.task_id, accepted.task_id);
+
+        let other = processor
+            .execute_start_request(HealChannelRequest {
+                id: uuid::Uuid::new_v4().to_string(),
+                bucket: "bucket-b".to_string(),
+                object_prefix: Some("object".to_string()),
+                priority: HealChannelPriority::High,
+                source: HealRequestSource::Admin,
+                ..Default::default()
+            })
+            .await
+            .expect("different target should be admitted independently");
+        assert_eq!(other.result, HealAdmissionResult::Accepted);
+        assert_ne!(other.task_id, accepted.task_id);
+
+        let status = processor
+            .execute_query_request(String::new(), accepted.task_id.clone())
+            .await
+            .expect("canonical token should be queryable");
+        assert!(status.success);
+        let cancelled = processor
+            .execute_cancel_request(String::new(), accepted.task_id.clone())
+            .await
+            .expect("canonical token should be cancellable");
+        assert!(cancelled.success);
+        let stopped = processor
+            .execute_query_request(String::new(), accepted.task_id)
+            .await
+            .expect("cancelled task status should remain queryable");
+        assert!(stopped.success);
+        assert_eq!(stopped.error.as_deref(), Some("heal task not found or expired"));
+        let status: serde_json::Value = serde_json::from_slice(stopped.data.as_deref().unwrap()).unwrap();
+        assert_eq!(status["summary"], "notFound");
     }
 
     #[tokio::test]

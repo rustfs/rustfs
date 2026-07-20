@@ -29,8 +29,10 @@ use std::{fmt, io::Cursor, io::Write};
 
 const ENVELOPE_VERSION: u8 = 1;
 pub const ENVELOPE_MAX_SIZE: usize = 64 * 1024;
+pub const RESULT_MAX_SIZE: usize = 16 * 1024 * 1024;
 pub const NONCE_SIZE: usize = 16;
 pub const MAX_LIFETIME_MS: i64 = 30_000;
+const MAX_CLOCK_SKEW_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestMetadata {
@@ -136,10 +138,49 @@ impl TryFrom<HealChannelRequest> for StartCommand {
     }
 }
 
+impl StartCommand {
+    fn into_channel_request(self, request_id: String) -> Result<HealChannelRequest, String> {
+        Ok(HealChannelRequest {
+            id: request_id,
+            disk: self.disk,
+            bucket: self.bucket,
+            object_prefix: self.object_prefix,
+            object_version_id: self.object_version_id,
+            force_start: self.force_start,
+            priority: self.priority.into(),
+            pool_index: self
+                .pool_index
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| "heal pool index exceeds platform range".to_string())?,
+            set_index: self
+                .set_index
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| "heal set index exceeds platform range".to_string())?,
+            scan_mode: self.scan_mode,
+            remove_corrupted: self.remove_corrupted,
+            recreate_missing: self.recreate_missing,
+            update_parity: self.update_parity,
+            recursive: self.recursive,
+            dry_run: self.dry_run,
+            timeout_seconds: self.timeout_seconds,
+            source: self.source,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Start { request: StartCommand },
+    Query { heal_path: String, client_token: String },
+    Cancel { heal_path: String, client_token: String },
+}
+
+#[derive(Debug)]
+pub enum ExecutableCommand {
+    Start { request: HealChannelRequest },
     Query { heal_path: String, client_token: String },
     Cancel { heal_path: String, client_token: String },
 }
@@ -214,12 +255,41 @@ impl Envelope {
         }
         match &self.command {
             Command::Start { .. } => {}
-            Command::Query { client_token, .. } | Command::Cancel { client_token, .. } if client_token.is_empty() => {
+            Command::Query { client_token, .. } if client_token.is_empty() => {
                 return Err("heal control client token is empty".to_string());
             }
             Command::Query { .. } | Command::Cancel { .. } => {}
         }
         Ok(())
+    }
+
+    pub fn validate_execution(&self, now_unix_ms: i64, expected_coordinator_epoch: u64) -> Result<(), String> {
+        self.validate()?;
+        if self.coordinator_epoch != expected_coordinator_epoch {
+            return Err("heal control coordinator epoch does not match".to_string());
+        }
+        if self.issued_at_unix_ms > now_unix_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
+            return Err("heal control request was issued in the future".to_string());
+        }
+        if self.expires_at_unix_ms <= now_unix_ms {
+            return Err("heal control request expired".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn into_execution(self) -> Result<(String, u64, ExecutableCommand), String> {
+        let command = match self.command {
+            Command::Start { request } => ExecutableCommand::Start {
+                request: request.into_channel_request(self.request_id.clone())?,
+            },
+            Command::Query { heal_path, client_token } => ExecutableCommand::Query { heal_path, client_token },
+            Command::Cancel { heal_path, client_token } => ExecutableCommand::Cancel { heal_path, client_token },
+        };
+        Ok((self.request_id, self.coordinator_epoch, command))
+    }
+
+    pub const fn expires_at_unix_ms(&self) -> i64 {
+        self.expires_at_unix_ms
     }
 }
 
@@ -249,6 +319,16 @@ impl Admission {
     pub const fn is_admitted(self) -> bool {
         matches!(self, Self::Accepted | Self::Merged)
     }
+
+    pub const fn into_heal_admission_result(self) -> HealAdmissionResult {
+        match self {
+            Self::Accepted => HealAdmissionResult::Accepted,
+            Self::Merged => HealAdmissionResult::Merged,
+            Self::Full => HealAdmissionResult::Full,
+            Self::DroppedQueueFull => HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull),
+            Self::DroppedPolicy => HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,20 +354,20 @@ impl<'de> Visitor<'de> for BoundedBytesVisitor {
     type Value = BoundedBytes;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "at most {ENVELOPE_MAX_SIZE} bytes")
+        write!(formatter, "at most {RESULT_MAX_SIZE} bytes")
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
     where
         A: SeqAccess<'de>,
     {
-        if sequence.size_hint().is_some_and(|length| length > ENVELOPE_MAX_SIZE) {
+        if sequence.size_hint().is_some_and(|length| length > RESULT_MAX_SIZE) {
             return Err(serde::de::Error::custom("heal control response data exceeds size limit"));
         }
 
         let mut bytes = Vec::new();
         while let Some(byte) = sequence.next_element()? {
-            if bytes.len() == ENVELOPE_MAX_SIZE {
+            if bytes.len() == RESULT_MAX_SIZE {
                 return Err(serde::de::Error::custom("heal control response data exceeds size limit"));
             }
             bytes.push(byte);
@@ -359,13 +439,6 @@ impl ResultEnvelope {
         match &self.outcome {
             Outcome::Start { task_id, .. } => validate_uuid(task_id, "result task")?,
             Outcome::Channel {
-                success: true,
-                error: Some(_),
-                ..
-            } => {
-                return Err("successful heal control result contains an error".to_string());
-            }
-            Outcome::Channel {
                 success: false,
                 error: None,
                 ..
@@ -390,6 +463,17 @@ impl ResultEnvelope {
         }
         Ok(())
     }
+
+    pub fn into_outcome(self, expected_request_id: &str, expected_epoch: u64) -> Result<Outcome, String> {
+        self.validate()?;
+        if self.request_id != expected_request_id {
+            return Err("heal control result request ID does not match".to_string());
+        }
+        if self.coordinator_epoch != expected_epoch {
+            return Err("heal control result coordinator epoch does not match".to_string());
+        }
+        Ok(self.outcome)
+    }
 }
 
 fn validate_uuid(value: &str, field: &str) -> Result<(), String> {
@@ -400,8 +484,8 @@ fn validate_uuid(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(data: &[u8], value_name: &str) -> Result<T, String> {
-    if data.len() > ENVELOPE_MAX_SIZE {
+fn decode<T: for<'de> Deserialize<'de>>(data: &[u8], value_name: &str, max_size: usize) -> Result<T, String> {
+    if data.len() > max_size {
         return Err(format!("{value_name} exceeds size limit"));
     }
     let mut deserializer = Deserializer::new(Cursor::new(data));
@@ -414,35 +498,36 @@ fn decode<T: for<'de> Deserialize<'de>>(data: &[u8], value_name: &str) -> Result
 
 pub fn encode_envelope(envelope: &Envelope) -> Result<Vec<u8>, String> {
     envelope.validate()?;
-    encode_bounded(envelope, "heal control envelope")
+    encode_bounded(envelope, "heal control envelope", ENVELOPE_MAX_SIZE)
 }
 
 pub fn decode_envelope(data: &[u8]) -> Result<Envelope, String> {
-    let envelope: Envelope = decode(data, "heal control envelope")?;
+    let envelope: Envelope = decode(data, "heal control envelope", ENVELOPE_MAX_SIZE)?;
     envelope.validate()?;
     Ok(envelope)
 }
 
 pub fn encode_result(result: &ResultEnvelope) -> Result<Vec<u8>, String> {
     result.validate()?;
-    encode_bounded(result, "heal control result")
+    encode_bounded(result, "heal control result", RESULT_MAX_SIZE)
 }
 
 pub fn decode_result(data: &[u8]) -> Result<ResultEnvelope, String> {
-    let result: ResultEnvelope = decode(data, "heal control result")?;
+    let result: ResultEnvelope = decode(data, "heal control result", RESULT_MAX_SIZE)?;
     result.validate()?;
     Ok(result)
 }
 
-fn encode_bounded(value: &impl Serialize, value_name: &str) -> Result<Vec<u8>, String> {
+fn encode_bounded(value: &impl Serialize, value_name: &str, max_size: usize) -> Result<Vec<u8>, String> {
     struct BoundedWriter {
         bytes: Vec<u8>,
         exceeded: bool,
+        max_size: usize,
     }
 
     impl Write for BoundedWriter {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            let remaining = ENVELOPE_MAX_SIZE.saturating_sub(self.bytes.len());
+            let remaining = self.max_size.saturating_sub(self.bytes.len());
             if data.len() > remaining {
                 self.exceeded = true;
                 return Err(std::io::Error::other("heal control value exceeds size limit"));
@@ -459,6 +544,7 @@ fn encode_bounded(value: &impl Serialize, value_name: &str) -> Result<Vec<u8>, S
     let mut writer = BoundedWriter {
         bytes: Vec::with_capacity(1024),
         exceeded: false,
+        max_size,
     };
     let result = value.serialize(&mut rmp_serde::Serializer::new(&mut writer).with_struct_map());
     if writer.exceeded {
@@ -471,7 +557,8 @@ fn encode_bounded(value: &impl Serialize, value_name: &str) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, ENVELOPE_MAX_SIZE, Envelope, Outcome, RequestMetadata, ResultEnvelope, decode_envelope, decode_result,
+        Admission, ENVELOPE_MAX_SIZE, Envelope, Outcome, RESULT_MAX_SIZE, RequestMetadata, ResultEnvelope, decode_envelope,
+        decode_result, encode_result,
     };
     use rustfs_common::heal_channel::{HealChannelRequest, HealChannelResponse, HealRequestSource};
     use serde::de::{DeserializeSeed, SeqAccess, Visitor, value::Error as ValueError};
@@ -640,11 +727,7 @@ mod tests {
         assert!(Envelope::start(test_request(request_id.clone()), metadata(1, 0)).is_err());
         assert!(Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 1_000, 31_001, 7),).is_err());
         assert!(Envelope::query(request_id.clone(), metadata(1, 7), String::new(), String::new()).is_err());
-        assert!(
-            Envelope::cancel(request_id.clone(), metadata(1, 7), String::new(), String::new())
-                .unwrap_err()
-                .contains("token is empty")
-        );
+        assert!(Envelope::cancel(request_id.clone(), metadata(1, 7), String::new(), String::new()).is_ok());
 
         let mut noncanonical_request = test_request(request_id.to_uppercase());
         assert!(Envelope::start(noncanonical_request.clone(), metadata(1, 7)).is_err());
@@ -689,6 +772,15 @@ mod tests {
         let unknown = rmp_serde::to_vec_named(&unknown).unwrap();
         assert!(decode_envelope(&unknown).unwrap_err().contains("unknown field"));
 
+        let executable =
+            Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 10_000, 20_000, 7)).unwrap();
+        assert!(executable.validate_execution(15_000, 7).is_ok());
+        assert!(executable.validate_execution(20_000, 7).unwrap_err().contains("expired"));
+        assert!(executable.validate_execution(4_999, 7).unwrap_err().contains("future"));
+        let wrong_epoch =
+            Envelope::start(test_request(request_id.clone()), RequestMetadata::new([1; 16], 10_000, 20_000, 8)).unwrap();
+        assert!(wrong_epoch.validate_execution(15_000, 7).unwrap_err().contains("epoch"));
+
         assert!(
             ResultEnvelope::channel(
                 uuid::Uuid::new_v4().to_string(),
@@ -711,11 +803,25 @@ mod tests {
                 Outcome::Channel {
                     success: true,
                     data: None,
-                    error: Some("unexpected".to_string()),
+                    error: Some("status detail".to_string()),
                 },
             )
-            .is_err()
+            .is_ok()
         );
+
+        let large_result = ResultEnvelope::new(
+            request_id.clone(),
+            7,
+            Outcome::Channel {
+                success: true,
+                data: Some(vec![7; ENVELOPE_MAX_SIZE + 1]),
+                error: None,
+            },
+        )
+        .unwrap();
+        let large_result = encode_result(&large_result).expect("status results may exceed the request envelope limit");
+        assert!(large_result.len() > ENVELOPE_MAX_SIZE);
+        assert!(decode_result(&large_result).is_ok());
         assert!(
             ResultEnvelope::new(
                 request_id.clone(),
@@ -823,7 +929,7 @@ mod tests {
             }
 
             fn size_hint(&self) -> Option<usize> {
-                Some(ENVELOPE_MAX_SIZE + 1)
+                Some(RESULT_MAX_SIZE + 1)
             }
         }
 

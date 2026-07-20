@@ -1114,6 +1114,8 @@ pub struct HealControlResponse {
     pub result: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "3")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub response_proof: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetMetacacheListingRequest {
