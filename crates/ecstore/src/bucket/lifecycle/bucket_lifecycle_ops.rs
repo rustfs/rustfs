@@ -2682,6 +2682,7 @@ pub async fn put_restore_opts(
     for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
     }
+    rustfs_utils::http::metadata_compat::remove_str(&mut meta, rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID);
     if !oi.user_tags.is_empty() {
         meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }

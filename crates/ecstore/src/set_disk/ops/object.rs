@@ -3108,6 +3108,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let (actual_fi, _, _) = fi?;
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        if let Some(expected_operation_id) = restore_operation_id_from_metadata(&opts.user_defined)? {
+            require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
+        }
         let mut ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
         // The restore copy-back re-writes this same object via put_object /
         // new_multipart_upload / complete_multipart_upload, each of which takes
@@ -4098,6 +4101,141 @@ mod transition_commit_failure_tests {
         assert_eq!(
             body, replacement_payload,
             "stale restore cleanup must not make the old remote body current again"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_restore_cleanup_ignores_replaced_operation_id_with_same_identity() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-operation-id-bucket";
+        let object = "object.bin";
+        let payload = b"same identity restore cleanup must respect operation id".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_a = Uuid::new_v4();
+        let operation_b = Uuid::new_v4();
+        let mut metadata = HashMap::new();
+        metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
+        metadata.insert(rustfs_utils::http::headers::AMZ_RESTORE_EXPIRY_DAYS.to_string(), "1".to_string());
+        metadata.insert(
+            rustfs_utils::http::headers::AMZ_RESTORE_REQUEST_DATE.to_string(),
+            "2026-07-20T00:00:00Z".to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_a.to_string(),
+        );
+
+        let mut reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    user_defined: metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object with restore operation A should be written");
+        let stale_operation_a = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation A metadata should resolve");
+
+        let mut operation_b_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut operation_b_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_b_metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("same-identity restore operation B should replace A");
+
+        let mut expected_operation_a = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut expected_operation_a,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_a.to_string(),
+        );
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &stale_operation_a,
+                &ObjectOptions {
+                    user_defined: expected_operation_a,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stale operation A cleanup should no-op, not fail");
+        let current_operation_b = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain readable");
+        assert!(
+            current_operation_b
+                .user_defined
+                .contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "stale cleanup for operation A must not remove operation B's restore header"
+        );
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current_operation_b.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale cleanup for operation A must not remove or rewrite operation B"
+        );
+
+        let mut expected_operation_b = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut expected_operation_b,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &current_operation_b,
+                &ObjectOptions {
+                    user_defined: expected_operation_b,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B cleanup should remove restore markers");
+        let cleaned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cleaned object metadata should remain readable");
+        assert!(
+            !cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "matching cleanup must remove the restore header"
+        );
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                cleaned.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            )
+            .is_none(),
+            "matching cleanup must remove the restore operation id"
         );
     }
 
