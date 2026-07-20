@@ -43,7 +43,7 @@ crc-fast = { workspace = true }
 pin-project-lite.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bytes = { workspace = true, features = ["serde"] }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy", "stream"] }
+reqwest = { workspace = true, features = ["stream"] }
 rustls-pki-types.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 faster-hex.workspace = true

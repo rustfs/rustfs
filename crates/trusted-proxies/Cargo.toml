@@ -31,7 +31,7 @@ http = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 moka = { workspace = true, features = ["future", "sync"] }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "json"] }
+reqwest = { workspace = true, features = ["json"] }
 rustfs-config = { workspace = true }
 rustfs-utils = { workspace = true, features = ["net"] }
 serde = { workspace = true, features = ["derive"] }
