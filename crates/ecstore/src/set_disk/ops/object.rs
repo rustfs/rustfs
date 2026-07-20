@@ -4653,6 +4653,55 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn cancelled_after_remote_upload_cleans_candidate_and_preserves_source() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-cancel-after-upload-bucket";
+        let object = "object.bin";
+        let payload = b"cancelled transition after upload must clean remote candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let barrier = TransitionCommitBarrier::install(bucket, object);
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move {
+            transition_set
+                .transition_object(bucket, object, &transition_options(&original, tier_name))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        assert_eq!(
+            backend.put_count().await,
+            1,
+            "transition must upload a remote candidate before the cancellation point"
+        );
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should expose one remote candidate/version");
+        assert_eq!(backend.object_count().await, 1, "remote candidate should be visible before cancellation");
+
+        transition.abort();
+        let join = transition
+            .await
+            .expect_err("aborted transition task should report cancellation");
+        assert!(join.is_cancelled(), "transition task should be cancelled, not panic");
+        drop(barrier);
+
+        assert!(
+            backend
+                .wait_for_remote_absence(&put_versions[0].0, Duration::from_secs(5))
+                .await,
+            "cancellation cleanup must remove the uploaded remote candidate"
+        );
+        assert_eq!(
+            backend.remove_versions().await,
+            put_versions,
+            "cancellation cleanup must target the exact remote version returned by PUT"
+        );
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn real_bitrot_producer_failures_do_not_commit_transition() {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
