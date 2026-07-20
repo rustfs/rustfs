@@ -2112,6 +2112,21 @@ fn build_join_peers(
     normalize_peer_map_by_identity(peers)
 }
 
+/// Promote each peer's persisted `sync_state` from `Unknown` to `Enable` once site
+/// replication has been established for it. The persisted value is a static
+/// "configured & enabled" signal so that the `replicate info` endpoint (and the
+/// console, which read the persisted peer map verbatim) do not report `Unknown` for a
+/// healthy peer. `build_status_info` still refines this to `Disable`/`Unknown` from
+/// live health signals at query time for the `replicate status` endpoint. A peer that
+/// has been explicitly marked `Disable` is left untouched.
+fn mark_peers_sync_enabled(peers: &mut BTreeMap<String, PeerInfo>) {
+    for peer in peers.values_mut() {
+        if peer.sync_state == SyncStatus::Unknown {
+            peer.sync_state = SyncStatus::Enable;
+        }
+    }
+}
+
 fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String, PeerInfo>) -> BTreeMap<String, PeerInfo> {
     let mut normalized = BTreeMap::new();
 
@@ -2726,6 +2741,17 @@ async fn bootstrap_existing_metadata_after_add(
     }
 
     errors
+}
+
+/// Combine the metadata-bootstrap and object-back-fill failure lists into the single
+/// `initial_sync_error_message` surfaced by `mc admin replicate add`, so an operator can
+/// see exactly which buckets did not propagate instead of receiving an unqualified success.
+fn compose_initial_sync_error_message(bootstrap_errors: Vec<String>, backfill_errors: Vec<String>) -> String {
+    bootstrap_errors
+        .into_iter()
+        .chain(backfill_errors)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
@@ -5366,11 +5392,18 @@ pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) ->
 
 /// Fix 1: after persisting a new site-replication state (add or join), enumerate every bucket
 /// that already exists locally, wire up versioning + targets + replication config for each, and
-/// kick a resync toward every remote peer so pre-existing objects back-fill. Errors are logged
-/// but never abort the caller — the admin can run a manual resync if needed.
-async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo, bootstrap_token: Option<&str>) {
+/// kick a resync toward every remote peer so pre-existing objects back-fill. Returns a list of
+/// human-readable per-bucket failure messages (empty on full success) so the caller can surface
+/// them to the operator instead of silently reporting success; a failure never aborts the caller.
+async fn backfill_existing_buckets_after_add(
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    bootstrap_token: Option<&str>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
     let Some(store) = current_object_store_handle() else {
-        return;
+        errors.push("object store not initialized; pre-existing buckets were not backfilled".to_string());
+        return errors;
     };
     let buckets = match store.list_bucket(&BucketOptions::default()).await {
         Ok(b) => b,
@@ -5383,7 +5416,8 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 error = ?err,
                 "admin site replication state"
             );
-            return;
+            errors.push(format!("list buckets failed: {}", summarize_peer_error_detail(&err.to_string())));
+            return errors;
         }
     };
 
@@ -5401,18 +5435,41 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 error = ?err,
                 "admin site replication state"
             );
+            errors.push(format!(
+                "{name}: versioning setup failed: {}",
+                summarize_peer_error_detail(&err.to_string())
+            ));
             continue;
         }
-        if let Err(err) = ensure_site_replication_bucket_setup(name).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_bucket_setup_failed",
-                error = ?err,
-                "admin site replication state"
-            );
+        match ensure_site_replication_bucket_setup(name).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Runtime targets unavailable: the setup silently no-ops, which would make the
+                // downstream make-bucket broadcast and resync fail. Record it and skip so the
+                // operator sees this bucket was not propagated instead of an unqualified success.
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    result = "backfill_bucket_setup_skipped",
+                    "admin site replication state"
+                );
+                errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    result = "backfill_bucket_setup_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                errors.push(format!("{name}: bucket setup failed: {}", summarize_peer_error_detail(&err.to_string())));
+            }
         }
         // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
         // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
@@ -5443,6 +5500,10 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 error = ?err,
                 "admin site replication state"
             );
+            errors.push(format!(
+                "{name}: make-bucket broadcast failed: {}",
+                summarize_peer_error_detail(&err.to_string())
+            ));
         }
         // Kick a resync toward every remote peer so existing objects travel across.
         for peer in state.peers.values() {
@@ -5461,9 +5522,15 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                     detail = %result.err_detail,
                     "admin site replication state"
                 );
+                errors.push(format!(
+                    "{name} -> {}: resync kick failed: {}",
+                    peer.endpoint,
+                    summarize_peer_error_detail(&result.err_detail)
+                ));
             }
         }
     }
+    errors
 }
 
 async fn refresh_bucket_targets_after_service_account_rotation() {
@@ -6188,18 +6255,22 @@ impl Operation for SiteReplicationAddHandler {
             })?;
         }
 
+        // BUG1: persist a real sync_state so `mc admin replicate info` and the console report
+        // Enable for healthy peers instead of Unknown. build_status_info still refines this from
+        // live health for the `replicate status` endpoint.
+        mark_peers_sync_enabled(&mut state.peers);
         persist_site_replication_state(&state).await?;
         let bootstrap_errors = bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await;
 
         // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
-        // are not silently left out of replication. Failures are logged but do not abort
-        // the overall add operation — the admin can trigger a manual resync if needed.
-        backfill_existing_buckets_after_add(&state, &local_peer, None).await;
+        // are not silently left out of replication. Per-bucket failures are surfaced in the add
+        // response below (BUG2) rather than swallowed; they do not abort the overall add.
+        let backfill_errors = backfill_existing_buckets_after_add(&state, &local_peer, None).await;
 
         json_response(&ReplicateAddStatus {
             success: true,
             status: SITE_REPL_ADD_SUCCESS.to_string(),
-            initial_sync_error_message: bootstrap_errors.join("; "),
+            initial_sync_error_message: compose_initial_sync_error_message(bootstrap_errors, backfill_errors),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         })
@@ -6497,6 +6568,9 @@ impl Operation for SRPeerJoinHandler {
         state.service_account_parent = join_req.svc_acct_parent;
         state.updated_at = join_req.updated_at.or_else(|| Some(OffsetDateTime::now_utc()));
         state.peers = normalize_join_peers_for_local(&local_peer, join_req.peers);
+        // BUG1: persist Enable on the joining side too, so its `replicate info` endpoint reports a
+        // real sync state rather than Unknown.
+        mark_peers_sync_enabled(&mut state.peers);
         state.name = state
             .peers
             .get(&local_peer.deployment_id)
@@ -6505,8 +6579,19 @@ impl Operation for SRPeerJoinHandler {
             .unwrap_or_else(|| local_peer.name.clone());
         persist_site_replication_state(&state).await?;
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
-        // buckets it already owns so the reverse direction works from the start.
-        backfill_existing_buckets_after_add(&state, &local_peer, bootstrap_token.as_deref()).await;
+        // buckets it already owns so the reverse direction works from the start. Per-bucket
+        // failures are logged (BUG2) so a reverse-direction back-fill gap is observable.
+        let backfill_errors = backfill_existing_buckets_after_add(&state, &local_peer, bootstrap_token.as_deref()).await;
+        if !backfill_errors.is_empty() {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "join_backfill_incomplete",
+                errors = %backfill_errors.join("; "),
+                "admin site replication state"
+            );
+        }
         json_response(&SRPeerJoinResponse {
             peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
         })
@@ -10916,6 +11001,78 @@ mod tests {
             (1, true),
             "config only on one of two sites → mismatch"
         );
+    }
+
+    // BUG1: peers persisted on add/join must carry a real sync_state (Enable), not Unknown,
+    // so `mc admin replicate info` and the console show the correct state for healthy peers.
+    #[test]
+    fn test_added_peers_persist_enable_sync_state() {
+        let local = peer("local", "https://local.example.com");
+        let sites = vec![PeerSite {
+            name: "remote".to_string(),
+            endpoint: "https://remote.example.com".to_string(),
+            ..Default::default()
+        }];
+        let mut peers = build_join_peers(&SiteReplicationState::default(), &local, sites, false);
+        // Construction defaults every peer to Unknown — the pre-fix behavior that made
+        // `replicate info` render a blank/Unknown Sync column.
+        assert!(
+            peers.values().all(|p| p.sync_state == SyncStatus::Unknown),
+            "freshly constructed peers default to Unknown"
+        );
+        mark_peers_sync_enabled(&mut peers);
+        assert!(
+            !peers.is_empty() && peers.values().all(|p| p.sync_state == SyncStatus::Enable),
+            "add/join must persist Enable so the info endpoint reports a real sync state"
+        );
+    }
+
+    // BUG1: an explicit Disable is a meaningful state and must survive the Unknown -> Enable promotion.
+    #[test]
+    fn test_mark_peers_sync_enabled_preserves_disable() {
+        let mut peers = BTreeMap::new();
+        peers.insert(
+            "a".to_string(),
+            PeerInfo {
+                deployment_id: "a".to_string(),
+                sync_state: SyncStatus::Unknown,
+                ..peer("a", "https://a.example.com")
+            },
+        );
+        peers.insert(
+            "b".to_string(),
+            PeerInfo {
+                deployment_id: "b".to_string(),
+                sync_state: SyncStatus::Disable,
+                ..peer("b", "https://b.example.com")
+            },
+        );
+        mark_peers_sync_enabled(&mut peers);
+        assert_eq!(peers["a"].sync_state, SyncStatus::Enable, "Unknown must be promoted to Enable");
+        assert_eq!(peers["b"].sync_state, SyncStatus::Disable, "explicit Disable must be preserved");
+    }
+
+    // BUG2: pre-existing-bucket back-fill failures must be surfaced in the add response's
+    // initial_sync_error_message, not swallowed behind an unqualified success.
+    #[test]
+    fn test_initial_sync_error_message_surfaces_backfill_failures() {
+        let bootstrap_errors = vec!["peer-x: metadata sync failed".to_string()];
+        let backfill_errors = vec![
+            "test78787: replication setup skipped (site replication runtime unavailable)".to_string(),
+            "test78787 -> https://peer.example.com: resync kick failed: timeout".to_string(),
+        ];
+        let msg = compose_initial_sync_error_message(bootstrap_errors, backfill_errors);
+        assert!(msg.contains("peer-x: metadata sync failed"), "bootstrap errors must be surfaced");
+        assert!(
+            msg.contains("test78787: replication setup skipped"),
+            "a back-fill setup-skip must be surfaced so a dropped bucket is visible"
+        );
+        assert!(msg.contains("resync kick failed"), "resync kick failures must be surfaced");
+    }
+
+    #[test]
+    fn test_compose_initial_sync_error_message_empty_on_success() {
+        assert_eq!(compose_initial_sync_error_message(Vec::new(), Vec::new()), "");
     }
 
     // Fix 5: remove --all must purge local state unconditionally even when peer errors occur
