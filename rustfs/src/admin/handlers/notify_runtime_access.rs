@@ -12,16 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::server::init_event_notifier;
 use rustfs_config::server_config::Config;
 use s3s::{S3Result, s3_error};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
-pub(crate) fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
+static NOTIFICATION_SYSTEM_INIT_LOCK: Mutex<()> = Mutex::const_new(());
+
+pub(crate) async fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
+    if let Some(system) = rustfs_notify::notification_system() {
+        return Ok(system);
+    }
+
+    let _guard = NOTIFICATION_SYSTEM_INIT_LOCK.lock().await;
+    if let Some(system) = rustfs_notify::notification_system() {
+        return Ok(system);
+    }
+
+    init_event_notifier().await;
     rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))
 }
 
 pub(crate) async fn load_notification_config_snapshot() -> S3Result<(Arc<rustfs_notify::NotificationSystem>, Config)> {
-    let system = get_notification_system()?;
+    let system = get_notification_system().await?;
     let config = system.config.read().await.clone();
     Ok((system, config))
 }
@@ -31,7 +45,7 @@ pub(crate) async fn set_notification_target_config(
     target_name: &str,
     kvs: rustfs_config::server_config::KVS,
 ) -> S3Result<()> {
-    let system = get_notification_system()?;
+    let system = get_notification_system().await?;
     system
         .set_target_config(subsystem, target_name, kvs)
         .await
@@ -39,7 +53,7 @@ pub(crate) async fn set_notification_target_config(
 }
 
 pub(crate) async fn remove_notification_target_config(subsystem: &str, target_name: &str) -> S3Result<()> {
-    let system = get_notification_system()?;
+    let system = get_notification_system().await?;
     system
         .remove_target_config(subsystem, target_name)
         .await

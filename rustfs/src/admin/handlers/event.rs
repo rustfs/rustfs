@@ -371,7 +371,7 @@ impl Operation for ListTargetsArns {
             log_notification_target_operation_blocked!("list_target_arns", None, None, &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
-        let ns = get_notification_system()?;
+        let ns = get_notification_system().await?;
 
         let region = req.region.clone().ok_or_else(|| {
             warn!(
