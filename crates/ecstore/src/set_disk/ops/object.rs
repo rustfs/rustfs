@@ -1464,7 +1464,7 @@ fn log_transition_upload_cleanup_failure(lease: &TierOperationLease, object: &st
 pub(crate) struct TransitionUploadCleanup {
     lease: TierOperationLease,
     object: String,
-    candidate: TransitionUploadCandidate,
+    candidate: Option<TransitionUploadCandidate>,
     cleanup_ctx: Arc<crate::runtime::instance::InstanceContext>,
     cleanup_api: Option<Arc<ECStore>>,
     armed: bool,
@@ -1474,29 +1474,31 @@ impl TransitionUploadCleanup {
     pub(crate) fn new(
         lease: TierOperationLease,
         object: &str,
-        candidate: TransitionUploadCandidate,
         cleanup_ctx: Arc<crate::runtime::instance::InstanceContext>,
     ) -> Self {
         Self {
             lease,
             object: object.to_string(),
-            candidate,
+            candidate: None,
             cleanup_ctx,
             cleanup_api: None,
             armed: true,
         }
     }
 
-    fn cleanup_version(&self) -> &str {
-        self.candidate.cleanup_version()
+    fn cleanup_candidate(&self) -> std::io::Result<&TransitionUploadCandidate> {
+        self.candidate
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("transition upload cleanup has no confirmed remote candidate"))
     }
 
     pub(crate) async fn cleanup(&mut self) -> std::io::Result<RemoteTierDeleteOutcome> {
+        let candidate = self.cleanup_candidate()?;
         let result = cleanup_uncommitted_transition_upload(
             &self.lease,
             &self.object,
-            self.cleanup_version(),
-            self.candidate.cleanup_version_is_exact(),
+            candidate.cleanup_version(),
+            candidate.cleanup_version_is_exact(),
         )
         .await;
         match result {
@@ -1505,7 +1507,7 @@ impl TransitionUploadCleanup {
                 Ok(outcome)
             }
             Err(err) => {
-                log_transition_upload_cleanup_failure(&self.lease, &self.object, self.cleanup_version(), &err);
+                log_transition_upload_cleanup_failure(&self.lease, &self.object, candidate.cleanup_version(), &err);
                 Err(err)
             }
         }
@@ -1513,11 +1515,12 @@ impl TransitionUploadCleanup {
 
     async fn cleanup_rejected_upload(&mut self, api: Option<Arc<ECStore>>) -> std::io::Result<()> {
         self.cleanup_api = api.clone();
+        let candidate = self.cleanup_candidate()?;
         let result = cleanup_rejected_transition_upload_durably(
             &self.lease,
             &self.object,
-            self.cleanup_version(),
-            self.candidate.cleanup_version_is_exact(),
+            candidate.cleanup_version(),
+            candidate.cleanup_version_is_exact(),
             api,
         )
         .await;
@@ -1537,6 +1540,9 @@ impl Drop for TransitionUploadCleanup {
         if !self.armed {
             return;
         }
+        let Some(candidate) = self.candidate.as_ref() else {
+            return;
+        };
         let lease = match self.lease.try_clone() {
             Ok(lease) => lease,
             Err(err) => {
@@ -1551,8 +1557,8 @@ impl Drop for TransitionUploadCleanup {
             }
         };
         let object = self.object.clone();
-        let cleanup_version = self.cleanup_version().to_string();
-        let version_id_exact = self.candidate.cleanup_version_is_exact();
+        let cleanup_version = candidate.cleanup_version().to_string();
+        let version_id_exact = candidate.cleanup_version_is_exact();
         let cleanup_api = self.cleanup_api.clone();
         let cleanup_ctx = self.cleanup_ctx.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1717,6 +1723,67 @@ async fn pause_transition_cleanup_store() {
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("transition cleanup store barrier mutex should not poison")
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TransitionUploadCandidateBarrier {
+    state: Arc<TransitionCleanupStoreBarrierState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static TRANSITION_UPLOAD_CANDIDATE_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<TransitionCleanupStoreBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl TransitionUploadCandidateBarrier {
+    fn install() -> Self {
+        let state = Arc::new(TransitionCleanupStoreBarrierState::default());
+        let mut slot = TRANSITION_UPLOAD_CANDIDATE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition upload candidate barrier mutex should not poison");
+        assert!(
+            slot.is_none(),
+            "transition upload candidate barrier must be installed by one test at a time"
+        );
+        *slot = Some(state.clone());
+        drop(slot);
+        Self { state }
+    }
+
+    async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("transition should record its remote upload candidate");
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TransitionUploadCandidateBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TRANSITION_UPLOAD_CANDIDATE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition upload candidate barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn pause_after_transition_upload_candidate_recorded() {
+    let barrier = TRANSITION_UPLOAD_CANDIDATE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition upload candidate barrier mutex should not poison")
         .take();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -3134,18 +3201,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Ok(writer.produced())
         };
 
-        let rv = complete_transition_upload(
-            tgt_client.put_with_meta(&dest_obj, reader, fi.size, transition_meta),
-            producer,
-            expected_size,
-            consumed,
-        )
-        .await;
+        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, self.ctx.clone());
+        let remote_upload = {
+            let lease = &upload_cleanup.lease;
+            let recorded_candidate = &mut upload_cleanup.candidate;
+            let remote_object = &dest_obj;
+            async move {
+                let remote_version = lease.put_with_meta(remote_object, reader, fi.size, transition_meta).await?;
+                *recorded_candidate = Some(TransitionUploadCandidate::from_put_response(remote_version.clone()));
+                #[cfg(all(test, feature = "test-util"))]
+                pause_after_transition_upload_candidate_recorded().await;
+                Ok(remote_version)
+            }
+        };
+        let rv = complete_transition_upload(remote_upload, producer, expected_size, consumed).await;
         let candidate = match rv {
             Ok(completion) => completion.candidate,
             Err(failure) => {
-                if let Some(candidate) = failure.candidate {
-                    let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate, self.ctx.clone());
+                if failure.candidate.is_some() {
                     let cleanup_api = transition_cleanup_store(&self.ctx).await;
                     if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
                         return Err(StorageError::Io(std::io::Error::other(format!(
@@ -3158,11 +3231,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
 
-        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate, self.ctx.clone());
-        if let Err(err) = upload_cleanup
-            .lease
-            .validate_remote_version_id(upload_cleanup.candidate.remote_version())
-        {
+        if let Err(err) = upload_cleanup.lease.validate_remote_version_id(candidate.remote_version()) {
             let cleanup_api = transition_cleanup_store(&self.ctx).await;
             if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
                 return Err(StorageError::Io(std::io::Error::other(format!(
@@ -3171,7 +3240,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
             return Err(err.into());
         }
-        let transition_version_id = match parse_transition_version_id(upload_cleanup.candidate.remote_version()) {
+        let transition_version_id = match parse_transition_version_id(candidate.remote_version()) {
             Ok(version_id) => version_id,
             Err(err) => {
                 let _cleanup_result = upload_cleanup.cleanup().await;
@@ -4938,6 +5007,48 @@ mod transition_upload_integrity_tests {
             put_versions,
             "cancellation cleanup must target the exact remote version returned by PUT"
         );
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_after_put_response_before_upload_join_cleans_candidate() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-cancel-before-upload-join-bucket";
+        let object = "object.bin";
+        let payload = b"a confirmed remote upload must survive cancellation until cleanup owns it".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let barrier = TransitionUploadCandidateBarrier::install();
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move {
+            transition_set
+                .transition_object(bucket, object, &transition_options(&original, tier_name))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "the remote PUT response must identify one cleanup candidate");
+        assert_eq!(backend.object_count().await, 1, "the candidate must exist at the cancellation point");
+
+        transition.abort();
+        assert!(
+            transition
+                .await
+                .expect_err("aborted transition task should report cancellation")
+                .is_cancelled()
+        );
+        drop(barrier);
+
+        assert!(
+            backend
+                .wait_for_remote_absence(&put_versions[0].0, Duration::from_secs(5))
+                .await,
+            "the pre-created cleanup guard must remove a candidate recorded before upload finalization completes"
+        );
+        assert_eq!(backend.remove_versions().await, put_versions);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 

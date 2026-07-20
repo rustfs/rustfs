@@ -400,16 +400,11 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
         }
     }
 
-    let d = d.ok_or_else(|| AdminError {
+    d.ok_or_else(|| AdminError {
         code: "XRustFSAdminTierInvalidConfig".to_string(),
         message: "Tier backend not initialized".to_string(),
         status_code: StatusCode::BAD_REQUEST,
-    })?;
-
-    if probe {
-        d.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
-    }
-    Ok(d)
+    })
 }
 
 #[cfg(test)]
@@ -420,6 +415,8 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    const PROBE_VERSION: &str = "remote-v2";
+
     struct RejectingValidationBackend {
         validations: Arc<AtomicUsize>,
         puts: Arc<AtomicUsize>,
@@ -429,6 +426,12 @@ mod tests {
     struct RejectingProbeVersionBackend {
         gets: Arc<AtomicUsize>,
         removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    struct RecordingProbeBackend {
+        get_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+        removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+        fail_get: bool,
     }
 
     #[async_trait::async_trait]
@@ -510,6 +513,41 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl WarmBackend for RecordingProbeBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            Ok(PROBE_VERSION.to_string())
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            self.get_versions.lock().await.push(rv.to_string());
+            if self.fail_get {
+                Err(std::io::Error::other("probe GET failed"))
+            } else {
+                Ok(ReadCloser::new(std::io::Cursor::new(Vec::new())))
+            }
+        }
+
+        async fn remove(&self, _object: &str, rv: &str) -> Result<(), std::io::Error> {
+            self.removed_versions.lock().await.push(rv.to_string());
+            Ok(())
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
     #[tokio::test]
     async fn check_warm_backend_validates_before_probe_io() {
         let validations = Arc::new(AtomicUsize::new(0));
@@ -565,6 +603,43 @@ mod tests {
         assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(gets.load(Ordering::SeqCst), 0);
         assert_eq!(removed_versions.lock().await.as_slice(), [uuid::Uuid::nil().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_forwards_probe_version_to_get_and_remove() {
+        let get_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
+            get_versions: get_versions.clone(),
+            removed_versions: removed_versions.clone(),
+            fail_get: false,
+        });
+
+        check_warm_backend(Some(&backend))
+            .await
+            .expect("a successful probe should validate, read, and remove its object");
+
+        assert_eq!(get_versions.lock().await.as_slice(), [PROBE_VERSION]);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_removes_probe_after_get_failure() {
+        let get_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
+            get_versions: get_versions.clone(),
+            removed_versions: removed_versions.clone(),
+            fail_get: true,
+        });
+
+        let err = check_warm_backend(Some(&backend))
+            .await
+            .expect_err("a failed probe GET should return a permission error after cleanup");
+
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert_eq!(get_versions.lock().await.as_slice(), [PROBE_VERSION]);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
     }
 
     #[test]
