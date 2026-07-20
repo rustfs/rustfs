@@ -33,7 +33,7 @@ use rustfs_policy::{
     format::Format,
     policy::{Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa},
 };
-use rustfs_utils::{MaskedAccessKey, get_env_opt_str, path::path_join_buf};
+use rustfs_utils::{get_env_opt_str, path::path_join_buf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU8, AtomicU64};
@@ -783,10 +783,14 @@ where
         }
 
         let cache = self.cache.snapshot();
-        if cache.users.contains_key(&cred.access_key) || cache.sts_accounts.contains_key(&cred.access_key) {
+        let users = Arc::clone(&cache.users);
+        if let Some(x) = users.get(&cred.access_key)
+            && x.credentials.is_service_account()
+        {
             return Err(Error::AccessKeyAlreadyExists);
         }
         drop(cache);
+        drop(users);
 
         let u = UserIdentity::new(cred);
 
@@ -1328,13 +1332,10 @@ where
 
     pub async fn add_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
         let cache = self.cache.snapshot();
-        if cache.sts_accounts.contains_key(access_key) {
-            return Err(Error::AccessKeyAlreadyExists);
-        }
         let users = Arc::clone(&cache.users);
         if let Some(x) = users.get(access_key) {
-            warn!(access_key = %MaskedAccessKey(access_key), "IAM user already exists");
-            if x.credentials.is_temp() || x.credentials.is_service_account() {
+            warn!(error = ?x, "IAM user already exists");
+            if x.credentials.is_temp() {
                 return Err(Error::AccessKeyAlreadyExists);
             }
         }

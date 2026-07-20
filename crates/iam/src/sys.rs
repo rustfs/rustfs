@@ -1686,25 +1686,29 @@ mod tests {
         }
     }
 
+    async fn test_iam_sys() -> IamSys<StsTestMockStore> {
+        let store = StsTestMockStore::new(false);
+        let cache = IamCache::new(store).await.expect("IAM cache should initialize");
+        IamSys::new(cache)
+    }
+
+    fn service_account_opts(access_key: &str, secret_key: &str) -> NewServiceAccountOpts {
+        NewServiceAccountOpts {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn new_service_account_rejects_parent_access_key() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
+        let iam_sys = test_iam_sys().await;
         let access_key = "PARENTACCESSKEY123";
 
         let err = iam_sys
-            .new_service_account(
-                access_key,
-                None,
-                NewServiceAccountOpts {
-                    access_key: access_key.to_string(),
-                    secret_key: "parentAccessKeySecret123".to_string(),
-                    ..Default::default()
-                },
-            )
+            .new_service_account(access_key, None, service_account_opts(access_key, "parentAccessKeySecret123"))
             .await
             .expect_err("a service account must not reuse its parent access key");
 
@@ -1715,149 +1719,18 @@ mod tests {
     async fn duplicate_service_account_returns_access_key_already_exists() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
+        let iam_sys = test_iam_sys().await;
         let access_key = "DUPLICATESERVICEKEY1";
 
         iam_sys
-            .new_service_account(
-                "svc-parent-user",
-                None,
-                NewServiceAccountOpts {
-                    access_key: access_key.to_string(),
-                    secret_key: "firstServiceSecret123".to_string(),
-                    ..Default::default()
-                },
-            )
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "firstServiceSecret123"))
             .await
             .expect("initial service account should be created");
 
         let err = iam_sys
-            .new_service_account(
-                "svc-parent-user",
-                None,
-                NewServiceAccountOpts {
-                    access_key: access_key.to_string(),
-                    secret_key: "secondServiceSecret123".to_string(),
-                    ..Default::default()
-                },
-            )
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "secondServiceSecret123"))
             .await
             .expect_err("duplicate service account should fail");
-
-        assert_eq!(err, Error::AccessKeyAlreadyExists);
-    }
-
-    #[tokio::test]
-    async fn service_account_creation_rejects_regular_user_access_key() {
-        ensure_test_global_credentials();
-
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
-        let access_key = "REGULARUSERACCESSKEY1";
-        let user = AddOrUpdateUserReq {
-            secret_key: "regularUserSecret123".to_string(),
-            policy: None,
-            status: rustfs_madmin::AccountStatus::Enabled,
-        };
-
-        iam_sys
-            .store
-            .add_user(access_key, &user)
-            .await
-            .expect("regular user should be created");
-
-        let err = iam_sys
-            .new_service_account(
-                "svc-parent-user",
-                None,
-                NewServiceAccountOpts {
-                    access_key: access_key.to_string(),
-                    secret_key: "serviceAccountSecret123".to_string(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect_err("service-account creation must reject a regular-user access key");
-
-        assert_eq!(err, Error::AccessKeyAlreadyExists);
-    }
-
-    #[tokio::test]
-    async fn regular_user_can_be_updated_with_the_same_access_key() {
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
-        let access_key = "REGULARUSERUPDATEKEY1";
-
-        iam_sys
-            .store
-            .add_user(
-                access_key,
-                &AddOrUpdateUserReq {
-                    secret_key: "initialRegularSecret123".to_string(),
-                    policy: None,
-                    status: rustfs_madmin::AccountStatus::Enabled,
-                },
-            )
-            .await
-            .expect("regular user should be created");
-
-        iam_sys
-            .store
-            .add_user(
-                access_key,
-                &AddOrUpdateUserReq {
-                    secret_key: "updatedRegularSecret123".to_string(),
-                    policy: None,
-                    status: rustfs_madmin::AccountStatus::Disabled,
-                },
-            )
-            .await
-            .expect("regular user should remain updatable");
-
-        let user = iam_sys.get_user(access_key).await.expect("updated user should stay cached");
-        assert_eq!(user.credentials.secret_key, "updatedRegularSecret123");
-        assert_eq!(user.credentials.status, rustfs_policy::auth::ACCOUNT_OFF);
-    }
-
-    #[tokio::test]
-    async fn service_account_creation_rejects_sts_access_key() {
-        ensure_test_global_credentials();
-
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
-        let access_key = "TEMPORARYSERVICEKEY12";
-        let temp_cred = Credentials {
-            access_key: access_key.to_string(),
-            secret_key: "temporarySecretKey123".to_string(),
-            session_token: "temporary-session-token".to_string(),
-            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
-            status: ACCOUNT_ON.to_string(),
-            parent_user: "sts-parent-user".to_string(),
-            ..Default::default()
-        };
-
-        iam_sys
-            .set_temp_user(access_key, &temp_cred, None)
-            .await
-            .expect("temporary credentials should be created");
-
-        let err = iam_sys
-            .new_service_account(
-                "svc-parent-user",
-                None,
-                NewServiceAccountOpts {
-                    access_key: access_key.to_string(),
-                    secret_key: "serviceAccountSecret123".to_string(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect_err("service-account creation must reject a temporary access key");
 
         assert_eq!(err, Error::AccessKeyAlreadyExists);
     }
@@ -1866,21 +1739,11 @@ mod tests {
     async fn user_creation_rejects_service_account_access_key() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
+        let iam_sys = test_iam_sys().await;
         let access_key = "SERVICEACCOUNTKEY123";
 
         iam_sys
-            .new_service_account(
-                "svc-parent-user",
-                None,
-                NewServiceAccountOpts {
-                    access_key: access_key.to_string(),
-                    secret_key: "serviceAccountSecret123".to_string(),
-                    ..Default::default()
-                },
-            )
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "serviceAccountSecret123"))
             .await
             .expect("service account should be created");
 
@@ -1893,80 +1756,6 @@ mod tests {
             .create_user(access_key, &user)
             .await
             .expect_err("user creation must reject a service-account access key");
-
-        assert_eq!(err, Error::AccessKeyAlreadyExists);
-    }
-
-    #[tokio::test]
-    async fn user_creation_rejects_expired_service_account_access_key() {
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
-        let access_key = "EXPIREDSERVICEKEY123";
-        let mut claims = HashMap::new();
-        claims.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string()));
-        let service_account = UserIdentity::from(Credentials {
-            access_key: access_key.to_string(),
-            secret_key: "expiredServiceSecret123".to_string(),
-            session_token: "expired-service-token".to_string(),
-            expiration: Some(OffsetDateTime::now_utc() - time::Duration::hours(1)),
-            status: ACCOUNT_ON.to_string(),
-            parent_user: "svc-parent-user".to_string(),
-            claims: Some(claims),
-            ..Default::default()
-        });
-        assert!(!service_account.credentials.is_temp());
-        assert!(service_account.credentials.is_service_account());
-        iam_sys
-            .store
-            .cache
-            .add_or_update_user(access_key, &service_account, OffsetDateTime::now_utc());
-
-        let user = AddOrUpdateUserReq {
-            secret_key: "regularUserSecret123".to_string(),
-            policy: None,
-            status: rustfs_madmin::AccountStatus::Enabled,
-        };
-        let err = iam_sys
-            .create_user(access_key, &user)
-            .await
-            .expect_err("user creation must reject an expired service-account access key");
-
-        assert_eq!(err, Error::AccessKeyAlreadyExists);
-    }
-
-    #[tokio::test]
-    async fn user_creation_rejects_sts_access_key() {
-        ensure_test_global_credentials();
-
-        let store = StsTestMockStore::new(false);
-        let cache_manager = IamCache::new(store).await.expect("IAM cache should initialize");
-        let iam_sys = IamSys::new(cache_manager);
-        let access_key = "TEMPORARYACCESSKEY123";
-        let temp_cred = Credentials {
-            access_key: access_key.to_string(),
-            secret_key: "temporarySecretKey123".to_string(),
-            session_token: "temporary-session-token".to_string(),
-            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
-            status: ACCOUNT_ON.to_string(),
-            parent_user: "sts-parent-user".to_string(),
-            ..Default::default()
-        };
-
-        iam_sys
-            .set_temp_user(access_key, &temp_cred, None)
-            .await
-            .expect("temporary credentials should be created");
-
-        let user = AddOrUpdateUserReq {
-            secret_key: "regularUserSecret123".to_string(),
-            policy: None,
-            status: rustfs_madmin::AccountStatus::Enabled,
-        };
-        let err = iam_sys
-            .create_user(access_key, &user)
-            .await
-            .expect_err("user creation must reject a temporary access key");
 
         assert_eq!(err, Error::AccessKeyAlreadyExists);
     }

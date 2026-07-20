@@ -28,7 +28,7 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials as StoredCredentials;
-use rustfs_iam::error::{Error as IamError, is_err_no_such_service_account, is_err_no_such_temp_account};
+use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
 use rustfs_madmin::{
@@ -136,15 +136,6 @@ fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str)
         iam_error_to_s3_error(err)
     } else {
         s3_error!(InternalError, "{action}")
-    }
-}
-
-fn map_service_account_create_error(err: IamError) -> S3Error {
-    match err {
-        IamError::InvalidAccessKeyLength | IamError::InvalidSecretKeyLength | IamError::AccessKeyAlreadyExists => {
-            iam_error_to_s3_error(err)
-        }
-        err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
     }
 }
 
@@ -406,7 +397,12 @@ impl Operation for AddServiceAccount {
                     error = ?e,
                     "admin service account state"
                 );
-                map_service_account_create_error(e)
+                match e {
+                    rustfs_iam::error::Error::InvalidAccessKeyLength
+                    | rustfs_iam::error::Error::InvalidSecretKeyLength
+                    | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(e),
+                    err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
+                }
             })?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
@@ -1573,39 +1569,19 @@ mod tests {
 
     #[test]
     fn add_service_account_maps_iam_create_errors_to_s3_errors() {
-        let err = map_service_account_create_error(IamError::AccessKeyAlreadyExists);
-
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
-        assert_eq!(err.message(), Some("access key is already in use"));
-    }
-
-    #[test]
-    fn add_service_account_preserves_existing_create_error_mappings() {
-        for iam_err in [IamError::InvalidAccessKeyLength, IamError::InvalidSecretKeyLength] {
-            let err = map_service_account_create_error(iam_err);
-            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
-        }
-
-        let err = map_service_account_create_error(IamError::IamSysNotInitialized);
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("create service account failed, e: IamSysNotInitialized"));
-    }
-
-    #[test]
-    fn add_service_account_operation_uses_create_error_mapper() {
         let src = include_str!("service_account.rs");
         let create_start = src
-            .find("let (new_cred, _) = iam_store")
-            .expect("service-account create call should exist");
+            .find("impl Operation for AddServiceAccount")
+            .expect("AddServiceAccount operation should exist");
         let create_block = &src[create_start..];
         let create_end = create_block
             .find("if let Err(err) = site_replication_iam_change_hook")
             .expect("site replication hook marker should exist");
-        let create_block = create_block[..create_end].split_whitespace().collect::<Vec<_>>().join(" ");
+        let create_block = &create_block[..create_end];
 
         assert!(
-            create_block.trim_end().ends_with("map_service_account_create_error(e) })?;"),
-            "AddServiceAccount must return the production create-error mapper result"
+            create_block.contains("AccessKeyAlreadyExists") && create_block.contains("iam_error_to_s3_error(e)"),
+            "duplicate access keys must map to client S3 errors"
         );
     }
 

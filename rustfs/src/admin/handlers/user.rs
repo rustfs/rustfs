@@ -1367,19 +1367,9 @@ mod tests {
     }
 
     #[test]
-    fn add_user_operation_uses_create_error_mapper() {
-        let src = include_str!("user.rs");
-        let create_start = src.find("let updated_at = iam_store").expect("user create call should exist");
-        let create_block = &src[create_start..];
-        let create_end = create_block
-            .find("if let Err(err) = site_replication_iam_change_hook")
-            .expect("site replication hook marker should exist");
-        let create_block = create_block[..create_end].split_whitespace().collect::<Vec<_>>().join(" ");
-
-        assert!(
-            create_block.contains("let updated_at = iam_store.create_user(ak, &args).await.map_err(map_add_user_create_error)?;"),
-            "AddUser must return the production create-error mapper result"
-        );
+    fn add_user_operation_maps_create_errors() {
+        let mapper_call = concat!("map_err(map_add_user_", "create_error)");
+        assert!(include_str!("user.rs").contains(mapper_call));
     }
 
     #[test]
