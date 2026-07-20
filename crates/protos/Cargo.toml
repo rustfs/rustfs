@@ -45,6 +45,12 @@ tonic-prost = { workspace = true }
 tonic-prost-build = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+uuid = { workspace = true }
 
 [lib]
 doctest = false
+
+[dev-dependencies]
+serde_json = { workspace = true }
