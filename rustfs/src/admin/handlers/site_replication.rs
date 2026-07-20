@@ -21,8 +21,8 @@ use crate::admin::runtime_sources::{
     current_token_signing_key, object_store_from_req,
 };
 use crate::admin::site_replication_identity::{
-    canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
-    site_identity_key,
+    canonical_endpoint, deployment_id_for_endpoint, is_https_endpoint, normalize_peer_map_by_identity_with,
+    same_identity_endpoint, site_identity_key,
 };
 use crate::admin::storage_api::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -2081,7 +2081,9 @@ fn build_join_peers(
     if let Some(local_site) = sites
         .iter()
         .find(|site| same_identity_endpoint(&site.endpoint, &normalized_local.endpoint))
+        && (is_https_endpoint(&local_site.endpoint) || !is_https_endpoint(&normalized_local.endpoint))
     {
+        normalized_local.endpoint = local_site.endpoint.clone();
         normalized_local.skip_tls_verify = local_site.skip_tls_verify;
         normalized_local.ca_cert_pem = local_site.ca_cert_pem.clone();
     }
@@ -7964,6 +7966,66 @@ mod tests {
         let local = peers.get("local-deployment").expect("local peer should be present");
         assert!(local.skip_tls_verify);
         assert_eq!(local.ca_cert_pem, "local-ca");
+    }
+
+    #[test]
+    fn test_build_join_peers_prefers_explicit_https_for_all_local_peer_tls_modes() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-deployment".to_string(),
+            ..peer("local", "http://local.example.com:9000")
+        };
+        let custom_ca = valid_test_ca_pem("local.example.com");
+
+        for (skip_tls_verify, ca_cert_pem) in [(false, String::new()), (true, String::new()), (false, custom_ca)] {
+            let peers = build_join_peers(
+                &SiteReplicationState::default(),
+                &local_peer,
+                vec![PeerSite {
+                    name: "local".to_string(),
+                    endpoint: "https://local.example.com:9000".to_string(),
+                    skip_tls_verify,
+                    ca_cert_pem: ca_cert_pem.clone(),
+                    ..PeerSite::default()
+                }],
+                false,
+            );
+
+            let local = peers.get("local-deployment").expect("local peer should be present");
+            assert_eq!(local.endpoint, "https://local.example.com:9000");
+            assert_eq!(local.skip_tls_verify, skip_tls_verify);
+            assert_eq!(local.ca_cert_pem, ca_cert_pem);
+            assert!(validate_join_peer_snapshot(&peers).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_build_join_peers_does_not_downgrade_local_https_tls_modes() {
+        let custom_ca = valid_test_ca_pem("local.example.com");
+
+        for (skip_tls_verify, ca_cert_pem) in [(false, String::new()), (true, String::new()), (false, custom_ca)] {
+            let local_peer = PeerInfo {
+                deployment_id: "local-deployment".to_string(),
+                skip_tls_verify,
+                ca_cert_pem: ca_cert_pem.clone(),
+                ..peer("local", "https://local.example.com:9000")
+            };
+            let peers = build_join_peers(
+                &SiteReplicationState::default(),
+                &local_peer,
+                vec![PeerSite {
+                    name: "local".to_string(),
+                    endpoint: "http://local.example.com:9000".to_string(),
+                    ..PeerSite::default()
+                }],
+                false,
+            );
+
+            let local = peers.get("local-deployment").expect("local peer should be present");
+            assert_eq!(local.endpoint, "https://local.example.com:9000");
+            assert_eq!(local.skip_tls_verify, skip_tls_verify);
+            assert_eq!(local.ca_cert_pem, ca_cert_pem);
+            assert!(validate_join_peer_snapshot(&peers).is_ok());
+        }
     }
 
     #[test]

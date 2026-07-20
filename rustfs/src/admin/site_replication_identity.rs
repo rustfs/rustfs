@@ -76,7 +76,7 @@ pub fn same_identity_endpoint(left: &str, right: &str) -> bool {
     site_identity_key(left) == site_identity_key(right)
 }
 
-fn is_https_endpoint(endpoint: &str) -> bool {
+pub(super) fn is_https_endpoint(endpoint: &str) -> bool {
     canonical_endpoint(endpoint).starts_with("https://")
 }
 
