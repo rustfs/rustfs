@@ -1235,7 +1235,7 @@ mod tests {
         let backend = register_mock_tier(&ctx_a.tier_config_mgr(), tier_name).await;
         backend.set_put_remote_version(Some(uuid::Uuid::new_v4().to_string())).await;
         backend.set_reject_non_empty_remote_versions(true);
-        backend.set_remove_failure(true);
+        let remove_barrier = backend.arm_failing_remove_barrier().await;
 
         let bucket = "transition-cleanup-context-a";
         let object = "rejected-candidate.bin";
@@ -1273,26 +1273,20 @@ mod tests {
                 .is_cancelled()
         );
 
-        let journal_counts = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let count_a = tier_delete_journal_count(store_a.clone()).await;
-                let count_b = tier_delete_journal_count(store_b.clone()).await;
-                if count_a + count_b > 0 {
-                    return (count_a, count_b);
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the cancelled transition must persist its cleanup journal to store A");
+        remove_barrier.wait_until_paused().await;
+        let journal_counts = (
+            tier_delete_journal_count(store_a.clone()).await,
+            tier_delete_journal_count(store_b.clone()).await,
+        );
         assert_eq!(
             journal_counts,
             (1, 0),
             "the journal must land only on store A even while the process resolver points at store B"
         );
         assert_eq!(backend.object_count().await, 1, "failed cleanup should retain the remote candidate");
+        remove_barrier.release();
+        remove_barrier.wait_until_operation_dropped().await;
 
-        backend.set_remove_failure(false);
         let recovered = recover_tier_delete_journal_entries(store_a.clone(), 100, None)
             .await
             .expect("store A should recover its own cancelled-transition journal");
