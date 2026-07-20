@@ -3598,7 +3598,7 @@ mod metadata_mutation_generation_tests {
 mod transition_commit_failure_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
-    use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
+    use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions};
     use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
     use crate::services::tier::tier::TierConfigMgr;
@@ -3815,6 +3815,89 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn failed_restore_cleanup_does_not_overwrite_concurrent_unversioned_put() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-cas-bucket";
+        let object = "object.bin";
+        let original_payload = b"old transitioned body".repeat(1024);
+        let replacement_payload = b"new visible unversioned body".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(original_payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should transition before restore");
+
+        let get_barrier = backend.arm_failing_get_barrier().await;
+        let restore_set = Arc::clone(&set_disks);
+        let restore = tokio::spawn(async move {
+            let mut opts = ObjectOptions::default();
+            opts.transition.restore_request.days = Some(1);
+            restore_set.restore_transitioned_object(bucket, object, &opts).await
+        });
+        get_barrier.wait_until_paused().await;
+
+        let mut replacement_reader = PutObjReader::from_vec(replacement_payload.clone());
+        let replacement = set_disks
+            .put_object(bucket, object, &mut replacement_reader, &ObjectOptions::default())
+            .await
+            .expect("concurrent unversioned PUT should commit while restore GET is paused");
+        get_barrier.release();
+        restore
+            .await
+            .expect("restore task should join")
+            .expect_err("injected tier GET failure should surface");
+
+        let visible = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("replacement metadata should remain visible");
+        assert_eq!(visible.etag, replacement.etag, "stale restore cleanup must not republish the old ETag");
+        assert_ne!(
+            visible.transitioned_object.status, TRANSITION_COMPLETE,
+            "replacement object must not regain stale transition metadata"
+        );
+        let mut body = Vec::new();
+        set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("replacement object should be readable")
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("replacement body should drain");
+        assert_eq!(
+            body, replacement_payload,
+            "stale restore cleanup must not make the old remote body current again"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn legacy_reload_rejects_route_change_after_local_transition_commit() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-post-check-fence-bucket";
@@ -3960,6 +4043,7 @@ mod transition_upload_integrity_tests {
     use crate::services::tier::test_util::register_mock_tier;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
+    use std::path::PathBuf;
 
     async fn assert_local_source_intact(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, payload: &[u8]) {
         let mut restored = Vec::new();
@@ -4030,6 +4114,56 @@ mod transition_upload_integrity_tests {
         }
     }
 
+    async fn corrupt_shard_at(path: PathBuf, position: ShardCorruptionPosition) {
+        let mut bytes = tokio::fs::read(&path).await.expect("committed shard should be readable");
+        assert!(!bytes.is_empty(), "committed shard should not be empty");
+        let offset = match position {
+            ShardCorruptionPosition::First => 0,
+            ShardCorruptionPosition::Middle => bytes.len() / 2,
+            ShardCorruptionPosition::Last => bytes.len() - 1,
+        };
+        bytes[offset] ^= 0xff;
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("committed shard corruption should be written");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ShardCorruptionPosition {
+        First,
+        Middle,
+        Last,
+    }
+
+    impl ShardCorruptionPosition {
+        fn label(self) -> &'static str {
+            match self {
+                ShardCorruptionPosition::First => "first",
+                ShardCorruptionPosition::Middle => "middle",
+                ShardCorruptionPosition::Last => "last",
+            }
+        }
+    }
+
+    async fn corrupt_beyond_read_quorum(
+        temp_dirs: &[tempfile::TempDir],
+        bucket: &str,
+        object: &str,
+        data_dir: Uuid,
+        parity_blocks: usize,
+        position: ShardCorruptionPosition,
+    ) {
+        for temp_dir in temp_dirs.iter().take(parity_blocks + 1) {
+            let shard = temp_dir
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(data_dir.to_string())
+                .join("part.1");
+            corrupt_shard_at(shard, position).await;
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn partial_remote_acceptance_cleans_exact_candidate_and_preserves_source() {
@@ -4057,6 +4191,98 @@ mod transition_upload_integrity_tests {
         );
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_bitrot_producer_failures_do_not_commit_transition() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+
+        for position in [
+            ShardCorruptionPosition::First,
+            ShardCorruptionPosition::Middle,
+            ShardCorruptionPosition::Last,
+        ] {
+            let bucket = format!("transition-real-bitrot-{}", position.label());
+            let object = format!("{}-corrupt.bin", position.label());
+            let payload = vec![0x41; 2 * 1024 * 1024];
+            let original = write_source(&set_disks, &disk_stores, &bucket, &object, &payload).await;
+            let (source, _, _) = set_disks
+                .get_object_fileinfo(
+                    &bucket,
+                    &object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        ..Default::default()
+                    },
+                    true,
+                    false,
+                )
+                .await
+                .expect("source metadata should be available before shard corruption");
+            let data_dir = source.data_dir.expect("source object should have a data directory");
+
+            corrupt_beyond_read_quorum(&temp_dirs, &bucket, &object, data_dir, source.erasure.parity_blocks, position).await;
+
+            let error = set_disks
+                .transition_object(&bucket, &object, &transition_options(&original, tier_name.clone()))
+                .await
+                .expect_err("producer bitrot failure must not commit transition metadata");
+            assert!(
+                matches!(
+                    error,
+                    StorageError::FileCorrupt
+                        | StorageError::ErasureReadQuorum
+                        | StorageError::InsufficientReadQuorum(_, _)
+                        | StorageError::LessData
+                        | StorageError::Io(_)
+                ),
+                "{position:?}: unexpected transition producer error: {error:?}"
+            );
+            let (after, _, _) = set_disks
+                .get_object_fileinfo(
+                    &bucket,
+                    &object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        ..Default::default()
+                    },
+                    true,
+                    false,
+                )
+                .await
+                .expect("failed transition must leave metadata readable");
+            assert_eq!(
+                after.data_dir,
+                Some(data_dir),
+                "{position:?}: transition must not release the source data dir"
+            );
+            assert_ne!(
+                after.transition_status, TRANSITION_COMPLETE,
+                "{position:?}: transition status must remain incomplete after producer bitrot failure"
+            );
+        }
+
+        assert_eq!(
+            backend.put_count().await,
+            3,
+            "each bitrot case should create one remote cleanup candidate"
+        );
+        assert_eq!(backend.remove_count().await, 3, "each bitrot candidate must be removed before returning");
+        assert_eq!(
+            backend.remove_versions().await,
+            backend.put_versions().await,
+            "bitrot cleanup must target the exact remote version returned by PUT"
+        );
+        assert_eq!(
+            backend.object_count().await,
+            0,
+            "bitrot producer failures must not leave remote candidates"
+        );
     }
 
     #[tokio::test]
