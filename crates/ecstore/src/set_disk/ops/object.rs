@@ -722,11 +722,15 @@ impl SetDisks {
             }
         }
 
+        let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
         if let Some(eval_metadata) = &opts.eval_metadata {
             for (key, value) in eval_metadata {
                 user_defined.insert(key.clone(), value.clone());
             }
+        }
+        if expected_restore_operation_id.is_some() {
+            rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
         }
         let WriteLayout {
             data_drives,
@@ -1029,6 +1033,9 @@ impl SetDisks {
                     achieved: 0,
                 });
             }
+
+            self.require_current_restore_operation_id(bucket, object, opts, expected_restore_operation_id, "put_object_commit")
+                .await?;
 
             let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
@@ -3108,10 +3115,30 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let (actual_fi, _, _) = fi?;
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
-        if let Some(expected_operation_id) = restore_operation_id_from_metadata(&opts.user_defined)? {
+        let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
+        if let Some(expected_operation_id) = expected_operation_id {
             require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
         }
         let mut ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
+        if let Some(expected_operation_id) = expected_operation_id {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut ropts.user_defined,
+                SUFFIX_RESTORE_OPERATION_ID,
+                expected_operation_id.to_string(),
+            );
+        }
+        let restore_commit_metadata = if let Some(expected_operation_id) = expected_operation_id {
+            let mut metadata = HashMap::new();
+            metadata.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"false\"".to_string());
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut metadata,
+                SUFFIX_RESTORE_OPERATION_ID,
+                expected_operation_id.to_string(),
+            );
+            metadata
+        } else {
+            HashMap::new()
+        };
         // The restore copy-back re-writes this same object via put_object /
         // new_multipart_upload / complete_multipart_upload, each of which takes
         // the object write lock in its commit phase. The caller
@@ -3257,6 +3284,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 uploaded_parts,
                 &ObjectOptions {
                     mod_time: oi.mod_time,
+                    version_id: oi.version_id.map(|version| version.to_string()),
+                    user_defined: restore_commit_metadata,
                     // Inherit the restore write lock (see ropts.no_lock above):
                     // the commit phase re-acquires this object's write lock.
                     no_lock: opts.no_lock,
@@ -3624,7 +3653,24 @@ mod transition_commit_failure_tests {
     use crate::services::tier::tier::TierConfigMgr;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
+    use s3s::dto::RestoreRequest;
     use tokio::io::AsyncReadExt;
+
+    fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_id.to_string(),
+        );
+        metadata
+    }
+
+    fn restore_metadata(operation_id: Uuid, ongoing: bool) -> HashMap<String, String> {
+        let mut metadata = restore_operation_id_metadata(operation_id);
+        metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
+        metadata
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -4117,32 +4163,24 @@ mod transition_commit_failure_tests {
 
         let operation_a = Uuid::new_v4();
         let operation_b = Uuid::new_v4();
-        let mut metadata = HashMap::new();
-        metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
-        metadata.insert(rustfs_utils::http::headers::AMZ_RESTORE_EXPIRY_DAYS.to_string(), "1".to_string());
-        metadata.insert(
-            rustfs_utils::http::headers::AMZ_RESTORE_REQUEST_DATE.to_string(),
-            "2026-07-20T00:00:00Z".to_string(),
-        );
-        rustfs_utils::http::metadata_compat::insert_str(
-            &mut metadata,
-            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
-            operation_a.to_string(),
-        );
+        let metadata = restore_metadata(operation_a, true);
 
         let mut reader = PutObjReader::from_vec(payload);
         set_disks
-            .put_object(
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
                 bucket,
                 object,
-                &mut reader,
                 &ObjectOptions {
-                    user_defined: metadata,
+                    eval_metadata: Some(metadata),
                     ..Default::default()
                 },
             )
             .await
-            .expect("source object with restore operation A should be written");
+            .expect("restore operation A metadata should be installed");
         let stale_operation_a = set_disks
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
@@ -4236,6 +4274,377 @@ mod transition_commit_failure_tests {
             )
             .is_none(),
             "matching cleanup must remove the restore operation id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_worker_propagates_operation_id_to_final_put_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-worker-commit-operation-id-bucket";
+        let object = "object.bin";
+        let payload = b"restore worker must carry operation id to final commit".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should transition before restore");
+
+        let operation_a = Uuid::new_v4();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_a, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore operation A metadata should be installed");
+
+        let get_barrier = backend.arm_get_barrier().await;
+        let restore_set = Arc::clone(&set_disks);
+        let restore = tokio::spawn(async move {
+            restore_set
+                .restore_transitioned_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            restore_request: RestoreRequest {
+                                days: Some(1),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        user_defined: restore_operation_id_metadata(operation_a),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        get_barrier.wait_until_paused().await;
+
+        let operation_b = Uuid::new_v4();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_operation_id_metadata(operation_b)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operation B should replace operation A after worker starts tier GET");
+        get_barrier.release();
+        restore
+            .await
+            .expect("restore task should join")
+            .expect_err("stale operation A must fail at final PUT commit");
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain visible after stale worker is rejected");
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale worker must not remove or replace operation B"
+        );
+        assert_eq!(
+            current.transitioned_object.status, TRANSITION_COMPLETE,
+            "stale worker must not publish its restored local body after operation id replacement"
+        );
+        let mut body = Vec::new();
+        set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("original transitioned object should remain readable")
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("original remote body should drain");
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_put_commit_rechecks_operation_id_and_strips_internal_marker() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-put-commit-operation-id-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_a = Uuid::new_v4();
+        let operation_a_metadata = restore_metadata(operation_a, true);
+        let mut reader = PutObjReader::from_vec(b"restore source body".repeat(1024));
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_a_metadata.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ongoing restore operation A should be installed");
+
+        let operation_b = Uuid::new_v4();
+        let mut operation_b_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut operation_b_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_b_metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operation B should replace operation A before final commit");
+
+        let mut stale_restore_reader = PutObjReader::from_vec(b"stale A restored body".repeat(1024));
+        let result = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut stale_restore_reader,
+                &ObjectOptions {
+                    user_defined: operation_a_metadata,
+                    ..Default::default()
+                },
+            )
+            .await;
+        result.expect_err("stale operation A must not commit after operation B replaces it");
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain current after stale commit is rejected");
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale commit must not remove or replace operation B"
+        );
+
+        let mut matching_restore_reader = PutObjReader::from_vec(b"matching B restored body".repeat(1024));
+        let operation_b_restore_metadata = restore_metadata(operation_b, false);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut matching_restore_reader,
+                &ObjectOptions {
+                    user_defined: operation_b_restore_metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B should be allowed to commit");
+        let restored = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restored object should remain readable");
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                restored.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            )
+            .is_none(),
+            "completed restore PUT must not persist the internal operation id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_multipart_complete_rechecks_operation_id_and_strips_internal_marker() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-multipart-commit-operation-id-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_a = Uuid::new_v4();
+        let operation_a_metadata = restore_metadata(operation_a, true);
+        let mut initial_reader = PutObjReader::from_vec(b"multipart restore source body".repeat(1024));
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_a_metadata.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ongoing multipart restore operation A should be installed");
+
+        let upload = set_disks
+            .new_multipart_upload(
+                bucket,
+                object,
+                &ObjectOptions {
+                    user_defined: operation_a_metadata.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore multipart upload should be created");
+        let mut part_reader = PutObjReader::from_vec(b"stale multipart A restored body".repeat(1024));
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("restore multipart part should be written");
+
+        let operation_b = Uuid::new_v4();
+        let mut operation_b_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut operation_b_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_b_metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operation B should replace operation A before multipart complete");
+
+        let complete_result = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag.clone(),
+                    ..Default::default()
+                }],
+                &ObjectOptions {
+                    user_defined: operation_a_metadata,
+                    ..Default::default()
+                },
+            )
+            .await;
+        complete_result.expect_err("stale operation A must not complete after operation B replaces it");
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain current after stale multipart completion");
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale multipart completion must not remove or replace operation B"
+        );
+
+        let operation_b_restore_metadata = restore_metadata(operation_b, false);
+        let upload = set_disks
+            .new_multipart_upload(
+                bucket,
+                object,
+                &ObjectOptions {
+                    user_defined: operation_b_restore_metadata.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B multipart upload should be created");
+        let mut part_reader = PutObjReader::from_vec(b"matching multipart B restored body".repeat(1024));
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("matching restore multipart part should be written");
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions {
+                    user_defined: operation_b_restore_metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B should complete");
+        let restored = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("completed multipart restore should remain readable");
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                restored.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            )
+            .is_none(),
+            "completed multipart restore must not persist the internal operation id"
         );
     }
 
