@@ -3285,7 +3285,13 @@ fn site_replication_config_mismatch<'a>(values: impl Iterator<Item = Option<&'a 
 
     let expected_rules = total_sites.saturating_sub(1);
     let replicated = values.iter().all(|raw| {
-        deserialize::<ReplicationConfiguration>(raw.as_bytes())
+        // `raw` is the wire form produced by build_sr_info, i.e. base64-encoded XML
+        // (raw_config_to_base64). Decode it before XML-parsing — parsing the base64 text
+        // directly always fails, which would falsely report every replicated bucket as
+        // out-of-sync ("0/N Buckets in sync"). decode_bucket_meta_wire_value falls back to
+        // the raw bytes when the value is not base64, so plain-XML callers still work.
+        let xml = decode_bucket_meta_wire_value(raw);
+        deserialize::<ReplicationConfiguration>(&xml)
             .is_ok_and(|config| config.rules.len() == expected_rules && config.rules.iter().all(site_replication_rule_complete))
     });
 
@@ -11000,6 +11006,45 @@ mod tests {
             site_replication_config_mismatch(vec![Some(&repl_complete_xml)].into_iter(), 2),
             (1, true),
             "config only on one of two sites → mismatch"
+        );
+    }
+
+    // Status miscount regression: build_sr_info stores replication_config as base64-encoded XML
+    // (the wire form). site_replication_config_mismatch must decode it before XML-parsing; before
+    // the fix it parsed the base64 text directly, always failed, and reported every replicated
+    // bucket as out-of-sync ("0/N Buckets in sync"). This test feeds the real base64 wire form.
+    #[test]
+    fn test_site_replication_config_mismatch_accepts_base64_wire_form() {
+        let xml = {
+            let config = ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![build_site_replication_rule(
+                    "arn:rustfs:replication::dep-b:bucket",
+                    1,
+                    "site-repl-dep-b",
+                )],
+            };
+            String::from_utf8(serialize(&config).unwrap()).unwrap()
+        };
+        let b64 = BASE64_STANDARD.encode(xml.as_bytes());
+
+        // Both sites present the complete config in base64 wire form → NOT a mismatch.
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&b64), Some(&b64)].into_iter(), 2),
+            (2, false),
+            "base64-encoded complete configs on both sites must not be reported as a mismatch"
+        );
+        // The tolerant decode keeps plain-XML callers working too.
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&xml), Some(&xml)].into_iter(), 2),
+            (2, false),
+            "raw-XML wire form still parses via the base64 fallback"
+        );
+        // A base64 config present on only one of two sites is still a mismatch.
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&b64)].into_iter(), 2),
+            (1, true),
+            "config present on only one site is a mismatch regardless of encoding"
         );
     }
 
