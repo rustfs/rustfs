@@ -4823,6 +4823,32 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn remote_put_failure_preserves_error_without_cleanup_candidate() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-remote-put-failure-bucket";
+        let object = "object.bin";
+        let payload = b"a failed remote PUT must not manufacture a cleanup candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_unreachable(true).await;
+
+        let error = set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("an unreachable tier must fail the remote PUT");
+        assert!(
+            matches!(error, StorageError::Io(ref err) if err.kind() == std::io::ErrorKind::ConnectionRefused),
+            "the original remote PUT error must be preserved: {error:?}"
+        );
+        assert_eq!(backend.remove_count().await, 0, "an unconfirmed candidate must not be cleaned up");
+        assert_eq!(backend.exact_remove_count(), 0, "an unconfirmed candidate must not reach exact cleanup");
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn partial_remote_acceptance_cleans_exact_candidate_and_preserves_source() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-partial-accept-bucket";
