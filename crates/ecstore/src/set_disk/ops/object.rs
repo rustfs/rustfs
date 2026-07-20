@@ -21,10 +21,14 @@
 
 use super::super::*;
 
-use crate::bucket::lifecycle::tier_sweeper::{RemoteTierDeleteOutcome, delete_object_from_remote_tier_with_lease_idempotent};
+use crate::bucket::lifecycle::{
+    tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
+    tier_sweeper::{Jentry, RemoteTierDeleteOutcome, delete_object_from_remote_tier_with_lease_idempotent},
+};
 use crate::disk::OldCurrentSize;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
+use crate::store::ECStore;
 use futures::FutureExt as _;
 use std::future::Future;
 
@@ -722,11 +726,15 @@ impl SetDisks {
             }
         }
 
+        let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
         if let Some(eval_metadata) = &opts.eval_metadata {
             for (key, value) in eval_metadata {
                 user_defined.insert(key.clone(), value.clone());
             }
+        }
+        if expected_restore_operation_id.is_some() {
+            rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
         }
         let WriteLayout {
             data_drives,
@@ -1029,6 +1037,9 @@ impl SetDisks {
                     achieved: 0,
                 });
             }
+
+            self.require_current_restore_operation_id(bucket, object, opts, expected_restore_operation_id, "put_object_commit")
+                .await?;
 
             let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
@@ -1349,12 +1360,11 @@ enum TransitionUploadRemoteVersion {
 
 impl TransitionUploadCandidate {
     pub(crate) fn from_put_response(remote_version: String) -> Self {
-        let remote_version =
-            if remote_version.is_empty() || Uuid::parse_str(&remote_version).is_ok_and(|version_id| version_id.is_nil()) {
-                TransitionUploadRemoteVersion::KnownUnversioned(remote_version)
-            } else {
-                TransitionUploadRemoteVersion::KnownExact(remote_version)
-            };
+        let remote_version = if remote_version.is_empty() {
+            TransitionUploadRemoteVersion::KnownUnversioned(remote_version)
+        } else {
+            TransitionUploadRemoteVersion::KnownExact(remote_version)
+        };
         Self { remote_version }
     }
 
@@ -1370,6 +1380,10 @@ impl TransitionUploadCandidate {
             TransitionUploadRemoteVersion::KnownExact(remote_version) => remote_version,
             TransitionUploadRemoteVersion::KnownUnversioned(_) => "",
         }
+    }
+
+    fn cleanup_version_is_exact(&self) -> bool {
+        matches!(&self.remote_version, TransitionUploadRemoteVersion::KnownExact(_))
     }
 }
 
@@ -1437,22 +1451,18 @@ where
 pub(crate) async fn cleanup_uncommitted_transition_upload(
     lease: &TierOperationLease,
     object: &str,
-    candidate: &TransitionUploadCandidate,
+    cleanup_version: &str,
+    version_id_exact: bool,
 ) -> std::io::Result<RemoteTierDeleteOutcome> {
-    delete_object_from_remote_tier_with_lease_idempotent(object, candidate.cleanup_version(), lease).await
+    delete_object_from_remote_tier_with_lease_idempotent(object, cleanup_version, lease, version_id_exact).await
 }
 
-fn log_transition_upload_cleanup_failure(
-    lease: &TierOperationLease,
-    object: &str,
-    candidate: &TransitionUploadCandidate,
-    err: &std::io::Error,
-) {
+fn log_transition_upload_cleanup_failure(lease: &TierOperationLease, object: &str, cleanup_version: &str, err: &std::io::Error) {
     warn!(
         tier = lease.tier_name(),
         tier_generation = lease.generation(),
         object,
-        remote_version = candidate.cleanup_version(),
+        remote_version = cleanup_version,
         error = ?err,
         "failed to clean uncommitted transition upload"
     );
@@ -1461,31 +1471,70 @@ fn log_transition_upload_cleanup_failure(
 pub(crate) struct TransitionUploadCleanup {
     lease: TierOperationLease,
     object: String,
-    candidate: TransitionUploadCandidate,
+    candidate: Option<TransitionUploadCandidate>,
+    cleanup_ctx: Arc<crate::runtime::instance::InstanceContext>,
+    cleanup_api: Option<Arc<ECStore>>,
     armed: bool,
 }
 
 impl TransitionUploadCleanup {
-    pub(crate) fn new(lease: TierOperationLease, object: &str, candidate: TransitionUploadCandidate) -> Self {
+    pub(crate) fn new(
+        lease: TierOperationLease,
+        object: &str,
+        cleanup_ctx: Arc<crate::runtime::instance::InstanceContext>,
+    ) -> Self {
         Self {
             lease,
             object: object.to_string(),
-            candidate,
+            candidate: None,
+            cleanup_ctx,
+            cleanup_api: None,
             armed: true,
         }
     }
 
+    fn cleanup_candidate(&self) -> std::io::Result<&TransitionUploadCandidate> {
+        self.candidate
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("transition upload cleanup has no confirmed remote candidate"))
+    }
+
     pub(crate) async fn cleanup(&mut self) -> std::io::Result<RemoteTierDeleteOutcome> {
-        match cleanup_uncommitted_transition_upload(&self.lease, &self.object, &self.candidate).await {
+        let candidate = self.cleanup_candidate()?;
+        let result = cleanup_uncommitted_transition_upload(
+            &self.lease,
+            &self.object,
+            candidate.cleanup_version(),
+            candidate.cleanup_version_is_exact(),
+        )
+        .await;
+        match result {
             Ok(outcome) => {
                 self.armed = false;
                 Ok(outcome)
             }
             Err(err) => {
-                log_transition_upload_cleanup_failure(&self.lease, &self.object, &self.candidate, &err);
+                log_transition_upload_cleanup_failure(&self.lease, &self.object, candidate.cleanup_version(), &err);
                 Err(err)
             }
         }
+    }
+
+    async fn cleanup_rejected_upload(&mut self, api: Option<Arc<ECStore>>) -> std::io::Result<()> {
+        self.cleanup_api = api.clone();
+        let candidate = self.cleanup_candidate()?;
+        let result = cleanup_rejected_transition_upload_durably(
+            &self.lease,
+            &self.object,
+            candidate.cleanup_version(),
+            candidate.cleanup_version_is_exact(),
+            api,
+        )
+        .await;
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -1498,6 +1547,9 @@ impl Drop for TransitionUploadCleanup {
         if !self.armed {
             return;
         }
+        let Some(candidate) = self.candidate.as_ref() else {
+            return;
+        };
         let lease = match self.lease.try_clone() {
             Ok(lease) => lease,
             Err(err) => {
@@ -1512,14 +1564,237 @@ impl Drop for TransitionUploadCleanup {
             }
         };
         let object = self.object.clone();
-        let candidate = self.candidate.clone();
+        let cleanup_version = candidate.cleanup_version().to_string();
+        let version_id_exact = candidate.cleanup_version_is_exact();
+        let cleanup_api = self.cleanup_api.clone();
+        let cleanup_ctx = self.cleanup_ctx.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                if let Err(err) = cleanup_uncommitted_transition_upload(&lease, &object, &candidate).await {
-                    log_transition_upload_cleanup_failure(&lease, &object, &candidate, &err);
+                let api = match cleanup_api {
+                    Some(api) => Some(api),
+                    None => transition_cleanup_store(&cleanup_ctx).await,
+                };
+                if let Err(err) =
+                    cleanup_rejected_transition_upload_durably(&lease, &object, &cleanup_version, version_id_exact, api).await
+                {
+                    warn!(
+                        tier = lease.tier_name(),
+                        tier_generation = lease.generation(),
+                        object,
+                        remote_version = cleanup_version,
+                        error = ?err,
+                        "cancelled transition upload was neither deleted nor journaled"
+                    );
                 }
             });
         }
+    }
+}
+
+async fn cleanup_rejected_transition_upload_durably(
+    lease: &TierOperationLease,
+    object: &str,
+    cleanup_version: &str,
+    version_id_exact: bool,
+    api: Option<Arc<ECStore>>,
+) -> std::io::Result<()> {
+    let journal_entry = Jentry {
+        obj_name: object.to_string(),
+        version_id: cleanup_version.to_string(),
+        tier_name: lease.tier_name().to_string(),
+        backend_identity: Some(lease.backend_identity()),
+        version_id_exact,
+    };
+
+    let journal_error = if let Some(api) = api.as_ref() {
+        match persist_tier_delete_journal_entry(api.clone(), &journal_entry).await {
+            Ok(()) => {
+                match cleanup_uncommitted_transition_upload(lease, object, cleanup_version, version_id_exact).await {
+                    Ok(_) => {
+                        if let Err(err) = remove_tier_delete_journal_entry(api.clone(), &journal_entry).await {
+                            warn!(
+                                tier = lease.tier_name(),
+                                object,
+                                error = ?err,
+                                "rejected transition upload was deleted but its cleanup journal was retained"
+                            );
+                        }
+                    }
+                    Err(err) => log_transition_upload_cleanup_failure(lease, object, cleanup_version, &err),
+                }
+                return Ok(());
+            }
+            Err(err) => err,
+        }
+    } else {
+        std::io::Error::other("object store unavailable for rejected transition cleanup journal")
+    };
+    warn!(
+        tier = lease.tier_name(),
+        object,
+        error = ?journal_error,
+        "failed to persist rejected transition upload cleanup journal"
+    );
+
+    let cleanup_error = match cleanup_uncommitted_transition_upload(lease, object, cleanup_version, version_id_exact).await {
+        Ok(_) => return Ok(()),
+        Err(err) => {
+            log_transition_upload_cleanup_failure(lease, object, cleanup_version, &err);
+            err
+        }
+    };
+    if let Some(api) = api {
+        match persist_tier_delete_journal_entry(api, &journal_entry).await {
+            Ok(()) => return Ok(()),
+            Err(retry_error) => {
+                return Err(std::io::Error::other(format!(
+                    "rejected transition upload was neither deleted nor journaled: initial journal error: {journal_error}; cleanup error: {cleanup_error}; journal retry error: {retry_error}"
+                )));
+            }
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "rejected transition upload was neither deleted nor journaled: journal error: {journal_error}; cleanup error: {cleanup_error}"
+    )))
+}
+
+async fn transition_cleanup_store(ctx: &Arc<crate::runtime::instance::InstanceContext>) -> Option<Arc<ECStore>> {
+    #[cfg(feature = "test-util")]
+    pause_transition_cleanup_store().await;
+
+    if let Some(api) = runtime_sources::object_store_handle().filter(|api| Arc::ptr_eq(&api.ctx, ctx)) {
+        return Some(api);
+    }
+    let metadata_sys = ctx.bucket_metadata_sys()?;
+    let api = metadata_sys.read().await.object_store();
+    Arc::ptr_eq(&api.ctx, ctx).then_some(api)
+}
+
+#[cfg(feature = "test-util")]
+#[derive(Default)]
+struct TransitionCleanupStoreBarrierState {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-util")]
+/// One-shot test barrier placed before transition cleanup resolves its ECStore.
+pub(crate) struct TransitionCleanupStoreBarrier {
+    state: Arc<TransitionCleanupStoreBarrierState>,
+}
+
+#[cfg(feature = "test-util")]
+static TRANSITION_CLEANUP_STORE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionCleanupStoreBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "test-util")]
+impl TransitionCleanupStoreBarrier {
+    /// Install the process-local barrier for the next cleanup-store resolution.
+    pub(crate) fn install() -> Self {
+        let state = Arc::new(TransitionCleanupStoreBarrierState::default());
+        let mut slot = TRANSITION_CLEANUP_STORE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition cleanup store barrier mutex should not poison");
+        assert!(slot.is_none(), "transition cleanup store barrier must be installed by one test at a time");
+        *slot = Some(state.clone());
+        drop(slot);
+        Self { state }
+    }
+
+    /// Wait until a transition reaches the cleanup-store resolution boundary.
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("transition should reach the cleanup store barrier");
+    }
+}
+
+#[cfg(feature = "test-util")]
+impl Drop for TransitionCleanupStoreBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TRANSITION_CLEANUP_STORE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition cleanup store barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(feature = "test-util")]
+async fn pause_transition_cleanup_store() {
+    let barrier = TRANSITION_CLEANUP_STORE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition cleanup store barrier mutex should not poison")
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TransitionUploadCandidateBarrier {
+    state: Arc<TransitionCleanupStoreBarrierState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static TRANSITION_UPLOAD_CANDIDATE_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<TransitionCleanupStoreBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl TransitionUploadCandidateBarrier {
+    fn install() -> Self {
+        let state = Arc::new(TransitionCleanupStoreBarrierState::default());
+        let mut slot = TRANSITION_UPLOAD_CANDIDATE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition upload candidate barrier mutex should not poison");
+        assert!(
+            slot.is_none(),
+            "transition upload candidate barrier must be installed by one test at a time"
+        );
+        *slot = Some(state.clone());
+        drop(slot);
+        Self { state }
+    }
+
+    async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("transition should record its remote upload candidate");
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TransitionUploadCandidateBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TRANSITION_UPLOAD_CANDIDATE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition upload candidate barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn pause_after_transition_upload_candidate_recorded() {
+    let barrier = TRANSITION_UPLOAD_CANDIDATE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition upload candidate barrier mutex should not poison")
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
     }
 }
 
@@ -1791,17 +2066,20 @@ mod transition_version_id_tests {
     use uuid::Uuid;
 
     #[test]
-    fn normalizes_unversioned_remote_ids() {
+    fn normalizes_persisted_unversioned_ids_and_preserves_put_constraints() {
         assert_eq!(parse_transition_version_id("").expect("empty remote version should be valid"), None);
         assert_eq!(
             parse_transition_version_id(&Uuid::nil().to_string()).expect("nil remote version should be valid"),
             None
         );
-        assert_eq!(
-            TransitionUploadCandidate::from_put_response(Uuid::nil().to_string()).cleanup_version(),
-            ""
-        );
-        assert_eq!(TransitionUploadCandidate::from_put_response(String::new()).cleanup_version(), "");
+        let nil_put_response = Uuid::nil().to_string();
+        let nil_candidate = TransitionUploadCandidate::from_put_response(nil_put_response.clone());
+        assert_eq!(nil_candidate.cleanup_version(), nil_put_response);
+        assert!(nil_candidate.cleanup_version_is_exact());
+
+        let empty_candidate = TransitionUploadCandidate::from_put_response(String::new());
+        assert_eq!(empty_candidate.cleanup_version(), "");
+        assert!(!empty_candidate.cleanup_version_is_exact());
     }
 
     #[test]
@@ -2930,33 +3208,52 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Ok(writer.produced())
         };
 
-        let rv = complete_transition_upload(
-            tgt_client.put_with_meta(&dest_obj, reader, fi.size, transition_meta),
-            producer,
-            expected_size,
-            consumed,
-        )
-        .await;
+        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, self.ctx.clone());
+        let remote_upload = {
+            let lease = &upload_cleanup.lease;
+            let recorded_candidate = &mut upload_cleanup.candidate;
+            let remote_object = &dest_obj;
+            async move {
+                let remote_version = lease.put_with_meta(remote_object, reader, fi.size, transition_meta).await?;
+                *recorded_candidate = Some(TransitionUploadCandidate::from_put_response(remote_version.clone()));
+                #[cfg(all(test, feature = "test-util"))]
+                pause_after_transition_upload_candidate_recorded().await;
+                Ok(remote_version)
+            }
+        };
+        let rv = complete_transition_upload(remote_upload, producer, expected_size, consumed).await;
         let candidate = match rv {
             Ok(completion) => completion.candidate,
             Err(failure) => {
-                if let Some(candidate) = failure.candidate {
-                    let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate);
-                    let _cleanup_result = upload_cleanup.cleanup().await;
+                if failure.candidate.is_some() {
+                    let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                    if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                        return Err(StorageError::Io(std::io::Error::other(format!(
+                            "{}; rejected remote upload cleanup failed: {cleanup_err}",
+                            failure.error
+                        ))));
+                    }
                 }
                 return Err(failure.error);
             }
         };
 
+        if let Err(err) = upload_cleanup.lease.validate_remote_version_id(candidate.remote_version()) {
+            let cleanup_api = transition_cleanup_store(&self.ctx).await;
+            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                return Err(StorageError::Io(std::io::Error::other(format!(
+                    "{err}; rejected remote upload cleanup failed: {cleanup_err}"
+                ))));
+            }
+            return Err(err.into());
+        }
         let transition_version_id = match parse_transition_version_id(candidate.remote_version()) {
             Ok(version_id) => version_id,
             Err(err) => {
-                let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate);
                 let _cleanup_result = upload_cleanup.cleanup().await;
                 return Err(err.into());
             }
         };
-        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, candidate);
 
         let mut commit_opts = opts.clone();
         commit_opts.no_lock = true;
@@ -3108,7 +3405,30 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let (actual_fi, _, _) = fi?;
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
+        if let Some(expected_operation_id) = expected_operation_id {
+            require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
+        }
         let mut ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
+        if let Some(expected_operation_id) = expected_operation_id {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut ropts.user_defined,
+                SUFFIX_RESTORE_OPERATION_ID,
+                expected_operation_id.to_string(),
+            );
+        }
+        let restore_commit_metadata = if let Some(expected_operation_id) = expected_operation_id {
+            let mut metadata = HashMap::new();
+            metadata.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"false\"".to_string());
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut metadata,
+                SUFFIX_RESTORE_OPERATION_ID,
+                expected_operation_id.to_string(),
+            );
+            metadata
+        } else {
+            HashMap::new()
+        };
         // The restore copy-back re-writes this same object via put_object /
         // new_multipart_upload / complete_multipart_upload, each of which takes
         // the object write lock in its commit phase. The caller
@@ -3254,6 +3574,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 uploaded_parts,
                 &ObjectOptions {
                     mod_time: oi.mod_time,
+                    version_id: oi.version_id.map(|version| version.to_string()),
+                    user_defined: restore_commit_metadata,
                     // Inherit the restore write lock (see ropts.no_lock above):
                     // the commit phase re-acquires this object's write lock.
                     no_lock: opts.no_lock,
@@ -3621,7 +3943,24 @@ mod transition_commit_failure_tests {
     use crate::services::tier::tier::TierConfigMgr;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
+    use s3s::dto::RestoreRequest;
     use tokio::io::AsyncReadExt;
+
+    fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_id.to_string(),
+        );
+        metadata
+    }
+
+    fn restore_metadata(operation_id: Uuid, ongoing: bool) -> HashMap<String, String> {
+        let mut metadata = restore_operation_id_metadata(operation_id);
+        metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
+        metadata
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -3831,6 +4170,97 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn local_commit_post_apply_error_rolls_back_the_errored_disk() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-post-apply-rollback-bucket";
+        let object = "object.bin";
+        let payload = b"post-apply delete errors must still roll back the changed disk".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install_after_lease_check(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(backend.put_count().await, 1, "remote candidate must exist before local commit");
+
+        crate::disk::local::set_delete_version_fail_after_commit(disk_stores[0].path().as_path(), object);
+        let saved_disk = {
+            let mut disks = set_disks.disks.write().await;
+            let saved = disks[1].take();
+            assert!(saved.is_some(), "test setup should start with the second disk online");
+            saved
+        };
+        barrier.release();
+        let result = transition.await.expect("transition task should not panic");
+
+        result.expect_err("post-apply disk error plus one offline disk must fail write quorum");
+        let errored_disk_fi = disk_stores[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("rollback must restore metadata on the disk that returned the post-apply error");
+        assert_ne!(
+            errored_disk_fi.transition_status, TRANSITION_COMPLETE,
+            "rollback must not skip the disk that applied delete_version but returned an error"
+        );
+        disk_stores[0]
+            .check_parts(bucket, object, &errored_disk_fi)
+            .await
+            .expect("rollback must restore the errored disk's staged data directory");
+
+        set_disks.disks.write().await[1] = saved_disk;
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "ambiguous local commit failure must retain the remote candidate for reconciliation"
+        );
+        assert_eq!(backend.object_count().await, 1);
+
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source must remain readable after rolling back the post-apply error")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the local source body should drain");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn production_transition_replacement_revokes_commit_and_cleans_with_old_driver() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-generation-fence-bucket";
@@ -4012,6 +4442,504 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn failed_restore_cleanup_ignores_replaced_operation_id_with_same_identity() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-operation-id-bucket";
+        let object = "object.bin";
+        let payload = b"same identity restore cleanup must respect operation id".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_a = Uuid::new_v4();
+        let operation_b = Uuid::new_v4();
+        let metadata = restore_metadata(operation_a, true);
+
+        let mut reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore operation A metadata should be installed");
+        let stale_operation_a = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation A metadata should resolve");
+
+        let mut operation_b_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut operation_b_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_b_metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("same-identity restore operation B should replace A");
+
+        let mut expected_operation_a = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut expected_operation_a,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_a.to_string(),
+        );
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &stale_operation_a,
+                &ObjectOptions {
+                    user_defined: expected_operation_a,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stale operation A cleanup should no-op, not fail");
+        let current_operation_b = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain readable");
+        assert!(
+            current_operation_b
+                .user_defined
+                .contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "stale cleanup for operation A must not remove operation B's restore header"
+        );
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current_operation_b.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale cleanup for operation A must not remove or rewrite operation B"
+        );
+
+        let mut expected_operation_b = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut expected_operation_b,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &current_operation_b,
+                &ObjectOptions {
+                    user_defined: expected_operation_b,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B cleanup should remove restore markers");
+        let cleaned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cleaned object metadata should remain readable");
+        assert!(
+            !cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "matching cleanup must remove the restore header"
+        );
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                cleaned.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            )
+            .is_none(),
+            "matching cleanup must remove the restore operation id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_worker_propagates_operation_id_to_final_put_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-worker-commit-operation-id-bucket";
+        let object = "object.bin";
+        let payload = b"restore worker must carry operation id to final commit".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should transition before restore");
+
+        let operation_a = Uuid::new_v4();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_a, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore operation A metadata should be installed");
+
+        let get_barrier = backend.arm_get_barrier().await;
+        let restore_set = Arc::clone(&set_disks);
+        let restore = tokio::spawn(async move {
+            restore_set
+                .restore_transitioned_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            restore_request: RestoreRequest {
+                                days: Some(1),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        user_defined: restore_operation_id_metadata(operation_a),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        get_barrier.wait_until_paused().await;
+
+        let operation_b = Uuid::new_v4();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_operation_id_metadata(operation_b)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operation B should replace operation A after worker starts tier GET");
+        get_barrier.release();
+        restore
+            .await
+            .expect("restore task should join")
+            .expect_err("stale operation A must fail at final PUT commit");
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain visible after stale worker is rejected");
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale worker must not remove or replace operation B"
+        );
+        assert_eq!(
+            current.transitioned_object.status, TRANSITION_COMPLETE,
+            "stale worker must not publish its restored local body after operation id replacement"
+        );
+        let mut body = Vec::new();
+        set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("original transitioned object should remain readable")
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("original remote body should drain");
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_put_commit_rechecks_operation_id_and_strips_internal_marker() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-put-commit-operation-id-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_a = Uuid::new_v4();
+        let operation_a_metadata = restore_metadata(operation_a, true);
+        let mut reader = PutObjReader::from_vec(b"restore source body".repeat(1024));
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_a_metadata.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ongoing restore operation A should be installed");
+
+        let operation_b = Uuid::new_v4();
+        let mut operation_b_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut operation_b_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_b_metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operation B should replace operation A before final commit");
+
+        let mut stale_restore_reader = PutObjReader::from_vec(b"stale A restored body".repeat(1024));
+        let result = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut stale_restore_reader,
+                &ObjectOptions {
+                    user_defined: operation_a_metadata,
+                    ..Default::default()
+                },
+            )
+            .await;
+        result.expect_err("stale operation A must not commit after operation B replaces it");
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain current after stale commit is rejected");
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale commit must not remove or replace operation B"
+        );
+
+        let mut matching_restore_reader = PutObjReader::from_vec(b"matching B restored body".repeat(1024));
+        let operation_b_restore_metadata = restore_metadata(operation_b, false);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut matching_restore_reader,
+                &ObjectOptions {
+                    user_defined: operation_b_restore_metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B should be allowed to commit");
+        let restored = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("restored object should remain readable");
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                restored.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            )
+            .is_none(),
+            "completed restore PUT must not persist the internal operation id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_multipart_complete_rechecks_operation_id_and_strips_internal_marker() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-multipart-commit-operation-id-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_a = Uuid::new_v4();
+        let operation_a_metadata = restore_metadata(operation_a, true);
+        let mut initial_reader = PutObjReader::from_vec(b"multipart restore source body".repeat(1024));
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_a_metadata.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ongoing multipart restore operation A should be installed");
+
+        let upload = set_disks
+            .new_multipart_upload(
+                bucket,
+                object,
+                &ObjectOptions {
+                    user_defined: operation_a_metadata.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restore multipart upload should be created");
+        let mut part_reader = PutObjReader::from_vec(b"stale multipart A restored body".repeat(1024));
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("restore multipart part should be written");
+
+        let operation_b = Uuid::new_v4();
+        let mut operation_b_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut operation_b_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_b_metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("operation B should replace operation A before multipart complete");
+
+        let complete_result = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag.clone(),
+                    ..Default::default()
+                }],
+                &ObjectOptions {
+                    user_defined: operation_a_metadata,
+                    ..Default::default()
+                },
+            )
+            .await;
+        complete_result.expect_err("stale operation A must not complete after operation B replaces it");
+
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain current after stale multipart completion");
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale multipart completion must not remove or replace operation B"
+        );
+
+        let operation_b_restore_metadata = restore_metadata(operation_b, false);
+        let upload = set_disks
+            .new_multipart_upload(
+                bucket,
+                object,
+                &ObjectOptions {
+                    user_defined: operation_b_restore_metadata.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B multipart upload should be created");
+        let mut part_reader = PutObjReader::from_vec(b"matching multipart B restored body".repeat(1024));
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("matching restore multipart part should be written");
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions {
+                    user_defined: operation_b_restore_metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B should complete");
+        let restored = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("completed multipart restore should remain readable");
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                restored.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            )
+            .is_none(),
+            "completed multipart restore must not persist the internal operation id"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn legacy_reload_rejects_route_change_after_local_transition_commit() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-post-check-fence-bucket";
@@ -4106,6 +5034,26 @@ mod transition_commit_failure_tests {
             .await
             .expect("transitioned metadata should resolve");
         let expected_identity = rustfs_utils::crypto::hex(old_identity);
+        let rustfs_identity_key = format!(
+            "{}{}",
+            rustfs_utils::http::metadata_compat::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID
+        );
+        let minio_identity_key = format!(
+            "{}{}",
+            rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID
+        );
+        assert_eq!(
+            transitioned.user_defined.get(&rustfs_identity_key),
+            Some(&expected_identity),
+            "transition commits must write the RustFS destination identity key"
+        );
+        assert_eq!(
+            transitioned.user_defined.get(&minio_identity_key),
+            Some(&expected_identity),
+            "transition commits must write the MinIO-compatible destination identity key"
+        );
         assert_eq!(
             rustfs_utils::http::metadata_compat::get_str(
                 &transitioned.user_defined,
@@ -4422,6 +5370,32 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn remote_put_failure_preserves_error_without_cleanup_candidate() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-remote-put-failure-bucket";
+        let object = "object.bin";
+        let payload = b"a failed remote PUT must not manufacture a cleanup candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_unreachable(true).await;
+
+        let error = set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("an unreachable tier must fail the remote PUT");
+        assert!(
+            matches!(error, StorageError::Io(ref err) if err.kind() == std::io::ErrorKind::ConnectionRefused),
+            "the original remote PUT error must be preserved: {error:?}"
+        );
+        assert_eq!(backend.remove_count().await, 0, "an unconfirmed candidate must not be cleaned up");
+        assert_eq!(backend.exact_remove_count(), 0, "an unconfirmed candidate must not reach exact cleanup");
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn partial_remote_acceptance_cleans_exact_candidate_and_preserves_source() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-partial-accept-bucket";
@@ -4442,8 +5416,8 @@ mod transition_upload_integrity_tests {
         let removed_versions = backend.remove_versions().await;
         assert_eq!(removed_versions.len(), 1);
         assert_eq!(
-            removed_versions[0].1, "",
-            "the nil UUID response is the backend's unversioned sentinel and must not become an S3 versionId"
+            removed_versions[0].1, remote_version,
+            "a non-empty fresh PUT response must be used as the exact cleanup constraint"
         );
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
@@ -4562,10 +5536,102 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn cancelled_after_remote_upload_cleans_candidate_and_preserves_source() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-cancel-after-upload-bucket";
+        let object = "object.bin";
+        let payload = b"cancelled transition after upload must clean remote candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let barrier = TransitionCommitBarrier::install(bucket, object);
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move {
+            transition_set
+                .transition_object(bucket, object, &transition_options(&original, tier_name))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        assert_eq!(
+            backend.put_count().await,
+            1,
+            "transition must upload a remote candidate before the cancellation point"
+        );
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should expose one remote candidate/version");
+        assert_eq!(backend.object_count().await, 1, "remote candidate should be visible before cancellation");
+
+        transition.abort();
+        let join = transition
+            .await
+            .expect_err("aborted transition task should report cancellation");
+        assert!(join.is_cancelled(), "transition task should be cancelled, not panic");
+        drop(barrier);
+
+        assert!(
+            backend
+                .wait_for_remote_absence(&put_versions[0].0, Duration::from_secs(5))
+                .await,
+            "cancellation cleanup must remove the uploaded remote candidate"
+        );
+        assert_eq!(
+            backend.remove_versions().await,
+            put_versions,
+            "cancellation cleanup must target the exact remote version returned by PUT"
+        );
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_after_put_response_before_upload_join_cleans_candidate() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-cancel-before-upload-join-bucket";
+        let object = "object.bin";
+        let payload = b"a confirmed remote upload must survive cancellation until cleanup owns it".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let barrier = TransitionUploadCandidateBarrier::install();
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move {
+            transition_set
+                .transition_object(bucket, object, &transition_options(&original, tier_name))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "the remote PUT response must identify one cleanup candidate");
+        assert_eq!(backend.object_count().await, 1, "the candidate must exist at the cancellation point");
+
+        transition.abort();
+        assert!(
+            transition
+                .await
+                .expect_err("aborted transition task should report cancellation")
+                .is_cancelled()
+        );
+        drop(barrier);
+
+        assert!(
+            backend
+                .wait_for_remote_absence(&put_versions[0].0, Duration::from_secs(5))
+                .await,
+            "the pre-created cleanup guard must remove a candidate recorded before upload finalization completes"
+        );
+        assert_eq!(backend.remove_versions().await, put_versions);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn real_bitrot_producer_failures_do_not_commit_transition() {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_reject_non_empty_remote_versions(true);
 
         for position in [
             ShardCorruptionPosition::First,
@@ -4721,6 +5787,63 @@ mod transition_upload_integrity_tests {
             backend.put_versions().await,
             "authoritative read failure must remove the exact uploaded remote version"
         );
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn backend_version_constraint_rejects_uuid_candidate_before_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-version-constraint-bucket";
+        let object = "object.bin";
+        let payload = b"version-constrained backend candidate must retain local data".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let remote_version = Uuid::new_v4().to_string();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        backend.set_reject_non_empty_remote_versions(true);
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("a backend requiring unversioned objects must reject a UUID-shaped version");
+
+        let put_versions = backend.put_versions().await;
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions, put_versions);
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(removed_versions[0].1, remote_version);
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn backend_version_constraint_cleans_nil_uuid_with_exact_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-nil-version-constraint-bucket";
+        let object = "object.bin";
+        let payload = b"a fresh nil UUID response remains an exact cleanup constraint".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let remote_version = Uuid::nil().to_string();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        backend.set_reject_non_empty_remote_versions(true);
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("a backend requiring an empty version must reject a nil UUID string");
+
+        let put_versions = backend.put_versions().await;
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(removed_versions[0].0, put_versions[0].0);
+        assert_eq!(removed_versions[0].1, remote_version);
+        assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }

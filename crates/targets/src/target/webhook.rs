@@ -896,4 +896,63 @@ mod tests {
 
         handle.join().expect("mock server thread");
     }
+
+    #[tokio::test]
+    async fn test_webhook_client_reaches_https_origin_with_custom_ca() {
+        use rustls::{
+            ServerConfig, ServerConnection, StreamOwned,
+            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Once};
+
+        static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
+        INSTALL_CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert should generate");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = temp_dir.path().join("webhook-ca.pem");
+        std::fs::write(&ca_path, cert.pem()).expect("write ca pem");
+
+        let cert_chain = vec![cert.der().clone()];
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key_der)
+                .expect("server cert should be valid"),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept tls client");
+            let connection = ServerConnection::new(server_config).expect("server connection");
+            let mut tls_stream = StreamOwned::new(connection, stream);
+            let mut buf = [0u8; 1024];
+            let _ = tls_stream.read(&mut buf);
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            tls_stream.write_all(response.as_bytes()).expect("write response");
+            tls_stream.flush().expect("flush response");
+        });
+
+        let args = WebhookArgs {
+            client_ca: ca_path.to_string_lossy().into_owned(),
+            ..base_args()
+        };
+        let client = WebhookTarget::<serde_json::Value>::build_http_client(&args).expect("build https client");
+        let resp = client
+            .head(format!("https://localhost:{}/hook", addr.port()))
+            .send()
+            .await
+            .expect("https webhook probe should trust configured ca");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text_with_charset("utf-8").await.expect("read response body"), "");
+        handle.join().expect("tls server thread");
+    }
 }

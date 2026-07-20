@@ -28,6 +28,24 @@ const NODE_HEAL_STATUS_VERSION: u8 = 1;
 const NODE_HEAL_STATUS_MAX_SIZE: usize = 64 * 1024;
 const HEAL_TOPOLOGY_FINGERPRINT_DOMAIN: &[u8] = b"rustfs-heal-topology-v1\0";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HealControlCoordinator {
+    pub grid_host: String,
+    pub is_local: bool,
+}
+
+pub(crate) fn heal_control_coordinator(endpoint_pools: &EndpointServerPools) -> Result<HealControlCoordinator, String> {
+    endpoint_pools
+        .get_nodes()
+        .into_iter()
+        .next()
+        .map(|node| HealControlCoordinator {
+            grid_host: node.grid_host,
+            is_local: node.is_local,
+        })
+        .ok_or_else(|| "heal control topology has no coordinator".to_string())
+}
+
 fn hash_sized(hasher: &mut Sha256, value: &[u8]) -> Result<(), String> {
     let len = u64::try_from(value.len()).map_err(|_| "heal topology field length cannot be represented".to_string())?;
     hasher.update(len.to_be_bytes());
@@ -246,7 +264,7 @@ pub(crate) fn decode_node_heal_status(data: &[u8]) -> Result<NodeHealStatusSnaps
 mod tests {
     use super::{
         NODE_HEAL_STATUS_MAX_SIZE, NODE_HEAL_STATUS_VERSION, NodeHealProgress, NodeHealStatusSnapshot, decode_node_heal_status,
-        encode_node_heal_status, heal_topology_fingerprint,
+        encode_node_heal_status, heal_control_coordinator, heal_topology_fingerprint,
     };
     use crate::storage::storage_api::{
         Endpoint,
@@ -306,6 +324,23 @@ mod tests {
 
         let changed = topology_endpoints("node-e");
         assert_ne!(heal_topology_fingerprint(&changed).expect("changed topology should still hash"), expected);
+    }
+
+    #[test]
+    fn heal_control_coordinator_is_stable_across_node_views() {
+        let topology = topology_endpoints("node-d");
+        let coordinator = heal_control_coordinator(&topology).expect("valid topology should select a coordinator");
+        assert_eq!(coordinator.grid_host, "http://node-a:9000");
+        assert!(coordinator.is_local);
+
+        let mut other_node_view = topology;
+        for endpoint in other_node_view.as_mut()[0].endpoints.as_mut() {
+            endpoint.is_local = endpoint.host_port() == "node-c:9000";
+        }
+        let coordinator = heal_control_coordinator(&other_node_view).expect("all nodes should select the same coordinator");
+        assert_eq!(coordinator.grid_host, "http://node-a:9000");
+        assert!(!coordinator.is_local);
+        assert!(heal_control_coordinator(&EndpointServerPools::default()).is_err());
     }
 
     #[test]

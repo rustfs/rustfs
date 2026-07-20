@@ -179,6 +179,7 @@ struct CompletedHealStatus {
     heal_type: HealType,
     status: HealTaskStatus,
     result_items: Vec<HealResultItem>,
+    result_items_truncated: bool,
     completed_at: SystemTime,
 }
 
@@ -198,6 +199,7 @@ struct RetryingHeal {
 pub struct HealTaskReport {
     pub status: HealTaskStatus,
     pub result_items: Vec<HealResultItem>,
+    pub result_items_truncated: bool,
     pub progress: Option<HealProgress>,
 }
 
@@ -1600,6 +1602,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: task.get_status().await,
                     result_items: task.get_result_items().await,
+                    result_items_truncated: task.result_items_truncated(),
                     progress: Some(task.get_progress().await),
                 });
             }
@@ -1611,6 +1614,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: retrying.status(),
                     result_items: Vec::new(),
+                    result_items_truncated: false,
                     progress: None,
                 });
             }
@@ -1625,6 +1629,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    result_items_truncated: completed.result_items_truncated,
                     progress: None,
                 });
             }
@@ -1636,6 +1641,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: HealTaskStatus::Pending,
                     result_items: Vec::new(),
+                    result_items_truncated: false,
                     progress: None,
                 });
             }
@@ -1647,6 +1653,7 @@ impl HealManager {
             return Ok(HealTaskReport {
                 status: completed.status.clone(),
                 result_items: completed.result_items.clone(),
+                result_items_truncated: completed.result_items_truncated,
                 progress: None,
             });
         }
@@ -1666,6 +1673,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: task.get_status().await,
                     result_items: task.get_result_items().await,
+                    result_items_truncated: task.result_items_truncated(),
                     progress: Some(task.get_progress().await),
                 });
             }
@@ -1679,6 +1687,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: retrying.status(),
                     result_items: Vec::new(),
+                    result_items_truncated: false,
                     progress: None,
                 });
             }
@@ -1694,6 +1703,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    result_items_truncated: completed.result_items_truncated,
                     progress: None,
                 });
             }
@@ -1705,6 +1715,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: HealTaskStatus::Pending,
                     result_items: Vec::new(),
+                    result_items_truncated: false,
                     progress: None,
                 });
             }
@@ -1719,6 +1730,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    result_items_truncated: completed.result_items_truncated,
                     progress: None,
                 });
             }
@@ -2618,6 +2630,7 @@ impl HealManager {
                             heal_type: completed_task.heal_type.clone(),
                             status: completed_status.clone(),
                             result_items: completed_task.get_result_items().await,
+                            result_items_truncated: completed_task.result_items_truncated(),
                             completed_at: SystemTime::now(),
                         };
                         let mut completed_heals_guard = completed_heals_clone.lock().await;
@@ -3848,6 +3861,7 @@ mod tests {
                     retry_attempt: request.retry_attempts,
                 },
                 result_items: Vec::new(),
+                result_items_truncated: false,
                 completed_at: SystemTime::now(),
             },
         );
@@ -4411,6 +4425,7 @@ mod tests {
                 },
                 status: HealTaskStatus::Completed,
                 result_items: Vec::new(),
+                result_items_truncated: false,
                 completed_at: SystemTime::now(),
             },
         );
@@ -4444,6 +4459,7 @@ mod tests {
                     object_size: 1024,
                     ..Default::default()
                 }],
+                result_items_truncated: true,
                 completed_at: SystemTime::now(),
             },
         );
@@ -4452,6 +4468,7 @@ mod tests {
             .get_task_report_for_path("bucket/object", "completed-token")
             .await
             .expect("recent completed task report should be queryable");
+        assert!(report.result_items_truncated);
 
         assert_eq!(report.status, HealTaskStatus::Completed);
         assert_eq!(report.result_items.len(), 1);

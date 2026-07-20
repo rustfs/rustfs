@@ -26,7 +26,8 @@ use rustfs_utils::http::headers::{
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING,
     SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
-    SUFFIX_REPLICATION_TIMESTAMP, has_internal_suffix, insert_bytes, is_internal_key,
+    SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID, contains_key_str, has_internal_suffix, insert_bytes,
+    is_internal_key, remove_bytes,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -248,6 +249,9 @@ impl FileMeta {
                         if let Some(ref mut obj) = ver.object {
                             if replace_user_metadata {
                                 obj.meta_user.clear();
+                                if !contains_key_str(&fi.metadata, SUFFIX_RESTORE_OPERATION_ID) {
+                                    remove_bytes(&mut obj.meta_sys, SUFFIX_RESTORE_OPERATION_ID);
+                                }
                             }
 
                             for (k, v) in fi.metadata.iter() {
@@ -527,6 +531,9 @@ impl FileMeta {
         for (i, ver) in self.versions.iter().enumerate() {
             if ver.header.version_id != vid {
                 continue;
+            }
+            if fi.tier_free_version() && !ver.header.free_version() {
+                return Err(Error::FileVersionNotFound);
             }
 
             match ver.header.version_type {

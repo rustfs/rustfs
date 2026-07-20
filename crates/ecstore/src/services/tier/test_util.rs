@@ -57,7 +57,10 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -74,6 +77,21 @@ use crate::services::tier::tier_config::{TierConfig, TierMinIO, TierType};
 use crate::services::tier::warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::path_join_buf;
+
+/// One-shot barrier before rejected transition cleanup resolves its ECStore.
+pub struct TransitionCleanupStoreBarrier(crate::set_disk::SetDiskTransitionCleanupStoreBarrier);
+
+impl TransitionCleanupStoreBarrier {
+    /// Install the barrier for the next rejected transition cleanup.
+    pub fn install() -> Self {
+        Self(crate::set_disk::SetDiskTransitionCleanupStoreBarrier::install())
+    }
+
+    /// Wait until the rejected transition reaches cleanup-store resolution.
+    pub async fn wait_until_paused(&self) {
+        self.0.wait_until_paused().await;
+    }
+}
 
 /// Default polling cadence used by the `wait_for_*` helpers.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -142,11 +160,15 @@ struct MockWarmBackendInner {
     faults: Mutex<FaultConfig>,
     put_read_limit: Mutex<Option<usize>>,
     put_remote_version: Mutex<Option<String>>,
+    reject_non_empty_remote_versions: AtomicBool,
+    fail_remove: AtomicBool,
+    exact_remove_count: AtomicUsize,
     op_log: Mutex<Vec<MockWarmOp>>,
     put_versions: Mutex<Vec<(String, String)>>,
     remove_versions: Mutex<Vec<(String, String)>>,
     put_barrier: Mutex<Option<Arc<MockPutBarrierState>>>,
     get_barrier: Mutex<Option<Arc<MockGetBarrierState>>>,
+    remove_barrier: Mutex<Option<Arc<MockRemoveBarrierState>>>,
 }
 
 #[derive(Default)]
@@ -160,6 +182,23 @@ struct MockGetBarrierState {
     arrived: Notify,
     release: Notify,
     fail_after_release: bool,
+}
+
+#[derive(Default)]
+struct MockRemoveBarrierState {
+    arrived: Notify,
+    release: Notify,
+    operation_dropped: Notify,
+}
+
+struct MockRemoveOperationGuard {
+    state: Arc<MockRemoveBarrierState>,
+}
+
+impl Drop for MockRemoveOperationGuard {
+    fn drop(&mut self) {
+        self.state.operation_dropped.notify_one();
+    }
 }
 
 /// One-shot barrier that pauses a mock tier PUT after storing its remote body.
@@ -212,6 +251,38 @@ impl Drop for MockGetBarrier {
     }
 }
 
+/// One-shot barrier that pauses and then fails a mock tier DELETE.
+pub struct MockRemoveBarrier {
+    state: Arc<MockRemoveBarrierState>,
+}
+
+impl MockRemoveBarrier {
+    /// Wait until DELETE reaches the deterministic failure point.
+    pub async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("mock tier DELETE should reach the deterministic barrier");
+    }
+
+    /// Release the paused DELETE, which then returns an injected error.
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+
+    /// Wait until the paused DELETE future completes or is cancelled.
+    pub async fn wait_until_operation_dropped(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.operation_dropped.notified())
+            .await
+            .expect("mock tier DELETE operation should be dropped");
+    }
+}
+
+impl Drop for MockRemoveBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+    }
+}
+
 /// In-memory [`WarmBackend`] for lifecycle / tiering integration tests.
 ///
 /// Cloning shares the same underlying storage, fault configuration, and
@@ -235,6 +306,15 @@ impl MockWarmBackend {
         MockPutBarrier { state }
     }
 
+    /// Pause and then fail the next DELETE after it reaches the backend.
+    pub async fn arm_failing_remove_barrier(&self) -> MockRemoveBarrier {
+        let state = Arc::new(MockRemoveBarrierState::default());
+        let mut barrier = self.inner.remove_barrier.lock().await;
+        assert!(barrier.is_none(), "mock tier DELETE barrier is already armed");
+        *barrier = Some(state.clone());
+        MockRemoveBarrier { state }
+    }
+
     /// Arm a one-shot pause before the next tier GET, then return an error
     /// after the test releases it.
     pub async fn arm_failing_get_barrier(&self) -> MockGetBarrier {
@@ -242,6 +322,14 @@ impl MockWarmBackend {
             fail_after_release: true,
             ..Default::default()
         });
+        *self.inner.get_barrier.lock().await = Some(Arc::clone(&state));
+        MockGetBarrier { state }
+    }
+
+    /// Arm a one-shot pause before the next tier GET, then continue normally
+    /// after the test releases it.
+    pub async fn arm_get_barrier(&self) -> MockGetBarrier {
+        let state = Arc::new(MockGetBarrierState::default());
         *self.inner.get_barrier.lock().await = Some(Arc::clone(&state));
         MockGetBarrier { state }
     }
@@ -290,6 +378,16 @@ impl MockWarmBackend {
         *self.inner.put_remote_version.lock().await = remote_version;
     }
 
+    /// Reject non-empty remote versions before transition metadata is committed.
+    pub fn set_reject_non_empty_remote_versions(&self, reject: bool) {
+        self.inner.reject_non_empty_remote_versions.store(reject, Ordering::Release);
+    }
+
+    /// Enable or disable a persistent remove failure for durability tests.
+    pub fn set_remove_failure(&self, fail: bool) {
+        self.inner.fail_remove.store(fail, Ordering::Release);
+    }
+
     async fn precondition(&self) -> Result<(), std::io::Error> {
         let (latency, error) = {
             let faults = self.inner.faults.lock().await;
@@ -329,6 +427,11 @@ impl MockWarmBackend {
             .iter()
             .filter(|op| matches!(op, MockWarmOp::Remove { .. }))
             .count()
+    }
+
+    /// Number of exact-version trait remove calls, including failed attempts.
+    pub fn exact_remove_count(&self) -> usize {
+        self.inner.exact_remove_count.load(Ordering::Acquire)
     }
 
     /// Return the exact object/version pairs produced by successful tier PUTs.
@@ -476,6 +579,13 @@ impl MockWarmBackend {
 
 #[async_trait]
 impl WarmBackend for MockWarmBackend {
+    fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
+        if self.inner.reject_non_empty_remote_versions.load(Ordering::Acquire) && !remote_version_id.is_empty() {
+            return Err(std::io::Error::other("mock warm backend requires an unversioned remote object"));
+        }
+        Ok(())
+    }
+
     async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
         self.precondition().await?;
         let bytes = self.read_bytes(r).await?;
@@ -574,6 +684,15 @@ impl WarmBackend for MockWarmBackend {
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         self.precondition().await?;
+        if let Some(barrier) = self.inner.remove_barrier.lock().await.take() {
+            let _operation = MockRemoveOperationGuard { state: barrier.clone() };
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+            return Err(std::io::Error::other("mock warm backend remove failure after barrier"));
+        }
+        if self.inner.fail_remove.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("mock warm backend remove failure"));
+        }
         let mut objects = self.inner.objects.lock().await;
         if let Some(stored) = objects.get(object)
             && !rv.is_empty()
@@ -593,6 +712,17 @@ impl WarmBackend for MockWarmBackend {
         })
         .await;
         Ok(())
+    }
+
+    async fn remove_exact(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
+        if rv.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an exact mock tier delete requires a remote version ID",
+            ));
+        }
+        self.inner.exact_remove_count.fetch_add(1, Ordering::AcqRel);
+        self.remove(object, rv).await
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {

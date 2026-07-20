@@ -39,6 +39,7 @@ pub const SUFFIX_TRANSITIONED_OBJECTNAME: &str = "transitioned-object";
 pub const SUFFIX_TRANSITIONED_VERSION_ID: &str = "transitioned-versionID";
 pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
 pub const SUFFIX_TRANSITION_TIER_DESTINATION_ID: &str = "transition-tier-destination-id";
+pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
 pub const SUFFIX_FREE_VERSION: &str = "free-version";
 pub const SUFFIX_PURGESTATUS: &str = "purgestatus";
 pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";

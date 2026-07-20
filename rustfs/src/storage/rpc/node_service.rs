@@ -39,9 +39,17 @@ use rustfs_protos::{
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
 use serde::Deserialize;
-use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
+use time::OffsetDateTime;
 use tokio::spawn;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
@@ -59,6 +67,95 @@ const EVENT_RPC_REQUEST_FAILED: &str = "rpc_request_failed";
 const EVENT_RPC_RESPONSE_EMITTED: &str = "rpc_response_emitted";
 const EVENT_RPC_BACKGROUND_TASK_SPAWNED: &str = "rpc_background_task_spawned";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
+const HEAL_CONTROL_REPLAY_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[derive(Debug)]
+struct HealControlReplayEntry {
+    command_digest: [u8; 32],
+    expires_at_unix_ms: i64,
+    result: tokio::sync::Mutex<Option<Vec<u8>>>,
+}
+
+fn remove_heal_control_replay(
+    replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
+    request_id: &str,
+    replay_entry: &Arc<HealControlReplayEntry>,
+) {
+    if replay_cache
+        .get(request_id)
+        .is_some_and(|cached| Arc::ptr_eq(cached, replay_entry))
+    {
+        replay_cache.remove(request_id);
+    }
+}
+
+static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
+
+fn admit_heal_control_replay(
+    replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
+    request_id: &str,
+    command_digest: &[u8; 32],
+    expires_at_unix_ms: i64,
+    now_unix_ms: i64,
+) -> Result<Arc<HealControlReplayEntry>, Status> {
+    replay_cache.retain(|_, entry| entry.expires_at_unix_ms > now_unix_ms || Arc::strong_count(entry) > 1);
+    if let Some(cached) = replay_cache.get(request_id) {
+        if &cached.command_digest != command_digest {
+            return Err(Status::already_exists("heal control request ID was reused with a different command"));
+        }
+        return Ok(Arc::clone(cached));
+    }
+    if replay_cache.len() >= HEAL_CONTROL_REPLAY_CACHE_MAX_ENTRIES {
+        return Err(Status::resource_exhausted("heal control replay cache is full"));
+    }
+    let entry = Arc::new(HealControlReplayEntry {
+        command_digest: *command_digest,
+        expires_at_unix_ms,
+        result: tokio::sync::Mutex::new(None),
+    });
+    replay_cache.insert(request_id.to_string(), Arc::clone(&entry));
+    Ok(entry)
+}
+
+fn heal_control_now_unix_ms() -> Result<i64, Status> {
+    i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| Status::internal("heal control clock is out of range"))
+}
+
+fn heal_control_remaining(expires_at_unix_ms: i64, now_unix_ms: i64) -> Result<Duration, Status> {
+    let remaining_ms = expires_at_unix_ms.saturating_sub(now_unix_ms);
+    let remaining_ms = u64::try_from(remaining_ms).map_err(|_| Status::deadline_exceeded("heal control request expired"))?;
+    if remaining_ms == 0 {
+        return Err(Status::deadline_exceeded("heal control request expired"));
+    }
+    Ok(Duration::from_millis(remaining_ms))
+}
+
+fn validate_admin_heal_control_start(request: &rustfs_common::heal_channel::HealChannelRequest) -> Result<(), Status> {
+    if request.source != rustfs_common::heal_channel::HealRequestSource::Admin {
+        return Err(Status::permission_denied("heal control start source must be admin"));
+    }
+    if request.pool_index.is_some() != request.set_index.is_some() {
+        return Err(Status::invalid_argument("heal control start requires both pool and set"));
+    }
+    if request.bucket.is_empty() {
+        if request.object_prefix.as_deref().is_some_and(|prefix| !prefix.is_empty()) {
+            return Err(Status::invalid_argument("root heal control start cannot contain an object prefix"));
+        }
+        if request.recursive != Some(true) {
+            return Err(Status::invalid_argument("root heal control start must be recursive"));
+        }
+        let erasure_set_target = request.pool_index.is_some();
+        if request.disk.is_some() != erasure_set_target {
+            return Err(Status::invalid_argument("root erasure-set heal control target is inconsistent"));
+        }
+    } else if request.disk.is_some() {
+        return Err(Status::invalid_argument(
+            "bucket heal control start cannot contain an erasure-set disk target",
+        ));
+    }
+    Ok(())
+}
 
 fn scanner_activity_response(namespace_generation: u64) -> ScannerActivityResponse {
     ScannerActivityResponse {
@@ -265,12 +362,17 @@ impl HealControlRpcService {
         Err(Status::failed_precondition("heal control topology is not initialized"))
     }
 
-    #[cfg(test)]
     async fn endpoint_pools(&self) -> Option<EndpointServerPools> {
+        #[cfg(test)]
         if let Some(source) = self.endpoint_pools_source.as_ref() {
             return source.read().await.clone();
         }
-        self.endpoint_pools.clone()
+        #[cfg(test)]
+        if self.endpoint_pools.is_some() {
+            return self.endpoint_pools.clone();
+        }
+        let context = runtime_sources::current_app_context()?;
+        context.endpoints().handle()
     }
 }
 
@@ -286,6 +388,100 @@ pub(crate) async fn initialize_heal_topology_fingerprint(
         .map_err(|_| "heal control topology calculation task failed".to_string())??;
     let _ = cache.set(fingerprint);
     Ok(())
+}
+
+pub(crate) async fn execute_heal_control_envelope(
+    envelope: rustfs_protos::heal_control::Envelope,
+    expected_coordinator_epoch: u64,
+) -> Result<Vec<u8>, Status> {
+    execute_heal_control_envelope_with_manager(envelope, expected_coordinator_epoch, None).await
+}
+
+async fn execute_heal_control_envelope_with_manager(
+    envelope: rustfs_protos::heal_control::Envelope,
+    expected_coordinator_epoch: u64,
+    manager: Option<Arc<rustfs_heal::HealManager>>,
+) -> Result<Vec<u8>, Status> {
+    let now = heal_control_now_unix_ms()?;
+    envelope
+        .validate_execution(now, expected_coordinator_epoch)
+        .map_err(Status::failed_precondition)?;
+    let expires_at_unix_ms = envelope.expires_at_unix_ms();
+    let canonical_envelope = rustfs_protos::heal_control::encode_envelope(&envelope).map_err(Status::invalid_argument)?;
+    let command_digest = Sha256::digest(&canonical_envelope).into();
+    let (request_id, coordinator_epoch, command) = envelope.into_execution().map_err(Status::invalid_argument)?;
+
+    let replay_cache = HEAL_CONTROL_REPLAY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let replay_entry = {
+        let mut replay_cache = timeout(heal_control_remaining(expires_at_unix_ms, now)?, replay_cache.lock())
+            .await
+            .map_err(|_| Status::deadline_exceeded("heal control request expired while awaiting replay admission"))?;
+        admit_heal_control_replay(&mut replay_cache, &request_id, &command_digest, expires_at_unix_ms, now)?
+    };
+    let mut replay_result = timeout(heal_control_remaining(expires_at_unix_ms, now)?, replay_entry.result.lock())
+        .await
+        .map_err(|_| Status::deadline_exceeded("heal control request expired while awaiting matching execution"))?;
+    let now = heal_control_now_unix_ms()?;
+    if expires_at_unix_ms <= now {
+        return Err(Status::deadline_exceeded("heal control request expired before execution"));
+    }
+    if let Some(cached) = replay_result.as_ref() {
+        return Ok(cached.clone());
+    }
+
+    if let rustfs_protos::heal_control::ExecutableCommand::Start { request } = &command {
+        validate_admin_heal_control_start(request)?;
+    }
+    let retain_completed_result = !matches!(&command, rustfs_protos::heal_control::ExecutableCommand::Query { .. });
+
+    let manager = manager
+        .or_else(|| rustfs_heal::get_heal_manager().cloned())
+        .ok_or_else(|| Status::failed_precondition("heal manager is not initialized"))?;
+    let processor = rustfs_heal::HealChannelProcessor::new(manager.clone());
+    let remaining = heal_control_remaining(expires_at_unix_ms, now)?;
+    let outcome = match command {
+        rustfs_protos::heal_control::ExecutableCommand::Start { request } => {
+            let receipt = timeout(remaining, processor.execute_start_request(request))
+                .await
+                .map_err(|_| Status::deadline_exceeded("heal control start expired before admission"))?
+                .map_err(|_| Status::internal("heal control start admission failed"))?;
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id: receipt.task_id,
+                admission: receipt.result.into(),
+            }
+        }
+        rustfs_protos::heal_control::ExecutableCommand::Query { heal_path, client_token } => {
+            let response = timeout(remaining, processor.execute_query_request(heal_path, client_token))
+                .await
+                .map_err(|_| Status::deadline_exceeded("heal control query expired before execution"))?
+                .map_err(|_| Status::internal("heal control query failed"))?;
+            rustfs_protos::heal_control::Outcome::Channel {
+                success: response.success,
+                data: response.data,
+                error: response.error,
+            }
+        }
+        rustfs_protos::heal_control::ExecutableCommand::Cancel { heal_path, client_token } => {
+            let response = timeout(remaining, processor.execute_cancel_request(heal_path, client_token))
+                .await
+                .map_err(|_| Status::deadline_exceeded("heal control cancel expired before execution"))?
+                .map_err(|_| Status::internal("heal control cancel failed"))?;
+            rustfs_protos::heal_control::Outcome::Channel {
+                success: response.success,
+                data: response.data,
+                error: response.error,
+            }
+        }
+    };
+    let result = rustfs_protos::heal_control::ResultEnvelope::new(request_id.clone(), coordinator_epoch, outcome)
+        .and_then(|result| rustfs_protos::heal_control::encode_result(&result))
+        .map_err(Status::internal)?;
+    *replay_result = Some(result.clone());
+    if !retain_completed_result {
+        let mut replay_cache = replay_cache.lock().await;
+        remove_heal_control_replay(&mut replay_cache, &request_id, &replay_entry);
+    }
+    Ok(result)
 }
 
 #[tonic::async_trait]
@@ -307,11 +503,11 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
         if request.get_ref().version != rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION {
             return Err(Status::failed_precondition("unsupported heal control protocol version"));
         }
+        let fingerprint = self.capability_fingerprint().await?;
+        if request.get_ref().topology_fingerprint != *fingerprint {
+            return Err(Status::failed_precondition("heal control topology does not match"));
+        }
         if rustfs_protos::is_heal_control_capability_probe(&request.get_ref().command) {
-            let fingerprint = self.capability_fingerprint().await?;
-            if request.get_ref().topology_fingerprint != *fingerprint {
-                return Err(Status::failed_precondition("heal control topology does not match"));
-            }
             let canonical_ack = rustfs_protos::canonical_heal_control_capability_ack(
                 request.get_ref().version,
                 fingerprint,
@@ -324,9 +520,39 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
                 success: true,
                 result: result.into(),
                 error_info: None,
+                response_proof: Bytes::new(),
             }));
         }
-        Err(Status::unimplemented("heal control routing is not enabled"))
+        let endpoints = self
+            .endpoint_pools()
+            .await
+            .ok_or_else(|| Status::failed_precondition("heal control topology is not initialized"))?;
+        if !heal::heal_control_coordinator(&endpoints)
+            .map_err(Status::failed_precondition)?
+            .is_local
+        {
+            return Err(Status::failed_precondition("heal control request reached a non-coordinator node"));
+        }
+        let envelope =
+            rustfs_protos::heal_control::decode_envelope(&request.get_ref().command).map_err(Status::invalid_argument)?;
+        let coordinator_epoch =
+            rustfs_protos::heal_control_coordinator_epoch(fingerprint).map_err(Status::failed_precondition)?;
+        let result = execute_heal_control_envelope(envelope, coordinator_epoch).await?;
+        let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+            request.get_ref().version,
+            &request.get_ref().topology_fingerprint,
+            &request.get_ref().command,
+            &result,
+        )
+        .map_err(|_| Status::internal("heal control response length cannot be represented"))?;
+        let response_proof = sign_tonic_rpc_response_proof(&canonical_response)
+            .map_err(|_| Status::internal("heal control response proof is unavailable"))?;
+        Ok(Response::new(HealControlResponse {
+            success: true,
+            result: result.into(),
+            error_info: None,
+            response_proof: response_proof.into(),
+        }))
     }
 }
 
@@ -1388,18 +1614,21 @@ impl Node for NodeService {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        CollectMetricsOpts, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService, PEER_RESTSIGNAL,
+        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService, PEER_RESTSIGNAL,
         PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
-        background_rebalance_start_error_message, initialize_heal_topology_fingerprint, make_heal_control_server,
-        make_heal_control_server_with_cache, make_server, scanner_activity_response, stop_rebalance_response,
+        admit_heal_control_replay, background_rebalance_start_error_message, execute_heal_control_envelope_with_manager,
+        initialize_heal_topology_fingerprint, make_heal_control_server, make_heal_control_server_with_cache, make_server,
+        remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
+    use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use crate::storage::storage_api::{
         Endpoint,
         ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use bytes::Bytes;
+    use rustfs_heal::heal::{manager::HealManager, storage::HealStorageAPI};
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
@@ -1422,12 +1651,271 @@ mod tests {
         node_service_server::NodeServiceServer,
     };
     use std::{collections::HashMap, sync::Arc};
+    use time::OffsetDateTime;
     use tokio::net::TcpListener;
+    use tokio::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
 
+    struct HealControlMockStorage;
+
+    #[async_trait::async_trait]
+    impl HealStorageAPI for HealControlMockStorage {
+        async fn get_object_meta(
+            &self,
+            _bucket: &str,
+            _object: &str,
+        ) -> rustfs_heal::Result<Option<rustfs_heal::heal::storage::HealObjectInfo>> {
+            Ok(None)
+        }
+
+        async fn get_object_data(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_object(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
+            Ok(true)
+        }
+
+        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_disk_status(&self, _endpoint: &HealEndpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
+            Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
+        }
+
+        async fn format_disk(&self, _endpoint: &HealEndpoint) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<HealBucketInfo>> {
+            Ok(None)
+        }
+
+        async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
+            Ok(())
+        }
+
+        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<HealBucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
+            Ok(false)
+        }
+
+        async fn get_object_size(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<u64>> {
+            Ok(None)
+        }
+
+        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: Option<&str>,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
+        }
+
+        async fn heal_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &rustfs_common::heal_channel::HealOpts,
+        ) -> rustfs_heal::Result<rustfs_madmin::heal_commands::HealResultItem> {
+            Ok(rustfs_madmin::heal_commands::HealResultItem::default())
+        }
+
+        async fn heal_format(
+            &self,
+            _dry_run: bool,
+        ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
+            Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
+        }
+
+        async fn list_objects_for_heal(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+        ) -> rustfs_heal::Result<Vec<rustfs_heal::heal::storage::HealListItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_objects_for_heal_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+        ) -> rustfs_heal::Result<(Vec<rustfs_heal::heal::storage::HealListItem>, Option<String>, bool)> {
+            Ok((Vec::new(), None, false))
+        }
+
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<DiskStore> {
+            Err(rustfs_heal::Error::other("not implemented in heal control test"))
+        }
+    }
+
     fn create_test_node_service() -> NodeService {
         make_server()
+    }
+
+    #[tokio::test]
+    async fn heal_control_replay_cache_singleflights_only_matching_request_ids() {
+        let mut cache = HashMap::new();
+        let first = admit_heal_control_replay(&mut cache, "request-1", &[1; 32], 200, 100).unwrap();
+        let exact = admit_heal_control_replay(&mut cache, "request-1", &[1; 32], 200, 100).unwrap();
+        assert!(Arc::ptr_eq(&first, &exact));
+
+        let collision = admit_heal_control_replay(&mut cache, "request-1", &[2; 32], 200, 100)
+            .expect_err("one request ID must not identify two commands");
+        assert_eq!(collision.code(), tonic::Code::AlreadyExists);
+
+        remove_heal_control_replay(&mut cache, "request-1", &first);
+        assert!(!cache.contains_key("request-1"), "completed query results must not remain cached");
+
+        let second = admit_heal_control_replay(&mut cache, "request-2", &[2; 32], 300, 100).unwrap();
+        let first_execution = first.result.lock().await;
+        let _second_execution = tokio::time::timeout(Duration::from_millis(50), second.result.lock())
+            .await
+            .expect("a different request ID must not wait behind the first request");
+
+        drop(first_execution);
+        drop(_second_execution);
+        drop(exact);
+        drop(first);
+        drop(second);
+        let _third = admit_heal_control_replay(&mut cache, "request-3", &[3; 32], 400, 300).unwrap();
+        assert!(!cache.contains_key("request-1"), "expired idle entries must be purged before admission");
+    }
+
+    #[tokio::test]
+    async fn heal_control_executor_preserves_canonical_token_and_drops_query_results() {
+        let manager = Arc::new(HealManager::new(Arc::new(HealControlMockStorage), None));
+        let coordinator_epoch = 7;
+        let now = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        let now = i64::try_from(now).expect("test clock should fit in i64");
+        let metadata = || rustfs_protos::heal_control::RequestMetadata::new(rand::random(), now, now + 30_000, coordinator_epoch);
+        let start = |request_id: String| {
+            let mut request =
+                rustfs_common::heal_channel::create_heal_request("bucket".to_string(), Some("prefix".to_string()), false, None);
+            request.id = request_id;
+            request.source = rustfs_common::heal_channel::HealRequestSource::Admin;
+            request
+        };
+
+        let canonical_token = uuid::Uuid::new_v4().to_string();
+        let first = rustfs_protos::heal_control::Envelope::start(start(canonical_token.clone()), metadata()).unwrap();
+        let first_result = execute_heal_control_envelope_with_manager(first, coordinator_epoch, Some(Arc::clone(&manager)))
+            .await
+            .unwrap();
+        let first_outcome = rustfs_protos::heal_control::decode_result(&first_result)
+            .and_then(|result| result.into_outcome(&canonical_token, coordinator_epoch))
+            .unwrap();
+        assert!(matches!(
+            first_outcome,
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Accepted,
+            } if task_id == canonical_token
+        ));
+
+        let duplicate_id = uuid::Uuid::new_v4().to_string();
+        let duplicate = rustfs_protos::heal_control::Envelope::start(start(duplicate_id.clone()), metadata()).unwrap();
+        let duplicate_result =
+            execute_heal_control_envelope_with_manager(duplicate, coordinator_epoch, Some(Arc::clone(&manager)))
+                .await
+                .unwrap();
+        let duplicate_outcome = rustfs_protos::heal_control::decode_result(&duplicate_result)
+            .and_then(|result| result.into_outcome(&duplicate_id, coordinator_epoch))
+            .unwrap();
+        assert!(matches!(
+            duplicate_outcome,
+            rustfs_protos::heal_control::Outcome::Start {
+                task_id,
+                admission: rustfs_protos::heal_control::Admission::Merged,
+            } if task_id == canonical_token
+        ));
+
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let query = rustfs_protos::heal_control::Envelope::query(
+            query_id.clone(),
+            metadata(),
+            "bucket/prefix".to_string(),
+            canonical_token.clone(),
+        )
+        .unwrap();
+        let query_result = execute_heal_control_envelope_with_manager(query, coordinator_epoch, Some(Arc::clone(&manager)))
+            .await
+            .unwrap();
+        let query_outcome = rustfs_protos::heal_control::decode_result(&query_result)
+            .and_then(|result| result.into_outcome(&query_id, coordinator_epoch))
+            .unwrap();
+        assert!(matches!(
+            query_outcome,
+            rustfs_protos::heal_control::Outcome::Channel { success: true, .. }
+        ));
+
+        let cancel_id = uuid::Uuid::new_v4().to_string();
+        let cancel = rustfs_protos::heal_control::Envelope::cancel(
+            cancel_id.clone(),
+            metadata(),
+            "bucket/prefix".to_string(),
+            canonical_token.clone(),
+        )
+        .unwrap();
+        let cancel_result = execute_heal_control_envelope_with_manager(cancel, coordinator_epoch, Some(Arc::clone(&manager)))
+            .await
+            .unwrap();
+        let cancel_outcome = rustfs_protos::heal_control::decode_result(&cancel_result)
+            .and_then(|result| result.into_outcome(&cancel_id, coordinator_epoch))
+            .unwrap();
+        assert!(matches!(
+            cancel_outcome,
+            rustfs_protos::heal_control::Outcome::Channel { success: true, .. }
+        ));
+
+        let stopped_query_id = uuid::Uuid::new_v4().to_string();
+        let stopped_query = rustfs_protos::heal_control::Envelope::query(
+            stopped_query_id.clone(),
+            metadata(),
+            "bucket/prefix".to_string(),
+            canonical_token,
+        )
+        .unwrap();
+        let stopped_result = execute_heal_control_envelope_with_manager(stopped_query, coordinator_epoch, Some(manager))
+            .await
+            .unwrap();
+        let stopped_outcome = rustfs_protos::heal_control::decode_result(&stopped_result)
+            .and_then(|result| result.into_outcome(&stopped_query_id, coordinator_epoch))
+            .unwrap();
+        assert!(matches!(
+            stopped_outcome,
+            rustfs_protos::heal_control::Outcome::Channel {
+                success: true,
+                error: Some(detail),
+                ..
+            } if detail == "heal task not found or expired"
+        ));
+
+        let replay_cache = super::HEAL_CONTROL_REPLAY_CACHE.get().unwrap().lock().await;
+        assert!(!replay_cache.contains_key(&query_id), "completed query results must not remain cached");
+        assert!(
+            !replay_cache.contains_key(&stopped_query_id),
+            "completed stopped queries must not remain cached"
+        );
     }
 
     #[tokio::test]
@@ -1439,19 +1927,24 @@ mod tests {
 
     fn heal_control_request(command: &[u8]) -> Request<HealControlRequest> {
         Request::new(HealControlRequest {
-            version: 1,
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
             topology_fingerprint: "fingerprint".to_string(),
             command: Bytes::copy_from_slice(command),
         })
     }
 
     fn heal_control_test_endpoints(last_host: &str) -> EndpointServerPools {
+        heal_control_test_endpoints_with_coordinator(last_host, false)
+    }
+
+    fn heal_control_test_endpoints_with_coordinator(last_host: &str, coordinator_local: bool) -> EndpointServerPools {
         let endpoints = ["node-a", "node-b", "node-c", last_host]
             .into_iter()
             .enumerate()
             .map(|(index, host)| {
                 let mut endpoint = Endpoint::try_from(format!("http://{host}:9000/disk{}", index + 1).as_str())
                     .expect("test endpoint should parse");
+                endpoint.is_local = coordinator_local && index == 0;
                 endpoint.set_pool_index(0);
                 endpoint.set_set_index(index / 2);
                 endpoint.set_disk_index(index % 2);
@@ -1475,7 +1968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heal_control_requires_body_bound_auth_before_reporting_disabled() {
+    async fn heal_control_requires_body_bound_auth_before_topology_validation() {
         let service = make_heal_control_server();
         let unsigned = service
             .heal_control(heal_control_request(b"query"))
@@ -1484,20 +1977,31 @@ mod tests {
         assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
 
         let mut tampered = heal_control_request(b"query");
-        let other_body =
-            rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"cancel").expect("small request should encode");
+        let other_body = rustfs_protos::canonical_heal_control_request_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            "fingerprint",
+            b"cancel",
+        )
+        .expect("small request should encode");
         set_tonic_canonical_body_digest(&mut tampered, &other_body).expect("digest metadata should encode");
         mark_v2_authenticated(&mut tampered);
         let tampered = service.heal_control(tampered).await.expect_err("tampered request must fail");
         assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
 
         let mut signed = heal_control_request(b"query");
-        let body =
-            rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"query").expect("small request should encode");
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            "fingerprint",
+            b"query",
+        )
+        .expect("small request should encode");
         set_tonic_canonical_body_digest(&mut signed, &body).expect("digest metadata should encode");
         mark_v2_authenticated(&mut signed);
-        let disabled = service.heal_control(signed).await.expect_err("routing must remain disabled");
-        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+        let unavailable = service
+            .heal_control(signed)
+            .await
+            .expect_err("authenticated commands still require initialized topology");
+        assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -1511,15 +2015,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heal_control_probe_requires_exact_topology_and_keeps_commands_disabled() {
+    async fn heal_control_probe_requires_exact_topology_and_coordinator() {
         let _ = rustfs_credentials::set_global_rpc_secret("heal-control-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints("node-d");
         let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
-        let cache = Arc::new(tokio::sync::OnceCell::new());
-        initialize_heal_topology_fingerprint(Arc::clone(&cache), endpoints)
-            .await
-            .expect("valid topology should initialize");
-        let service = make_heal_control_server_with_cache(cache);
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
 
         let probe_command = rustfs_protos::heal_control_capability_probe(&[7; 16]);
         let mut probe = Request::new(HealControlRequest {
@@ -1548,6 +2049,25 @@ mod tests {
         crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical_ack, &response.into_inner().result)
             .expect("response proof should authenticate the exact acknowledgement");
 
+        let mut old_probe = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION - 1,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from(probe_command.clone()),
+        });
+        let old_body = rustfs_protos::canonical_heal_control_request_body(
+            old_probe.get_ref().version,
+            &old_probe.get_ref().topology_fingerprint,
+            &old_probe.get_ref().command,
+        )
+        .expect("old probe should encode for rejection test");
+        set_tonic_canonical_body_digest(&mut old_probe, &old_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut old_probe);
+        let old_version = service
+            .heal_control(old_probe)
+            .await
+            .expect_err("old coordination capability must fail closed");
+        assert_eq!(old_version.code(), tonic::Code::FailedPrecondition);
+
         let divergent_probe = rustfs_protos::heal_control_capability_probe(&[8; 16]);
         let mut divergent = Request::new(HealControlRequest {
             version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
@@ -1569,15 +2089,81 @@ mod tests {
             .expect_err("divergent topology must fail closed");
         assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
 
-        let mut command = heal_control_request(b"start");
-        let body = rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"start").expect("command should encode");
+        let mut command = Request::new(HealControlRequest {
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            topology_fingerprint: fingerprint.clone(),
+            command: Bytes::from_static(b"start"),
+        });
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            &fingerprint,
+            b"start",
+        )
+        .expect("command should encode");
         set_tonic_canonical_body_digest(&mut command, &body).expect("digest metadata should encode");
         mark_v2_authenticated(&mut command);
-        let disabled = service
+        let non_coordinator = service
             .heal_control(command)
             .await
-            .expect_err("commands must remain disabled");
-        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+            .expect_err("commands must be rejected by a non-coordinator node");
+        assert_eq!(non_coordinator.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn heal_control_coordinator_rejects_expired_and_non_admin_starts() {
+        let _ = rustfs_credentials::set_global_rpc_secret("heal-control-node-service-test-secret".to_string());
+        let endpoints = heal_control_test_endpoints_with_coordinator("node-d", true);
+        let fingerprint = heal_topology_fingerprint(&endpoints).expect("test topology should hash");
+        let coordinator_epoch =
+            rustfs_protos::heal_control_coordinator_epoch(&fingerprint).expect("test topology should have an epoch");
+        let (service, source) = super::make_heal_control_server_for_source();
+        *source.write().await = Some(endpoints);
+
+        fn signed_command(fingerprint: &str, command: Vec<u8>) -> Request<HealControlRequest> {
+            let mut request = Request::new(HealControlRequest {
+                version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+                topology_fingerprint: fingerprint.to_string(),
+                command: command.into(),
+            });
+            let body = rustfs_protos::canonical_heal_control_request_body(
+                request.get_ref().version,
+                &request.get_ref().topology_fingerprint,
+                &request.get_ref().command,
+            )
+            .expect("command should encode");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+            mark_v2_authenticated(&mut request);
+            request
+        }
+
+        let expired_request = rustfs_common::heal_channel::create_heal_request("bucket".to_string(), None, false, None);
+        let expired = rustfs_protos::heal_control::Envelope::start(
+            expired_request,
+            rustfs_protos::heal_control::RequestMetadata::new([1; 16], 1, 2, coordinator_epoch),
+        )
+        .and_then(|envelope| rustfs_protos::heal_control::encode_envelope(&envelope))
+        .expect("expired command should encode structurally");
+        let expired = service
+            .heal_control(signed_command(&fingerprint, expired))
+            .await
+            .expect_err("expired commands must fail before admission");
+        assert_eq!(expired.code(), tonic::Code::FailedPrecondition);
+
+        let mut non_admin_request = rustfs_common::heal_channel::create_heal_request("bucket".to_string(), None, false, None);
+        non_admin_request.source = rustfs_common::heal_channel::HealRequestSource::Scanner;
+        let now = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        let now = i64::try_from(now).expect("test clock should fit in i64");
+        let non_admin = rustfs_protos::heal_control::Envelope::start(
+            non_admin_request,
+            rustfs_protos::heal_control::RequestMetadata::new([2; 16], now, now + 1_000, coordinator_epoch),
+        )
+        .and_then(|envelope| rustfs_protos::heal_control::encode_envelope(&envelope))
+        .expect("non-admin command should encode structurally");
+        let non_admin = service
+            .heal_control(signed_command(&fingerprint, non_admin))
+            .await
+            .expect_err("non-admin commands must fail before admission");
+        assert_eq!(non_admin.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -3389,32 +3975,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heal_control_transport_enforces_codec_limit_and_reaches_disabled_handler() {
+    async fn heal_control_transport_enforces_codec_limit_and_fails_closed() {
         let Some(mut client) = connect_test_heal_control_client().await else {
             return;
         };
         let mut request = heal_control_request(b"query");
-        let body =
-            rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", b"query").expect("small request should encode");
+        let body = rustfs_protos::canonical_heal_control_request_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            "fingerprint",
+            b"query",
+        )
+        .expect("small request should encode");
         set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
         mark_v2_authenticated(&mut request);
-        let disabled = client.heal_control(request).await.expect_err("routing must remain disabled");
-        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+        let rejected = client
+            .heal_control(request)
+            .await
+            .expect_err("invalid command must fail closed");
+        assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
 
         let max_command = vec![0; HEAL_CONTROL_PAYLOAD_MAX_SIZE];
         let mut max_request = heal_control_request(&max_command);
-        let max_body = rustfs_protos::canonical_heal_control_request_body(1, "fingerprint", &max_command)
-            .expect("maximum request should encode");
+        let max_body = rustfs_protos::canonical_heal_control_request_body(
+            rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
+            "fingerprint",
+            &max_command,
+        )
+        .expect("maximum request should encode");
         set_tonic_canonical_body_digest(&mut max_request, &max_body).expect("digest metadata should encode");
         mark_v2_authenticated(&mut max_request);
-        let disabled = client
+        let rejected = client
             .heal_control(max_request)
             .await
-            .expect_err("maximum valid request must reach disabled handler");
-        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+            .expect_err("maximum valid transport payload must reach validation");
+        assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
 
         let oversized = Request::new(HealControlRequest {
-            version: 1,
+            version: rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION,
             topology_fingerprint: "fingerprint".to_string(),
             command: Bytes::from(vec![0; rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE]),
         });

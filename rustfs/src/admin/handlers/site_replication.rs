@@ -21,8 +21,8 @@ use crate::admin::runtime_sources::{
     current_token_signing_key, object_store_from_req,
 };
 use crate::admin::site_replication_identity::{
-    canonical_endpoint, deployment_id_for_endpoint, is_https_endpoint, normalize_peer_map_by_identity_with,
-    same_identity_endpoint, site_identity_key,
+    canonical_endpoint, deployment_id_for_endpoint, is_https_endpoint, mark_unknown_peer_sync_enabled,
+    normalize_peer_map_by_identity_with, same_identity_endpoint, site_identity_key,
 };
 use crate::admin::storage_api::bucket::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
@@ -119,6 +119,7 @@ const SITE_REPL_MAX_NETPERF_DURATION: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
+const SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT: usize = 32;
 const MAX_PEER_CA_CERT_PEM_SIZE: usize = 256 * 1024;
 const ALLOW_LOOPBACK_REPLICATION_TARGET_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
 const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
@@ -427,6 +428,8 @@ struct SiteReplicationState {
     pending_endpoint_refresh: Option<PendingEndpointRefresh>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retry_queue: Vec<SiteReplicationRetryEvent>,
+    #[serde(default)]
+    sync_state_initialized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -519,6 +522,57 @@ struct SiteReplicationBootstrapPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SRPeerJoinResponse {
     peer: PeerInfo,
+    #[serde(rename = "initialSyncErrorMessage", default, skip_serializing_if = "String::is_empty")]
+    initial_sync_error_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SRPeerJoinEnvelope {
+    #[serde(flatten)]
+    request: SRPeerJoinReq,
+    #[serde(rename = "deferSyncStateEnable", default, skip_serializing_if = "std::ops::Not::not")]
+    defer_sync_state_enable: bool,
+}
+
+#[derive(Debug, Default)]
+struct SiteReplicationErrorSummary {
+    entries: Vec<String>,
+    total: usize,
+}
+
+impl SiteReplicationErrorSummary {
+    fn push(&mut self, error: impl AsRef<str>) {
+        self.total = self.total.saturating_add(1);
+        if self.entries.len() < SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT {
+            self.entries.push(summarize_peer_error_detail(error.as_ref()));
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.total = self.total.saturating_add(other.total);
+        let remaining = SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT.saturating_sub(self.entries.len());
+        self.entries.extend(other.entries.into_iter().take(remaining));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn reported(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn render(&self) -> String {
+        let mut message = self.entries.join("; ");
+        let omitted = self.total.saturating_sub(self.entries.len());
+        if omitted > 0 {
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            message.push_str(&format!("{omitted} additional error(s) omitted"));
+        }
+        message
+    }
 }
 
 const GO_GOB_SITE_NETPERF_SCHEMA: &[u8] = &[
@@ -838,6 +892,12 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
             let mut state: SiteReplicationState = serde_json::from_slice(&data)
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication state: {e}")))?;
             state.peers = normalize_peer_map_by_identity(state.peers);
+            if !state.sync_state_initialized {
+                if state.enabled() {
+                    mark_unknown_peer_sync_enabled(&mut state.peers);
+                }
+                state.sync_state_initialized = true;
+            }
             Ok(state)
         }
         Err(StorageError::ConfigNotFound) => Ok(SiteReplicationState::default()),
@@ -1657,6 +1717,32 @@ fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()>
     Ok(())
 }
 
+/// The web console's "Set Up Site Replication" flow sends only the remote peer(s) and omits the
+/// local deployment from the add payload. The add preflight requires the local deployment to be
+/// present (`validate_add_preflight_topology`), so inject the local site when the payload does not
+/// already include it. `mc admin replicate add` includes every site (matched here by endpoint
+/// identity), so this is a no-op for the CLI. The local site carries no credentials — they are not
+/// required for the local peer (`validate_add_sites` skips credential checks for it).
+fn ensure_local_site_present(sites: &mut Vec<PeerSite>, local_peer: &PeerInfo) {
+    if sites
+        .iter()
+        .any(|site| same_identity_endpoint(&site.endpoint, &local_peer.endpoint))
+    {
+        return;
+    }
+    sites.insert(
+        0,
+        PeerSite {
+            name: local_peer.name.clone(),
+            endpoint: local_peer.endpoint.clone(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            skip_tls_verify: local_peer.skip_tls_verify,
+            ca_cert_pem: local_peer.ca_cert_pem.clone(),
+        },
+    );
+}
+
 fn idp_settings_value(settings: &IDPSettings) -> S3Result<serde_json::Value> {
     serde_json::to_value(settings)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize IDP settings failed: {e}")))
@@ -2133,6 +2219,12 @@ fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String,
     }
 
     normalize_peer_map_by_identity(normalized)
+}
+
+fn initialize_join_peer_sync_state(peers: &mut BTreeMap<String, PeerInfo>, defer_sync_state_enable: bool) {
+    if !defer_sync_state_enable {
+        mark_unknown_peer_sync_enabled(peers);
+    }
 }
 
 fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_peer: PeerInfo) -> SiteReplicationState {
@@ -2685,27 +2777,25 @@ async fn bootstrap_existing_metadata_after_add(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
-) -> Vec<String> {
+) -> SiteReplicationErrorSummary {
     let info = match build_sr_info(state, local_peer).await {
         Ok(info) => info,
         Err(err) => {
-            return vec![format!(
-                "local snapshot failed: {}",
-                summarize_peer_error_detail(&err.to_string())
-            )];
+            let mut errors = SiteReplicationErrorSummary::default();
+            errors.push(format!("local snapshot failed: {err}"));
+            return errors;
         }
     };
     let plan = match site_replication_bootstrap_plan(&info) {
         Ok(plan) => plan,
         Err(err) => {
-            return vec![format!(
-                "bootstrap plan failed: {}",
-                summarize_peer_error_detail(&err.to_string())
-            )];
+            let mut errors = SiteReplicationErrorSummary::default();
+            errors.push(format!("bootstrap plan failed: {err}"));
+            return errors;
         }
     };
 
-    let mut errors = Vec::new();
+    let mut errors = SiteReplicationErrorSummary::default();
     for peer in state.peers.values() {
         if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
@@ -3261,7 +3351,13 @@ fn site_replication_config_mismatch<'a>(values: impl Iterator<Item = Option<&'a 
 
     let expected_rules = total_sites.saturating_sub(1);
     let replicated = values.iter().all(|raw| {
-        deserialize::<ReplicationConfiguration>(raw.as_bytes())
+        // `raw` is the wire form produced by build_sr_info, i.e. base64-encoded XML
+        // (raw_config_to_base64). Decode it before XML-parsing — parsing the base64 text
+        // directly always fails, which would falsely report every replicated bucket as
+        // out-of-sync ("0/N Buckets in sync"). decode_bucket_meta_wire_value falls back to
+        // the raw bytes when the value is not base64, so plain-XML callers still work.
+        let xml = decode_bucket_meta_wire_value(raw);
+        deserialize::<ReplicationConfiguration>(&xml)
             .is_ok_and(|config| config.rules.len() == expected_rules && config.rules.iter().all(site_replication_rule_complete))
     });
 
@@ -5368,11 +5464,18 @@ pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) ->
 
 /// Fix 1: after persisting a new site-replication state (add or join), enumerate every bucket
 /// that already exists locally, wire up versioning + targets + replication config for each, and
-/// kick a resync toward every remote peer so pre-existing objects back-fill. Errors are logged
-/// but never abort the caller — the admin can run a manual resync if needed.
-async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo, bootstrap_token: Option<&str>) {
+/// kick a resync toward every remote peer so pre-existing objects back-fill. Returns a list of
+/// human-readable per-bucket failure messages (empty on full success) so the caller can surface
+/// them to the operator instead of silently reporting success; a failure never aborts the caller.
+async fn backfill_existing_buckets_after_add(
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    bootstrap_token: Option<&str>,
+) -> SiteReplicationErrorSummary {
+    let mut errors = SiteReplicationErrorSummary::default();
     let Some(store) = current_object_store_handle() else {
-        return;
+        errors.push("object store not initialized; pre-existing buckets were not backfilled");
+        return errors;
     };
     let buckets = match store.list_bucket(&BucketOptions::default()).await {
         Ok(b) => b,
@@ -5385,7 +5488,8 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 error = ?err,
                 "admin site replication state"
             );
-            return;
+            errors.push(format!("list buckets failed: {err}"));
+            return errors;
         }
     };
 
@@ -5403,18 +5507,38 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 error = ?err,
                 "admin site replication state"
             );
+            errors.push(format!("{name}: versioning setup failed: {err}"));
             continue;
         }
-        if let Err(err) = ensure_site_replication_bucket_setup(name).await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                bucket = %name,
-                result = "backfill_bucket_setup_failed",
-                error = ?err,
-                "admin site replication state"
-            );
+        match ensure_site_replication_bucket_setup(name).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Runtime targets unavailable: the setup silently no-ops, which would make the
+                // downstream make-bucket broadcast and resync fail. Record it and skip so the
+                // operator sees this bucket was not propagated instead of an unqualified success.
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    result = "backfill_bucket_setup_skipped",
+                    "admin site replication state"
+                );
+                errors.push(format!("{name}: replication setup skipped (site replication runtime unavailable)"));
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %name,
+                    result = "backfill_bucket_setup_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                errors.push(format!("{name}: bucket setup failed: {err}"));
+            }
         }
         // Broadcast the bucket to peers so they create it too (idempotent on the peer side).
         // Read the real lock_enabled flag so peers recreate the bucket with the same object-lock
@@ -5445,6 +5569,7 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 error = ?err,
                 "admin site replication state"
             );
+            errors.push(format!("{name}: make-bucket broadcast failed: {err}"));
         }
         // Kick a resync toward every remote peer so existing objects travel across.
         for peer in state.peers.values() {
@@ -5463,9 +5588,11 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                     detail = %result.err_detail,
                     "admin site replication state"
                 );
+                errors.push(format!("{name} -> {}: resync kick failed: {}", peer.endpoint, result.err_detail));
             }
         }
     }
+    errors
 }
 
 async fn refresh_bucket_targets_after_service_account_rotation() {
@@ -6109,7 +6236,10 @@ impl Operation for SiteReplicationAddHandler {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
         }
         let local_peer = current_local_peer(&req, &current_state);
-        let sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
+        let mut sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
+        // The web console's "Set Up Site Replication" omits the local deployment from the payload;
+        // inject it so the add preflight (which requires the local deployment) succeeds. No-op for `mc`.
+        ensure_local_site_present(&mut sites, &local_peer);
         validate_add_sites(&sites, &local_peer)?;
         let mut preflight_infos = Vec::with_capacity(sites.len());
         for site in &sites {
@@ -6145,17 +6275,22 @@ impl Operation for SiteReplicationAddHandler {
             cred.access_key.clone(),
             replicate_ilm_expiry,
         );
-        let join_req = SRPeerJoinReq {
-            svc_acct_access_key: service_account_access_key,
-            svc_acct_secret_key: service_account_secret_key.clone(),
-            svc_acct_parent: String::new(),
-            peers: state.peers.clone(),
-            updated_at: state.updated_at,
+        state.sync_state_initialized = true;
+        let join_req = SRPeerJoinEnvelope {
+            request: SRPeerJoinReq {
+                svc_acct_access_key: service_account_access_key,
+                svc_acct_secret_key: service_account_secret_key.clone(),
+                svc_acct_parent: String::new(),
+                peers: state.peers.clone(),
+                updated_at: state.updated_at,
+            },
+            defer_sync_state_enable: true,
         };
         let peer_join_path =
             with_site_replication_bootstrap_token(SITE_REPLICATION_PEER_JOIN_PATH, &add_in_progress_guard.token.to_string());
 
         let mut joined_endpoints = HashSet::new();
+        let mut initial_sync_errors = SiteReplicationErrorSummary::default();
         for site in &sites {
             if same_identity_endpoint(&site.endpoint, &local_peer.endpoint)
                 || !joined_endpoints.insert(site_identity_key(&site.endpoint))
@@ -6164,7 +6299,7 @@ impl Operation for SiteReplicationAddHandler {
             }
 
             let mut peer_join_req = join_req.clone();
-            peer_join_req.svc_acct_parent = site.access_key.clone();
+            peer_join_req.request.svc_acct_parent = site.access_key.clone();
             let connection = PeerConnection::try_from(site)?;
             let body =
                 send_peer_admin_request(&connection, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req).await?;
@@ -6175,6 +6310,9 @@ impl Operation for SiteReplicationAddHandler {
                     format!("parse peer join response from {} failed: {e}", site.endpoint),
                 )
             })?;
+            if !join_response.initial_sync_error_message.is_empty() {
+                initial_sync_errors.push(format!("{}: {}", site.endpoint, join_response.initial_sync_error_message));
+            }
             state = reconcile_peer_with_actual_identity(state, join_response.peer);
             let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
                 S3Error::with_message(
@@ -6190,18 +6328,49 @@ impl Operation for SiteReplicationAddHandler {
             })?;
         }
 
+        mark_unknown_peer_sync_enabled(&mut state.peers);
         persist_site_replication_state(&state).await?;
-        let bootstrap_errors = bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await;
+
+        for target in state.peers.values() {
+            if target.deployment_id == local_peer.deployment_id || same_identity_endpoint(&target.endpoint, &local_peer.endpoint)
+            {
+                continue;
+            }
+            let transport = match PeerTransport::for_runtime_peer(target).await {
+                Ok(transport) => transport,
+                Err(err) => {
+                    initial_sync_errors.push(format!("{}: finalize peer sync state failed: {err}", target.endpoint));
+                    continue;
+                }
+            };
+            for peer in state.peers.values() {
+                if let Err(err) = send_peer_admin_request_with_client(
+                    &transport.client,
+                    &transport.connection,
+                    SITE_REPLICATION_PEER_EDIT_PATH,
+                    &state.service_account_access_key,
+                    &service_account_secret_key,
+                    peer,
+                )
+                .await
+                {
+                    initial_sync_errors
+                        .push(format!("{}: finalize sync state for {} failed: {err}", target.endpoint, peer.endpoint));
+                }
+            }
+        }
+
+        initial_sync_errors.extend(bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await);
 
         // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
-        // are not silently left out of replication. Failures are logged but do not abort
-        // the overall add operation — the admin can trigger a manual resync if needed.
-        backfill_existing_buckets_after_add(&state, &local_peer, None).await;
+        // are not silently left out of replication. Per-bucket failures are surfaced in the add
+        // response below (BUG2) rather than swallowed; they do not abort the overall add.
+        initial_sync_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, None).await);
 
         json_response(&ReplicateAddStatus {
             success: true,
             status: SITE_REPL_ADD_SUCCESS.to_string(),
-            initial_sync_error_message: bootstrap_errors.join("; "),
+            initial_sync_error_message: initial_sync_errors.render(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         })
@@ -6429,18 +6598,22 @@ impl Operation for SRPeerJoinHandler {
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        let join_req: SRPeerJoinReq = read_site_replication_json(req, &cred.secret_key, true).await?;
+        let join_envelope: SRPeerJoinEnvelope = read_site_replication_json(req, &cred.secret_key, true).await?;
+        let defer_sync_state_enable = join_envelope.defer_sync_state_enable;
+        let join_req = join_envelope.request;
         validate_join_peer_snapshot(&join_req.peers)?;
 
         if let Some(current_updated_at) = state.updated_at {
             let Some(incoming_updated_at) = join_req.updated_at else {
                 return json_response(&SRPeerJoinResponse {
                     peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                    ..Default::default()
                 });
             };
             if incoming_updated_at <= current_updated_at {
                 return json_response(&SRPeerJoinResponse {
                     peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                    ..Default::default()
                 });
             }
         }
@@ -6499,6 +6672,8 @@ impl Operation for SRPeerJoinHandler {
         state.service_account_parent = join_req.svc_acct_parent;
         state.updated_at = join_req.updated_at.or_else(|| Some(OffsetDateTime::now_utc()));
         state.peers = normalize_join_peers_for_local(&local_peer, join_req.peers);
+        initialize_join_peer_sync_state(&mut state.peers, defer_sync_state_enable);
+        state.sync_state_initialized = true;
         state.name = state
             .peers
             .get(&local_peer.deployment_id)
@@ -6507,10 +6682,23 @@ impl Operation for SRPeerJoinHandler {
             .unwrap_or_else(|| local_peer.name.clone());
         persist_site_replication_state(&state).await?;
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
-        // buckets it already owns so the reverse direction works from the start.
-        backfill_existing_buckets_after_add(&state, &local_peer, bootstrap_token.as_deref()).await;
+        // buckets it already owns so the reverse direction works from the start. Per-bucket
+        // failures are logged (BUG2) so a reverse-direction back-fill gap is observable.
+        let backfill_errors = backfill_existing_buckets_after_add(&state, &local_peer, bootstrap_token.as_deref()).await;
+        if !backfill_errors.is_empty() {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "join_backfill_incomplete",
+                error_count = backfill_errors.total,
+                reported_error_count = backfill_errors.reported(),
+                "admin site replication state"
+            );
+        }
         json_response(&SRPeerJoinResponse {
             peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+            initial_sync_error_message: backfill_errors.render(),
         })
     }
 }
@@ -7209,7 +7397,7 @@ impl Operation for SiteReplicationRepairHandler {
             } else {
                 "Partial".to_string()
             },
-            err_detail: repair_errors.join("; "),
+            err_detail: repair_errors.render(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         })
     }
@@ -8978,6 +9166,63 @@ mod tests {
         let err = validate_add_sites(&sites, &local_peer).expect_err("missing remote secret should fail");
 
         assert!(err.to_string().contains("secretKey is required"));
+    }
+
+    // Console fix: the web UI omits the local deployment from the add payload. ensure_local_site_present
+    // injects it so the add preflight (which requires the local deployment) succeeds.
+    #[test]
+    fn test_ensure_local_site_present_injects_when_missing() {
+        let local_peer = peer("local", "https://local.example.com");
+        let mut sites = vec![PeerSite {
+            name: "remote".to_string(),
+            endpoint: "https://remote.example.com".to_string(),
+            access_key: "remote-ak".to_string(),
+            secret_key: "remote-sk".to_string(),
+            ..Default::default()
+        }];
+
+        ensure_local_site_present(&mut sites, &local_peer);
+
+        assert_eq!(sites.len(), 2, "the local site must be injected when missing");
+        assert!(
+            sites
+                .iter()
+                .any(|s| same_identity_endpoint(&s.endpoint, &local_peer.endpoint)),
+            "an injected site must match the local endpoint"
+        );
+        // The console payload (remote-only) now validates end-to-end at the add-sites stage.
+        validate_add_sites(&sites, &local_peer).expect("add sites must validate after injecting the local site");
+    }
+
+    #[test]
+    fn test_ensure_local_site_present_noop_when_already_included() {
+        let local_peer = peer("local", "https://local.example.com");
+        let mut sites = vec![
+            PeerSite {
+                name: "local".to_string(),
+                endpoint: "https://local.example.com".to_string(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "remote".to_string(),
+                endpoint: "https://remote.example.com".to_string(),
+                access_key: "remote-ak".to_string(),
+                secret_key: "remote-sk".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        ensure_local_site_present(&mut sites, &local_peer);
+
+        assert_eq!(sites.len(), 2, "the local site must not be duplicated when already present");
+        assert_eq!(
+            sites
+                .iter()
+                .filter(|s| same_identity_endpoint(&s.endpoint, &local_peer.endpoint))
+                .count(),
+            1,
+            "exactly one local site entry"
+        );
     }
 
     fn preflight_site(name: &str, endpoint: &str, deployment_id: &str, bucket_count: usize) -> SiteReplicationAddPreflightInfo {
@@ -10978,6 +11223,171 @@ mod tests {
             (1, true),
             "config only on one of two sites → mismatch"
         );
+    }
+
+    // Status miscount regression: build_sr_info stores replication_config as base64-encoded XML
+    // (the wire form). site_replication_config_mismatch must decode it before XML-parsing; before
+    // the fix it parsed the base64 text directly, always failed, and reported every replicated
+    // bucket as out-of-sync ("0/N Buckets in sync"). This test feeds the real base64 wire form.
+    #[test]
+    fn test_site_replication_config_mismatch_accepts_base64_wire_form() {
+        let xml = {
+            let config = ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![build_site_replication_rule(
+                    "arn:rustfs:replication::dep-b:bucket",
+                    1,
+                    "site-repl-dep-b",
+                )],
+            };
+            String::from_utf8(serialize(&config).unwrap()).unwrap()
+        };
+        let b64 = BASE64_STANDARD.encode(xml.as_bytes());
+
+        // Both sites present the complete config in base64 wire form → NOT a mismatch.
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&b64), Some(&b64)].into_iter(), 2),
+            (2, false),
+            "base64-encoded complete configs on both sites must not be reported as a mismatch"
+        );
+        // The tolerant decode keeps plain-XML callers working too.
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&xml), Some(&xml)].into_iter(), 2),
+            (2, false),
+            "raw-XML wire form still parses via the base64 fallback"
+        );
+        // A base64 config present on only one of two sites is still a mismatch.
+        assert_eq!(
+            site_replication_config_mismatch(vec![Some(&b64)].into_iter(), 2),
+            (1, true),
+            "config present on only one site is a mismatch regardless of encoding"
+        );
+    }
+
+    // BUG1: peers persisted on add/join must carry a real sync_state (Enable), not Unknown,
+    // so `mc admin replicate info` and the console show the correct state for healthy peers.
+    #[test]
+    fn test_added_peers_persist_enable_sync_state() {
+        let local = peer("local", "https://local.example.com");
+        let sites = vec![PeerSite {
+            name: "remote".to_string(),
+            endpoint: "https://remote.example.com".to_string(),
+            ..Default::default()
+        }];
+        let mut peers = build_join_peers(&SiteReplicationState::default(), &local, sites, false);
+        // Construction defaults every peer to Unknown — the pre-fix behavior that made
+        // `replicate info` render a blank/Unknown Sync column.
+        assert!(
+            peers.values().all(|p| p.sync_state == SyncStatus::Unknown),
+            "freshly constructed peers default to Unknown"
+        );
+        mark_unknown_peer_sync_enabled(&mut peers);
+        assert!(
+            !peers.is_empty() && peers.values().all(|p| p.sync_state == SyncStatus::Enable),
+            "add/join must persist Enable so the info endpoint reports a real sync state"
+        );
+    }
+
+    // BUG1: an explicit Disable is a meaningful state and must survive the Unknown -> Enable promotion.
+    #[test]
+    fn test_mark_peers_sync_enabled_preserves_disable() {
+        let mut peers = BTreeMap::new();
+        peers.insert(
+            "a".to_string(),
+            PeerInfo {
+                deployment_id: "a".to_string(),
+                sync_state: SyncStatus::Unknown,
+                ..peer("a", "https://a.example.com")
+            },
+        );
+        peers.insert(
+            "b".to_string(),
+            PeerInfo {
+                deployment_id: "b".to_string(),
+                sync_state: SyncStatus::Disable,
+                ..peer("b", "https://b.example.com")
+            },
+        );
+        mark_unknown_peer_sync_enabled(&mut peers);
+        assert_eq!(peers["a"].sync_state, SyncStatus::Enable, "Unknown must be promoted to Enable");
+        assert_eq!(peers["b"].sync_state, SyncStatus::Disable, "explicit Disable must be preserved");
+    }
+
+    #[test]
+    fn test_join_peer_sync_state_waits_for_deferred_commit() {
+        let mut peers = BTreeMap::from([("a".to_string(), peer("a", "https://a.example.com"))]);
+
+        initialize_join_peer_sync_state(&mut peers, true);
+        assert_eq!(peers["a"].sync_state, SyncStatus::Unknown);
+
+        initialize_join_peer_sync_state(&mut peers, false);
+        assert_eq!(peers["a"].sync_state, SyncStatus::Enable);
+    }
+
+    #[test]
+    fn test_join_deferred_sync_state_flag_is_wire_compatible() {
+        let legacy: SRPeerJoinEnvelope = serde_json::from_value(serde_json::json!({})).expect("parse legacy peer join request");
+        assert!(!legacy.defer_sync_state_enable);
+
+        let value = serde_json::to_value(SRPeerJoinEnvelope {
+            defer_sync_state_enable: true,
+            ..Default::default()
+        })
+        .expect("serialize peer join request");
+        assert_eq!(value.get("deferSyncStateEnable"), Some(&Value::Bool(true)));
+    }
+
+    // BUG2: pre-existing-bucket back-fill failures must be surfaced in the add response's
+    // initial_sync_error_message, not swallowed behind an unqualified success.
+    #[test]
+    fn test_initial_sync_error_message_surfaces_backfill_failures() {
+        let bootstrap_errors = vec!["peer-x: metadata sync failed".to_string()];
+        let backfill_errors = vec![
+            "test78787: replication setup skipped (site replication runtime unavailable)".to_string(),
+            "test78787 -> https://peer.example.com: resync kick failed: timeout".to_string(),
+        ];
+        let mut errors = SiteReplicationErrorSummary::default();
+        for error in bootstrap_errors.into_iter().chain(backfill_errors) {
+            errors.push(error);
+        }
+        let msg = errors.render();
+        assert!(msg.contains("peer-x: metadata sync failed"), "bootstrap errors must be surfaced");
+        assert!(
+            msg.contains("test78787: replication setup skipped"),
+            "a back-fill setup-skip must be surfaced so a dropped bucket is visible"
+        );
+        assert!(msg.contains("resync kick failed"), "resync kick failures must be surfaced");
+    }
+
+    #[test]
+    fn test_initial_sync_error_summary_is_bounded() {
+        let mut errors = SiteReplicationErrorSummary::default();
+        for index in 0..(SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT + 5) {
+            errors.push(format!("bucket-{index}: {}", "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT + 32)));
+        }
+
+        let message = errors.render();
+
+        assert_eq!(errors.reported(), SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT);
+        assert!(message.contains("5 additional error(s) omitted"));
+        assert!(message.chars().count() <= SITE_REPLICATION_INITIAL_SYNC_ERROR_LIMIT * 258 + 64);
+    }
+
+    #[test]
+    fn test_peer_join_response_error_summary_is_wire_compatible() {
+        let response: SRPeerJoinResponse = serde_json::from_value(serde_json::json!({
+            "peer": peer("remote", "https://remote.example.com")
+        }))
+        .expect("parse legacy peer join response");
+
+        assert!(response.initial_sync_error_message.is_empty());
+
+        let value = serde_json::to_value(SRPeerJoinResponse {
+            peer: peer("remote", "https://remote.example.com"),
+            initial_sync_error_message: "bucket setup failed".to_string(),
+        })
+        .expect("serialize peer join response");
+        assert_eq!(value.get("initialSyncErrorMessage").and_then(Value::as_str), Some("bucket setup failed"));
     }
 
     // Fix 5: remove --all must purge local state unconditionally even when peer errors occur

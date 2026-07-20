@@ -43,6 +43,12 @@ use s3s::Body;
 use serde_json::Value;
 use serial_test::serial;
 use std::error::Error;
+use std::path::Path;
+use std::sync::{
+    Arc, Once,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -148,6 +154,83 @@ async fn spawn_event_collector() -> Result<(String, mpsc::UnboundedReceiver<Valu
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = serve_event_collector(listener, tx);
     Ok((format!("http://{endpoint_ip}.nip.io:{port}/events"), rx, handle))
+}
+
+fn spawn_https_event_collector(ca_path: &Path) -> Result<(String, Arc<AtomicBool>, thread::JoinHandle<()>), BoxError> {
+    use rustls::{
+        ServerConfig,
+        pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    };
+    use std::io::ErrorKind;
+    use std::net::TcpListener as StdTcpListener;
+
+    static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
+    INSTALL_CRYPTO_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+
+    let listener = StdTcpListener::bind("0.0.0.0:0")?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let endpoint_ip = local_ip()?;
+    let endpoint_host = format!("{endpoint_ip}.nip.io");
+
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![endpoint_host.clone()])?;
+    std::fs::write(ca_path, cert.pem())?;
+
+    let cert_chain = vec![cert.der().clone()];
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key_der)?,
+    );
+
+    let running = Arc::new(AtomicBool::new(true));
+    let server_running = Arc::clone(&running);
+    let handle = thread::spawn(move || {
+        while server_running.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let config = Arc::clone(&server_config);
+                    handle_https_probe(stream, config);
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok((format!("https://{endpoint_host}:{}/events", addr.port()), running, handle))
+}
+
+fn handle_https_probe(stream: std::net::TcpStream, server_config: Arc<rustls::ServerConfig>) {
+    use std::io::{Read, Write};
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let Ok(connection) = rustls::ServerConnection::new(server_config) else {
+        return;
+    };
+    let mut tls_stream = rustls::StreamOwned::new(connection, stream);
+    let mut buf = [0u8; 1024];
+    if tls_stream.read(&mut buf).is_err() {
+        return;
+    }
+    let response = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let _ = tls_stream.write_all(response.as_bytes());
+    let _ = tls_stream.flush();
+}
+
+fn stop_https_event_collector(endpoint: &str, running: Arc<AtomicBool>, handle: thread::JoinHandle<()>) -> TestResult {
+    running.store(false, Ordering::Relaxed);
+    if let Ok(parsed) = endpoint.parse::<reqwest::Url>()
+        && let Some(port) = parsed.port()
+    {
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+    }
+    handle.join().map_err(|_| "https event collector thread panicked")?;
+    Ok(())
 }
 
 /// Decoded object key of the first record in an event envelope.
@@ -284,13 +367,24 @@ async fn enable_notify_module(env: &RustFSTestEnvironment) -> TestResult {
 /// Registers a webhook notification target with a persistent queue directory, so
 /// delivery goes through the durable store-and-forward path.
 async fn configure_webhook_target(env: &RustFSTestEnvironment, target_name: &str, endpoint: &str) -> TestResult {
+    configure_webhook_target_with_key_values(env, target_name, vec![("endpoint", endpoint.to_string())]).await
+}
+
+async fn configure_webhook_target_with_key_values(
+    env: &RustFSTestEnvironment,
+    target_name: &str,
+    mut key_values: Vec<(&str, String)>,
+) -> TestResult {
     let queue_dir = format!("{}/notify-queue-{target_name}", env.temp_dir);
     tokio::fs::create_dir_all(&queue_dir).await?;
+    if !key_values.iter().any(|(key, _)| *key == "queue_dir") {
+        key_values.push(("queue_dir", queue_dir));
+    }
     let payload = serde_json::json!({
-        "key_values": [
-            { "key": "endpoint", "value": endpoint },
-            { "key": "queue_dir", "value": queue_dir },
-        ]
+        "key_values": key_values
+            .into_iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect::<Vec<_>>(),
     });
     let url = format!("{}/rustfs/admin/v3/target/notify_webhook/{target_name}", env.url);
     let response = signed_admin_request(env, http::Method::PUT, &url, Some(payload.to_string().into_bytes())).await?;
@@ -319,6 +413,28 @@ async fn wait_for_target_registered(env: &RustFSTestEnvironment, target_name: &s
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     Err(format!("target {target_name} was not registered in admin ARNs").into())
+}
+
+async fn wait_for_target_listed(env: &RustFSTestEnvironment, target_name: &str) -> TestResult {
+    let url = format!("{}/rustfs/admin/v3/target/list", env.url);
+    for _ in 0..40 {
+        let response = signed_admin_request(env, http::Method::GET, &url, None).await?;
+        if response.status() == StatusCode::OK {
+            let body: Value = serde_json::from_slice(&response.bytes().await?)?;
+            let listed = body["notification_endpoints"].as_array().is_some_and(|endpoints| {
+                endpoints.iter().any(|endpoint| {
+                    endpoint["account_id"].as_str() == Some(target_name)
+                        && endpoint["service"].as_str() == Some("webhook")
+                        && endpoint["status"].as_str().is_some()
+                })
+            });
+            if listed {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(format!("target {target_name} was not listed in admin targets").into())
 }
 
 /// Binds a bucket to a webhook target for ObjectCreated:*/ObjectRemoved:* events,
@@ -366,6 +482,38 @@ fn trimmed_etag(value: Option<&str>) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Regression for rustfs#5052: with the notify module enabled through
+/// RUSTFS_NOTIFY_ENABLE, an HTTPS webhook using a configured CA must be accepted
+/// and remain visible in the admin target list.
+#[tokio::test]
+#[serial]
+async fn test_https_webhook_target_lists_with_notify_env_enabled() -> TestResult {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
+        .await?;
+
+    let ca_path = Path::new(&env.temp_dir).join("https-webhook-ca.pem");
+    let (endpoint, running, handle) = spawn_https_event_collector(&ca_path)?;
+    let target = "peri1https";
+
+    configure_webhook_target_with_key_values(
+        &env,
+        target,
+        vec![
+            ("endpoint", endpoint.clone()),
+            ("client_ca", ca_path.to_string_lossy().into_owned()),
+        ],
+    )
+    .await?;
+    wait_for_target_listed(&env, target).await?;
+
+    env.stop_server();
+    stop_https_event_collector(&endpoint, running, handle)?;
+    Ok(())
+}
 
 /// PUT / multipart-complete / DELETE each deliver one event with correct fields,
 /// and the prefix/suffix filter drops non-matching keys.

@@ -123,7 +123,7 @@ libc.workspace = true
 # (backlog#1178); "fs" comes from the workspace default.
 rustix = { workspace = true, features = ["process", "fs"] }
 rustfs-madmin.workspace = true
-reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy"] }
+reqwest = { workspace = true }
 aes-gcm = { workspace = true, features = ["rand_core"] }
 chacha20poly1305.workspace = true
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }

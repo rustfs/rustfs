@@ -150,8 +150,8 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::http::{
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE,
-    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, contains_key_str, get_header_map, get_str,
-    insert_str, is_encryption_metadata_key, remove_header_map,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, contains_key_str,
+    get_header_map, get_str, insert_str, is_encryption_metadata_key, remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,
@@ -188,6 +188,61 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
+
+pub(super) fn restore_operation_id_from_metadata(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
+    let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_RESTORE_OPERATION_ID) else {
+        if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_RESTORE_OPERATION_ID) {
+            return Err(Error::other("invalid restore operation id metadata".to_string()));
+        }
+        return Ok(None);
+    };
+    let id = Uuid::parse_str(value).map_err(|_| Error::other("invalid restore operation id metadata".to_string()))?;
+    if id.is_nil() {
+        return Err(Error::other("invalid restore operation id metadata".to_string()));
+    }
+    Ok(Some(id))
+}
+
+pub(super) fn require_restore_operation_id(metadata: &HashMap<String, String>, expected: Uuid) -> Result<()> {
+    match restore_operation_id_from_metadata(metadata)? {
+        Some(actual) if actual == expected => Ok(()),
+        _ => Err(Error::other("restore operation id changed before copy-back".to_string())),
+    }
+}
+
+pub(super) fn restore_commit_operation_id_from_metadata(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
+    if !metadata.contains_key(X_AMZ_RESTORE.as_str()) {
+        return Ok(None);
+    }
+    restore_operation_id_from_metadata(metadata)
+}
+
+impl SetDisks {
+    pub(super) async fn require_current_restore_operation_id(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        expected: Option<Uuid>,
+        mode: &str,
+    ) -> Result<()> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let read_opts = ObjectOptions {
+            version_id: opts.version_id.clone(),
+            versioned: opts.versioned,
+            version_suspended: opts.version_suspended,
+            no_lock: true,
+            ..Default::default()
+        };
+        let (current, _, _) = self.get_object_fileinfo(bucket, object, &read_opts, true, false).await?;
+        restore_operation_id_from_metadata(&current.metadata)?
+            .filter(|actual| *actual == expected)
+            .ok_or_else(|| Error::other(format!("restore operation id changed before {mode}: expected {expected}")))?;
+        Ok(())
+    }
+}
 
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -632,6 +687,8 @@ mod core;
 mod ctx;
 mod metadata;
 mod ops;
+#[cfg(feature = "test-util")]
+pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 pub(crate) use ops::object::body_cache_plaintext_len;
 mod read;
 mod replication;

@@ -51,7 +51,7 @@ use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, Result, StorageError};
 use crate::services::tier::{
     tier_admin::TierCreds,
-    tier_config::{TierConfig, TierType},
+    tier_config::{TierConfig, TierType, TierWasabi},
     tier_handlers::{ERR_TIER_ALREADY_EXISTS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME},
     warm_backend::{WarmBackend, check_warm_backend, new_warm_backend},
 };
@@ -146,6 +146,8 @@ const EXTERNAL_TIER_TYPE_S3: i32 = 1;
 const EXTERNAL_TIER_TYPE_AZURE: i32 = 2;
 const EXTERNAL_TIER_TYPE_GCS: i32 = 3;
 const EXTERNAL_TIER_TYPE_MINIO: i32 = 4;
+const EXTERNAL_TIER_VERSION_WASABI_V1: &str = "rustfs-wasabi-v1";
+const EXTERNAL_TIER_WASABI_ENDPOINT_SENTINEL: &str = "rustfs-wasabi-v1:";
 const TIER_BACKEND_IDENTITY_VERSION: u8 = 2;
 const _TIER_CFG_REFRESH_AT_HDR: &str = "X-RustFS-TierCfg-RefreshedAt";
 
@@ -484,6 +486,14 @@ fn replaced_tier_destinations(
     for (tier_name, current_config) in &current.tiers {
         let changed = match replacement.tiers.get(tier_name) {
             Some(replacement_config) => {
+                if matches!(current_config.tier_type, TierType::Wasabi)
+                    != matches!(replacement_config.tier_type, TierType::Wasabi)
+                {
+                    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                    admin_err.message =
+                        "Changing an existing remote tier to or from Wasabi is not supported; add a new tier instead".to_string();
+                    return Err(admin_err);
+                }
                 let current_identity = tier_backend_identity(current_config).map_err(|err| {
                     let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
                     admin_err.message = err.to_string();
@@ -505,7 +515,43 @@ fn replaced_tier_destinations(
     Ok(replaced)
 }
 
+fn encode_tier_backend_identity(
+    tier_type: &str,
+    endpoint: &str,
+    bucket: &str,
+    prefix: &str,
+    region: &str,
+    routing_account: &str,
+) -> io::Result<TierDestinationId> {
+    let encoded = rmp_serde::to_vec(&(
+        TIER_BACKEND_IDENTITY_VERSION,
+        tier_type,
+        endpoint,
+        bucket,
+        prefix,
+        region,
+        routing_account,
+    ))
+    .map_err(|err| io::Error::other(format!("serialize tier backend identity failed: {err}")))?;
+    Ok(Sha256::digest(encoded).into())
+}
+
 fn tier_backend_identity(config: &TierConfig) -> io::Result<TierDestinationId> {
+    if matches!(config.tier_type, TierType::Wasabi) {
+        let wasabi = config
+            .wasabi
+            .as_ref()
+            .ok_or_else(|| io::Error::other("tier backend identity payload is missing"))?;
+        return encode_tier_backend_identity(
+            "s3",
+            &wasabi.canonical_endpoint()?,
+            &wasabi.bucket,
+            normalized_tier_prefix(&config.tier_type, &wasabi.prefix),
+            &wasabi.region,
+            "",
+        );
+    }
+
     let (tier_type, endpoint, bucket, prefix, region, routing_account) = match config.tier_type {
         TierType::S3 => config.s3.as_ref().map(|value| {
             (
@@ -517,6 +563,7 @@ fn tier_backend_identity(config: &TierConfig) -> io::Result<TierDestinationId> {
                 "",
             )
         }),
+        TierType::Wasabi => None,
         TierType::RustFS => config.rustfs.as_ref().map(|value| {
             (
                 "rustfs",
@@ -601,17 +648,7 @@ fn tier_backend_identity(config: &TierConfig) -> io::Result<TierDestinationId> {
     }
     .ok_or_else(|| io::Error::other("tier backend identity payload is missing"))?;
     let prefix = normalized_tier_prefix(&config.tier_type, prefix);
-    let encoded = rmp_serde::to_vec(&(
-        TIER_BACKEND_IDENTITY_VERSION,
-        tier_type,
-        endpoint,
-        bucket,
-        prefix,
-        region,
-        routing_account,
-    ))
-    .map_err(|err| io::Error::other(format!("serialize tier backend identity failed: {err}")))?;
-    Ok(Sha256::digest(encoded).into())
+    encode_tier_backend_identity(tier_type, endpoint, bucket, prefix, region, routing_account)
 }
 
 pub(crate) fn tier_destination_id_from_metadata(metadata: &HashMap<String, String>) -> io::Result<Option<TierDestinationId>> {
@@ -642,7 +679,7 @@ pub(crate) fn tier_destination_id_from_metadata(metadata: &HashMap<String, Strin
 
 fn normalized_tier_prefix<'a>(tier_type: &TierType, prefix: &'a str) -> &'a str {
     match tier_type {
-        TierType::S3 => prefix.trim_matches('/'),
+        TierType::S3 | TierType::Wasabi => prefix.trim_matches('/'),
         TierType::RustFS
         | TierType::MinIO
         | TierType::Aliyun
@@ -672,6 +709,14 @@ struct SharedWarmBackendProxy(SharedWarmBackend);
 
 #[async_trait::async_trait]
 impl WarmBackend for SharedWarmBackendProxy {
+    async fn validate(&self) -> io::Result<()> {
+        self.0.validate().await
+    }
+
+    fn validate_remote_version_id(&self, remote_version_id: &str) -> io::Result<()> {
+        self.0.validate_remote_version_id(remote_version_id)
+    }
+
     async fn put(&self, object: &str, r: crate::client::transition_api::ReaderImpl, length: i64) -> io::Result<String> {
         self.0.put(object, r, length).await
     }
@@ -697,6 +742,10 @@ impl WarmBackend for SharedWarmBackendProxy {
 
     async fn remove(&self, object: &str, rv: &str) -> io::Result<()> {
         self.0.remove(object, rv).await
+    }
+
+    async fn remove_exact(&self, object: &str, rv: &str) -> io::Result<()> {
+        self.0.remove_exact(object, rv).await
     }
 
     async fn in_use(&self) -> io::Result<bool> {
@@ -937,6 +986,7 @@ fn tier_config_path(file: &str) -> String {
 fn tier_hint_for_type(tier_type: TierType) -> Option<&'static str> {
     match tier_type {
         TierType::RustFS => Some("rustfs"),
+        TierType::Wasabi => Some("wasabi"),
         TierType::Aliyun => Some("aliyun"),
         TierType::Tencent => Some("tencent"),
         TierType::Huaweicloud => Some("huaweicloud"),
@@ -1038,6 +1088,26 @@ fn to_external_tier_config(name: &str, tier: &TierConfig) -> io::Result<External
                 .ok_or_else(|| io::Error::other("tier config missing s3 backend payload"))?;
             out.tier_type = EXTERNAL_TIER_TYPE_S3;
             out.s3 = Some(external_tier_s3_from_internal(s3));
+        }
+        TierType::Wasabi => {
+            let backend = tier
+                .wasabi
+                .as_ref()
+                .ok_or_else(|| io::Error::other("tier config missing Wasabi backend payload"))?;
+            out.version = EXTERNAL_TIER_VERSION_WASABI_V1.to_string();
+            out.tier_type = EXTERNAL_TIER_TYPE_S3;
+            out.tier_type_hint = tier_hint_for_type(tier.tier_type.clone()).map(ToString::to_string);
+            out.s3 = Some(external_tier_s3_from_compatible_payload(
+                {
+                    backend.canonical_endpoint()?;
+                    EXTERNAL_TIER_WASABI_ENDPOINT_SENTINEL.to_string()
+                },
+                backend.access_key.clone(),
+                backend.secret_key.clone(),
+                backend.bucket.clone(),
+                backend.prefix.clone(),
+                backend.region.clone(),
+            ));
         }
         TierType::Azure => {
             let az = tier
@@ -1205,17 +1275,36 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         ..Default::default()
     };
 
-    let hinted = tier_type_from_hint(ext.tier_type_hint.as_deref());
-    let tier_type = if let Some(h) = hinted {
-        h
+    let wasabi_hint = ext.tier_type_hint.as_deref() == Some("wasabi");
+    let wasabi_version = ext.version == EXTERNAL_TIER_VERSION_WASABI_V1;
+    if wasabi_hint && !wasabi_version {
+        return Err(io::Error::other(format!(
+            "tier config '{}' has inconsistent Wasabi type discriminators",
+            cfg.name
+        )));
+    }
+    if (wasabi_hint || wasabi_version) && ext.tier_type != EXTERNAL_TIER_TYPE_S3 {
+        return Err(io::Error::other(format!(
+            "tier config '{}' has inconsistent Wasabi type discriminators",
+            cfg.name
+        )));
+    }
+    if wasabi_version && ext.tier_type_hint.as_deref().is_some_and(|hint| hint != "wasabi") {
+        return Err(io::Error::other(format!(
+            "tier config '{}' has inconsistent Wasabi type discriminators",
+            cfg.name
+        )));
+    }
+    let tier_type = if wasabi_version {
+        TierType::Wasabi
     } else {
-        match ext.tier_type {
+        tier_type_from_hint(ext.tier_type_hint.as_deref()).unwrap_or_else(|| match ext.tier_type {
             EXTERNAL_TIER_TYPE_S3 => TierType::S3,
             EXTERNAL_TIER_TYPE_AZURE => TierType::Azure,
             EXTERNAL_TIER_TYPE_GCS => TierType::GCS,
             EXTERNAL_TIER_TYPE_MINIO => TierType::MinIO,
             _ => TierType::Unsupported,
-        }
+        })
     };
 
     cfg.tier_type = tier_type.clone();
@@ -1241,6 +1330,41 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
                 aws_role_session_name: s3.aws_role_session_name.clone(),
                 aws_role_duration_seconds: s3.aws_role_duration_seconds,
             });
+        }
+        TierType::Wasabi => {
+            let s3 = ext
+                .s3
+                .as_ref()
+                .ok_or_else(|| io::Error::other(format!("tier config '{}' missing Wasabi S3 payload", cfg.name)))?;
+            if !s3.storage_class.is_empty()
+                || s3.aws_role
+                || !s3.aws_role_web_identity_token_file.is_empty()
+                || !s3.aws_role_arn.is_empty()
+                || !s3.aws_role_session_name.is_empty()
+                || s3.aws_role_duration_seconds != 0
+            {
+                return Err(io::Error::other(format!(
+                    "tier config '{}' has unsupported Wasabi S3 credential fields",
+                    cfg.name
+                )));
+            }
+            if s3.endpoint != EXTERNAL_TIER_WASABI_ENDPOINT_SENTINEL {
+                return Err(io::Error::other(format!(
+                    "tier config '{}' has an invalid Wasabi compatibility endpoint",
+                    cfg.name
+                )));
+            }
+            let mut wasabi = TierWasabi {
+                name: cfg.name.clone(),
+                endpoint: String::new(),
+                access_key: s3.access_key.clone(),
+                secret_key: s3.secret_key.clone(),
+                bucket: s3.bucket.clone(),
+                prefix: s3.prefix.clone(),
+                region: s3.region.clone(),
+            };
+            wasabi.normalize_endpoint()?;
+            cfg.wasabi = Some(wasabi);
         }
         TierType::Azure => {
             let az = ext
@@ -1420,7 +1544,19 @@ impl TierConfigMgr {
     }
 
     pub fn unmarshal(data: &[u8]) -> std::result::Result<TierConfigMgr, std::io::Error> {
-        let cfg: TierConfigMgr = serde_json::from_slice(data)?;
+        let mut cfg: TierConfigMgr = serde_json::from_slice(data)?;
+        for (name, tier) in &mut cfg.tiers {
+            if matches!(&tier.tier_type, TierType::Wasabi) {
+                let wasabi = tier
+                    .wasabi
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other(format!("tier config '{name}' missing Wasabi backend payload")))?;
+                if wasabi.endpoint.is_empty() {
+                    return Err(io::Error::other(format!("tier config '{name}' missing Wasabi endpoint")));
+                }
+                wasabi.normalize_endpoint()?;
+            }
+        }
         Ok(cfg)
     }
 
@@ -1447,7 +1583,7 @@ impl TierConfigMgr {
         (TierType::Unsupported, false)
     }
 
-    pub async fn add(&mut self, tier_config: TierConfig, force: bool) -> std::result::Result<(), AdminError> {
+    pub async fn add(&mut self, mut tier_config: TierConfig, force: bool) -> std::result::Result<(), AdminError> {
         self.ensure_generation_is_idle(&tier_config.name)?;
         let tier_name = tier_config.name.clone();
         if tier_name != tier_name.to_uppercase() {
@@ -1467,6 +1603,16 @@ impl TierConfigMgr {
         let (_, b) = self.is_tier_name_in_use(&tier_name);
         if b {
             return Err(ERR_TIER_ALREADY_EXISTS.clone());
+        }
+
+        if matches!(&tier_config.tier_type, TierType::Wasabi)
+            && let Some(wasabi) = tier_config.wasabi.as_mut()
+        {
+            wasabi.normalize_endpoint().map_err(|source| {
+                let mut err = ERR_TIER_INVALID_CONFIG.clone();
+                err.message = source.to_string();
+                err
+            })?;
         }
 
         let d = new_warm_backend(&tier_config, true).await?;
@@ -1601,6 +1747,15 @@ impl TierConfigMgr {
                         s3.access_key = creds.access_key;
                         s3.secret_key = creds.secret_key;
                     }
+                }
+            }
+            TierType::Wasabi => {
+                if let Some(wasabi) = tier_config.wasabi.as_mut() {
+                    if creds.access_key.is_empty() || creds.secret_key.is_empty() {
+                        return Err(ERR_TIER_MISSING_CREDENTIALS.clone());
+                    }
+                    wasabi.access_key = creds.access_key;
+                    wasabi.secret_key = creds.secret_key;
                 }
             }
             TierType::RustFS => {
@@ -2906,6 +3061,24 @@ mod tests {
         }
     }
 
+    fn build_wasabi_tier(name: &str) -> TierConfig {
+        TierConfig {
+            version: "v1".to_string(),
+            tier_type: TierType::Wasabi,
+            name: name.to_string(),
+            wasabi: Some(TierWasabi {
+                name: name.to_string(),
+                endpoint: "https://s3.ap-northeast-1.wasabisys.com".to_string(),
+                access_key: "ak".to_string(),
+                secret_key: "sk".to_string(),
+                bucket: "wasabi-bucket".to_string(),
+                prefix: "archive".to_string(),
+                region: "ap-northeast-1".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_tiering_external_blob_roundtrip_for_standard_type() {
         let mut cfg = TierConfigMgr {
@@ -2962,6 +3135,246 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wasabi_external_blob_survives_old_node_rewrite_and_fences_old_drivers() {
+        const WASABI_V2_GOLDEN: &[u8] = &[
+            1, 0, 2, 0, 145, 129, 171, 67, 79, 76, 68, 45, 87, 65, 83, 65, 66, 73, 152, 176, 114, 117, 115, 116, 102, 115, 45,
+            119, 97, 115, 97, 98, 105, 45, 118, 49, 1, 171, 67, 79, 76, 68, 45, 87, 65, 83, 65, 66, 73, 156, 177, 114, 117, 115,
+            116, 102, 115, 45, 119, 97, 115, 97, 98, 105, 45, 118, 49, 58, 162, 97, 107, 162, 115, 107, 173, 119, 97, 115, 97,
+            98, 105, 45, 98, 117, 99, 107, 101, 116, 167, 97, 114, 99, 104, 105, 118, 101, 174, 97, 112, 45, 110, 111, 114, 116,
+            104, 101, 97, 115, 116, 45, 49, 160, 194, 160, 160, 160, 0, 192, 192, 192, 166, 119, 97, 115, 97, 98, 105,
+        ];
+
+        let mut cfg = empty_mgr();
+        let mut tier = build_wasabi_tier("COLD-WASABI");
+        tier.wasabi.as_mut().expect("Wasabi payload should exist").endpoint.clear();
+        cfg.tiers.insert("COLD-WASABI".to_string(), tier);
+
+        let bytes = encode_external_tiering_config_blob(&cfg).expect("Wasabi tier should encode");
+        assert_eq!(bytes.as_ref(), WASABI_V2_GOLDEN, "Wasabi v2 bytes must remain stable");
+        assert_eq!(&bytes[0..2], &TIER_CONFIG_FORMAT.to_le_bytes());
+        assert_eq!(&bytes[2..4], &TIER_CONFIG_VERSION.to_le_bytes());
+        let external: ExternalTierConfigMgr = rmp_serde::from_slice(&bytes[4..]).expect("external Wasabi payload should decode");
+        let stored = external.tiers.get("COLD-WASABI").expect("stored Wasabi tier should exist");
+        assert_eq!(stored.version, EXTERNAL_TIER_VERSION_WASABI_V1);
+        assert_eq!(stored.tier_type, EXTERNAL_TIER_TYPE_S3);
+        assert_eq!(stored.tier_type_hint.as_deref(), Some("wasabi"));
+        assert!(stored.compatible_backend.is_none());
+        let s3 = stored.s3.as_ref().expect("Wasabi should use the S3 payload");
+        assert_eq!(s3.endpoint, EXTERNAL_TIER_WASABI_ENDPOINT_SENTINEL);
+        assert_eq!(s3.bucket, "wasabi-bucket");
+        assert_eq!(s3.prefix, "archive");
+        assert_eq!(s3.region, "ap-northeast-1");
+        assert!(s3.storage_class.is_empty());
+
+        let decoded = decode_external_tiering_config_blob(&bytes).expect("Wasabi tier should decode");
+        let wasabi = decoded.tiers["COLD-WASABI"]
+            .wasabi
+            .as_ref()
+            .expect("Wasabi payload should survive roundtrip");
+        assert_eq!(wasabi.endpoint, "https://s3.ap-northeast-1.wasabisys.com");
+        assert_eq!(wasabi.secret_key, "sk");
+        assert_eq!(decoded.tiers["COLD-WASABI"].version, EXTERNAL_TIER_VERSION_WASABI_V1);
+
+        let encode_fixture = |external: &ExternalTierConfigMgr| {
+            let payload = rmp_serde::to_vec(external).expect("Wasabi fixture should encode");
+            let mut fixture = Vec::with_capacity(4 + payload.len());
+            fixture.extend_from_slice(&TIER_CONFIG_FORMAT.to_le_bytes());
+            fixture.extend_from_slice(&TIER_CONFIG_VERSION.to_le_bytes());
+            fixture.extend_from_slice(&payload);
+            fixture
+        };
+
+        // Current older nodes preserve the per-tier Version and S3 payload when
+        // rewriting the binary document, but drop an unrecognized XTierType.
+        let mut old_node_rewrite = external.clone();
+        old_node_rewrite
+            .tiers
+            .get_mut("COLD-WASABI")
+            .expect("stored Wasabi tier should exist")
+            .tier_type_hint = None;
+        let rewritten = encode_fixture(&old_node_rewrite);
+        let decoded = decode_external_tiering_config_blob(&rewritten)
+            .expect("the durable per-tier marker must restore Wasabi after an old-node rewrite");
+        assert!(matches!(decoded.tiers["COLD-WASABI"].tier_type, TierType::Wasabi));
+
+        let old_s3_payload = old_node_rewrite.tiers["COLD-WASABI"]
+            .s3
+            .as_ref()
+            .expect("old nodes should retain the physical S3 payload");
+        let old_s3 = crate::services::tier::tier_config::TierS3 {
+            name: "COLD-WASABI".to_string(),
+            endpoint: old_s3_payload.endpoint.clone(),
+            access_key: old_s3_payload.access_key.clone(),
+            secret_key: old_s3_payload.secret_key.clone(),
+            bucket: old_s3_payload.bucket.clone(),
+            prefix: old_s3_payload.prefix.clone(),
+            region: old_s3_payload.region.clone(),
+            ..Default::default()
+        };
+        let err = match crate::services::tier::warm_backend_s3::WarmBackendS3::new(&old_s3, "COLD-WASABI").await {
+            Ok(_) => panic!("an older generic S3 driver must not operate a Wasabi compatibility envelope"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("missing a host"), "{err}");
+
+        let mut generic_s3 = old_node_rewrite.clone();
+        generic_s3
+            .tiers
+            .get_mut("COLD-WASABI")
+            .expect("stored Wasabi tier should exist")
+            .version = "v1".to_string();
+        let decoded = decode_external_tiering_config_blob(&encode_fixture(&generic_s3))
+            .expect("a generic S3 tier without an explicit marker must stay generic");
+        assert!(matches!(decoded.tiers["COLD-WASABI"].tier_type, TierType::S3));
+
+        let mut hint_only = external.clone();
+        hint_only
+            .tiers
+            .get_mut("COLD-WASABI")
+            .expect("stored Wasabi tier should exist")
+            .version = "v1".to_string();
+        let err = expect_decode_err(&encode_fixture(&hint_only));
+        assert!(err.to_string().contains("inconsistent Wasabi type discriminators"), "{err}");
+
+        let mut wrong_type = old_node_rewrite.clone();
+        wrong_type
+            .tiers
+            .get_mut("COLD-WASABI")
+            .expect("stored Wasabi tier should exist")
+            .tier_type = EXTERNAL_TIER_TYPE_MINIO;
+        let err = expect_decode_err(&encode_fixture(&wrong_type));
+        assert!(err.to_string().contains("inconsistent Wasabi type discriminators"), "{err}");
+
+        let mut wrong_hint = external.clone();
+        wrong_hint
+            .tiers
+            .get_mut("COLD-WASABI")
+            .expect("stored Wasabi tier should exist")
+            .tier_type_hint = Some("rustfs".to_string());
+        let err = expect_decode_err(&encode_fixture(&wrong_hint));
+        assert!(err.to_string().contains("inconsistent Wasabi type discriminators"), "{err}");
+
+        let poison_fields: [(&str, fn(&mut ExternalTierS3)); 6] = [
+            ("storage_class", |s3| s3.storage_class = "GLACIER".to_string()),
+            ("aws_role", |s3| s3.aws_role = true),
+            ("web_identity_token", |s3| s3.aws_role_web_identity_token_file = "/tmp/token".to_string()),
+            ("role_arn", |s3| s3.aws_role_arn = "arn:aws:iam::1:role/test".to_string()),
+            ("role_session", |s3| s3.aws_role_session_name = "session".to_string()),
+            ("role_duration", |s3| s3.aws_role_duration_seconds = 900),
+        ];
+        for (field, poison) in poison_fields {
+            let mut unsupported_credentials = external.clone();
+            let s3 = unsupported_credentials
+                .tiers
+                .get_mut("COLD-WASABI")
+                .expect("stored Wasabi tier should exist")
+                .s3
+                .as_mut()
+                .expect("Wasabi S3 payload should exist");
+            poison(s3);
+            let err = expect_decode_err(&encode_fixture(&unsupported_credentials));
+            assert!(
+                err.to_string().contains("unsupported Wasabi S3 credential fields"),
+                "field {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_extended_type_hint_keeps_precedence_over_numeric_type() {
+        let mut external = ExternalTierConfigMgr::default();
+        external.tiers.insert(
+            "COLD-LEGACY".to_string(),
+            ExternalTierConfig {
+                version: "v1".to_string(),
+                tier_type: EXTERNAL_TIER_TYPE_MINIO,
+                name: "COLD-LEGACY".to_string(),
+                tier_type_hint: Some("rustfs".to_string()),
+                s3: Some(ExternalTierS3 {
+                    endpoint: "https://rustfs.example.invalid".to_string(),
+                    access_key: "ak".to_string(),
+                    secret_key: "sk".to_string(),
+                    bucket: "archive".to_string(),
+                    prefix: "objects".to_string(),
+                    region: "us-east-1".to_string(),
+                    ..Default::default()
+                }),
+                compatible_backend: Some(ExternalTierCompatible {
+                    endpoint: "https://minio.example.invalid".to_string(),
+                    bucket: "different".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let payload = rmp_serde::to_vec(&external).expect("legacy fixture should encode");
+        let mut blob = Vec::with_capacity(4 + payload.len());
+        blob.extend_from_slice(&TIER_CONFIG_FORMAT.to_le_bytes());
+        blob.extend_from_slice(&TIER_CONFIG_VERSION.to_le_bytes());
+        blob.extend_from_slice(&payload);
+
+        let decoded = decode_external_tiering_config_blob(&blob).expect("legacy extended hint should decode as before");
+        let rustfs = decoded.tiers["COLD-LEGACY"]
+            .rustfs
+            .as_ref()
+            .expect("recognized legacy hint must override the numeric type");
+        assert_eq!(rustfs.endpoint, "https://rustfs.example.invalid");
+        assert_eq!(rustfs.bucket, "archive");
+    }
+
+    #[test]
+    fn wasabi_external_blob_rejects_noncanonical_endpoint_and_unsafe_region() {
+        let mut cfg = empty_mgr();
+        cfg.tiers.insert("COLD-WASABI".to_string(), build_wasabi_tier("COLD-WASABI"));
+        let bytes = encode_external_tiering_config_blob(&cfg).expect("Wasabi tier should encode");
+        let base: ExternalTierConfigMgr = rmp_serde::from_slice(&bytes[4..]).expect("external Wasabi payload should decode");
+
+        for (endpoint, region, expected) in [
+            ("https://s3.example.invalid", "ap-northeast-1", "invalid Wasabi compatibility endpoint"),
+            (EXTERNAL_TIER_WASABI_ENDPOINT_SENTINEL, "ap.northeast-1", "invalid Wasabi region"),
+        ] {
+            let mut external = base.clone();
+            let s3 = external
+                .tiers
+                .get_mut("COLD-WASABI")
+                .and_then(|tier| tier.s3.as_mut())
+                .expect("stored Wasabi S3 payload should exist");
+            s3.endpoint = endpoint.to_string();
+            s3.region = region.to_string();
+            let payload = rmp_serde::to_vec(&external).expect("corrupt fixture should encode");
+            let mut corrupt = Vec::with_capacity(4 + payload.len());
+            corrupt.extend_from_slice(&TIER_CONFIG_FORMAT.to_le_bytes());
+            corrupt.extend_from_slice(&TIER_CONFIG_VERSION.to_le_bytes());
+            corrupt.extend_from_slice(&payload);
+
+            let err = expect_decode_err(&corrupt);
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+
+        let mut external = base;
+        let stored = external
+            .tiers
+            .get_mut("COLD-WASABI")
+            .expect("stored Wasabi tier should exist");
+        let s3 = stored.s3.take().expect("stored Wasabi S3 payload should exist");
+        stored.compatible_backend = Some(external_tier_alias_from_compatible_payload(
+            s3.endpoint,
+            s3.access_key,
+            s3.secret_key,
+            s3.bucket,
+            s3.prefix,
+            s3.region,
+        ));
+        let payload = rmp_serde::to_vec(&external).expect("wrong-payload fixture should encode");
+        let mut corrupt = Vec::with_capacity(4 + payload.len());
+        corrupt.extend_from_slice(&TIER_CONFIG_FORMAT.to_le_bytes());
+        corrupt.extend_from_slice(&TIER_CONFIG_VERSION.to_le_bytes());
+        corrupt.extend_from_slice(&payload);
+        let err = expect_decode_err(&corrupt);
+        assert!(err.to_string().contains("missing Wasabi S3 payload"), "{err}");
+    }
+
     #[test]
     fn test_decode_tiering_config_blob_accepts_legacy_json() {
         let mut cfg = TierConfigMgr {
@@ -2981,6 +3394,42 @@ mod tests {
                 .map(|s3| s3.bucket.as_str()),
             Some("bucket-a")
         );
+    }
+
+    #[test]
+    fn wasabi_legacy_json_rejects_missing_payload_and_invalid_endpoints() {
+        let mut cfg = empty_mgr();
+        let mut tier = build_wasabi_tier("COLD-WASABI");
+        tier.wasabi.as_mut().expect("Wasabi payload should exist").endpoint = "https://s3.example.invalid".to_string();
+        cfg.tiers.insert("COLD-WASABI".to_string(), tier);
+
+        let data = serde_json::to_vec(&cfg).expect("legacy JSON fixture should encode");
+        let err = match TierConfigMgr::unmarshal(&data) {
+            Ok(_) => panic!("legacy Wasabi endpoint mismatch must fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("https://s3.ap-northeast-1.wasabisys.com"));
+
+        cfg.tiers
+            .get_mut("COLD-WASABI")
+            .and_then(|tier| tier.wasabi.as_mut())
+            .expect("Wasabi payload should exist")
+            .endpoint
+            .clear();
+        let data = serde_json::to_vec(&cfg).expect("empty-endpoint fixture should encode");
+        let err = match TierConfigMgr::unmarshal(&data) {
+            Ok(_) => panic!("legacy Wasabi endpoint must not be empty"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("missing Wasabi endpoint"), "{err}");
+
+        cfg.tiers.get_mut("COLD-WASABI").expect("Wasabi tier should exist").wasabi = None;
+        let data = serde_json::to_vec(&cfg).expect("missing-payload fixture should encode");
+        let err = match TierConfigMgr::unmarshal(&data) {
+            Ok(_) => panic!("legacy Wasabi payload must exist"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("missing Wasabi backend payload"), "{err}");
     }
 
     #[test]
@@ -3046,6 +3495,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WarmBackend for MockWarmBackend {
+        async fn validate(&self) -> std::result::Result<(), std::io::Error> {
+            if self.healthy {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("mock validation failed"))
+            }
+        }
+
+        fn validate_remote_version_id(&self, remote_version_id: &str) -> std::result::Result<(), std::io::Error> {
+            if remote_version_id == "unsupported-version" {
+                Err(std::io::Error::other("mock remote version rejected"))
+            } else {
+                Ok(())
+            }
+        }
+
         async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> std::result::Result<String, std::io::Error> {
             if self.healthy {
                 Ok("mock-version".to_string())
@@ -3083,6 +3548,13 @@ mod tests {
             } else {
                 Err(std::io::Error::other("mock remove failed"))
             }
+        }
+
+        async fn remove_exact(&self, object: &str, rv: &str) -> std::result::Result<(), std::io::Error> {
+            if rv == "exact-only" {
+                return Err(std::io::Error::other("mock exact remove forwarded"));
+            }
+            self.remove(object, rv).await
         }
 
         async fn in_use(&self) -> std::result::Result<bool, std::io::Error> {
@@ -3158,6 +3630,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_rejects_custom_wasabi_endpoint_before_backend_setup() {
+        let mut mgr = empty_mgr();
+        let mut tier = build_wasabi_tier("COLD-WASABI");
+        tier.wasabi.as_mut().expect("Wasabi payload should exist").endpoint = "https://s3.example.invalid".to_string();
+
+        let err = mgr
+            .add(tier, true)
+            .await
+            .expect_err("custom Wasabi endpoint must fail before backend setup");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert_eq!(err.message, "Wasabi endpoint must be https://s3.ap-northeast-1.wasabisys.com");
+        assert!(mgr.tiers.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_add_rejects_reserved_names() {
         // Supersedes the former `test_add_does_not_reserve_standard_name_regression_anchor`
         // (added by PR #4713 to pin the pre-fix behavior). RustFS now rejects the
@@ -3207,6 +3694,18 @@ mod tests {
             .edit("COLD-R", TierCreds::default())
             .await
             .expect_err("empty credentials must be rejected");
+        assert_eq!(err.code, ERR_TIER_MISSING_CREDENTIALS.code);
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_missing_credentials_for_wasabi() {
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert("COLD-WASABI".to_string(), build_wasabi_tier("COLD-WASABI"));
+
+        let err = mgr
+            .edit("COLD-WASABI", TierCreds::default())
+            .await
+            .expect_err("empty Wasabi credentials must be rejected before backend setup");
         assert_eq!(err.code, ERR_TIER_MISSING_CREDENTIALS.code);
     }
 
@@ -3440,6 +3939,32 @@ mod tests {
         mgr.verify("COLD-A")
             .await
             .expect_err("an unhealthy backend must fail verification");
+    }
+
+    #[tokio::test]
+    async fn shared_backend_proxy_forwards_validation_hooks() {
+        let unhealthy: SharedWarmBackend = Arc::new(MockWarmBackend {
+            in_use_value: Some(false),
+            healthy: false,
+        });
+        let proxy = SharedWarmBackendProxy(unhealthy);
+        let err = proxy.validate().await.expect_err("proxy must forward backend validation");
+        assert_eq!(err.to_string(), "mock validation failed");
+
+        let healthy: SharedWarmBackend = Arc::new(MockWarmBackend {
+            in_use_value: Some(false),
+            healthy: true,
+        });
+        let proxy = SharedWarmBackendProxy(healthy);
+        let err = proxy
+            .validate_remote_version_id("unsupported-version")
+            .expect_err("proxy must forward remote version validation");
+        assert_eq!(err.to_string(), "mock remote version rejected");
+        let err = proxy
+            .remove_exact("remote-object", "exact-only")
+            .await
+            .expect_err("proxy must forward exact-version cleanup");
+        assert_eq!(err.to_string(), "mock exact remove forwarded");
     }
 
     // ---- pure query helpers --------------------------------------------
@@ -4665,6 +5190,50 @@ mod tests {
     }
 
     #[test]
+    fn wasabi_backend_identity_uses_its_canonical_physical_destination() {
+        let mut wasabi = build_wasabi_tier("COLD-WASABI");
+        let wasabi_config = wasabi.wasabi.as_mut().expect("Wasabi payload should exist");
+        wasabi_config.endpoint = "https://s3.nl-1.wasabisys.com".to_string();
+        wasabi_config.prefix = "/archive//".to_string();
+        wasabi_config.region = "eu-central-1".to_string();
+
+        let mut physical_s3 = build_s3_tier("COLD-WASABI");
+        let s3 = physical_s3.s3.as_mut().expect("S3 payload should exist");
+        s3.endpoint = "https://s3.eu-central-1.wasabisys.com".to_string();
+        s3.bucket = wasabi_config.bucket.clone();
+        s3.prefix = "archive".to_string();
+        s3.region = wasabi_config.region.clone();
+
+        assert_eq!(
+            tier_backend_identity(&wasabi).expect("Wasabi identity should encode"),
+            tier_backend_identity(&physical_s3).expect("physical S3 identity should encode")
+        );
+    }
+
+    #[test]
+    fn in_place_wasabi_type_changes_are_rejected() {
+        let mut wasabi = build_wasabi_tier("COLD-WASABI");
+        wasabi.wasabi.as_mut().expect("Wasabi payload should exist").region = "us-east-1".to_string();
+        let mut s3 = build_s3_tier("COLD-WASABI");
+        let s3_config = s3.s3.as_mut().expect("S3 payload should exist");
+        s3_config.endpoint = "https://s3.wasabisys.com".to_string();
+        s3_config.bucket = "wasabi-bucket".to_string();
+        s3_config.prefix = "archive".to_string();
+        s3_config.region = "us-east-1".to_string();
+
+        for (current_tier, replacement_tier) in [(s3.clone_with_credentials(), wasabi.clone_with_credentials()), (wasabi, s3)] {
+            let mut current = empty_mgr();
+            current.tiers.insert("COLD-WASABI".to_string(), current_tier);
+            let mut replacement = empty_mgr();
+            replacement.tiers.insert("COLD-WASABI".to_string(), replacement_tier);
+
+            let err = replaced_tier_destinations(&current, &replacement)
+                .expect_err("in-place type changes must not bypass mixed-version Wasabi fencing");
+            assert!(err.message.contains("add a new tier instead"), "{}", err.message);
+        }
+    }
+
+    #[test]
     fn backend_identity_v2_has_stable_fixtures() {
         assert_eq!(
             tier_backend_identity(&build_rustfs_tier("COLD-A")).expect("identity should encode"),
@@ -4685,6 +5254,7 @@ mod tests {
     #[test]
     fn destination_identity_prefix_normalization_matches_driver_matrix() {
         assert_eq!(normalized_tier_prefix(&TierType::S3, "/foo//"), "foo");
+        assert_eq!(normalized_tier_prefix(&TierType::Wasabi, "/foo//"), "foo");
         for tier_type in [
             TierType::RustFS,
             TierType::MinIO,

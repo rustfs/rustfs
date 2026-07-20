@@ -79,6 +79,14 @@ pub struct AddTierQuery {
 
 pub struct AddTier {}
 
+fn wasabi_payload_name(config: &TierConfig) -> S3Result<String> {
+    config
+        .wasabi
+        .as_ref()
+        .map(|wasabi| wasabi.name.clone())
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Wasabi configuration"))
+}
+
 fn spawn_transition_tier_config_propagation(action: &'static str) {
     if let Some(notification_sys) = current_notification_system() {
         spawn_traced(async move {
@@ -270,6 +278,9 @@ impl Operation for AddTier {
                     .clone()
                     .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing S3 configuration"))?
                     .name;
+            }
+            TierType::Wasabi => {
+                args.name = wasabi_payload_name(&args)?;
             }
             TierType::RustFS => {
                 args.name = args
@@ -943,6 +954,20 @@ mod tests {
     use crate::admin::storage_api::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use http::Uri;
     use matchit::Router;
+
+    #[test]
+    fn wasabi_payload_name_requires_nested_configuration() {
+        let config: TierConfig = serde_json::from_slice(
+            br#"{"type":"wasabi","wasabi":{"name":"WASABI-FIRST","accessKey":"ak","secretKey":"sk","bucket":"archive","region":"us-east-1"}}"#,
+        )
+        .expect("Wasabi AddTier payload should decode");
+        assert_eq!(wasabi_payload_name(&config).expect("Wasabi payload name should exist"), "WASABI-FIRST");
+
+        let missing: TierConfig = serde_json::from_slice(br#"{"type":"wasabi"}"#).expect("type-only payload should decode");
+        let err = wasabi_payload_name(&missing).expect_err("missing Wasabi payload must fail at the AddTier boundary");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("missing Wasabi configuration"));
+    }
 
     #[test]
     fn resolve_tier_name_prefers_path_parameter() {
