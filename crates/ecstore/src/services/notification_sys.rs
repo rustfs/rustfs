@@ -1772,14 +1772,20 @@ mod tests {
         let mut info = StorageInfo {
             disks: vec![
                 rustfs_madmin::Disk {
-                    endpoint: "http://node2:9000/data".to_string(),
-                    drive_path: "/data".to_string(),
+                    endpoint: "http://node2:9000/media/rustfs-01".to_string(),
+                    drive_path: "/media/rustfs-01".to_string(),
                     local: true,
                     ..Default::default()
                 },
                 rustfs_madmin::Disk {
-                    endpoint: "http://node3:9000/data".to_string(),
-                    drive_path: "/data".to_string(),
+                    endpoint: "http://node3:9000/media/rustfs-01".to_string(),
+                    drive_path: "/media/rustfs-01".to_string(),
+                    local: true,
+                    ..Default::default()
+                },
+                rustfs_madmin::Disk {
+                    endpoint: "http://node4:9000/media/rustfs-01".to_string(),
+                    drive_path: "/media/rustfs-01".to_string(),
                     local: true,
                     ..Default::default()
                 },
