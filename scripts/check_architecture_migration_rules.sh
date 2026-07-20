@@ -141,6 +141,10 @@ ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/ecstore_storage_api_root
 ECSTORE_TEST_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_test_direct_api_hits.txt"
 ECSTORE_BENCH_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_bench_direct_api_hits.txt"
 ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE="${TMP_DIR}/erasure_panicking_constructor_hits.txt"
+ERASURE_PANICKING_CONSTRUCTOR_ALL_HITS_FILE="${TMP_DIR}/erasure_panicking_constructor_all_hits.txt"
+ERASURE_GUARD_FIXTURE_HITS_FILE="${TMP_DIR}/erasure_guard_fixture_hits.txt"
+ERASURE_GUARD_FIXTURE_EXPECTED_FILE="${TMP_DIR}/erasure_guard_fixture_expected.txt"
+ERASURE_GUARD_FIXTURE="scripts/fixtures/architecture_migration_rules/cfg_test_field.rs"
 LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE="${TMP_DIR}/local_storage_api_raw_contract_path_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
@@ -1154,9 +1158,12 @@ fi
 
 (
   cd "$ROOT_DIR"
-  find rustfs/src crates -type f -name '*.rs' -print0 |
+  {
+    find rustfs/src crates -type f -name '*.rs' -print0
+    printf '%s\0' "$ERASURE_GUARD_FIXTURE"
+  } |
     xargs -0 perl -ne '
-      next unless $ARGV =~ m{^(?:rustfs/src/|crates/[^/]+/src/)};
+      next unless $ARGV =~ m{^(?:rustfs/src/|crates/[^/]+/src/|scripts/fixtures/architecture_migration_rules/cfg_test_field\.rs$)};
       if (!defined $current_file || $ARGV ne $current_file) {
         $current_file = $ARGV;
         $line = 0;
@@ -1174,15 +1181,17 @@ fi
         my $item = $2;
         if ($item =~ /^\s*(?:\/\/.*)?$/) {
           $pending_test_item = 1;
-        } elsif ($item !~ /;\s*(?:\/\/.*)?$/ && $item =~ /\{/ && $item !~ /}\s*(?:\/\/.*)?$/) {
+        } elsif ($item !~ /[,;]\s*(?:\/\/.*)?$/ && $item =~ /\{/ && $item !~ /}\s*(?:\/\/.*)?$/) {
           $in_test_item = 1;
-        } elsif ($item !~ /;\s*(?:\/\/.*)?$/ && $item !~ /\{/) {
+        } elsif ($item !~ /[,;]\s*(?:\/\/.*)?$/ && $item !~ /\{/) {
           $pending_test_item = 1;
         }
         next;
       }
       if ($pending_test_item) {
         if (/;\s*(?:\/\/.*)?$/) {
+          $pending_test_item = 0;
+        } elsif (/^(\s*).*,\s*(?:\/\/.*)?$/ && $1 eq $test_indent) {
           $pending_test_item = 0;
         } elsif (/\{/) {
           $pending_test_item = 0;
@@ -1193,8 +1202,22 @@ fi
       if (/^\s*(?!\/\/).*\bErasure::new(?:_with_options)?\s*\(/) {
         print "$ARGV:$line:$_";
       }
-    ' || true
-) >"$ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE"
+      ' || true
+) >"$ERASURE_PANICKING_CONSTRUCTOR_ALL_HITS_FILE"
+
+grep -Fv "$ERASURE_GUARD_FIXTURE:" "$ERASURE_PANICKING_CONSTRUCTOR_ALL_HITS_FILE" \
+  >"$ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE" || true
+
+grep -F "$ERASURE_GUARD_FIXTURE:" "$ERASURE_PANICKING_CONSTRUCTOR_ALL_HITS_FILE" \
+  >"$ERASURE_GUARD_FIXTURE_HITS_FILE" || true
+printf '%s\n' \
+  "$ERASURE_GUARD_FIXTURE:19:    let _ = Erasure::new(2, 1, 64);" \
+  "$ERASURE_GUARD_FIXTURE:23:    let _ = Erasure::new_with_options(2, 1, 64, false);" \
+  >"$ERASURE_GUARD_FIXTURE_EXPECTED_FILE"
+
+if ! cmp -s "$ERASURE_GUARD_FIXTURE_EXPECTED_FILE" "$ERASURE_GUARD_FIXTURE_HITS_FILE"; then
+  report_failure "Erasure constructor guard must resume production scanning after a cfg(test) field"
+fi
 
 if [[ -s "$ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE" ]]; then
   report_failure "production code must use fallible Erasure constructors: $(paste -sd '; ' "$ERASURE_PANICKING_CONSTRUCTOR_HITS_FILE")"

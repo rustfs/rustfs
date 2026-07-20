@@ -121,7 +121,7 @@ impl SetDisks {
         online_disks: &[Option<DiskStore>],
         read_quorum: usize,
     ) {
-        if fi.deleted || !fi.is_valid() {
+        if fi.deleted || !fi.has_valid_erasure_geometry() {
             return;
         }
         let (bucket, object) = identity;
@@ -2540,20 +2540,27 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
-    async fn get_object_metadata_cache_invalidation_removes_object_entry() {
+    async fn metadata_cache_per_key_invalidation_physically_reclaims_retired_generation() {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
 
-        let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("metadata cache generation should be active");
+        let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
             .await;
+        set.get_object_metadata_cache.run_pending_tasks().await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 1);
 
         set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        set.get_object_metadata_cache.run_pending_tasks().await;
         assert!(
-            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
-            "explicit invalidation must remove the cached object metadata"
+            set.get_object_metadata_cache.get(&retired_key).await.is_none(),
+            "per-key invalidation must physically remove the retired generation"
         );
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
     }
 
     #[tokio::test]
@@ -2705,6 +2712,77 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    async fn metadata_cache_generation_isolated_between_set_instances() {
+        let first = new_metadata_cache_test_set().await;
+        let second = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let first_generation = first.get_object_metadata_cache_generation("bucket", "object");
+        let second_generation = second.get_object_metadata_cache_generation("bucket", "object");
+        first
+            .cache_get_object_fileinfo(("bucket", "object"), first_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        second
+            .cache_get_object_fileinfo(("bucket", "object"), second_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+
+        first.invalidate_get_object_metadata_cache("bucket", "object").await;
+
+        assert!(first.cached_get_object_fileinfo("bucket", "object").await.is_none());
+        assert!(second.cached_get_object_fileinfo("bucket", "object").await.is_some());
+        assert_eq!(second.get_object_metadata_cache_generation("bucket", "object"), second_generation);
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_cached_hash_collision_preserves_full_identity() {
+        let set = new_metadata_cache_test_set().await;
+        let generation = set
+            .get_object_metadata_cache_generation("bucket-a", "object-a")
+            .expect("metadata cache generation should be active");
+        let first_key = GetObjectMetadataCacheKey::new("bucket-a", "object-a", generation);
+        let second_key = GetObjectMetadataCacheKey {
+            bucket: Arc::from("bucket-b"),
+            object: Arc::from("object-b"),
+            generation: generation.value,
+            hash: generation.hash,
+        };
+        let first_fi = valid_test_fileinfo("object-a");
+        let second_fi = valid_test_fileinfo("object-b");
+        let entry = |fi: FileInfo| {
+            Arc::new(GetObjectMetadataCacheEntry {
+                created_at: Instant::now(),
+                parts_metadata: vec![fi.clone()],
+                fi,
+                online_disks: Vec::new(),
+                read_quorum: 0,
+            })
+        };
+
+        set.get_object_metadata_cache.insert(first_key.clone(), entry(first_fi)).await;
+        set.get_object_metadata_cache
+            .insert(second_key.clone(), entry(second_fi))
+            .await;
+
+        assert_eq!(
+            set.get_object_metadata_cache
+                .get(&first_key)
+                .await
+                .expect("first colliding entry should remain addressable")
+                .fi
+                .name,
+            "object-a"
+        );
+        assert_eq!(
+            set.get_object_metadata_cache
+                .get(&second_key)
+                .await
+                .expect("second colliding entry should remain addressable")
+                .fi
+                .name,
+            "object-b"
+        );
+    }
+
+    #[tokio::test]
     async fn metadata_cache_generation_overflow_fails_closed() {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
@@ -2741,6 +2819,62 @@ mod metadata_cache_tests {
         set.cache_get_object_fileinfo(("bucket", "object"), stale_generation, &fi, std::slice::from_ref(&fi), &[], 0)
             .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_invalidate_all_physically_reclaims_retired_generations() {
+        let set = new_metadata_cache_test_set().await;
+        let mut retired_keys = Vec::new();
+        for object in ["object-a", "object-b", "object-c"] {
+            let fi = valid_test_fileinfo(object);
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", object)
+                .expect("metadata cache generation should be active");
+            retired_keys.push(GetObjectMetadataCacheKey::new("bucket", object, generation));
+            set.cache_get_object_fileinfo(("bucket", object), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
+                .await;
+        }
+        set.get_object_metadata_cache.run_pending_tasks().await;
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 3);
+
+        set.invalidate_all_get_object_metadata_cache();
+        set.get_object_metadata_cache.run_pending_tasks().await;
+
+        for key in retired_keys {
+            assert!(
+                set.get_object_metadata_cache.get(&key).await.is_none(),
+                "invalidate-all must physically remove every retired generation"
+            );
+        }
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_invalidate_all_at_max_fails_closed_and_clears_entries() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("metadata cache generation should be active");
+        let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        for fence in set.get_object_metadata_cache_generations.iter() {
+            fence.store(u64::MAX, Ordering::Release);
+        }
+
+        set.invalidate_all_get_object_metadata_cache();
+        set.get_object_metadata_cache.run_pending_tasks().await;
+
+        assert!(
+            set.get_object_metadata_cache_generations
+                .iter()
+                .all(|fence| fence.load(Ordering::Acquire) == u64::MAX),
+            "invalidate-all must not wrap a saturated fence"
+        );
+        assert_eq!(set.get_object_metadata_cache_generation("bucket", "object"), None);
+        assert!(set.get_object_metadata_cache.get(&retired_key).await.is_none());
+        assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
     }
 
     #[tokio::test]
@@ -3058,10 +3192,13 @@ mod tests {
         let mut historical = metadata_fanout_test_fileinfo("object");
         historical.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
 
-        let mut delete_marker = metadata_fanout_test_fileinfo("object");
-        delete_marker.deleted = true;
-        delete_marker.version_id =
-            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").expect("static uuid should parse"));
+        let delete_marker = FileInfo {
+            name: "object".to_string(),
+            deleted: true,
+            version_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").expect("static uuid should parse")),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(3).expect("static timestamp should parse")),
+            ..Default::default()
+        };
 
         let diagnostics = MetadataFanoutDiagnostics::new(
             Duration::from_millis(9),
@@ -3163,6 +3300,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_quorum_accumulator_rejects_semantic_field_splits() {
+        type FileInfoMutation = fn(&mut FileInfo);
+
+        let mutations: &[(&str, FileInfoMutation)] = &[
+            ("transition_status", |fi| fi.transition_status = "complete".to_string()),
+            ("transitioned_objname", |fi| fi.transitioned_objname = "remote-object".to_string()),
+            ("transition_tier", |fi| fi.transition_tier = "WARM".to_string()),
+            ("transition_version_id", |fi| fi.transition_version_id = Some(Uuid::from_u128(10))),
+            ("expire_restored", |fi| fi.expire_restored = true),
+            ("written_by_version", |fi| fi.written_by_version = Some(1)),
+            ("replication_state_internal", |fi| {
+                fi.replication_state_internal = Some(Default::default())
+            }),
+            ("num_versions", |fi| fi.num_versions = 2),
+            ("successor_mod_time", |fi| {
+                fi.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(10).expect("static timestamp should parse"));
+            }),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut accumulator = metadata_early_stop_accumulator();
+            let first = metadata_early_stop_candidate("object", 1);
+            let mut second = metadata_early_stop_candidate("object", 2);
+            let mut third = metadata_early_stop_candidate("object", 3);
+            mutate(&mut second);
+            mutate(&mut third);
+
+            accumulator.observe_file_info(&first);
+            accumulator.observe_file_info(&second);
+            accumulator.observe_file_info(&third);
+
+            assert!(accumulator.conflicting_metadata, "split {field} must block metadata early-stop");
+            assert!(
+                accumulator.early_stop_decision().is_none(),
+                "split {field} must not be mistaken for three matching votes"
+            );
+            assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
+        }
+    }
+
+    #[test]
     fn metadata_quorum_accumulator_falls_back_on_split_data_dir() {
         let mut accumulator = metadata_early_stop_accumulator();
         let mut first = metadata_early_stop_candidate("object", 1);
@@ -3191,8 +3369,15 @@ mod tests {
     #[test]
     fn metadata_quorum_accumulator_hits_delete_marker_quorum_early_stop() {
         let mut accumulator = metadata_early_stop_accumulator();
-        let mut deleted = metadata_early_stop_candidate("object", 1);
-        deleted.deleted = true;
+        let deleted = FileInfo {
+            name: "object".to_string(),
+            deleted: true,
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        assert!(!deleted.is_valid(), "real delete markers do not carry erasure geometry");
 
         accumulator.observe_file_info(&deleted);
         accumulator.observe_file_info(&deleted);
@@ -3210,13 +3395,61 @@ mod tests {
     #[test]
     fn metadata_quorum_accumulator_falls_back_on_delete_marker_below_quorum() {
         let mut accumulator = metadata_early_stop_accumulator();
-        let mut deleted = metadata_early_stop_candidate("object", 1);
-        deleted.deleted = true;
+        let deleted = FileInfo {
+            name: "object".to_string(),
+            deleted: true,
+            version_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000004").expect("static uuid should parse")),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(4).expect("static timestamp should parse")),
+            ..Default::default()
+        };
 
         accumulator.observe_file_info(&deleted);
 
         assert!(accumulator.early_stop_decision().is_none());
         assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_does_not_treat_purge_pending_payload_as_delete_marker() {
+        let mut accumulator = MetadataQuorumAccumulator::new(6, 3, true);
+        let version_id = Uuid::parse_str("00000000-0000-0000-0000-000000000005").expect("static uuid should parse");
+
+        for disk_index in 1..=4 {
+            let mut purge_pending = FileInfo::new("object", 5, 1);
+            purge_pending.name = "object".to_string();
+            purge_pending.version_id = Some(version_id);
+            purge_pending.mod_time = Some(OffsetDateTime::from_unix_timestamp(5).expect("static timestamp should parse"));
+            purge_pending.size = 1;
+            purge_pending.deleted = true;
+            purge_pending.erasure.index = disk_index;
+            purge_pending.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
+
+            accumulator.observe_file_info(&purge_pending);
+        }
+
+        assert!(!accumulator.delete_marker_seen);
+        assert_eq!(accumulator.candidate_votes, 4);
+        assert!(
+            accumulator.early_stop_decision().is_none(),
+            "EC:1 purge-pending payload on six disks still requires five matching payload votes"
+        );
+
+        let mut fifth = FileInfo::new("object", 5, 1);
+        fifth.name = "object".to_string();
+        fifth.version_id = Some(version_id);
+        fifth.mod_time = Some(OffsetDateTime::from_unix_timestamp(5).expect("static timestamp should parse"));
+        fifth.size = 1;
+        fifth.deleted = true;
+        fifth.erasure.index = 5;
+        fifth.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
+        accumulator.observe_file_info(&fifth);
+
+        assert_eq!(
+            accumulator.early_stop_decision(),
+            Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM
+            })
+        );
     }
 
     #[test]

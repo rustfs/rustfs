@@ -15,8 +15,8 @@
 enabled: true
 
 document:
-  version: v1
-  url: https://github.com/rustfs/cla/blob/main/cla/v1.md
+  version: v2
+  url: https://github.com/rustfs/cla/blob/main/cla/v2.md
 
 signing:
   mode: comment

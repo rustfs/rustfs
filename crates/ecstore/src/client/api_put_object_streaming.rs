@@ -44,7 +44,7 @@ use crate::client::{
 
 use crate::client::utils::base64_encode;
 use rustfs_utils::path::trim_etag;
-use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
+use s3s::header::X_AMZ_EXPIRATION;
 
 /// Read exactly `want` bytes for a single multipart part, or fewer if the reader
 /// reaches EOF first. Advances the reader so the next call returns the following
@@ -567,11 +567,7 @@ impl TransitionClient {
             key: object_name.to_string(),
             etag: trim_etag(h.get("ETag").and_then(|v| v.to_str().ok()).unwrap_or("")),
 
-            version_id: if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) {
-                h_x_amz_version_id.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
+            version_id: self.raw_version_id(h)?.unwrap_or_default().to_string(),
             size,
             expiration: exp_time,
             expiration_rule_id: rule_id,

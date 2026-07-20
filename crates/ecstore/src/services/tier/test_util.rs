@@ -140,16 +140,26 @@ pub struct MockStoredObject {
 struct MockWarmBackendInner {
     objects: Mutex<HashMap<String, MockStoredObject>>,
     faults: Mutex<FaultConfig>,
+    put_read_limit: Mutex<Option<usize>>,
+    put_remote_version: Mutex<Option<String>>,
     op_log: Mutex<Vec<MockWarmOp>>,
     put_versions: Mutex<Vec<(String, String)>>,
     remove_versions: Mutex<Vec<(String, String)>>,
     put_barrier: Mutex<Option<Arc<MockPutBarrierState>>>,
+    get_barrier: Mutex<Option<Arc<MockGetBarrierState>>>,
 }
 
 #[derive(Default)]
 struct MockPutBarrierState {
     arrived: Notify,
     release: Notify,
+}
+
+#[derive(Default)]
+struct MockGetBarrierState {
+    arrived: Notify,
+    release: Notify,
+    fail_after_release: bool,
 }
 
 /// One-shot barrier that pauses a mock tier PUT after storing its remote body.
@@ -177,6 +187,31 @@ impl Drop for MockPutBarrier {
     }
 }
 
+/// One-shot barrier that pauses a mock tier GET before it reads remote bytes.
+pub struct MockGetBarrier {
+    state: Arc<MockGetBarrierState>,
+}
+
+impl MockGetBarrier {
+    /// Wait until the GET has reached the deterministic pause point.
+    pub async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("mock tier GET should reach the deterministic barrier");
+    }
+
+    /// Release the paused GET.
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+impl Drop for MockGetBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+    }
+}
+
 /// In-memory [`WarmBackend`] for lifecycle / tiering integration tests.
 ///
 /// Cloning shares the same underlying storage, fault configuration, and
@@ -198,6 +233,17 @@ impl MockWarmBackend {
         let state = Arc::new(MockPutBarrierState::default());
         *self.inner.put_barrier.lock().await = Some(Arc::clone(&state));
         MockPutBarrier { state }
+    }
+
+    /// Arm a one-shot pause before the next tier GET, then return an error
+    /// after the test releases it.
+    pub async fn arm_failing_get_barrier(&self) -> MockGetBarrier {
+        let state = Arc::new(MockGetBarrierState {
+            fail_after_release: true,
+            ..Default::default()
+        });
+        *self.inner.get_barrier.lock().await = Some(Arc::clone(&state));
+        MockGetBarrier { state }
     }
 
     // ---- fault injection -------------------------------------------------
@@ -230,6 +276,18 @@ impl MockWarmBackend {
     /// Clear all injected faults, restoring healthy behaviour.
     pub async fn clear_faults(&self) {
         *self.inner.faults.lock().await = FaultConfig::default();
+    }
+
+    /// Limit how many body bytes a successful mock PUT consumes. `None` drains
+    /// the complete body. This models a backend that incorrectly accepts a
+    /// truncated stream while still returning success.
+    pub async fn set_put_read_limit(&self, limit: Option<usize>) {
+        *self.inner.put_read_limit.lock().await = limit;
+    }
+
+    /// Override the remote version returned by subsequent successful PUTs.
+    pub async fn set_put_remote_version(&self, remote_version: Option<String>) {
+        *self.inner.put_remote_version.lock().await = remote_version;
     }
 
     async fn precondition(&self) -> Result<(), std::io::Error> {
@@ -379,7 +437,13 @@ impl MockWarmBackend {
     // ---- internal helpers -----------------------------------------------
 
     async fn put_bytes(&self, object: &str, bytes: Vec<u8>, metadata: HashMap<String, String>) -> String {
-        let remote_version_id = Uuid::new_v4().to_string();
+        let remote_version_id = self
+            .inner
+            .put_remote_version
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         self.inner.objects.lock().await.insert(
             object.to_string(),
             MockStoredObject {
@@ -392,11 +456,18 @@ impl MockWarmBackend {
     }
 
     async fn read_bytes(&self, reader: ReaderImpl) -> Result<Vec<u8>, std::io::Error> {
+        let limit = *self.inner.put_read_limit.lock().await;
         match reader {
-            ReaderImpl::Body(bytes) => Ok(bytes.to_vec()),
+            ReaderImpl::Body(bytes) => Ok(bytes.slice(..limit.unwrap_or(bytes.len()).min(bytes.len())).to_vec()),
             ReaderImpl::ObjectBody(mut reader) => {
                 let mut buf = Vec::new();
-                reader.stream.read_to_end(&mut buf).await?;
+                if let Some(limit) = limit {
+                    let limit =
+                        u64::try_from(limit).map_err(|_| std::io::Error::other("mock PUT read limit exceeds u64::MAX"))?;
+                    reader.stream.take(limit).read_to_end(&mut buf).await?;
+                } else {
+                    reader.stream.read_to_end(&mut buf).await?;
+                }
                 Ok(buf)
             }
         }
@@ -473,6 +544,14 @@ impl WarmBackend for MockWarmBackend {
 
     async fn get(&self, object: &str, _rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         self.precondition().await?;
+        let barrier = self.inner.get_barrier.lock().await.take();
+        if let Some(barrier) = barrier {
+            barrier.arrived.notify_one();
+            barrier.release.notified().await;
+            if barrier.fail_after_release {
+                return Err(std::io::Error::other("mock warm backend GET failed after barrier"));
+            }
+        }
         self.record(MockWarmOp::Get {
             object: object.to_string(),
         })
@@ -519,7 +598,7 @@ impl WarmBackend for MockWarmBackend {
     async fn in_use(&self) -> Result<bool, std::io::Error> {
         self.precondition().await?;
         self.record(MockWarmOp::InUse).await;
-        Ok(false)
+        Ok(!self.inner.objects.lock().await.is_empty())
     }
 }
 
@@ -558,7 +637,9 @@ pub async fn register_mock_tier_backend(handle: &Arc<RwLock<TierConfigMgr>>, tie
             ..Default::default()
         },
     );
-    tier_config_mgr.driver_cache.insert(tier_name.to_string(), Box::new(backend));
+    tier_config_mgr
+        .install_test_driver(tier_name, Box::new(backend))
+        .expect("mock tier driver should install");
 }
 
 /// The transition-state tuple read from an on-disk `xl.meta`, plus the object's

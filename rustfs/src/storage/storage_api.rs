@@ -229,6 +229,11 @@ pub(crate) mod rpc_consumer {
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
         #[cfg(test)]
+        pub(crate) type HealEndpoint = super::super::ecstore_disk::endpoint::Endpoint;
+        #[cfg(test)]
+        pub(crate) type HealBucketInfo = super::super::contract::bucket::BucketInfo;
+
+        #[cfg(test)]
         pub(crate) const STORAGE_CLASS_SUB_SYS: &str = super::super::STORAGE_CLASS_SUB_SYS;
 
         pub(crate) mod contract {
@@ -247,7 +252,14 @@ pub(crate) mod rpc_consumer {
 
 pub(crate) mod runtime_sources_consumer {
     pub(crate) type ECStore = super::ECStore;
+    pub(crate) type EndpointServerPools = super::EndpointServerPools;
     pub(crate) use crate::storage::runtime_sources;
+}
+
+pub(crate) mod heal_control_startup_consumer {
+    #[cfg(test)]
+    pub(crate) use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
+    pub(crate) use crate::storage::rpc::node_service::initialize_heal_topology_fingerprint;
 }
 
 pub(crate) mod s3_api_consumer {
@@ -319,7 +331,9 @@ pub(crate) mod timeout_wrapper_consumer {
 }
 
 pub(crate) mod tonic_service_consumer {
-    pub(crate) use super::super::tonic_service::make_server;
+    #[cfg(test)]
+    pub(crate) use super::super::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
+    pub(crate) use super::super::tonic_service::{make_heal_control_server_with_cache, make_server};
 }
 
 #[cfg(test)]
@@ -464,7 +478,12 @@ pub(crate) mod ecstore_rio {
 pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, verify_rpc_signature,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, sign_tonic_rpc_response_proof,
+        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::{
+        gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
     };
 }
 
@@ -492,7 +511,7 @@ pub(crate) mod ecstore_storage {
 }
 
 pub(crate) mod ecstore_tier {
-    pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
+    pub(crate) use rustfs_ecstore::api::tier::tier::{TierConfigMgr, TierConfigUpdateError};
     pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers};
     // Shared lifecycle/tier test utilities behind ecstore's `test-util` feature
     // (rustfs/backlog#1148 ilm-6). Only linked into test builds.
@@ -518,6 +537,21 @@ pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNA
 pub(crate) const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = ecstore_rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC;
 pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
 pub(crate) const TONIC_RPC_PREFIX: &str = ecstore_rpc::TONIC_RPC_PREFIX;
+
+pub(crate) fn normalize_tonic_rpc_audience(value: &str) -> std::io::Result<String> {
+    ecstore_rpc::normalize_tonic_rpc_audience(value)
+}
+
+pub(crate) fn try_current_local_node_name() -> Option<String> {
+    crate::storage::runtime_sources::try_current_local_node_name()
+}
+
+#[cfg(test)]
+pub(crate) use ecstore_rpc::gen_tonic_signature_headers;
+pub(crate) use ecstore_rpc::sign_tonic_rpc_response_proof;
+#[cfg(test)]
+pub(crate) use ecstore_rpc::verify_tonic_rpc_response_proof;
+
 #[cfg(test)]
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
 
@@ -556,6 +590,8 @@ pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
 pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerContextSlot;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
+#[cfg(test)]
+pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
@@ -577,6 +613,7 @@ pub(crate) type ReplicationStatusType = ecstore_bucket::replication::Replication
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
+pub(crate) type TierConfigUpdateError = ecstore_tier::TierConfigUpdateError;
 pub(crate) use ecstore_disk::validate_batch_read_version_item_count;
 pub(crate) type TransitionState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::TransitionState;
 pub(crate) type Error = ecstore_error::Error;
@@ -1383,6 +1420,19 @@ pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &h
     ecstore_rpc::verify_rpc_signature(url, method, headers)
 }
 
+pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &http::HeaderMap) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_rpc_signature(audience, path, headers)
+}
+
+pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_canonical_body_digest(request, canonical_body)
+}
+
+#[cfg(test)]
+pub(crate) fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    ecstore_rpc::set_tonic_canonical_body_digest(request, canonical_body)
+}
+
 pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
     ecstore_client::object_api_utils::to_s3s_etag(etag)
 }
@@ -1438,7 +1488,8 @@ pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
 }
 
 pub(crate) async fn reload_transition_tier_config(api: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_runtime::global_tier_config_mgr().write().await.reload(api).await
+    let handle = api.tier_config_mgr();
+    TierConfigMgr::reload_handle(&handle, api).await
 }
 
 pub(crate) async fn all_local_disk_path() -> Vec<String> {

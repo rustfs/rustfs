@@ -1129,6 +1129,9 @@ fn decode_batch_read_version_response_items(
             let resp = decode_msgpack_or_json::<BatchReadVersionResp>(buf, "", "BatchReadVersionResp").map_err(|err| {
                 Error::other(format!("decode BatchReadVersionResp msgpack item {index} from {endpoint} failed: {err}"))
             })?;
+            if resp.success {
+                validate_decoded_file_info(&resp.file_info)?;
+            }
             batch_read_version_resps.push(resp);
         }
         return Ok(batch_read_version_resps);
@@ -1143,10 +1146,17 @@ fn decode_batch_read_version_response_items(
         let resp = serde_json::from_str::<BatchReadVersionResp>(json_str).map_err(|err| {
             Error::other(format!("decode BatchReadVersionResp json item {index} from {endpoint} failed: {err}"))
         })?;
+        if resp.success {
+            validate_decoded_file_info(&resp.file_info)?;
+        }
         batch_read_version_resps.push(resp);
     }
 
     Ok(batch_read_version_resps)
+}
+
+fn validate_decoded_file_info(file_info: &FileInfo) -> Result<()> {
+    file_info.validate_for_metadata_read().map_err(Into::into)
 }
 
 #[async_trait::async_trait]
@@ -1825,6 +1835,7 @@ impl DiskAPI for RemoteDisk {
                 }
 
                 let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info, "FileInfo")?;
+                validate_decoded_file_info(&file_info)?;
 
                 Ok(file_info)
             },
@@ -2712,6 +2723,25 @@ mod tests {
 
     static INIT: Once = Once::new();
 
+    #[test]
+    fn decoded_remote_metadata_rejects_default_like_delete_marker() {
+        let forged = FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+        assert!(matches!(validate_decoded_file_info(&forged), Err(DiskError::FileCorrupt)));
+
+        let marker = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mod_time: Some(::time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        validate_decoded_file_info(&marker).expect("canonical remote delete marker should validate");
+    }
+
     #[derive(Clone, Default)]
     struct CapturedLogs {
         buffer: Arc<Mutex<Vec<u8>>>,
@@ -3021,17 +3051,19 @@ mod tests {
     }
 
     fn sample_batch_read_version_resp(index: usize, path: &str, success: bool) -> BatchReadVersionResp {
+        let mut file_info = FileInfo::new(path, 1, 0);
+        file_info.erasure.index = 1;
         BatchReadVersionResp {
             index,
             path: path.to_string(),
             version_id: "version-a".to_string(),
             success,
+            file_info,
             error: if success {
                 String::new()
             } else {
                 "file version not found".to_string()
             },
-            ..Default::default()
         }
     }
 
@@ -3053,6 +3085,25 @@ mod tests {
         assert_eq!(decoded[0].index, 7);
         assert_eq!(decoded[0].path, "msgpack-object");
         assert!(decoded[0].success);
+    }
+
+    #[test]
+    fn batch_read_version_response_rejects_invalid_success_metadata() {
+        let endpoint = sample_remote_endpoint();
+        let mut response_item = sample_batch_read_version_resp(0, "invalid-object", true);
+        response_item.file_info.erasure.data_blocks = 0;
+        response_item.file_info.erasure.parity_blocks = 2;
+        let response = BatchReadVersionResponse {
+            success: true,
+            batch_read_version_resps: Vec::new(),
+            batch_read_version_resps_bin: vec![encode_msgpack(&response_item).expect("msgpack response should encode").into()],
+            error: None,
+        };
+
+        let err = decode_batch_read_version_response_items(response, &endpoint)
+            .expect_err("successful remote response with invalid metadata must fail closed");
+
+        assert_eq!(err, DiskError::FileCorrupt);
     }
 
     #[test]

@@ -319,8 +319,8 @@ impl NotificationSys {
                 if let Some(client) = client {
                     let host = client.host.to_string();
                     match timeout(peer_timeout, client.local_storage_info()).await {
-                        Ok(Ok(info)) => {
-                            update_storage_info_cache(cache, &host, &info);
+                        Ok(Ok(mut info)) => {
+                            normalize_and_cache_peer_storage_info(cache, &host, &mut info);
                             Some(info)
                         }
                         Ok(Err(err)) => {
@@ -1156,7 +1156,13 @@ fn handle_peer_failure(
     None
 }
 
-fn update_storage_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &StorageInfo) {
+fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &mut StorageInfo) {
+    // `Disk::local` is relative to this aggregator, not to the peer that
+    // produced the response.
+    for disk in &mut info.disks {
+        disk.local = false;
+    }
+
     let Some(cache) = cache else {
         return;
     };
@@ -1761,6 +1767,53 @@ mod tests {
     }
 
     #[test]
+    fn normalize_and_cache_peer_storage_info_marks_disks_remote() {
+        let cache = Mutex::new(PeerAdminCache::new());
+        let mut info = StorageInfo {
+            disks: vec![
+                rustfs_madmin::Disk {
+                    endpoint: "http://node2:9000/media/rustfs-01".to_string(),
+                    drive_path: "/media/rustfs-01".to_string(),
+                    local: true,
+                    ..Default::default()
+                },
+                rustfs_madmin::Disk {
+                    endpoint: "http://node3:9000/media/rustfs-01".to_string(),
+                    drive_path: "/media/rustfs-01".to_string(),
+                    local: true,
+                    ..Default::default()
+                },
+                rustfs_madmin::Disk {
+                    endpoint: "http://node4:9000/media/rustfs-01".to_string(),
+                    drive_path: "/media/rustfs-01".to_string(),
+                    local: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        normalize_and_cache_peer_storage_info(Some(&cache), "peer-1", &mut info);
+
+        assert!(info.disks.iter().all(|disk| !disk.local));
+        let cached = cache.lock().expect("peer cache must remain available");
+        assert!(
+            cached
+                .last_storage_info
+                .as_ref()
+                .expect("successful peer response must be cached")
+                .disks
+                .iter()
+                .all(|disk| !disk.local)
+        );
+        drop(cached);
+
+        let degraded = handle_peer_failure(Some(&cache), "peer-1", &EndpointServerPools::default())
+            .expect("first peer failure must return the cached snapshot");
+        assert!(degraded.disks.iter().all(|disk| !disk.local));
+    }
+
+    #[test]
     fn handle_peer_failure_returns_offline_after_threshold_exceeded() {
         let cached_info = StorageInfo {
             disks: vec![rustfs_madmin::Disk {
@@ -2059,10 +2112,10 @@ mod tests {
             panic!("poison server cache mutex");
         });
 
-        update_storage_info_cache(
+        normalize_and_cache_peer_storage_info(
             Some(&storage_cache),
             "peer-1",
-            &StorageInfo {
+            &mut StorageInfo {
                 disks: vec![rustfs_madmin::Disk {
                     endpoint: "disk-0".to_string(),
                     state: "ok".to_string(),

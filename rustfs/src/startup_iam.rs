@@ -39,8 +39,11 @@ const IAM_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 const IAM_RETRY_ESCALATION_THRESHOLD: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HealTopologyReady(());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IamBootstrapDisposition {
-    ReadyInline,
+    ReadyInline(HealTopologyReady),
     Deferred,
 }
 
@@ -63,12 +66,23 @@ where
     PublishFn: FnOnce() -> PublishFuture,
     PublishFuture: Future<Output = Result<()>>,
 {
-    if disposition == IamBootstrapDisposition::ReadyInline {
-        publish_ready().await?;
-        return Ok(true);
+    if let IamBootstrapDisposition::ReadyInline(topology_ready) = disposition {
+        publish_runtime_ready_after_heal_topology(topology_ready, publish_ready).await?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
+}
 
-    Ok(false)
+async fn publish_runtime_ready_after_heal_topology<PublishFn, PublishFuture>(
+    _topology_ready: HealTopologyReady,
+    publish_ready: PublishFn,
+) -> Result<()>
+where
+    PublishFn: FnOnce() -> PublishFuture,
+    PublishFuture: Future<Output = Result<()>>,
+{
+    publish_ready().await
 }
 
 async fn finalize_iam_recovery(
@@ -81,10 +95,32 @@ async fn finalize_iam_recovery(
     // Resolve the globally published system directly (not context-first —
     // the AppContext does not exist yet; creating it is this function's job).
     let iam = rustfs_iam::get().map_err(|_| std::io::Error::other("IAM recovered but unavailable"))?;
+    let endpoint_pools = heal_control_endpoint_pools(store.as_ref())?;
     AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx, iam)?;
+    let topology_ready =
+        publish_iam_ready_after_heal_topology(readiness.as_ref(), server_ctx.heal_topology_fingerprint(), endpoint_pools).await?;
+    publish_runtime_ready_after_heal_topology(topology_ready, || async {
+        publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
+    })
+    .await
+}
 
+async fn publish_iam_ready_after_heal_topology(
+    readiness: &GlobalReadiness,
+    cache: Arc<tokio::sync::OnceCell<String>>,
+    endpoint_pools: crate::storage_api::cluster::EndpointServerPools,
+) -> Result<HealTopologyReady> {
+    crate::storage_api::startup::heal_control::initialize_heal_topology_fingerprint(cache, endpoint_pools)
+        .await
+        .map_err(std::io::Error::other)?;
     readiness.mark_stage(SystemStage::IamReady);
-    publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
+    Ok(HealTopologyReady(()))
+}
+
+fn heal_control_endpoint_pools(store: &ECStore) -> Result<crate::storage_api::cluster::EndpointServerPools> {
+    store
+        .instance_endpoints()
+        .ok_or_else(|| std::io::Error::other("heal control topology is unavailable"))
 }
 
 fn compute_backoff_interval(attempt: u64, initial: Duration, max: Duration) -> Duration {
@@ -336,7 +372,7 @@ async fn attempt_init_iam_sys(
 ///
 /// Returns `Ok(ReadyInline)` if IAM initialized immediately, `Ok(Deferred)` if
 /// recovery is happening in the background, or `Err` if IAM succeeded but
-/// app context initialization failed (unexpected, indicates a bug).
+/// the instance context or heal topology could not be initialized.
 pub(crate) async fn bootstrap_or_defer_iam_init(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
@@ -347,9 +383,12 @@ pub(crate) async fn bootstrap_or_defer_iam_init(
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(iam) => {
+            let endpoint_pools = heal_control_endpoint_pools(store.as_ref())?;
             AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx, iam)?;
-            readiness.mark_stage(SystemStage::IamReady);
-            return Ok(IamBootstrapDisposition::ReadyInline);
+            let topology_ready =
+                publish_iam_ready_after_heal_topology(readiness.as_ref(), server_ctx.heal_topology_fingerprint(), endpoint_pools)
+                    .await?;
+            return Ok(IamBootstrapDisposition::ReadyInline(topology_ready));
         }
         Err(err) => {
             let interval = initial_retry_interval();
@@ -445,6 +484,7 @@ mod hint_tests {
 mod tests {
     use super::*;
     use super::{IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval};
+    use crate::storage_api::cluster::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use rustfs_common::{GlobalReadiness, SystemStage};
     use std::io::Error;
     use std::sync::{
@@ -483,10 +523,13 @@ mod tests {
         let publish_calls = Arc::new(AtomicUsize::new(0));
         let publish_calls_for_assert = publish_calls.clone();
 
-        let published = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::ReadyInline, move || async move {
-            publish_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
+        let published = publish_ready_for_iam_bootstrap_with(
+            IamBootstrapDisposition::ReadyInline(HealTopologyReady(())),
+            move || async move {
+                publish_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
         .await;
 
         assert!(published.is_ok(), "ready inline publication should succeed");
@@ -514,13 +557,55 @@ mod tests {
 
     #[tokio::test]
     async fn ready_inline_bootstrap_propagates_runtime_readiness_failure() {
-        let err = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::ReadyInline, || async {
+        let err = publish_ready_for_iam_bootstrap_with(IamBootstrapDisposition::ReadyInline(HealTopologyReady(())), || async {
             Err(Error::other("runtime readiness failed"))
         })
         .await
         .expect_err("ready inline publication failure should be returned");
 
         assert_eq!(err.to_string(), "runtime readiness failed");
+    }
+
+    #[tokio::test]
+    async fn iam_readiness_is_published_only_after_heal_topology_initialization() {
+        let readiness = GlobalReadiness::new();
+        let cache = Arc::new(tokio::sync::OnceCell::new());
+        let mut endpoint = Endpoint::try_from("http://node-a:9000/disk").expect("valid test endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let endpoint_pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint]),
+            cmd_line: "test".to_string(),
+            platform: String::new(),
+        }]);
+        let expected = crate::storage_api::startup::heal_control::heal_topology_fingerprint(&endpoint_pools)
+            .expect("valid topology should hash");
+
+        publish_iam_ready_after_heal_topology(&readiness, Arc::clone(&cache), endpoint_pools)
+            .await
+            .expect("topology initialization should publish IAM readiness");
+
+        assert_eq!(cache.get(), Some(&expected));
+        assert!(matches!(readiness.current_stage(), SystemStage::IamReady));
+
+        let failed_readiness = GlobalReadiness::new();
+        let invalid_cache = Arc::new(tokio::sync::OnceCell::new());
+        publish_iam_ready_after_heal_topology(
+            &failed_readiness,
+            Arc::clone(&invalid_cache),
+            EndpointServerPools::from(Vec::<PoolEndpoints>::new()),
+        )
+        .await
+        .expect_err("invalid topology must block IAM readiness");
+        assert!(invalid_cache.get().is_none());
+        assert!(!matches!(
+            failed_readiness.current_stage(),
+            SystemStage::IamReady | SystemStage::FullReady
+        ));
     }
 
     #[tokio::test(start_paused = true)]

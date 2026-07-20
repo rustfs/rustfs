@@ -1333,7 +1333,6 @@ mod tests {
             name: "object".to_string(),
             version_id: Some(free_version_id),
             deleted: true,
-            mod_time: Some(OffsetDateTime::now_utc()),
             ..Default::default()
         };
         free_delete_fi.set_tier_free_version();

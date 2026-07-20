@@ -845,6 +845,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         crate::hp_guard!("SetDisks::new_multipart_upload");
+        let storage_class_config = self.storage_class_config_snapshot();
         let mut _object_lock_guard = None;
 
         if opts.http_preconditions.is_some() {
@@ -876,18 +877,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
-        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
-
-        let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
-        if opts.max_parity {
-            parity_drives = disks.len() / 2;
-        }
-
-        let data_drives = disks.len() - parity_drives;
-        let mut write_quorum = data_drives;
-        if data_drives == parity_drives {
-            write_quorum += 1
-        }
+        let WriteLayout {
+            data_drives,
+            parity_drives,
+            write_quorum,
+        } = resolve_write_layout(
+            &storage_class_config,
+            self.pool_index,
+            disks.len(),
+            self.default_parity_count,
+            user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str),
+            opts.max_parity,
+        )?;
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
 
@@ -1369,7 +1370,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         for meta in parts_metadatas.iter_mut() {
-            if meta.is_valid() {
+            if meta.has_valid_erasure_geometry() {
                 meta.size = fi.size;
                 meta.mod_time = fi.mod_time;
                 meta.parts.clone_from(&fi.parts);
@@ -1556,10 +1557,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::storageclass::lookup_config_for_pools_without_env;
     use crate::disk::DiskAPI as _;
     use crate::disk::{endpoint::Endpoint, format::FormatV3};
-    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks;
+    use crate::set_disk::ops::object::hermetic_set_disks_support::{
+        hermetic_set_disks, hermetic_set_disks_for_pool_with_default_parity,
+    };
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+    use rustfs_config::server_config::KVS;
     use rustfs_lock::{LockClient, client::local::LocalClient};
     use serial_test::serial;
     use tempfile::TempDir;
@@ -1605,6 +1610,74 @@ mod tests {
             lockers,
         )
         .await
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_invalidation_probe)]
+    async fn complete_multipart_generation_retires_cached_snapshot() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+        use crate::storage_api_contracts::object::ObjectIO as _;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-metadata-generation-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut initial_reader = PutObjReader::from_vec(b"old multipart body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be written");
+        set_disks
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+            .expect("initial metadata should resolve");
+        let generation = set_disks
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("metadata cache generation should be active");
+        let retired_key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        assert!(set_disks.get_object_metadata_cache.get(&retired_key).await.is_some());
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        let payload = vec![9u8; 4096];
+        let payload_len = i64::try_from(payload.len()).expect("test payload length should fit i64");
+        let mut part_reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(payload), payload_len, payload_len, None, None, false)
+                .expect("part hash reader should be created"),
+        );
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("multipart part should be written");
+
+        let invalidations = MetadataCacheInvalidationProbe::install(bucket, object);
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("multipart completion should succeed");
+
+        assert_eq!(
+            invalidations.count(),
+            2,
+            "multipart completion must invalidate before mutation and after commit"
+        );
+        set_disks.get_object_metadata_cache.run_pending_tasks().await;
+        assert!(set_disks.get_object_metadata_cache.get(&retired_key).await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1820,6 +1893,65 @@ mod tests {
             leftovers.is_empty(),
             "failed multipart upload part must not leave tmp shards behind, leftovers: {leftovers:?}, err: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn second_pool_multipart_uses_its_own_layout_and_round_trips() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(2, 1, 2).await;
+        set_disks.set_test_storage_class_config(
+            lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("heterogeneous pool storage class should resolve"),
+        );
+
+        let bucket = "multipart-second-pool-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("second-pool multipart upload should be created");
+        let (upload_info, _) = set_disks
+            .check_upload_id_exists(bucket, object, &upload.upload_id, false)
+            .await
+            .expect("stored multipart layout should be readable");
+        assert_eq!(upload_info.erasure.data_blocks, 1);
+        assert_eq!(upload_info.erasure.parity_blocks, 1);
+
+        let payload = vec![0x5a; 4096];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("second-pool part should encode without zero data shards");
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("second-pool multipart upload should complete");
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed second-pool object should be readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("completed second-pool object should stream");
+        assert_eq!(restored, payload);
     }
 
     #[tokio::test]

@@ -67,7 +67,9 @@ pub mod bucket {
         }
 
         pub mod tier_delete_journal {
-            pub use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
+            pub use crate::bucket::lifecycle::tier_delete_journal::{
+                persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
+            };
         }
 
         pub mod tier_last_day_stats {
@@ -380,8 +382,11 @@ pub mod rio {
 pub mod rpc {
     pub use crate::cluster::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_tonic_signature_interceptor,
-        node_service_time_out_client, node_service_time_out_client_no_auth, verify_rpc_signature,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers,
+        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
+        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
+        sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature,
     };
 }
 
@@ -408,7 +413,7 @@ pub mod tier {
         pub use crate::services::tier::tier::{
             ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_INVALID_CONFIG, ERR_TIER_MISSING_CREDENTIALS,
             ERR_TIER_TYPE_UNSUPPORTED, TIER_CONFIG_FILE, TIER_CONFIG_FORMAT, TIER_CONFIG_V1, TIER_CONFIG_VERSION, TierConfigMgr,
-            is_err_config_not_found, try_migrate_tiering_config,
+            TierConfigUpdateError, is_err_config_not_found, try_migrate_tiering_config,
         };
     }
 

@@ -390,6 +390,13 @@ pub(crate) mod bucket {
         pub(crate) mod tier_delete_journal {
             use std::sync::Arc;
 
+            pub(crate) fn record_tier_delete_journal_backend_identity(
+                je: &mut super::tier_sweeper::Jentry,
+                metadata: &std::collections::HashMap<String, String>,
+            ) -> std::io::Result<()> {
+                crate::storage::storage_api::ecstore_bucket::lifecycle::tier_delete_journal::record_tier_delete_journal_backend_identity(je, metadata)
+            }
+
             pub(crate) async fn persist_tier_delete_journal_entry(
                 api: Arc<crate::storage::storage_api::ECStore>,
                 je: &super::tier_sweeper::Jentry,

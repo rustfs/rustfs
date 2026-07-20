@@ -93,7 +93,18 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
-        pub(crate) use crate::storage::storage_api::{ServerContextSlot, TONIC_RPC_PREFIX, verify_rpc_signature};
+        pub(crate) use crate::storage::storage_api::{
+            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, verify_tonic_rpc_signature,
+        };
+
+        pub(crate) fn try_current_local_node_name() -> Option<String> {
+            crate::storage::storage_api::try_current_local_node_name()
+        }
+
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, gen_tonic_signature_headers,
+        };
 
         pub(crate) mod ecfs {
             pub(crate) type FS = crate::storage::storage_api::FS;
@@ -119,7 +130,13 @@ pub(crate) mod server {
         }
 
         pub(crate) mod tonic_service {
-            pub(crate) use crate::storage::storage_api::tonic_service_consumer::make_server;
+            #[cfg(test)]
+            pub(crate) use crate::storage::storage_api::tonic_service_consumer::{
+                heal_topology_fingerprint, make_heal_control_server_for_source,
+            };
+            pub(crate) use crate::storage::storage_api::tonic_service_consumer::{
+                make_heal_control_server_with_cache, make_server,
+            };
         }
     }
 
@@ -156,6 +173,12 @@ pub(crate) mod server {
 }
 
 pub(crate) mod startup {
+    pub(crate) mod heal_control {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::heal_control_startup_consumer::heal_topology_fingerprint;
+        pub(crate) use crate::storage::storage_api::heal_control_startup_consumer::initialize_heal_topology_fingerprint;
+    }
+
     pub(crate) mod background {
         pub(crate) use crate::storage::storage_api::{ECStore, set_workload_admission_snapshot_provider};
     }
