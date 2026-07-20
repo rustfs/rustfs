@@ -366,6 +366,30 @@ fn run_remote_tier_delete_test_hook(obj_name: &str, rv_id: &str, tier_name: &str
         .map(|hook| hook(obj_name, rv_id, tier_name))
 }
 
+#[cfg(test)]
+pub(super) struct RemoteTierDeleteHookGuard;
+
+#[cfg(test)]
+impl Drop for RemoteTierDeleteHookGuard {
+    fn drop(&mut self) {
+        let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
+            .lock()
+            .expect("remote tier delete test hook lock should not poison");
+        *hook = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_remote_tier_delete_test_hook(
+    hook_fn: impl Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync + 'static,
+) -> RemoteTierDeleteHookGuard {
+    let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
+        .lock()
+        .expect("remote tier delete test hook lock should not poison");
+    *hook = Some(Box::new(hook_fn));
+    RemoteTierDeleteHookGuard
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteTierDeleteOutcome {
     Deleted,
@@ -468,34 +492,13 @@ mod test {
     use crate::client::signer_error::invalid_utf8_header_error;
 
     use super::{
-        ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, REMOTE_TIER_DELETE_TEST_HOOK, RemoteDeleteBreaker,
-        RemoteTierDeleteOutcome, delete_object_from_remote_tier_idempotent,
-        delete_object_from_remote_tier_idempotent_with_manager_and_identity, is_remote_tier_not_found_error,
-        is_signer_header_error, should_record_remote_delete_failure,
+        ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, RemoteDeleteBreaker, RemoteTierDeleteOutcome,
+        delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
+        is_remote_tier_not_found_error, is_signer_header_error, set_remote_tier_delete_test_hook,
+        should_record_remote_delete_failure,
     };
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
-
-    struct RemoteTierDeleteHookGuard;
-
-    impl Drop for RemoteTierDeleteHookGuard {
-        fn drop(&mut self) {
-            let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
-                .lock()
-                .expect("remote tier delete test hook lock should not poison");
-            *hook = None;
-        }
-    }
-
-    fn set_remote_tier_delete_test_hook(
-        hook_fn: impl Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync + 'static,
-    ) -> RemoteTierDeleteHookGuard {
-        let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
-            .lock()
-            .expect("remote tier delete test hook lock should not poison");
-        *hook = Some(Box::new(hook_fn));
-        RemoteTierDeleteHookGuard
-    }
 
     #[test]
     fn signer_header_error_detection_matches_utf8_failures() {
