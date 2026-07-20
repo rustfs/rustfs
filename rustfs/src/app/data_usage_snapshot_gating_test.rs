@@ -137,6 +137,17 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
         before_endpoint,
         "revert detector: the data usage endpoint must not run live full-version listings"
     );
+    assert_eq!(
+        info.total_used_capacity,
+        info.total_capacity.saturating_sub(info.total_free_capacity),
+        "server used capacity must use the same usable-capacity scope as total and free"
+    );
+    assert!(
+        info.total_capacity > 0 && info.total_free_capacity > 0,
+        "test fixture must expose non-zero capacity: total={}, free={}",
+        info.total_capacity,
+        info.total_free_capacity
+    );
 
     // The endpoint must serve the seeded snapshot numbers, not recomputed ones.
     assert_eq!(info.last_update, Some(seeded_at), "endpoint must report the snapshot timestamp");

@@ -24,7 +24,6 @@ use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_endpoints_handle, current_object_store_handle_for_context,
 };
-use crate::capacity::resolve_admin_used_capacity;
 use crate::cluster_snapshot::{
     ClusterReadOnlySnapshot, ClusterRuntimeStatusSnapshot, cluster_read_only_snapshot_from_endpoint_pools,
     collect_cluster_read_only_snapshot,
@@ -311,8 +310,7 @@ impl DefaultAdminUsecase {
             info.total_free_capacity = free_u64;
         }
 
-        info.total_used_capacity =
-            resolve_admin_used_capacity(&storage_info.disks, info.total_capacity.saturating_sub(info.total_free_capacity)).await;
+        info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
         debug!(
             "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
             info.total_capacity as f64 / (1024.0_f64.powi(4)),
