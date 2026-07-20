@@ -30,7 +30,7 @@ use tokio_util::io::StreamReader;
 use crate::client::{
     api_error_response::err_invalid_argument,
     api_get_options::GetObjectOptions,
-    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
+    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info_for_provider},
 };
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
@@ -77,7 +77,8 @@ impl TransitionClient {
             )
             .await?;
 
-        let object_stat = to_object_info(bucket_name, object_name, resp.headers())?;
+        let object_stat =
+            to_object_info_for_provider(bucket_name, object_name, resp.headers(), self.provider_version_capabilities())?;
 
         let h = resp.headers().clone();
 

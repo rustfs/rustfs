@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::client::{
     api_error_response::{ErrorResponse, err_invalid_argument, http_resp_to_error_response},
     api_get_options::GetObjectOptions,
-    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
+    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info_for_provider},
 };
 use s3s::{
     dto::VersioningConfiguration,
@@ -206,20 +206,20 @@ impl TransitionClient {
                             ..Default::default()
                         };
                         return Ok(ObjectInfo {
-                            version_id: h
-                                .get(X_AMZ_VERSION_ID)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|s| Uuid::from_str(s).ok()),
+                            version_id: self
+                                .raw_version_id(h)?
+                                .and_then(|s| Uuid::from_str(s).ok())
+                                .filter(|v| !v.is_nil()),
                             is_delete_marker: delete_marker,
                             ..Default::default()
                         });
                         //err_resp
                     }
                     return Ok(ObjectInfo {
-                        version_id: h
-                            .get(X_AMZ_VERSION_ID)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| Uuid::from_str(s).ok()),
+                        version_id: self
+                            .raw_version_id(h)?
+                            .and_then(|s| Uuid::from_str(s).ok())
+                            .filter(|v| !v.is_nil()),
                         is_delete_marker: delete_marker,
                         replication_ready: replication_ready,
                         ..Default::default()
@@ -227,7 +227,7 @@ impl TransitionClient {
                     //http_resp_to_error_response(resp, bucket_name, object_name)
                 }
 
-                Ok(to_object_info(bucket_name, object_name, h).expect("operation should succeed"))
+                to_object_info_for_provider(bucket_name, object_name, h, self.provider_version_capabilities())
             }
             Err(err) => {
                 return Err(std::io::Error::other(err));
