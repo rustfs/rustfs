@@ -926,6 +926,19 @@ mod tests {
         Arc<crate::store::ECStore>,
         CancellationToken,
     ) {
+        build_isolated_test_store_with_shutdown(temp_dir, cmd_line, pool_drive_counts, CancellationToken::new()).await
+    }
+
+    async fn build_isolated_test_store_with_shutdown(
+        temp_dir: &std::path::Path,
+        cmd_line: &str,
+        pool_drive_counts: &[usize],
+        shutdown: CancellationToken,
+    ) -> (
+        Arc<crate::runtime::instance::InstanceContext>,
+        Arc<crate::store::ECStore>,
+        CancellationToken,
+    ) {
         let mut pools = Vec::with_capacity(pool_drive_counts.len());
         for (pool_index, &drives_per_set) in pool_drive_counts.iter().enumerate() {
             let mut endpoints = Vec::with_capacity(drives_per_set);
@@ -954,7 +967,6 @@ mod tests {
             .await
             .expect("register local disks into the fresh context");
 
-        let shutdown = CancellationToken::new();
         let store = crate::store::ECStore::new_with_instance_ctx(
             "127.0.0.1:0".parse().expect("test address"),
             endpoint_pools,
@@ -1205,12 +1217,26 @@ mod tests {
 
         let temp_a = tempfile::tempdir().expect("create transition store dir a");
         let temp_b = tempfile::tempdir().expect("create transition store dir b");
-        let (ctx_a, store_a, shutdown_a) =
-            without_storage_class_env(build_isolated_test_store(temp_a.path(), "transition-cleanup-context-a", &[4])).await;
-        let (ctx_b, store_b, shutdown_b) =
-            without_storage_class_env(build_isolated_test_store(temp_b.path(), "transition-cleanup-context-b", &[4])).await;
+        let shutdown_a = CancellationToken::new();
+        let shutdown_b = CancellationToken::new();
         shutdown_a.cancel();
         shutdown_b.cancel();
+        let (ctx_a, store_a, shutdown_a) = without_storage_class_env(build_isolated_test_store_with_shutdown(
+            temp_a.path(),
+            "transition-cleanup-context-a",
+            &[4],
+            shutdown_a,
+        ))
+        .await;
+        let (ctx_b, store_b, shutdown_b) = without_storage_class_env(build_isolated_test_store_with_shutdown(
+            temp_b.path(),
+            "transition-cleanup-context-b",
+            &[4],
+            shutdown_b,
+        ))
+        .await;
+        assert!(shutdown_a.is_cancelled());
+        assert!(shutdown_b.is_cancelled());
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
 
         let resolver_target = Arc::new(std::sync::Mutex::new(Some(Arc::downgrade(&store_b))));

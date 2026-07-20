@@ -335,12 +335,14 @@ pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_tok
     loop {
         #[cfg(test)]
         tokio::select! {
+            biased;
             _ = cancel_token.cancelled() => return,
             _ = interval.tick() => {},
             _ = api.ctx.wait_for_tier_delete_journal_recovery() => {},
         }
         #[cfg(not(test))]
         tokio::select! {
+            biased;
             _ = cancel_token.cancelled() => return,
             _ = interval.tick() => {},
         }
