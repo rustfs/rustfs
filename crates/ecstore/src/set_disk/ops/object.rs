@@ -4438,6 +4438,97 @@ mod transition_upload_integrity_tests {
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authoritative_read_failure_after_upload_cleans_exact_candidate_and_preserves_source() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-authoritative-read-failure-bucket";
+        let object = "object.bin";
+        let payload = b"authoritative metadata read failure must clean remote candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let put_barrier = backend.arm_put_barrier().await;
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move {
+            transition_set
+                .transition_object(bucket, object, &transition_options(&original, tier_name))
+                .await
+        });
+        put_barrier.wait_until_paused().await;
+        let saved_disks = {
+            let mut disks = set_disks.disks.write().await;
+            let saved = std::mem::take(&mut *disks);
+            *disks = vec![None; saved.len()];
+            saved
+        };
+        put_barrier.release();
+
+        let err = transition
+            .await
+            .expect("transition task should not panic")
+            .expect_err("authoritative metadata read failure must fail the transition");
+        *set_disks.disks.write().await = saved_disks;
+        assert!(
+            matches!(
+                err,
+                StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) | StorageError::Io(_)
+            ),
+            "unexpected authoritative read failure: {err:?}"
+        );
+        assert_eq!(backend.put_count().await, 1);
+        assert_eq!(backend.remove_count().await, 1);
+        assert_eq!(
+            backend.remove_versions().await,
+            backend.put_versions().await,
+            "authoritative read failure must remove the exact uploaded remote version"
+        );
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn remote_cleanup_failure_after_version_rejection_preserves_source_and_candidate() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-cleanup-failure-bucket";
+        let object = "object.bin";
+        let payload = b"cleanup failure must keep source and orphan evidence".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some("opaque-version-token".to_string())).await;
+        let put_barrier = backend.arm_put_barrier().await;
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move {
+            transition_set
+                .transition_object(bucket, object, &transition_options(&original, tier_name))
+                .await
+        });
+        put_barrier.wait_until_paused().await;
+        backend.set_server_error(true).await;
+        put_barrier.release();
+
+        transition
+            .await
+            .expect("transition task should not panic")
+            .expect_err("opaque remote version must fail closed even if cleanup also fails");
+        assert_eq!(backend.put_count().await, 1);
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "cleanup failure before backend remove must not be reported as a successful exact delete"
+        );
+        assert_eq!(
+            backend.object_count().await,
+            1,
+            "failed cleanup must leave the remote candidate visible for durable reconciliation"
+        );
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
 }
 
 #[cfg(all(test, feature = "test-util"))]
