@@ -156,7 +156,7 @@ http = "1.4.2"
 http-body = "1.1.0"
 http-body-util = "0.1.4"
 minlz = "1.2.3"
-reqwest = { default-features = false, version = "0.13.4" }
+reqwest = "0.13.4"
 rustfs-kafka-async = { version = "1.2.0" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.53.0" }

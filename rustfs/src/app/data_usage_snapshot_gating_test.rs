@@ -129,18 +129,45 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
     record_bucket_object_write_memory(&overlay_bucket, None, 512).await;
 
     let before_endpoint = live_bucket_usage_computations();
-    let info = DefaultAdminUsecase::query_data_usage_info_with_store(ecstore.clone())
+    let first_info = DefaultAdminUsecase::query_data_usage_info_with_store(ecstore.clone())
         .await
-        .expect("query data usage info");
+        .expect("query data usage info first time");
+    let second_info = DefaultAdminUsecase::query_data_usage_info_with_store(ecstore.clone())
+        .await
+        .expect("query data usage info second time");
     assert_eq!(
         live_bucket_usage_computations(),
         before_endpoint,
-        "revert detector: the data usage endpoint must not run live full-version listings"
+        "revert detector: repeated data usage requests must not run live full-version listings"
+    );
+    assert_eq!(
+        first_info.total_used_capacity,
+        first_info.total_capacity.saturating_sub(first_info.total_free_capacity),
+        "server used capacity must use the same usable-capacity scope as total and free"
+    );
+    assert!(
+        first_info.total_capacity > 0 && first_info.total_free_capacity > 0,
+        "test fixture must expose non-zero capacity: total={}, free={}",
+        first_info.total_capacity,
+        first_info.total_free_capacity
+    );
+    assert_eq!(
+        (first_info.total_capacity, first_info.total_free_capacity, first_info.total_used_capacity,),
+        (
+            second_info.total_capacity,
+            second_info.total_free_capacity,
+            second_info.total_used_capacity,
+        ),
+        "repeated data usage requests must report stable capacity values"
     );
 
     // The endpoint must serve the seeded snapshot numbers, not recomputed ones.
-    assert_eq!(info.last_update, Some(seeded_at), "endpoint must report the snapshot timestamp");
-    let seeded_usage = info
+    assert_eq!(first_info.last_update, Some(seeded_at), "endpoint must report the snapshot timestamp");
+    assert_eq!(
+        second_info.last_update, first_info.last_update,
+        "repeated requests must use the same snapshot"
+    );
+    let seeded_usage = first_info
         .buckets_usage
         .get(&seeded_bucket)
         .expect("seeded bucket must come from the snapshot");
@@ -148,7 +175,7 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
     assert_eq!(seeded_usage.objects_count, SEEDED_BUCKET_OBJECTS);
 
     // The in-memory overlay stays applied on top of the snapshot.
-    let overlay_usage = info
+    let overlay_usage = first_info
         .buckets_usage
         .get(&overlay_bucket)
         .expect("overlay bucket must come from the memory overlay");

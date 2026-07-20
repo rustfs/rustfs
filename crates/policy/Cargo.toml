@@ -42,7 +42,7 @@ ipnetwork = { workspace = true, features = ["serde"] }
 base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 regex = { workspace = true }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy", "json"] }
+reqwest = { workspace = true, features = ["json"] }
 chrono = { workspace = true, features = ["serde"] }
 tracing.workspace = true
 moka = { workspace = true, features = ["future"] }

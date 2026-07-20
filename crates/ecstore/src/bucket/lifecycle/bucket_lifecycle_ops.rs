@@ -2682,6 +2682,7 @@ pub async fn put_restore_opts(
     for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
     }
+    rustfs_utils::http::metadata_compat::remove_str(&mut meta, rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID);
     if !oi.user_tags.is_empty() {
         meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }
@@ -4335,6 +4336,43 @@ mod tests {
         assert!(first, "first enqueue must succeed");
         assert!(second, "duplicate enqueue is reported handled (already queued)");
         assert_eq!(state.transition_rx.len(), 1, "only one task must actually be queued");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queue_transition_task_dedupes_immediate_and_scanner_sources_for_same_version() {
+        let state = TransitionState::new_with_capacity(4);
+        let version_id = Uuid::new_v4();
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        let immediate = state.queue_transition_task(&object, &event, &LcEventSrc::S3PutObject).await;
+        let scanner = state.queue_transition_task(&object, &event, &LcEventSrc::Scanner).await;
+
+        assert!(immediate, "immediate transition enqueue must succeed");
+        assert!(scanner, "scanner duplicate is reported handled while already queued");
+        assert_eq!(
+            state.transition_rx.len(),
+            1,
+            "immediate transition plus scanner/backfill duplicate must queue one task"
+        );
+
+        let next_version = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            ..object
+        };
+        let queued_next_version = state.queue_transition_task(&next_version, &event, &LcEventSrc::Scanner).await;
+
+        assert!(queued_next_version, "a different version of the same object must enqueue independently");
+        assert_eq!(state.transition_rx.len(), 2, "deduplication must be scoped to the exact object version");
     }
 
     #[tokio::test]

@@ -3108,6 +3108,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let (actual_fi, _, _) = fi?;
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        if let Some(expected_operation_id) = restore_operation_id_from_metadata(&opts.user_defined)? {
+            require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
+        }
         let mut ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
         // The restore copy-back re-writes this same object via put_object /
         // new_multipart_upload / complete_multipart_upload, each of which takes
@@ -3734,6 +3737,194 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn partial_local_commit_failure_rolls_back_applied_disks_and_preserves_remote_candidate() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-partial-rollback-bucket";
+        let object = "object.bin";
+        let payload = b"partial local commit failure must roll back applied disks".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install_after_lease_check(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(backend.put_count().await, 1, "remote candidate must exist before local commit");
+
+        let saved_disks = {
+            let mut disks = set_disks.disks.write().await;
+            let saved = disks.clone();
+            for disk in disks.iter_mut().skip(2) {
+                *disk = None;
+            }
+            saved
+        };
+        barrier.release();
+        let result = transition.await.expect("transition task should not panic");
+
+        result.expect_err("partial local commit must fail when only two of four disks are writable");
+        let fi = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("rollback should keep the source metadata readable on applied disks")
+            .0;
+        assert_ne!(
+            fi.transition_status, TRANSITION_COMPLETE,
+            "rollback must not leave the applied disks marked as transitioned"
+        );
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rollback should keep the source object readable on applied disks")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the local source body should drain after rollback");
+        assert_eq!(restored, payload);
+
+        *set_disks.disks.write().await = saved_disks;
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "ambiguous local commit failure must retain the remote candidate for scanner reconciliation"
+        );
+        assert_eq!(backend.object_count().await, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_commit_post_apply_error_rolls_back_the_errored_disk() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-post-apply-rollback-bucket";
+        let object = "object.bin";
+        let payload = b"post-apply delete errors must still roll back the changed disk".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let barrier = TransitionCommitBarrier::install_after_lease_check(bucket, object);
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        assert_eq!(backend.put_count().await, 1, "remote candidate must exist before local commit");
+
+        crate::disk::local::set_delete_version_fail_after_commit(disk_stores[0].path().as_path(), object);
+        let saved_disk = {
+            let mut disks = set_disks.disks.write().await;
+            let saved = disks[1].take();
+            assert!(saved.is_some(), "test setup should start with the second disk online");
+            saved
+        };
+        barrier.release();
+        let result = transition.await.expect("transition task should not panic");
+
+        result.expect_err("post-apply disk error plus one offline disk must fail write quorum");
+        let errored_disk_fi = disk_stores[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("rollback must restore metadata on the disk that returned the post-apply error");
+        assert_ne!(
+            errored_disk_fi.transition_status, TRANSITION_COMPLETE,
+            "rollback must not skip the disk that applied delete_version but returned an error"
+        );
+        disk_stores[0]
+            .check_parts(bucket, object, &errored_disk_fi)
+            .await
+            .expect("rollback must restore the errored disk's staged data directory");
+
+        set_disks.disks.write().await[1] = saved_disk;
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "ambiguous local commit failure must retain the remote candidate for reconciliation"
+        );
+        assert_eq!(backend.object_count().await, 1);
+
+        let mut restored = Vec::new();
+        set_disks
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source must remain readable after rolling back the post-apply error")
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("the local source body should drain");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn production_transition_replacement_revokes_commit_and_cleans_with_old_driver() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-generation-fence-bucket";
@@ -3910,6 +4101,141 @@ mod transition_commit_failure_tests {
         assert_eq!(
             body, replacement_payload,
             "stale restore cleanup must not make the old remote body current again"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_restore_cleanup_ignores_replaced_operation_id_with_same_identity() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-operation-id-bucket";
+        let object = "object.bin";
+        let payload = b"same identity restore cleanup must respect operation id".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let operation_a = Uuid::new_v4();
+        let operation_b = Uuid::new_v4();
+        let mut metadata = HashMap::new();
+        metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"true\"".to_string());
+        metadata.insert(rustfs_utils::http::headers::AMZ_RESTORE_EXPIRY_DAYS.to_string(), "1".to_string());
+        metadata.insert(
+            rustfs_utils::http::headers::AMZ_RESTORE_REQUEST_DATE.to_string(),
+            "2026-07-20T00:00:00Z".to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_a.to_string(),
+        );
+
+        let mut reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    user_defined: metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object with restore operation A should be written");
+        let stale_operation_a = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation A metadata should resolve");
+
+        let mut operation_b_metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut operation_b_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(operation_b_metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("same-identity restore operation B should replace A");
+
+        let mut expected_operation_a = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut expected_operation_a,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_a.to_string(),
+        );
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &stale_operation_a,
+                &ObjectOptions {
+                    user_defined: expected_operation_a,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stale operation A cleanup should no-op, not fail");
+        let current_operation_b = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("operation B metadata should remain readable");
+        assert!(
+            current_operation_b
+                .user_defined
+                .contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "stale cleanup for operation A must not remove operation B's restore header"
+        );
+        assert_eq!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                current_operation_b.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            ),
+            Some(operation_b.to_string().as_str()),
+            "stale cleanup for operation A must not remove or rewrite operation B"
+        );
+
+        let mut expected_operation_b = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut expected_operation_b,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_b.to_string(),
+        );
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &current_operation_b,
+                &ObjectOptions {
+                    user_defined: expected_operation_b,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching operation B cleanup should remove restore markers");
+        let cleaned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cleaned object metadata should remain readable");
+        assert!(
+            !cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+            "matching cleanup must remove the restore header"
+        );
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                cleaned.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            )
+            .is_none(),
+            "matching cleanup must remove the restore operation id"
         );
     }
 
@@ -4459,6 +4785,55 @@ mod transition_upload_integrity_tests {
             backend.object_count().await,
             0,
             "lock-lost commit fence must not leave an orphan remote candidate"
+        );
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_after_remote_upload_cleans_candidate_and_preserves_source() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-cancel-after-upload-bucket";
+        let object = "object.bin";
+        let payload = b"cancelled transition after upload must clean remote candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let barrier = TransitionCommitBarrier::install(bucket, object);
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move {
+            transition_set
+                .transition_object(bucket, object, &transition_options(&original, tier_name))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        assert_eq!(
+            backend.put_count().await,
+            1,
+            "transition must upload a remote candidate before the cancellation point"
+        );
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should expose one remote candidate/version");
+        assert_eq!(backend.object_count().await, 1, "remote candidate should be visible before cancellation");
+
+        transition.abort();
+        let join = transition
+            .await
+            .expect_err("aborted transition task should report cancellation");
+        assert!(join.is_cancelled(), "transition task should be cancelled, not panic");
+        drop(barrier);
+
+        assert!(
+            backend
+                .wait_for_remote_absence(&put_versions[0].0, Duration::from_secs(5))
+                .await,
+            "cancellation cleanup must remove the uploaded remote candidate"
+        );
+        assert_eq!(
+            backend.remove_versions().await,
+            put_versions,
+            "cancellation cleanup must target the exact remote version returned by PUT"
         );
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }

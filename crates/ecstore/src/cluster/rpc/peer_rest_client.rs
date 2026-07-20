@@ -99,6 +99,11 @@ fn validate_heal_control_capability_proof(canonical_ack: &[u8], proof: &[u8]) ->
         .map_err(|_| Error::other("peer returned an invalid heal control capability proof"))
 }
 
+fn validate_heal_control_response_proof(canonical_response: &[u8], proof: &[u8]) -> Result<()> {
+    verify_tonic_rpc_response_proof(canonical_response, proof)
+        .map_err(|_| Error::other("peer returned an invalid heal control response proof"))
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
@@ -737,6 +742,7 @@ impl PeerRestClient {
         if command.len() > HEAL_CONTROL_PAYLOAD_MAX_SIZE {
             return Err(Error::other("heal control command exceeds size limit"));
         }
+        let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
         self.finalize_result(
             async {
                 let mut client = self
@@ -748,9 +754,10 @@ impl PeerRestClient {
                     .map_err(|_| Error::other("heal control request length cannot be represented"))?;
                 let mut request = Request::new(HealControlRequest {
                     version,
-                    topology_fingerprint,
-                    command: command.into(),
+                    topology_fingerprint: topology_fingerprint.clone(),
+                    command: command.clone().into(),
                 });
+                request.set_timeout(rustfs_protos::heal_control_execution_timeout());
                 set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
                 let response = client.heal_control(request).await?.into_inner();
                 if !response.success {
@@ -760,6 +767,16 @@ impl PeerRestClient {
                             .unwrap_or_else(|| "peer heal control failed without an error".to_string()),
                     ));
                 }
+                if !capability_probe {
+                    let canonical_response = rustfs_protos::canonical_heal_control_response_body(
+                        version,
+                        &topology_fingerprint,
+                        &command,
+                        &response.result,
+                    )
+                    .map_err(|_| Error::other("heal control response length cannot be represented"))?;
+                    validate_heal_control_response_proof(&canonical_response, &response.response_proof)?;
+                }
                 Ok(response.result.to_vec())
             }
             .await,
@@ -767,7 +784,8 @@ impl PeerRestClient {
         .await
     }
 
-    /// Confirms that a peer supports heal-control v1 and has the same storage
+    /// Confirms that a peer supports the current heal-control coordination
+    /// contract and has the same storage
     /// topology. Every non-success response is an error so old or divergent
     /// peers cannot be mistaken for compatible ones.
     pub async fn probe_heal_control(&self, topology_fingerprint: String) -> Result<()> {
@@ -1405,6 +1423,24 @@ mod tests {
         let err = validate_heal_control_capability_proof(b"different", &proof)
             .expect_err("a proof for a different acknowledgement must fail closed");
         assert!(err.to_string().contains("invalid heal control capability proof"));
+    }
+
+    #[test]
+    fn heal_control_response_proof_binds_command_and_result() {
+        runtime_sources::ensure_test_rpc_secret();
+        let canonical = rustfs_protos::canonical_heal_control_response_body(2, "fingerprint", b"query", b"result")
+            .expect("small response should encode");
+        let proof = crate::cluster::rpc::sign_tonic_rpc_response_proof(&canonical).expect("test proof should sign");
+        assert!(validate_heal_control_response_proof(&canonical, &proof).is_ok());
+
+        for tampered in [
+            rustfs_protos::canonical_heal_control_response_body(2, "fingerprint", b"cancel", b"result").unwrap(),
+            rustfs_protos::canonical_heal_control_response_body(2, "fingerprint", b"query", b"tampered").unwrap(),
+        ] {
+            let err = validate_heal_control_response_proof(&tampered, &proof)
+                .expect_err("proof must not authenticate a different command or result");
+            assert!(err.to_string().contains("invalid heal control response proof"));
+        }
     }
 
     #[tokio::test]

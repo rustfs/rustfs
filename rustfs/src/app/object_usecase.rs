@@ -137,6 +137,7 @@ use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
+    SUFFIX_RESTORE_OPERATION_ID,
     headers::{
         AMZ_CONTENT_SHA256, AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
         AMZ_MINIO_SNOWBALL_PREFIX, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
@@ -7264,6 +7265,7 @@ impl DefaultObjectUsecase {
 
         let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), *rreq.days.as_ref().unwrap_or(&1));
         let mut metadata = (*obj_info.user_defined).clone();
+        let restore_operation_id = (!is_select && !already_restored).then(Uuid::new_v4);
 
         let mut header = HeaderMap::new();
 
@@ -7294,6 +7296,9 @@ impl DefaultObjectUsecase {
                     }
                     .to_string(),
                 );
+                if let Some(id) = restore_operation_id {
+                    insert_str(&mut metadata, SUFFIX_RESTORE_OPERATION_ID, id.to_string());
+                }
             }
             obj_info.user_defined = Arc::new(metadata);
 
@@ -7371,6 +7376,10 @@ impl DefaultObjectUsecase {
         let object_clone = object.clone();
         let rreq_clone = rreq.clone();
         let version_id_clone = obj_info_.version_id.map(|v| v.to_string());
+        let mut restore_operation_metadata = HashMap::new();
+        if let Some(id) = restore_operation_id {
+            insert_str(&mut restore_operation_metadata, SUFFIX_RESTORE_OPERATION_ID, id.to_string());
+        }
 
         spawn_traced(async move {
             let opts = ObjectOptions {
@@ -7380,6 +7389,7 @@ impl DefaultObjectUsecase {
                     ..Default::default()
                 },
                 version_id: version_id_clone,
+                user_defined: restore_operation_metadata,
                 ..Default::default()
             };
 

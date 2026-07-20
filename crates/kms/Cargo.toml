@@ -60,7 +60,7 @@ rustfs-utils = { workspace = true }
 rustfs-security-governance = { workspace = true }
 
 # HTTP client for Vault
-reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy"] }
+reqwest = { workspace = true }
 vaultrs = { workspace = true }
 
 [dev-dependencies]

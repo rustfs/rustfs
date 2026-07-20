@@ -783,6 +783,7 @@ message HealControlResponse {
   bool success = 1;
   bytes result = 2;
   optional string error_info = 3;
+  bytes response_proof = 4;
 }
 
 message GetMetacacheListingRequest {
