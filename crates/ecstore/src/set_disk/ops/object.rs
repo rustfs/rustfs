@@ -1526,8 +1526,9 @@ impl Drop for TransitionUploadCleanup {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TransitionCommitPause {
-    BeforeLeaseCheck,
-    AfterLeaseCheck,
+    BeforeLockLost,
+    BeforeLeaseValidation,
+    AfterLeaseValidation,
 }
 
 #[cfg(test)]
@@ -1550,12 +1551,16 @@ static TRANSITION_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Ar
 
 #[cfg(test)]
 impl TransitionCommitBarrier {
+    fn install_before_lock_lost_check(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, TransitionCommitPause::BeforeLockLost)
+    }
+
     fn install(bucket: &str, object: &str) -> Self {
-        Self::install_at(bucket, object, TransitionCommitPause::BeforeLeaseCheck)
+        Self::install_at(bucket, object, TransitionCommitPause::BeforeLeaseValidation)
     }
 
     fn install_after_lease_check(bucket: &str, object: &str) -> Self {
-        Self::install_at(bucket, object, TransitionCommitPause::AfterLeaseCheck)
+        Self::install_at(bucket, object, TransitionCommitPause::AfterLeaseValidation)
     }
 
     fn install_at(bucket: &str, object: &str, pause: TransitionCommitPause) -> Self {
@@ -3004,6 +3009,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         fi = current_fi;
         let event_name = EventName::LifecycleTransition.as_str();
 
+        #[cfg(test)]
+        pause_transition_commit(bucket, object, TransitionCommitPause::BeforeLockLost).await;
         if transition_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
             drop(transition_lock_guard);
             let _cleanup_result = upload_cleanup.cleanup().await;
@@ -3016,14 +3023,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             });
         }
         #[cfg(test)]
-        pause_transition_commit(bucket, object, TransitionCommitPause::BeforeLeaseCheck).await;
+        pause_transition_commit(bucket, object, TransitionCommitPause::BeforeLeaseValidation).await;
         if !upload_cleanup.lease.is_current_generation() {
             drop(transition_lock_guard);
             let _cleanup_result = upload_cleanup.cleanup().await;
             return Err(Error::other("remote tier configuration changed during transition"));
         }
         #[cfg(test)]
-        pause_transition_commit(bucket, object, TransitionCommitPause::AfterLeaseCheck).await;
+        pause_transition_commit(bucket, object, TransitionCommitPause::AfterLeaseValidation).await;
         upload_cleanup.disarm();
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             warn!(
@@ -4055,8 +4062,10 @@ mod transition_upload_integrity_tests {
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
     use rustfs_lock::client::local::LocalClient;
-    use rustfs_lock::{LockClient, LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_lock::{LockClient, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats};
+    use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
 
     struct SetupTypeGuard {
         previous: SetupType,
@@ -4117,6 +4126,77 @@ mod transition_upload_integrity_tests {
 
         async fn is_online(&self) -> bool {
             false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug)]
+    struct LockLostRefreshClient {
+        refresh_calls: Arc<AtomicUsize>,
+        active: tokio::sync::Mutex<HashSet<LockId>>,
+    }
+
+    impl LockLostRefreshClient {
+        fn new(refresh_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                refresh_calls,
+                active: tokio::sync::Mutex::new(HashSet::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for LockLostRefreshClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> rustfs_lock::Result<LockResponse> {
+            self.active.lock().await.insert(request.lock_id.clone());
+            Ok(LockResponse::success(
+                LockInfo {
+                    id: request.lock_id.clone(),
+                    resource: request.resource.clone(),
+                    lock_type: request.lock_type,
+                    status: rustfs_lock::LockStatus::Acquired,
+                    owner: request.owner.clone(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + request.ttl,
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: request.metadata.clone(),
+                    priority: request.priority,
+                    wait_start_time: None,
+                },
+                Duration::ZERO,
+            ))
+        }
+
+        async fn release(&self, lock_id: &LockId) -> rustfs_lock::Result<bool> {
+            Ok(self.active.lock().await.remove(lock_id))
+        }
+
+        async fn refresh(&self, _lock_id: &LockId) -> rustfs_lock::Result<bool> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+
+        async fn force_release(&self, lock_id: &LockId) -> rustfs_lock::Result<bool> {
+            self.release(lock_id).await
+        }
+
+        async fn check_status(&self, _lock_id: &LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            true
         }
 
         async fn is_local(&self) -> bool {
@@ -4320,6 +4400,65 @@ mod transition_upload_integrity_tests {
             backend.object_count().await,
             0,
             "commit lock failure must not leave an orphan remote candidate"
+        );
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial]
+    async fn commit_lock_lost_after_upload_cleans_remote_candidate_and_preserves_source() {
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| Arc::new(LockLostRefreshClient::new(Arc::clone(&refresh_calls))) as Arc<dyn LockClient>)
+            .collect();
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "transition-lock-lost-bucket";
+        let object = "object.bin";
+        let payload = b"lost transition commit lock must clean the remote candidate".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        let previous_setup_type = runtime_sources::current_setup_type().await;
+        runtime_sources::set_setup_type(SetupType::DistErasure).await;
+        let mut opts = transition_options(&original, tier_name);
+        opts.no_lock = false;
+        let barrier = TransitionCommitBarrier::install_before_lock_lost_check(bucket, object);
+
+        let transition_set = Arc::clone(&set_disks);
+        let transition = tokio::spawn(async move { transition_set.transition_object(bucket, object, &opts).await });
+        barrier.wait_until_paused().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            refresh_calls.load(Ordering::SeqCst) > 0,
+            "test must drive the real distributed-lock heartbeat before the commit fence"
+        );
+        barrier.release();
+
+        let error = transition
+            .await
+            .expect("transition task should not panic")
+            .expect_err("transition must fail after the commit namespace write lock loses refresh quorum");
+        assert!(
+            matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
+            "unexpected transition lock-lost error: {error:?}"
+        );
+        runtime_sources::set_setup_type(previous_setup_type).await;
+        assert_eq!(backend.put_count().await, 1);
+        assert_eq!(
+            backend.remove_count().await,
+            1,
+            "lock-lost commit fence must remove the uploaded remote candidate"
+        );
+        assert_eq!(
+            backend.remove_versions().await,
+            backend.put_versions().await,
+            "lock-lost cleanup must target the exact remote version returned by PUT"
+        );
+        assert_eq!(
+            backend.object_count().await,
+            0,
+            "lock-lost commit fence must not leave an orphan remote candidate"
         );
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
