@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Helm Ingress**: `customAnnotations` are now merged with class-specific annotations (nginx/traefik) instead of being ignored when `ingress.className` is set.
+- **Per-pool erasure parity**: Erasure parity (STANDARD and reduced-redundancy) is now resolved independently for every pool instead of reusing the first pool's value. A heterogeneous topology — for example a 4-drive pool plus a 2-drive pool created during expansion — previously inherited the first pool's parity and could resolve to zero data shards in the smaller pool, panicking Reed-Solomon construction on write. Automatic parity now resolves per pool (for example `2+2` in the 4-drive pool and `1+1` in the 2-drive pool). Fixes #4801.
 
 ### Added
 - **NATS JetStream Publish Path**: Opt-in at-least-once delivery for the NATS notify and audit targets. A NATS Core publish flushes to the connection without awaiting a broker acknowledgement, so an event can be lost across a broker restart or a reconnect after the send queue has already cleared it. A queued event now clears only after the JetStream `PublishAck`, so bucket notifications survive those interruptions. Off by default and byte-identical to the NATS Core path when disabled.
@@ -38,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **HTTP Server Stack**: Integrated `KeystoneAuthLayer` middleware from `rustfs-keystone` crate into service stack (positioned after ReadinessGateLayer)
+- **Storage-class validation on startup (upgrade note)**: A persisted explicit storage class (`RUSTFS_STORAGE_CLASS_STANDARD` / `RUSTFS_STORAGE_CLASS_RRS`, for example `EC:2`) is now validated against the actual per-pool drive counts at startup and rejected when a pool cannot satisfy it. This is fail-closed and correct, but a cluster that persisted a storage class larger than a small or heterogeneous pool can hold (for example `EC:2` alongside a 2-drive pool), which earlier releases accepted and silently resolved to an invalid layout, will now refuse to start after upgrade. To recover, unset `RUSTFS_STORAGE_CLASS_STANDARD` so the server derives a valid per-pool default automatically, or set it to a value every pool can satisfy.
 - **IAMAuth**: Enhanced `get_secret_key()` to return empty secret for Keystone credentials (bypasses signature validation)
 - **Auth Module**: Modified `check_key_valid()` to retrieve Keystone credentials from task-local storage and determine admin status
 - **`StorageBackend` trait**: extended with multipart upload methods (`create_multipart_upload`, `upload_part`, `complete_multipart_upload`, `abort_multipart_upload`) plus `upload_part_copy`. Streaming-upload code path is now available to FTPS, WebDAV, and Swift drivers as well.

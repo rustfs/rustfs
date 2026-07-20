@@ -508,6 +508,8 @@ pub enum AdminAction {
     ExportBucketMetadataAction,
     #[strum(serialize = "admin:GetTableCatalog")]
     GetTableCatalogAction,
+    #[strum(serialize = "admin:MigrateTableCatalog")]
+    MigrateTableCatalogAction,
     #[strum(serialize = "admin:GetTableBucket")]
     GetTableBucketAction,
     #[strum(serialize = "admin:SetTableBucket")]
@@ -658,6 +660,7 @@ impl AdminAction {
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
                 | AdminAction::GetTableCatalogAction
+                | AdminAction::MigrateTableCatalogAction
                 | AdminAction::GetTableBucketAction
                 | AdminAction::SetTableBucketAction
                 | AdminAction::GetTableNamespaceAction
@@ -832,9 +835,12 @@ mod tests {
     #[test]
     fn test_table_catalog_admin_action_is_valid() {
         let get_action = AdminAction::try_from("admin:GetTableCatalog").expect("Should parse GetTableCatalog action");
+        let migrate_action = AdminAction::try_from("admin:MigrateTableCatalog").expect("Should parse MigrateTableCatalog action");
 
         assert_eq!(get_action, AdminAction::GetTableCatalogAction);
+        assert_eq!(migrate_action, AdminAction::MigrateTableCatalogAction);
         assert!(get_action.is_valid());
+        assert!(migrate_action.is_valid());
     }
 
     #[test]

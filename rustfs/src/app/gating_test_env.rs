@@ -78,6 +78,9 @@ pub(crate) async fn shared_gating_ecstore() -> Arc<ECStore> {
     super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
+    crate::storage::storage_api::new_global_notification_sys(endpoint_pools.clone())
+        .await
+        .expect("initialize notification system for gating test env");
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())

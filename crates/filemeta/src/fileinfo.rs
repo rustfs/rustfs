@@ -17,8 +17,8 @@ use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
-    SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, insert_str,
+    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_FREE_VERSION, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID,
+    SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, has_internal_suffix, insert_str,
 };
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
@@ -30,6 +30,12 @@ use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
+
+const MAX_ERASURE_SHARDS: usize = 16;
+const MAX_FILEINFO_PARTS: usize = 10_000;
+const MAX_FILEINFO_CHECKSUMS: usize = 10_000;
+const FILEINFO_PART_BITMAP_WORD_BITS: usize = std::mem::size_of::<u64>() * 8;
+const FILEINFO_PART_BITMAP_WORDS: usize = MAX_FILEINFO_PARTS.div_ceil(FILEINFO_PART_BITMAP_WORD_BITS);
 
 // Additional constants from Go version
 pub const NULL_VERSION_ID: &str = "null";
@@ -135,6 +141,14 @@ pub struct ErasureInfo {
 
 pub fn calc_shard_size(block_size: usize, data_shards: usize) -> usize {
     (block_size.div_ceil(data_shards) + 1) & !1
+}
+
+fn checked_calc_shard_size(block_size: usize, data_shards: usize) -> Option<usize> {
+    if data_shards == 0 {
+        return None;
+    }
+
+    block_size.div_ceil(data_shards).checked_add(1).map(|size| size & !1)
 }
 
 impl ErasureInfo {
@@ -243,6 +257,55 @@ pub struct FileInfo {
     pub uses_legacy_checksum: bool,
 }
 
+/// Selects the validation policy for a trusted operation boundary.
+///
+/// This mode is deliberately caller-selected and is never inferred from
+/// serialized [`FileInfo`] state such as `deleted` or `transition_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationMode {
+    /// Validate the complete storage erasure layout before payload access.
+    RequireErasure,
+    /// Validate delete metadata without requiring a payload erasure layout.
+    DeleteOnly,
+}
+
+/// Erasure geometry that passed the storage-layout validation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedErasureLayout {
+    data_blocks: usize,
+    block_size: usize,
+    shard_size: usize,
+}
+
+impl ValidatedErasureLayout {
+    /// Calculates a shard file size without overflowing the metadata's integer format.
+    pub fn shard_file_size(&self, total_length: usize) -> Option<i64> {
+        let full_blocks = total_length / self.block_size;
+        let last_block_size = total_length % self.block_size;
+        let last_shard_size = checked_calc_shard_size(last_block_size, self.data_blocks)?;
+        let shard_file_size = full_blocks.checked_mul(self.shard_size)?.checked_add(last_shard_size)?;
+        i64::try_from(shard_file_size).ok()
+    }
+}
+
+fn mark_fileinfo_part(bitmap: &mut [u64; FILEINFO_PART_BITMAP_WORDS], part_number: usize) -> bool {
+    let Some(index) = part_number.checked_sub(1).filter(|&index| index < MAX_FILEINFO_PARTS) else {
+        return false;
+    };
+    let word = index / FILEINFO_PART_BITMAP_WORD_BITS;
+    let mask = 1u64 << (index % FILEINFO_PART_BITMAP_WORD_BITS);
+    let was_absent = bitmap[word] & mask == 0;
+    bitmap[word] |= mask;
+    was_absent
+}
+
+fn has_fileinfo_part(bitmap: &[u64; FILEINFO_PART_BITMAP_WORDS], part_number: usize) -> bool {
+    let Some(index) = part_number.checked_sub(1).filter(|&index| index < MAX_FILEINFO_PARTS) else {
+        return false;
+    };
+    bitmap[index / FILEINFO_PART_BITMAP_WORD_BITS] & (1u64 << (index % FILEINFO_PART_BITMAP_WORD_BITS)) != 0
+}
+
 /// Validates that an erasure `distribution` is a permutation of `1..=n`.
 ///
 /// A well-formed distribution has exactly `n` entries and each 1-based slot
@@ -252,11 +315,11 @@ pub struct FileInfo {
 /// `usize` underflow / out-of-bounds panic. Rejecting such distributions here
 /// lets the metadata surface as a clean quorum/corruption error instead.
 pub(crate) fn is_valid_distribution(distribution: &[usize], n: usize) -> bool {
-    if n == 0 || distribution.len() != n {
+    if n == 0 || n > MAX_ERASURE_SHARDS || distribution.len() != n {
         return false;
     }
 
-    let mut seen = vec![false; n];
+    let mut seen = [false; MAX_ERASURE_SHARDS];
     for &block_idx in distribution {
         // Valid 1-based slots are `1..=n`; anything else (including `0`) is invalid.
         if block_idx < 1 || block_idx > n {
@@ -304,19 +367,264 @@ impl FileInfo {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
-        if self.deleted {
-            return true;
+    fn validate_erasure_geometry_with_index(&self, index: usize) -> Result<ValidatedErasureLayout> {
+        let erasure = &self.erasure;
+        if erasure.data_blocks == 0 || erasure.block_size == 0 || erasure.data_blocks < erasure.parity_blocks {
+            return Err(Error::FileCorrupt);
         }
 
-        let data_blocks = self.erasure.data_blocks;
-        let parity_blocks = self.erasure.parity_blocks;
+        let total_blocks = erasure
+            .data_blocks
+            .checked_add(erasure.parity_blocks)
+            .ok_or(Error::FileCorrupt)?;
+        if total_blocks > MAX_ERASURE_SHARDS
+            || index == 0
+            || index > total_blocks
+            || !is_valid_distribution(&erasure.distribution, total_blocks)
+        {
+            return Err(Error::FileCorrupt);
+        }
 
-        (data_blocks >= parity_blocks)
-            && (data_blocks > 0)
-            && (self.erasure.index > 0
-                && self.erasure.index <= data_blocks + parity_blocks
-                && is_valid_distribution(&self.erasure.distribution, data_blocks + parity_blocks))
+        let shard_size = checked_calc_shard_size(erasure.block_size, erasure.data_blocks)
+            .filter(|&size| i64::try_from(size).is_ok())
+            .ok_or(Error::FileCorrupt)?;
+        i64::try_from(erasure.block_size).map_err(|_| Error::FileCorrupt)?;
+
+        let layout = ValidatedErasureLayout {
+            data_blocks: erasure.data_blocks,
+            block_size: erasure.block_size,
+            shard_size,
+        };
+        let object_size = usize::try_from(self.size).map_err(|_| Error::FileCorrupt)?;
+        layout.shard_file_size(object_size).ok_or(Error::FileCorrupt)?;
+        Ok(layout)
+    }
+
+    fn validate_erasure_geometry(&self) -> Result<ValidatedErasureLayout> {
+        self.validate_erasure_geometry_with_index(self.erasure.index)
+    }
+
+    fn validate_collection_bounds(&self) -> Result<()> {
+        if self.parts.len() > MAX_FILEINFO_PARTS
+            || self.erasure.checksums.len() > MAX_FILEINFO_CHECKSUMS
+            || self.erasure.distribution.len() > MAX_ERASURE_SHARDS
+        {
+            return Err(Error::FileCorrupt);
+        }
+        Ok(())
+    }
+
+    fn validate_collection_contents(&self, layout: Option<&ValidatedErasureLayout>) -> Result<()> {
+        let mut part_numbers = [0u64; FILEINFO_PART_BITMAP_WORDS];
+        for part in &self.parts {
+            if let Some(layout) = layout {
+                i64::try_from(part.size).map_err(|_| Error::FileCorrupt)?;
+                layout.shard_file_size(part.size).ok_or(Error::FileCorrupt)?;
+
+                // A negative `actual_size` is the documented "unknown size" sentinel for
+                // compressed streaming objects (see `ObjectPartInfo::actual_size` /
+                // `ObjectInfo::get_actual_size`), written to xl.meta by both RustFS and
+                // MinIO. Only shard-validate a real, non-negative size; rejecting the
+                // sentinel would make legitimate compressed objects unreadable.
+                if let Ok(actual_size) = usize::try_from(part.actual_size) {
+                    layout.shard_file_size(actual_size).ok_or(Error::FileCorrupt)?;
+                }
+            }
+            if !mark_fileinfo_part(&mut part_numbers, part.number) {
+                return Err(Error::FileCorrupt);
+            }
+        }
+
+        let mut checksum_parts = [0u64; FILEINFO_PART_BITMAP_WORDS];
+        for checksum in &self.erasure.checksums {
+            if !has_fileinfo_part(&part_numbers, checksum.part_number)
+                || !mark_fileinfo_part(&mut checksum_parts, checksum.part_number)
+            {
+                return Err(Error::FileCorrupt);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_delete_marker_shape(&self, expected_index: usize, allow_nil_version_id: bool) -> Result<()> {
+        if !self.deleted {
+            return Err(Error::FileCorrupt);
+        }
+        let erasure = &self.erasure;
+        let stored_free_version = contains_key_str(&self.metadata, SUFFIX_FREE_VERSION);
+        if self.mod_time.is_none_or(|mod_time| mod_time <= OffsetDateTime::UNIX_EPOCH)
+            || (!allow_nil_version_id && self.version_id.is_some_and(|version_id| version_id.is_nil()))
+            || self.transition_version_id.is_some_and(|version_id| version_id.is_nil())
+            || self.size != 0
+            || self.data_dir.is_some()
+            || self.mode.is_some()
+            || self.written_by_version.is_some()
+            || self.data.is_some()
+            || self.checksum.is_some()
+            || !self.parts.is_empty()
+            || !erasure.algorithm.is_empty()
+            || erasure.data_blocks != 0
+            || erasure.parity_blocks != 0
+            || erasure.block_size != 0
+            || erasure.index != expected_index
+            || !erasure.distribution.is_empty()
+            || !erasure.checksums.is_empty()
+            || stored_free_version != self.tier_free_version()
+            || (stored_free_version && (self.transition_tier.is_empty() || self.transitioned_objname.is_empty()))
+        {
+            return Err(Error::FileCorrupt);
+        }
+        Ok(())
+    }
+
+    fn validate_tier_free_version_delete_shape(&self) -> Result<()> {
+        let erasure = &self.erasure;
+        if !self.deleted
+            || !self.tier_free_version()
+            || self.version_id.is_none_or(|version_id| version_id.is_nil())
+            || self.mod_time.is_some()
+            || self.is_latest
+            || !self.transition_status.is_empty()
+            || !self.transitioned_objname.is_empty()
+            || !self.transition_tier.is_empty()
+            || self.transition_version_id.is_some()
+            || self.expire_restored
+            || self.size != 0
+            || self.data_dir.is_some()
+            || self.mode.is_some()
+            || self.written_by_version.is_some()
+            || self.mark_deleted
+            || self.replication_state_internal.is_some()
+            || self.data.is_some()
+            || self.num_versions != 0
+            || self.successor_mod_time.is_some()
+            || self.fresh
+            || self.idx != 0
+            || self.checksum.is_some()
+            || self.versioned
+            || self.uses_legacy_checksum
+            || !self.parts.is_empty()
+            || self.metadata.is_empty()
+            || self.metadata.len() > 2
+            || self
+                .metadata
+                .iter()
+                .any(|(key, value)| !has_internal_suffix(key, SUFFIX_TIER_FV_MARKER) || !value.is_empty())
+            || !erasure.algorithm.is_empty()
+            || erasure.data_blocks != 0
+            || erasure.parity_blocks != 0
+            || erasure.block_size != 0
+            || erasure.index != 0
+            || !erasure.distribution.is_empty()
+            || !erasure.checksums.is_empty()
+        {
+            return Err(Error::FileCorrupt);
+        }
+        Ok(())
+    }
+
+    /// Validates this metadata for the caller-selected operation boundary and
+    /// returns the payload erasure layout when one is established.
+    ///
+    /// All modes enforce collection bounds and checksum-to-part associations.
+    /// Only [`ValidationMode::RequireErasure`] establishes a payload erasure
+    /// layout; the other modes cannot be upgraded based on serialized flags and
+    /// return `None`.
+    pub fn validate(&self, mode: ValidationMode) -> Result<Option<ValidatedErasureLayout>> {
+        self.validate_collection_bounds()?;
+
+        let erasure_layout = match mode {
+            ValidationMode::RequireErasure => Some(self.validate_erasure_geometry()?),
+            ValidationMode::DeleteOnly => {
+                self.validate_delete_marker_shape(0, false)?;
+                None
+            }
+        };
+        self.validate_collection_contents(erasure_layout.as_ref())?;
+
+        Ok(erasure_layout)
+    }
+
+    /// Validate metadata returned by a disk or peer as a strict tagged union.
+    /// Payload entries require complete erasure geometry, including
+    /// purge-pending object versions whose replication state sets `deleted`.
+    /// Only entries that are not valid payloads may fall back to the canonical
+    /// delete-marker shape, so `deleted` cannot bypass payload validation.
+    pub fn validate_for_metadata_read(&self) -> Result<()> {
+        if self.validate(ValidationMode::RequireErasure).is_ok() {
+            return Ok(());
+        }
+
+        self.validate(ValidationMode::DeleteOnly).map(|_| ())
+    }
+
+    /// Cheap shape check for metadata that already passed
+    /// [`Self::validate_for_metadata_read`] at its decode boundary.
+    pub fn has_valid_metadata_shape(&self) -> bool {
+        self.has_valid_erasure_geometry() || self.is_canonical_delete_marker()
+    }
+
+    /// Returns whether this is a canonical delete marker rather than an
+    /// erasure-backed object version in a purge-pending state.
+    pub fn is_canonical_delete_marker(&self) -> bool {
+        self.validate_delete_marker_shape(0, false).is_ok()
+    }
+
+    /// Storage-only marker classification after an absent version ID has been
+    /// normalized to the internal nil UUID. Network and disk boundaries must
+    /// continue to use [`Self::is_canonical_delete_marker`].
+    pub(crate) fn is_storage_delete_marker(&self) -> bool {
+        self.validate_delete_marker_shape(0, true).is_ok()
+    }
+
+    /// Whether this is a canonical delete marker carrying only the per-disk
+    /// index assigned by an older rename coordinator.
+    pub fn is_legacy_indexed_delete_marker(&self) -> bool {
+        self.erasure.index > 0
+            && self.erasure.index <= MAX_ERASURE_SHARDS
+            && self.validate_delete_marker_shape(self.erasure.index, false).is_ok()
+    }
+
+    /// Validates complete metadata before a write fanout assigns its per-disk
+    /// shard index. An index of zero is treated only as the pending assignment;
+    /// every other geometry and collection invariant remains mandatory.
+    pub fn validate_for_erasure_write(&self) -> Result<()> {
+        self.validate_collection_bounds()?;
+        let index = if self.erasure.index == 0 { 1 } else { self.erasure.index };
+        let layout = self.validate_erasure_geometry_with_index(index)?;
+        self.validate_collection_contents(Some(&layout))
+    }
+
+    /// Validates metadata used to mutate a version list during a delete.
+    /// Delete-marker creation requires the canonical marker shape; other
+    /// delete operations do not access payload shards but still validate all
+    /// collection bounds and checksum-to-part associations before mutation.
+    pub fn validate_for_delete_operation(&self) -> Result<()> {
+        self.validate_collection_bounds()?;
+
+        if self.deleted && self.tier_free_version() {
+            return self.validate_tier_free_version_delete_shape();
+        }
+
+        if self.deleted {
+            return self.validate(ValidationMode::DeleteOnly).map(|_| ());
+        }
+
+        self.validate_collection_contents(None)
+    }
+
+    /// Performs the cheap layout check used by quorum selection after a decode
+    /// boundary has already called [`Self::validate`].
+    pub fn has_valid_erasure_geometry(&self) -> bool {
+        self.validate_erasure_geometry().is_ok()
+    }
+
+    /// Validates the complete payload metadata shape.
+    ///
+    /// Repeated quorum passes over metadata that was already fully validated
+    /// should use [`Self::has_valid_erasure_geometry`] instead.
+    pub fn is_valid(&self) -> bool {
+        self.validate(ValidationMode::RequireErasure).is_ok()
     }
 
     pub fn get_etag(&self) -> Option<String> {
@@ -324,7 +632,7 @@ impl FileInfo {
     }
 
     pub fn write_quorum(&self, quorum: usize) -> usize {
-        if self.deleted {
+        if self.deleted && !self.has_valid_erasure_geometry() {
             return quorum;
         }
 
@@ -815,6 +1123,419 @@ mod tests {
         let mut fi = distribution_test_fileinfo();
         fi.erasure.distribution = vec![1, 2, 3];
         assert!(!fi.is_valid());
+    }
+
+    fn validation_test_fileinfo() -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 4, 2);
+        fi.erasure.index = 1;
+        fi.parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                ..Default::default()
+            },
+        ];
+        fi.erasure.checksums = vec![
+            ChecksumInfo {
+                part_number: 1,
+                algorithm: HashAlgorithm::HighwayHash256S,
+                hash: Bytes::from_static(b"checksum-one"),
+            },
+            ChecksumInfo {
+                part_number: 2,
+                algorithm: HashAlgorithm::SHA256,
+                hash: Bytes::from_static(b"checksum-two"),
+            },
+        ];
+        fi
+    }
+
+    fn assert_file_corrupt(fi: &FileInfo, mode: ValidationMode) {
+        assert_eq!(fi.validate(mode).expect_err("invalid FileInfo must be rejected"), Error::FileCorrupt);
+    }
+
+    #[test]
+    fn validate_require_erasure_returns_checked_layout() {
+        let fi = validation_test_fileinfo();
+        let layout = fi
+            .validate(ValidationMode::RequireErasure)
+            .expect("well-formed erasure metadata must validate")
+            .expect("strict validation must return an erasure layout");
+        assert_eq!(layout.data_blocks, 4);
+        assert_eq!(layout.block_size, BLOCK_SIZE_V2);
+        assert_eq!(layout.shard_size, calc_shard_size(BLOCK_SIZE_V2, 4));
+        let shard_size = i64::try_from(layout.shard_size).expect("validated shard size must fit i64");
+        assert_eq!(layout.shard_file_size(0), Some(0));
+        assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2 - 1), Some(shard_size));
+        assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2), Some(shard_size));
+        assert_eq!(layout.shard_file_size(BLOCK_SIZE_V2 + 1), Some(shard_size + 2));
+    }
+
+    #[test]
+    fn validate_require_erasure_accepts_zero_parity() {
+        let mut fi = FileInfo::new("bucket/object", 16, 0);
+        fi.erasure.index = 1;
+
+        let layout = fi
+            .validate(ValidationMode::RequireErasure)
+            .expect("zero parity is a valid storage layout");
+        assert_eq!(layout.expect("strict layout must be present").data_blocks, 16);
+    }
+
+    #[test]
+    fn validate_for_erasure_write_only_relaxes_pending_shard_index() {
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.index = 0;
+
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        fi.validate_for_erasure_write()
+            .expect("write preparation must accept an index that fanout has not assigned yet");
+
+        fi.erasure.index = fi.erasure.data_blocks + fi.erasure.parity_blocks + 1;
+        assert_eq!(fi.validate_for_erasure_write(), Err(Error::FileCorrupt));
+
+        fi.erasure.index = 0;
+        fi.parts.push(fi.parts[0].clone());
+        assert_eq!(fi.validate_for_erasure_write(), Err(Error::FileCorrupt));
+    }
+
+    #[test]
+    fn validate_require_erasure_rejects_invalid_geometry() {
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = 0;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.block_size = 0;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = usize::MAX;
+        fi.erasure.parity_blocks = 1;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = 9;
+        fi.erasure.parity_blocks = 8;
+        fi.erasure.index = 1;
+        fi.erasure.distribution = (1..=17).collect();
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.data_blocks = 1;
+        fi.erasure.parity_blocks = 2;
+        fi.erasure.index = 1;
+        fi.erasure.distribution = vec![1, 2, 3];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.index = 0;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.index = 7;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.distribution = vec![1, 2, 3, 4, 5, 5];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+    }
+
+    fn one_shard_validation_fileinfo(block_size: usize) -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 1, 0);
+        fi.erasure.index = 1;
+        fi.erasure.block_size = block_size;
+        fi
+    }
+
+    #[test]
+    fn validate_require_erasure_rejects_unrepresentable_shard_sizes() {
+        let fi = one_shard_validation_fileinfo(usize::MAX);
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        if let Some((max_i64, above_i64_max)) = usize::try_from(i64::MAX)
+            .ok()
+            .and_then(|max_i64| max_i64.checked_add(1).map(|above_i64_max| (max_i64, above_i64_max)))
+        {
+            let mut fi = FileInfo::new("bucket/object", 2, 0);
+            fi.erasure.index = 1;
+            fi.erasure.block_size = above_i64_max;
+            assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+            let mut fi = FileInfo::new("bucket/object", 2, 0);
+            fi.erasure.index = 1;
+            fi.erasure.block_size = max_i64;
+            fi.parts = vec![ObjectPartInfo {
+                number: 1,
+                size: above_i64_max,
+                ..Default::default()
+            }];
+            assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        }
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.size = -1;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.size = i64::MAX;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: usize::MAX,
+            ..Default::default()
+        }];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+
+        // A negative `actual_size` is the compressed "unknown size" sentinel, not an
+        // unrepresentable size: it must stay readable so existing compressed objects
+        // remain accessible. Only real (non-negative) sizes are shard-validated.
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            actual_size: -1,
+            ..Default::default()
+        }];
+        fi.validate(ValidationMode::RequireErasure)
+            .expect("negative actual_size sentinel (compressed objects) must remain readable");
+
+        let mut fi = one_shard_validation_fileinfo(2);
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            actual_size: i64::MAX,
+            ..Default::default()
+        }];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+    }
+
+    #[test]
+    fn metadata_read_validation_rejects_flags_that_try_to_relax_payload_validation() {
+        let mut fi = FileInfo::new("bucket/legacy", 0, 2);
+        fi.erasure.index = 1;
+        fi.deleted = true;
+        fi.transition_status = TRANSITION_COMPLETE.to_owned();
+        fi.transitioned_objname = "remote/object".to_owned();
+        fi.transition_tier = "WARM".to_owned();
+
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert!(!fi.is_valid(), "wire-controlled state flags must not relax is_valid");
+        assert!(matches!(fi.validate_for_metadata_read(), Err(Error::FileCorrupt)));
+        assert_file_corrupt(&fi, ValidationMode::DeleteOnly);
+    }
+
+    #[test]
+    fn metadata_read_validation_requires_canonical_delete_marker_shape() {
+        let marker = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        marker
+            .validate_for_metadata_read()
+            .expect("canonical delete marker should validate");
+
+        let mut missing_time = marker.clone();
+        missing_time.mod_time = None;
+        assert!(matches!(missing_time.validate_for_metadata_read(), Err(Error::FileCorrupt)));
+
+        let mut epoch_time = marker.clone();
+        epoch_time.mod_time = Some(OffsetDateTime::UNIX_EPOCH);
+        assert!(matches!(epoch_time.validate_for_metadata_read(), Err(Error::FileCorrupt)));
+
+        let mut disguised_payload = marker.clone();
+        disguised_payload.erasure.data_blocks = 1;
+        assert!(matches!(disguised_payload.validate_for_metadata_read(), Err(Error::FileCorrupt)));
+
+        let mut marker_with_part = marker;
+        marker_with_part.parts.push(ObjectPartInfo {
+            number: 1,
+            ..Default::default()
+        });
+        assert!(matches!(marker_with_part.validate_for_metadata_read(), Err(Error::FileCorrupt)));
+
+        let mut purge_pending = validation_test_fileinfo();
+        purge_pending.deleted = true;
+        purge_pending
+            .validate_for_metadata_read()
+            .expect("erasure-backed purge-pending objects remain valid payload metadata");
+        assert!(!purge_pending.is_canonical_delete_marker());
+    }
+
+    #[test]
+    fn rename_validation_accepts_only_legacy_assigned_delete_marker_index() {
+        let marker = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let mut legacy_marker = marker.clone();
+        legacy_marker.erasure.index = 2;
+        assert_eq!(legacy_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
+        assert!(legacy_marker.is_legacy_indexed_delete_marker());
+        legacy_marker.erasure.index = 0;
+        legacy_marker
+            .validate_for_metadata_read()
+            .expect("normalized legacy marker should pass strict metadata validation");
+
+        let mut malformed_marker = legacy_marker;
+        malformed_marker.erasure.index = 2;
+        malformed_marker.erasure.data_blocks = 1;
+        assert!(!malformed_marker.is_legacy_indexed_delete_marker());
+        assert_eq!(malformed_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
+
+        let mut forged_free_marker = marker.clone();
+        insert_str(&mut forged_free_marker.metadata, SUFFIX_FREE_VERSION, String::new());
+        assert_eq!(forged_free_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
+
+        let mut free_marker = marker.clone();
+        insert_str(&mut free_marker.metadata, SUFFIX_FREE_VERSION, String::new());
+        free_marker.set_tier_free_version();
+        free_marker.transition_tier = "WARM".to_string();
+        free_marker.transitioned_objname = "remote/object".to_string();
+        free_marker
+            .validate_for_metadata_read()
+            .expect("complete tier free-version marker should remain valid");
+
+        let mut out_of_range_marker = marker;
+        out_of_range_marker.erasure.index = MAX_ERASURE_SHARDS + 1;
+        assert!(!out_of_range_marker.is_legacy_indexed_delete_marker());
+        assert_eq!(out_of_range_marker.validate_for_metadata_read(), Err(Error::FileCorrupt));
+    }
+
+    #[test]
+    fn delete_operation_accepts_only_the_worker_tier_free_version_request_shape() {
+        let mut worker_request = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            ..Default::default()
+        };
+        worker_request.set_tier_free_version();
+        worker_request
+            .validate_for_delete_operation()
+            .expect("the lifecycle worker request shape must remain valid");
+
+        let mut timestamped = worker_request.clone();
+        timestamped.mod_time = Some(OffsetDateTime::now_utc());
+        assert_eq!(timestamped.validate_for_delete_operation(), Err(Error::FileCorrupt));
+
+        let mut with_payload = worker_request.clone();
+        with_payload.size = 1;
+        assert_eq!(with_payload.validate_for_delete_operation(), Err(Error::FileCorrupt));
+
+        let mut with_unrelated_metadata = worker_request;
+        with_unrelated_metadata
+            .metadata
+            .insert("unexpected".to_string(), "value".to_string());
+        assert_eq!(with_unrelated_metadata.validate_for_delete_operation(), Err(Error::FileCorrupt));
+    }
+
+    #[test]
+    fn erasure_and_delete_operation_validation_enforce_basic_collection_bounds() {
+        let mut fi = validation_test_fileinfo();
+        fi.parts = (1..=10_001)
+            .map(|number| ObjectPartInfo {
+                number,
+                ..Default::default()
+            })
+            .collect();
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert_eq!(fi.validate_for_delete_operation(), Err(Error::FileCorrupt));
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.checksums = (1..=10_001)
+            .map(|part_number| ChecksumInfo {
+                part_number,
+                ..Default::default()
+            })
+            .collect();
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert_eq!(fi.validate_for_delete_operation(), Err(Error::FileCorrupt));
+
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.distribution = vec![1; 17];
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert_eq!(fi.validate_for_delete_operation(), Err(Error::FileCorrupt));
+    }
+
+    #[test]
+    fn validate_accepts_exact_collection_limits() {
+        let mut fi = validation_test_fileinfo();
+        fi.parts = (1..=10_000)
+            .map(|number| ObjectPartInfo {
+                number,
+                ..Default::default()
+            })
+            .collect();
+        fi.erasure.checksums = (1..=10_000)
+            .map(|part_number| ChecksumInfo {
+                part_number,
+                ..Default::default()
+            })
+            .collect();
+
+        fi.validate(ValidationMode::RequireErasure)
+            .expect("exact collection limits must remain valid");
+        fi.validate_for_delete_operation()
+            .expect("non-marker delete requests must accept exact collection limits");
+    }
+
+    #[test]
+    fn erasure_and_delete_operation_validation_reject_checksum_association_errors() {
+        let mut fi = validation_test_fileinfo();
+        fi.erasure.checksums[0].part_number = 99;
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert_eq!(fi.validate_for_delete_operation(), Err(Error::FileCorrupt));
+
+        let mut fi = validation_test_fileinfo();
+        let duplicate = fi.erasure.checksums[0].clone();
+        fi.erasure.checksums.push(duplicate);
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert_eq!(fi.validate_for_delete_operation(), Err(Error::FileCorrupt));
+    }
+
+    #[test]
+    fn erasure_and_delete_operation_validation_reject_duplicate_parts() {
+        let mut fi = validation_test_fileinfo();
+        fi.parts[1].number = fi.parts[0].number;
+        fi.erasure.checksums.clear();
+
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+        assert_eq!(fi.validate_for_delete_operation(), Err(Error::FileCorrupt));
+    }
+
+    #[test]
+    fn write_quorum_distinguishes_purge_pending_payload_from_delete_marker() {
+        let mut purge_pending = FileInfo::new("bucket/object", 5, 1);
+        purge_pending.erasure.index = 1;
+        purge_pending.deleted = true;
+        assert_eq!(purge_pending.write_quorum(4), 5);
+
+        let marker = FileInfo {
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        assert_eq!(marker.write_quorum(4), 4);
+
+        let malformed_marker = FileInfo {
+            deleted: true,
+            ..Default::default()
+        };
+        assert_eq!(malformed_marker.write_quorum(4), 4, "invalid marker metadata must never reduce quorum");
     }
 
     fn small_string_strategy() -> impl Strategy<Value = String> {

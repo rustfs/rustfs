@@ -31,6 +31,7 @@ use crate::client::{
     },
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
+    provider_versions::{BucketVersioningState, ProviderVersionCapabilities},
     signer_error,
 };
 use crate::{client::checksum::ChecksumMode, object_api::GetObjectReader};
@@ -41,7 +42,7 @@ use http::{
     request::{Builder, Request},
 };
 use http_body::Body;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Bytes;
 use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
@@ -54,9 +55,7 @@ use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
     net::get_endpoint_url,
-    retry::{
-        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
-    },
+    retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer},
 };
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::PemObject;
@@ -81,8 +80,24 @@ use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
+pub(crate) const MAX_S3_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
 
 const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT, StatusCode::PARTIAL_CONTENT];
+
+pub(crate) async fn collect_response_body<B>(body: B, limit: usize) -> Result<Vec<u8>, std::io::Error>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let body = Limited::new(body, limit).collect().await.map_err(|err| {
+        if err.is::<LengthLimitError>() {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "remote tier response body exceeds limit")
+        } else {
+            std::io::Error::other(err)
+        }
+    })?;
+    Ok(body.to_bytes().to_vec())
+}
 
 const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
@@ -92,9 +107,18 @@ fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
     signer_error::invalid_utf8_header_error(scope, header_name)
 }
 
-fn validate_header_values(headers: &HeaderMap, scope: &str) -> Result<(), std::io::Error> {
+fn validate_header_values(headers: &HeaderMap, scope: &str, signer_type: &SignatureType) -> Result<(), std::io::Error> {
     for (name, value) in headers {
-        value.to_str().map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+        if signer_type == &SignatureType::SignatureV2 {
+            // The SigV2 canonicalizer only supports visible ASCII values. Keep rejecting
+            // non-ASCII here so it cannot silently omit a value that is sent on the wire.
+            value.to_str().map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+        } else {
+            let value = std::str::from_utf8(value.as_bytes()).map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+            if value.chars().any(|ch| !ch.is_ascii() && ch.is_whitespace()) {
+                return Err(invalid_utf8_header_error(scope, name.as_str()));
+            }
+        }
     }
     Ok(())
 }
@@ -300,6 +324,14 @@ impl TransitionClient {
         self.endpoint_url.clone()
     }
 
+    pub(crate) fn provider_version_capabilities(&self) -> ProviderVersionCapabilities {
+        ProviderVersionCapabilities::for_tier_type(&self.tier_type)
+    }
+
+    pub(crate) fn raw_version_id<'a>(&self, headers: &'a HeaderMap) -> Result<Option<&'a str>, std::io::Error> {
+        self.provider_version_capabilities().raw_version_id(headers)
+    }
+
     fn trace_errors_only_off(&self) {
         if let Ok(mut trace_errors_only) = self.trace_errors_only.lock() {
             *trace_errors_only = false;
@@ -379,20 +411,17 @@ impl TransitionClient {
     pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
         let req_method;
         let req_uri;
-        let req_headers;
         let resp;
         let http_client = self.http_client.clone();
         {
             req_method = req.method().clone();
             req_uri = req.uri().clone();
-            req_headers = req.headers().clone();
 
             debug!("endpoint_url: {}", self.endpoint_url.as_str().to_string());
             resp = http_client.request(req);
         }
         let resp = resp.await;
         debug!("http_client url: {} {}", req_method, req_uri);
-        debug!("http_client headers: {:?}", req_headers);
         if let Err(err) = resp {
             error!("http_client call error: {:?}", err);
             return Err(std::io::Error::other(err));
@@ -402,28 +431,23 @@ impl TransitionClient {
             Ok(r) => r,
             Err(_) => return Err(std::io::Error::other("Unexpected error in response")),
         };
-        debug!("http_resp: {:?}", resp);
+        debug!(status = %resp.status(), "remote tier response received");
 
         //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
         //debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
 
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
         if !resp.status().is_success() {
-            //self.dump_http(&cloned_req, &resp)?;
-            let mut body_vec = Vec::new();
-            let mut body = resp.into_body();
-            while let Some(frame) = body.frame().await {
-                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                if let Some(data) = frame.data_ref() {
-                    body_vec.extend_from_slice(data);
-                }
-            }
-            let body_str = String::from_utf8_lossy(&body_vec);
-            warn!("err_body: {}", body_str);
-            Err(std::io::Error::other(format!("http_client call error: {}", body_str)))
-        } else {
-            Ok(resp)
+            let status = resp.status();
+            let request_id = resp
+                .headers()
+                .get("x-amz-request-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            warn!(status = %status, request_id, "remote tier request rejected");
         }
+        Ok(resp)
     }
 
     pub async fn execute_method(
@@ -465,17 +489,22 @@ impl TransitionClient {
             let resp_status = resp.status();
             let h = resp.headers().clone();
 
-            let mut body_vec = Vec::new();
-            let mut body = resp.into_body();
-            while let Some(frame) = body.frame().await {
-                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                if let Some(data) = frame.data_ref() {
-                    body_vec.extend_from_slice(data);
-                }
-            }
-            let mut err_response =
-                http_resp_to_error_response(resp_status, &h, body_vec.clone(), &metadata.bucket_name, &metadata.object_name);
-            err_response.message = format!("remote tier error: {}", err_response.message);
+            let body_vec = collect_response_body(resp.into_body(), MAX_S3_ERROR_RESPONSE_SIZE).await?;
+            let parsed_error =
+                http_resp_to_error_response(resp_status, &h, body_vec, &metadata.bucket_name, &metadata.object_name);
+            let routing_region = parsed_error.region;
+            let code = match parsed_error.code {
+                S3ErrorCode::Custom(_) => S3ErrorCode::ResponseInterrupted,
+                code => code,
+            };
+            let err_response = ErrorResponse {
+                status_code: resp_status,
+                message: format!("remote tier request failed with status {resp_status}: {}", code.as_str()),
+                code,
+                bucket_name: metadata.bucket_name.clone(),
+                key: metadata.object_name.clone(),
+                ..Default::default()
+            };
 
             if self.region == "" {
                 return match err_response.code {
@@ -484,20 +513,20 @@ impl TransitionClient {
                         Err(std::io::Error::other(err_response))
                     }
                     S3ErrorCode::AccessDenied => {
-                        if err_response.region == "" {
+                        if routing_region.is_empty() {
                             return Err(std::io::Error::other(err_response));
                         }
                         if metadata.bucket_name != "" {
                             if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
                                 if let Some(location) = bucket_loc_cache.get(&metadata.bucket_name) {
-                                    if location != err_response.region {
-                                        bucket_loc_cache.set(&metadata.bucket_name, &err_response.region);
+                                    if location != routing_region {
+                                        bucket_loc_cache.set(&metadata.bucket_name, &routing_region);
                                         //continue;
                                     }
                                 }
                             }
-                        } else if err_response.region != metadata.bucket_location {
-                            metadata.bucket_location = err_response.region.clone();
+                        } else if routing_region != metadata.bucket_location {
+                            metadata.bucket_location = routing_region;
                             //continue;
                         }
                         Err(std::io::Error::other(err_response))
@@ -508,18 +537,10 @@ impl TransitionClient {
                 };
             }
 
-            if is_s3code_retryable(err_response.code.as_str()) {
-                continue;
-            }
-
-            if is_http_status_retryable(&resp_status) {
-                continue;
-            }
-
-            break;
+            return Err(std::io::Error::other(err_response));
         }
 
-        Err(std::io::Error::other("resp err"))
+        Err(std::io::Error::other("remote tier request did not produce a response"))
     }
 
     async fn new_request(
@@ -586,7 +607,7 @@ impl TransitionClient {
                     )));
                 }
                 if let Some(extra_headers) = metadata.extra_pre_sign_header.as_ref() {
-                    validate_header_values(extra_headers, "presign extra header")?;
+                    validate_header_values(extra_headers, "presign extra header", &signer_type)?;
                     let headers = req.headers_mut();
                     for (k, v) in extra_headers {
                         headers.insert(k, v.clone());
@@ -611,7 +632,7 @@ impl TransitionClient {
         }
 
         self.set_user_agent(&mut req);
-        validate_header_values(&metadata.custom_header, "request custom header")?;
+        validate_header_values(&metadata.custom_header, "request custom header", &signer_type)?;
 
         for (k, v) in metadata.custom_header.clone() {
             if let Some(key) = k {
@@ -1144,6 +1165,15 @@ impl Default for UploadInfo {
 /// This function parses various S3 response headers to construct an ObjectInfo struct
 /// containing metadata about an S3 object.
 pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Result<ObjectInfo, std::io::Error> {
+    to_object_info_for_provider(bucket_name, object_name, h, ProviderVersionCapabilities::for_tier_type("s3"))
+}
+
+pub(crate) fn to_object_info_for_provider(
+    bucket_name: &str,
+    object_name: &str,
+    h: &HeaderMap,
+    version_capabilities: ProviderVersionCapabilities,
+) -> Result<ObjectInfo, std::io::Error> {
     // Helper function to get header value as string
     let get_header = |name: &str| -> String { h.get(name).and_then(|val| val.to_str().ok()).unwrap_or("").to_string() };
 
@@ -1261,14 +1291,11 @@ pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Re
     };
 
     // Extract version ID
-    let version_id = {
-        let version_id_str = get_header("x-amz-version-id");
-        if !version_id_str.is_empty() {
-            Some(Uuid::parse_str(&version_id_str).unwrap_or_else(|_| Uuid::nil()))
-        } else {
-            None
-        }
-    };
+    let version_id = version_capabilities
+        .remote_version(h, BucketVersioningState::Unknown)?
+        .exact_id()
+        .and_then(|version_id| Uuid::parse_str(version_id).ok())
+        .filter(|version_id| !version_id.is_nil());
 
     // Check if it's a delete marker
     let is_delete_marker = get_header("x-amz-delete-marker") == "true";
@@ -1383,8 +1410,43 @@ pub struct CreateBucketConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tls_config, signer_error_to_io_error, validate_header_values, with_rustls_init_guard};
+    use super::{
+        MAX_S3_CLIENT_RESPONSE_SIZE, MAX_S3_ERROR_RESPONSE_SIZE, SignatureType, build_tls_config, collect_response_body,
+        signer_error_to_io_error, to_object_info_for_provider, validate_header_values, with_rustls_init_guard,
+    };
+    use crate::client::provider_versions::ProviderVersionCapabilities;
     use http::{HeaderMap, HeaderValue};
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn response_body_limit_rejects_the_first_byte_past_the_boundary() {
+        let exact = collect_response_body(
+            Full::new(Bytes::from(vec![0_u8; MAX_S3_CLIENT_RESPONSE_SIZE])),
+            MAX_S3_CLIENT_RESPONSE_SIZE,
+        )
+        .await
+        .expect("a response exactly at the limit should be accepted");
+        assert_eq!(exact.len(), MAX_S3_CLIENT_RESPONSE_SIZE);
+
+        let err = collect_response_body(
+            Full::new(Bytes::from(vec![0_u8; MAX_S3_CLIENT_RESPONSE_SIZE + 1])),
+            MAX_S3_CLIENT_RESPONSE_SIZE,
+        )
+        .await
+        .expect_err("oversized remote response must fail closed");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let err = collect_response_body(
+            Full::new(Bytes::from(vec![0_u8; MAX_S3_ERROR_RESPONSE_SIZE + 1])),
+            MAX_S3_ERROR_RESPONSE_SIZE,
+        )
+        .await
+        .expect_err("oversized S3 error response must use the smaller error limit");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn rustls_guard_converts_panics_to_io_errors() {
@@ -1427,9 +1489,32 @@ mod tests {
             HeaderValue::from_bytes(&[0xFF]).expect("invalid utf8 bytes should be accepted by HeaderValue"),
         );
 
-        let err =
-            validate_header_values(&headers, "request custom header").expect_err("invalid header value should fail validation");
+        let err = validate_header_values(&headers, "request custom header", &SignatureType::SignatureV4)
+            .expect_err("invalid header value should fail validation");
         assert!(err.to_string().contains("x-amz-meta-invalid"));
+    }
+
+    #[test]
+    fn validate_header_values_accepts_utf8_for_v4_but_not_v2() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("20260715/鲁A12345/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        assert!(validate_header_values(&headers, "request custom header", &SignatureType::SignatureV4).is_ok());
+        assert!(validate_header_values(&headers, "request custom header", &SignatureType::SignatureV2).is_err());
+    }
+
+    #[test]
+    fn validate_header_values_rejects_non_ascii_whitespace_for_v4() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("tier/a\u{00a0}b/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        assert!(validate_header_values(&headers, "request custom header", &SignatureType::SignatureV4).is_err());
     }
 
     #[test]
@@ -1442,5 +1527,40 @@ mod tests {
         );
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("x-amz-meta-invalid"));
+    }
+
+    #[test]
+    fn object_info_uses_provider_version_header_without_uuid_coercion() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-cos-version-id", HeaderValue::from_static("opaque.version_01"));
+
+        let info =
+            to_object_info_for_provider("bucket", "object", &headers, ProviderVersionCapabilities::for_tier_type("tencent"))
+                .expect("opaque provider version should parse");
+
+        assert_eq!(info.version_id, None);
+        assert_eq!(
+            info.metadata.get("x-cos-version-id").and_then(|value| value.to_str().ok()),
+            Some("opaque.version_01")
+        );
+    }
+
+    #[test]
+    fn object_info_keeps_s3_uuid_version_id_and_filters_nil() {
+        let version_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(&version_id.to_string()).expect("uuid header should be valid"),
+        );
+
+        let info = to_object_info_for_provider("bucket", "object", &headers, ProviderVersionCapabilities::for_tier_type("s3"))
+            .expect("s3 uuid version should parse");
+        assert_eq!(info.version_id, Some(version_id));
+
+        headers.insert("x-amz-version-id", HeaderValue::from_static("00000000-0000-0000-0000-000000000000"));
+        let info = to_object_info_for_provider("bucket", "object", &headers, ProviderVersionCapabilities::for_tier_type("s3"))
+            .expect("nil s3 uuid version should parse");
+        assert_eq!(info.version_id, None);
     }
 }

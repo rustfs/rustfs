@@ -25,7 +25,7 @@ use crate::client::{
 };
 use crate::error::is_err_bucket_not_found;
 use crate::services::tier::{
-    tier::ERR_TIER_TYPE_UNSUPPORTED,
+    tier::{ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
@@ -37,6 +37,7 @@ use crate::services::tier::{
     warm_backend_rustfs::WarmBackendRustFS,
     warm_backend_s3::WarmBackendS3,
     warm_backend_tencent::WarmBackendTencent,
+    warm_backend_wasabi::WarmBackendWasabi,
 };
 use bytes::Bytes;
 use http::StatusCode;
@@ -65,7 +66,23 @@ pub struct WarmBackendGetOpts {
 
 #[async_trait::async_trait]
 pub trait WarmBackend {
+    async fn validate(&self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+
+    fn validate_remote_version_id(&self, _remote_version_id: &str) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+
+    /// Return `Ok` only after the backend has consumed the complete declared
+    /// body and its storage service has acknowledged the PUT. The built-in S3
+    /// family uses the transition client's declared-length request plus
+    /// Content-MD5 for multipart parts, while GCS materializes the body before
+    /// awaiting its buffered write response. Test backends may deliberately
+    /// violate this contract to exercise transition compensation.
     async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error>;
+    /// The same completion contract as [`WarmBackend::put`] applies when
+    /// metadata is attached.
     async fn put_with_meta(
         &self,
         object: &str,
@@ -75,6 +92,15 @@ pub trait WarmBackend {
     ) -> Result<String, std::io::Error>;
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error>;
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error>;
+    async fn remove_exact(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
+        if rv.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an exact tier delete requires a remote version ID",
+            ));
+        }
+        self.remove(object, rv).await
+    }
     async fn in_use(&self) -> Result<bool, std::io::Error>;
 }
 
@@ -157,16 +183,23 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
 
 pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), AdminError> {
     let w = w.ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?;
+    w.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
     let remote_version_id = w
         .put(PROBE_OBJECT, ReaderImpl::Body(Bytes::from("RustFS".as_bytes().to_vec())), 5)
-        .await;
-    if let Err(err) = remote_version_id {
-        return Err(ERR_TIER_PERM_ERR.clone());
+        .await
+        .map_err(|_| ERR_TIER_PERM_ERR.clone())?;
+
+    if w.validate_remote_version_id(&remote_version_id).is_err() {
+        w.remove_exact(PROBE_OBJECT, &remote_version_id)
+            .await
+            .map_err(|_| ERR_TIER_PERM_ERR.clone())?;
+        return Err(ERR_TIER_INVALID_CONFIG.clone());
     }
 
-    let r = w.get(PROBE_OBJECT, "", WarmBackendGetOpts::default()).await;
+    let read_result = w.get(PROBE_OBJECT, &remote_version_id, WarmBackendGetOpts::default()).await;
+    let remove_result = w.remove(PROBE_OBJECT, &remote_version_id).await;
     //xhttp.DrainBody(r);
-    if let Err(err) = r {
+    if read_result.is_err() || remove_result.is_err() {
         //if is_err_bucket_not_found(&err) {
         //    return Err(ERR_TIER_BUCKET_NOT_FOUND);
         //}
@@ -176,11 +209,6 @@ pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), Admin
         //else {
         return Err(ERR_TIER_PERM_ERR.clone());
         //}
-    }
-    if let Ok(version_id) = remote_version_id {
-        if let Err(err) = w.remove(PROBE_OBJECT, &version_id).await {
-            return Err(ERR_TIER_PERM_ERR.clone());
-        };
     }
     Ok(())
 }
@@ -204,6 +232,27 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
                 return Err(AdminError {
                     code: "XRustFSAdminTierInvalidConfig".to_string(),
                     message: "S3 tier configuration not found".to_string(),
+                    status_code: StatusCode::BAD_REQUEST,
+                });
+            }
+        }
+        TierType::Wasabi => {
+            if let Some(wasabi_config) = tier.wasabi.as_ref() {
+                match WarmBackendWasabi::new(wasabi_config, &tier.name).await {
+                    Ok(backend) => d = Some(Box::new(backend)),
+                    Err(err) => {
+                        warn!("{}", err);
+                        return Err(AdminError {
+                            code: "XRustFSAdminTierInvalidConfig".to_string(),
+                            message: format!("Unable to setup remote tier, check tier configuration: {err}"),
+                            status_code: StatusCode::BAD_REQUEST,
+                        });
+                    }
+                }
+            } else {
+                return Err(AdminError {
+                    code: "XRustFSAdminTierInvalidConfig".to_string(),
+                    message: "Wasabi tier configuration not found".to_string(),
                     status_code: StatusCode::BAD_REQUEST,
                 });
             }
@@ -373,16 +422,284 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
         }
     }
 
-    d.ok_or_else(|| AdminError {
+    let d = d.ok_or_else(|| AdminError {
         code: "XRustFSAdminTierInvalidConfig".to_string(),
         message: "Tier backend not initialized".to_string(),
         status_code: StatusCode::BAD_REQUEST,
-    })
+    })?;
+
+    if probe {
+        d.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
+    }
+    Ok(d)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::tier::tier_config::TierWasabi;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const PROBE_VERSION: &str = "remote-v2";
+
+    struct RejectingValidationBackend {
+        validations: Arc<AtomicUsize>,
+        puts: Arc<AtomicUsize>,
+        removes: Arc<AtomicUsize>,
+    }
+
+    struct RejectingProbeVersionBackend {
+        gets: Arc<AtomicUsize>,
+        removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    struct RecordingProbeBackend {
+        get_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+        removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+        fail_get: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WarmBackend for RejectingValidationBackend {
+        async fn validate(&self) -> Result<(), std::io::Error> {
+            self.validations.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("invalid backend configuration"))
+        }
+
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            Ok(String::new())
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            Err(std::io::Error::other("get must not run after validation failure"))
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> Result<(), std::io::Error> {
+            self.removes.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("remove must not run after validation failure"))
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Err(std::io::Error::other("in_use must not run after validation failure"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarmBackend for RejectingProbeVersionBackend {
+        fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
+            if remote_version_id.is_empty() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("probe returned a version ID"))
+            }
+        }
+
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            Ok(uuid::Uuid::nil().to_string())
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("GET must not run for a rejected probe version"))
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> Result<(), std::io::Error> {
+            Err(std::io::Error::other("generic remove must not run for a rejected fresh PUT response"))
+        }
+
+        async fn remove_exact(&self, _object: &str, rv: &str) -> Result<(), std::io::Error> {
+            self.removed_versions.lock().await.push(rv.to_string());
+            Ok(())
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarmBackend for RecordingProbeBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            Ok(PROBE_VERSION.to_string())
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            self.get_versions.lock().await.push(rv.to_string());
+            if self.fail_get {
+                Err(std::io::Error::other("probe GET failed"))
+            } else {
+                Ok(ReadCloser::new(std::io::Cursor::new(Vec::new())))
+            }
+        }
+
+        async fn remove(&self, _object: &str, rv: &str) -> Result<(), std::io::Error> {
+            self.removed_versions.lock().await.push(rv.to_string());
+            Ok(())
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_validates_before_probe_io() {
+        let validations = Arc::new(AtomicUsize::new(0));
+        let puts = Arc::new(AtomicUsize::new(0));
+        let removes = Arc::new(AtomicUsize::new(0));
+        let backend: WarmBackendImpl = Box::new(RejectingValidationBackend {
+            validations: validations.clone(),
+            puts: puts.clone(),
+            removes: removes.clone(),
+        });
+
+        let err = check_warm_backend(Some(&backend))
+            .await
+            .expect_err("invalid backend configuration should fail before probe I/O");
+
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert_eq!(validations.load(Ordering::SeqCst), 1);
+        assert_eq!(puts.load(Ordering::SeqCst), 0);
+        assert_eq!(removes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn default_exact_remove_rejects_an_empty_version() {
+        let removes = Arc::new(AtomicUsize::new(0));
+        let backend = RejectingValidationBackend {
+            validations: Arc::new(AtomicUsize::new(0)),
+            puts: Arc::new(AtomicUsize::new(0)),
+            removes: removes.clone(),
+        };
+
+        let err = backend
+            .remove_exact("remote-object", "")
+            .await
+            .expect_err("an empty exact constraint must fail closed");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(removes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_removes_exact_probe_when_versioning_drifts() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RejectingProbeVersionBackend {
+            gets: gets.clone(),
+            removed_versions: removed_versions.clone(),
+        });
+
+        let err = check_warm_backend(Some(&backend))
+            .await
+            .expect_err("a probe version ID must fail an unversioned backend check");
+
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert_eq!(gets.load(Ordering::SeqCst), 0);
+        assert_eq!(removed_versions.lock().await.as_slice(), [uuid::Uuid::nil().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_forwards_probe_version_to_get_and_remove() {
+        let get_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
+            get_versions: get_versions.clone(),
+            removed_versions: removed_versions.clone(),
+            fail_get: false,
+        });
+
+        check_warm_backend(Some(&backend))
+            .await
+            .expect("a successful probe should validate, read, and remove its object");
+
+        assert_eq!(get_versions.lock().await.as_slice(), [PROBE_VERSION]);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_removes_probe_after_get_failure() {
+        let get_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
+            get_versions: get_versions.clone(),
+            removed_versions: removed_versions.clone(),
+            fail_get: true,
+        });
+
+        let err = check_warm_backend(Some(&backend))
+            .await
+            .expect_err("a failed probe GET should return a permission error after cleanup");
+
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert_eq!(get_versions.lock().await.as_slice(), [PROBE_VERSION]);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn new_wasabi_backend_honors_probe_flag() {
+        let tier = TierConfig {
+            name: "WASABI".to_string(),
+            tier_type: TierType::Wasabi,
+            wasabi: Some(TierWasabi {
+                name: "WASABI".to_string(),
+                access_key: "invalid\naccess-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                bucket: "tier-bucket".to_string(),
+                prefix: "archive".to_string(),
+                region: "us-east-1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let backend = new_warm_backend(&tier, false)
+            .await
+            .expect("valid Wasabi config should initialize without probing the remote service");
+
+        assert!(backend.validate_remote_version_id("").is_ok());
+        assert!(backend.validate_remote_version_id("unexpected-version").is_err());
+
+        let err = match new_warm_backend(&tier, true).await {
+            Ok(_) => panic!("probing a Wasabi backend must validate its credentials"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+    }
 
     #[test]
     fn build_transition_put_options_preserves_content_headers() {

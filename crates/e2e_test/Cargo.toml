@@ -57,7 +57,7 @@ http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "multipart"] }
+reqwest = { workspace = true, features = ["json", "multipart", "stream"] }
 rustfs-signer.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }

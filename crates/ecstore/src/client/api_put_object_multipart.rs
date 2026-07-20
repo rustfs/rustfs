@@ -41,7 +41,7 @@ use crate::client::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 use rustfs_utils::path::trim_etag;
-use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
+use s3s::header::X_AMZ_EXPIRATION;
 
 impl TransitionClient {
     pub async fn put_object_multipart(
@@ -417,11 +417,7 @@ impl TransitionClient {
             bucket: complete_multipart_upload_result.bucket,
             key: complete_multipart_upload_result.key,
             etag: trim_etag(&complete_multipart_upload_result.etag),
-            version_id: if let Some(h_x_amz_version_id) = h.get(X_AMZ_VERSION_ID) {
-                h_x_amz_version_id.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
+            version_id: self.raw_version_id(&h)?.unwrap_or_default().to_string(),
             location: complete_multipart_upload_result.location,
             expiration: exp_time,
             expiration_rule_id: rule_id,

@@ -841,6 +841,12 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+    fn erasure_with_zero_block_size() -> Erasure {
+        let mut erasure = Erasure::default();
+        erasure.data_shards = 1;
+        erasure
+    }
+
     #[derive(Clone, Default)]
     struct DeferredCommitWriter {
         buffered: Vec<u8>,
@@ -1500,7 +1506,7 @@ mod tests {
             HashAlgorithm::HighwayHash256S,
         ))];
 
-        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let erasure = Arc::new(erasure_with_zero_block_size());
         let reader = tokio::io::BufReader::new(Cursor::new(b"payload".to_vec()));
         let err = erasure
             .encode(reader, &mut writers, 1)
@@ -1660,7 +1666,7 @@ mod tests {
         let writer = DeferredCommitWriter::new(committed);
         let mut writers = vec![Some(bitrot_writer(writer, 16))];
 
-        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let erasure = Arc::new(erasure_with_zero_block_size());
         let reader = tokio::io::BufReader::new(Cursor::new(b"payload".to_vec()));
         let err = erasure
             .encode_batched(reader, &mut writers, 1)

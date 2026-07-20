@@ -649,6 +649,7 @@ message GetAllBucketStatsResponse {
 
 message LoadBucketMetadataRequest {
   string bucket = 1;
+  bool scanner_maintenance_change = 2;
 }
 
 message LoadBucketMetadataResponse {
@@ -756,12 +757,33 @@ message SignalServiceResponse {
   optional string error_info = 2;
 }
 
+message ScannerActivityRequest {}
+
+message ScannerActivityResponse {
+  string instance_id = 1;
+  uint64 namespace_generation = 2;
+  uint64 maintenance_generation = 3;
+}
+
 message BackgroundHealStatusRequest {}
 
 message BackgroundHealStatusResponse {
   bool success = 1;
   bytes bg_heal_state = 2;
   optional string error_info = 3;
+}
+
+message HealControlRequest {
+  uint32 version = 1;
+  string topology_fingerprint = 2;
+  bytes command = 3;
+}
+
+message HealControlResponse {
+  bool success = 1;
+  bytes result = 2;
+  optional string error_info = 3;
+  bytes response_proof = 4;
 }
 
 message GetMetacacheListingRequest {
@@ -944,6 +966,7 @@ service NodeService {
   // rpc VerifyBinary() returns () {};
   // rpc CommitBinary() returns () {};
   rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {};
+  rpc ScannerActivity(ScannerActivityRequest) returns (ScannerActivityResponse) {};
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {};
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {};
   rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {};
@@ -955,4 +978,8 @@ service NodeService {
   rpc ClearDecommission(ClearDecommissionRequest) returns (ClearDecommissionResponse) {};
   rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {};
   rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {};
+}
+
+service HealControlService {
+  rpc HealControl(HealControlRequest) returns (HealControlResponse) {};
 }

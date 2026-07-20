@@ -798,6 +798,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn scanner_activity(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ScannerActivityRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::ScannerActivityResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn background_heal_status(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::BackgroundHealStatusRequest>,

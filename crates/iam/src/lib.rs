@@ -28,6 +28,7 @@ const EVENT_OIDC_STATE: &str = "oidc_state";
 
 pub mod cache;
 pub mod error;
+pub mod federation;
 pub mod keyring;
 pub mod manager;
 pub mod oidc;

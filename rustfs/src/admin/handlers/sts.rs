@@ -13,14 +13,16 @@
 // limitations under the License.
 
 use super::is_admin::IsAdminHandler;
+use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
+use crate::admin::service::session_policy::populate_session_policy;
 use crate::admin::storage_api::bucket::utils::serialize;
 use crate::{
-    admin::runtime_sources::{current_action_credentials, current_oidc_handle, current_token_signing_key},
+    admin::runtime_sources::{current_action_credentials, current_federated_identity_service, current_token_signing_key},
     admin::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, extract_string_list_claim, get_session_token},
+    auth::{check_key_valid, get_session_token},
     server::ADMIN_PREFIX,
     server::RemoteAddr,
 };
@@ -29,12 +31,12 @@ use http::header::HeaderValue;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_iam::{oidc::OidcClaims, sys::SESSION_POLICY_NAME};
+use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
     policy::{
-        Args, Policy,
+        Args,
         action::{Action, StsAction},
     },
 };
@@ -46,7 +48,6 @@ use s3s::{
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
-use std::collections::{BTreeMap, HashMap};
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, error, info, warn};
 
@@ -75,138 +76,21 @@ fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
     }
 }
 
-fn has_identity_authorization_context(policies: &[String], groups: &[String]) -> bool {
-    !policies.is_empty() || !groups.is_empty()
-}
-
-fn configured_roles_claim_key(provider_id: &str) -> Option<String> {
-    current_oidc_handle()
-        .as_ref()
-        .and_then(|oidc_sys| oidc_sys.get_provider_config(provider_id))
-        .map(|cfg| cfg.roles_claim.trim().to_string())
-        .filter(|claim| !claim.is_empty())
-}
-
-fn build_oidc_token_claims(
-    claims: &OidcClaims,
-    provider_id: &str,
-    groups: &[String],
-    roles_claim_key: Option<&str>,
-) -> HashMap<String, Value> {
-    let mut token_claims: HashMap<String, Value> = HashMap::new();
-    token_claims.insert("sub".to_string(), Value::String(claims.sub.clone()));
-    token_claims.insert("iss".to_string(), Value::String("rustfs-oidc".to_string()));
-    token_claims.insert("oidc_provider".to_string(), Value::String(provider_id.to_string()));
-
-    if !claims.email.is_empty() {
-        token_claims.insert("email".to_string(), Value::String(claims.email.clone()));
-    }
-    if !claims.username.is_empty() {
-        token_claims.insert("preferred_username".to_string(), Value::String(claims.username.clone()));
-    }
-    if !groups.is_empty() {
-        token_claims.insert(
-            "groups".to_string(),
-            Value::Array(groups.iter().map(|g| Value::String(g.clone())).collect()),
-        );
-    }
-    if let Some(roles_claim_key) = roles_claim_key {
-        let roles = extract_string_list_claim(&claims.raw, roles_claim_key);
-        if !roles.is_empty() {
-            token_claims.insert("roles".to_string(), Value::Array(roles.into_iter().map(Value::String).collect()));
+fn web_identity_federation_error(error: FederationError) -> S3Error {
+    match error {
+        FederationError::TokenVerification(message) => {
+            S3Error::with_message(S3ErrorCode::AccessDenied, format!("token verification failed: {message}"))
         }
-    }
-    token_claims
-}
-
-fn resolve_oidc_session_identity(claims: &OidcClaims) -> String {
-    if !claims.username.is_empty() {
-        claims.username.clone()
-    } else if !claims.email.is_empty() {
-        claims.email.clone()
-    } else if !claims.sub.is_empty() {
-        claims.sub.clone()
-    } else {
-        "oidc-user-unknown".to_string()
-    }
-}
-
-async fn log_oidc_policy_diagnostics(
-    iam_store: &rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>,
-    provider_id: &str,
-    parent_user: &str,
-    policies: &[String],
-    groups: &[String],
-) {
-    if policies.is_empty() {
-        let policy_documents = BTreeMap::<String, Value>::new();
-        let missing_policies = Vec::<String>::new();
-        let combined_policy = Value::Null;
-        debug!(
-            provider_id = %provider_id,
-            parent_user = %parent_user,
-            policy_count = 0,
-            group_count = groups.len(),
-            policies = ?policies,
-            groups = ?groups,
-            policy_documents = ?policy_documents,
-            missing_policies = ?missing_policies,
-            combined_policy = ?combined_policy,
-            "OIDC STS policy diagnostics"
-        );
-        return;
-    }
-
-    match iam_store.list_policy_docs("").await {
-        Ok(policy_docs) => {
-            let mut policy_documents = BTreeMap::new();
-            let mut missing_policies = Vec::new();
-            for policy_name in policies {
-                match policy_docs.get(policy_name) {
-                    Some(policy_doc) => {
-                        let policy_doc_json = serde_json::to_value(policy_doc).unwrap_or_else(|err| {
-                            serde_json::json!({
-                                "serialization_error": err.to_string(),
-                            })
-                        });
-                        policy_documents.insert(policy_name.clone(), policy_doc_json);
-                    }
-                    None => missing_policies.push(policy_name.clone()),
-                }
-            }
-
-            let combined_policy = iam_store.get_combined_policy(policies).await;
-            let combined_policy_json = serde_json::to_value(&combined_policy).unwrap_or_else(|err| {
-                serde_json::json!({
-                    "serialization_error": err.to_string(),
-                })
-            });
-
-            debug!(
-                provider_id = %provider_id,
-                parent_user = %parent_user,
-                policy_count = policies.len(),
-                group_count = groups.len(),
-                policies = ?policies,
-                groups = ?groups,
-                missing_policies = ?missing_policies,
-                policy_documents = ?policy_documents,
-                combined_policy = ?combined_policy_json,
-                "OIDC STS policy diagnostics"
-            );
+        FederationError::NoAuthorizationContext => {
+            s3_error!(InvalidArgument, "no policies are available for this OIDC token")
         }
-        Err(err) => {
-            warn!(
-                provider_id = %provider_id,
-                parent_user = %parent_user,
-                policy_count = policies.len(),
-                group_count = groups.len(),
-                policies = ?policies,
-                groups = ?groups,
-                error = %err,
-                "OIDC STS policy diagnostics failed"
-            );
+        FederationError::Binding(FederatedSessionBindingError::InvalidRequest(message)) => {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, message)
         }
+        FederationError::Binding(FederatedSessionBindingError::Internal(message)) => {
+            S3Error::with_message(S3ErrorCode::InternalError, message)
+        }
+        other => S3Error::with_message(S3ErrorCode::InternalError, other.to_string()),
     }
 }
 
@@ -411,42 +295,6 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
         return Err(s3_error!(InvalidArgument, "not support version"));
     }
 
-    // Verify the JWT and extract claims
-    let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
-
-    let (claims, provider_id) = oidc_sys
-        .verify_web_identity_token(&body.web_identity_token)
-        .await
-        .map_err(|e| {
-            warn!("AssumeRoleWithWebIdentity JWT verification failed: {}", e);
-            S3Error::with_message(S3ErrorCode::AccessDenied, format!("token verification failed: {e}"))
-        })?;
-
-    // Map claims to policies and groups
-    let (policies, groups) = oidc_sys.map_claims_to_policies(&provider_id, &claims);
-
-    if !has_identity_authorization_context(&policies, &groups) {
-        warn!(
-            provider_id = %provider_id,
-            username = %claims.username,
-            sub = %claims.sub,
-            policy_count = policies.len(),
-            group_count = groups.len(),
-            "AssumeRoleWithWebIdentity has no mapped policies or groups"
-        );
-        return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
-    }
-
-    debug!(
-        provider_id = %provider_id,
-        username = %claims.username,
-        policy_count = policies.len(),
-        group_count = groups.len(),
-        policies = ?policies,
-        groups = ?groups,
-        "AssumeRoleWithWebIdentity mapped OIDC policies and groups"
-    );
-
     let mut duration = if body.duration_seconds > 0 {
         body.duration_seconds
     } else {
@@ -455,18 +303,24 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
 
     // Enforce reasonable bounds for STS credentials duration (similar to AWS STS)
     duration = duration.clamp(900, 43200);
-    // Generate STS credentials using the shared helper
-    let new_cred = create_oidc_sts_credentials(
-        &claims,
-        &provider_id,
-        &policies,
-        &groups,
-        duration,
-        if body.policy.is_empty() { None } else { Some(&body.policy) },
-    )
-    .await?;
-
-    let subject = resolve_oidc_session_identity(&claims);
+    let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+    let session = federation
+        .assume_role_with_web_identity(
+            &body.web_identity_token,
+            duration,
+            if body.policy.is_empty() { None } else { Some(body.policy) },
+            &DefaultFederatedSessionBinding,
+        )
+        .await
+        .map_err(|error| {
+            if let FederationError::TokenVerification(message) = &error {
+                warn!("AssumeRoleWithWebIdentity JWT verification failed: {}", message);
+            }
+            web_identity_federation_error(error)
+        })?;
+    let authorization = &session.authorization;
+    let new_cred = &session.credentials;
+    let subject = authorization.claims.session_identity();
 
     // Build XML response (AssumeRoleWithWebIdentityResponse)
     let expiration = new_cred
@@ -500,121 +354,6 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     resp.headers
         .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
     Ok(resp)
-}
-
-/// Shared helper to generate STS credentials from OIDC claims.
-/// Used by both the OIDC callback handler and AssumeRoleWithWebIdentity.
-pub async fn create_oidc_sts_credentials(
-    claims: &OidcClaims,
-    provider_id: &str,
-    policies: &[String],
-    groups: &[String],
-    duration_seconds: usize,
-    session_policy: Option<&str>,
-) -> S3Result<rustfs_credentials::Credentials> {
-    let roles_claim_key = configured_roles_claim_key(provider_id);
-    let mut token_claims = build_oidc_token_claims(claims, provider_id, groups, roles_claim_key.as_deref());
-
-    // Set expiration
-    let exp = OffsetDateTime::now_utc().saturating_add(Duration::seconds(duration_seconds as i64));
-    token_claims.insert("exp".to_string(), Value::Number(serde_json::Number::from(exp.unix_timestamp())));
-
-    // Set the parent user: prefer username, then email, then sub
-    let parent_user = resolve_oidc_session_identity(claims);
-    debug!(
-        provider_id = %provider_id,
-        parent_user = %parent_user,
-        email = %claims.email,
-        username = %claims.username,
-        sub = %claims.sub,
-        policy_count = policies.len(),
-        group_count = groups.len(),
-        policies = ?policies,
-        groups = ?groups,
-        roles_claim_key = ?roles_claim_key,
-        has_session_policy = session_policy.is_some(),
-        "OIDC STS credential claims prepared"
-    );
-    token_claims.insert("parent".to_string(), Value::String(parent_user.clone()));
-
-    // Set policies as a comma-separated string
-    if !policies.is_empty() {
-        token_claims.insert("policy".to_string(), Value::String(policies.join(",")));
-    }
-
-    // Optionally apply session policy
-    if let Some(policy_str) = session_policy {
-        populate_session_policy(&mut token_claims, policy_str)?;
-    }
-
-    // Generate STS temp credentials
-    let secret = current_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
-
-    let mut new_cred = get_new_credentials_with_metadata(&token_claims, &secret)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("credential generation failed: {e}")))?;
-
-    new_cred.parent_user = parent_user;
-    new_cred.groups = Some(groups.to_vec());
-
-    // Store temp user in IAM
-    let iam_store =
-        crate::admin::runtime_sources::current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        log_oidc_policy_diagnostics(&iam_store, provider_id, &new_cred.parent_user, policies, groups).await;
-    }
-
-    let updated_at = iam_store
-        .set_temp_user(&new_cred.access_key, &new_cred, None)
-        .await
-        .map_err(|_| s3_error!(InternalError, "failed to store temp user"))?;
-
-    if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
-        r#type: "sts-credential".to_string(),
-        sts_credential: Some(SRSTSCredential {
-            access_key: new_cred.access_key.clone(),
-            secret_key: new_cred.secret_key.clone(),
-            session_token: new_cred.session_token.clone(),
-            parent_user: new_cred.parent_user.clone(),
-            parent_policy_mapping: policies.join(","),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        }),
-        updated_at: Some(updated_at),
-        api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        ..Default::default()
-    })
-    .await
-    {
-        warn!("site replication OIDC STS hook failed, err: {err}");
-    }
-
-    Ok(new_cred)
-}
-
-pub fn populate_session_policy(claims: &mut HashMap<String, Value>, policy: &str) -> S3Result<()> {
-    if !policy.is_empty() {
-        let session_policy = Policy::parse_config(policy.as_bytes())
-            .map_err(|e| {
-                let error_msg = format!("Failed to parse session policy: {}. Please check that the policy is valid JSON format with standard brackets [] for arrays.", e);
-                S3Error::with_message(S3ErrorCode::InvalidRequest, error_msg)
-            })?;
-        if session_policy.version.is_empty() {
-            return Err(s3_error!(InvalidRequest, "invalid policy"));
-        }
-
-        let policy_buf = serde_json::to_vec(&session_policy)
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal policy err {e}")))?;
-
-        if policy_buf.len() > 2048 {
-            return Err(s3_error!(InvalidRequest, "policy too large"));
-        }
-
-        claims.insert(
-            SESSION_POLICY_NAME.to_string(),
-            Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
-        );
-    }
-
-    Ok(())
 }
 
 /// Escape special XML characters in a string.
@@ -684,93 +423,34 @@ mod tests {
     }
 
     #[test]
-    fn test_has_identity_authorization_context() {
-        let empty: Vec<String> = vec![];
-        let groups = vec!["RustFS.ConsoleAdmin".to_string()];
-        let policies = vec!["consoleAdmin".to_string()];
+    fn web_identity_errors_preserve_existing_s3_semantics() {
+        let cases = [
+            (
+                FederationError::TokenVerification("invalid token".to_string()),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: invalid token",
+            ),
+            (
+                FederationError::NoAuthorizationContext,
+                S3ErrorCode::InvalidArgument,
+                "no policies are available for this OIDC token",
+            ),
+            (
+                FederationError::Binding(FederatedSessionBindingError::InvalidRequest("invalid policy".to_string())),
+                S3ErrorCode::InvalidRequest,
+                "invalid policy",
+            ),
+            (
+                FederationError::Binding(FederatedSessionBindingError::Internal("failed to store temp user".to_string())),
+                S3ErrorCode::InternalError,
+                "failed to store temp user",
+            ),
+        ];
 
-        assert!(!has_identity_authorization_context(&empty, &empty));
-        assert!(has_identity_authorization_context(&policies, &empty));
-        assert!(has_identity_authorization_context(&empty, &groups));
-    }
-
-    #[test]
-    fn test_extract_string_list_claim_supports_array_and_csv() {
-        let mut claims = HashMap::new();
-        claims.insert("roles".to_string(), serde_json::json!(["admin", "reader"]));
-        claims.insert("groups".to_string(), serde_json::json!("devs, ops"));
-
-        assert_eq!(extract_string_list_claim(&claims, "roles"), vec!["admin", "reader"]);
-        assert_eq!(extract_string_list_claim(&claims, "groups"), vec!["devs", "ops"]);
-    }
-
-    #[test]
-    fn test_extract_string_list_claim_prefers_exact_match() {
-        let mut claims = HashMap::new();
-        claims.insert("Roles".to_string(), serde_json::json!(["mixed-case"]));
-        claims.insert("roles".to_string(), serde_json::json!(["exact-match"]));
-
-        assert_eq!(extract_string_list_claim(&claims, "roles"), vec!["exact-match"]);
-    }
-
-    #[test]
-    fn test_extract_string_list_claim_ambiguous_case_insensitive_match_returns_empty() {
-        let mut claims = HashMap::new();
-        claims.insert("Roles".to_string(), serde_json::json!(["mixed-case"]));
-        claims.insert("ROLES".to_string(), serde_json::json!(["upper-case"]));
-
-        assert!(extract_string_list_claim(&claims, "roles").is_empty());
-    }
-
-    #[test]
-    fn test_build_oidc_token_claims_includes_normalized_roles() {
-        let mut raw = HashMap::new();
-        raw.insert("Roles".to_string(), serde_json::json!("admin, reader"));
-        let claims = OidcClaims {
-            sub: "user-sub".to_string(),
-            raw,
-            ..Default::default()
-        };
-        let token_claims = build_oidc_token_claims(&claims, "default", &["devs".to_string()], Some("roles"));
-
-        assert_eq!(token_claims.get("roles"), Some(&serde_json::json!(["admin", "reader"])));
-    }
-
-    #[test]
-    fn test_configured_roles_claim_key_requires_explicit_config() {
-        assert_eq!(configured_roles_claim_key("default"), None);
-    }
-
-    #[test]
-    fn test_resolve_oidc_session_identity_prefers_username_over_email() {
-        let claims = OidcClaims {
-            username: "john".to_string(),
-            email: "john@example.com".to_string(),
-            sub: "sub-1".to_string(),
-            ..Default::default()
-        };
-
-        assert_eq!(resolve_oidc_session_identity(&claims), "john");
-    }
-
-    #[test]
-    fn test_resolve_oidc_session_identity_falls_back_to_email_then_sub() {
-        let claims_with_email = OidcClaims {
-            email: "john@example.com".to_string(),
-            sub: "sub-1".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(resolve_oidc_session_identity(&claims_with_email), "john@example.com");
-
-        let claims_with_sub = OidcClaims {
-            sub: "sub-1".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(resolve_oidc_session_identity(&claims_with_sub), "sub-1");
-    }
-
-    #[test]
-    fn test_resolve_oidc_session_identity_uses_unknown_when_all_empty() {
-        assert_eq!(resolve_oidc_session_identity(&OidcClaims::default()), "oidc-user-unknown");
+        for (error, expected_code, expected_message) in cases {
+            let error = web_identity_federation_error(error);
+            assert_eq!(error.code(), &expected_code);
+            assert_eq!(error.message(), Some(expected_message));
+        }
     }
 }

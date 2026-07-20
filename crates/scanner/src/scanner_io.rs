@@ -31,7 +31,7 @@ use rustfs_utils::path::path_join_buf;
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
 use std::time::{Instant, SystemTime};
 use std::{fmt::Debug, sync::Arc};
@@ -71,6 +71,13 @@ const METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE: &str = "rustfs_scanner_disk_bucke
 const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucket_scans_queued";
 
 pub type DirtyUsageBuckets = HashMap<String, u64>;
+
+#[derive(Clone, Debug)]
+struct DirtyUsageSnapshot {
+    buckets: Arc<DirtyUsageBuckets>,
+    generation: u64,
+    covers_all_pending: bool,
+}
 
 pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
     matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_CORRUPT_ERROR))
@@ -115,6 +122,7 @@ pub struct ScannerBucketScanPlan {
     buckets: Vec<BucketInfo>,
     dirty_usage_buckets: Arc<DirtyUsageBuckets>,
     failed_dirty_buckets: Arc<Mutex<HashSet<String>>>,
+    pending_maintenance_work: Arc<AtomicBool>,
 }
 
 impl ScannerBucketScanPlan {
@@ -122,11 +130,13 @@ impl ScannerBucketScanPlan {
         buckets: Vec<BucketInfo>,
         dirty_usage_buckets: Arc<DirtyUsageBuckets>,
         failed_dirty_buckets: Arc<Mutex<HashSet<String>>>,
+        pending_maintenance_work: Arc<AtomicBool>,
     ) -> Self {
         Self {
             buckets,
             dirty_usage_buckets,
             failed_dirty_buckets,
+            pending_maintenance_work,
         }
     }
 }
@@ -134,6 +144,9 @@ impl ScannerBucketScanPlan {
 static DIRTY_USAGE_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 static DIRTY_USAGE_BUCKET_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
+static SCANNER_MAINTENANCE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SCANNER_MAINTENANCE_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
     DIRTY_USAGE_BUCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -148,14 +161,40 @@ pub fn record_dirty_usage_bucket(bucket: &str) {
         return;
     }
 
-    let generation = DIRTY_USAGE_BUCKET_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     let pending_buckets = {
         let mut dirty_buckets = dirty_usage_buckets();
+        let generation = DIRTY_USAGE_BUCKET_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
         dirty_buckets.insert(bucket.to_string(), generation);
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending_buckets));
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
+}
+
+pub fn record_scanner_maintenance_change(bucket: &str) {
+    if bucket.is_empty() {
+        return;
+    }
+
+    SCANNER_MAINTENANCE_GENERATION.fetch_add(1, Ordering::AcqRel);
+    SCANNER_MAINTENANCE_NOTIFY.notify_one();
+    record_dirty_usage_bucket(bucket);
+}
+
+pub fn scanner_maintenance_generation() -> u64 {
+    SCANNER_MAINTENANCE_GENERATION.load(Ordering::Acquire)
+}
+
+pub(crate) async fn scanner_maintenance_changed() {
+    SCANNER_MAINTENANCE_NOTIFY.notified().await;
+}
+
+pub fn scanner_activity_epoch() -> &'static str {
+    SCANNER_ACTIVITY_EPOCH.as_str()
+}
+
+pub(crate) fn dirty_usage_generation() -> u64 {
+    DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire)
 }
 
 pub fn clear_dirty_usage_bucket(bucket: &str) {
@@ -166,25 +205,39 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
     let pending_buckets = {
         let mut dirty_buckets = dirty_usage_buckets();
         dirty_buckets.remove(bucket);
+        DIRTY_USAGE_BUCKET_GENERATION.fetch_add(1, Ordering::AcqRel);
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_clear(usize_to_u64_saturated(pending_buckets));
 }
 
-fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo]) -> DirtyUsageBuckets {
-    let snapshot = {
+fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_generation_cutoff: u64) -> DirtyUsageSnapshot {
+    let (snapshot, generation, covers_all_pending) = {
         let dirty_buckets = dirty_usage_buckets();
-        buckets
+        let listed_buckets = dirty_buckets
+            .values()
+            .any(|generation| *generation > absent_generation_cutoff)
+            .then(|| buckets.iter().map(|bucket| bucket.name.as_str()).collect::<HashSet<_>>());
+        let snapshot = dirty_buckets
             .iter()
-            .filter_map(|bucket| {
-                dirty_buckets
-                    .get(&bucket.name)
-                    .map(|generation| (bucket.name.clone(), *generation))
+            .filter(|(bucket, generation)| {
+                **generation <= absent_generation_cutoff
+                    || listed_buckets
+                        .as_ref()
+                        .is_some_and(|listed_buckets| listed_buckets.contains(bucket.as_str()))
             })
-            .collect::<DirtyUsageBuckets>()
+            .map(|(bucket, generation)| (bucket.clone(), *generation))
+            .collect::<DirtyUsageBuckets>();
+        let generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
+        let covers_all_pending = generation == absent_generation_cutoff && snapshot.len() == dirty_buckets.len();
+        (snapshot, generation, covers_all_pending)
     };
     global_metrics().record_scanner_dirty_usage_cycle_snapshot(usize_to_u64_saturated(snapshot.len()));
-    snapshot
+    DirtyUsageSnapshot {
+        buckets: Arc::new(snapshot),
+        generation,
+        covers_all_pending,
+    }
 }
 
 pub(crate) fn dirty_usage_buckets_pending() -> bool {
@@ -204,6 +257,9 @@ fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
                 dirty_buckets.remove(bucket);
                 cleared_buckets += 1;
             }
+        }
+        if cleared_buckets > 0 {
+            DIRTY_USAGE_BUCKET_GENERATION.fetch_add(1, Ordering::AcqRel);
         }
         (cleared_buckets, dirty_buckets.len())
     };
@@ -237,13 +293,8 @@ async fn record_failed_dirty_bucket(failed_buckets: &Arc<Mutex<HashSet<String>>>
     failed_buckets.lock().await.insert(bucket.to_string());
 }
 
-fn dirty_usage_snapshot_covers_current(snapshot: &DirtyUsageBuckets) -> bool {
-    let dirty_buckets = dirty_usage_buckets();
-    dirty_buckets.iter().all(|(bucket, generation)| {
-        snapshot
-            .get(bucket)
-            .is_some_and(|snapshot_generation| snapshot_generation == generation)
-    })
+fn dirty_usage_snapshot_covers_current(snapshot: &DirtyUsageSnapshot) -> bool {
+    snapshot.covers_all_pending && DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire) == snapshot.generation
 }
 
 #[cfg(test)]
@@ -252,8 +303,13 @@ fn dirty_usage_bucket_count() -> usize {
 }
 
 #[cfg(test)]
-fn clear_dirty_usage_buckets_for_tests() {
+pub(crate) fn clear_dirty_usage_buckets_for_tests() {
     dirty_usage_buckets().clear();
+}
+
+#[cfg(test)]
+pub(crate) fn dirty_usage_buckets_for_tests() -> DirtyUsageBuckets {
+    dirty_usage_buckets().clone()
 }
 
 fn bucket_usage_scan_order(
@@ -479,6 +535,34 @@ fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error
     Ok(())
 }
 
+fn classify_nsscanner_cycle(
+    completed_all_sets: bool,
+    budget_elapsed: bool,
+    cancelled: bool,
+    has_failed_buckets: bool,
+    dirty_usage_current: bool,
+) -> ScannerCycleStatus {
+    if completed_all_sets && !budget_elapsed && !cancelled && !has_failed_buckets && dirty_usage_current {
+        ScannerCycleStatus::Complete
+    } else {
+        ScannerCycleStatus::Incomplete
+    }
+}
+
+fn scanner_results_have_pending_maintenance_work(results: &[DataUsageCache]) -> bool {
+    results.iter().any(|result| !result.info.pending_heals.is_empty())
+}
+
+fn pending_maintenance_work_for_cycle(pending: &AtomicBool, results: &[DataUsageCache]) -> bool {
+    pending.load(Ordering::Acquire) || scanner_results_have_pending_maintenance_work(results)
+}
+
+fn record_bucket_pending_maintenance_work(cache: &DataUsageCache, pending: &AtomicBool) {
+    if !cache.info.pending_heals.is_empty() {
+        pending.store(true, Ordering::Release);
+    }
+}
+
 fn is_xl_meta_path(path: &str) -> bool {
     Path::new(path)
         .file_name()
@@ -588,7 +672,9 @@ mod publish_gate_tests {
 async fn send_cache_root_entry_info(
     bucket_result_tx: &Arc<Mutex<mpsc::Sender<DataUsageEntryInfo>>>,
     cache: &DataUsageCache,
+    pending_maintenance_work: &AtomicBool,
 ) -> std::result::Result<(), mpsc::error::SendError<DataUsageEntryInfo>> {
+    record_bucket_pending_maintenance_work(cache, pending_maintenance_work);
     bucket_result_tx.lock().await.send(cache_root_entry_info(cache)).await
 }
 
@@ -657,6 +743,18 @@ pub trait ScannerIO: Send + Sync + Debug + 'static {
 }
 
 #[async_trait::async_trait]
+pub(crate) trait ScannerIOCycle: Send + Sync + Debug + 'static {
+    async fn nsscanner_with_status(
+        &self,
+        ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
+        updates: mpsc::Sender<DataUsageInfo>,
+        want_cycle: u64,
+        scan_mode: HealScanMode,
+    ) -> Result<ScannerCycleResult>;
+}
+
+#[async_trait::async_trait]
 pub trait ScannerIOCache: Send + Sync + Debug + 'static {
     async fn nsscanner_cache(
         self: Arc<Self>,
@@ -689,9 +787,61 @@ pub enum ScannerDiskScanOutcome {
     Partial(DataUsageCache),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerCycleStatus {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScannerCycleResult {
+    pub(crate) status: ScannerCycleStatus,
+    dirty_usage_clear: Option<DirtyUsageBuckets>,
+    failed_dirty_usage: bool,
+    pending_maintenance_work: bool,
+}
+
+impl ScannerCycleResult {
+    pub(crate) fn new(status: ScannerCycleStatus, dirty_usage_clear: Option<DirtyUsageBuckets>) -> Self {
+        Self {
+            status,
+            dirty_usage_clear,
+            failed_dirty_usage: false,
+            pending_maintenance_work: false,
+        }
+    }
+
+    fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {
+        self.failed_dirty_usage = failed_dirty_usage;
+        self
+    }
+
+    fn with_pending_maintenance_work(mut self, pending_maintenance_work: bool) -> Self {
+        self.pending_maintenance_work = pending_maintenance_work;
+        self
+    }
+
+    pub(crate) fn acknowledge_durable_usage(self) {
+        if let Some(snapshot) = self.dirty_usage_clear {
+            clear_dirty_usage_buckets(&snapshot);
+        }
+    }
+
+    pub(crate) fn has_dirty_usage_to_acknowledge(&self) -> bool {
+        self.dirty_usage_clear.as_ref().is_some_and(|snapshot| !snapshot.is_empty())
+    }
+
+    pub(crate) fn has_failed_dirty_usage(&self) -> bool {
+        self.failed_dirty_usage
+    }
+
+    pub(crate) fn has_pending_maintenance_work(&self) -> bool {
+        self.pending_maintenance_work
+    }
+}
+
 #[async_trait::async_trait]
 impl ScannerIO for ECStore {
-    #[tracing::instrument(skip(self, budget, updates))]
     async fn nsscanner(
         &self,
         ctx: CancellationToken,
@@ -700,13 +850,40 @@ impl ScannerIO for ECStore {
         want_cycle: u64,
         scan_mode: HealScanMode,
     ) -> Result<()> {
+        // Preserve the public API's pre-existing completion semantics for
+        // embedders. The main scanner uses nsscanner_with_status so it can
+        // delay this acknowledgement until usage persistence succeeds.
+        ScannerIOCycle::nsscanner_with_status(self, ctx, budget, updates, want_cycle, scan_mode)
+            .await?
+            .acknowledge_durable_usage();
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ScannerIOCycle for ECStore {
+    #[tracing::instrument(skip(self, budget, updates))]
+    async fn nsscanner_with_status(
+        &self,
+        ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
+        updates: mpsc::Sender<DataUsageInfo>,
+        want_cycle: u64,
+        scan_mode: HealScanMode,
+    ) -> Result<ScannerCycleResult> {
         let child_token = ctx.child_token();
 
+        let dirty_generation_before_bucket_list = dirty_usage_generation();
         let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
+        let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
 
         if all_buckets.is_empty() {
             reset_set_scan_gauges();
-            if let Err(e) = updates.send(DataUsageInfo::default()).await {
+            let empty_usage = DataUsageInfo {
+                last_update: Some(SystemTime::now()),
+                ..Default::default()
+            };
+            if let Err(e) = updates.send(empty_usage).await {
                 error!(
                     target: "rustfs::scanner::io",
                     event = EVENT_SCANNER_SET_STATE,
@@ -717,7 +894,14 @@ impl ScannerIO for ECStore {
                     "Scanner set state update failed"
                 );
             }
-            return Ok(());
+            let status = if dirty_usage_snapshot_covers_current(&dirty_usage_snapshot) {
+                ScannerCycleStatus::Complete
+            } else {
+                ScannerCycleStatus::Incomplete
+            };
+            let dirty_usage_clear =
+                (status == ScannerCycleStatus::Complete).then(|| dirty_usage_snapshot.buckets.as_ref().clone());
+            return Ok(ScannerCycleResult::new(status, dirty_usage_clear));
         }
 
         let mut total_results = 0;
@@ -735,12 +919,12 @@ impl ScannerIO for ECStore {
                 "Scanner set state update detected missing disk sets"
             );
             reset_set_scan_gauges();
-            return Ok(());
+            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None));
         }
 
         let set_scan_limit = scanner_max_concurrent_set_scans(total_results);
-        let dirty_usage_buckets = Arc::new(snapshot_dirty_usage_buckets(&all_buckets));
         let failed_dirty_buckets = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let pending_maintenance_work = Arc::new(AtomicBool::new(false));
         record_set_scan_concurrency_limit(set_scan_limit);
         debug!(
             target: "rustfs::scanner::io",
@@ -794,8 +978,12 @@ impl ScannerIO for ECStore {
                 });
                 wait_futs.push(receiver_fut);
 
-                let scan_plan =
-                    ScannerBucketScanPlan::new(all_buckets.clone(), dirty_usage_buckets.clone(), failed_dirty_buckets.clone());
+                let scan_plan = ScannerBucketScanPlan::new(
+                    all_buckets.clone(),
+                    dirty_usage_snapshot.buckets.clone(),
+                    failed_dirty_buckets.clone(),
+                    pending_maintenance_work.clone(),
+                );
                 // Spawn task to run the scanner
                 let scanner_fut = tokio::spawn(async move {
                     let permit_wait = child_token_clone.clone();
@@ -870,7 +1058,7 @@ impl ScannerIO for ECStore {
         let results_mutex_for_updates = results_mutex.clone();
         let budget_for_updates = budget.clone();
         let child_token_for_updates = child_token.clone();
-        let dirty_usage_buckets_for_updates = dirty_usage_buckets.clone();
+        let dirty_usage_snapshot_for_updates = dirty_usage_snapshot.clone();
         tokio::spawn(async move {
             let mut last_update = SystemTime::UNIX_EPOCH;
             let mut has_sent_once = false;
@@ -893,7 +1081,7 @@ impl ScannerIO for ECStore {
                                 &all_buckets_clone,
                                 budget_for_updates.budget_elapsed(),
                                 child_token_for_updates.is_cancelled(),
-                                dirty_usage_snapshot_covers_current(dirty_usage_buckets_for_updates.as_ref()),
+                                dirty_usage_snapshot_covers_current(dirty_usage_snapshot_for_updates.as_ref()),
                             )
                         };
 
@@ -912,7 +1100,7 @@ impl ScannerIO for ECStore {
                                 &all_buckets_clone,
                                 budget_for_updates.budget_elapsed(),
                                 child_token_for_updates.is_cancelled(),
-                                dirty_usage_snapshot_covers_current(dirty_usage_buckets_for_updates.as_ref()),
+                                dirty_usage_snapshot_covers_current(dirty_usage_snapshot_for_updates.as_ref()),
                             )
                         };
 
@@ -954,16 +1142,27 @@ impl ScannerIO for ECStore {
         let completed_all_sets = results.iter().all(|result| result.info.last_update.is_some());
         let result = finalize_nsscanner_result(&results, first_err);
         let failed_buckets = failed_dirty_buckets.lock().await.clone();
-        if let Some(clear_snapshot) = should_clear_dirty_usage_snapshot(
+        let pending_maintenance_work = pending_maintenance_work_for_cycle(&pending_maintenance_work, &results);
+        let budget_elapsed = budget.budget_elapsed();
+        let dirty_usage_current = dirty_usage_snapshot_covers_current(&dirty_usage_snapshot);
+        let cycle_status = classify_nsscanner_cycle(
+            completed_all_sets,
+            budget_elapsed,
+            ctx.is_cancelled(),
+            !failed_buckets.is_empty(),
+            dirty_usage_current,
+        );
+        let dirty_usage_clear = should_clear_dirty_usage_snapshot(
             result.is_ok(),
             completed_all_sets,
-            budget.budget_elapsed(),
-            &dirty_usage_buckets,
+            budget_elapsed,
+            &dirty_usage_snapshot.buckets,
             &failed_buckets,
-        ) {
-            clear_dirty_usage_buckets(&clear_snapshot);
-        }
-        result
+        );
+        result?;
+        Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
+            .with_failed_dirty_usage(!failed_buckets.is_empty())
+            .with_pending_maintenance_work(pending_maintenance_work))
     }
 }
 
@@ -983,6 +1182,7 @@ impl ScannerIOCache for SetDisks {
             buckets,
             dirty_usage_buckets,
             failed_dirty_buckets,
+            pending_maintenance_work,
         } = scan_plan;
         let pool_label = self.pool_index.to_string();
         let set_label = self.set_index.to_string();
@@ -1127,6 +1327,7 @@ impl ScannerIOCache for SetDisks {
             let pool_label_clone = pool_label.clone();
             let set_label_clone = set_label.clone();
             let failed_dirty_buckets_clone = failed_dirty_buckets.clone();
+            let pending_maintenance_work_clone = pending_maintenance_work.clone();
             futs.push(tokio::spawn(async move {
                 loop {
                     let Some(bucket) = bucket_rx_mutex_clone.lock().await.recv().await else {
@@ -1322,7 +1523,6 @@ impl ScannerIOCache for SetDisks {
                             continue;
                         }
                     };
-
                     debug!(
                         target: "rustfs::scanner::io",
                         event = EVENT_SCANNER_DISK_BUCKET_STATE,
@@ -1349,7 +1549,9 @@ impl ScannerIOCache for SetDisks {
                         "Scanner root entry publish started"
                     );
 
-                    if let Err(e) = send_cache_root_entry_info(&bucket_result_tx_clone_clone, &cache).await {
+                    if let Err(e) =
+                        send_cache_root_entry_info(&bucket_result_tx_clone_clone, &cache, &pending_maintenance_work_clone).await
+                    {
                         record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                         error!(
                             target: "rustfs::scanner::io",
@@ -1761,10 +1963,10 @@ mod tests {
         clear_dirty_usage_buckets_for_tests();
         record_dirty_usage_bucket("photos");
         let buckets = vec![bucket_info("photos")];
-        let snapshot = snapshot_dirty_usage_buckets(&buckets);
+        let snapshot = snapshot_dirty_usage_buckets(&buckets, dirty_usage_generation());
 
         record_dirty_usage_bucket("photos");
-        clear_dirty_usage_buckets(&snapshot);
+        clear_dirty_usage_buckets(&snapshot.buckets);
 
         assert_eq!(dirty_usage_bucket_count(), 1);
         clear_dirty_usage_buckets_for_tests();
@@ -1776,7 +1978,7 @@ mod tests {
         clear_dirty_usage_buckets_for_tests();
         record_dirty_usage_bucket("photos");
         let buckets = vec![bucket_info("photos")];
-        let snapshot = snapshot_dirty_usage_buckets(&buckets);
+        let snapshot = snapshot_dirty_usage_buckets(&buckets, dirty_usage_generation());
 
         assert!(dirty_usage_snapshot_covers_current(&snapshot));
 
@@ -1788,14 +1990,91 @@ mod tests {
 
     #[test]
     #[serial]
+    fn dirty_usage_snapshot_clears_a_stably_absent_bucket_after_durable_save() {
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_bucket("photos");
+        record_dirty_usage_bucket("temporarily-omitted");
+        let generation_before_bucket_list = dirty_usage_generation();
+
+        let snapshot = snapshot_dirty_usage_buckets(&[bucket_info("photos")], generation_before_bucket_list);
+
+        assert!(snapshot.buckets.contains_key("photos"));
+        assert!(snapshot.buckets.contains_key("temporarily-omitted"));
+        assert!(dirty_usage_buckets().contains_key("temporarily-omitted"));
+        assert!(dirty_usage_snapshot_covers_current(&snapshot));
+
+        ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()))
+            .acknowledge_durable_usage();
+        assert!(!dirty_usage_buckets().contains_key("temporarily-omitted"));
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn dirty_usage_snapshot_preserves_an_absent_bucket_recorded_after_listing_started() {
+        clear_dirty_usage_buckets_for_tests();
+        let generation_before_bucket_list = dirty_usage_generation();
+        record_dirty_usage_bucket("new-or-racing-bucket");
+
+        let snapshot = snapshot_dirty_usage_buckets(&[], generation_before_bucket_list);
+
+        assert!(!snapshot.buckets.contains_key("new-or-racing-bucket"));
+        assert!(!dirty_usage_snapshot_covers_current(&snapshot));
+        assert!(dirty_usage_buckets().contains_key("new-or-racing-bucket"));
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_a_clean_bucket_invalidates_an_inflight_usage_snapshot() {
+        clear_dirty_usage_buckets_for_tests();
+        let snapshot = snapshot_dirty_usage_buckets(&[bucket_info("photos")], dirty_usage_generation());
+        assert!(dirty_usage_snapshot_covers_current(&snapshot));
+
+        record_dirty_usage_bucket("photos");
+
+        assert!(!dirty_usage_snapshot_covers_current(&snapshot));
+        assert!(dirty_usage_buckets().contains_key("photos"));
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn deleting_a_bucket_during_listing_invalidates_the_resulting_usage_snapshot() {
+        clear_dirty_usage_buckets_for_tests();
+        let generation_before_bucket_list = dirty_usage_generation();
+
+        record_dirty_usage_bucket("photos");
+        let snapshot = snapshot_dirty_usage_buckets(&[bucket_info("photos")], generation_before_bucket_list);
+
+        assert!(!dirty_usage_snapshot_covers_current(&snapshot));
+        assert!(dirty_usage_buckets().contains_key("photos"));
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_maintenance_change_advances_generation_and_marks_usage_dirty() {
+        clear_dirty_usage_buckets_for_tests();
+        let generation = scanner_maintenance_generation();
+
+        record_scanner_maintenance_change("photos");
+
+        assert!(scanner_maintenance_generation() > generation);
+        assert!(dirty_usage_buckets().contains_key("photos"));
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
     fn dirty_usage_clear_excludes_failed_buckets() {
         clear_dirty_usage_buckets_for_tests();
         record_dirty_usage_bucket("photos");
         record_dirty_usage_bucket("videos");
         let buckets = vec![bucket_info("photos"), bucket_info("videos")];
-        let snapshot = snapshot_dirty_usage_buckets(&buckets);
+        let snapshot = snapshot_dirty_usage_buckets(&buckets, dirty_usage_generation());
         let failed_buckets = HashSet::from(["videos".to_string()]);
-        let clear_snapshot = dirty_usage_buckets_excluding_failed(&snapshot, &failed_buckets);
+        let clear_snapshot = dirty_usage_buckets_excluding_failed(&snapshot.buckets, &failed_buckets);
 
         clear_dirty_usage_buckets(&clear_snapshot);
 
@@ -1820,6 +2099,23 @@ mod tests {
 
     #[test]
     #[serial]
+    fn dirty_usage_is_acknowledged_only_after_durable_usage_confirmation() {
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_bucket("photos");
+        let snapshot = snapshot_dirty_usage_buckets(&[bucket_info("photos")], dirty_usage_generation());
+
+        let unconfirmed = ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()));
+        drop(unconfirmed);
+        assert!(dirty_usage_buckets().contains_key("photos"));
+
+        let confirmed = ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()));
+        confirmed.acknowledge_durable_usage();
+        assert!(!dirty_usage_buckets().contains_key("photos"));
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
     fn clear_dirty_usage_bucket_removes_deleted_bucket_marker() {
         clear_dirty_usage_buckets_for_tests();
         record_dirty_usage_bucket("photos");
@@ -1828,9 +2124,9 @@ mod tests {
         clear_dirty_usage_bucket("photos");
 
         let buckets = vec![bucket_info("photos"), bucket_info("videos")];
-        let snapshot = snapshot_dirty_usage_buckets(&buckets);
-        assert!(!snapshot.contains_key("photos"));
-        assert!(snapshot.contains_key("videos"));
+        let snapshot = snapshot_dirty_usage_buckets(&buckets, dirty_usage_generation());
+        assert!(!snapshot.buckets.contains_key("photos"));
+        assert!(snapshot.buckets.contains_key("videos"));
         assert_eq!(dirty_usage_bucket_count(), 1);
         clear_dirty_usage_buckets_for_tests();
     }
@@ -1894,6 +2190,78 @@ mod tests {
         let err = finalize_nsscanner_result(&results, Some(Error::other("set failed")))
             .expect_err("all failed sets should bubble first error");
         assert!(err.to_string().contains("set failed"));
+    }
+
+    #[test]
+    fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
+        assert_eq!(classify_nsscanner_cycle(true, false, false, false, true), ScannerCycleStatus::Complete);
+
+        for status in [
+            classify_nsscanner_cycle(false, false, false, false, true),
+            classify_nsscanner_cycle(true, true, false, false, true),
+            classify_nsscanner_cycle(true, false, true, false, true),
+            classify_nsscanner_cycle(true, false, false, true, true),
+            classify_nsscanner_cycle(true, false, false, false, false),
+        ] {
+            assert_eq!(status, ScannerCycleStatus::Incomplete);
+        }
+    }
+
+    #[test]
+    fn scanner_cycle_surfaces_persisted_pending_heal_work() {
+        let clean = DataUsageCache::default();
+        assert!(!scanner_results_have_pending_maintenance_work(std::slice::from_ref(&clean)));
+
+        let mut pending = clean;
+        pending.info.pending_heals.push(crate::PendingScannerHeal {
+            kind: crate::PendingScannerHealKind::Object,
+            bucket: "photos".to_string(),
+            object: Some("image.jpg".to_string()),
+            version_id: None,
+            scan_mode: HealScanMode::Normal,
+            first_seen: 1,
+            last_attempt: 1,
+            attempts: 1,
+            last_admission_result: "queue_full".to_string(),
+            last_admission_reason: "capacity".to_string(),
+        });
+
+        assert!(scanner_results_have_pending_maintenance_work(&[pending]));
+    }
+
+    #[tokio::test]
+    async fn bucket_cache_pending_heal_reaches_cycle_maintenance_state() {
+        let pending_maintenance_work = Arc::new(AtomicBool::new(false));
+        let mut bucket_cache = DataUsageCache::default();
+        bucket_cache.info.pending_heals.push(crate::PendingScannerHeal {
+            kind: crate::PendingScannerHealKind::Object,
+            bucket: "photos".to_string(),
+            object: Some("image.jpg".to_string()),
+            version_id: None,
+            scan_mode: HealScanMode::Normal,
+            first_seen: 1,
+            last_attempt: 1,
+            attempts: 1,
+            last_admission_result: "queue_full".to_string(),
+            last_admission_reason: "capacity".to_string(),
+        });
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sender = Arc::new(Mutex::new(sender));
+
+        send_cache_root_entry_info(&sender, &bucket_cache, &pending_maintenance_work)
+            .await
+            .expect("bucket result should send");
+
+        let cycle_pending = pending_maintenance_work_for_cycle(&pending_maintenance_work, &[]);
+        assert!(cycle_pending);
+        assert_eq!(
+            crate::scanner::scanner_cycle_outcome_with_pending_maintenance(
+                crate::scanner::ScannerCycleOutcome::Completed,
+                cycle_pending,
+            ),
+            crate::scanner::ScannerCycleOutcome::CompletedWithPendingMaintenance
+        );
+        assert!(receiver.recv().await.is_some());
     }
 
     #[test]
@@ -2119,10 +2487,16 @@ mod tests {
             meta.add_version(fi).expect("object version should be added");
         }
 
-        let mut delete_marker = FileInfo::new(object, 1, 1);
-        delete_marker.version_id = Some(Uuid::new_v4());
-        delete_marker.mod_time = Some(OffsetDateTime::from_unix_timestamp(30).expect("timestamp should be valid"));
-        delete_marker.deleted = true;
+        // A real delete marker carries no erasure geometry (delete paths build it as
+        // `FileInfo { deleted: true, .. }`). Construct it that way so it classifies as a
+        // storage delete marker rather than a purge-pending payload object.
+        let delete_marker = FileInfo {
+            name: object.to_string(),
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(30).expect("timestamp should be valid")),
+            deleted: true,
+            ..Default::default()
+        };
         meta.add_version(delete_marker).expect("delete marker should be added");
 
         tokio::fs::write(&metadata_path, meta.marshal_msg().expect("metadata should marshal"))

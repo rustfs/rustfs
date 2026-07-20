@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_iam::{get_oidc, init_oidc_sys};
-use std::io::{Error, Result};
+use rustfs_iam::{
+    federation::{FederatedIdentityRegistry, FederatedIdentityService, oidc::StandardOidcAdapter},
+    get_oidc, init_oidc_sys,
+};
+use std::{
+    io::{Error, Result},
+    sync::Arc,
+};
 use tracing::{error, info, warn};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -47,7 +53,10 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
     match init_oidc_sys().await {
         Ok(()) => {
             if let Some(oidc) = get_oidc() {
-                crate::runtime_sources::publish_oidc_handle(oidc);
+                let adapter = Arc::new(StandardOidcAdapter::new(oidc));
+                let registry = FederatedIdentityRegistry::new(adapter);
+                let service = Arc::new(FederatedIdentityService::new(registry));
+                crate::runtime_sources::publish_federated_identity_service(service);
             }
         }
         Err(e) => {

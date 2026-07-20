@@ -19,16 +19,11 @@ use super::storage_api::admin_usecase::capacity::{
     PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
-use super::storage_api::admin_usecase::contract::bucket::{BucketOperations, BucketOptions};
-use super::storage_api::admin_usecase::data_usage::{
-    apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
-    replace_bucket_usage_memory_from_info,
-};
+use super::storage_api::admin_usecase::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend_cached};
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_endpoints_handle, current_object_store_handle_for_context,
 };
-use crate::capacity::resolve_admin_used_capacity;
 use crate::cluster_snapshot::{
     ClusterReadOnlySnapshot, ClusterRuntimeStatusSnapshot, cluster_read_only_snapshot_from_endpoint_pools,
     collect_cluster_read_only_snapshot,
@@ -213,6 +208,10 @@ impl DefaultAdminUsecase {
         Self::app_error(code, message)
     }
 
+    fn map_data_usage_load_result<E>(result: Result<DataUsageInfo, E>) -> AdminUsecaseResult<DataUsageInfo> {
+        result.map_err(|_| Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed"))
+    }
+
     async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
         store.refresh_rebalance_status_meta().await.map_err(|err| {
             error!("refresh rebalance metadata for pool status failed: {:?}", err);
@@ -245,13 +244,15 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        let mut info = load_data_usage_from_backend(store.clone()).await.map_err(|e| {
-            error!("load_data_usage_from_backend failed {:?}", e);
-            Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed")
-        })?;
-        replace_bucket_usage_memory_from_info(&info).await;
+        Self::query_data_usage_info_with_store(store).await
+    }
+
+    /// Serve the last persisted scanner snapshot plus the in-memory overlay.
+    /// This request path must never trigger a live full-version listing
+    /// (rustfs/backlog#1306); freshness is owned by the scanner.
+    pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
+        let mut info = Self::map_data_usage_load_result(load_data_usage_from_backend_cached(store.clone()).await)?;
         apply_bucket_usage_memory_overlay(&mut info).await;
-        Self::refresh_live_bucket_usage_for_data_usage_info(store.clone(), &mut info).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
@@ -309,8 +310,7 @@ impl DefaultAdminUsecase {
             info.total_free_capacity = free_u64;
         }
 
-        info.total_used_capacity =
-            resolve_admin_used_capacity(&storage_info.disks, info.total_capacity.saturating_sub(info.total_free_capacity)).await;
+        info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
         debug!(
             "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
             info.total_capacity as f64 / (1024.0_f64.powi(4)),
@@ -319,32 +319,6 @@ impl DefaultAdminUsecase {
         );
 
         Ok(info)
-    }
-
-    async fn refresh_live_bucket_usage_for_data_usage_info(store: Arc<ECStore>, data_usage_info: &mut DataUsageInfo) {
-        let buckets = match store
-            .list_bucket(&BucketOptions {
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(buckets) => buckets,
-            Err(err) => {
-                debug!(error = %err, "failed to list buckets while refreshing data usage info");
-                return;
-            }
-        };
-
-        for bucket in buckets {
-            if let Err(err) = refresh_bucket_usage_from_object_layer(store.clone(), data_usage_info, &bucket.name).await {
-                debug!(
-                    bucket = %bucket.name,
-                    error = %err,
-                    "failed to refresh data usage info bucket usage from object layer"
-                );
-            }
-        }
     }
 
     pub async fn execute_list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>> {
@@ -642,6 +616,30 @@ mod tests {
     use super::super::storage_api::admin_usecase::capacity::{PoolDecommissionInfo, PoolStatus};
     use super::*;
     use time::OffsetDateTime;
+    use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
+
+    struct RejectEvents;
+
+    impl<S> Layer<S> for RejectEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            panic!("data usage error mapping must not emit a duplicate event");
+        }
+    }
+
+    #[test]
+    fn data_usage_load_error_is_generic_and_not_logged_again() {
+        let subscriber = Registry::default().with(RejectEvents);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let err = DefaultAdminUsecase::map_data_usage_load_result::<&str>(Err("sensitive disk path"))
+                .expect_err("load failure must reach the response");
+            assert_eq!(err.code, S3ErrorCode::InternalError);
+            assert_eq!(err.message, "load_data_usage_from_backend failed");
+        });
+    }
 
     #[tokio::test]
     async fn execute_query_storage_info_returns_internal_error_when_store_uninitialized() {

@@ -41,10 +41,11 @@ use storage_api::lifecycle::{
     BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskOption, ECStore,
     EcstoreError, Endpoint, EndpointServerPools, Endpoints, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
     MakeBucketOptions, MockWarmBackend, MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints,
-    STORAGE_FORMAT_FILE, TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
-    expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
-    init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk,
-    path2_bucket_object_with_base_path, register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
+    STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
+    enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
+    get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
+    is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_tier_delete_journal_entries,
+    register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
 };
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
@@ -603,6 +604,7 @@ mod serial_tests {
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&tier_name).await;
+        backend.set_put_remote_version(Some(String::new())).await;
 
         let bucket_name = format!("test-expire-get-race-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let object_name = "test/race-object.bin";
@@ -639,6 +641,10 @@ mod serial_tests {
             .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
             .await
             .expect("Failed to load transitioned object info");
+        assert!(
+            oi.transitioned_object.version_id.is_empty(),
+            "the regression must exercise an unversioned remote tier"
+        );
 
         // Concurrent GET loop: hammer GET while the expiry runs. Every outcome
         // must be a full correct body or a clean not-found -- never a tier-fetch
@@ -734,7 +740,328 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+    async fn rejected_transition_candidate_is_recovered_from_persisted_delete_journal() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+        backend.set_put_read_limit(Some(4096)).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        backend.set_remove_failure(true);
+
+        let bucket_name = format!("test-transition-cleanup-journal-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/rejected-candidate.bin";
+        let payload = b"rejected remote candidate must not replace the local source".repeat(1024);
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+        let original = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("source object metadata should resolve before transition");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().expect("uploaded source object should have an ETag"),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        ecstore
+            .transition_object(bucket_name.as_str(), object_name, &opts)
+            .await
+            .expect_err("a remotely accepted partial upload must not commit transition metadata");
+
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should create exactly one remote candidate");
+        assert!(put_versions[0].1.is_empty());
+        assert_eq!(
+            backend.object_count().await,
+            1,
+            "failed cleanup must retain the remote candidate for recovery"
+        );
+        assert!(
+            backend.remove_versions().await.is_empty(),
+            "no cleanup path may delete the candidate while remove failures are enabled"
+        );
+
+        let retained = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("tier delete journal recovery should scan the persisted candidate");
+        assert_eq!(retained.scanned, 1);
+        assert_eq!(retained.deleted, 0);
+        assert_eq!(retained.failed, 1);
+        assert_eq!(backend.object_count().await, 1, "failed recovery must retain the remote candidate");
+
+        backend.set_remove_failure(false);
+        let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("tier delete journal recovery should delete the retained candidate");
+        assert_eq!(recovered.scanned, 1);
+        assert_eq!(recovered.deleted, 1);
+        assert_eq!(recovered.failed, 0);
+        let removed_versions = backend.remove_versions().await;
+        assert!(!removed_versions.is_empty(), "recovery must issue at least one successful delete");
+        assert!(
+            removed_versions.iter().all(|removed| removed == &put_versions[0]),
+            "every idempotent cleanup must delete the exact PUT object and version"
+        );
+        assert_eq!(backend.object_count().await, 0, "recovery should remove the rejected remote candidate");
+
+        let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("a removed tier delete journal entry should no longer be listed");
+        assert_eq!(empty.scanned, 0, "successful recovery must remove the persisted journal entry");
+        assert_eq!(
+            read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
+            payload,
+            "rejected transition cleanup must leave the source object readable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+    async fn cancelled_before_cleanup_store_resolution_persists_journal() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+        backend.set_put_remote_version(Some(Uuid::new_v4().to_string())).await;
+        backend.set_reject_non_empty_remote_versions(true);
+        backend.set_remove_failure(true);
+        let cleanup_store_barrier = TransitionCleanupStoreBarrier::install();
+
+        let bucket_name = format!("test-transition-cancel-cleanup-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/rejected-candidate.bin";
+        let payload = b"cancelled rejected cleanup must retain durable recovery evidence".repeat(1024);
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+        let original = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("source object metadata should resolve before transition");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().expect("uploaded source object should have an ETag"),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let transition_store = ecstore.clone();
+        let transition_bucket = bucket_name.clone();
+        let transition = tokio::spawn(async move {
+            transition_store
+                .transition_object(transition_bucket.as_str(), object_name, &opts)
+                .await
+        });
+        cleanup_store_barrier.wait_until_paused().await;
+        transition.abort();
+        assert!(
+            transition
+                .await
+                .expect_err("aborted transition task should be cancelled")
+                .is_cancelled()
+        );
+
+        let retained = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                    .await
+                    .expect("the cancelled transition journal should be readable");
+                if recovery.scanned > 0 {
+                    break recovery;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Drop should persist the rejected candidate through the saved instance context");
+        assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 0, 1));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backend.exact_remove_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Drop cleanup and failed journal recovery must both preserve the exact version constraint");
+        let failed_exact_attempts = backend.exact_remove_count();
+        assert_eq!(backend.object_count().await, 1);
+        assert!(backend.remove_versions().await.is_empty());
+
+        backend.set_remove_failure(false);
+        let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("recovery should delete the candidate retained by the cancelled transition");
+        assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+        assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+        assert_eq!(backend.exact_remove_count(), failed_exact_attempts + 1);
+        assert_eq!(backend.object_count().await, 0);
+        let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("successful recovery should remove the cancellation journal");
+        assert_eq!(empty.scanned, 0);
+        assert_eq!(
+            read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
+            payload,
+            "cancelled transition cleanup must preserve the local source"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+    async fn rejected_transition_cleanup_durability_matrix() {
+        #[derive(Clone, Copy)]
+        enum CleanupCase {
+            Persisted,
+            DeleteFallback,
+            RetryPersisted,
+            FullyFailed,
+        }
+
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        for case in [
+            CleanupCase::Persisted,
+            CleanupCase::DeleteFallback,
+            CleanupCase::RetryPersisted,
+            CleanupCase::FullyFailed,
+        ] {
+            let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&tier_name).await;
+            let remote_version = Uuid::new_v4().to_string();
+            backend.set_put_remote_version(Some(remote_version.clone())).await;
+            backend.set_reject_non_empty_remote_versions(true);
+            backend.set_remove_failure(matches!(case, CleanupCase::FullyFailed));
+            let put_barrier = backend.arm_put_barrier().await;
+            let remove_barrier = if matches!(case, CleanupCase::RetryPersisted) {
+                Some(backend.arm_failing_remove_barrier().await)
+            } else {
+                None
+            };
+
+            let bucket_name = format!("test-transition-journal-failure-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let object_name = "test/rejected-candidate.bin";
+            let payload = b"journal failure must either delete the exact candidate or report both failures".repeat(1024);
+            create_test_bucket(&ecstore, bucket_name.as_str()).await;
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+            let original = ecstore
+                .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+                .await
+                .expect("source object metadata should resolve before transition");
+            let opts = ObjectOptions {
+                no_lock: true,
+                transition: TransitionOptions {
+                    status: TRANSITION_PENDING.to_string(),
+                    tier: tier_name,
+                    etag: original.etag.clone().expect("uploaded source object should have an ETag"),
+                    ..Default::default()
+                },
+                version_id: original.version_id.map(|version| version.to_string()),
+                mod_time: original.mod_time,
+                ..Default::default()
+            };
+
+            let transition_store = ecstore.clone();
+            let transition_bucket = bucket_name.clone();
+            let transition = tokio::spawn(async move {
+                transition_store
+                    .transition_object(transition_bucket.as_str(), object_name, &opts)
+                    .await
+            });
+            put_barrier.wait_until_paused().await;
+            let set = ecstore.pools[0].get_disks(0);
+            let mut saved_disks = if matches!(case, CleanupCase::Persisted) {
+                None
+            } else {
+                let mut disks = set.disks.write().await;
+                let saved = std::mem::take(&mut *disks);
+                *disks = vec![None; saved.len()];
+                Some(saved)
+            };
+            put_barrier.release();
+            if let Some(remove_barrier) = remove_barrier.as_ref() {
+                remove_barrier.wait_until_paused().await;
+                *set.disks.write().await = saved_disks.take().expect("offline disks should be restorable");
+                backend.set_remove_failure(true);
+                remove_barrier.release();
+            }
+            let transition_result = tokio::time::timeout(Duration::from_secs(30), transition).await;
+            if let Some(saved_disks) = saved_disks {
+                *set.disks.write().await = saved_disks;
+            }
+            let err = transition_result
+                .expect("transition should finish while validating cleanup durability")
+                .expect("transition task should not panic")
+                .expect_err("a versioned candidate must not commit to an unversioned tier");
+
+            match case {
+                CleanupCase::Persisted | CleanupCase::DeleteFallback => {
+                    assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+                    assert_eq!(backend.object_count().await, 0, "cleanup must remove the exact candidate");
+                    let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("successful cleanup must not retain a journal entry");
+                    assert_eq!(recovery.scanned, 0);
+                }
+                CleanupCase::RetryPersisted => {
+                    assert!(
+                        !err.to_string().contains("journal retry error"),
+                        "a successful journal retry must preserve the original version-constraint error"
+                    );
+                    assert_eq!(backend.object_count().await, 1);
+                    let retained = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("the retried journal should be recoverable");
+                    assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 0, 1));
+                    backend.set_remove_failure(false);
+                    let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("recovery should delete the exact retried candidate");
+                    assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+                    assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+                    assert_eq!(backend.object_count().await, 0);
+                    let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("successful recovery must remove the retried journal");
+                    assert_eq!(empty.scanned, 0);
+                }
+                CleanupCase::FullyFailed => {
+                    let message = err.to_string();
+                    assert!(message.contains("initial journal error"), "{message}");
+                    assert!(message.contains("cleanup error"), "{message}");
+                    assert!(message.contains("journal retry error"), "{message}");
+                    assert_eq!(backend.object_count().await, 1, "both failed safeguards must leave the candidate visible");
+                    assert!(backend.remove_versions().await.is_empty());
+                    let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("failed journal writes must not create partial recovery entries");
+                    assert_eq!(recovery.scanned, 0);
+                }
+            }
+            assert_eq!(
+                read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
+                payload,
+                "rejected transition cleanup must preserve the local source"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_transition_and_restore_flows() {
         let (disk_paths, ecstore) = setup_test_env().await;
 
@@ -1780,7 +2107,7 @@ mod serial_tests {
     /// tier again -> a second restore succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8); currently excluded there - DeleteRestoredAction/expire_restored delete semantics are unimplemented, so cleanup removes the whole object"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
     async fn test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 

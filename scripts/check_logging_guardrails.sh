@@ -43,6 +43,7 @@ checked_files=(
   "crates/targets/src/target/webhook.rs"
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
+  "crates/ecstore/src/client/transition_api.rs"
   "crates/ecstore/src/services/tier/tier.rs"
   "crates/heal/src/heal/manager.rs"
   "crates/heal/src/heal/storage.rs"
@@ -124,6 +125,8 @@ forbidden_patterns=(
   'secret_key={}'
   'Authorization={}'
   'token={}'
+  'debug!("http_client headers: {:?}"'
+  'warn!("err_body: {}"'
   'debug!("config: {:?}"'
   'warn!("No audit targets configured for dispatch"'
   'warn!("No audit targets configured for batch dispatch"'

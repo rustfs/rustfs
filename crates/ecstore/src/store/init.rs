@@ -18,6 +18,7 @@ use crate::error::is_err_decommission_running;
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
+use rustfs_config::server_config::KVS;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -29,6 +30,23 @@ const EVENT_ECSTORE_INIT_STATUS: &str = "ecstore_init_status";
 
 fn pool_first_endpoint_is_local(pool: &crate::layout::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
+}
+
+fn startup_pool_drive_counts(endpoint_pools: &EndpointServerPools) -> Vec<usize> {
+    endpoint_pools.as_ref().iter().map(|pool| pool.drives_per_set).collect()
+}
+
+fn resolve_startup_pool_defaults(endpoint_pools: &EndpointServerPools) -> Result<Vec<usize>> {
+    resolve_startup_pool_defaults_with(endpoint_pools, ECStore::validate_startup_storage_class)
+}
+
+fn resolve_startup_pool_defaults_with(
+    endpoint_pools: &EndpointServerPools,
+    validate: impl FnOnce(&EndpointServerPools) -> Result<()>,
+) -> Result<Vec<usize>> {
+    validate(endpoint_pools)?;
+    let drive_counts = startup_pool_drive_counts(endpoint_pools);
+    drive_counts.into_iter().map(ec_drives_no_config).collect()
 }
 
 fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
@@ -163,6 +181,12 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
 }
 
 impl ECStore {
+    /// Validate topology and process storage-class overrides before any disk is opened.
+    pub fn validate_startup_storage_class(endpoint_pools: &EndpointServerPools) -> Result<()> {
+        let drive_counts = startup_pool_drive_counts(endpoint_pools);
+        storageclass::lookup_config_for_pools(&KVS::new(), &drive_counts).map(|_| ())
+    }
+
     #[allow(clippy::new_ret_no_self)]
     #[instrument(level = "debug", skip(endpoint_pools))]
     pub async fn new(address: SocketAddr, endpoint_pools: EndpointServerPools, ctx: CancellationToken) -> Result<Arc<Self>> {
@@ -184,7 +208,15 @@ impl ECStore {
         ctx: CancellationToken,
         instance_ctx: Arc<InstanceContext>,
     ) -> Result<Arc<Self>> {
+        instance_ctx.bind_background_cancel_token(ctx.clone());
+
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
+
+        // Validate topology and environment overrides before opening any disk.
+        // The values stored on SetDisks remain pure per-pool topology defaults;
+        // payload writes use the runtime storage-class snapshot published later
+        // from config before the store is marked ready.
+        let default_pool_parities = resolve_startup_pool_defaults(&endpoint_pools)?;
 
         let mut deployment_id = None;
 
@@ -222,15 +254,12 @@ impl ECStore {
 
         // debug!("endpoint_pools: {:?}", endpoint_pools);
 
-        let mut common_parity_drives = 0;
-
         for (i, pool_eps) in endpoint_pools.as_ref().iter().enumerate() {
             let pool_first_is_local = pool_first_endpoint_is_local(pool_eps);
-            if common_parity_drives == 0 {
-                let parity_drives = ec_drives_no_config(pool_eps.drives_per_set)?;
-                storageclass::validate_parity(parity_drives, pool_eps.drives_per_set)?;
-                common_parity_drives = parity_drives;
-            }
+            let parity_drives = default_pool_parities
+                .get(i)
+                .copied()
+                .ok_or_else(|| Error::other(format!("store init failed to resolve default parity for pool {i}")))?;
 
             // validate_parity(parity_count, pool_eps.drives_per_set)?;
 
@@ -327,8 +356,7 @@ impl ECStore {
                 }
             }
 
-            let sets =
-                Sets::new_with_instance_ctx(disks.clone(), pool_eps, &fm, i, common_parity_drives, instance_ctx.clone()).await?;
+            let sets = Sets::new_with_instance_ctx(disks.clone(), pool_eps, &fm, i, parity_drives, instance_ctx.clone()).await?;
             pools.push(sets);
 
             disk_map.insert(i, disks);
@@ -468,6 +496,7 @@ impl ECStore {
         }
 
         runtime_sources::init_bucket_monitor_for_current_endpoints();
+        crate::bucket::bucket_target_sys::BucketTargetSys::get().start_heartbeat();
 
         init_background_expiry(self.clone()).await;
         crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_stale_multipart_upload_cleanup(self.clone());
@@ -493,9 +522,30 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, load_pool_meta_for_startup, pool_first_endpoint_is_local,
-        resolve_store_init_stage_result, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
-        should_auto_start_rebalance_after_recovered_meta, should_resume_local_decommission,
-        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        resolve_startup_pool_defaults_with, resolve_store_init_stage_result, save_validated_pool_meta_for_startup,
+        should_auto_start_rebalance_after_init, should_auto_start_rebalance_after_recovered_meta,
+        should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+    };
+    #[cfg(feature = "test-util")]
+    use crate::{
+        bucket::lifecycle::{
+            lifecycle::{TRANSITION_PENDING, TransitionOptions},
+            tier_delete_journal::{
+                TIER_DELETE_JOURNAL_PREFIX, persist_tier_delete_journal_entry, recover_tier_delete_journal_entries,
+            },
+            tier_sweeper::Jentry,
+        },
+        disk::RUSTFS_META_BUCKET,
+        runtime::{global::set_object_store_resolver, sources as runtime_sources},
+        services::tier::{
+            test_util::{MockWarmBackend, TransitionCleanupStoreBarrier, register_mock_tier},
+            tier::TierConfigMgr,
+        },
+        storage_api_contracts::{
+            bucket::{BucketOperations as _, MakeBucketOptions},
+            list::ListOperations as _,
+            object::ObjectOperations as _,
+        },
     };
     use crate::{
         core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
@@ -507,7 +557,9 @@ mod tests {
         storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec},
     };
     use http::HeaderMap;
+    use rustfs_config::server_config::KVS;
     use std::{
+        future::Future,
         io::Cursor,
         sync::{
             Arc,
@@ -784,33 +836,131 @@ mod tests {
         );
     }
 
-    // Build a real 4-drive store over a temp dir around a fresh instance
-    // context — shared by the isolation tests below.
+    fn endpoint_pools_with_drive_counts(counts: &[usize]) -> EndpointServerPools {
+        EndpointServerPools::from(
+            counts
+                .iter()
+                .enumerate()
+                .map(|(pool_index, &drives_per_set)| PoolEndpoints {
+                    legacy: false,
+                    set_count: 1,
+                    drives_per_set,
+                    endpoints: Endpoints::from(Vec::new()),
+                    cmd_line: format!("pool-{pool_index}"),
+                    platform: String::new(),
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn startup_pool_defaults_are_resolved_per_pool() {
+        let validate = |pools: &EndpointServerPools| {
+            let drive_counts: Vec<_> = pools.as_ref().iter().map(|pool| pool.drives_per_set).collect();
+            crate::config::storageclass::lookup_config_for_pools_without_env(&KVS::new(), &drive_counts).map(|_| ())
+        };
+        let defaults = resolve_startup_pool_defaults_with(&endpoint_pools_with_drive_counts(&[4, 2]), validate)
+            .expect("heterogeneous topology should resolve");
+        assert_eq!(defaults, vec![2, 1]);
+
+        let defaults = resolve_startup_pool_defaults_with(&endpoint_pools_with_drive_counts(&[4, 6]), validate)
+            .expect("heterogeneous topology should resolve");
+        assert_eq!(defaults, vec![2, 3]);
+    }
+
+    #[test]
+    fn startup_pool_defaults_validate_explicit_environment_for_every_pool() {
+        let validate = |pools: &EndpointServerPools| {
+            let drive_counts: Vec<_> = pools.as_ref().iter().map(|pool| pool.drives_per_set).collect();
+            let mut kvs = KVS::new();
+            kvs.insert(crate::config::storageclass::CLASS_STANDARD.to_string(), "EC:2".to_string());
+            crate::config::storageclass::lookup_config_for_pools_without_env(&kvs, &drive_counts).map(|_| ())
+        };
+        let err = resolve_startup_pool_defaults_with(&endpoint_pools_with_drive_counts(&[4, 2]), validate)
+            .expect_err("explicit EC:2 must fail before any two-drive pool I/O");
+        assert!(err.to_string().contains("pool 1") && err.to_string().contains("2 drives"));
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn startup_pool_defaults_validate_environment_without_changing_metadata_fallback() {
+        temp_env::with_vars(
+            [
+                (crate::config::storageclass::STANDARD_ENV, Some("EC:1")),
+                (crate::config::storageclass::RRS_ENV, None),
+                (crate::config::storageclass::OPTIMIZE_ENV, None),
+                (crate::config::storageclass::INLINE_BLOCK_ENV, None),
+            ],
+            || {
+                let runtime = crate::config::storageclass::lookup_config_for_pools(&KVS::new(), &[6, 4])
+                    .expect("explicit standard parity must resolve the runtime candidate");
+                assert_eq!(runtime.parities_for_sc(crate::config::storageclass::STANDARD), Some(vec![1, 1]));
+
+                let defaults = super::resolve_startup_pool_defaults(&endpoint_pools_with_drive_counts(&[6, 4]))
+                    .expect("explicit standard parity must validate for every pool");
+                assert_eq!(defaults, vec![3, 2]);
+            },
+        );
+    }
+
+    async fn without_storage_class_env<F: Future>(future: F) -> F::Output {
+        temp_env::async_with_vars(
+            [
+                (crate::config::storageclass::STANDARD_ENV, None::<&str>),
+                (crate::config::storageclass::RRS_ENV, None::<&str>),
+                (crate::config::storageclass::OPTIMIZE_ENV, None::<&str>),
+                (crate::config::storageclass::INLINE_BLOCK_ENV, None::<&str>),
+            ],
+            future,
+        )
+        .await
+    }
+
+    // Build a real local store over a temp dir around a fresh instance context.
     async fn build_isolated_test_store(
         temp_dir: &std::path::Path,
         cmd_line: &str,
-    ) -> (Arc<crate::runtime::instance::InstanceContext>, Arc<crate::store::ECStore>) {
-        let disk_paths: Vec<_> = (1..=4).map(|i| temp_dir.join(format!("disk{i}"))).collect();
-        for path in &disk_paths {
-            tokio::fs::create_dir_all(path).await.expect("create disk dir");
-        }
+        pool_drive_counts: &[usize],
+    ) -> (
+        Arc<crate::runtime::instance::InstanceContext>,
+        Arc<crate::store::ECStore>,
+        CancellationToken,
+    ) {
+        build_isolated_test_store_with_shutdown(temp_dir, cmd_line, pool_drive_counts, CancellationToken::new()).await
+    }
 
-        let mut endpoints = Vec::new();
-        for (i, path) in disk_paths.iter().enumerate() {
-            let mut endpoint = Endpoint::try_from(path.to_str().expect("disk path should be utf-8")).expect("local endpoint");
-            endpoint.set_pool_index(0);
-            endpoint.set_set_index(0);
-            endpoint.set_disk_index(i);
-            endpoints.push(endpoint);
+    async fn build_isolated_test_store_with_shutdown(
+        temp_dir: &std::path::Path,
+        cmd_line: &str,
+        pool_drive_counts: &[usize],
+        shutdown: CancellationToken,
+    ) -> (
+        Arc<crate::runtime::instance::InstanceContext>,
+        Arc<crate::store::ECStore>,
+        CancellationToken,
+    ) {
+        let mut pools = Vec::with_capacity(pool_drive_counts.len());
+        for (pool_index, &drives_per_set) in pool_drive_counts.iter().enumerate() {
+            let mut endpoints = Vec::with_capacity(drives_per_set);
+            for disk_index in 0..drives_per_set {
+                let path = temp_dir.join(format!("pool{pool_index}/disk{disk_index}"));
+                tokio::fs::create_dir_all(&path).await.expect("create disk dir");
+                let mut endpoint = Endpoint::try_from(path.to_str().expect("disk path should be utf-8")).expect("local endpoint");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_index);
+                endpoints.push(endpoint);
+            }
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("{cmd_line}-pool-{pool_index}"),
+                platform: "test".to_string(),
+            });
         }
-        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
-            legacy: false,
-            set_count: 1,
-            drives_per_set: 4,
-            endpoints: Endpoints::from(endpoints),
-            cmd_line: cmd_line.to_string(),
-            platform: "test".to_string(),
-        }]);
+        let endpoint_pools = EndpointServerPools(pools);
 
         let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         crate::store::init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
@@ -820,13 +970,43 @@ mod tests {
         let store = crate::store::ECStore::new_with_instance_ctx(
             "127.0.0.1:0".parse().expect("test address"),
             endpoint_pools,
-            CancellationToken::new(),
+            shutdown.clone(),
             instance_ctx.clone(),
         )
         .await
         .expect("store should build around the fresh context");
 
-        (instance_ctx, store)
+        (instance_ctx, store, shutdown)
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn tier_delete_journal_count(store: Arc<crate::store::ECStore>) -> usize {
+        store
+            .list_objects_v2(RUSTFS_META_BUCKET, TIER_DELETE_JOURNAL_PREFIX, None, None, 100, false, None, false)
+            .await
+            .expect("tier delete journal should be listable")
+            .objects
+            .len()
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn wait_for_tier_delete_journal_recovery(
+        store: Arc<crate::store::ECStore>,
+        backend: &MockWarmBackend,
+        expected_removes: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if backend.remove_versions().await.len() >= expected_removes
+                    && tier_delete_journal_count(store.clone()).await == 0
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tier delete journal recovery should complete");
     }
 
     // Phase 5 follow-up (backlog#1052): building a real store through the
@@ -835,9 +1015,11 @@ mod tests {
     // context, not on the process bootstrap one. This is the storage-layer
     // seam a future second embedded server needs to stay isolated.
     #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn new_with_instance_ctx_threads_context_through_store_graph() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
-        let (instance_ctx, store) = build_isolated_test_store(temp_dir.path(), "instance-ctx-store-graph-test").await;
+        let (instance_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "instance-ctx-store-graph-test", &[4])).await;
 
         assert!(
             Arc::ptr_eq(&store.ctx, &instance_ctx),
@@ -873,16 +1055,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn new_with_instance_ctx_applies_default_parity_to_each_real_pool() {
+        let temp_dir = tempfile::tempdir().expect("create multi-pool store dir");
+        let (_, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "pool-parity-regression", &[4, 2])).await;
+
+        assert_eq!(store.pools.len(), 2);
+        assert_eq!(store.pools[0].default_parity_count, 2);
+        assert_eq!(store.pools[0].disk_set[0].default_parity_count, 2);
+        assert_eq!(store.pools[1].default_parity_count, 1);
+        assert_eq!(store.pools[1].disk_set[0].default_parity_count, 1);
+    }
+
     // backlog#1052 S3: two stores in one process each initialize their own
     // bucket metadata system on their own instance context. Before this, the
     // second `init_bucket_metadata_sys` panicked on the process-global
     // OnceLock — the hard blocker for a second embedded server's services.
     #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn two_stores_initialize_their_own_bucket_metadata_sys() {
         let temp_a = tempfile::tempdir().expect("create temp store dir a");
         let temp_b = tempfile::tempdir().expect("create temp store dir b");
-        let (ctx_a, store_a) = build_isolated_test_store(temp_a.path(), "bucket-metadata-isolation-a").await;
-        let (ctx_b, store_b) = build_isolated_test_store(temp_b.path(), "bucket-metadata-isolation-b").await;
+        let (ctx_a, store_a, _shutdown_a) =
+            without_storage_class_env(build_isolated_test_store(temp_a.path(), "bucket-metadata-isolation-a", &[4])).await;
+        let (ctx_b, store_b, _shutdown_b) =
+            without_storage_class_env(build_isolated_test_store(temp_b.path(), "bucket-metadata-isolation-b", &[4])).await;
 
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
         // The old process-global cell would panic right here.
@@ -895,5 +1094,236 @@ mod tests {
             .bucket_metadata_sys()
             .expect("store B's context must hold its metadata system");
         assert!(!Arc::ptr_eq(&sys_a, &sys_b), "each store must own a distinct bucket metadata system");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_journal_recovery_spawns_for_each_store() {
+        let temp_a = tempfile::tempdir().expect("create temp store dir a");
+        let temp_b = tempfile::tempdir().expect("create temp store dir b");
+        let (ctx_a, store_a, shutdown_a) =
+            without_storage_class_env(build_isolated_test_store(temp_a.path(), "tier-journal-recovery-a", &[4])).await;
+        let (ctx_b, store_b, shutdown_b) =
+            without_storage_class_env(build_isolated_test_store(temp_b.path(), "tier-journal-recovery-b", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_b.clone(), Vec::new()).await;
+
+        assert!(
+            !ctx_a.mark_tier_delete_journal_recovery_started(store_a.id),
+            "store A should have claimed its production recovery worker"
+        );
+        assert!(
+            !ctx_b.mark_tier_delete_journal_recovery_started(store_b.id),
+            "store B should have claimed its production recovery worker"
+        );
+        assert!(!shutdown_a.is_cancelled());
+        assert!(!shutdown_b.is_cancelled());
+
+        let tier_a = "JOURNAL-A";
+        let tier_b = "JOURNAL-B";
+        let backend_a = register_mock_tier(&ctx_a.tier_config_mgr(), tier_a).await;
+        let backend_b = register_mock_tier(&ctx_b.tier_config_mgr(), tier_b).await;
+        let identity_a = TierConfigMgr::acquire_operation_lease(&ctx_a.tier_config_mgr(), tier_a)
+            .await
+            .expect("store A tier lease should resolve")
+            .backend_identity();
+        let identity_b = TierConfigMgr::acquire_operation_lease(&ctx_b.tier_config_mgr(), tier_b)
+            .await
+            .expect("store B tier lease should resolve")
+            .backend_identity();
+        let entry_a = Jentry {
+            obj_name: "remote-a".to_string(),
+            version_id: "version-a".to_string(),
+            tier_name: tier_a.to_string(),
+            backend_identity: Some(identity_a),
+            version_id_exact: false,
+        };
+        let entry_b = Jentry {
+            obj_name: "remote-b".to_string(),
+            version_id: "version-b".to_string(),
+            tier_name: tier_b.to_string(),
+            backend_identity: Some(identity_b),
+            version_id_exact: false,
+        };
+        let remove_a = backend_a.arm_failing_remove_barrier().await;
+        persist_tier_delete_journal_entry(store_a.clone(), &entry_a)
+            .await
+            .expect("store A journal should persist");
+        persist_tier_delete_journal_entry(store_b.clone(), &entry_b)
+            .await
+            .expect("store B journal should persist");
+
+        ctx_a.wake_tier_delete_journal_recovery();
+        ctx_b.wake_tier_delete_journal_recovery();
+        remove_a.wait_until_paused().await;
+        wait_for_tier_delete_journal_recovery(store_b.clone(), &backend_b, 1).await;
+
+        shutdown_a.cancel();
+        remove_a.wait_until_operation_dropped().await;
+        assert!(
+            ctx_a
+                .background_cancel_token()
+                .expect("store A shutdown token should be bound")
+                .is_cancelled()
+        );
+        assert!(
+            !ctx_b
+                .background_cancel_token()
+                .expect("store B shutdown token should be bound")
+                .is_cancelled(),
+            "cancelling store A must not stop store B"
+        );
+        assert_eq!(tier_delete_journal_count(store_a.clone()).await, 1);
+
+        let recovered_a = recover_tier_delete_journal_entries(store_a.clone(), 100, None)
+            .await
+            .expect("the cancelled store A worker must leave its journal recoverable");
+        assert_eq!((recovered_a.scanned, recovered_a.deleted, recovered_a.failed), (1, 1, 0));
+        assert_eq!(backend_a.remove_versions().await, vec![("remote-a".to_string(), "version-a".to_string())]);
+
+        let second_entry_b = Jentry {
+            obj_name: "remote-b-2".to_string(),
+            version_id: "version-b-2".to_string(),
+            ..entry_b
+        };
+        persist_tier_delete_journal_entry(store_b.clone(), &second_entry_b)
+            .await
+            .expect("store B second journal should persist");
+        ctx_b.wake_tier_delete_journal_recovery();
+        wait_for_tier_delete_journal_recovery(store_b.clone(), &backend_b, 2).await;
+        assert_eq!(
+            backend_b.remove_versions().await,
+            vec![
+                ("remote-b".to_string(), "version-b".to_string()),
+                ("remote-b-2".to_string(), "version-b-2".to_string()),
+            ]
+        );
+
+        shutdown_b.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn cancelled_transition_cleanup_journals_to_its_own_instance_store() {
+        struct ResolverReset(Arc<std::sync::Mutex<Option<std::sync::Weak<crate::store::ECStore>>>>);
+
+        impl Drop for ResolverReset {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+        }
+
+        let temp_a = tempfile::tempdir().expect("create transition store dir a");
+        let temp_b = tempfile::tempdir().expect("create transition store dir b");
+        let shutdown_a = CancellationToken::new();
+        let shutdown_b = CancellationToken::new();
+        shutdown_a.cancel();
+        shutdown_b.cancel();
+        let (ctx_a, store_a, shutdown_a) = without_storage_class_env(build_isolated_test_store_with_shutdown(
+            temp_a.path(),
+            "transition-cleanup-context-a",
+            &[4],
+            shutdown_a,
+        ))
+        .await;
+        let (ctx_b, store_b, shutdown_b) = without_storage_class_env(build_isolated_test_store_with_shutdown(
+            temp_b.path(),
+            "transition-cleanup-context-b",
+            &[4],
+            shutdown_b,
+        ))
+        .await;
+        assert!(shutdown_a.is_cancelled());
+        assert!(shutdown_b.is_cancelled());
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
+
+        let resolver_target = Arc::new(std::sync::Mutex::new(Some(Arc::downgrade(&store_b))));
+        let resolver_store = resolver_target.clone();
+        assert!(
+            set_object_store_resolver(Arc::new(move || {
+                resolver_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+            })),
+            "the cross-context regression test must install the only process object-store resolver"
+        );
+        let _resolver_reset = ResolverReset(resolver_target);
+        assert!(
+            runtime_sources::object_store_handle().is_some_and(|store| Arc::ptr_eq(&store, &store_b)),
+            "the process resolver must deliberately point at store B"
+        );
+
+        let tier_name = "CROSSCTXA";
+        let backend = register_mock_tier(&ctx_a.tier_config_mgr(), tier_name).await;
+        backend.set_put_remote_version(Some(uuid::Uuid::new_v4().to_string())).await;
+        backend.set_reject_non_empty_remote_versions(true);
+        let remove_barrier = backend.arm_failing_remove_barrier().await;
+
+        let bucket = "transition-cleanup-context-a";
+        let object = "rejected-candidate.bin";
+        store_a
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("store A bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"cross-context rejected transition cleanup".repeat(1024));
+        let original = store_a
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("store A source object should be written");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.to_string(),
+                etag: original.etag.clone().expect("the source object should have an ETag"),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let cleanup_store_barrier = TransitionCleanupStoreBarrier::install();
+        let transition_store = store_a.clone();
+        let transition = tokio::spawn(async move { transition_store.transition_object(bucket, object, &opts).await });
+        cleanup_store_barrier.wait_until_paused().await;
+        transition.abort();
+        assert!(
+            transition
+                .await
+                .expect_err("the transition task should observe cancellation")
+                .is_cancelled()
+        );
+
+        remove_barrier.wait_until_paused().await;
+        let journal_counts = (
+            tier_delete_journal_count(store_a.clone()).await,
+            tier_delete_journal_count(store_b.clone()).await,
+        );
+        assert_eq!(
+            journal_counts,
+            (1, 0),
+            "the journal must land only on store A even while the process resolver points at store B"
+        );
+        assert_eq!(backend.object_count().await, 1, "failed cleanup should retain the remote candidate");
+        remove_barrier.release();
+        remove_barrier.wait_until_operation_dropped().await;
+
+        let recovered = recover_tier_delete_journal_entries(store_a.clone(), 100, None)
+            .await
+            .expect("store A should recover its own cancelled-transition journal");
+        assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+        assert_eq!(tier_delete_journal_count(store_a.clone()).await, 0);
+        assert_eq!(tier_delete_journal_count(store_b.clone()).await, 0);
+        assert_eq!(
+            backend.object_count().await,
+            0,
+            "store A recovery should delete the exact remote candidate"
+        );
+        assert!(!Arc::ptr_eq(&ctx_a, &ctx_b), "the regression requires two distinct instance contexts");
     }
 }

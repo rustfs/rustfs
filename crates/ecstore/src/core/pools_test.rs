@@ -87,50 +87,57 @@ mod capacity_dedup_tests {
     }
 
     #[test]
-    fn test_four_disk_erasure_coding() {
-        // 4-disk erasure coding: 2 data disks + 2 parity disks
+    fn test_four_node_ec_2_2_reports_stable_usable_capacity() {
+        const TIB: u64 = 1 << 40;
+        const DISK_TOTAL: u64 = 2 * TIB;
+        const DISK_FREE: u64 = TIB / 5;
+
         let disks = vec![
             rustfs_madmin::Disk {
                 endpoint: "node1".to_string(),
-                drive_path: "/mnt/disk1".to_string(),
+                drive_path: "/media/rustfs-01".to_string(),
                 pool_index: 0,
                 set_index: 0,
                 disk_index: 0,
-                total_space: 1_000_000_000_000, // 1TB
-                available_space: 250_000_000_000,
+                total_space: DISK_TOTAL,
+                available_space: DISK_FREE,
+                used_space: DISK_TOTAL - DISK_FREE,
                 state: "ok".to_string(),
                 ..Default::default()
             },
             rustfs_madmin::Disk {
-                endpoint: "node1".to_string(),
-                drive_path: "/mnt/disk2".to_string(),
+                endpoint: "node2".to_string(),
+                drive_path: "/media/rustfs-01".to_string(),
                 pool_index: 0,
                 set_index: 0,
                 disk_index: 1,
-                total_space: 1_000_000_000_000,
-                available_space: 250_000_000_000,
+                total_space: DISK_TOTAL,
+                available_space: DISK_FREE,
+                used_space: DISK_TOTAL - DISK_FREE,
                 state: "ok".to_string(),
                 ..Default::default()
             },
             rustfs_madmin::Disk {
-                endpoint: "node1".to_string(),
-                drive_path: "/mnt/disk3".to_string(),
+                endpoint: "node3".to_string(),
+                drive_path: "/media/rustfs-01".to_string(),
                 pool_index: 0,
                 set_index: 0,
                 disk_index: 2,
-                total_space: 1_000_000_000_000,
-                available_space: 250_000_000_000,
+                total_space: DISK_TOTAL,
+                available_space: DISK_FREE,
+                used_space: DISK_TOTAL - DISK_FREE,
                 state: "ok".to_string(),
                 ..Default::default()
             },
             rustfs_madmin::Disk {
-                endpoint: "node1".to_string(),
-                drive_path: "/mnt/disk4".to_string(),
+                endpoint: "node4".to_string(),
+                drive_path: "/media/rustfs-01".to_string(),
                 pool_index: 0,
                 set_index: 0,
                 disk_index: 3,
-                total_space: 1_000_000_000_000,
-                available_space: 250_000_000_000,
+                total_space: DISK_TOTAL,
+                available_space: DISK_FREE,
+                used_space: DISK_TOTAL - DISK_FREE,
                 state: "ok".to_string(),
                 ..Default::default()
             },
@@ -146,9 +153,17 @@ mod capacity_dedup_tests {
         };
 
         let total = get_total_usable_capacity(&disks, &info);
+        let free = get_total_usable_capacity_free(&disks, &info);
+        let used = total.saturating_sub(free);
+        let expected_total = usize::try_from(4 * TIB).expect("4 TiB must fit the supported platform's usize");
+        let expected_free = usize::try_from(2 * DISK_FREE).expect("usable free capacity must fit usize");
+        let single_node_used = usize::try_from(DISK_TOTAL - DISK_FREE).expect("single-node used capacity must fit usize");
 
-        // Only count data disks (disk_index < 2)
-        assert_eq!(total, 2_000_000_000_000, "Should count only data disks (2 × 1TB)");
+        assert_eq!(total, expected_total, "usable total must count the two data disks");
+        assert_eq!(free, expected_free, "usable free must count the two data disks");
+        assert_eq!(used, 2 * single_node_used, "usable used must be approximately 3.6 TiB");
+        assert_ne!(used, single_node_used, "used must not collapse to one node's approximately 1.8 TiB");
+        assert_ne!(used, 4 * single_node_used, "used must not report the approximately 7.2 TiB raw aggregate");
     }
 
     #[test]

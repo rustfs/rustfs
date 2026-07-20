@@ -67,7 +67,11 @@ pub mod bucket {
         }
 
         pub mod tier_delete_journal {
-            pub use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
+            #[cfg(feature = "test-util")]
+            pub use crate::bucket::lifecycle::tier_delete_journal::recover_tier_delete_journal_entries;
+            pub use crate::bucket::lifecycle::tier_delete_journal::{
+                persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
+            };
         }
 
         pub mod tier_last_day_stats {
@@ -247,7 +251,8 @@ pub mod config {
             CLASS_RRS, CLASS_STANDARD, Config, DEEP_ARCHIVE, DEFAULT_INLINE_BLOCK, DEFAULT_KVS, DEFAULT_RRS_PARITY,
             EXPRESS_ONEZONE, GLACIER, GLACIER_IR, INLINE_BLOCK, INLINE_BLOCK_ENV, INTELLIGENT_TIERING, MIN_PARITY_DRIVES,
             ONEZONE_IA, OPTIMIZE, OPTIMIZE_ENV, OUTPOSTS, RRS, RRS_ENV, SCHEME_PREFIX, SNOW, STANDARD, STANDARD_ENV, STANDARD_IA,
-            StorageClass, default_parity_count, lookup_config, parse_storage_class, validate_parity, validate_parity_inner,
+            StorageClass, default_parity_count, lookup_config, lookup_config_for_pools, parse_storage_class, validate_parity,
+            validate_parity_inner,
         };
     }
 
@@ -258,12 +263,14 @@ pub mod config {
 
 pub mod data_usage {
     pub use crate::data_usage::{
-        DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend,
-        load_compression_total_from_memory, load_data_usage_from_backend, record_bucket_delete_marker_memory,
+        DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
+        init_compression_total_memory_from_backend, live_bucket_usage_computations, load_compression_total_from_memory,
+        load_data_usage_from_backend, load_data_usage_from_backend_cached, record_bucket_delete_marker_memory,
         record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
+        store_data_usage_in_backend,
     };
 }
 
@@ -308,8 +315,8 @@ pub mod error {
 
 pub mod erasure {
     pub use crate::erasure::coding::{
-        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ReedSolomonEncoder, calc_shard_size,
-        calc_shard_size_legacy,
+        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ErasureConstructionError, ReedSolomonEncoder,
+        calc_shard_size, calc_shard_size_legacy,
     };
 }
 
@@ -351,9 +358,12 @@ pub mod notification {
 
 pub mod object {
     pub use crate::object_api::{
-        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectReader, ObjectInfo, ObjectMutationHook, ObjectOptions,
-        PutObjReader, RangedDecompressReader, StreamConsumer, register_get_object_body_cache_hook, register_object_mutation_hook,
+        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource,
+        GetObjectReader, ObjectInfo, ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader, StreamConsumer,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
+    pub use crate::store::PreparedGetObjectReader;
 }
 
 pub mod rebalance {
@@ -374,8 +384,11 @@ pub mod rio {
 pub mod rpc {
     pub use crate::cluster::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, TonicInterceptor, gen_tonic_signature_interceptor,
-        node_service_time_out_client, node_service_time_out_client_no_auth, verify_rpc_signature,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers,
+        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
+        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
+        sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature,
     };
 }
 
@@ -402,7 +415,7 @@ pub mod tier {
         pub use crate::services::tier::tier::{
             ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_INVALID_CONFIG, ERR_TIER_MISSING_CREDENTIALS,
             ERR_TIER_TYPE_UNSUPPORTED, TIER_CONFIG_FILE, TIER_CONFIG_FORMAT, TIER_CONFIG_V1, TIER_CONFIG_VERSION, TierConfigMgr,
-            is_err_config_not_found, try_migrate_tiering_config,
+            TierConfigUpdateError, is_err_config_not_found, try_migrate_tiering_config,
         };
     }
 
@@ -413,7 +426,7 @@ pub mod tier {
     pub mod tier_config {
         pub use crate::services::tier::tier_config::{
             ServicePrincipalAuth, TierAliyun, TierAzure, TierConfig, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS,
-            TierS3, TierTencent, TierType,
+            TierS3, TierTencent, TierType, TierWasabi,
         };
     }
 
@@ -433,9 +446,9 @@ pub mod tier {
     #[cfg(feature = "test-util")]
     pub mod test_util {
         pub use crate::services::tier::test_util::{
-            FaultConfig, MockStoredObject, MockWarmBackend, MockWarmOp, TransitionMeta, assert_transition_meta_consistent,
-            free_version_count, read_transition_meta, register_mock_tier, register_mock_tier_backend,
-            wait_for_free_version_absence,
+            FaultConfig, MockStoredObject, MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, TransitionMeta,
+            assert_transition_meta_consistent, free_version_count, read_transition_meta, register_mock_tier,
+            register_mock_tier_backend, wait_for_free_version_absence,
         };
     }
 }

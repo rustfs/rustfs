@@ -307,6 +307,17 @@ pub struct GetObjectReader {
 }
 
 impl GetObjectReader {
+    /// Builds a fully materialized reader from a cache-coordinated body.
+    pub fn from_cache_body(mut object_info: ObjectInfo, body: Bytes) -> Result<Self> {
+        object_info.size = i64::try_from(body.len()).map_err(|_| Error::other("cached GET body length exceeds i64::MAX"))?;
+        Ok(Self {
+            stream: Box::new(std::io::Cursor::new(body.clone())),
+            object_info,
+            buffered_body: Some(body),
+            body_source: GetObjectBodySource::HookServed,
+        })
+    }
+
     /// True when `buffered_body` is the body the cache hook served. The app
     /// layer serves it as the object-data-cache source without a second lookup.
     pub fn is_cache_hook_served(&self) -> bool {
@@ -1672,6 +1683,40 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&digest);
         bytes
+    }
+
+    #[tokio::test]
+    async fn cache_body_uses_plaintext_length_for_compressed_metadata() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_string(),
+        );
+        let object_info = ObjectInfo {
+            size: 3,
+            actual_size: 11,
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        assert!(object_info.is_compressed());
+
+        let body = Bytes::from_static(b"hello world");
+        let mut reader =
+            GetObjectReader::from_cache_body(object_info, body.clone()).expect("cache body length must fit in object metadata");
+
+        assert_eq!(reader.body_source, GetObjectBodySource::HookServed);
+        assert_eq!(reader.buffered_body.as_ref(), Some(&body));
+        assert_eq!(reader.object_info.size, 11);
+        assert_eq!(reader.object_info.actual_size, 11);
+        assert!(reader.object_info.is_compressed());
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("cache body should stream");
+        assert_eq!(restored, body);
     }
 
     /// Regression for the #4576 fallout: the encrypt side persists a random

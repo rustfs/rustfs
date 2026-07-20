@@ -239,8 +239,8 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
 PRODUCTION_READINESS_INVENTORY: list[dict[str, str]] = [
     {
         "capability": "strong-catalog-backing",
-        "status": "migration-contract-supported",
-        "validation": "catalog export and diagnostics expose an object-backed manifest, recoverable commit-log WAL state, strong-kv-wal migration target, required migration steps, and recovery blockers before cutover",
+        "status": "state-transfer-supported",
+        "validation": "preflight exposes recovery blockers and target agreement; migration execution fences object-backed writes, drains in-flight catalog mutations, and idempotently materializes table bucket, namespace, table, view, commit-log, and idempotency state before cutover",
     },
     {
         "capability": "single-active-writer-ha",

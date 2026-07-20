@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::index::{ObjectDataCacheIndexInsertResult, ObjectDataCacheKeySet, ObjectDataCacheKeyToken};
+use crate::index::{
+    ObjectDataCacheGeneration, ObjectDataCacheGenerationalInsertResult, ObjectDataCacheIndexInsertResult, ObjectDataCacheKeySet,
+    ObjectDataCacheKeyToken,
+};
 use crate::key::{ObjectDataCacheIdentity, ObjectDataCacheKey};
 use starshard::{AsyncShardedHashMap, DEFAULT_SHARDS, SnapshotMode};
 use std::collections::hash_map::RandomState;
@@ -56,6 +59,21 @@ impl StarshardIdentityIndex {
         key: ObjectDataCacheKey,
         token: ObjectDataCacheKeyToken,
     ) -> ObjectDataCacheIndexInsertResult {
+        let generation = u64::try_from(token).unwrap_or(u64::MAX);
+        match self.insert_generation(identity, key, generation).await {
+            ObjectDataCacheGenerationalInsertResult::Inserted { evicted } => ObjectDataCacheIndexInsertResult::Inserted {
+                evicted_keys: evicted.into_iter().map(|entry| entry.key).collect(),
+            },
+            ObjectDataCacheGenerationalInsertResult::Duplicate => ObjectDataCacheIndexInsertResult::Duplicate,
+        }
+    }
+
+    pub(crate) async fn insert_generation(
+        &self,
+        identity: ObjectDataCacheIdentity,
+        key: ObjectDataCacheKey,
+        generation: ObjectDataCacheGeneration,
+    ) -> ObjectDataCacheGenerationalInsertResult {
         let max_keys = self.max_keys_per_identity;
         loop {
             let mut outcome = None;
@@ -65,7 +83,7 @@ impl StarshardIdentityIndex {
                 let _ = self
                     .by_object
                     .compute_if_present(&identity, move |mut key_set| {
-                        let result = key_set.insert(key, token, max_keys);
+                        let result = key_set.insert_generation(key, generation, max_keys);
                         // Insert never empties the set (it either dedups or
                         // bounded-evicts and adds the new key), but keep the
                         // guard so an already-empty entry is not republished.
@@ -80,7 +98,7 @@ impl StarshardIdentityIndex {
 
             // Identity not tracked yet: publish a fresh single-key set.
             let mut fresh = ObjectDataCacheKeySet::default();
-            let result = fresh.insert(key.clone(), token, max_keys);
+            let result = fresh.insert_generation(key.clone(), generation, max_keys);
             let final_set = self.by_object.compute_if_absent(identity.clone(), move || fresh).await;
             if final_set.contains(&key) {
                 return result;
@@ -147,13 +165,23 @@ impl StarshardIdentityIndex {
         key: &ObjectDataCacheKey,
         token: ObjectDataCacheKeyToken,
     ) -> bool {
+        self.remove_generation(identity, key, u64::try_from(token).unwrap_or(u64::MAX))
+            .await
+    }
+
+    pub(crate) async fn remove_generation(
+        &self,
+        identity: &ObjectDataCacheIdentity,
+        key: &ObjectDataCacheKey,
+        generation: ObjectDataCacheGeneration,
+    ) -> bool {
         let mut removed = false;
         {
             let removed = &mut removed;
             let _ = self
                 .by_object
                 .compute_if_present(identity, move |mut key_set| {
-                    *removed = key_set.remove_evicted_key(key, token);
+                    *removed = key_set.remove_generation(key, generation);
                     (!key_set.is_empty()).then_some(key_set)
                 })
                 .await;
@@ -167,6 +195,18 @@ impl StarshardIdentityIndex {
             .get(identity)
             .await
             .is_some_and(|key_set| key_set.contains(key))
+    }
+
+    pub(crate) async fn contains_generation(
+        &self,
+        identity: &ObjectDataCacheIdentity,
+        key: &ObjectDataCacheKey,
+        generation: ObjectDataCacheGeneration,
+    ) -> bool {
+        self.by_object
+            .get(identity)
+            .await
+            .is_some_and(|key_set| key_set.contains_generation(key, generation))
     }
 
     /// Returns the number of tracked identities.

@@ -38,11 +38,14 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
+use tokio::sync::Notify;
 use tracing::warn;
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
+#[cfg(test)]
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 const LOG_SUBSYSTEM_RUNTIME_CONFIG: &str = "runtime_config";
+#[cfg(test)]
 const EVENT_SCANNER_RUNTIME_CONFIG: &str = "scanner_runtime_config";
 const EVENT_SCANNER_RUNTIME_CONFIG_PARSE: &str = "scanner_runtime_config_parse";
 
@@ -52,6 +55,8 @@ const MAX_SCANNER_DELAY_FACTOR: f64 = 10_000.0;
 const SCANNER_DELAY_RANGE_REASON: &str = "expected scanner delay between 0 and 10000";
 
 static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_OVERRIDE);
+static SCANNER_RUNTIME_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SCANNER_RUNTIME_CONFIG_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 static SCANNER_RUNTIME_CONFIG: LazyLock<RwLock<ScannerRuntimeConfig>> =
     LazyLock::new(|| RwLock::new(lookup_scanner_runtime_config(None).unwrap_or_default()));
@@ -678,6 +683,7 @@ fn current_server_config() -> Option<ServerConfig> {
     resolve_scanner_server_config()
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_scanner_runtime_config_from_global() -> ScannerRuntimeConfig {
     let config = current_server_config();
     match lookup_scanner_runtime_config(config.as_ref()) {
@@ -705,7 +711,17 @@ pub fn apply_scanner_runtime_config(config: &ServerConfig) -> Result<(), Scanner
     validate_scanner_runtime_config(config)?;
     let resolved = lookup_scanner_runtime_config(Some(config))?;
     apply_resolved_runtime_config(resolved);
+    SCANNER_RUNTIME_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
+    SCANNER_RUNTIME_CONFIG_NOTIFY.notify_one();
     Ok(())
+}
+
+pub(crate) fn scanner_runtime_config_generation() -> u64 {
+    SCANNER_RUNTIME_CONFIG_GENERATION.load(Ordering::Acquire)
+}
+
+pub(crate) async fn scanner_runtime_config_changed() {
+    SCANNER_RUNTIME_CONFIG_NOTIFY.notified().await;
 }
 
 pub(crate) fn refresh_scanner_runtime_config_from_global() -> Result<(), ScannerRuntimeConfigError> {
@@ -846,11 +862,11 @@ mod tests {
     use crate::init_ecstore_config_for_scanner_tests;
     use rustfs_config::server_config::{Config as ServerConfig, KVS};
     use rustfs_config::{
-        DEFAULT_DELIMITER, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE,
-        ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED, HEAL_BITROT_CYCLE,
-        HEAL_SUB_SYS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES,
-        SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS,
-        ScannerSpeed,
+        DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
+        ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
+        HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE,
+        SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_IDLE_MODE,
+        SCANNER_SPEED, SCANNER_SUB_SYS, ScannerSpeed,
     };
     use serial_test::serial;
     use std::collections::HashMap;
@@ -929,6 +945,22 @@ mod tests {
 
     #[test]
     #[serial]
+    fn scanner_runtime_config_normalizes_persisted_default_speed() {
+        let config = server_config_with_scanner(&[(SCANNER_SPEED, "default")]);
+
+        with_var_unset(ENV_SCANNER_SPEED, || {
+            with_var_unset(ENV_SCANNER_CYCLE, || {
+                let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+
+                assert_eq!(resolved.speed, ScannerSpeed::Default);
+                assert_eq!(resolved.speed_source, ScannerRuntimeConfigSource::Default);
+                assert_eq!(resolved.cycle_interval_source, ScannerRuntimeConfigSource::Default);
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
     fn scanner_runtime_config_prefers_env_over_persisted_config() {
         let config = server_config_with_scanner(&[(SCANNER_SPEED, "slowest"), (SCANNER_CYCLE, "600")]);
 
@@ -972,6 +1004,23 @@ mod tests {
             assert_eq!(encoded["bitrot_cycle_seconds"]["source"], "scanner_compat_config");
         });
         super::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_runtime_config_normalizes_persisted_default_bitrot_cycles() {
+        let default_cycle = DEFAULT_HEAL_BITROT_CYCLE_SECS.to_string();
+        for config in [
+            server_config_with_scanner_and_heal(&[], &[(HEAL_BITROT_CYCLE, default_cycle.as_str())]),
+            server_config_with_scanner(&[(SCANNER_BITROT_CYCLE, default_cycle.as_str())]),
+        ] {
+            with_var_unset(ENV_SCANNER_BITROT_CYCLE_SECS, || {
+                let resolved = lookup_scanner_runtime_config(Some(&config)).expect("scanner runtime config");
+
+                assert_eq!(resolved.bitrot_cycle, Some(Duration::from_secs(DEFAULT_HEAL_BITROT_CYCLE_SECS)));
+                assert_eq!(resolved.bitrot_cycle_source, ScannerRuntimeConfigSource::Default);
+            });
+        }
     }
 
     #[test]
@@ -1054,6 +1103,23 @@ mod tests {
                 assert_eq!(status.cache_save_timeout_seconds.value, 5);
                 assert_eq!(status.cache_save_timeout_seconds.source, ScannerRuntimeConfigSource::Config);
             });
+        });
+        super::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn applied_runtime_config_is_the_authoritative_scheduler_state() {
+        let config = server_config_with_scanner(&[(SCANNER_CYCLE, "321")]);
+
+        with_var_unset(ENV_SCANNER_CYCLE, || {
+            let generation = super::scanner_runtime_config_generation();
+            super::apply_scanner_runtime_config(&config).expect("scanner runtime config should apply");
+
+            let applied = super::current_scanner_runtime_config();
+            assert_eq!(applied.cycle_interval, Duration::from_secs(321));
+            assert_eq!(applied.cycle_interval_source, ScannerRuntimeConfigSource::Config);
+            assert!(super::scanner_runtime_config_generation() > generation);
         });
         super::refresh_scanner_runtime_config_for_tests();
     }
