@@ -249,6 +249,7 @@ impl ObjSweeper {
                 version_id: self.transition_version_id.clone(),
                 tier_name: self.transition_tier.clone(),
                 backend_identity: None,
+                version_id_exact: false,
             });
         }
         None
@@ -284,6 +285,7 @@ pub struct Jentry {
     pub(crate) version_id: String,
     pub(crate) tier_name: String,
     pub(crate) backend_identity: Option<TierDestinationId>,
+    pub(crate) version_id_exact: bool,
 }
 
 impl ExpiryOp for Jentry {
@@ -328,13 +330,14 @@ async fn delete_object_from_remote_tier_raw_with_manager(
     let lease = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, tier_name)
         .await
         .map_err(std::io::Error::other)?;
-    delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease).await
+    delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease, false).await
 }
 
 async fn delete_object_from_remote_tier_raw_with_lease(
     obj_name: &str,
     rv_id: &str,
     lease: &TierOperationLease,
+    version_id_exact: bool,
 ) -> Result<(), std::io::Error> {
     if remote_delete_breaker_is_open(Instant::now()).await {
         metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
@@ -347,7 +350,11 @@ async fn delete_object_from_remote_tier_raw_with_lease(
         .map_err(|_| std::io::Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED))?;
     let _inflight = RemoteDeleteInflightGuard::new();
 
-    lease.remove(obj_name, rv_id).await
+    if version_id_exact {
+        lease.remove_exact(obj_name, rv_id).await
+    } else {
+        lease.remove(obj_name, rv_id).await
+    }
 }
 
 #[cfg(test)]
@@ -388,19 +395,21 @@ pub(crate) async fn delete_object_from_remote_tier_idempotent_with_manager_and_i
     tier_name: &str,
     backend_identity: TierDestinationId,
     tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+    version_id_exact: bool,
 ) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
     let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, tier_name, backend_identity)
         .await
         .map_err(std::io::Error::other)?;
-    delete_object_from_remote_tier_with_lease_idempotent(obj_name, rv_id, &lease).await
+    delete_object_from_remote_tier_with_lease_idempotent(obj_name, rv_id, &lease, version_id_exact).await
 }
 
 pub(crate) async fn delete_object_from_remote_tier_with_lease_idempotent(
     obj_name: &str,
     rv_id: &str,
     lease: &TierOperationLease,
+    version_id_exact: bool,
 ) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
-    match delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, lease).await {
+    match delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, lease, version_id_exact).await {
         Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
         Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
         Err(err) => {
@@ -450,6 +459,7 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
         version_id: transitioned.version_id.clone(),
         tier_name: transitioned.tier.clone(),
         backend_identity: None,
+        version_id_exact: false,
     })
 }
 
@@ -574,11 +584,39 @@ mod test {
             "WARM",
             mismatched,
             &manager,
+            false,
         )
         .await
         .expect_err("journal recovery must fail closed when the tier name was rebound");
 
         assert!(err.to_string().contains("identity no longer matches"));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_delete_dispatches_an_exact_version_constraint() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        let backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let identity = lease.backend_identity();
+        drop(lease);
+
+        let outcome = delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "exact-version",
+            "WARM",
+            identity,
+            &manager,
+            true,
+        )
+        .await
+        .expect("an exact journal delete should reach the backend");
+
+        assert_eq!(outcome, RemoteTierDeleteOutcome::Deleted);
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.remove_count().await, 1);
     }
 
     #[test]

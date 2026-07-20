@@ -672,6 +672,14 @@ struct SharedWarmBackendProxy(SharedWarmBackend);
 
 #[async_trait::async_trait]
 impl WarmBackend for SharedWarmBackendProxy {
+    async fn validate(&self) -> io::Result<()> {
+        self.0.validate().await
+    }
+
+    fn validate_remote_version_id(&self, remote_version_id: &str) -> io::Result<()> {
+        self.0.validate_remote_version_id(remote_version_id)
+    }
+
     async fn put(&self, object: &str, r: crate::client::transition_api::ReaderImpl, length: i64) -> io::Result<String> {
         self.0.put(object, r, length).await
     }
@@ -697,6 +705,10 @@ impl WarmBackend for SharedWarmBackendProxy {
 
     async fn remove(&self, object: &str, rv: &str) -> io::Result<()> {
         self.0.remove(object, rv).await
+    }
+
+    async fn remove_exact(&self, object: &str, rv: &str) -> io::Result<()> {
+        self.0.remove_exact(object, rv).await
     }
 
     async fn in_use(&self) -> io::Result<bool> {
@@ -3046,6 +3058,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WarmBackend for MockWarmBackend {
+        async fn validate(&self) -> std::result::Result<(), std::io::Error> {
+            if self.healthy {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("mock validation failed"))
+            }
+        }
+
+        fn validate_remote_version_id(&self, remote_version_id: &str) -> std::result::Result<(), std::io::Error> {
+            if remote_version_id == "unsupported-version" {
+                Err(std::io::Error::other("mock remote version rejected"))
+            } else {
+                Ok(())
+            }
+        }
+
         async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> std::result::Result<String, std::io::Error> {
             if self.healthy {
                 Ok("mock-version".to_string())
@@ -3083,6 +3111,13 @@ mod tests {
             } else {
                 Err(std::io::Error::other("mock remove failed"))
             }
+        }
+
+        async fn remove_exact(&self, object: &str, rv: &str) -> std::result::Result<(), std::io::Error> {
+            if rv == "exact-only" {
+                return Err(std::io::Error::other("mock exact remove forwarded"));
+            }
+            self.remove(object, rv).await
         }
 
         async fn in_use(&self) -> std::result::Result<bool, std::io::Error> {
@@ -3440,6 +3475,32 @@ mod tests {
         mgr.verify("COLD-A")
             .await
             .expect_err("an unhealthy backend must fail verification");
+    }
+
+    #[tokio::test]
+    async fn shared_backend_proxy_forwards_validation_hooks() {
+        let unhealthy: SharedWarmBackend = Arc::new(MockWarmBackend {
+            in_use_value: Some(false),
+            healthy: false,
+        });
+        let proxy = SharedWarmBackendProxy(unhealthy);
+        let err = proxy.validate().await.expect_err("proxy must forward backend validation");
+        assert_eq!(err.to_string(), "mock validation failed");
+
+        let healthy: SharedWarmBackend = Arc::new(MockWarmBackend {
+            in_use_value: Some(false),
+            healthy: true,
+        });
+        let proxy = SharedWarmBackendProxy(healthy);
+        let err = proxy
+            .validate_remote_version_id("unsupported-version")
+            .expect_err("proxy must forward remote version validation");
+        assert_eq!(err.to_string(), "mock remote version rejected");
+        let err = proxy
+            .remove_exact("remote-object", "exact-only")
+            .await
+            .expect_err("proxy must forward exact-version cleanup");
+        assert_eq!(err.to_string(), "mock exact remove forwarded");
     }
 
     // ---- pure query helpers --------------------------------------------
