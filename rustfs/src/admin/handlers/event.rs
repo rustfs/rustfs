@@ -245,6 +245,7 @@ struct NotificationEndpoint {
 
 #[derive(Serialize, Debug)]
 struct NotificationEndpointsResponse {
+    notify_enabled: bool,
     notification_endpoints: Vec<NotificationEndpoint>,
 }
 
@@ -399,11 +400,29 @@ impl Operation for ListNotificationTargets {
         let span = Span::current();
         let _enter = span.enter();
         authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+        refresh_persisted_module_switches_from_store().await.map_err(|err| {
+            warn!(
+                event = EVENT_ADMIN_REQUEST_FAILED,
+                component = LOG_COMPONENT_ADMIN_API,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION_TARGET,
+                operation = "list_targets",
+                result = "failed",
+                reason = "module_switch_refresh_failed",
+                error = %err,
+                "admin request failed"
+            );
+            s3_error!(InternalError, "failed to refresh notification module state")
+        })?;
+        let notify_enabled = refresh_notify_module_enabled();
         let (ns, config) = load_notification_config_snapshot().await?;
         let runtime_statuses = collect_runtime_statuses(ns.get_target_values().await).await;
         let notification_endpoints = merge_notification_endpoints(&config, runtime_statuses)?;
 
-        let data = serde_json::to_vec(&NotificationEndpointsResponse { notification_endpoints }).map_err(|e| {
+        let data = serde_json::to_vec(&NotificationEndpointsResponse {
+            notify_enabled,
+            notification_endpoints,
+        })
+        .map_err(|e| {
             log_notification_target_request_failed!("list_targets", "serialize_targets_failed", None, None, e);
             s3_error!(InternalError, "failed to serialize targets: {}", e)
         })?;
@@ -536,6 +555,32 @@ mod tests {
             NOTIFY_WEBHOOK_SUB_SYS
         );
         assert!(notification_target_subsystem("webhook").is_err());
+    }
+
+    #[test]
+    fn notification_endpoints_response_includes_required_module_state() {
+        let response = NotificationEndpointsResponse {
+            notify_enabled: true,
+            notification_endpoints: vec![NotificationEndpoint {
+                account_id: "primary".to_string(),
+                service: "webhook".to_string(),
+                status: "online".to_string(),
+                source: TargetEndpointSource::Config,
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).expect("notification target response should serialize"),
+            serde_json::json!({
+                "notify_enabled": true,
+                "notification_endpoints": [{
+                    "account_id": "primary",
+                    "service": "webhook",
+                    "status": "online",
+                    "source": "config"
+                }]
+            })
+        );
     }
 
     #[test]
@@ -947,6 +992,22 @@ mod tests {
         assert!(
             list_block.contains("authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
             "notification target list should require GetBucketTargetAction"
+        );
+        let authorize_index = list_block
+            .find("authorize_notification_admin_request")
+            .expect("target list should authorize the request");
+        let refresh_index = list_block
+            .find("refresh_persisted_module_switches_from_store().await.map_err")
+            .expect("target list should fail when persisted module state cannot be refreshed");
+        let effective_state_index = list_block
+            .find("let notify_enabled = refresh_notify_module_enabled();")
+            .expect("target list should resolve the effective env and persisted module state");
+        let load_index = list_block
+            .find("load_notification_config_snapshot().await?")
+            .expect("target list should load notification config");
+        assert!(
+            authorize_index < refresh_index && refresh_index < effective_state_index && effective_state_index < load_index,
+            "target list should authorize, refresh persisted state, resolve effective state, then load targets"
         );
         assert!(
             arns_block.contains("authorize_notification_admin_request(&req, AdminAction::GetBucketTargetAction).await?;"),
