@@ -187,6 +187,19 @@ fn validate_tier_mutation_payload_len(phase: TierMutationRpcPhase, payload_len: 
     Ok(())
 }
 
+fn tier_mutation_phase_label(phase: TierMutationRpcPhase) -> &'static str {
+    match phase {
+        TierMutationRpcPhase::Prepare => "prepare",
+        TierMutationRpcPhase::Commit => "commit",
+        TierMutationRpcPhase::Abort => "abort",
+        _ => "unknown",
+    }
+}
+
+fn tier_mutation_control_status_error(phase: TierMutationRpcPhase, status: tonic::Status) -> Error {
+    Error::other(format!("peer tier mutation {} RPC failed: {status}", tier_mutation_phase_label(phase)))
+}
+
 impl PeerRestClient {
     fn recovery_monitor_span(grid_host: &str) -> tracing::Span {
         tracing::info_span!(
@@ -864,7 +877,11 @@ impl PeerRestClient {
                             canonical_payload: canonical_payload.clone(),
                         });
                         set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-                        client.prepare_tier_mutation(request).await?.into_inner()
+                        client
+                            .prepare_tier_mutation(request)
+                            .await
+                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .into_inner()
                     }
                     TierMutationRpcPhase::Commit => {
                         let mut request = Request::new(TierMutationCommitRequest {
@@ -873,7 +890,11 @@ impl PeerRestClient {
                             canonical_payload: canonical_payload.clone(),
                         });
                         set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-                        client.commit_tier_mutation(request).await?.into_inner()
+                        client
+                            .commit_tier_mutation(request)
+                            .await
+                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .into_inner()
                     }
                     TierMutationRpcPhase::Abort => {
                         let mut request = Request::new(TierMutationAbortRequest {
@@ -882,7 +903,11 @@ impl PeerRestClient {
                             canonical_payload: canonical_payload.clone(),
                         });
                         set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-                        client.abort_tier_mutation(request).await?.into_inner()
+                        client
+                            .abort_tier_mutation(request)
+                            .await
+                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .into_inner()
                     }
                     _ => return Err(Error::other("tier mutation rpc phase is unsupported")),
                 };
@@ -1755,6 +1780,32 @@ mod tests {
         );
         validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 0).expect("empty abort payload should fit");
         assert!(validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 1).is_err());
+    }
+
+    #[test]
+    fn tier_mutation_rpc_status_matrix_fails_closed_for_old_or_unresponsive_peers() {
+        for (phase, label) in [
+            (TierMutationRpcPhase::Prepare, "prepare"),
+            (TierMutationRpcPhase::Commit, "commit"),
+            (TierMutationRpcPhase::Abort, "abort"),
+        ] {
+            for status in [
+                tonic::Status::unimplemented("old peer has no tier mutation control service"),
+                tonic::Status::deadline_exceeded("peer tier mutation control timed out"),
+                tonic::Status::unavailable("peer tier mutation control unavailable"),
+            ] {
+                let err = tier_mutation_control_status_error(phase, status);
+                let rendered = err.to_string();
+                assert!(rendered.contains(&format!("peer tier mutation {label} RPC failed")), "{rendered}");
+                assert!(
+                    rendered.contains("old peer")
+                        || rendered.contains("timed out")
+                        || rendered.contains("unavailable")
+                        || rendered.contains("Unavailable"),
+                    "{rendered}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
