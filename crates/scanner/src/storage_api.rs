@@ -27,6 +27,8 @@ pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::{
     Event as EcstoreEvent, Lifecycle as EcstoreLifecycle, ObjectOpts as EcstoreObjectOpts,
     TRANSITION_COMPLETE as ECSTORE_TRANSITION_COMPLETE, object_opts_from_object_info as ecstore_object_opts_from_object_info,
 };
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys as ecstore_init_bucket_metadata_sys;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
     get_lifecycle_config as ecstore_get_lifecycle_config, get_object_lock_config as ecstore_get_object_lock_config,
     get_replication_config as ecstore_get_replication_config,
@@ -62,8 +64,8 @@ pub(crate) use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError,
 pub(crate) use rustfs_ecstore::api::disk::{
     BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes, Disk as EcstoreDisk, DiskAPI as EcstoreDiskAPI,
     DiskInfo as EcstoreDiskInfo, DiskInfoOptions as EcstoreDiskInfoOptions, DiskLocation as EcstoreDiskLocation,
-    RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE as ECSTORE_STORAGE_FORMAT_FILE,
-    ScanGuard as EcstoreScanGuard,
+    NsScannerOpenRequest as EcstoreNsScannerOpenRequest, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
+    STORAGE_FORMAT_FILE as ECSTORE_STORAGE_FORMAT_FILE, ScanGuard as EcstoreScanGuard,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
@@ -72,6 +74,12 @@ pub(crate) use rustfs_ecstore::api::disk::{
 pub(crate) use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
 };
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::layout::{
+    EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
 pub(crate) use rustfs_ecstore::api::runtime::{
     expiry_state_handle as ecstore_expiry_state_handle, global_tier_config_mgr as ecstore_get_global_tier_config_mgr,
     object_store_handle as ecstore_resolve_object_store_handle, setup_is_erasure as ecstore_is_erasure,
@@ -79,30 +87,39 @@ pub(crate) use rustfs_ecstore::api::runtime::{
 };
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx;
 pub(crate) use rustfs_ecstore::api::tier::tier_config::TierConfig as EcstoreTierConfig;
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
-    pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete};
+    pub(crate) use super::storage_contracts::{
+        HTTPPreconditions, HTTPRangeSpec, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,
+    };
 
     pub(crate) use super::{
         ECSTORE_BUCKET_META_PREFIX, ECSTORE_RUSTFS_META_BUCKET, ECSTORE_STORAGE_FORMAT_FILE, ECSTORE_STORAGECLASS_RRS,
         ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys,
         EcstoreDisk, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskInfo, EcstoreDiskInfoOptions,
         EcstoreDiskLocation, EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc,
-        EcstoreLifecycle, EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
-        EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
-        EcstoreTierConfig, EcstoreVersioningApi, ScannerReplicationHealObject, ScannerReplicationHealResult,
-        ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle,
-        ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
-        ecstore_get_replication_config, ecstore_is_erasure, ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket,
-        ecstore_list_path_raw, ecstore_object_opts_from_object_info, ecstore_path2_bucket_object,
-        ecstore_path2_bucket_object_with_base_path, ecstore_read_config, ecstore_replace_bucket_usage_memory_from_info,
-        ecstore_resolve_object_store_handle, ecstore_save_config, scanner_replication_config_for_lifecycle_eval,
+        EcstoreLifecycle, EcstoreListPathRawOptions, EcstoreNsScannerOpenRequest, EcstoreObjectOpts,
+        EcstoreReplicationConfigurationExt, EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard,
+        EcstoreSetDisks, EcstoreStorageError, EcstoreStore, EcstoreTierConfig, EcstoreVersioningApi,
+        ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
+        ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr,
+        ecstore_get_lifecycle_config, ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_is_erasure,
+        ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw,
+        ecstore_object_opts_from_object_info, ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path,
+        ecstore_read_config, ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle,
+        ecstore_save_config, scanner_replication_config_for_lifecycle_eval,
     };
 
     #[cfg(test)]
-    pub(crate) use super::{EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, ecstore_config_init, ecstore_new_disk};
+    pub(crate) use super::{
+        EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
+        EcstoreInstanceContext, EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+    };
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -244,11 +261,14 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
-    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, NamespaceLocking};
+    pub use super::storage_contracts::SCANNER_ACTIVITY_PROTOCOL_VERSION;
+    pub(crate) use super::storage_contracts::{
+        BucketOperations, BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+    };
 }
 
 pub(crate) mod scanner_io {
-    pub(crate) use super::storage_contracts::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
+    pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
 }

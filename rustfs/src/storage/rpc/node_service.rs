@@ -174,11 +174,31 @@ fn validate_admin_heal_control_start(request: &rustfs_common::heal_channel::Heal
     Ok(())
 }
 
-fn scanner_activity_response(namespace_generation: u64) -> ScannerActivityResponse {
+fn scanner_activity_response(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+) -> ScannerActivityResponse {
     ScannerActivityResponse {
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
         namespace_generation,
         maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+        topology_digest: topology_digest.to_vec().into(),
+        data_movement_active,
+        response_proof: Bytes::new(),
+    }
+}
+
+fn legacy_scanner_activity_response(namespace_generation: u64) -> ScannerActivityResponse {
+    ScannerActivityResponse {
+        instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        namespace_generation,
+        maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        protocol_version: rustfs_storage_api::SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+        topology_digest: Bytes::new(),
+        data_movement_active: false,
+        response_proof: Bytes::new(),
     }
 }
 
@@ -1594,12 +1614,34 @@ impl Node for NodeService {
 
     async fn scanner_activity(
         &self,
-        _request: Request<ScannerActivityRequest>,
+        request: Request<ScannerActivityRequest>,
     ) -> Result<Response<ScannerActivityResponse>, Status> {
         let store = self
             .resolve_object_store()
             .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
-        Ok(Response::new(scanner_activity_response(store.scanner_namespace_mutation_generation())))
+        let request = request.into_inner();
+        if request.challenge.is_empty() {
+            // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers send an empty activity request. Remove after every supported peer implements authenticated scanner activity protocol v4.
+            return Ok(Response::new(legacy_scanner_activity_response(
+                store.scanner_namespace_mutation_generation(),
+            )));
+        }
+        let challenge: [u8; 16] = request
+            .challenge
+            .as_ref()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("scanner activity challenge must be 16 bytes"))?;
+        let mut response = scanner_activity_response(
+            store.scanner_namespace_mutation_generation(),
+            rustfs_scanner::scanner_topology_digest(store.as_ref()),
+            store.scanner_data_movement_active().await,
+        );
+        let canonical = rustfs_protos::canonical_scanner_activity_response_body(&challenge, &response)
+            .map_err(|_| Status::internal("scanner activity response is too large to authenticate"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&canonical)
+            .map_err(|_| Status::unavailable("scanner activity response authentication is unavailable"))?
+            .into();
+        Ok(Response::new(response))
     }
 
     async fn background_heal_status(
@@ -1858,9 +1900,10 @@ mod tests {
         CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService,
         PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
         STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
-        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, make_heal_control_server,
-        make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server_for_context,
-        remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
+        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, legacy_scanner_activity_response,
+        make_heal_control_server, make_heal_control_server_with_cache, make_server,
+        make_tier_mutation_control_server_for_context, remove_heal_control_replay, scanner_activity_response,
+        stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
@@ -4213,7 +4256,9 @@ mod tests {
         let service = create_test_node_service();
 
         let err = service
-            .scanner_activity(Request::new(ScannerActivityRequest {}))
+            .scanner_activity(Request::new(ScannerActivityRequest {
+                challenge: vec![7; 16].into(),
+            }))
             .await
             .expect_err("activity queries must fail closed before storage is initialized");
 
@@ -4222,11 +4267,25 @@ mod tests {
 
     #[test]
     fn test_scanner_activity_response_uses_process_epoch_and_generations() {
-        let response = scanner_activity_response(17);
+        let response = scanner_activity_response(17, [7; 32], true);
 
         assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
         assert_eq!(response.namespace_generation, 17);
         assert_eq!(response.maintenance_generation, rustfs_scanner::scanner_maintenance_generation());
+        assert_eq!(response.protocol_version, rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION);
+        assert_eq!(response.topology_digest.as_ref(), &[7; 32]);
+        assert!(response.data_movement_active);
+    }
+
+    #[test]
+    fn test_legacy_scanner_activity_response_omits_extended_fields() {
+        let response = legacy_scanner_activity_response(17);
+
+        assert_eq!(response.namespace_generation, 17);
+        assert_eq!(response.protocol_version, rustfs_storage_api::SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION);
+        assert!(response.topology_digest.is_empty());
+        assert!(!response.data_movement_active);
+        assert!(response.response_proof.is_empty());
     }
 
     #[tokio::test]

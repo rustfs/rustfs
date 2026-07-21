@@ -19,7 +19,8 @@ use http::{HeaderMap, Version};
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
+    INTERNODE_OPERATION_WALK_DIR,
 };
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_opt_u64, get_env_opt_usize};
@@ -43,6 +44,7 @@ use tracing::{error, warn};
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
+const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const HTTP_VERSION_09_LABEL: &str = "http/0.9";
 const HTTP_VERSION_10_LABEL: &str = "http/1.0";
 const HTTP_VERSION_11_LABEL: &str = "http/1.1";
@@ -1120,6 +1122,7 @@ fn internode_rpc_operation(url: &str) -> Option<&'static str> {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
         PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
+        NS_SCANNER_PATH => Some(INTERNODE_OPERATION_NS_SCANNER),
         _ => None,
     }
 }
@@ -1769,6 +1772,10 @@ mod tests {
         assert_eq!(
             internode_rpc_operation(&format!("http://node:9000{WALK_DIR_PATH}?disk=d")),
             Some(INTERNODE_OPERATION_WALK_DIR)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{NS_SCANNER_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_NS_SCANNER)
         );
         assert_eq!(internode_rpc_operation("http://node:9000/rustfs/rpc/unknown"), None);
         assert_eq!(

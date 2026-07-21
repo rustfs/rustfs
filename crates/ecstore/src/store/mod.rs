@@ -322,6 +322,11 @@ impl ECStore {
     pub fn scanner_namespace_mutation_generation(&self) -> u64 {
         list_objects::scanner_namespace_mutation_generation()
     }
+
+    pub async fn scanner_data_movement_active(&self) -> bool {
+        let (decommission, rebalance) = tokio::join!(self.is_decommission_running(), self.is_rebalance_started());
+        decommission || rebalance
+    }
 }
 
 // impl Clone for ECStore {

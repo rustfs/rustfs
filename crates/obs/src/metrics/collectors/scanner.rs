@@ -44,8 +44,9 @@ use crate::metrics::schema::scanner::{
     SCANNER_LAST_CYCLE_THROTTLE_SLEEP_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_THROTTLE_SLEEP_EVENTS_MD,
     SCANNER_LAST_CYCLE_USAGE_SAVES_MD, SCANNER_LAST_CYCLE_YIELD_DURATION_SECONDS_MD, SCANNER_LAST_CYCLE_YIELD_EVENTS_MD,
     SCANNER_OBJECTS_SCANNED_MD, SCANNER_OLDEST_ACTIVE_PATH_AGE_SECONDS_MD, SCANNER_PARTIAL_CYCLES_BY_REASON_MD,
-    SCANNER_PARTIAL_CYCLES_MD, SCANNER_THROTTLE_IDLE_MODE_ENABLED_MD, SCANNER_THROTTLE_MAX_SLEEP_SECONDS_MD,
-    SCANNER_THROTTLE_SLEEP_FACTOR_MD, SCANNER_VERSIONS_SCANNED_MD, SCANNER_YIELD_EVERY_N_OBJECTS_MD,
+    SCANNER_PARTIAL_CYCLES_MD, SCANNER_SUPERSEDED_CYCLES_MD, SCANNER_THROTTLE_IDLE_MODE_ENABLED_MD,
+    SCANNER_THROTTLE_MAX_SLEEP_SECONDS_MD, SCANNER_THROTTLE_SLEEP_FACTOR_MD, SCANNER_VERSIONS_SCANNED_MD,
+    SCANNER_YIELD_EVERY_N_OBJECTS_MD,
 };
 
 /// Scanner statistics.
@@ -139,7 +140,7 @@ pub struct ScannerStats {
     pub current_cycle_usage_saves: u64,
     /// Current scanner mode: 0 unknown or idle, 1 normal, 2 deep bitrot scan
     pub current_scan_mode: u64,
-    /// Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial
+    /// Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded
     pub last_cycle_result: u64,
     /// Last scanner partial cycle reason: 0 unknown, 1 runtime, 2 objects, 3 directories
     pub last_cycle_partial_reason: u64,
@@ -177,6 +178,8 @@ pub struct ScannerStats {
     pub last_cycle_usage_saves: u64,
     /// Number of scanner cycles that failed since server start
     pub failed_cycles: u64,
+    /// Number of scanner cycles superseded by concurrent namespace activity
+    pub superseded_cycles: u64,
     /// Number of scanner cycles stopped by runtime budget since server start
     pub partial_cycles: u64,
     /// Number of scanner cycles stopped by an unknown budget reason
@@ -318,6 +321,7 @@ pub fn collect_scanner_metrics(stats: &ScannerStats) -> Vec<PrometheusMetric> {
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_REPLICATION_CHECKS_MD, stats.last_cycle_replication_checks as f64),
         PrometheusMetric::from_descriptor(&SCANNER_LAST_CYCLE_USAGE_SAVES_MD, stats.last_cycle_usage_saves as f64),
         PrometheusMetric::from_descriptor(&SCANNER_FAILED_CYCLES_MD, stats.failed_cycles as f64),
+        PrometheusMetric::from_descriptor(&SCANNER_SUPERSEDED_CYCLES_MD, stats.superseded_cycles as f64),
         PrometheusMetric::from_descriptor(&SCANNER_PARTIAL_CYCLES_MD, stats.partial_cycles as f64),
         PrometheusMetric::from_descriptor(&SCANNER_PARTIAL_CYCLES_BY_REASON_MD, stats.partial_cycles_unknown as f64)
             .with_label("reason", "unknown"),
@@ -405,6 +409,7 @@ mod tests {
             last_cycle_replication_checks: 12,
             last_cycle_usage_saves: 9,
             failed_cycles: 3,
+            superseded_cycles: 5,
             partial_cycles: 10,
             partial_cycles_unknown: 1,
             partial_cycles_runtime: 2,
@@ -415,7 +420,7 @@ mod tests {
         let metrics = collect_scanner_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 68);
+        assert_eq!(metrics.len(), 69);
 
         let objects = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(objects.is_some());
@@ -707,6 +712,11 @@ mod tests {
             .iter()
             .find(|m| m.name == SCANNER_FAILED_CYCLES_MD.get_full_metric_name());
         assert_eq!(failed_cycles.map(|m| m.value), Some(3.0));
+
+        let superseded_cycles = metrics
+            .iter()
+            .find(|m| m.name == SCANNER_SUPERSEDED_CYCLES_MD.get_full_metric_name());
+        assert_eq!(superseded_cycles.map(|m| m.value), Some(5.0));
 
         let partial_cycles = metrics
             .iter()

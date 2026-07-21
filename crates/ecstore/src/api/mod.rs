@@ -240,11 +240,12 @@ pub mod config {
     pub mod com {
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
-            ServerConfigCorruptError, delete_config, is_server_config_corrupt_error, lookup_configs, read_config,
-            read_config_no_lock, read_config_with_metadata, read_config_without_migrate, read_config_without_migrate_no_lock,
-            read_existing_server_config_no_lock, save_config, save_config_no_lock, save_config_with_opts, save_server_config,
-            save_server_config_no_lock, try_migrate_server_config, with_config_object_read_lock, with_config_object_write_lock,
-            with_server_config_read_lock, with_server_config_write_lock,
+            ServerConfigCorruptError, ServerConfigSnapshot, delete_config, is_server_config_corrupt_error, lookup_configs,
+            read_config, read_config_no_lock, read_config_with_metadata, read_config_without_migrate,
+            read_config_without_migrate_no_lock, read_existing_server_config_no_lock, read_server_config_snapshot, save_config,
+            save_config_no_lock, save_config_with_opts, save_server_config, save_server_config_no_lock,
+            save_server_config_snapshot, server_config_path, try_migrate_server_config, with_config_object_read_lock,
+            with_config_object_write_lock, with_server_config_read_lock, with_server_config_write_lock,
         };
     }
 
@@ -282,9 +283,9 @@ pub mod disk {
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
         CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, OldCurrentSize, RUSTFS_META_BUCKET, ReadMultipleReq,
-        ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        new_disk, validate_batch_read_version_item_count,
+        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize, RUSTFS_META_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo,
+        WalkDirOptions, new_disk, validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
@@ -385,12 +386,12 @@ pub mod rio {
 
 pub mod rpc {
     pub use crate::cluster::rpc::{
-        LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
-        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor,
-        gen_signature_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
-        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
-        sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
-        verify_tonic_rpc_signature,
+        LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, S3PeerSys,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerPeerActivity,
+        TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
+        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
+        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature,
+        verify_tonic_canonical_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
     };
 }
 

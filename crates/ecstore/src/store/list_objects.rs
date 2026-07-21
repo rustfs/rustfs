@@ -617,7 +617,7 @@ pub(super) fn scanner_namespace_mutation_generation() -> u64 {
     SCANNER_NAMESPACE_MUTATION_GENERATION.load(Ordering::Acquire)
 }
 
-pub(super) fn observe_scanner_namespace_mutations(bucket: &str, delta: u64) {
+pub(crate) fn observe_scanner_namespace_mutations(bucket: &str, delta: u64) {
     if bucket == RUSTFS_META_BUCKET {
         return;
     }

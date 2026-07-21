@@ -27,6 +27,7 @@
 //! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-r5qv-rc46-hv8q>
 
 use crate::cluster::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
+use crate::storage_api_contracts::internode::NS_SCANNER_PROTOCOL_VERSION;
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
@@ -59,6 +60,7 @@ const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
 const MAX_REPLAY_PROTECTED_NONCES: usize = 65_536;
+const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
 
@@ -199,6 +201,42 @@ fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, si
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     mac.verify_slice(&signature).is_ok()
+}
+
+fn update_ns_scanner_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid) {
+    mac.update(NS_SCANNER_CAPABILITY_AUTH_DOMAIN);
+    mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
+    mac.update(challenge.as_bytes());
+    mac.update(server_epoch.as_bytes());
+}
+
+fn generate_ns_scanner_capability_proof(secret: &str, challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
+    if challenge.is_nil() || server_epoch.is_nil() {
+        return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
+    }
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn verify_ns_scanner_capability_proof(secret: &str, challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
+    if challenge.is_nil() || server_epoch.is_nil() {
+        return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
+    }
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    update_ns_scanner_capability_mac(&mut mac, challenge, server_epoch);
+    mac.verify_slice(proof)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Invalid namespace scanner capability proof"))
+}
+
+pub fn sign_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
+    generate_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch)
+}
+
+pub fn verify_ns_scanner_capability(challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
+    verify_ns_scanner_capability_proof(&get_shared_secret()?, challenge, server_epoch, proof)
 }
 
 #[derive(Clone, Copy)]
@@ -591,6 +629,20 @@ mod tests {
 
     fn ensure_test_rpc_secret() {
         runtime_sources::ensure_test_rpc_secret();
+    }
+
+    #[test]
+    fn namespace_scanner_capability_proof_binds_challenge_and_server_epoch() {
+        let secret = "test-scanner-capability-secret";
+        let challenge = Uuid::new_v4();
+        let server_epoch = Uuid::new_v4();
+        let proof =
+            generate_ns_scanner_capability_proof(secret, challenge, server_epoch).expect("capability proof should be generated");
+
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, server_epoch, &proof).is_ok());
+        assert!(verify_ns_scanner_capability_proof(secret, Uuid::new_v4(), server_epoch, &proof).is_err());
+        assert!(verify_ns_scanner_capability_proof(secret, challenge, Uuid::new_v4(), &proof).is_err());
+        assert!(verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof).is_err());
     }
 
     /// Security regression for GHSA-r5qv-rc46-hv8q (internode RPC fail-closed,

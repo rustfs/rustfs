@@ -416,7 +416,7 @@ pub static SCANNER_CURRENT_SCAN_MODE_MD: LazyLock<MetricDescriptor> = LazyLock::
 pub static SCANNER_LAST_CYCLE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerLastCycleResult,
-        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial.",
+        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded.",
         &[],
         subsystems::SCANNER,
     )
@@ -579,6 +579,15 @@ pub static SCANNER_FAILED_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(
     new_counter_md(
         MetricName::ScannerFailedCycles,
         "Total number of scanner cycles that failed since server start.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_SUPERSEDED_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::ScannerSupersededCycles,
+        "Total number of clean scanner cycles superseded by concurrent cluster, configuration, topology, or namespace activity since server start.",
         &[],
         subsystems::SCANNER,
     )

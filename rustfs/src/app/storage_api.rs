@@ -110,13 +110,6 @@ pub(crate) mod data_usage {
         )
         .await;
     }
-
-    pub(crate) async fn remove_bucket_usage_from_backend(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        bucket: &str,
-    ) -> Result<(), crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::remove_bucket_usage_from_backend(store, bucket).await
-    }
 }
 
 pub(crate) mod runtime {
@@ -952,7 +945,7 @@ pub(crate) mod bucket_usecase {
         }
     }
 
-    pub(crate) use super::{access, bucket, data_usage, error, helper, object_utils, request_context, s3_api};
+    pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3_api};
     pub(crate) use crate::storage::storage_api::{
         ECStore, StorageObjectInfo, get_validated_store, process_lambda_configurations, process_queue_configurations,
         process_topic_configurations, validate_list_object_unordered_with_delimiter,

@@ -1077,8 +1077,11 @@ pub struct SignalServiceResponse {
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ScannerActivityRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScannerActivityRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub challenge: ::prost::bytes::Bytes,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerActivityResponse {
     #[prost(string, tag = "1")]
@@ -1087,6 +1090,14 @@ pub struct ScannerActivityResponse {
     pub namespace_generation: u64,
     #[prost(uint64, tag = "3")]
     pub maintenance_generation: u64,
+    #[prost(uint32, tag = "4")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub topology_digest: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "6")]
+    pub data_movement_active: bool,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub response_proof: ::prost::bytes::Bytes,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusRequest {}

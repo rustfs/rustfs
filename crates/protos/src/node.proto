@@ -758,12 +758,18 @@ message SignalServiceResponse {
   optional string error_info = 2;
 }
 
-message ScannerActivityRequest {}
+message ScannerActivityRequest {
+  bytes challenge = 1;
+}
 
 message ScannerActivityResponse {
   string instance_id = 1;
   uint64 namespace_generation = 2;
   uint64 maintenance_generation = 3;
+  uint32 protocol_version = 4;
+  bytes topology_digest = 5;
+  bool data_movement_active = 6;
+  bytes response_proof = 7;
 }
 
 message BackgroundHealStatusRequest {}

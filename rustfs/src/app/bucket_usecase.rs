@@ -47,7 +47,6 @@ use super::storage_api::bucket_usecase::contract::bucket::{
 use super::storage_api::bucket_usecase::contract::list::{
     ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _,
 };
-use super::storage_api::bucket_usecase::data_usage::remove_bucket_usage_from_backend;
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::bucket_usecase::object_utils::to_s3s_etag;
@@ -1218,12 +1217,8 @@ impl DefaultBucketUsecase {
         // Invalidate bucket validation cache
         crate::storage::invalidate_bucket_validation_cache(&input.bucket);
 
-        // Re-evaluate lifecycle/replication after bucket removal and keep an
-        // absent-bucket dirty marker until a complete usage snapshot is durable.
+        // Re-evaluate lifecycle and replication after bucket removal.
         rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
-        if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
-            warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");
-        }
 
         if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");

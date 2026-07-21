@@ -212,9 +212,17 @@ pub(crate) mod rpc_consumer {
     pub(crate) mod http_service {
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::WALK_DIR_BODY_SHA256_QUERY;
-        pub(crate) use super::super::storage_contracts::WALK_DIR_STREAM_COMPLETION_V1;
-        pub(crate) use super::super::{StorageDiskRpcExt, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature};
+        pub(crate) use super::super::storage_contracts::{
+            NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY,
+            NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
+            NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, WALK_DIR_BODY_SHA256_QUERY,
+        };
+        pub(crate) use super::super::storage_contracts::{
+            NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, WALK_DIR_STREAM_COMPLETION_V1,
+        };
+        pub(crate) use super::super::{
+            StorageDiskRpcExt, WalkDirOptions, find_local_disk_by_ref, sign_ns_scanner_capability, verify_rpc_signature,
+        };
     }
 
     pub(crate) mod node_service {
@@ -400,7 +408,7 @@ pub(crate) mod ecstore_data_usage {
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_data_usage_from_backend,
         load_data_usage_from_backend_cached, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
         record_bucket_object_version_write_memory, record_bucket_object_write_memory,
-        record_bucket_object_write_unknown_previous_memory, remove_bucket_usage_from_backend, store_compression_total_in_backend,
+        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
@@ -480,7 +488,8 @@ pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
         LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
-        sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
+        sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest,
+        verify_tonic_rpc_signature,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -1454,6 +1463,10 @@ pub(crate) async fn collect_local_metrics(
 
 pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &http::HeaderMap) -> std::io::Result<()> {
     ecstore_rpc::verify_rpc_signature(url, method, headers)
+}
+
+pub(crate) fn sign_ns_scanner_capability(challenge: uuid::Uuid, server_epoch: uuid::Uuid) -> std::io::Result<Vec<u8>> {
+    ecstore_rpc::sign_ns_scanner_capability(challenge, server_epoch)
 }
 
 pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &http::HeaderMap) -> std::io::Result<()> {

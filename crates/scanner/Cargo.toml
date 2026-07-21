@@ -32,6 +32,7 @@ workspace = true
 [dependencies]
 rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
+rustfs-credentials = { workspace = true }
 rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync", "time", "macros", "rt-multi-thread"] }
 tracing = { workspace = true }
@@ -43,6 +44,8 @@ futures = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 rmp-serde = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 rustfs-filemeta = { workspace = true }
 tokio-util = { workspace = true, features = ["io", "compat"] }
 rustfs-ecstore = { workspace = true }
@@ -52,11 +55,15 @@ rand = { workspace = true, features = ["serde"] }
 s3s = { workspace = true, features = ["minio"] }
 metrics = { workspace = true }
 rustfs-data-usage = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde", "fast-rng"] }
+bytes.workspace = true
+hex-simd.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true }
+tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via

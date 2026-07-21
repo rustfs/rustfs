@@ -154,6 +154,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
         last_cycle_replication_checks: metrics.last_cycle_replication_checks,
         last_cycle_usage_saves: metrics.last_cycle_usage_saves,
         failed_cycles: metrics.failed_cycles,
+        superseded_cycles: metrics.superseded_cycles,
         partial_cycles_unknown: metrics.partial_cycles_unknown,
         partial_cycles_runtime: metrics.partial_cycles_runtime,
         partial_cycles_objects: metrics.partial_cycles_objects,
@@ -796,6 +797,7 @@ mod test {
             last_cycle_replication_checks: 27,
             last_cycle_usage_saves: 28,
             failed_cycles: 29,
+            superseded_cycles: 30,
             partial_cycles_unknown: 30,
             partial_cycles_runtime: 31,
             partial_cycles_objects: 32,
@@ -927,6 +929,7 @@ mod test {
         assert_eq!(scanner.last_cycle_replication_checks, 27);
         assert_eq!(scanner.last_cycle_usage_saves, 28);
         assert_eq!(scanner.failed_cycles, 29);
+        assert_eq!(scanner.superseded_cycles, 30);
         assert_eq!(scanner.partial_cycles_unknown, 30);
         assert_eq!(scanner.partial_cycles_runtime, 31);
         assert_eq!(scanner.partial_cycles_objects, 32);

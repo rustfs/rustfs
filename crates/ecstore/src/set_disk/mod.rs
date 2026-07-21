@@ -9301,6 +9301,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_level_if_none_match_fails_closed_without_read_quorum() {
+        let set_disks = make_local_bucket_test_set_disks_with_drive_count(4).await;
+        let bucket = "bucket-write-precondition-quorum";
+        let object = "existing-object.txt";
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created before disk loss");
+        let mut reader = PutObjReader::from_vec(b"existing object body".to_vec());
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("object should be written before disk loss");
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[1..].fill(None);
+        }
+
+        let create_only = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = set_disks.check_write_precondition(bucket, object, &create_only).await;
+        assert!(
+            matches!(result, Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))),
+            "expected read-quorum failure, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn set_level_versioned_delete_marker_hides_object_without_corrupting_version_metadata() {
         let set_disks = make_local_bucket_test_set_disks_with_drive_count(4).await;
         let bucket = "bucket-versioned-delete";

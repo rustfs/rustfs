@@ -17,7 +17,10 @@ use std::future::Future;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::ScannerObjectIO;
-use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
+use crate::data_usage_define::{
+    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DataUsageCache, DataUsageCacheRevision,
+    read_config_with_revision,
+};
 use crate::runtime_config::{
     ScannerRuntimeConfig, ScannerRuntimeConfigSource, refresh_scanner_runtime_config_from_global, scanner_bitrot_cycle,
     scanner_cycle_interval, scanner_runtime_config_changed, scanner_runtime_config_generation, scanner_start_delay,
@@ -31,11 +34,12 @@ use crate::scanner_io::{
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
     CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
-    emit_scan_cycle_partial_with_source, global_metrics,
+    emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
@@ -45,16 +49,20 @@ use rustfs_config::{
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::storage_api::scan::{BucketOperations, BucketOptions, NamespaceLocking as _};
+use crate::storage_api::scan::{
+    BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_PROTOCOL_VERSION,
+};
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
     get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
-    scanner_is_erasure_sd,
+    save_config_shared_with_preconditions, save_config_with_preconditions, scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -69,12 +77,35 @@ const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total
 const CLEAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
+const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 const MAINTENANCE_FEATURE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_FEATURE_INSPECTION_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAINTENANCE_FEATURE_INSPECTION_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MAX_MAINTENANCE_FEATURE_INSPECTION_ATTEMPTS: usize = 2;
+const SCANNER_PERSIST_CAS_RETRIES: usize = 2;
+const SCANNER_CYCLE_STATE_MAGIC: &[u8; 8] = b"RSCYC001";
+const SCANNER_CYCLE_STATE_HEADER_LEN: usize = 24;
 #[cfg(test)]
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
+
+#[derive(Debug, thiserror::Error)]
+enum ScannerCycleStateError {
+    #[error("failed to encode scanner cycle state: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("failed to decode scanner cycle state: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
+    #[error("{0}")]
+    InvalidData(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PersistedUsageFloor {
+    next_cycle: u64,
+    leader_epoch: u64,
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[non_exhaustive]
@@ -233,6 +264,7 @@ pub(crate) enum ScannerCycleOutcome {
     Completed,
     CompletedWithPendingMaintenance,
     Partial,
+    Superseded,
     Failed,
 }
 
@@ -372,13 +404,16 @@ struct ScannerCycleObservedGenerations {
 const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ScannerNodeActivity {
+pub(crate) struct ScannerNodeActivity {
     instance_id: String,
     namespace_generation: u64,
     maintenance_generation: u64,
+    protocol_version: u32,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
 }
 
-type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
+pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerActivityObservation {
@@ -709,13 +744,76 @@ async fn observe_scanner_activity(
     observation
 }
 
-async fn probe_scanner_activity(storeapi: &Arc<ECStore>, distributed: bool) -> Result<ScannerActivitySnapshot, String> {
+pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for (host, activity) in snapshot {
+        let host = host.as_bytes();
+        let instance_id = activity.instance_id.as_bytes();
+        hasher.update(u64::try_from(host.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(host);
+        hasher.update(u64::try_from(instance_id.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(instance_id);
+        hasher.update(activity.namespace_generation.to_be_bytes());
+        hasher.update(activity.maintenance_generation.to_be_bytes());
+        hasher.update(activity.protocol_version.to_be_bytes());
+        hasher.update(activity.topology_digest);
+        hasher.update([u8::from(activity.data_movement_active)]);
+    }
+    hasher.finalize().into()
+}
+
+pub(crate) fn scanner_activity_allows_usage_publication(snapshot: &ScannerActivitySnapshot) -> bool {
+    snapshot.values().all(|activity| !activity.data_movement_active)
+}
+
+pub fn scanner_topology_digest(storeapi: &ECStore) -> [u8; 32] {
+    let endpoint_pools = storeapi.endpoints();
+    let mut hasher = Sha256::new();
+    hasher.update(u64::try_from(endpoint_pools.0.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for (pool_index, pool) in endpoint_pools.0.iter().enumerate() {
+        hasher.update(u64::try_from(pool_index).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(u64::try_from(pool.set_count).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(u64::try_from(pool.drives_per_set).unwrap_or(u64::MAX).to_be_bytes());
+        let mut endpoints = pool.endpoints.as_ref().iter().collect::<Vec<_>>();
+        endpoints.sort_unstable_by(|left, right| {
+            (left.pool_idx, left.set_idx, left.disk_idx, left.url.as_str()).cmp(&(
+                right.pool_idx,
+                right.set_idx,
+                right.disk_idx,
+                right.url.as_str(),
+            ))
+        });
+        hasher.update(u64::try_from(endpoints.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for endpoint in endpoints {
+            hasher.update(endpoint.pool_idx.to_be_bytes());
+            hasher.update(endpoint.set_idx.to_be_bytes());
+            hasher.update(endpoint.disk_idx.to_be_bytes());
+            let url = endpoint.url.as_str().as_bytes();
+            hasher.update(u64::try_from(url.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(url);
+        }
+    }
+    hasher.finalize().into()
+}
+
+pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool) -> Result<ScannerActivitySnapshot, String> {
+    let topology_digest = scanner_topology_digest(storeapi);
+    let data_movement_active = storeapi.scanner_data_movement_active().await;
+    let namespace_generation = storeapi.scanner_namespace_mutation_generation();
+    let maintenance_generation = scanner_maintenance_generation();
+    if namespace_generation == u64::MAX || maintenance_generation == u64::MAX {
+        return Err("local scanner activity generation is exhausted".to_string());
+    }
     let mut snapshot = ScannerActivitySnapshot::from([(
         LOCAL_SCANNER_ACTIVITY_NODE.to_string(),
         ScannerNodeActivity {
             instance_id: crate::scanner_io::scanner_activity_epoch().to_string(),
-            namespace_generation: storeapi.scanner_namespace_mutation_generation(),
-            maintenance_generation: scanner_maintenance_generation(),
+            namespace_generation,
+            maintenance_generation,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest,
+            data_movement_active,
         },
     )]);
     if !distributed {
@@ -730,6 +828,31 @@ async fn probe_scanner_activity(storeapi: &Arc<ECStore>, distributed: bool) -> R
         .await
         .map_err(|err| err.to_string())?;
     for (host, activity) in peers {
+        if activity.namespace_generation == u64::MAX || activity.maintenance_generation == u64::MAX {
+            return Err(format!("scanner activity peer {host} exhausted its activity generation"));
+        }
+        let (peer_topology_digest, peer_data_movement_active) = match activity.protocol_version {
+            SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
+                return Err(format!("scanner activity peer {host} cannot verify data movement publication fencing"));
+            }
+            SCANNER_ACTIVITY_PROTOCOL_VERSION => (
+                activity
+                    .topology_digest
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its storage topology"))?,
+                activity
+                    .data_movement_active
+                    .ok_or_else(|| format!("scanner activity peer {host} omitted its data movement state"))?,
+            ),
+            version => {
+                return Err(format!(
+                    "scanner activity peer {host} uses protocol {version}, expected {}",
+                    SCANNER_ACTIVITY_PROTOCOL_VERSION
+                ));
+            }
+        };
+        if peer_topology_digest != topology_digest {
+            return Err(format!("scanner activity peer {host} has a different storage topology"));
+        }
         if snapshot
             .insert(
                 host.clone(),
@@ -737,6 +860,9 @@ async fn probe_scanner_activity(storeapi: &Arc<ECStore>, distributed: bool) -> R
                     instance_id: activity.instance_id,
                     namespace_generation: activity.namespace_generation,
                     maintenance_generation: activity.maintenance_generation,
+                    protocol_version: activity.protocol_version,
+                    topology_digest: peer_topology_digest,
+                    data_movement_active: peer_data_movement_active,
                 },
             )
             .is_some()
@@ -1400,14 +1526,486 @@ fn get_lock_acquire_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64("RUSTFS_LOCK_ACQUIRE_TIMEOUT", 5))
 }
 
+fn data_usage_persist_timeout() -> Duration {
+    DataUsageCache::persistence_timeout()
+}
+
 async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 }
 
-async fn persist_scanner_cycle_state(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &CurrentCycle) -> bool {
-    let cycle_info_buf = match cycle_info.marshal() {
+fn encode_scanner_cycle_state(cycle_info: &CurrentCycle, leader_epoch: u64) -> Result<Vec<u8>, ScannerCycleStateError> {
+    if cycle_info.next == u64::MAX {
+        return Err(ScannerCycleStateError::InvalidData("scanner cycle counter is exhausted"));
+    }
+    let cycle_info_buf = rmp_serde::to_vec(cycle_info)?;
+    let mut buf = Vec::with_capacity(cycle_info_buf.len() + SCANNER_CYCLE_STATE_HEADER_LEN);
+    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
+    buf.extend_from_slice(SCANNER_CYCLE_STATE_MAGIC);
+    buf.extend_from_slice(&leader_epoch.to_le_bytes());
+    buf.extend_from_slice(&cycle_info_buf);
+    Ok(buf)
+}
+
+fn decode_scanner_cycle_state(buf: &[u8]) -> Result<(CurrentCycle, u64), ScannerCycleStateError> {
+    if buf.len() < 8 {
+        return Err(ScannerCycleStateError::InvalidData("scanner cycle state is truncated"));
+    }
+
+    let persisted_next = u64::from_le_bytes(
+        buf[0..8]
+            .try_into()
+            .map_err(|_| ScannerCycleStateError::InvalidData("scanner cycle counter is truncated"))?,
+    );
+    if persisted_next == u64::MAX {
+        return Err(ScannerCycleStateError::InvalidData("scanner cycle counter is exhausted"));
+    }
+    if buf.len() == 8 {
+        return Ok((
+            CurrentCycle {
+                next: persisted_next,
+                ..Default::default()
+            },
+            0,
+        ));
+    }
+
+    let (leader_epoch, payload) = if buf.len() >= 16 && &buf[8..16] == SCANNER_CYCLE_STATE_MAGIC {
+        if buf.len() < SCANNER_CYCLE_STATE_HEADER_LEN {
+            return Err(ScannerCycleStateError::InvalidData("scanner cycle fencing header is truncated"));
+        }
+        let epoch = u64::from_le_bytes(
+            buf[16..24]
+                .try_into()
+                .map_err(|_| ScannerCycleStateError::InvalidData("scanner leader epoch is truncated"))?,
+        );
+        if epoch == 0 {
+            return Err(ScannerCycleStateError::InvalidData("scanner leader epoch is zero"));
+        }
+        (epoch, &buf[SCANNER_CYCLE_STATE_HEADER_LEN..])
+    } else {
+        (0, &buf[8..])
+    };
+
+    let cycle_info = rmp_serde::from_slice::<CurrentCycle>(payload)?;
+    if cycle_info.next != persisted_next {
+        return Err(ScannerCycleStateError::InvalidData("scanner cycle counter disagrees with encoded state"));
+    }
+    Ok((cycle_info, leader_epoch))
+}
+
+pub(crate) fn decode_persisted_scanner_cycle_fence(buf: &[u8]) -> Result<(u64, u64), ScannerError> {
+    decode_scanner_cycle_state(buf)
+        .map(|(cycle, leader_epoch)| (cycle.next, leader_epoch))
+        .map_err(|err| ScannerError::Other(format!("persisted scanner cycle state is invalid: {err}")))
+}
+
+#[cfg(test)]
+pub(crate) fn encode_scanner_cycle_fence_for_test(next_cycle: u64, leader_epoch: u64) -> Vec<u8> {
+    encode_scanner_cycle_state(
+        &CurrentCycle {
+            next: next_cycle,
+            ..Default::default()
+        },
+        leader_epoch,
+    )
+    .expect("test scanner cycle fence should encode")
+}
+
+pub(crate) async fn current_scanner_leader_epoch() -> Result<u64, ScannerError> {
+    let store = crate::resolve_scanner_object_store_handle()
+        .ok_or_else(|| ScannerError::Other("scanner object layer is unavailable".to_string()))?;
+    match read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await {
+        Ok(buf) => {
+            let (_, leader_epoch) = decode_persisted_scanner_cycle_fence(&buf)?;
+            if leader_epoch == 0 {
+                return Err(ScannerError::Other("persisted scanner cycle state has no leader epoch".to_string()));
+            }
+            Ok(leader_epoch)
+        }
+        Err(err) => Err(ScannerError::Other(format!("failed to read persisted scanner leader epoch: {err}"))),
+    }
+}
+
+fn decode_scanner_cycle_state_for_startup(buf: &[u8]) -> Result<(CurrentCycle, u64), ScannerCycleStateError> {
+    if buf.is_empty() {
+        Ok((CurrentCycle::default(), 0))
+    } else {
+        decode_scanner_cycle_state(buf)
+    }
+}
+
+fn advance_scanner_cycle(cycle_info: &mut CurrentCycle) -> Result<(), ScannerCycleStateError> {
+    let next = cycle_info
+        .next
+        .checked_add(1)
+        .filter(|next| *next < u64::MAX)
+        .ok_or(ScannerCycleStateError::InvalidData("scanner cycle counter is exhausted"))?;
+    cycle_info.next = next;
+    Ok(())
+}
+
+async fn persisted_usage_floor(storeapi: Arc<impl ScannerObjectIO>) -> Result<PersistedUsageFloor, ScannerError> {
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let mut floor = PersistedUsageFloor::default();
+    for path in [DATA_USAGE_OBJ_NAME_PATH.as_str(), backup_path.as_str()] {
+        let data = match read_config(storeapi.clone(), path).await {
+            Ok(data) => data,
+            Err(EcstoreError::ConfigNotFound) => continue,
+            Err(err) => {
+                return Err(ScannerError::Other(format!(
+                    "failed to read scanner usage epoch floor from {path}: {err}"
+                )));
+            }
+        };
+        let usage = serde_json::from_slice::<DataUsageInfo>(&data)
+            .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage floor from {path}: {err}")))?;
+        floor.leader_epoch = floor.leader_epoch.max(usage.scanner_epoch.unwrap_or_default());
+        if let Some(completed_cycle) = usage.scanner_cycle {
+            let next_cycle = completed_cycle
+                .checked_add(1)
+                .filter(|next| *next < u64::MAX)
+                .ok_or_else(|| ScannerError::Other(format!("persisted scanner usage cycle is exhausted in {path}")))?;
+            floor.next_cycle = floor.next_cycle.max(next_cycle);
+        }
+    }
+    Ok(floor)
+}
+
+fn apply_persisted_usage_floor(cycle_info: &mut CurrentCycle, leader_epoch: &mut u64, floor: PersistedUsageFloor) {
+    cycle_info.next = cycle_info.next.max(floor.next_cycle);
+    *leader_epoch = (*leader_epoch).max(floor.leader_epoch);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerLeadershipClaimReconcile {
+    Durable,
+    Changed,
+    Unchanged,
+}
+
+async fn reconcile_scanner_leadership_claim(
+    storeapi: Arc<impl ScannerObjectIO>,
+    attempted: &[u8],
+    previous_revision: &DataUsageCacheRevision,
+    claimed_epoch: u64,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    persisted_epoch: &mut u64,
+) -> Result<ScannerLeadershipClaimReconcile, ScannerError> {
+    let (persisted, persisted_revision) = read_config_with_revision(storeapi, DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to reconcile scanner leadership claim: {err}")))?;
+    let revision_changed = &persisted_revision != previous_revision;
+    *revision = persisted_revision;
+
+    let Some(persisted) = persisted else {
+        *cycle_info = CurrentCycle::default();
+        return Ok(if revision_changed {
+            ScannerLeadershipClaimReconcile::Changed
+        } else {
+            ScannerLeadershipClaimReconcile::Unchanged
+        });
+    };
+    if persisted == attempted {
+        *persisted_epoch = claimed_epoch;
+        return Ok(ScannerLeadershipClaimReconcile::Durable);
+    }
+
+    let (current, epoch) = decode_scanner_cycle_state(&persisted)
+        .map_err(|err| ScannerError::Other(format!("scanner leadership conflict winner is invalid: {err}")))?;
+    *cycle_info = current;
+    *persisted_epoch = (*persisted_epoch).max(epoch);
+    Ok(if revision_changed {
+        ScannerLeadershipClaimReconcile::Changed
+    } else {
+        ScannerLeadershipClaimReconcile::Unchanged
+    })
+}
+
+fn decode_usage_snapshot_for_epoch_fence(data: &[u8], path: &str) -> Result<DataUsageInfo, ScannerError> {
+    serde_json::from_slice(data)
+        .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage epoch fence from {path}: {err}")))
+}
+
+async fn usage_snapshot_for_epoch_fence(
+    storeapi: Arc<impl ScannerObjectIO>,
+    primary: Option<&[u8]>,
+) -> Result<DataUsageInfo, ScannerError> {
+    if let Some(primary) = primary {
+        return decode_usage_snapshot_for_epoch_fence(primary, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    }
+
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let (backup, _) = read_config_with_revision(storeapi, &backup_path)
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to read scanner usage epoch fence backup: {err}")))?;
+    backup
+        .as_deref()
+        .map(|data| decode_usage_snapshot_for_epoch_fence(data, &backup_path))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+async fn fence_scanner_usage_epoch(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
+    claimed_epoch: u64,
+) -> Result<(), ScannerError> {
+    for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
+        if ctx.is_cancelled() {
+            return Err(ScannerError::Other("scanner leadership was cancelled before usage fencing".to_string()));
+        }
+
+        let (primary, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to read scanner usage epoch fence: {err}")))?;
+        let mut usage = usage_snapshot_for_epoch_fence(storeapi.clone(), primary.as_deref()).await?;
+        match usage.scanner_epoch {
+            Some(epoch) if epoch > claimed_epoch => {
+                return Err(ScannerError::Other(format!(
+                    "scanner usage epoch fence lost to newer leader: claimed={claimed_epoch}, persisted={epoch}"
+                )));
+            }
+            Some(epoch) if epoch == claimed_epoch => return Ok(()),
+            Some(_) | None => {}
+        }
+        usage.scanner_epoch = Some(claimed_epoch);
+        let data = serde_json::to_vec(&usage)
+            .map_err(|err| ScannerError::Other(format!("failed to encode scanner usage epoch fence: {err}")))?;
+
+        let save_result =
+            save_config_with_preconditions(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data, revision.preconditions())
+                .await;
+        if save_result
+            .as_ref()
+            .ok()
+            .and_then(|object_info| object_info.etag.as_deref())
+            .is_some_and(|etag| !etag.is_empty())
+        {
+            return Ok(());
+        }
+
+        let (persisted, persisted_revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to reconcile scanner usage epoch fence: {err}")))?;
+        if let Some(persisted) = persisted {
+            let persisted = decode_usage_snapshot_for_epoch_fence(&persisted, DATA_USAGE_OBJ_NAME_PATH.as_str())?;
+            match persisted.scanner_epoch {
+                Some(epoch) if epoch == claimed_epoch => return Ok(()),
+                Some(epoch) if epoch > claimed_epoch => {
+                    return Err(ScannerError::Other(format!(
+                        "scanner usage epoch fence lost to newer leader: claimed={claimed_epoch}, persisted={epoch}"
+                    )));
+                }
+                Some(_) | None => {}
+            }
+        }
+
+        let precondition_failed = matches!(save_result, Err(EcstoreError::PreconditionFailed));
+        if retry < SCANNER_PERSIST_CAS_RETRIES && (precondition_failed || persisted_revision != revision) {
+            continue;
+        }
+        return Err(ScannerError::Other(match save_result {
+            Ok(_) => "scanner usage epoch fence returned no ETag and could not be confirmed".to_string(),
+            Err(err) => format!("scanner usage epoch fence save failed: {err}"),
+        }));
+    }
+
+    Err(ScannerError::Other("scanner usage epoch fence retries exhausted".to_string()))
+}
+
+async fn complete_scanner_leadership_claim(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
+    claimed_epoch: u64,
+) -> bool {
+    if let Err(err) = fence_scanner_usage_epoch(ctx, storeapi, claimed_epoch).await {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            state = "usage_epoch_fence_failed",
+            claimed_epoch,
+            error = %err,
+            "Scanner leadership usage epoch fencing failed"
+        );
+        return false;
+    }
+    !ctx.is_cancelled()
+}
+
+async fn claim_scanner_leadership(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    persisted_epoch: &mut u64,
+) -> bool {
+    for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
+        if ctx.is_cancelled() {
+            return false;
+        }
+        let Some(claimed_epoch) = persisted_epoch.checked_add(1) else {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                state = "leader_epoch_exhausted",
+                "Scanner leadership epoch is exhausted"
+            );
+            return false;
+        };
+        let data = match encode_scanner_cycle_state(cycle_info, claimed_epoch) {
+            Ok(data) => data,
+            Err(err) => {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = "leader_claim_encode_failed",
+                    error = %err,
+                    "Scanner leadership claim encoding failed"
+                );
+                return false;
+            }
+        };
+        let previous_revision = revision.clone();
+
+        let save_result =
+            save_config_with_preconditions(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, data.clone(), revision.preconditions())
+                .await;
+        match save_result {
+            Ok(object_info) => {
+                if let Some(etag) = object_info.etag.filter(|etag| !etag.is_empty()) {
+                    *revision = DataUsageCacheRevision::Etag(etag);
+                    *persisted_epoch = claimed_epoch;
+                    return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch).await;
+                }
+
+                match reconcile_scanner_leadership_claim(
+                    storeapi.clone(),
+                    &data,
+                    &previous_revision,
+                    claimed_epoch,
+                    cycle_info,
+                    revision,
+                    persisted_epoch,
+                )
+                .await
+                {
+                    Ok(ScannerLeadershipClaimReconcile::Durable) => {
+                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch).await;
+                    }
+                    Ok(ScannerLeadershipClaimReconcile::Changed) if retry < SCANNER_PERSIST_CAS_RETRIES => continue,
+                    Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                            state = "leader_claim_missing_revision",
+                            "Scanner leadership claim returned no ETag and could not be confirmed"
+                        );
+                        return false;
+                    }
+                    Err(err) => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                            state = "leader_claim_reconcile_failed",
+                            error = %err,
+                            "Scanner leadership claim read-back failed"
+                        );
+                        return false;
+                    }
+                }
+            }
+            Err(err) => {
+                let precondition_failed = matches!(err, EcstoreError::PreconditionFailed);
+                match reconcile_scanner_leadership_claim(
+                    storeapi.clone(),
+                    &data,
+                    &previous_revision,
+                    claimed_epoch,
+                    cycle_info,
+                    revision,
+                    persisted_epoch,
+                )
+                .await
+                {
+                    Ok(ScannerLeadershipClaimReconcile::Durable) => {
+                        return complete_scanner_leadership_claim(ctx, storeapi, claimed_epoch).await;
+                    }
+                    Ok(ScannerLeadershipClaimReconcile::Changed)
+                        if retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
+                    {
+                        continue;
+                    }
+                    Ok(ScannerLeadershipClaimReconcile::Unchanged)
+                        if precondition_failed && retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
+                    {
+                        continue;
+                    }
+                    Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                            state = if precondition_failed {
+                                "leader_claim_conflicts_exhausted"
+                            } else {
+                                "leader_claim_failed"
+                            },
+                            error = %err,
+                            "Scanner leadership claim failed"
+                        );
+                        return false;
+                    }
+                    Err(reconcile_err) => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                            state = "leader_claim_reload_failed",
+                            error = %reconcile_err,
+                            save_error = %err,
+                            "Scanner leadership claim reconciliation failed"
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+async fn persist_scanner_cycle_state(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+) -> bool {
+    let buf = match encode_scanner_cycle_state(cycle_info, leader_epoch) {
         Ok(buf) => buf,
         Err(e) => {
             error!(
@@ -1424,45 +2022,279 @@ async fn persist_scanner_cycle_state(storeapi: Arc<impl ScannerObjectIO>, cycle_
         }
     };
 
-    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
-    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
-    buf.extend_from_slice(&cycle_info_buf);
+    for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
+        if ctx.is_cancelled() {
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                state = "cancelled_before_save",
+                retry,
+                "Scanner state persistence cancelled by the leader fence"
+            );
+            return false;
+        }
 
-    if let Err(e) = save_config(storeapi, &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
-        error!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "failed",
-            error = %e,
-            "Scanner state persistence failed"
-        );
-        false
-    } else {
-        debug!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "saved",
-            "Scanner state saved"
-        );
-        true
+        match save_config_with_preconditions(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf.clone(), revision.preconditions())
+            .await
+        {
+            Ok(object_info) => {
+                let Some(etag) = object_info.etag.filter(|etag| !etag.is_empty()) else {
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                        state = "missing_revision",
+                        "Scanner state save returned no ETag"
+                    );
+                    return false;
+                };
+                *revision = DataUsageCacheRevision::Etag(etag);
+                if ctx.is_cancelled() {
+                    debug!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                        state = "cancelled_after_save",
+                        retry,
+                        "Scanner state save completed after the leader fence was cancelled"
+                    );
+                    return false;
+                }
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = "saved",
+                    "Scanner state saved"
+                );
+                return true;
+            }
+            Err(EcstoreError::PreconditionFailed) => {
+                let (persisted, persisted_revision) =
+                    match read_config_with_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            error!(
+                                target: "rustfs::scanner",
+                                event = EVENT_SCANNER_PERSIST_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                                state = "conflict_reload_failed",
+                                error = %e,
+                                "Scanner state conflict reconciliation failed"
+                            );
+                            return false;
+                        }
+                    };
+                *revision = persisted_revision;
+                if ctx.is_cancelled() {
+                    debug!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                        state = "cancelled_after_conflict",
+                        retry,
+                        "Scanner state conflict reconciliation cancelled by the leader fence"
+                    );
+                    return false;
+                }
+
+                if let Some(persisted) = persisted {
+                    if persisted.len() < 8 {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                            state = "conflict_state_invalid",
+                            length = persisted.len(),
+                            "Scanner state conflict winner is truncated"
+                        );
+                        return false;
+                    }
+
+                    let (persisted_cycle, persisted_epoch) = match decode_scanner_cycle_state(&persisted) {
+                        Ok(state) => state,
+                        Err(e) => {
+                            error!(
+                                target: "rustfs::scanner",
+                                event = EVENT_SCANNER_PERSIST_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                                state = "conflict_state_decode_failed",
+                                error = %e,
+                                "Scanner state conflict winner could not be decoded"
+                            );
+                            return false;
+                        }
+                    };
+                    if persisted_epoch != leader_epoch {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                            state = "leader_epoch_fenced",
+                            expected_epoch = leader_epoch,
+                            persisted_epoch,
+                            "Scanner state save rejected by a newer leadership epoch"
+                        );
+                        return false;
+                    }
+
+                    if persisted_cycle.next >= cycle_info.next {
+                        *cycle_info = persisted_cycle;
+                        global_metrics().set_cycle(Some(cycle_info.clone())).await;
+                        debug!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                            state = "conflict_reconciled",
+                            retry,
+                            "Scanner state adopted the current persisted cycle"
+                        );
+                        return true;
+                    }
+                }
+
+                if retry < SCANNER_PERSIST_CAS_RETRIES {
+                    debug!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                        state = "conflict_retry",
+                        retry = retry + 1,
+                        "Scanner state CAS conflict will be retried"
+                    );
+                    continue;
+                }
+
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = "conflict_retries_exhausted",
+                    retries = SCANNER_PERSIST_CAS_RETRIES,
+                    "Scanner state CAS conflict retries exhausted"
+                );
+                return false;
+            }
+            Err(e) => {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = "failed",
+                    error = %e,
+                    "Scanner state persistence failed"
+                );
+                return false;
+            }
+        }
     }
+
+    false
 }
 
-async fn finalize_partial_scan_cycle(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &mut CurrentCycle) -> bool {
+async fn finalize_partial_scan_cycle(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+) -> bool {
     // A budget-limited cycle is deliberate pacing, not a failure. The cycle counter
     // must still advance (and persist) because per-bucket next_cycle is stamped from
     // it and compacted folders are only rescanned when their hash matches
     // next_cycle % DATA_USAGE_UPDATE_DIR_CYCLES; a pinned counter starves lifecycle
     // expiry and usage refresh on every folder outside the stuck window.
-    cycle_info.next += 1;
+    if let Err(err) = advance_scanner_cycle(cycle_info) {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "cycle_counter_exhausted",
+            error = %err,
+            "Scanner partial cycle could not advance"
+        );
+        mark_scan_cycle_idle(cycle_info).await;
+        return false;
+    }
     mark_scan_cycle_idle(cycle_info).await;
-    persist_scanner_cycle_state(storeapi, cycle_info).await
+    persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await
+}
+
+async fn persist_required_scanner_cycle_floor(
+    ctx: &CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
+    cycle_info: &mut CurrentCycle,
+    revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
+    required_cycle: u64,
+) -> bool {
+    if required_cycle <= cycle_info.current || required_cycle == u64::MAX {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            current_cycle = cycle_info.current,
+            required_cycle,
+            state = "invalid_cache_cycle_floor",
+            "Scanner cache cycle floor is invalid"
+        );
+        mark_scan_cycle_idle(cycle_info).await;
+        return false;
+    }
+
+    cycle_info.next = cycle_info.next.max(required_cycle);
+    mark_scan_cycle_idle(cycle_info).await;
+    persist_scanner_cycle_state(ctx, storeapi, cycle_info, revision, leader_epoch).await
+}
+
+async fn await_scanner_cycle_with_lock_fence<Cycle, LockLost>(
+    cycle_ctx: &CancellationToken,
+    cycle: Cycle,
+    lock_lost: LockLost,
+) -> Option<Cycle::Output>
+where
+    Cycle: Future,
+    LockLost: Future<Output = ()>,
+{
+    tokio::pin!(cycle);
+    tokio::pin!(lock_lost);
+    tokio::select! {
+        biased;
+        _ = &mut lock_lost => {
+            cycle_ctx.cancel();
+            tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, &mut cycle).await.ok()
+        }
+        output = &mut cycle => Some(output),
+    }
 }
 
 #[instrument(skip_all)]
@@ -1470,6 +2302,8 @@ async fn run_data_scanner_cycle(
     ctx: &CancellationToken,
     storeapi: &Arc<ECStore>,
     cycle_info: &mut CurrentCycle,
+    cycle_revision: &mut DataUsageCacheRevision,
+    leader_epoch: u64,
 ) -> ScannerCycleOutcome {
     let _activity_guard = ScannerActivityGuard::new();
     if let Err(err) = refresh_scanner_runtime_config_from_global() {
@@ -1486,7 +2320,7 @@ async fn run_data_scanner_cycle(
     let configured_cycle_interval = scanner_cycle_interval();
     let configured_bitrot_cycle = scanner_bitrot_cycle();
     let cycle_budget_config = scanner_cycle_budget_config();
-    let usage_persist_timeout = resolve_scanner_runtime_config().cache_save_timeout;
+    let usage_persist_timeout = data_usage_persist_timeout();
     global_metrics().record_scanner_cycle_config(
         configured_cycle_interval,
         configured_bitrot_cycle,
@@ -1530,19 +2364,56 @@ async fn run_data_scanner_cycle(
         save_background_heal_info(storeapi.clone(), new_heal_info).await;
     }
 
+    let cycle_start = std::time::Instant::now();
+    let usage_persist_baseline = match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+        Ok((data, revision)) => DataUsagePersistBaseline {
+            data: data.map(Bytes::from),
+            revision,
+        },
+        Err(err) => {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "usage_baseline_load_failed",
+                error = %err,
+                "Scanner cycle could not capture the data usage persistence baseline"
+            );
+            emit_scan_cycle_complete(false, cycle_start.elapsed());
+            mark_scan_cycle_idle(cycle_info).await;
+            return ScannerCycleOutcome::Failed;
+        }
+    };
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
     let storeapi_clone = storeapi.clone();
     let ctx_clone = ctx.clone();
-    let mut usage_persist_task =
-        tokio::spawn(async move { store_data_usage_in_backend_with_outcome(ctx_clone, storeapi_clone, receiver).await });
+    let mut usage_persist_task = tokio::spawn(async move {
+        store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
+            ctx_clone,
+            storeapi_clone,
+            receiver,
+            Some(leader_epoch),
+            Some(usage_persist_baseline),
+        )
+        .await
+    });
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
-    let cycle_start = std::time::Instant::now();
     let cycle_work_start = global_metrics().start_scan_cycle_work();
     let cycle_budget = ScannerCycleBudget::new(ctx, cycle_budget_config);
     let scan_result = storeapi
         .clone()
-        .nsscanner_with_status(cycle_budget.token(), cycle_budget.clone(), sender, cycle_info.current, scan_mode)
+        .nsscanner_with_status(
+            cycle_budget.token(),
+            cycle_budget.clone(),
+            sender,
+            cycle_info.current,
+            leader_epoch,
+            scan_mode,
+        )
         .await;
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let usage_persist_outcome = match wait_for_data_usage_persist_task(ctx, &mut usage_persist_task, usage_persist_timeout).await
@@ -1629,6 +2500,33 @@ async fn run_data_scanner_cycle(
         mark_scan_cycle_idle(cycle_info).await;
         return ScannerCycleOutcome::Failed;
     }
+    if let Some(required_cycle) = scan_cycle_result.required_cycle_floor() {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            cycle = cycle_info.current,
+            required_cycle,
+            state = "cache_cycle_ahead",
+            "Scanner cycle is recovering to a newer durable cache generation"
+        );
+        emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
+        return if persist_required_scanner_cycle_floor(
+            ctx,
+            storeapi.clone(),
+            cycle_info,
+            cycle_revision,
+            leader_epoch,
+            required_cycle,
+        )
+        .await
+        {
+            ScannerCycleOutcome::Partial
+        } else {
+            ScannerCycleOutcome::Failed
+        };
+    }
     if usage_persist_outcome == DataUsagePersistOutcome::Failed {
         error!(
             target: "rustfs::scanner",
@@ -1664,7 +2562,7 @@ async fn run_data_scanner_cycle(
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        return if finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await {
+        return if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
             ScannerCycleOutcome::Partial
         } else {
             ScannerCycleOutcome::Failed
@@ -1713,22 +2611,52 @@ async fn run_data_scanner_cycle(
                 );
             }
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
-            return if finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await {
+            return if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
                 ScannerCycleOutcome::Partial
             } else {
                 ScannerCycleOutcome::Failed
             };
         }
+        ScannerCycleOutcome::Superseded => {
+            info!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_CYCLE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle = cycle_info.current,
+                state = "superseded",
+                "Scanner cycle usage snapshot was superseded by concurrent namespace activity"
+            );
+            if finalize_partial_scan_cycle(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
+                emit_scan_cycle_superseded(cycle_start.elapsed());
+                return ScannerCycleOutcome::Superseded;
+            }
+            emit_scan_cycle_complete(false, cycle_start.elapsed());
+            return ScannerCycleOutcome::Failed;
+        }
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance => {}
     }
-    cycle_info.next += 1;
+    if let Err(err) = advance_scanner_cycle(cycle_info) {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "cycle_counter_exhausted",
+            error = %err,
+            "Scanner completed cycle could not advance"
+        );
+        mark_scan_cycle_idle(cycle_info).await;
+        emit_scan_cycle_complete(false, cycle_start.elapsed());
+        return ScannerCycleOutcome::Failed;
+    }
     cycle_info.current = 0;
     cycle_info.cycle_completed.push(Utc::now());
     global_metrics().clear_current_scan_mode();
 
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
-    if !persist_scanner_cycle_state(storeapi.clone(), cycle_info).await {
+    if !persist_scanner_cycle_state(ctx, storeapi.clone(), cycle_info, cycle_revision, leader_epoch).await {
         mark_scan_cycle_idle(cycle_info).await;
         emit_scan_cycle_complete(false, cycle_start.elapsed());
         return ScannerCycleOutcome::Failed;
@@ -1870,26 +2798,91 @@ async fn run_data_scanner_with_maintenance_state(
         observe_scanner_activity(&storeapi, distributed, &mut scanner_activity_seen).await;
     }
 
-    let mut cycle_info = CurrentCycle::default();
-    let buf = read_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
-        .await
-        .unwrap_or_default();
-    if buf.len() == 8 {
-        cycle_info.next = u64::from_le_bytes(buf.try_into().unwrap_or_default());
-    } else if buf.len() > 8 {
-        cycle_info.next = u64::from_le_bytes(buf[0..8].try_into().unwrap_or_default());
-        if let Err(e) = cycle_info.unmarshal(&buf[8..]) {
-            warn!(
+    let (buf, mut cycle_revision) = match read_config_with_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await {
+        Ok((buf, revision)) => (buf.unwrap_or_default(), revision),
+        Err(err) => {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                state = "revision_load_failed",
+                error = %err,
+                "Scanner cycle state revision load failed"
+            );
+            global_metrics().set_cycle(None).await;
+            return Ok(());
+        }
+    };
+    let (mut cycle_info, mut leader_epoch) = match decode_scanner_cycle_state_for_startup(&buf) {
+        Ok(state) => state,
+        Err(err) => {
+            error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
                 path = %&*DATA_USAGE_BLOOM_NAME_PATH,
                 state = "cycle_decode_failed",
-                error = %e,
-                "Scanner cycle state decode failed"
+                error = %err,
+                "Scanner stopped because persisted cycle state is invalid"
             );
+            global_metrics().set_cycle(None).await;
+            return Ok(());
         }
+    };
+    let usage_floor = match persisted_usage_floor(storeapi.clone()).await {
+        Ok(floor) => floor,
+        Err(err) => {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "usage_floor_load_failed",
+                error = %err,
+                "Scanner stopped because the persisted usage floor could not be loaded"
+            );
+            global_metrics().set_cycle(None).await;
+            return Ok(());
+        }
+    };
+    apply_persisted_usage_floor(&mut cycle_info, &mut leader_epoch, usage_floor);
+
+    if ctx.is_cancelled() || guard.is_lock_lost() {
+        global_metrics().set_cycle(None).await;
+        return Ok(());
+    }
+    let claim_ctx = ctx.child_token();
+    let leadership_claimed = await_scanner_cycle_with_lock_fence(
+        &claim_ctx,
+        claim_scanner_leadership(&claim_ctx, storeapi.clone(), &mut cycle_info, &mut cycle_revision, &mut leader_epoch),
+        guard.lock_lost_notified(),
+    )
+    .await
+    .unwrap_or(false);
+    if guard.is_lock_lost() {
+        record_scanner_leader_lock_lost("Scanner leader lock lost while claiming the leadership epoch").await;
+        global_metrics().set_cycle(None).await;
+        return Ok(());
+    }
+    if !leadership_claimed {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_LOCK_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            lock_name = "leader.lock",
+            state = "epoch_claim_failed",
+            "Scanner stopped because the leadership epoch could not be claimed"
+        );
+        global_metrics()
+            .record_scanner_leader_liveness("epoch_claim_failed", false, "leadership epoch claim failed")
+            .await;
+        global_metrics().set_cycle(None).await;
+        return Ok(());
     }
 
     if !ctx.is_cancelled() {
@@ -1902,7 +2895,14 @@ async fn run_data_scanner_with_maintenance_state(
             global_metrics().set_cycle(None).await;
             return Ok(());
         }
-        let initial_outcome = run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
+        let cycle_ctx = ctx.child_token();
+        let initial_outcome = await_scanner_cycle_with_lock_fence(
+            &cycle_ctx,
+            run_data_scanner_cycle(&cycle_ctx, &storeapi, &mut cycle_info, &mut cycle_revision, leader_epoch),
+            guard.lock_lost_notified(),
+        )
+        .await
+        .unwrap_or(ScannerCycleOutcome::Failed);
         dirty_usage_generation_seen = dirty_generation_before_cycle;
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during the initial cycle").await;
@@ -2023,7 +3023,7 @@ async fn run_data_scanner_with_maintenance_state(
                 maintenance: maintenance_generation_before_wait,
             },
             || guard.is_lock_lost(),
-            || probe_scanner_activity(&storeapi, distributed),
+            || probe_scanner_activity(storeapi.as_ref(), distributed),
         )
         .await;
         scanner_activity_backoff_blocked =
@@ -2089,7 +3089,14 @@ async fn run_data_scanner_with_maintenance_state(
             break;
         }
         let dirty_generation_before_cycle = dirty_usage_generation();
-        let outcome = run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
+        let cycle_ctx = ctx.child_token();
+        let outcome = await_scanner_cycle_with_lock_fence(
+            &cycle_ctx,
+            run_data_scanner_cycle(&cycle_ctx, &storeapi, &mut cycle_info, &mut cycle_revision, leader_epoch),
+            guard.lock_lost_notified(),
+        )
+        .await
+        .unwrap_or(ScannerCycleOutcome::Failed);
         dirty_usage_generation_seen = dirty_generation_before_cycle;
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during a scanner cycle").await;
@@ -2207,8 +3214,16 @@ enum DataUsagePersistOutcome {
     #[default]
     NoUpdate,
     Current,
+    AlreadyDurable,
+    PriorCycleDurable,
     Saved,
     Failed,
+}
+
+#[derive(Clone, Debug)]
+struct DataUsagePersistBaseline {
+    data: Option<Bytes>,
+    revision: DataUsageCacheRevision,
 }
 
 #[derive(Debug)]
@@ -2251,11 +3266,17 @@ fn scanner_cycle_completion_outcome(
 ) -> ScannerCycleOutcome {
     match (scan_status, usage_persist_outcome) {
         (_, DataUsagePersistOutcome::Failed) => ScannerCycleOutcome::Failed,
-        (ScannerCycleStatus::Incomplete, DataUsagePersistOutcome::Saved) if !has_failed_dirty_usage => {
-            ScannerCycleOutcome::Partial
-        }
+        (ScannerCycleStatus::Superseded, _) if !has_failed_dirty_usage => ScannerCycleOutcome::Superseded,
+        (ScannerCycleStatus::Superseded, _) => ScannerCycleOutcome::Failed,
+        (
+            ScannerCycleStatus::Incomplete,
+            DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable | DataUsagePersistOutcome::PriorCycleDurable,
+        ) if !has_failed_dirty_usage => ScannerCycleOutcome::Partial,
         (ScannerCycleStatus::Incomplete, _) => ScannerCycleOutcome::Failed,
-        (ScannerCycleStatus::Complete, DataUsagePersistOutcome::Saved) => ScannerCycleOutcome::Completed,
+        (
+            ScannerCycleStatus::Complete,
+            DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable | DataUsagePersistOutcome::PriorCycleDurable,
+        ) => ScannerCycleOutcome::Completed,
         (ScannerCycleStatus::Complete, DataUsagePersistOutcome::Current) if !has_dirty_usage => ScannerCycleOutcome::Completed,
         (ScannerCycleStatus::Complete, _) => ScannerCycleOutcome::Failed,
     }
@@ -2272,7 +3293,10 @@ fn finalize_scanner_cycle_result(
         scan_cycle_result.has_failed_dirty_usage(),
     );
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work();
-    if usage_persist_outcome == DataUsagePersistOutcome::Saved {
+    if matches!(
+        usage_persist_outcome,
+        DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable
+    ) {
         scan_cycle_result.acknowledge_durable_usage();
     }
     (completion_outcome, pending_maintenance_work)
@@ -2291,6 +3315,28 @@ fn stale_data_usage_update_reason(
     existing: &DataUsageInfo,
     now: std::time::SystemTime,
 ) -> Option<&'static str> {
+    match (incoming.scanner_epoch, existing.scanner_epoch) {
+        (Some(incoming_epoch), Some(existing_epoch)) if incoming_epoch < existing_epoch => {
+            return Some("older_scanner_epoch");
+        }
+        (Some(incoming_epoch), Some(existing_epoch)) if incoming_epoch > existing_epoch => return None,
+        (Some(_), None) => return None,
+        (None, Some(_)) => return Some("missing_incoming_scanner_epoch"),
+        (Some(_), Some(_)) | (None, None) => {}
+    }
+
+    match (incoming.scanner_cycle, existing.scanner_cycle) {
+        (Some(incoming_cycle), Some(existing_cycle)) if incoming_cycle < existing_cycle => {
+            return Some("older_scanner_cycle");
+        }
+        (Some(incoming_cycle), Some(existing_cycle)) if incoming_cycle == existing_cycle => {
+            return Some("conflicting_same_scanner_cycle");
+        }
+        (Some(_), Some(_)) | (Some(_), None) => return None,
+        (None, Some(_)) => return Some("missing_incoming_scanner_cycle"),
+        (None, None) => {}
+    }
+
     match (incoming.last_update, existing.last_update) {
         (Some(new_ts), Some(existing_ts))
             if new_ts <= existing_ts && !rustfs_data_usage::usage_last_update_is_untrusted_future(existing_ts, now) =>
@@ -2300,6 +3346,17 @@ fn stale_data_usage_update_reason(
         (None, Some(_)) => Some("missing_incoming_last_update"),
         _ => None,
     }
+}
+
+fn data_usage_reintroduces_missing_bucket(incoming: &DataUsageInfo, existing: Option<&DataUsageInfo>) -> bool {
+    let Some(existing) = existing else {
+        return !incoming.buckets_usage.is_empty() || !incoming.bucket_sizes.is_empty();
+    };
+    incoming
+        .buckets_usage
+        .keys()
+        .chain(incoming.bucket_sizes.keys())
+        .any(|bucket| !existing.buckets_usage.contains_key(bucket) && !existing.bucket_sizes.contains_key(bucket))
 }
 
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
@@ -2315,36 +3372,38 @@ pub async fn store_data_usage_in_backend(
 async fn store_data_usage_in_backend_with_outcome(
     ctx: CancellationToken,
     storeapi: Arc<impl ScannerObjectIO>,
+    receiver: mpsc::Receiver<DataUsageInfo>,
+) -> DataUsagePersistOutcome {
+    store_data_usage_in_backend_with_outcome_for_epoch(ctx, storeapi, receiver, None).await
+}
+
+async fn store_data_usage_in_backend_with_outcome_for_epoch(
+    ctx: CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
+    receiver: mpsc::Receiver<DataUsageInfo>,
+    leader_epoch: Option<u64>,
+) -> DataUsagePersistOutcome {
+    store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(ctx, storeapi, receiver, leader_epoch, None).await
+}
+
+async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
+    ctx: CancellationToken,
+    storeapi: Arc<impl ScannerObjectIO>,
     mut receiver: mpsc::Receiver<DataUsageInfo>,
+    leader_epoch: Option<u64>,
+    initial_baseline: Option<DataUsagePersistBaseline>,
 ) -> DataUsagePersistOutcome {
     let mut attempts = 1u32;
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
+    let mut next_baseline = initial_baseline;
 
-    while let Some(data_usage_info) = receiver.recv().await {
+    'updates: while let Some(mut data_usage_info) = receiver.recv().await {
         let _activity_guard = ScannerActivityGuard::new();
         if ctx.is_cancelled() {
             break;
         }
-
-        if let Ok(buf) = read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await
-            && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
-            && let Some(reason) = stale_data_usage_update_reason(&data_usage_info, &existing, std::time::SystemTime::now())
-        {
-            debug!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
-                incoming_last_update = ?data_usage_info.last_update,
-                existing_last_update = ?existing.last_update,
-                reason = reason,
-                state = "skip_stale_update",
-                "Scanner stale data usage update skipped"
-            );
-            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::SkippedStale);
-            outcome = DataUsagePersistOutcome::Current;
-            continue;
+        if let Some(leader_epoch) = leader_epoch {
+            data_usage_info.scanner_epoch = Some(leader_epoch);
         }
 
         let data = match serde_json::to_vec(&data_usage_info) {
@@ -2365,48 +3424,232 @@ async fn store_data_usage_in_backend_with_outcome(
                 continue;
             }
         };
+        let sha256hex = (!data.is_empty()).then(|| hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower));
+        let data = Bytes::from(data);
         let backup_data = (attempts > 10).then(|| data.clone());
+        let mut cas_retry = 0usize;
+        let save_outcome = loop {
+            if ctx.is_cancelled() {
+                break 'updates;
+            }
 
-        let done_save = Metrics::time(Metric::SaveUsage);
-        let save_result = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await;
-        done_save();
-
-        if let Err(e) = save_result {
-            error!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_PERSIST_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
-                state = "save_failed",
-                error = %e,
-                "Scanner data usage save failed"
-            );
-            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
-            outcome = DataUsagePersistOutcome::Failed;
-        } else {
-            replace_bucket_usage_memory_from_info(&data_usage_info).await;
-            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
-            outcome = DataUsagePersistOutcome::Saved;
-
-            if let Some(data) = backup_data {
-                let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
-                let done_save = Metrics::time(Metric::SaveUsage);
-                if let Err(e) = save_config(storeapi.clone(), &backup_path, data).await {
-                    warn!(
+            let baseline = if cas_retry == 0 { next_baseline.take() } else { None };
+            let (existing_data, revision) = match baseline {
+                Some(baseline) => (baseline.data, baseline.revision),
+                None => match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+                    Ok((data, revision)) => (data.map(Bytes::from), revision),
+                    Err(e) => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                            state = "revision_load_failed",
+                            error = %e,
+                            "Scanner data usage revision load failed"
+                        );
+                        break DataUsagePersistOutcome::Failed;
+                    }
+                },
+            };
+            let existing = existing_data
+                .as_deref()
+                .and_then(|buf| serde_json::from_slice::<DataUsageInfo>(buf).ok());
+            if cas_retry > 0 && data_usage_reintroduces_missing_bucket(&data_usage_info, existing.as_ref()) {
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                    incoming_scanner_epoch = ?data_usage_info.scanner_epoch,
+                    incoming_scanner_cycle = ?data_usage_info.scanner_cycle,
+                    state = "skip_deleted_bucket_reintroduction",
+                    "Scanner usage update skipped after a concurrent bucket removal"
+                );
+                break DataUsagePersistOutcome::Current;
+            }
+            if let Some(existing) = existing.as_ref() {
+                if existing == &data_usage_info {
+                    break DataUsagePersistOutcome::AlreadyDurable;
+                }
+                if existing.scanner_epoch.is_some()
+                    && existing.scanner_epoch == data_usage_info.scanner_epoch
+                    && existing.scanner_cycle.is_some()
+                    && existing.scanner_cycle == data_usage_info.scanner_cycle
+                {
+                    break DataUsagePersistOutcome::PriorCycleDurable;
+                }
+                if let Some(reason) = stale_data_usage_update_reason(&data_usage_info, existing, std::time::SystemTime::now()) {
+                    debug!(
                         target: "rustfs::scanner",
                         event = EVENT_SCANNER_PERSIST_STATE,
                         component = LOG_COMPONENT_SCANNER,
                         subsystem = LOG_SUBSYSTEM_RUNTIME,
-                        path = %backup_path,
-                        state = "backup_save_failed",
-                        error = %e,
-                        "Scanner data usage backup save failed"
+                        path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                        incoming_scanner_epoch = ?data_usage_info.scanner_epoch,
+                        existing_scanner_epoch = ?existing.scanner_epoch,
+                        incoming_scanner_cycle = ?data_usage_info.scanner_cycle,
+                        existing_scanner_cycle = ?existing.scanner_cycle,
+                        incoming_last_update = ?data_usage_info.last_update,
+                        existing_last_update = ?existing.last_update,
+                        reason = reason,
+                        state = "skip_stale_update",
+                        "Scanner stale data usage update skipped"
+                    );
+                    break DataUsagePersistOutcome::Current;
+                }
+            }
+            if ctx.is_cancelled() {
+                break 'updates;
+            }
+
+            let done_save = Metrics::time(Metric::SaveUsage);
+            let save_result = save_config_shared_with_preconditions(
+                storeapi.clone(),
+                DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                data.clone(),
+                sha256hex.clone(),
+                revision.preconditions(),
+            )
+            .await;
+            done_save();
+
+            match save_result {
+                Ok(object_info) => {
+                    next_baseline = object_info
+                        .etag
+                        .filter(|etag| !etag.is_empty())
+                        .map(|etag| DataUsagePersistBaseline {
+                            data: Some(data.clone()),
+                            revision: DataUsageCacheRevision::Etag(etag),
+                        });
+                    break DataUsagePersistOutcome::Saved;
+                }
+                Err(EcstoreError::PreconditionFailed) if cas_retry < SCANNER_PERSIST_CAS_RETRIES => {
+                    cas_retry += 1;
+                    debug!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                        state = "conflict_retry",
+                        retry = cas_retry,
+                        "Scanner data usage CAS conflict will be reconciled"
                     );
                 }
-                done_save();
-                attempts = 1;
+                Err(e) => {
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                        state = if matches!(e, EcstoreError::PreconditionFailed) {
+                            "conflict_retries_exhausted"
+                        } else {
+                            "save_failed"
+                        },
+                        error = %e,
+                        "Scanner data usage save failed"
+                    );
+                    break DataUsagePersistOutcome::Failed;
+                }
             }
+        };
+
+        match save_outcome {
+            DataUsagePersistOutcome::Current => {
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::SkippedStale);
+                outcome = DataUsagePersistOutcome::Current;
+                continue;
+            }
+            DataUsagePersistOutcome::AlreadyDurable => {
+                replace_bucket_usage_memory_from_info(&data_usage_info).await;
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+                outcome = DataUsagePersistOutcome::AlreadyDurable;
+                continue;
+            }
+            DataUsagePersistOutcome::PriorCycleDurable => {
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+                outcome = DataUsagePersistOutcome::PriorCycleDurable;
+                continue;
+            }
+            DataUsagePersistOutcome::Failed | DataUsagePersistOutcome::NoUpdate => {
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
+                outcome = DataUsagePersistOutcome::Failed;
+                attempts += 1;
+                continue;
+            }
+            DataUsagePersistOutcome::Saved => {}
+        }
+
+        replace_bucket_usage_memory_from_info(&data_usage_info).await;
+        global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+        outcome = DataUsagePersistOutcome::Saved;
+
+        if let Some(data) = backup_data {
+            let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+            let done_save = Metrics::time(Metric::SaveUsage);
+            let backup_result = match read_config_with_revision(storeapi.clone(), &backup_path).await {
+                Ok((existing, revision)) => {
+                    let existing = existing
+                        .as_deref()
+                        .and_then(|buf| serde_json::from_slice::<DataUsageInfo>(buf).ok());
+                    let stale = existing
+                        .as_ref()
+                        .and_then(|existing| {
+                            stale_data_usage_update_reason(&data_usage_info, existing, std::time::SystemTime::now())
+                        })
+                        .is_some();
+                    let reintroduces_deleted_bucket = existing
+                        .as_ref()
+                        .is_some_and(|existing| data_usage_reintroduces_missing_bucket(&data_usage_info, Some(existing)));
+                    if reintroduces_deleted_bucket {
+                        debug!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            path = %backup_path,
+                            incoming_scanner_epoch = ?data_usage_info.scanner_epoch,
+                            incoming_scanner_cycle = ?data_usage_info.scanner_cycle,
+                            state = "skip_deleted_bucket_reintroduction",
+                            "Scanner usage backup skipped after a concurrent bucket removal"
+                        );
+                        Ok(None)
+                    } else if stale || ctx.is_cancelled() {
+                        Ok(None)
+                    } else {
+                        save_config_shared_with_preconditions(
+                            storeapi.clone(),
+                            &backup_path,
+                            data,
+                            sha256hex.clone(),
+                            revision.preconditions(),
+                        )
+                        .await
+                        .map(Some)
+                    }
+                }
+                Err(err) => Err(err),
+            };
+            if let Err(e) = backup_result {
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %backup_path,
+                    state = "backup_save_failed",
+                    error = %e,
+                    "Scanner data usage backup save failed"
+                );
+            }
+            done_save();
+            attempts = 1;
         }
 
         attempts += 1;
@@ -2445,6 +3688,42 @@ mod tests {
         assert_run_data_scanner_signature(run_data_scanner);
     }
 
+    #[tokio::test]
+    async fn scanner_cycle_lock_fence_cancels_cycle_context() {
+        let cycle_ctx = CancellationToken::new();
+        let observed_ctx = cycle_ctx.clone();
+        let output = await_scanner_cycle_with_lock_fence(
+            &cycle_ctx,
+            async move {
+                observed_ctx.cancelled().await;
+                observed_ctx.is_cancelled()
+            },
+            std::future::ready(()),
+        )
+        .await;
+
+        assert_eq!(output, Some(true));
+        assert!(cycle_ctx.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn scanner_cycle_lock_fence_preserves_completed_cycle() {
+        let cycle_ctx = CancellationToken::new();
+        let output = await_scanner_cycle_with_lock_fence(&cycle_ctx, std::future::ready(7_u8), std::future::pending()).await;
+
+        assert_eq!(output, Some(7));
+        assert!(!cycle_ctx.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn scanner_cycle_lock_fence_bounds_uncooperative_shutdown() {
+        let cycle_ctx = CancellationToken::new();
+        let output = await_scanner_cycle_with_lock_fence(&cycle_ctx, std::future::pending::<()>(), std::future::ready(())).await;
+
+        assert_eq!(output, None);
+        assert!(cycle_ctx.is_cancelled());
+    }
+
     struct ScannerDefaultSpeedGuard;
 
     impl ScannerDefaultSpeedGuard {
@@ -2478,7 +3757,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryConfigStore {
         objects: Mutex<HashMap<String, Vec<u8>>>,
+        revisions: Mutex<HashMap<String, u64>>,
         fail_put_number: Mutex<HashMap<String, usize>>,
+        error_after_commit_put_number: Mutex<HashMap<String, usize>>,
+        interleaving_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
+        cancel_after_interleaving_puts: Mutex<HashMap<String, CancellationToken>>,
+        cancel_after_successful_puts: Mutex<HashMap<String, (usize, CancellationToken)>>,
         put_counts: Mutex<HashMap<String, usize>>,
     }
 
@@ -2504,15 +3788,22 @@ mod tests {
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
         ) -> EcstoreResult<GetObjectReader> {
-            let objects = self.objects.lock().await;
-            let data = objects
-                .get(&memory_config_key(bucket, object))
+            let key = memory_config_key(bucket, object);
+            let data = self
+                .objects
+                .lock()
+                .await
+                .get(&key)
                 .cloned()
                 .ok_or(EcstoreError::FileNotFound)?;
+            let revision = *self.revisions.lock().await.entry(key).or_insert(1);
 
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(data)),
-                object_info: ObjectInfo::default(),
+                object_info: ObjectInfo {
+                    etag: Some(format!("memory-{revision}")),
+                    ..Default::default()
+                },
                 buffered_body: None,
                 body_source: Default::default(),
             })
@@ -2523,7 +3814,7 @@ mod tests {
             bucket: &str,
             object: &str,
             data: &mut PutObjReader,
-            _opts: &ObjectOptions,
+            opts: &ObjectOptions,
         ) -> EcstoreResult<ObjectInfo> {
             let mut buf = Vec::new();
             data.stream.read_to_end(&mut buf).await?;
@@ -2539,8 +3830,81 @@ mod tests {
                 return Err(EcstoreError::other("injected put failure"));
             }
 
-            self.objects.lock().await.insert(key, buf);
-            Ok(ObjectInfo::default())
+            let interleaving_data = {
+                let mut interleaving_puts = self.interleaving_puts.lock().await;
+                if interleaving_puts
+                    .get(&key)
+                    .is_some_and(|(expected_put, _)| *expected_put == put_count)
+                {
+                    interleaving_puts.remove(&key).map(|(_, data)| data)
+                } else {
+                    None
+                }
+            };
+            let cancel_after_interleaving = if interleaving_data.is_some() {
+                self.cancel_after_interleaving_puts.lock().await.remove(&key)
+            } else {
+                None
+            };
+            let mut objects = self.objects.lock().await;
+            let mut revisions = self.revisions.lock().await;
+            if let Some(interleaving_data) = interleaving_data {
+                let revision = revisions.get(&key).copied().unwrap_or(0) + 1;
+                objects.insert(key.clone(), interleaving_data);
+                revisions.insert(key.clone(), revision);
+                if let Some(cancel) = cancel_after_interleaving {
+                    cancel.cancel();
+                }
+            }
+            let current_revision = objects.contains_key(&key).then(|| revisions.get(&key).copied().unwrap_or(1));
+            if let Some(preconditions) = &opts.http_preconditions {
+                if preconditions
+                    .if_none_match
+                    .as_deref()
+                    .is_some_and(|condition| !condition.trim().is_empty())
+                    && current_revision.is_some()
+                {
+                    return Err(EcstoreError::PreconditionFailed);
+                }
+                if let Some(expected) = preconditions
+                    .if_match
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let actual = current_revision.map(|revision| format!("memory-{revision}"));
+                    if actual.as_deref() != Some(expected.trim_matches('"')) {
+                        return Err(EcstoreError::PreconditionFailed);
+                    }
+                }
+            }
+
+            let revision = current_revision.unwrap_or(0) + 1;
+            objects.insert(key.clone(), buf);
+            revisions.insert(key.clone(), revision);
+            drop(revisions);
+            drop(objects);
+            let cancel_after_success = {
+                let mut cancellations = self.cancel_after_successful_puts.lock().await;
+                if cancellations
+                    .get(&key)
+                    .is_some_and(|(expected_put, _)| *expected_put == put_count)
+                {
+                    cancellations.remove(&key).map(|(_, cancel)| cancel)
+                } else {
+                    None
+                }
+            };
+            if let Some(cancel) = cancel_after_success {
+                cancel.cancel();
+            }
+            if self.error_after_commit_put_number.lock().await.get(&key) == Some(&put_count) {
+                return Err(EcstoreError::other("injected post-commit put failure"));
+            }
+            Ok(ObjectInfo {
+                etag: Some(format!("memory-{revision}")),
+                ..Default::default()
+            })
         }
     }
 
@@ -2769,6 +4133,8 @@ mod tests {
     #[serial]
     async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
         let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
         let mut cycle_info = CurrentCycle {
             current: 12,
             next: 12,
@@ -2776,11 +4142,12 @@ mod tests {
             started: Utc::now(),
         };
 
-        assert!(finalize_partial_scan_cycle(store.clone(), &mut cycle_info).await);
+        assert!(finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1).await);
 
         assert_eq!(cycle_info.next, 13);
         assert_eq!(cycle_info.current, 0);
         assert!(cycle_info.cycle_completed.is_empty());
+        assert!(matches!(revision, DataUsageCacheRevision::Etag(ref etag) if etag == "memory-1"));
 
         let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
             .await
@@ -2789,20 +4156,20 @@ mod tests {
             u64::from_le_bytes(buf[0..8].try_into().expect("persisted state should start with the counter")),
             13
         );
-        let mut decoded = CurrentCycle::default();
-        decoded.unmarshal(&buf[8..]).expect("persisted cycle info should decode");
+        let (decoded, epoch) = decode_scanner_cycle_state(&buf).expect("persisted cycle info should decode");
         assert_eq!(decoded.next, 13);
         assert_eq!(decoded.current, 0);
+        assert_eq!(epoch, 1);
 
         global_metrics().set_cycle(None).await;
     }
 
     #[tokio::test]
     #[serial]
-    async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
+    async fn scanner_cycle_recovers_to_newer_durable_cache_floor() {
         let store = Arc::new(MemoryConfigStore::default());
-        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
-        store.fail_put_number.lock().await.insert(key, 1);
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
         let mut cycle_info = CurrentCycle {
             current: 12,
             next: 12,
@@ -2810,11 +4177,488 @@ mod tests {
             started: Utc::now(),
         };
 
-        assert!(!finalize_partial_scan_cycle(store, &mut cycle_info).await);
-        assert_eq!(cycle_info.next, 13);
+        assert!(persist_required_scanner_cycle_floor(&ctx, store.clone(), &mut cycle_info, &mut revision, 7, 19).await);
         assert_eq!(cycle_info.current, 0);
+        assert_eq!(cycle_info.next, 19);
+
+        let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("recovered cycle floor should be persisted");
+        let (decoded, epoch) = decode_scanner_cycle_state(&buf).expect("recovered cycle state should decode");
+        assert_eq!(decoded.current, 0);
+        assert_eq!(decoded.next, 19);
+        assert_eq!(epoch, 7);
 
         global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_cycle_rejects_invalid_cache_floor() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+
+        assert!(!persist_required_scanner_cycle_floor(&ctx, store.clone(), &mut cycle_info, &mut revision, 7, 12).await);
+        assert_eq!(cycle_info.next, 12);
+        assert_eq!(revision, DataUsageCacheRevision::Missing);
+        assert!(
+            !persist_required_scanner_cycle_floor(
+                &ctx,
+                store.clone(),
+                &mut CurrentCycle {
+                    current: 12,
+                    next: 12,
+                    ..Default::default()
+                },
+                &mut revision,
+                7,
+                u64::MAX,
+            )
+            .await
+        );
+        assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[test]
+    fn scanner_cycle_state_decodes_legacy_and_fenced_formats() {
+        let cycle = CurrentCycle {
+            current: 12,
+            next: 13,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+        let mut legacy = cycle.next.to_le_bytes().to_vec();
+        legacy.extend(cycle.marshal().expect("legacy cycle state should encode"));
+
+        let (legacy_cycle, legacy_epoch) =
+            decode_scanner_cycle_state(&legacy).expect("legacy cycle state should remain readable");
+        assert_eq!(legacy_cycle.next, 13);
+        assert_eq!(legacy_epoch, 0);
+
+        let fenced = encode_scanner_cycle_state(&cycle, 7).expect("fenced cycle state should encode");
+        let (fenced_cycle, fenced_epoch) = decode_scanner_cycle_state(&fenced).expect("fenced cycle state should decode");
+        assert_eq!(fenced_cycle.next, 13);
+        assert_eq!(fenced_epoch, 7);
+    }
+
+    #[test]
+    fn scanner_startup_fails_closed_on_nonempty_corrupt_cycle_state() {
+        assert_eq!(
+            decode_scanner_cycle_state_for_startup(&[])
+                .expect("missing cycle state should use defaults")
+                .1,
+            0
+        );
+        assert!(decode_scanner_cycle_state_for_startup(&[1]).is_err());
+
+        let mut corrupt_fenced = 13_u64.to_le_bytes().to_vec();
+        corrupt_fenced.extend_from_slice(SCANNER_CYCLE_STATE_MAGIC);
+        corrupt_fenced.extend_from_slice(&7_u64.to_le_bytes());
+        corrupt_fenced.extend_from_slice(b"not-msgpack");
+        assert!(decode_scanner_cycle_state_for_startup(&corrupt_fenced).is_err());
+        assert!(decode_scanner_cycle_state_for_startup(&u64::MAX.to_le_bytes()).is_err());
+
+        let exhausted = CurrentCycle {
+            next: u64::MAX,
+            ..Default::default()
+        };
+        assert!(encode_scanner_cycle_state(&exhausted, 7).is_err());
+    }
+
+    #[tokio::test]
+    async fn scanner_startup_uses_primary_and_backup_usage_floor() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+        for (path, epoch, cycle) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), 8, 100), (backup_path.as_str(), 11, 103)] {
+            store.objects.lock().await.insert(
+                memory_config_key(RUSTFS_META_BUCKET, path),
+                serde_json::to_vec(&DataUsageInfo {
+                    scanner_epoch: Some(epoch),
+                    scanner_cycle: Some(cycle),
+                    ..Default::default()
+                })
+                .expect("usage snapshot should encode"),
+            );
+        }
+
+        let floor = persisted_usage_floor(store).await.expect("usage floor should load");
+        assert_eq!(
+            floor,
+            PersistedUsageFloor {
+                next_cycle: 104,
+                leader_epoch: 11,
+            }
+        );
+
+        let mut cycle = CurrentCycle::default();
+        let mut epoch = 0;
+        apply_persisted_usage_floor(&mut cycle, &mut epoch, floor);
+        assert_eq!(cycle.next, 104);
+        assert_eq!(epoch, 11);
+    }
+
+    #[tokio::test]
+    async fn scanner_usage_floor_fails_closed_on_corrupt_or_exhausted_usage_state() {
+        let store = Arc::new(MemoryConfigStore::default());
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+            b"not-json".to_vec(),
+        );
+
+        assert!(persisted_usage_floor(store.clone()).await.is_err());
+
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+            serde_json::to_vec(&DataUsageInfo {
+                scanner_cycle: Some(u64::MAX - 1),
+                ..Default::default()
+            })
+            .expect("usage snapshot should encode"),
+        );
+        assert!(persisted_usage_floor(store).await.is_err());
+    }
+
+    #[test]
+    fn scanner_cycle_advance_fails_before_reserved_exhausted_value() {
+        let mut cycle = CurrentCycle {
+            next: u64::MAX - 2,
+            ..Default::default()
+        };
+        advance_scanner_cycle(&mut cycle).expect("last persistable scanner cycle should remain valid");
+        assert_eq!(cycle.next, u64::MAX - 1);
+        assert!(advance_scanner_cycle(&mut cycle).is_err());
+        assert_eq!(cycle.next, u64::MAX - 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+        store.fail_put_number.lock().await.insert(key, 1);
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+
+        assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1).await);
+        assert_eq!(cycle_info.next, 13);
+        assert_eq!(cycle_info.current, 0);
+        assert_eq!(revision, DataUsageCacheRevision::Missing);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_persist_scanner_cycle_state_reconciles_newer_winner() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut initial_revision = DataUsageCacheRevision::Missing;
+        let mut initial = CurrentCycle {
+            current: 0,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut initial, &mut initial_revision, 1).await);
+
+        let mut current_revision = initial_revision.clone();
+        let mut stale_revision = initial_revision;
+        let mut current = CurrentCycle {
+            next: 14,
+            ..initial.clone()
+        };
+        let mut stale = CurrentCycle { next: 13, ..initial };
+
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut current, &mut current_revision, 1).await);
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut stale, &mut stale_revision, 1).await);
+
+        let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("new leader cycle state should remain persisted");
+        let (decoded, epoch) = decode_scanner_cycle_state(&buf).expect("persisted cycle state should decode");
+        assert_eq!(decoded.next, 14);
+        assert_eq!(epoch, 1);
+        assert_eq!(stale.next, 14);
+        assert!(matches!(current_revision, DataUsageCacheRevision::Etag(ref etag) if etag == "memory-2"));
+        assert!(matches!(stale_revision, DataUsageCacheRevision::Etag(ref etag) if etag == "memory-2"));
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    async fn test_persist_scanner_cycle_state_retries_after_stale_winner() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut initial_revision = DataUsageCacheRevision::Missing;
+        let mut initial = CurrentCycle {
+            current: 0,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut initial, &mut initial_revision, 1).await);
+
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+        let stale = CurrentCycle {
+            next: 13,
+            ..initial.clone()
+        };
+        let stale_buf = encode_scanner_cycle_state(&stale, 1).expect("stale cycle state should encode");
+        store.interleaving_puts.lock().await.insert(key, (2, stale_buf));
+
+        let mut current = CurrentCycle { next: 14, ..initial };
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut current, &mut initial_revision, 1).await);
+
+        let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("newer cycle state should replace the stale conflict winner");
+        let (decoded, epoch) = decode_scanner_cycle_state(&buf).expect("persisted cycle state should decode");
+        assert_eq!(decoded.next, 14);
+        assert_eq!(epoch, 1);
+        assert_eq!(current.next, 14);
+        assert!(matches!(initial_revision, DataUsageCacheRevision::Etag(ref etag) if etag == "memory-3"));
+    }
+
+    #[tokio::test]
+    async fn test_persist_scanner_cycle_state_stops_retry_after_leader_fence() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut initial = CurrentCycle {
+            current: 0,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut initial, &mut revision, 1).await);
+
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+        let replacement = CurrentCycle {
+            next: 13,
+            ..initial.clone()
+        };
+        let replacement_buf = encode_scanner_cycle_state(&replacement, 2).expect("replacement cycle state should encode");
+        store.interleaving_puts.lock().await.insert(key.clone(), (2, replacement_buf));
+        store
+            .cancel_after_interleaving_puts
+            .lock()
+            .await
+            .insert(key.clone(), ctx.clone());
+
+        let mut stale_leader = CurrentCycle { next: 14, ..initial };
+        assert!(!persist_scanner_cycle_state(&ctx, store.clone(), &mut stale_leader, &mut revision, 1).await);
+
+        let buf = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("replacement leader cycle state should remain persisted");
+        let (decoded, epoch) = decode_scanner_cycle_state(&buf).expect("persisted cycle state should decode");
+        assert_eq!(decoded.next, 13);
+        assert_eq!(epoch, 2);
+        assert_eq!(stale_leader.next, 14);
+        assert!(matches!(revision, DataUsageCacheRevision::Etag(ref etag) if etag == "memory-2"));
+        assert_eq!(store.put_counts.lock().await.get(&key), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conflict() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut cycle = CurrentCycle {
+            current: 0,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+        let old_epoch_commit = CurrentCycle {
+            next: 14,
+            ..cycle.clone()
+        };
+        store.interleaving_puts.lock().await.insert(
+            key.clone(),
+            (
+                2,
+                encode_scanner_cycle_state(&old_epoch_commit, 1).expect("old-epoch cycle state should encode"),
+            ),
+        );
+
+        let mut persisted_epoch = 8;
+        assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch,).await);
+
+        let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("new leadership claim should remain persisted");
+        let (claimed_cycle, claimed_epoch) = decode_scanner_cycle_state(&state).expect("claimed cycle state should decode");
+        assert_eq!(claimed_cycle.next, 14);
+        assert_eq!(claimed_epoch, 9);
+        assert_eq!(persisted_epoch, 9);
+        assert_eq!(store.put_counts.lock().await.get(&key), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn test_leadership_claim_confirms_commit_after_returned_error() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+        let usage_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        store.error_after_commit_put_number.lock().await.insert(key.clone(), 1);
+        store.error_after_commit_put_number.lock().await.insert(usage_key.clone(), 1);
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut cycle = CurrentCycle {
+            current: 0,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+        let mut persisted_epoch = 0;
+
+        assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch).await);
+
+        let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("ambiguous leadership claim should be durable");
+        let (claimed_cycle, claimed_epoch) = decode_scanner_cycle_state(&state).expect("claimed cycle state should decode");
+        assert_eq!(claimed_cycle.next, 12);
+        assert_eq!(claimed_epoch, 1);
+        assert_eq!(persisted_epoch, 1);
+        assert!(matches!(revision, DataUsageCacheRevision::Etag(ref etag) if etag == "memory-1"));
+        assert_eq!(store.put_counts.lock().await.get(&key), Some(&1));
+        let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("ambiguous usage epoch fence should be durable");
+        assert_eq!(
+            serde_json::from_slice::<DataUsageInfo>(&usage)
+                .expect("usage epoch fence should decode")
+                .scanner_epoch,
+            Some(1)
+        );
+        assert_eq!(store.put_counts.lock().await.get(&usage_key), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn test_leadership_claim_usage_fence_rejects_old_inflight_writer() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let usage_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let mut old_usage = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(11),
+            ..Default::default()
+        };
+        old_usage.buckets_usage.insert(
+            "bucket-a".to_string(),
+            rustfs_data_usage::BucketUsageInfo {
+                objects_count: 2,
+                size: 84,
+                ..Default::default()
+            },
+        );
+        old_usage.buckets_count = 1;
+        old_usage.calculate_totals();
+        let old_data = serde_json::to_vec(&old_usage).expect("old usage snapshot should encode");
+        store.objects.lock().await.insert(usage_key.clone(), old_data.clone());
+        store.revisions.lock().await.insert(usage_key, 1);
+
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut cycle = CurrentCycle {
+            next: 12,
+            started: Utc::now(),
+            ..Default::default()
+        };
+        let mut persisted_epoch = 4;
+        assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch).await);
+
+        let (fenced_data, fenced_revision) = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("fenced usage snapshot should load");
+        let fenced = serde_json::from_slice::<DataUsageInfo>(fenced_data.as_deref().expect("fenced usage snapshot should exist"))
+            .expect("fenced usage snapshot should decode");
+        assert_eq!(fenced.scanner_epoch, Some(5));
+        assert_eq!(fenced.objects_total_count, 2);
+        assert_eq!(fenced.buckets_usage.get("bucket-a").map(|usage| usage.size), Some(84));
+        assert!(matches!(fenced_revision, DataUsageCacheRevision::Etag(ref etag) if etag == "memory-2"));
+
+        let stale_save = save_config_with_preconditions(
+            store,
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            old_data,
+            DataUsageCacheRevision::Etag("memory-1".to_string()).preconditions(),
+        )
+        .await;
+        assert!(matches!(stale_save, Err(EcstoreError::PreconditionFailed)));
+    }
+
+    #[tokio::test]
+    async fn test_successful_old_epoch_commit_is_fenced_after_cancellation() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut cycle = CurrentCycle {
+            current: 0,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+        store
+            .cancel_after_successful_puts
+            .lock()
+            .await
+            .insert(key.clone(), (2, ctx.clone()));
+        cycle.next = 14;
+        assert!(!persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+
+        let (persisted, persisted_revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+            .await
+            .expect("committed old-epoch state should load");
+        let mut replacement_cycle = decode_scanner_cycle_state(
+            persisted
+                .as_deref()
+                .expect("old-epoch state should have committed before cancellation"),
+        )
+        .expect("old-epoch state should decode")
+        .0;
+        let mut replacement_revision = persisted_revision;
+        let mut replacement_epoch = 1;
+        let replacement_ctx = CancellationToken::new();
+        assert!(
+            claim_scanner_leadership(
+                &replacement_ctx,
+                store.clone(),
+                &mut replacement_cycle,
+                &mut replacement_revision,
+                &mut replacement_epoch,
+            )
+            .await
+        );
+
+        let state = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("replacement leadership claim should persist");
+        let (claimed_cycle, claimed_epoch) = decode_scanner_cycle_state(&state).expect("replacement cycle state should decode");
+        assert_eq!(claimed_cycle.next, 14);
+        assert_eq!(claimed_epoch, 2);
     }
 
     #[tokio::test]
@@ -2849,6 +4693,222 @@ mod tests {
         assert_eq!(saved.buckets_count, 2);
         assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
         assert_eq!(outcome, DataUsagePersistOutcome::Current);
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_fences_interleaving_newer_writer() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(1);
+        let ctx = CancellationToken::new();
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let newer = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        let stale = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            buckets_count: 1,
+            ..Default::default()
+        };
+        store
+            .interleaving_puts
+            .lock()
+            .await
+            .insert(key.clone(), (1, serde_json::to_vec(&newer).expect("newer usage snapshot should encode")));
+
+        sender.send(stale).await.expect("stale usage snapshot should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&key)
+            .expect("interleaving newer usage snapshot should remain saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+        assert_eq!(saved.buckets_count, 2);
+        assert_eq!(saved.last_update, newer.last_update);
+        assert_eq!(outcome, DataUsagePersistOutcome::Current);
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_does_not_resurrect_deleted_bucket_after_conflict() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let mut initial = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            scanner_epoch: Some(8),
+            scanner_cycle: Some(12),
+            ..Default::default()
+        };
+        initial.buckets_usage.insert(
+            "bucket-a".to_string(),
+            rustfs_data_usage::BucketUsageInfo {
+                objects_count: 2,
+                size: 84,
+                ..Default::default()
+            },
+        );
+        initial.bucket_sizes.insert("bucket-a".to_string(), 84);
+        initial.buckets_count = 1;
+        initial.calculate_totals();
+        let initial_data = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
+        store.objects.lock().await.insert(key.clone(), initial_data.clone());
+        store.revisions.lock().await.insert(key.clone(), 1);
+
+        let mut deleted = initial.clone();
+        deleted.buckets_usage.clear();
+        deleted.bucket_sizes.clear();
+        deleted.buckets_count = 0;
+        deleted.calculate_totals();
+        store
+            .interleaving_puts
+            .lock()
+            .await
+            .insert(key.clone(), (1, serde_json::to_vec(&deleted).expect("deleted snapshot should encode")));
+
+        let mut incoming = initial;
+        incoming.last_update = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30));
+        incoming.scanner_cycle = Some(13);
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(incoming).await.expect("stale scanner snapshot should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
+            CancellationToken::new(),
+            store.clone(),
+            receiver,
+            Some(8),
+            Some(DataUsagePersistBaseline {
+                data: Some(Bytes::from(initial_data)),
+                revision: DataUsageCacheRevision::Etag("memory-1".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(outcome, DataUsagePersistOutcome::Current);
+        let saved = store
+            .objects
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("deleted usage snapshot should remain");
+        let saved = serde_json::from_slice::<DataUsageInfo>(&saved).expect("deleted usage snapshot should decode");
+        assert!(!saved.buckets_usage.contains_key("bucket-a"));
+        assert!(!saved.bucket_sizes.contains_key("bucket-a"));
+        assert_eq!(store.put_counts.lock().await.get(&key), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_does_not_resurrect_deleted_bucket_in_backup() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let backup_key = memory_config_key(RUSTFS_META_BUCKET, &backup_path);
+        let deleted = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            scanner_epoch: Some(8),
+            scanner_cycle: Some(1),
+            ..Default::default()
+        };
+        store.objects.lock().await.insert(
+            backup_key.clone(),
+            serde_json::to_vec(&deleted).expect("deleted backup snapshot should encode"),
+        );
+        store.revisions.lock().await.insert(backup_key.clone(), 1);
+
+        let (sender, receiver) = mpsc::channel(11);
+        for cycle in 2_u64..=12 {
+            let mut incoming = DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20 + cycle)),
+                scanner_epoch: Some(8),
+                scanner_cycle: Some(cycle),
+                ..Default::default()
+            };
+            incoming.buckets_usage.insert(
+                "bucket-a".to_string(),
+                rustfs_data_usage::BucketUsageInfo {
+                    objects_count: 2,
+                    size: 84,
+                    ..Default::default()
+                },
+            );
+            incoming.bucket_sizes.insert("bucket-a".to_string(), 84);
+            incoming.buckets_count = 1;
+            incoming.calculate_totals();
+            sender.send(incoming).await.expect("usage snapshot should enqueue");
+        }
+        drop(sender);
+
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await,
+            DataUsagePersistOutcome::Saved
+        );
+
+        let saved = store
+            .objects
+            .lock()
+            .await
+            .get(&backup_key)
+            .cloned()
+            .expect("deleted backup snapshot should remain");
+        let saved = serde_json::from_slice::<DataUsageInfo>(&saved).expect("backup snapshot should decode");
+        assert!(!saved.buckets_usage.contains_key("bucket-a"));
+        assert!(!saved.bucket_sizes.contains_key("bucket-a"));
+        assert_eq!(store.put_counts.lock().await.get(&backup_key), None);
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_retries_after_stale_interleaving_writer() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(1);
+        let ctx = CancellationToken::new();
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let initial = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            buckets_count: 1,
+            ..Default::default()
+        };
+        let stale_winner = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        let current = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
+            buckets_count: 3,
+            ..Default::default()
+        };
+        store
+            .objects
+            .lock()
+            .await
+            .insert(key.clone(), serde_json::to_vec(&initial).expect("initial usage snapshot should encode"));
+        store.revisions.lock().await.insert(key.clone(), 1);
+        store.interleaving_puts.lock().await.insert(
+            key.clone(),
+            (1, serde_json::to_vec(&stale_winner).expect("stale usage snapshot should encode")),
+        );
+
+        sender
+            .send(current.clone())
+            .await
+            .expect("current usage snapshot should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&key)
+            .expect("current usage snapshot should replace the stale conflict winner");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+        assert_eq!(saved.buckets_count, 3);
+        assert_eq!(saved.last_update, current.last_update);
+        assert_eq!(outcome, DataUsagePersistOutcome::Saved);
+        drop(objects);
+        assert_eq!(store.put_counts.lock().await.get(&key), Some(&2));
     }
 
     #[tokio::test]
@@ -2889,6 +4949,264 @@ mod tests {
         assert_eq!(saved.buckets_count, 2);
         assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
         assert_eq!(outcome, DataUsagePersistOutcome::Current);
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_recognizes_already_durable_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(1);
+        let ctx = CancellationToken::new();
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let snapshot = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            scanner_cycle: Some(12),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        store
+            .objects
+            .lock()
+            .await
+            .insert(key.clone(), serde_json::to_vec(&snapshot).expect("durable usage snapshot should encode"));
+        store.revisions.lock().await.insert(key.clone(), 1);
+
+        sender
+            .send(snapshot)
+            .await
+            .expect("ambiguous committed snapshot should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome(ctx, store.clone(), receiver).await;
+
+        assert_eq!(outcome, DataUsagePersistOutcome::AlreadyDurable);
+        assert_eq!(store.put_counts.lock().await.get(&key), None);
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_advances_past_changed_same_epoch_cycle() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(1);
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let durable = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            scanner_epoch: Some(8),
+            scanner_cycle: Some(12),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        store
+            .objects
+            .lock()
+            .await
+            .insert(key.clone(), serde_json::to_vec(&durable).expect("durable usage snapshot should encode"));
+        store.revisions.lock().await.insert(key.clone(), 1);
+
+        sender
+            .send(DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
+                scanner_epoch: Some(8),
+                scanner_cycle: Some(12),
+                buckets_count: 3,
+                ..Default::default()
+            })
+            .await
+            .expect("changed retry snapshot should enqueue");
+        drop(sender);
+
+        let outcome =
+            store_data_usage_in_backend_with_outcome_for_epoch(CancellationToken::new(), store.clone(), receiver, Some(8)).await;
+
+        assert_eq!(outcome, DataUsagePersistOutcome::PriorCycleDurable);
+        assert_eq!(store.put_counts.lock().await.get(&key), None);
+        let saved = store
+            .objects
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("first snapshot should remain durable");
+        assert_eq!(
+            serde_json::from_slice::<DataUsageInfo>(&saved)
+                .expect("durable usage snapshot should decode")
+                .buckets_count,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_orders_scanner_cycles_before_wall_clock() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let existing = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(200)),
+            scanner_cycle: Some(12),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        store
+            .objects
+            .lock()
+            .await
+            .insert(key.clone(), serde_json::to_vec(&existing).expect("existing usage snapshot should encode"));
+        store.revisions.lock().await.insert(key.clone(), 1);
+
+        let (older_sender, older_receiver) = mpsc::channel(1);
+        let older = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
+            scanner_cycle: Some(11),
+            buckets_count: 1,
+            ..Default::default()
+        };
+        older_sender.send(older).await.expect("older-cycle snapshot should enqueue");
+        drop(older_sender);
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), older_receiver).await,
+            DataUsagePersistOutcome::Current
+        );
+
+        let (newer_sender, newer_receiver) = mpsc::channel(1);
+        let newer = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
+            scanner_cycle: Some(13),
+            buckets_count: 3,
+            ..Default::default()
+        };
+        newer_sender
+            .send(newer.clone())
+            .await
+            .expect("newer-cycle snapshot should enqueue");
+        drop(newer_sender);
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), newer_receiver).await,
+            DataUsagePersistOutcome::Saved
+        );
+
+        let saved = store
+            .objects
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("newer scanner cycle should be persisted");
+        assert_eq!(
+            serde_json::from_slice::<DataUsageInfo>(&saved)
+                .expect("persisted usage snapshot should decode")
+                .scanner_cycle,
+            Some(13)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_orders_leader_epochs_before_cycles() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let existing = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(200)),
+            scanner_epoch: Some(8),
+            scanner_cycle: Some(12),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        store
+            .objects
+            .lock()
+            .await
+            .insert(key.clone(), serde_json::to_vec(&existing).expect("existing usage snapshot should encode"));
+        store.revisions.lock().await.insert(key.clone(), 1);
+
+        let (older_sender, older_receiver) = mpsc::channel(1);
+        older_sender
+            .send(DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
+                scanner_epoch: Some(7),
+                scanner_cycle: Some(99),
+                buckets_count: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("old-epoch snapshot should enqueue");
+        drop(older_sender);
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), older_receiver).await,
+            DataUsagePersistOutcome::Current
+        );
+
+        let (newer_sender, newer_receiver) = mpsc::channel(1);
+        newer_sender
+            .send(DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
+                scanner_epoch: None,
+                scanner_cycle: Some(1),
+                buckets_count: 3,
+                ..Default::default()
+            })
+            .await
+            .expect("replacement-epoch snapshot should enqueue");
+        drop(newer_sender);
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome_for_epoch(CancellationToken::new(), store.clone(), newer_receiver, Some(9),)
+                .await,
+            DataUsagePersistOutcome::Saved
+        );
+
+        let saved = store
+            .objects
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("replacement leader snapshot should persist");
+        let saved = serde_json::from_slice::<DataUsageInfo>(&saved).expect("persisted usage snapshot should decode");
+        assert_eq!(saved.scanner_epoch, Some(9));
+        assert_eq!(saved.scanner_cycle, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_keeps_first_same_cycle_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let existing = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
+            scanner_cycle: Some(12),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        store
+            .objects
+            .lock()
+            .await
+            .insert(key.clone(), serde_json::to_vec(&existing).expect("existing usage snapshot should encode"));
+        store.revisions.lock().await.insert(key.clone(), 1);
+
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
+                scanner_cycle: Some(12),
+                buckets_count: 3,
+                ..Default::default()
+            })
+            .await
+            .expect("conflicting same-cycle snapshot should enqueue");
+        drop(sender);
+
+        assert_eq!(
+            store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await,
+            DataUsagePersistOutcome::Current
+        );
+        let saved = store
+            .objects
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("first same-cycle snapshot should remain persisted");
+        assert_eq!(
+            serde_json::from_slice::<DataUsageInfo>(&saved)
+                .expect("persisted usage snapshot should decode")
+                .buckets_count,
+            2
+        );
     }
 
     fn usage_with_last_update(last_update: Option<std::time::SystemTime>) -> DataUsageInfo {
@@ -3039,6 +5357,19 @@ mod tests {
             ScannerCycleOutcome::Completed
         );
         assert_eq!(
+            scanner_cycle_completion_outcome(ScannerCycleStatus::Complete, DataUsagePersistOutcome::AlreadyDurable, true, false,),
+            ScannerCycleOutcome::Completed
+        );
+        assert_eq!(
+            scanner_cycle_completion_outcome(
+                ScannerCycleStatus::Complete,
+                DataUsagePersistOutcome::PriorCycleDurable,
+                true,
+                false,
+            ),
+            ScannerCycleOutcome::Completed
+        );
+        assert_eq!(
             scanner_cycle_completion_outcome(ScannerCycleStatus::Complete, DataUsagePersistOutcome::Current, false, false),
             ScannerCycleOutcome::Completed
         );
@@ -3048,6 +5379,20 @@ mod tests {
         );
         assert_eq!(
             scanner_cycle_completion_outcome(ScannerCycleStatus::Complete, DataUsagePersistOutcome::NoUpdate, false, false),
+            ScannerCycleOutcome::Failed
+        );
+        for persist_outcome in [
+            DataUsagePersistOutcome::NoUpdate,
+            DataUsagePersistOutcome::Current,
+            DataUsagePersistOutcome::Saved,
+        ] {
+            assert_eq!(
+                scanner_cycle_completion_outcome(ScannerCycleStatus::Superseded, persist_outcome, true, false),
+                ScannerCycleOutcome::Superseded
+            );
+        }
+        assert_eq!(
+            scanner_cycle_completion_outcome(ScannerCycleStatus::Superseded, DataUsagePersistOutcome::Saved, true, true),
             ScannerCycleOutcome::Failed
         );
     }
@@ -3068,6 +5413,60 @@ mod tests {
         let (outcome, _) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved);
         assert_eq!(outcome, ScannerCycleOutcome::Completed);
         assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    }
+
+    #[test]
+    #[serial]
+    fn finalizing_an_already_durable_cycle_acknowledges_its_exact_dirty_snapshot() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
+
+        let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
+        let (outcome, _) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::AlreadyDurable);
+
+        assert_eq!(outcome, ScannerCycleOutcome::Completed);
+        assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    }
+
+    #[test]
+    #[serial]
+    fn finalizing_a_prior_same_cycle_snapshot_keeps_new_dirty_work_pending() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
+
+        let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
+        let (outcome, _) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::PriorCycleDurable);
+
+        assert_eq!(outcome, ScannerCycleOutcome::Completed);
+        assert!(crate::scanner_io::dirty_usage_buckets_pending());
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+    }
+
+    #[test]
+    #[serial]
+    fn finalizing_a_superseded_cycle_keeps_dirty_work_pending() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
+
+        let superseded = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Superseded, Some(dirty_snapshot));
+        let (outcome, _) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::NoUpdate);
+
+        assert_eq!(outcome, ScannerCycleOutcome::Superseded);
+        assert!(crate::scanner_io::dirty_usage_buckets_pending());
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+    }
+
+    #[test]
+    #[serial]
+    fn data_usage_persist_wait_covers_cache_retries_and_backup() {
+        with_var(rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            assert_eq!(data_usage_persist_timeout(), Duration::from_millis(31_350));
+        });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
     }
 
     #[tokio::test]
@@ -3922,7 +6321,44 @@ mod tests {
             instance_id: epoch.to_string(),
             namespace_generation,
             maintenance_generation,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: [3; 32],
+            data_movement_active: false,
         }
+    }
+
+    #[test]
+    fn scanner_activity_snapshot_digest_fences_storage_topology() {
+        let first = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+        let mut changed = first.clone();
+        changed.get_mut("node-2").expect("node should exist").topology_digest = [4; 32];
+
+        assert_ne!(scanner_activity_snapshot_digest(&first), scanner_activity_snapshot_digest(&changed));
+    }
+
+    #[test]
+    fn scanner_activity_snapshot_digest_fences_peer_protocol_upgrades() {
+        let legacy = BTreeMap::from([(
+            "node-2".to_string(),
+            ScannerNodeActivity {
+                protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+                ..scanner_node_activity("epoch-a", 7, 3)
+            },
+        )]);
+        let current = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+
+        assert_ne!(scanner_activity_snapshot_digest(&legacy), scanner_activity_snapshot_digest(&current));
+    }
+
+    #[test]
+    fn scanner_activity_snapshot_fences_data_movement() {
+        let idle = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+        let mut moving = idle.clone();
+        moving.get_mut("node-2").expect("node should exist").data_movement_active = true;
+
+        assert!(scanner_activity_allows_usage_publication(&idle));
+        assert!(!scanner_activity_allows_usage_publication(&moving));
+        assert_ne!(scanner_activity_snapshot_digest(&idle), scanner_activity_snapshot_digest(&moving));
     }
 
     #[test]

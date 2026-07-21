@@ -349,6 +349,89 @@ pub fn canonical_tier_mutation_rpc_response_body(
     Ok(body)
 }
 
+/// Builds the stable byte representation authenticated for a scanner activity response.
+pub fn canonical_scanner_activity_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v1\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 5 + 1);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    Ok(body)
+}
+
+#[cfg(test)]
+mod scanner_activity_tests {
+    use super::{canonical_scanner_activity_response_body, proto_gen::node_service::ScannerActivityResponse};
+
+    #[test]
+    fn canonical_scanner_activity_response_binds_challenge_and_every_status_field() {
+        let response = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: 4,
+            topology_digest: vec![9; 32].into(),
+            data_movement_active: true,
+            response_proof: Vec::new().into(),
+        };
+        let baseline =
+            canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
+
+        let variants = [
+            ScannerActivityResponse {
+                instance_id: "1123456789abcdef0123456789abcdef".to_string(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                namespace_generation: 8,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                maintenance_generation: 4,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                protocol_version: 5,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                topology_digest: vec![8; 32].into(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                data_movement_active: false,
+                ..response.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_response_body(&[1; 16], &variant)
+                    .expect("scanner activity response variant should encode")
+            );
+        }
+        assert_ne!(
+            baseline,
+            canonical_scanner_activity_response_body(&[2; 16], &response)
+                .expect("scanner activity response with a different challenge should encode")
+        );
+    }
+}
+
 #[cfg(test)]
 mod heal_control_tests {
     use super::{

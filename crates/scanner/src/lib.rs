@@ -20,6 +20,7 @@
     rust_2018_idioms
 )]
 
+use bytes::Bytes;
 use http::HeaderMap;
 use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config as config_get_global_server_config};
 use std::path::PathBuf;
@@ -29,11 +30,11 @@ use storage_api::owner::{
     ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys, EcstoreDisk,
     EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskInfo, EcstoreDiskInfoOptions, EcstoreDiskLocation,
     EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc, EcstoreLifecycle,
-    EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfigurationExt, EcstoreReplicationScannerBridge,
-    EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore, EcstoreTierConfig,
-    EcstoreVersioningApi, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete, ScannerReplicationHealObject,
-    ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule,
-    ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
+    EcstoreListPathRawOptions, EcstoreNsScannerOpenRequest, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
+    EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
+    EcstoreTierConfig, EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
+    ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
+    ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
     ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_is_erasure, ecstore_is_erasure_sd,
     ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
     ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path, ecstore_read_config,
@@ -41,11 +42,16 @@ use storage_api::owner::{
     scanner_replication_config_for_lifecycle_eval,
 };
 #[cfg(test)]
-use storage_api::owner::{EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, ecstore_config_init, ecstore_new_disk};
+use storage_api::owner::{
+    EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints, EcstoreInstanceContext,
+    EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx,
+    ecstore_new_disk,
+};
 use tokio_util::sync::CancellationToken;
 
 pub mod data_usage_define;
 pub mod error;
+mod remote_scanner;
 pub mod runtime_config;
 pub mod scanner;
 pub mod scanner_budget;
@@ -56,9 +62,14 @@ pub(crate) mod storage_api;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use remote_scanner::{
+    NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
+    claim_remote_scanner_request, decode_remote_scanner_request, preflight_remote_scanner_request,
+    remote_scanner_request_matches_envelope, serve_remote_scanner_request, validate_remote_scanner_request_fence,
+};
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_common::last_minute;
-pub use scanner::{ScannerCycleScheduleStatus, init_data_scanner, scanner_cycle_schedule_status};
+pub use scanner::{ScannerCycleScheduleStatus, init_data_scanner, scanner_cycle_schedule_status, scanner_topology_digest};
 pub use scanner_io::{
     clear_dirty_usage_bucket, record_dirty_usage_bucket, record_scanner_maintenance_change, scanner_activity_epoch,
     scanner_maintenance_generation,
@@ -66,6 +77,7 @@ pub use scanner_io::{
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
+pub use storage_api::scan::SCANNER_ACTIVITY_PROTOCOL_VERSION;
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
@@ -150,6 +162,7 @@ pub(crate) type BucketTargetSys = EcstoreBucketTargetSys;
 pub(crate) type BucketVersioningSys = EcstoreBucketVersioningSys;
 pub(crate) type DiskInfo = EcstoreDiskInfo;
 pub(crate) type DiskInfoOptions = EcstoreDiskInfoOptions;
+pub(crate) type NsScannerOpenRequest = EcstoreNsScannerOpenRequest;
 pub(crate) type DiskBytes = EcstoreDiskBytes;
 pub(crate) type Evaluator = EcstoreEvaluator;
 pub(crate) type Event = EcstoreEvent;
@@ -185,6 +198,27 @@ pub(crate) fn init_ecstore_config_for_scanner_tests() {
 pub(crate) type DiskOption = EcstoreDiskOption;
 #[cfg(test)]
 pub(crate) type Endpoint = EcstoreEndpoint;
+#[cfg(test)]
+pub(crate) type EndpointServerPools = EcstoreEndpointServerPools;
+#[cfg(test)]
+pub(crate) type Endpoints = EcstoreEndpoints;
+#[cfg(test)]
+pub(crate) type InstanceContext = EcstoreInstanceContext;
+#[cfg(test)]
+pub(crate) type PoolEndpoints = EcstorePoolEndpoints;
+
+#[cfg(test)]
+pub(crate) async fn init_local_disks_with_instance_ctx(
+    ctx: &Arc<InstanceContext>,
+    pools: EndpointServerPools,
+) -> EcstoreResult<()> {
+    ecstore_init_local_disks_with_instance_ctx(ctx, pools).await
+}
+
+#[cfg(test)]
+pub(crate) async fn init_bucket_metadata_sys_for_scanner_tests(store: Arc<ECStore>) {
+    ecstore_init_bucket_metadata_sys(store, Vec::new()).await;
+}
 
 #[cfg(test)]
 pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<DiskStore> {
@@ -247,6 +281,8 @@ impl ScannerVersioningConfigExt for s3s::dto::VersioningConfiguration {
 pub(crate) trait ScannerDiskExt {
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo>;
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<DiskBytes>;
+    fn is_local(&self) -> bool;
+    fn host_name(&self) -> String;
     fn path(&self) -> PathBuf;
     fn get_disk_location(&self) -> DiskLocation;
     fn start_scan(&self) -> ScanGuard;
@@ -262,6 +298,14 @@ where
 
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<DiskBytes> {
         EcstoreDiskAPI::read_metadata(self, volume, path).await
+    }
+
+    fn is_local(&self) -> bool {
+        EcstoreDiskAPI::is_local(self)
+    }
+
+    fn host_name(&self) -> String {
+        EcstoreDiskAPI::host_name(self)
     }
 
     fn path(&self) -> PathBuf {
@@ -344,6 +388,10 @@ pub(crate) async fn scanner_is_erasure_sd() -> bool {
     ecstore_is_erasure_sd().await
 }
 
+pub(crate) async fn scanner_disk_is_online(disk: &Disk) -> bool {
+    EcstoreDiskAPI::is_online(disk).await
+}
+
 pub(crate) async fn read_config<S>(api: Arc<S>, file: &str) -> EcstoreResult<Vec<u8>>
 where
     S: ScannerObjectIO,
@@ -356,6 +404,53 @@ where
     S: ScannerObjectIO,
 {
     ecstore_save_config(api, file, data).await
+}
+
+pub(crate) async fn save_config_with_preconditions<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    preconditions: HTTPPreconditions,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO,
+{
+    let mut reader = ScannerPutObjReader::from_vec(data);
+    api.put_object(
+        RUSTFS_META_BUCKET,
+        file,
+        &mut reader,
+        &ScannerObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(preconditions),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub(crate) async fn save_config_shared_with_preconditions<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Bytes,
+    sha256hex: Option<String>,
+    preconditions: HTTPPreconditions,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO,
+{
+    let mut reader = ScannerPutObjReader::from_prehashed_bytes(data, sha256hex)?;
+    api.put_object(
+        RUSTFS_META_BUCKET,
+        file,
+        &mut reader,
+        &ScannerObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(preconditions),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 pub(crate) async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> std::result::Result<(), DiskError> {

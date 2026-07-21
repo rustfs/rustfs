@@ -18,6 +18,7 @@ use crate::cluster::rpc::client::{
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
+use crate::storage_api_contracts::internode::{SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION};
 use crate::{
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     layout::endpoints::EndpointServerPools,
@@ -80,10 +81,17 @@ pub struct ScannerPeerActivity {
     pub instance_id: String,
     pub namespace_generation: u64,
     pub maintenance_generation: u64,
+    pub protocol_version: u32,
+    pub topology_digest: Option<[u8; 32]>,
+    pub data_movement_active: Option<bool>,
 }
 
-fn decode_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerPeerActivity> {
-    let instance_id = response.instance_id;
+fn decode_scanner_activity_with_verifier(
+    response: ScannerActivityResponse,
+    challenge: &[u8; 16],
+    verify_proof: impl FnOnce(&[u8], &[u8]) -> Result<()>,
+) -> Result<ScannerPeerActivity> {
+    let instance_id = &response.instance_id;
     if instance_id.len() != 32
         || !instance_id
             .as_bytes()
@@ -92,10 +100,47 @@ fn decode_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerP
     {
         return Err(Error::other("peer returned an invalid scanner activity instance ID"));
     }
+    let topology_digest = match response.protocol_version {
+        // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers omit the activity challenge response fields. Remove after every supported peer implements authenticated scanner activity protocol v4.
+        SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION
+            if response.topology_digest.is_empty() && response.response_proof.is_empty() && !response.data_movement_active =>
+        {
+            None
+        }
+        SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
+            return Err(Error::other("legacy scanner activity peer returned unexpected extended fields"));
+        }
+        SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            let canonical = rustfs_protos::canonical_scanner_activity_response_body(challenge, &response)
+                .map_err(|_| Error::other("peer scanner activity response is too large to authenticate"))?;
+            verify_proof(&canonical, &response.response_proof)?;
+            Some(
+                response
+                    .topology_digest
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| Error::other("peer returned an invalid scanner topology digest"))?,
+            )
+        }
+        version => {
+            return Err(Error::other(format!("peer returned unsupported scanner activity protocol {version}")));
+        }
+    };
     Ok(ScannerPeerActivity {
-        instance_id,
+        instance_id: response.instance_id,
         namespace_generation: response.namespace_generation,
         maintenance_generation: response.maintenance_generation,
+        protocol_version: response.protocol_version,
+        topology_digest,
+        data_movement_active: (response.protocol_version == SCANNER_ACTIVITY_PROTOCOL_VERSION)
+            .then_some(response.data_movement_active),
+    })
+}
+
+fn decode_scanner_activity(response: ScannerActivityResponse, challenge: &[u8; 16]) -> Result<ScannerPeerActivity> {
+    decode_scanner_activity_with_verifier(response, challenge, |canonical, proof| {
+        verify_tonic_rpc_response_proof(canonical, proof)
+            .map_err(|_| Error::other("peer returned an invalid scanner activity response proof"))
     })
 }
 
@@ -1271,16 +1316,19 @@ impl PeerRestClient {
     pub async fn scanner_activity(&self) -> Result<ScannerPeerActivity> {
         self.finalize_result(
             async {
+                let challenge = Uuid::new_v4();
                 let mut client = self
                     .get_client()
                     .await?
                     .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
                     .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
                 let response = client
-                    .scanner_activity(Request::new(ScannerActivityRequest {}))
+                    .scanner_activity(Request::new(ScannerActivityRequest {
+                        challenge: challenge.as_bytes().to_vec().into(),
+                    }))
                     .await?
                     .into_inner();
-                decode_scanner_activity(response)
+                decode_scanner_activity(response, challenge.as_bytes())
             }
             .await,
         )
@@ -1536,15 +1584,65 @@ mod tests {
         )
     }
 
+    fn decode_test_scanner_activity(response: ScannerActivityResponse) -> Result<ScannerPeerActivity> {
+        decode_scanner_activity_with_verifier(response, &[9; 16], |_canonical, proof| {
+            (proof == b"proof")
+                .then_some(())
+                .ok_or_else(|| Error::other("peer returned an invalid scanner activity response proof"))
+        })
+    }
+
     #[test]
     fn scanner_activity_requires_restart_safe_peer_identity() {
+        let legacy = decode_test_scanner_activity(ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+            topology_digest: Vec::new().into(),
+            data_movement_active: false,
+            response_proof: Vec::new().into(),
+        })
+        .expect("legacy peers should retain their activity generations during a rolling upgrade");
+        assert_eq!(
+            legacy,
+            ScannerPeerActivity {
+                instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                namespace_generation: 7,
+                maintenance_generation: 3,
+                protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+                topology_digest: None,
+                data_movement_active: None,
+            }
+        );
+
+        let malformed_topology = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 31].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
+        };
+        assert!(
+            decode_test_scanner_activity(malformed_topology)
+                .expect_err("activity topology digests must have the protocol-defined length")
+                .to_string()
+                .contains("topology digest")
+        );
+
         let missing_instance = ScannerActivityResponse {
             instance_id: String::new(),
             namespace_generation: 7,
             maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
         };
         assert!(
-            decode_scanner_activity(missing_instance)
+            decode_test_scanner_activity(missing_instance)
                 .expect_err("an empty instance ID is not restart safe")
                 .to_string()
                 .contains("instance ID")
@@ -1554,18 +1652,26 @@ mod tests {
             instance_id: "ABCDEF0123456789ABCDEF0123456789".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
         };
         assert!(
-            decode_scanner_activity(malformed_instance)
+            decode_test_scanner_activity(malformed_instance)
                 .expect_err("activity instance IDs must use the canonical lowercase hex form")
                 .to_string()
                 .contains("instance ID")
         );
 
-        let activity = decode_scanner_activity(ScannerActivityResponse {
+        let activity = decode_test_scanner_activity(ScannerActivityResponse {
             instance_id: "0123456789abcdef0123456789abcdef".to_string(),
             namespace_generation: 7,
             maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: true,
+            response_proof: b"proof".to_vec().into(),
         })
         .expect("complete activity responses should be accepted");
         assert_eq!(
@@ -1574,7 +1680,58 @@ mod tests {
                 instance_id: "0123456789abcdef0123456789abcdef".to_string(),
                 namespace_generation: 7,
                 maintenance_generation: 3,
+                protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+                topology_digest: Some([7; 32]),
+                data_movement_active: Some(true),
             }
+        );
+
+        let legacy_with_topology = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
+        };
+        assert!(
+            decode_test_scanner_activity(legacy_with_topology)
+                .expect_err("legacy protocol responses must not claim extended fields")
+                .to_string()
+                .contains("unexpected extended fields")
+        );
+
+        let unsupported_protocol = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION + 1,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
+        };
+        assert!(
+            decode_test_scanner_activity(unsupported_protocol)
+                .expect_err("unknown activity protocols must fail closed")
+                .to_string()
+                .contains("unsupported scanner activity protocol")
+        );
+
+        let missing_proof = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: Vec::new().into(),
+        };
+        assert!(
+            decode_test_scanner_activity(missing_proof)
+                .expect_err("unsigned scanner activity responses must fail closed")
+                .to_string()
+                .contains("response proof")
         );
     }
 

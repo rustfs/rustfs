@@ -37,8 +37,11 @@ use rustfs_targets::config::{
 };
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::future::Future;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use url::Url;
+
+static RUNTIME_CONFIG_RELOAD_MUTEX: AsyncMutex<()> = AsyncMutex::const_new(());
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
     NOTIFY_SUB_SYSTEMS.contains(&sub_system)
@@ -393,6 +396,7 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
 }
 
 pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
+    let _reload_guard = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
     if sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM {
         let store = resolve_runtime_config_store_for_context(context)?;
         let notify_result = reconcile_event_notifier_from_store(store).await;
@@ -414,6 +418,14 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
         warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
         internal_error(format!("failed to load server config: {err}"))
     })?;
+
+    if matches!(sub_system, SCANNER_SUB_SYS | HEAL_SUB_SYS) {
+        validate_server_config_for_context(context, &config, Some(sub_system)).await?;
+        // Scanner cycles refresh from the process-wide server config before
+        // each pass. Publish the same validated snapshot first so that refresh
+        // cannot overwrite this peer's dynamic scanner update with stale data.
+        publish_server_config_for_context(context, config.clone());
+    }
     apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
         .await
         .inspect_err(|_| {
@@ -463,6 +475,7 @@ where
 }
 
 pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppContext>) -> S3Result<()> {
+    let _reload_guard = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
     let store = resolve_runtime_config_store_for_context(context)?;
 
     reload_runtime_config_snapshot_with(
@@ -648,6 +661,8 @@ mod tests {
         save_admin_server_config_no_lock, with_admin_server_config_write_lock,
     };
     use crate::admin::storage_api::error::StorageError;
+    use crate::admin::storage_api::runtime_sources::NotificationSys;
+    use crate::app::context::NotificationSystemInterface;
     use crate::server::{
         ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot, is_event_notifier_reconciled,
         refresh_persisted_module_switches_from, save_persisted_module_switches_to,
@@ -674,6 +689,36 @@ mod tests {
     const LIFECYCLE_RELOAD_LABEL: &str = "lifecycle";
     const REAL_STORE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     const REPLICATION_RELOAD_LABEL: &str = "replication";
+
+    struct TestNotificationSystemInterface(Arc<NotificationSys>);
+
+    impl NotificationSystemInterface for TestNotificationSystemInterface {
+        fn handle(&self) -> Option<Arc<NotificationSys>> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_scanner_reload_reports_unreachable_peer() {
+        let temp_dir = TempDir::new().expect("scanner reload temp dir");
+        let store = build_isolated_heterogeneous_store(temp_dir.path()).await;
+        let mut notification_system = NotificationSys::new(EndpointServerPools::default()).await;
+        notification_system.peer_clients.push(None);
+        let context = AppContext::new(
+            store,
+            Arc::new(TestIamInterface),
+            Arc::new(TestKmsInterface {
+                manager: Arc::new(KmsServiceManager::new()),
+            }),
+        )
+        .with_test_notification_system_interface(Arc::new(TestNotificationSystemInterface(Arc::new(notification_system))));
+
+        let err = signal_dynamic_config_reload_checked_for_context(Some(&context), SCANNER_SUB_SYS)
+            .await
+            .expect_err("scanner config must not report success when a peer did not reload it");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("dynamic config reload for scanner failed on peers: unreachable-peer"));
+    }
 
     fn without_storage_class_env<R>(f: impl FnOnce() -> R) -> R {
         temp_env::with_vars_unset(

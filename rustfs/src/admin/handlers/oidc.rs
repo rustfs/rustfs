@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::supervise_admin_mutation;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     current_app_context, current_federated_identity_service, current_object_store_handle_for_context,
@@ -20,8 +21,7 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::storage_api::config::{
-    read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_server_config_no_lock,
-    with_admin_server_config_write_lock,
+    read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_server_config_snapshot,
 };
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
@@ -374,17 +374,13 @@ impl Operation for PutOidcConfigHandler {
         let provider_id = provider_id.to_owned();
 
         let request: OidcConfigUpsertRequest = parse_json_body(&mut req).await?;
-        let store = oidc_config_store()?;
-        let lock_store = store.clone();
-        with_admin_server_config_write_lock(lock_store, move || async move {
-            let mut config = load_server_config_from_store_locked(store.clone()).await?;
-            let existing_secret = persisted_provider_secret(&config, &provider_id);
+        update_oidc_server_config(move |config| {
+            let existing_secret = persisted_provider_secret(config, &provider_id);
             let provider_config = build_provider_config_from_upsert(&provider_id, request, existing_secret)?;
-            upsert_persisted_provider_config(&mut config, &provider_config);
-            save_server_config_to_store_locked(store, &config).await
+            upsert_persisted_provider_config(config, &provider_config);
+            Ok(())
         })
-        .await
-        .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
+        .await?;
 
         json_response(
             StatusCode::OK,
@@ -415,15 +411,11 @@ impl Operation for DeleteOidcConfigHandler {
         }
         let provider_id = provider_id.to_owned();
 
-        let store = oidc_config_store()?;
-        let lock_store = store.clone();
-        with_admin_server_config_write_lock(lock_store, move || async move {
-            let mut config = load_server_config_from_store_locked(store.clone()).await?;
-            delete_persisted_provider_config(&mut config, &provider_id)?;
-            save_server_config_to_store_locked(store, &config).await
+        update_oidc_server_config(move |config| {
+            delete_persisted_provider_config(config, &provider_id)?;
+            Ok(())
         })
-        .await
-        .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
+        .await?;
 
         json_response(
             StatusCode::OK,
@@ -911,21 +903,23 @@ fn oidc_config_store() -> S3Result<std::sync::Arc<crate::admin::storage_api::run
         .ok_or_else(|| s3_error!(InternalError, "storage layer not initialized"))
 }
 
-async fn load_server_config_from_store_locked(
-    store: std::sync::Arc<crate::admin::storage_api::runtime::ECStore>,
-) -> S3Result<ServerConfig> {
-    read_admin_config_without_migrate_no_lock(store)
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load server config: {e}")))
-}
-
-async fn save_server_config_to_store_locked(
-    store: std::sync::Arc<crate::admin::storage_api::runtime::ECStore>,
-    config: &ServerConfig,
-) -> S3Result<()> {
-    save_admin_server_config_no_lock(store, config)
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to save server config: {e}")))
+async fn update_oidc_server_config<F>(modifier: F) -> S3Result<()>
+where
+    F: FnOnce(&mut ServerConfig) -> S3Result<()> + Send + 'static,
+{
+    let store = oidc_config_store()?;
+    supervise_admin_mutation("OIDC config update", async move {
+        let snapshot = read_admin_server_config_snapshot(store.clone())
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load server config: {e}")))?;
+        let mut config = snapshot.config.clone();
+        modifier(&mut config)?;
+        save_admin_server_config_snapshot(store, &config, &snapshot)
+            .await
+            .map(|_| ())
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to save server config: {e}")))
+    })
+    .await
 }
 
 fn is_env_managed_provider(provider_id: &str) -> bool {
