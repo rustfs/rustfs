@@ -71,6 +71,7 @@ mod tests {
         let s3_error = iam_error_to_s3_error(IamError::AccessKeyAlreadyExists);
 
         assert_eq!(s3_error.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
         assert_eq!(s3_error.message(), Some("access key is already in use"));
     }
 
