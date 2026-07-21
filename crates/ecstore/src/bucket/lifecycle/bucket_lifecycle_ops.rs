@@ -32,6 +32,7 @@ use crate::bucket::lifecycle::tier_free_version_recovery::{
 };
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
+use crate::bucket::lifecycle::transition_transaction::run_transition_transaction_recovery_loop;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -1535,7 +1536,8 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
 
     ExpiryState::resize_workers(workers, api.clone()).await;
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
-    spawn_tier_delete_journal_recovery_once(api);
+    spawn_tier_delete_journal_recovery_once(api.clone());
+    spawn_transition_transaction_recovery_once(api);
 }
 
 fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<()>) -> Option<JoinHandle<()>> {
@@ -1799,6 +1801,25 @@ fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
     }
     tokio::spawn(async move {
         run_tier_delete_journal_recovery_loop(api, cancel_token).await;
+    });
+}
+
+fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
+    let Some(cancel_token) = api.ctx.background_cancel_token() else {
+        error!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            store_id = %api.id,
+            "Transition transaction recovery was not started because the store shutdown token is unavailable"
+        );
+        return;
+    };
+    if !api.ctx.mark_transition_transaction_recovery_started(api.id) {
+        return;
+    }
+    tokio::spawn(async move {
+        run_transition_transaction_recovery_loop(api, cancel_token).await;
     });
 }
 
