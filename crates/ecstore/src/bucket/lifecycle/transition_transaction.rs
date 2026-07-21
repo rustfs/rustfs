@@ -21,10 +21,12 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::bucket::lifecycle::config_boundary;
+use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::lifecycle::tier_sweeper::delete_object_from_remote_tier_idempotent_with_manager_and_identity;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
-use crate::storage_api_contracts::list::ListOperations as _;
+use crate::object_api::ObjectOptions;
+use crate::storage_api_contracts::{list::ListOperations as _, object::ObjectOperations as _};
 use crate::store::ECStore;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -639,6 +641,10 @@ pub async fn process_transition_transaction_record(
             delete_transition_transaction_record(api, transaction.transaction_id).await?;
             Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
         }
+        TransitionTransactionState::LocalCommitStarted if local_commit_matches_transaction(api.clone(), transaction).await? => {
+            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
+        }
         TransitionTransactionState::AbortedNoRemote | TransitionTransactionState::Committed => {
             delete_transition_transaction_record(api, transaction.transaction_id).await?;
             Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
@@ -648,6 +654,24 @@ pub async fn process_transition_transaction_record(
         | TransitionTransactionState::LocalCommitStarted
         | TransitionTransactionState::CleanupPending => Ok(TransitionTransactionRecoveryOutcome::Retained),
     }
+}
+
+async fn local_commit_matches_transaction(api: Arc<ECStore>, transaction: &TransitionTransaction) -> EcstoreResult<bool> {
+    let opts = ObjectOptions {
+        version_id: transaction.source.version_id.map(|version_id| version_id.to_string()),
+        versioned: transaction.source.version_mode == TransitionSourceVersionMode::Versioned,
+        version_suspended: transaction.source.version_mode == TransitionSourceVersionMode::VersionSuspended,
+        metadata_cache_safe: false,
+        ..Default::default()
+    };
+    let object = api
+        .get_object_info(&transaction.source.bucket, &transaction.source.object, &opts)
+        .await?;
+    let transitioned = &object.transitioned_object;
+    Ok(transitioned.status == TRANSITION_COMPLETE
+        && transitioned.name == transaction.remote_object
+        && transitioned.tier == transaction.tier_name
+        && transitioned.version_id == transaction.remote_version.tier_delete_version_id().unwrap_or_default())
 }
 
 async fn delete_transition_remote_candidate(api: Arc<ECStore>, transaction: &TransitionTransaction) -> EcstoreResult<()> {
