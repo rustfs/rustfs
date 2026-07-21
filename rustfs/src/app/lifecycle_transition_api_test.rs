@@ -836,9 +836,13 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .build()
         .unwrap();
 
-    Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
+    let complete_output = Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
         .await
         .expect("Failed to complete multipart upload through usecase");
+    assert!(
+        complete_output.output.version_id.is_some(),
+        "versioned CompleteMultipartUpload should return the created version ID"
+    );
 
     let info = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
