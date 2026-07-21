@@ -1274,10 +1274,10 @@ mod tests {
                         let seen = seen_clone.clone();
                         Box::pin(async move {
                             let mut names = entries.0.iter().flatten().map(|entry| entry.name.as_str());
-                            if let (Some(first), Some(second), None) = (names.next(), names.next(), names.next()) {
-                                if first == second {
-                                    seen.lock().expect("seen mutex poisoned").push(first.to_owned());
-                                }
+                            if let (Some(first), Some(second), None) = (names.next(), names.next(), names.next())
+                                && first == second
+                            {
+                                seen.lock().expect("seen mutex poisoned").push(first.to_owned());
                             }
                         })
                     })),

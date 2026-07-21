@@ -124,7 +124,10 @@ pub(crate) mod range {
 
 pub(crate) mod topology {
     pub(crate) use rustfs_storage_api::{
-        CapabilityState, CapabilityStatus, DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool,
-        TopologySet, TopologySnapshot,
+        CapabilityStatus, DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet,
+        TopologySnapshot,
     };
+
+    #[cfg(test)]
+    pub(crate) use rustfs_storage_api::CapabilityState;
 }
