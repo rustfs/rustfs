@@ -56,6 +56,7 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
+use crate::app::storage_api::object_usecase::bucket::replication::{must_replicate_object, schedule_object_replication};
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
 #[derive(Debug, Clone)]
@@ -1296,6 +1297,22 @@ impl S3 for FS {
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
+        // PutObjectLegalHold only rewrites metadata, so replication is not scheduled by the
+        // object PUT path. Schedule it explicitly, otherwise the legal hold never reaches the
+        // replica and the peer copy remains deletable.
+        let dsc = must_replicate_object(
+            &bucket,
+            &key,
+            &info.user_defined,
+            info.user_tags.as_ref().clone(),
+            popts.delete_marker_replication_status(),
+            popts.clone(),
+        )
+        .await;
+        if dsc.replicate_any() {
+            schedule_object_replication(info.clone(), store.clone(), dsc).await;
+        }
+
         let output = PutObjectLegalHoldOutput {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
         };
@@ -1465,6 +1482,23 @@ impl S3 for FS {
             error!("put_object_metadata failed, {}", e.to_string());
             S3Error::from(ApiError::from(e))
         })?;
+
+        // PutObjectRetention only rewrites metadata, so the object PUT path that normally
+        // computes a replication decision and schedules replication never runs for it.
+        // Without scheduling here the peer keeps the previous, unprotected lock state and a
+        // WORM-protected object stays deletable on the replica.
+        let dsc = must_replicate_object(
+            &bucket,
+            &key,
+            &object_info.user_defined,
+            object_info.user_tags.as_ref().clone(),
+            opts.delete_marker_replication_status(),
+            opts.clone(),
+        )
+        .await;
+        if dsc.replicate_any() {
+            schedule_object_replication(object_info.clone(), store.clone(), dsc).await;
+        }
 
         let output = PutObjectRetentionOutput {
             request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
