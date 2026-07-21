@@ -17,7 +17,7 @@ use std::sync::Arc;
 use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
 use uuid::Uuid;
 
-use super::tier::TierConfigMgr;
+use super::tier::{TierConfigMgr, tier_config_etag_matches};
 use super::tier_mutation_intent::{
     MAX_TIER_MUTATION_INTENT_SIZE, TierMutationIntent, TierMutationIntentState, advance_tier_mutation_intent_record_idempotent,
     load_tier_mutation_intent_record, save_tier_mutation_intent_record_if_absent,
@@ -140,13 +140,27 @@ async fn handle_commit(
 ) -> TierMutationPeerResult<TierMutationPeerOutcome> {
     let committed_config_etag = parse_commit_etag(canonical_payload)?;
     let tier_config_mgr = api.tier_config_mgr();
-    let (intent, applied) = advance_tier_mutation_intent_record_idempotent(
-        api,
+    let (intent, applied) = match advance_tier_mutation_intent_record_idempotent(
+        api.clone(),
         mutation_id,
         TierMutationIntentState::Committed,
-        Some(committed_config_etag),
+        Some(committed_config_etag.clone()),
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(Error::ConfigNotFound)
+            if tier_config_etag_matches(api, &committed_config_etag)
+                .await
+                .map_err(Error::other)? =>
+        {
+            return Ok(TierMutationPeerOutcome {
+                state: TierMutationPeerState::Committed,
+                applied: false,
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
     if intent.state == TierMutationIntentState::Committed {
         TierConfigMgr::clear_prepared_mutation_intent_block(&tier_config_mgr, mutation_id).await;
     }
