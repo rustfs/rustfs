@@ -395,12 +395,12 @@ mod tests {
         let error = try_normalize_target_plugin_instances_from_env(
             &Config(HashMap::new()),
             &notify_webhook_descriptor(),
-            vec![("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(), "tru".to_string())],
+            vec![("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(), "invalid".to_string())],
         )
         .expect_err("invalid enable value must be propagated by the public normalizer");
 
         match error {
-            TargetError::Configuration(detail) => assert_eq!(detail, "Invalid enable value 'tru'"),
+            TargetError::Configuration(detail) => assert_eq!(detail, "Invalid enable value 'invalid'"),
             other => panic!("expected a configuration error, got {other}"),
         }
     }
@@ -413,7 +413,7 @@ mod tests {
             vec![
                 ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_GOOD".to_string(), "on".to_string()),
                 ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_GOOD".to_string(), "https://example.com/good".to_string()),
-                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_BAD".to_string(), "tru".to_string()),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_BAD".to_string(), "invalid".to_string()),
             ],
         );
 

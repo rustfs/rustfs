@@ -443,7 +443,7 @@ mod tests {
     #[test]
     #[serial]
     fn invalid_notify_env_is_rejected_before_runtime_reconcile() {
-        with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("tru"), || {
+        with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("invalid"), || {
             let err = validate_notify_module_env().expect_err("invalid notify env must fail closed");
             assert!(err.contains(rustfs_config::ENV_NOTIFY_ENABLE));
         });
