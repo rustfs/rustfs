@@ -330,10 +330,6 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
 
-        if endpoints.legacy() {
-            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
-        }
-
         Self::refresh_pool_status_snapshot(store.as_ref()).await?;
 
         let mut pool_statuses = Vec::new();
@@ -400,6 +396,12 @@ impl DefaultAdminUsecase {
         let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
+        let Some(endpoints) = self.endpoints() else {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        };
+        if endpoints.legacy() {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        }
         let pool_statuses = self.execute_list_pool_statuses().await?;
         Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
         let mut pools = Vec::with_capacity(pool_statuses.len());
