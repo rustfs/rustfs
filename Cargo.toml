@@ -341,7 +341,7 @@ dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
 mimalloc = "0.1.52"
-hotpath = "0.21.4"
+hotpath = "0.21.5"
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 
