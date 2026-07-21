@@ -127,4 +127,7 @@ pub(crate) mod topology {
         CapabilityStatus, DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet,
         TopologySnapshot,
     };
+
+    #[cfg(test)]
+    pub(crate) use rustfs_storage_api::CapabilityState;
 }

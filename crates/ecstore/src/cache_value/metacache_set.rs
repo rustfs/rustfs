@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::disk_store::get_drive_walkdir_stall_timeout;
+use crate::disk::disk_store::{get_drive_walkdir_peek_timeout, get_drive_walkdir_stall_timeout};
 use crate::disk::error::DiskError;
 use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
 use metrics::counter;
@@ -175,6 +175,10 @@ pub(crate) enum TestReaderBehavior {
     ProducerError(DiskError),
     PrimaryErrorThenFallback(DiskError),
     PartialThenTimeout(Vec<MetaCacheEntry>),
+    DelayedEntries {
+        delay: Duration,
+        entries: Vec<MetaCacheEntry>,
+    },
 }
 
 #[cfg(test)]
@@ -339,6 +343,13 @@ async fn list_path_raw_inner(
                         drop(out);
                         Some(err)
                     }
+                    TestReaderBehavior::DelayedEntries { delay, entries } => {
+                        tokio::time::sleep(delay).await;
+                        let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                        out.write(&entries).await.expect("delayed test entries should be written");
+                        out.close().await.expect("delayed test entries should close");
+                        return Ok(());
+                    }
                 }
             } else {
                 None
@@ -472,6 +483,17 @@ async fn list_path_raw_inner(
                             drop(out);
                             record_producer_error(&producer_errs_clone, disk_idx, &err);
                             return Err(err);
+                        }
+                        TestReaderBehavior::DelayedEntries { delay, entries } => {
+                            tokio::time::sleep(delay).await;
+                            let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                            out.write(&entries)
+                                .await
+                                .expect("delayed test fallback entries should be written");
+                            out.close().await.expect("delayed test fallback entries should close");
+                            need_fallback = false;
+                            last_err = None;
+                            continue;
                         }
                     }
                 }
@@ -609,47 +631,23 @@ async fn list_path_raw_inner(
         // Consumer-side peek timeout, and a caveat worth understanding
         // (rustfs/backlog#1217).
         //
-        // This budget is the SAME SOURCE and SAME VALUE as the producer-side
-        // walk stall budget: both default to `walkdir_stall_timeout` and fall
-        // back to `get_drive_walkdir_stall_timeout()` (5s). But the two measure
-        // different things:
+        // This budget must not be stricter than the producer-side walk stall
+        // budget. The two measure different things:
         //   * producer stall: bounds a single drive READ inside the walk (see
         //     `with_walk_stall_deadline` in `disk/local.rs`);
         //   * this consumer peek: bounds the interval between two ADJACENT
         //     entries arriving from a drive's reader (`peek_with_timeout`).
         //
-        // Because they are coupled to the same value, the consumer cannot wait
-        // meaningfully longer for the next entry than the producer is allowed to
-        // spend producing one. When a drive walks a region dense with
-        // non-listable internal items (many entries the producer filters out
-        // before emitting the next visible one), a HEALTHY drive can take longer
-        // than one budget to hand the consumer its next entry. The consumer then
-        // classifies it as `PeekOutcome::TimedOut` and DETACHES that reader (it
-        // is replaced by a drained duplex below), dropping a good drive from the
-        // merge. That caps the "large prefix always succeeds" guarantee: a wide
-        // enough non-listable stretch can knock healthy drives out of quorum.
-        //
-        // This is left documented, not decoupled. Giving the consumer peek an
-        // independent, strictly-larger budget would reduce these false detaches,
-        // but it also delays detaching a genuinely dead drive by the same amount
-        // and shifts listing tail-latency semantics; that trade-off wants soak
-        // data before it changes the default, so it is deferred to a follow-up.
-        // The constraint for any such change: the consumer peek must be >= the
-        // producer stall (never stricter), so it can never declare a drive
-        // stalled before the producer itself would have failed.
-        let peek_timeout = opts
-            .walkdir_stall_timeout
-            .or({
-                #[cfg(test)]
-                {
-                    opts.peek_timeout
-                }
-                #[cfg(not(test))]
-                {
-                    None
-                }
-            })
-            .unwrap_or_else(get_drive_walkdir_stall_timeout);
+        // A drive can spend one stall budget walking a dense non-listable region
+        // before it can publish the next visible entry. Use an independent,
+        // profile-aware consumer budget so the merge does not detach that reader
+        // before the producer itself would have failed.
+        let producer_stall_timeout = opts.walkdir_stall_timeout.unwrap_or_else(get_drive_walkdir_stall_timeout);
+        let configured_peek_timeout = get_drive_walkdir_peek_timeout().max(producer_stall_timeout);
+        #[cfg(not(test))]
+        let peek_timeout = configured_peek_timeout;
+        #[cfg(test)]
+        let peek_timeout = opts.peek_timeout.unwrap_or(configured_peek_timeout);
         let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
             errs.push(None);
@@ -1244,6 +1242,57 @@ mod tests {
         .expect_err("stalled reader should fail when read quorum cannot be met");
 
         assert_eq!(err, DiskError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_waits_past_producer_stall_for_slow_progressing_reader() {
+        let entry = MetaCacheEntry {
+            name: "bucket/visible-object".to_string(),
+            metadata: vec![1, 2, 3],
+            cached: None,
+            reusable: false,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        timeout(
+            Duration::from_secs(1),
+            list_path_raw(
+                CancellationToken::new(),
+                ListPathRawOptions {
+                    disks: vec![None, None],
+                    min_disks: 2,
+                    walkdir_stall_timeout: Some(Duration::from_millis(20)),
+                    test_reader_behaviors: vec![
+                        TestReaderBehavior::DelayedEntries {
+                            delay: Duration::from_millis(60),
+                            entries: vec![entry.clone()],
+                        },
+                        TestReaderBehavior::Entries(vec![entry]),
+                    ],
+                    partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                        let seen = seen_clone.clone();
+                        Box::pin(async move {
+                            let mut names = entries.0.iter().flatten().map(|entry| entry.name.as_str());
+                            if let (Some(first), Some(second), None) = (names.next(), names.next(), names.next())
+                                && first == second
+                            {
+                                seen.lock().expect("seen mutex poisoned").push(first.to_owned());
+                            }
+                        })
+                    })),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("slow-progressing reader should complete inside the consumer peek budget")
+        .expect("slow-progressing reader should not be detached by the producer stall budget");
+
+        assert_eq!(
+            seen.lock().expect("seen mutex poisoned").as_slice(),
+            &["bucket/visible-object".to_string()]
+        );
     }
 
     #[tokio::test]

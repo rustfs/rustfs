@@ -56,6 +56,7 @@ Explicit per-operation overrides always win over the profile, so you can select
 | Environment variable | Default | `high_latency` default | Bounds |
 |---|---:|---:|---|
 | `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` | `5` | `60` | Max time a single walk filesystem call may go without answering during a listing walk. **The knob for listing failures on large prefixes.** |
+| `RUSTFS_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS` | `10` | `120` | Max time the metacache merge consumer waits for the next visible entry from a walk reader. Values below the resolved stall timeout are clamped up to the stall timeout. |
 | `RUSTFS_DRIVE_WALKDIR_TIMEOUT_SECS` | `5` | `60` | Total wall-clock timeout for a `walk_dir`. Retained for non-foreground callers; the foreground listing path no longer uses it (see below). |
 | `RUSTFS_DRIVE_LIST_DIR_TIMEOUT_SECS` | `5` | `60` | Timeout for a standalone `list_dir` metadata listing. |
 | `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS` | `5` | `60` | Timeout for metadata reads such as `read_metadata`. |
@@ -117,6 +118,10 @@ Raise the walk stall budget, or select the high-latency profile:
 ```bash
 # widen just the listing walk budget
 -e RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS=60
+
+# widen the metacache reader wait budget when drives keep progressing but do
+# not publish visible entries quickly enough for the merge consumer
+-e RUSTFS_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS=120
 
 # or raise every profile-aware drive default at once
 -e RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency

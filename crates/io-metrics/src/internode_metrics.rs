@@ -514,6 +514,12 @@ pub fn cluster_peer_is_offline(addr: &str) -> bool {
     peers.get(normalize_peer_key(addr)).map(|peer| !peer.online).unwrap_or(false)
 }
 
+/// Return the last observed online/offline state for a peer, if this process has observed one.
+pub fn cluster_peer_observed_online_status(addr: &str) -> Option<bool> {
+    let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    peers.get(normalize_peer_key(addr)).map(|peer| peer.online)
+}
+
 /// Decide whether to fast-fail (bypass) an offline peer instead of attempting to reach it
 /// (grpc-optimization P3 offline bypass). Returns `true` to bypass.
 ///
@@ -780,6 +786,18 @@ mod tests {
         assert!(cluster_peer_is_offline(slashed));
         record_peer_reachable(slashed);
         assert!(!cluster_peer_is_offline(bare), "reachable via one form must mark the shared entry online");
+    }
+
+    #[test]
+    fn cluster_peer_observed_online_status_reports_known_and_unknown_peers() {
+        let addr = "http://cluster-peer-snapshot-status-test:9000";
+        assert_eq!(cluster_peer_observed_online_status(addr), None);
+
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+
+        record_peer_unreachable(addr, 1);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(false));
     }
 
     #[test]

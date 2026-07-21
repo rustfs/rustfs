@@ -564,8 +564,17 @@ fn summarize_peer_health(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus
         .iter()
         .filter(|peer| peer.status.state == CapabilityState::Unknown)
         .count();
+    let disabled = snapshot
+        .peer_health
+        .peers
+        .iter()
+        .filter(|peer| peer.status.state == CapabilityState::Disabled)
+        .count();
     if unknown > 0 {
         CapabilityStatus::unknown().with_reason(format!("cluster peer health has {unknown} unresolved peers"))
+    } else if disabled > 0 {
+        let noun = if disabled == 1 { "peer" } else { "peers" };
+        CapabilityStatus::disabled().with_reason(format!("cluster peer health is not reported by {disabled} {noun}"))
     } else {
         CapabilityStatus::supported().with_reason("cluster peer health resolved for all peers")
     }
@@ -824,6 +833,56 @@ mod tests {
         assert_eq!(summary.peer_health.state, CapabilityState::Unknown);
         assert_eq!(summary.rpc_boundary.state, CapabilityState::Supported);
         assert_eq!(summary.workload_admission.state, CapabilityState::Supported);
+        assert_eq!(summary.actionable_pressure.state, CapabilityState::Disabled);
+    }
+
+    #[test]
+    fn cluster_snapshot_summary_treats_not_reported_peer_health_as_disabled() {
+        let snapshot = ClusterReadOnlySnapshot {
+            topology: TopologySnapshot::default(),
+            membership: ClusterMembershipSnapshot {
+                nodes: vec![ClusterNodeMembership {
+                    node_id: "node-a".to_string(),
+                    grid_host: "node-a:9000".to_string(),
+                    is_local: true,
+                    pools: vec![0],
+                }],
+                drives: Vec::new(),
+            },
+            pool_state: ClusterPoolStateSnapshot::default(),
+            local_storage: ClusterLocalNodeStorageSnapshot::default(),
+            peer_health: ClusterPeerHealthSnapshot {
+                peers: vec![ClusterPeerHealth {
+                    node_id: "node-a".to_string(),
+                    is_local: true,
+                    status: CapabilityStatus::disabled().with_reason("peer health not reported by endpoints"),
+                }],
+            },
+            rpc_boundary: sample_rpc_boundary_snapshot(),
+            observability: ObservabilitySnapshot::default(),
+            workload_admission: WorkloadAdmissionRegistrySnapshot::new(vec![WorkloadAdmissionSnapshot::new(
+                WorkloadClass::ForegroundRead,
+                AdmissionState::Open,
+            )]),
+            runtime_status: ClusterRuntimeStatusSnapshot {
+                readiness: DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                },
+                state: ClusterRuntimeReadinessState::Ready,
+                degraded_reasons: Vec::new(),
+            },
+        };
+
+        let summary = ClusterSnapshotSummary::from(&snapshot);
+
+        assert_eq!(summary.peer_health.state, CapabilityState::Disabled);
+        assert_eq!(
+            summary.peer_health.reason.as_deref(),
+            Some("cluster peer health is not reported by 1 peer")
+        );
         assert_eq!(summary.actionable_pressure.state, CapabilityState::Disabled);
     }
 

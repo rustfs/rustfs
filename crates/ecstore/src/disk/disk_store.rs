@@ -209,6 +209,16 @@ pub fn get_drive_walkdir_stall_timeout() -> Duration {
     )
 }
 
+pub fn get_drive_walkdir_peek_timeout() -> Duration {
+    let stall_timeout = get_drive_walkdir_stall_timeout();
+    let configured = get_drive_timeout_duration(
+        rustfs_config::ENV_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS,
+        rustfs_config::DEFAULT_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS.saturating_mul(2)),
+    );
+    configured.max(stall_timeout)
+}
+
 pub fn get_object_disk_read_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT,
@@ -1650,6 +1660,64 @@ mod tests {
                     assert_eq!(
                         get_drive_walkdir_stall_timeout(),
                         Duration::from_secs(rustfs_config::DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_peek_timeout_uses_wider_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                    temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                        assert_eq!(
+                            get_drive_walkdir_peek_timeout(),
+                            Duration::from_secs(rustfs_config::DEFAULT_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS)
+                        );
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_peek_timeout_is_never_stricter_than_stall_timeout() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS, Some("3"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, Some("13"), || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                    assert_eq!(get_drive_walkdir_peek_timeout(), Duration::from_secs(13));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_peek_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS, Some("23"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, || {
+                    assert_eq!(get_drive_walkdir_peek_timeout(), Duration::from_secs(23));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_peek_timeout_uses_high_latency_profile_default() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                    temp_env::with_var(
+                        rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE,
+                        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY),
+                        || {
+                            assert_eq!(
+                                get_drive_walkdir_peek_timeout(),
+                                Duration::from_secs(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS * 2)
+                            );
+                        },
                     );
                 });
             });
