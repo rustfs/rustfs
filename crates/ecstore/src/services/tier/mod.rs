@@ -19,6 +19,7 @@ pub mod tier_admin;
 pub mod tier_config;
 pub mod tier_gen;
 pub mod tier_handlers;
+pub(crate) mod tier_mutation_intent;
 pub mod warm_backend;
 pub mod warm_backend_aliyun;
 pub mod warm_backend_azure;
