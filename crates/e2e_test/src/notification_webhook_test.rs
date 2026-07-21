@@ -189,15 +189,19 @@ fn spawn_https_event_collector(ca_path: &Path) -> Result<(String, Arc<AtomicBool
     let running = Arc::new(AtomicBool::new(true));
     let server_running = Arc::clone(&running);
     let handle = thread::spawn(move || {
+        let mut connections = Vec::new();
         while server_running.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let config = Arc::clone(&server_config);
-                    handle_https_probe(stream, config);
+                    connections.push(thread::spawn(move || handle_https_probe(stream, config)));
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(20)),
                 Err(_) => break,
             }
+        }
+        for connection in connections {
+            let _ = connection.join();
         }
     });
 
@@ -207,6 +211,7 @@ fn spawn_https_event_collector(ca_path: &Path) -> Result<(String, Arc<AtomicBool
 fn handle_https_probe(stream: std::net::TcpStream, server_config: Arc<rustls::ServerConfig>) {
     use std::io::{Read, Write};
 
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let Ok(connection) = rustls::ServerConnection::new(server_config) else {
@@ -218,8 +223,16 @@ fn handle_https_probe(stream: std::net::TcpStream, server_config: Arc<rustls::Se
         return;
     }
     let response = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-    let _ = tls_stream.write_all(response.as_bytes());
-    let _ = tls_stream.flush();
+    if tls_stream.write_all(response.as_bytes()).is_err() {
+        return;
+    }
+    tls_stream.conn.send_close_notify();
+    while tls_stream.conn.wants_write() {
+        if tls_stream.conn.write_tls(&mut tls_stream.sock).is_err() {
+            return;
+        }
+    }
+    let _ = tls_stream.sock.shutdown(std::net::Shutdown::Write);
 }
 
 fn stop_https_event_collector(endpoint: &str, running: Arc<AtomicBool>, handle: thread::JoinHandle<()>) -> TestResult {

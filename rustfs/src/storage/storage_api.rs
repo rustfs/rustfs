@@ -233,7 +233,6 @@ pub(crate) mod rpc_consumer {
         #[cfg(test)]
         pub(crate) type HealBucketInfo = super::super::contract::bucket::BucketInfo;
 
-        #[cfg(test)]
         pub(crate) const STORAGE_CLASS_SUB_SYS: &str = super::super::STORAGE_CLASS_SUB_SYS;
 
         pub(crate) mod contract {
@@ -555,7 +554,6 @@ pub(crate) use ecstore_rpc::sign_tonic_rpc_response_proof;
 #[cfg(test)]
 pub(crate) use ecstore_rpc::verify_tonic_rpc_response_proof;
 
-#[cfg(test)]
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
 
 pub(crate) type BucketMetadata = ecstore_bucket::metadata::BucketMetadata;

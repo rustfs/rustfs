@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use crate::admin::service::{
-    config::{is_dynamic_config_subsystem, reload_dynamic_config_runtime_state_for_context, reload_runtime_config_snapshot},
+    config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
 use crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM;
 use crate::storage::storage_api::ecstore_tier::tier_mutation_peer::{self, TierMutationPeerState as EcTierMutationPeerState};
-#[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_SYS;
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
@@ -33,6 +32,9 @@ use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
+use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+use rustfs_config::notify::NOTIFY_SUB_SYSTEMS;
+use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_filemeta::MetacacheReader;
 use rustfs_iam::store::UserType;
 use rustfs_lock::LockClient;
@@ -75,6 +77,14 @@ const TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE: i32 = 0;
 const TIER_MUTATION_PEER_STATE_PREPARED_WIRE: i32 = 1;
 const TIER_MUTATION_PEER_STATE_COMMITTED_WIRE: i32 = 2;
 const TIER_MUTATION_PEER_STATE_ABORTED_WIRE: i32 = 3;
+
+fn supports_dynamic_config_rpc(sub_system: &str) -> bool {
+    NOTIFY_SUB_SYSTEMS.contains(&sub_system)
+        || matches!(
+            sub_system,
+            STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS | SCANNER_SUB_SYS | HEAL_SUB_SYS
+        )
+}
 
 #[derive(Debug)]
 struct HealControlReplayEntry {
@@ -1543,7 +1553,7 @@ impl Node for NodeService {
                 })),
             },
             Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => {
-                let supported = sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM || is_dynamic_config_subsystem(sub_system);
+                let supported = sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM || supports_dynamic_config_rpc(sub_system);
                 if !supported {
                     return Ok(Response::new(SignalServiceResponse {
                         success: false,
@@ -1556,8 +1566,7 @@ impl Node for NodeService {
                         error_info: None,
                     }));
                 }
-                let context = self.context.clone().or_else(runtime_sources::current_app_context);
-                match reload_dynamic_config_runtime_state_for_context(context.as_deref(), sub_system).await {
+                match reload_dynamic_config_runtime_state(sub_system).await {
                     Ok(()) => Ok(Response::new(SignalServiceResponse {
                         success: true,
                         error_info: None,
@@ -4213,6 +4222,23 @@ mod tests {
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
         assert!(error_info.contains("unsupported dynamic config subsystem: identity_openid"));
+    }
+
+    #[test]
+    fn dynamic_config_rpc_allowlist_matches_supported_subsystems() {
+        for sub_system in rustfs_config::notify::NOTIFY_SUB_SYSTEMS {
+            assert!(super::supports_dynamic_config_rpc(sub_system));
+        }
+        for sub_system in [
+            STORAGE_CLASS_SUB_SYS,
+            rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS,
+            rustfs_config::audit::AUDIT_MQTT_SUB_SYS,
+            rustfs_config::SCANNER_SUB_SYS,
+            rustfs_config::HEAL_SUB_SYS,
+        ] {
+            assert!(super::supports_dynamic_config_rpc(sub_system));
+        }
+        assert!(!super::supports_dynamic_config_rpc("identity_openid"));
     }
 
     #[tokio::test]

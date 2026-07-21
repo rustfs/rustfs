@@ -76,7 +76,7 @@ async fn converge_target_mutation_on_cluster(
 fn notification_target_subsystem(target_type: &str) -> S3Result<&'static str> {
     notification_target_specs()
         .iter()
-        .find(|spec| spec.service == target_type)
+        .find(|spec| spec.subsystem == target_type)
         .map(|spec| spec.subsystem)
         .ok_or_else(|| s3_error!(InvalidArgument, "unsupported notification target type: {}", target_type))
 }
@@ -527,6 +527,15 @@ mod tests {
             value: value.to_string(),
             hidden_if_empty: false,
         }])
+    }
+
+    #[test]
+    fn notification_target_subsystem_resolves_admin_route_type() {
+        assert_eq!(
+            notification_target_subsystem(NOTIFY_WEBHOOK_SUB_SYS).expect("webhook subsystem should resolve"),
+            NOTIFY_WEBHOOK_SUB_SYS
+        );
+        assert!(notification_target_subsystem("webhook").is_err());
     }
 
     #[test]
