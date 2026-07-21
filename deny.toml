@@ -41,12 +41,6 @@ allow-git = [
     # owner: marshawcoco  review: 2026-10
     "https://github.com/s3s-project/s3s.git",
     "https://github.com/apache/datafusion.git",
-    # hyper pinned (via [patch.crates-io]) to a rev carrying the HTTP/1
-    # flush-before-shutdown fix (hyperium/hyper#4018, commit 72046cc7) that is
-    # not yet in a crates.io release. Fixes sporadic large-GET `unexpected EOF`
-    # (rustfs/backlog#1232). Remove once a released hyper > 1.10.1 contains it.
-    # owner: rustfs-maintainers  review: 2026-07
-    "https://github.com/hyperium/hyper.git",
 ]
 
 [bans]

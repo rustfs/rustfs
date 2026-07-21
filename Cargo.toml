@@ -140,7 +140,7 @@ mysql_async = { default-features = false, version = "0.37" }
 async-compression = { version = "0.4.42" }
 async-recursion = "1.1.1"
 async-trait = "0.1.91"
-async-nats = "0.49.1"
+async-nats = "0.50.0"
 axum = "0.8.9"
 futures = "0.3.33"
 futures-core = "0.3.33"
@@ -149,7 +149,7 @@ futures-util = "0.3.33"
 pollster = "1.0.1"
 pulsar = { default-features = false, version = "6.8.0" }
 lapin = { default-features = false, version = "4.10.0" }
-hyper = { version = "1.10.1" }
+hyper = { version = "1.11.0" }
 hyper-rustls = { default-features = false, version = "0.27.9" }
 hyper-util = { version = "0.1.20" }
 http = "1.4.2"
@@ -159,7 +159,7 @@ minlz = "1.2.3"
 reqwest = "0.13.4"
 rustfs-kafka-async = { version = "1.2.0" }
 socket2 = { version = "0.6.5" }
-tokio = { version = "1.53.0" }
+tokio = { version = "1.53.1" }
 tokio-rustls = { default-features = false, version = "0.26.4" }
 tokio-stream = { version = "0.1.18" }
 tokio-test = "0.4.5"
@@ -182,7 +182,7 @@ quick-xml = "0.41.0"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.229" }
-serde_json = { version = "1.0.150" }
+serde_json = { version = "1.0.151" }
 serde_urlencoded = "0.7.1"
 
 # Cryptography and Security
@@ -212,7 +212,7 @@ zeroize = { version = "1.9.0" }
 chrono = { version = "0.4.45" }
 humantime = "2.4.0"
 jiff = { version = "0.2.34" }
-time = { version = "0.3.53" }
+time = { version = "0.3.54" }
 
 # Database
 deadpool-postgres = { version = "0.14" }
@@ -234,7 +234,7 @@ aws-smithy-types = { version = "1.6.1" }
 base64 = "0.22.1"
 base64-simd = "0.8.0"
 brotli = "8.0.4"
-clap = { version = "4.6.2" }
+clap = { version = "4.6.3" }
 const-str = { version = "1.1.0" }
 convert_case = "0.11.0"
 criterion = { version = "0.8" }
@@ -244,7 +244,7 @@ crossbeam-deque = "0.8.7"
 crossbeam-utils = "0.8.22"
 datafusion = { default-features = false, git = "https://github.com/apache/datafusion.git", rev = "dae03ee062b2abf986de8df12ea82fb1578a2d99" }
 derive_builder = "0.20.2"
-enumset = "1.1.13"
+enumset = "1.1.14"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.3"
@@ -256,7 +256,7 @@ hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 ipnetwork = { version = "0.21.1" }
 lazy_static = "1.5.0"
-libc = "0.2.186"
+libc = "0.2.187"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.13"
 memmap2 = "0.9.11"
@@ -281,7 +281,7 @@ rayon = "1.12.0"
 reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "8.0.0" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
-rumqttc = { package = "rumqttc-next", version = "0.33.2" }
+rumqttc = { package = "rumqttc-next", version = "0.33.3" }
 redis = { version = "1.4.1" }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
@@ -333,7 +333,7 @@ libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "10.0.1" }
 rcgen = "0.14.8"
-russh = { version = "0.62.2" }
+russh = { version = "0.62.3" }
 russh-sftp = "2.3.0"
 
 # WebDAV
@@ -341,7 +341,7 @@ dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
 mimalloc = "0.1.52"
-hotpath = "0.21.5"
+hotpath = "0.21.4"
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 
@@ -370,21 +370,3 @@ inherits = "release"
 inherits = "release"
 debug = true
 strip = "none"
-
-# Pin hyper to a revision that carries the HTTP/1 "flush buffered data before
-# shutdown" fix (hyperium/hyper#4018, commit 72046cc7). This lands as a
-# `[patch.crates-io]` entry — not on the `hyper` workspace dependency — so that
-# every consumer in the tree, including the transitive `hyper-util` server path
-# (`conn::auto` / `GracefulShutdown`) that actually drives our connections,
-# resolves to the fixed hyper rather than the buggy crates.io copy.
-#
-# hyper <= 1.10.1 can call `poll_shutdown()` on the socket while response bytes
-# are still buffered (a prior `poll_flush()` returned `Poll::Pending` and the
-# result was discarded). A backpressured / slow-reading peer then receives a
-# graceful FIN before the full Content-Length body is flushed, which standard S3
-# clients (minio-go / warp) report as `unexpected EOF` on large-object GET under
-# load. The fix is not in any crates.io release yet as of hyper 1.10.1; drop
-# this patch once a released version (> 1.10.1) contains commit 72046cc7.
-# See rustfs/backlog#1232.
-[patch.crates-io]
-hyper = { git = "https://github.com/hyperium/hyper.git", rev = "ccc1e850dc0cda3e71b0acd11f60ca3d48d09034" }
