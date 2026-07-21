@@ -420,6 +420,10 @@ impl DefaultMultipartUsecase {
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
         let mut opts = get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &key).await;
+        opts.versioned = versioned;
+        opts.version_suspended = version_suspended;
         let capacity_scope_token = Uuid::new_v4();
         opts.capacity_scope_token = Some(capacity_scope_token);
 
@@ -512,8 +516,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    let mpu_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-                    if mpu_versioned {
+                    if versioned {
                         record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
                             .await;
                     } else {
@@ -529,11 +532,7 @@ impl DefaultMultipartUsecase {
         enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
 
         let raw_mpu_version = obj_info.version_id.map(|v| v.to_string());
-        let mpu_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            raw_mpu_version.clone()
-        } else {
-            None
-        };
+        let mpu_version = if versioned { raw_mpu_version.clone() } else { None };
         let mpu_version_for_event = mpu_version.clone();
         // checksum: stored (decrypted) values take precedence over the request input;
         // additional algorithms (XXHash3/64/128, SHA-512, MD5), which have no typed

@@ -24,6 +24,11 @@ use super::super::*;
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
     tier_sweeper::{Jentry, RemoteTierDeleteOutcome, delete_object_from_remote_tier_with_lease_idempotent},
+    transition_transaction::{
+        TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
+        TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
+        save_transition_transaction_record,
+    },
 };
 use crate::disk::OldCurrentSize;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
@@ -1662,12 +1667,135 @@ async fn transition_cleanup_store(ctx: &Arc<crate::runtime::instance::InstanceCo
     #[cfg(feature = "test-util")]
     pause_transition_cleanup_store().await;
 
+    transition_object_store(ctx).await
+}
+
+async fn transition_object_store(ctx: &Arc<crate::runtime::instance::InstanceContext>) -> Option<Arc<ECStore>> {
     if let Some(api) = runtime_sources::object_store_handle().filter(|api| Arc::ptr_eq(&api.ctx, ctx)) {
         return Some(api);
     }
     let metadata_sys = ctx.bucket_metadata_sys()?;
     let api = metadata_sys.read().await.object_store();
     Arc::ptr_eq(&api.ctx, ctx).then_some(api)
+}
+
+fn transition_deployment_id(ctx: &crate::runtime::instance::InstanceContext) -> Result<Uuid> {
+    if let Some(deployment_id) = ctx.deployment_id() {
+        return Ok(deployment_id);
+    }
+    #[cfg(test)]
+    {
+        Ok(Uuid::new_v4())
+    }
+    #[cfg(not(test))]
+    {
+        Err(Error::other("transition transaction requires initialized deployment id"))
+    }
+}
+
+fn transition_transaction_not_after_unix_nanos() -> Result<i64> {
+    let not_after = (OffsetDateTime::now_utc() + time::Duration::days(7)).unix_timestamp_nanos();
+    i64::try_from(not_after).map_err(|_| Error::other("transition transaction deadline timestamp overflow"))
+}
+
+fn transition_source_version_mode(opts: &ObjectOptions, fi: &FileInfo) -> TransitionSourceVersionMode {
+    let requested_null_version = opts
+        .version_id
+        .as_deref()
+        .and_then(|version_id| Uuid::parse_str(version_id).ok())
+        .is_some_and(|version_id| version_id.is_nil());
+    let source_version_id = fi.version_id.filter(|version_id| !version_id.is_nil());
+    if opts.versioned && (source_version_id.is_some() || (fi.versioned && !requested_null_version)) {
+        TransitionSourceVersionMode::Versioned
+    } else if opts.version_suspended || opts.versioned {
+        TransitionSourceVersionMode::VersionSuspended
+    } else {
+        TransitionSourceVersionMode::Unversioned
+    }
+}
+
+fn transition_source_identity(
+    bucket: &str,
+    object: &str,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    stored_etag: &str,
+) -> Result<TransitionSourceIdentity> {
+    let version_mode = transition_source_version_mode(opts, fi);
+    let mod_time = fi
+        .mod_time
+        .ok_or_else(|| Error::other("transition source identity requires mod_time"))?
+        .unix_timestamp_nanos();
+    let mod_time_unix_nanos =
+        i64::try_from(mod_time).map_err(|_| Error::other("transition source mod_time timestamp overflow"))?;
+    let version_id = if version_mode == TransitionSourceVersionMode::Versioned {
+        fi.version_id.filter(|version_id| !version_id.is_nil())
+    } else {
+        None
+    };
+    let data_dir = fi
+        .data_dir
+        .ok_or_else(|| Error::other("transition source identity requires data_dir"))?;
+    Ok(TransitionSourceIdentity {
+        bucket: bucket.to_string(),
+        object: object.to_string(),
+        version_id,
+        data_dir,
+        mod_time_unix_nanos,
+        size: fi.size,
+        etag: stored_etag.to_string(),
+        version_mode,
+    })
+}
+
+async fn save_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction: &TransitionTransaction) -> Result<()> {
+    if let Some(api) = api {
+        return save_transition_transaction_record(api.clone(), transaction).await;
+    }
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        Err(Error::other("transition transaction store is unavailable"))
+    }
+}
+
+async fn advance_and_save_transition_transaction(
+    api: Option<&Arc<ECStore>>,
+    transaction: &mut TransitionTransaction,
+    next: TransitionTransactionState,
+    remote_version: Option<TransitionRemoteVersion>,
+) -> Result<()> {
+    transaction
+        .advance(transaction.fence(), next, remote_version)
+        .map_err(Error::other)?;
+    save_transition_transaction_if_available(api, transaction).await
+}
+
+async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
+    if let Some(api) = api {
+        return delete_transition_transaction_record(api.clone(), transaction_id).await;
+    }
+    Ok(())
+}
+
+async fn delete_transition_transaction_after_remote_cleanup(
+    api: Option<&Arc<ECStore>>,
+    transaction_id: Uuid,
+    bucket: &str,
+    object: &str,
+) {
+    if let Err(err) = delete_transition_transaction_if_available(api, transaction_id).await {
+        warn!(
+            bucket = bucket,
+            object = object,
+            transaction_id = %transaction_id,
+            error = ?err,
+            "transition remote candidate was cleaned but transaction record cleanup failed"
+        );
+    }
 }
 
 #[cfg(feature = "test-util")]
@@ -3138,13 +3266,22 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }*/
 
-        let dest_obj = gen_transition_objname(bucket);
-        if let Err(err) = dest_obj {
-            return Err(to_object_err(err, vec![]));
-        }
-        let dest_obj = dest_obj?;
-
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let transaction_api = transition_object_store(&self.ctx).await;
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: transition_deployment_id(&self.ctx)?,
+            transaction_id: Uuid::new_v4(),
+            owner_epoch: Uuid::new_v4(),
+            write_id: Uuid::new_v4(),
+            source: transition_source_identity(bucket, object, &fi, opts, &stored_etag)?,
+            tier_name: opts.transition.tier.clone(),
+            backend_fingerprint: tgt_client.backend_identity(),
+            not_after_unix_nanos: transition_transaction_not_after_unix_nanos()?,
+        })
+        .map_err(Error::other)?;
+        save_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await?;
+        let transaction_id = transaction.transaction_id;
+        let dest_obj = transaction.remote_object.clone();
         let mut transition_meta = (*oi.user_defined).clone();
         transition_meta.insert("name".to_string(), object.to_string());
 
@@ -3233,6 +3370,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             failure.error
                         ))));
                     }
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                        .await;
                 }
                 return Err(failure.error);
             }
@@ -3245,12 +3384,33 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     "{err}; rejected remote upload cleanup failed: {cleanup_err}"
                 ))));
             }
+            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err.into());
+        }
+        if let Err(err) = advance_and_save_transition_transaction(
+            transaction_api.as_ref(),
+            &mut transaction,
+            TransitionTransactionState::Uploaded,
+            Some(TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
+        )
+        .await
+        {
+            let cleanup_api = transition_cleanup_store(&self.ctx).await;
+            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                return Err(StorageError::Io(std::io::Error::other(format!(
+                    "{err}; uploaded transition transaction persist failed and cleanup failed: {cleanup_err}"
+                ))));
+            }
+            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
+            return Err(err);
         }
         let transition_version_id = match parse_transition_version_id(candidate.remote_version()) {
             Ok(version_id) => version_id,
             Err(err) => {
-                let _cleanup_result = upload_cleanup.cleanup().await;
+                if upload_cleanup.cleanup().await.is_ok() {
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                        .await;
+                }
                 return Err(err.into());
             }
         };
@@ -3264,7 +3424,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             match self.acquire_write_lock_diag("transition_object_commit", bucket, object).await {
                 Ok(guard) => Some(guard),
                 Err(err) => {
-                    let _cleanup_result = upload_cleanup.cleanup().await;
+                    if upload_cleanup.cleanup().await.is_ok() {
+                        delete_transition_transaction_after_remote_cleanup(
+                            transaction_api.as_ref(),
+                            transaction_id,
+                            bucket,
+                            object,
+                        )
+                        .await;
+                    }
                     return Err(err);
                 }
             }
@@ -3275,7 +3443,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Ok(current) => current,
             Err(err) => {
                 drop(transition_lock_guard);
-                let _cleanup_result = upload_cleanup.cleanup().await;
+                if upload_cleanup.cleanup().await.is_ok() {
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                        .await;
+                }
                 return Err(err);
             }
         };
@@ -3287,7 +3458,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if current_fi.transition_status == TRANSITION_COMPLETE || !source_matches {
             let already_transitioned = current_fi.transition_status == TRANSITION_COMPLETE;
             drop(transition_lock_guard);
-            let _cleanup_result = upload_cleanup.cleanup().await;
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+            }
             if already_transitioned {
                 return Ok(());
             }
@@ -3310,7 +3484,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         pause_transition_commit(bucket, object, TransitionCommitPause::BeforeLockLost).await;
         if transition_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
             drop(transition_lock_guard);
-            let _cleanup_result = upload_cleanup.cleanup().await;
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+            }
             return Err(StorageError::NamespaceLockQuorumUnavailable {
                 mode: "transition_object_commit",
                 bucket: bucket.to_string(),
@@ -3323,11 +3500,29 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         pause_transition_commit(bucket, object, TransitionCommitPause::BeforeLeaseValidation).await;
         if !upload_cleanup.lease.is_current_generation() {
             drop(transition_lock_guard);
-            let _cleanup_result = upload_cleanup.cleanup().await;
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+            }
             return Err(Error::other("remote tier configuration changed during transition"));
         }
         #[cfg(test)]
         pause_transition_commit(bucket, object, TransitionCommitPause::AfterLeaseValidation).await;
+        if let Err(err) = advance_and_save_transition_transaction(
+            transaction_api.as_ref(),
+            &mut transaction,
+            TransitionTransactionState::LocalCommitStarted,
+            None,
+        )
+        .await
+        {
+            drop(transition_lock_guard);
+            if upload_cleanup.cleanup().await.is_ok() {
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+            }
+            return Err(err);
+        }
         upload_cleanup.disarm();
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
             warn!(
@@ -3339,6 +3534,38 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             self.invalidate_get_object_metadata_cache(bucket, object).await;
             drop(transition_lock_guard);
             return Err(err);
+        }
+        match transaction.advance(transaction.fence(), TransitionTransactionState::Committed, None) {
+            Ok(_) => {
+                if let Err(err) = save_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
+                    warn!(
+                        bucket = bucket,
+                        object = object,
+                        transaction_id = %transaction_id,
+                        error = ?err,
+                        "transition committed locally but transaction committed-state persist failed"
+                    );
+                } else if let Err(err) =
+                    delete_transition_transaction_if_available(transaction_api.as_ref(), transaction_id).await
+                {
+                    warn!(
+                        bucket = bucket,
+                        object = object,
+                        transaction_id = %transaction_id,
+                        error = ?err,
+                        "transition committed locally but transaction cleanup failed"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    bucket = bucket,
+                    object = object,
+                    transaction_id = %transaction_id,
+                    error = ?err,
+                    "transition committed locally but transaction committed-state advance failed"
+                );
+            }
         }
 
         // delete_object_version persisted transition_status=complete and freed the
@@ -5349,6 +5576,54 @@ mod transition_upload_integrity_tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn transition_uses_transaction_canonical_remote_object_name() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-transaction-remote-object-bucket";
+        let object = "object.bin";
+        let payload = b"transition remote object must be bound to its transaction id".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let remote_version = Uuid::new_v4().to_string();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect("transition should commit");
+
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should upload one remote candidate");
+        let remote_object = &put_versions[0].0;
+        assert!(
+            remote_object.starts_with(crate::bucket::lifecycle::transition_transaction::TRANSITION_TRANSACTION_PREFIX),
+            "remote object should be transaction-scoped: {remote_object}"
+        );
+        let (fi, _, _) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("committed transition metadata should be readable");
+        assert_eq!(fi.transition_status, TRANSITION_COMPLETE);
+        assert_eq!(fi.transitioned_objname, *remote_object);
+        assert_eq!(
+            fi.transition_version_id,
+            Some(Uuid::parse_str(&remote_version).expect("test version id should parse"))
+        );
+        assert!(backend.contains(remote_object).await, "committed remote object should remain available");
+    }
+
     async fn corrupt_beyond_read_quorum(
         temp_dirs: &[tempfile::TempDir],
         bucket: &str,
@@ -5898,6 +6173,105 @@ mod transition_source_identity_matrix_tests {
     use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::register_mock_tier;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+    #[test]
+    fn transition_source_identity_treats_nil_version_as_null_source() {
+        let fi = FileInfo {
+            version_id: Some(Uuid::nil()),
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("nil source version should build a null-version identity");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::VersionSuspended);
+        assert_eq!(source.version_id, None);
+        source.validate().expect("null-version source identity should validate");
+    }
+
+    #[test]
+    fn transition_source_identity_treats_requested_nil_version_as_null_source() {
+        let fi = FileInfo {
+            version_id: None,
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::nil().to_string()),
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("requested nil source version should build a null-version identity");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::VersionSuspended);
+        assert_eq!(source.version_id, None);
+        source
+            .validate()
+            .expect("requested null-version source identity should validate");
+    }
+
+    #[test]
+    fn transition_source_identity_treats_unversioned_fileinfo_as_null_source() {
+        let fi = FileInfo {
+            version_id: None,
+            versioned: false,
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("unversioned fileinfo should build a null-version identity");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::VersionSuspended);
+        assert_eq!(source.version_id, None);
+        source
+            .validate()
+            .expect("unversioned fileinfo null-version source identity should validate");
+    }
+
+    #[test]
+    fn transition_source_identity_still_rejects_missing_versioned_source_id() {
+        let fi = FileInfo {
+            version_id: None,
+            versioned: true,
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("source identity construction should preserve missing version evidence");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::Versioned);
+        assert!(matches!(
+            source.validate(),
+            Err(crate::bucket::lifecycle::transition_transaction::TransitionTransactionError::Corrupt(
+                "versioned source is missing version_id"
+            ))
+        ));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
