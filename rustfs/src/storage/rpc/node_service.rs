@@ -2671,6 +2671,7 @@ mod tests {
 
         let request = Request::new(DeleteBucketRequest {
             bucket: "test-bucket".to_string(),
+            options: String::new(),
         });
 
         let response = service.delete_bucket(request).await;
@@ -2679,6 +2680,24 @@ mod tests {
         let delete_response = response.unwrap().into_inner();
         // Response should be valid regardless of success/failure
         assert!(delete_response.success || delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_rejects_invalid_options() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteBucketRequest {
+            bucket: "test-bucket".to_string(),
+            options: "invalid json".to_string(),
+        });
+
+        let response = service
+            .delete_bucket(request)
+            .await
+            .expect("RPC response should be returned")
+            .into_inner();
+        assert!(!response.success);
+        assert!(response.error.is_some());
     }
 
     #[tokio::test]

@@ -40,16 +40,16 @@ fn validate_table_bucket_delete_allowed(
     Ok(())
 }
 
-async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> bool {
+async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
     let local_disks = runtime_sources::local_disks_in(ctx).await;
     for disk in local_disks.iter() {
         let catalog_path = disk.path().join(bucket).join(BUCKET_TABLE_RESERVED_PREFIX);
-        if has_xlmeta_files(&catalog_path).await {
-            return true;
+        if has_xlmeta_files(&catalog_path).await? {
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 async fn validate_table_bucket_delete_guard(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<()> {
@@ -57,7 +57,7 @@ async fn validate_table_bucket_delete_guard(ctx: &crate::runtime::instance::Inst
         .await
         .is_ok_and(|metadata| metadata.table_bucket_enabled());
     if table_bucket_enabled {
-        validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(ctx, bucket).await)?;
+        validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(ctx, bucket).await?)?;
     }
 
     Ok(())
@@ -257,49 +257,57 @@ impl ECStore {
             None
         };
 
-        // Check bucket exists before deletion (per S3 API spec)
-        // If bucket doesn't exist, return NoSuchBucket error
-        if let Err(err) = self.peer_sys.get_bucket_info(bucket, &BucketOptions::default()).await {
-            // Convert DiskError to StorageError for comparison
-            let storage_err: StorageError = err.into();
-            if is_err_bucket_not_found(&storage_err) {
-                return Err(StorageError::BucketNotFound(bucket.to_string()));
-            }
-            return Err(to_object_err(storage_err, vec![bucket]));
-        }
-
-        validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
-
         let sr_mark_delete = opts.srdelete_op == SRBucketDeleteOp::MarkDelete;
         let sr_purge = opts.srdelete_op == SRBucketDeleteOp::Purge;
-
-        // Check bucket is empty before deletion (per S3 API spec)
-        // If bucket is not empty (contains actual objects with xl.meta files) and force
-        // is not set, return BucketNotEmpty error.
-        // Note: Empty directories (left after object deletion) should NOT count as objects.
-        if !opts.force && !sr_mark_delete {
-            let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
-            for disk in local_disks.iter() {
-                // Check if bucket directory contains any xl.meta files (actual objects)
-                // We recursively scan for xl.meta files to determine if bucket has objects
-                // Use the disk's root path to construct bucket path
-                let bucket_path = disk.path().join(bucket);
-                if has_xlmeta_files(&bucket_path).await {
-                    return Err(StorageError::BucketNotEmpty(bucket.to_string()));
+        let sr_delete = sr_mark_delete || sr_purge;
+        let mut delete_opts = opts.clone();
+        let bucket_exists = match self.peer_sys.get_bucket_info(bucket, &BucketOptions::default()).await {
+            Ok(_) => true,
+            Err(err) => {
+                let storage_err: StorageError = err.into();
+                if is_err_strict_volume_not_found(&storage_err) && sr_delete {
+                    false
+                } else if is_err_strict_volume_not_found(&storage_err) {
+                    return Err(StorageError::BucketNotFound(bucket.to_string()));
+                } else {
+                    return Err(to_object_err(storage_err, vec![bucket]));
                 }
             }
+        };
+
+        if bucket_exists {
+            validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
+
+            // Check bucket is empty before deletion (per S3 API spec)
+            // If bucket is not empty (contains actual objects with xl.meta files) and force
+            // is not set, return BucketNotEmpty error.
+            // Note: Empty directories (left after object deletion) should NOT count as objects.
+            if !opts.force {
+                let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
+                for disk in local_disks.iter() {
+                    let bucket_path = disk.path().join(bucket);
+                    if has_xlmeta_files(&bucket_path).await? {
+                        return Err(StorageError::BucketNotEmpty(bucket.to_string()));
+                    }
+                }
+                delete_opts.force_if_empty = true;
+            }
+        }
+
+        if sr_delete && !bucket_exists {
+            delete_opts.force_if_empty = true;
         }
 
         if sr_mark_delete {
             self.mark_bucket_deleted(bucket).await?;
-            self.cleanup_deleted_bucket_metadata(bucket, false).await?;
-            return Ok(());
         }
 
-        self.peer_sys
-            .delete_bucket(bucket, opts)
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket]))?;
+        if let Err(err) = self.peer_sys.delete_bucket(bucket, &delete_opts).await {
+            let storage_err = to_object_err(err.into(), vec![bucket]);
+            if !sr_delete || !is_err_strict_volume_not_found(&storage_err) {
+                return Err(storage_err);
+            }
+        }
 
         self.cleanup_deleted_bucket_metadata(bucket, sr_purge).await?;
         Ok(())
@@ -319,7 +327,7 @@ mod tests {
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::runtime::instance::InstanceContext;
     use crate::storage_api_contracts::{
-        bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp},
+        bucket::{BucketOperations as _, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp},
         object::{ObjectIO as _, ObjectOperations as _},
     };
     use crate::store::{ECStore, init_local_disks_with_instance_ctx};
@@ -448,7 +456,10 @@ mod tests {
 
     async fn any_disk_has_object_metadata(disk_paths: &[PathBuf], bucket: &str) -> bool {
         for disk_path in disk_paths {
-            if super::has_xlmeta_files(&disk_path.join(bucket)).await {
+            if super::has_xlmeta_files(&disk_path.join(bucket))
+                .await
+                .expect("object metadata scan should succeed")
+            {
                 return true;
             }
         }
@@ -508,12 +519,19 @@ mod tests {
     // serialize them so their assertions cannot observe each other's operations.
     #[tokio::test]
     #[serial]
-    async fn bucket_delete_mark_delete_marks_metadata_deleted_without_physical_object_delete() {
+    async fn bucket_delete_mark_delete_removes_empty_bucket_and_keeps_deleted_marker() {
         let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
         let bucket = format!("bucket-mark-delete-{}", Uuid::new_v4().simple());
-        let object = "object.txt";
 
-        create_bucket_with_object(&ecstore, &bucket, object).await;
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        for disk_path in &disk_paths {
+            tokio::fs::create_dir_all(disk_path.join(&bucket).join("empty-directory"))
+                .await
+                .expect("empty directory remnant should be created");
+        }
         assert!(metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_ok());
 
         let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
@@ -526,7 +544,7 @@ mod tests {
                 },
             )
             .await
-            .expect("MarkDelete should not reject non-empty bucket data");
+            .expect("MarkDelete should remove an empty bucket");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
             generation_before_delete.saturating_add(1),
@@ -534,8 +552,8 @@ mod tests {
         );
 
         assert!(
-            any_disk_has_object_metadata(&disk_paths, &bucket).await,
-            "MarkDelete must not physically remove object xl.meta data"
+            !any_disk_path_exists(&disk_paths, &bucket).await,
+            "MarkDelete should remove the bucket volume"
         );
         assert!(
             any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await,
@@ -545,6 +563,79 @@ mod tests {
             metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_err(),
             "deleted bucket metadata must be removed from the local cache"
         );
+        let buckets = ecstore
+            .list_bucket(&BucketOptions::default())
+            .await
+            .expect("bucket listing should succeed after MarkDelete");
+        assert!(!buckets.iter().any(|info| info.name == bucket));
+        ecstore
+            .delete_all(RUSTFS_META_BUCKET, &bucket_deleted_marker_prefix(&bucket))
+            .await
+            .expect("deleted-bucket marker should be removed to simulate a partial failure");
+        assert!(!any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
+        ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    srdelete_op: SRBucketDeleteOp::MarkDelete,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retried MarkDelete should recreate a missing tombstone");
+        assert!(any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_delete_mark_delete_rejects_non_empty_bucket_without_force() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-mark-delete-non-empty-{}", Uuid::new_v4().simple());
+
+        create_bucket_with_object(&ecstore, &bucket, "object.txt").await;
+
+        let err = ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    srdelete_op: SRBucketDeleteOp::MarkDelete,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("MarkDelete should reject a non-empty bucket without force");
+
+        assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
+        assert!(any_disk_has_object_metadata(&disk_paths, &bucket).await);
+        assert!(!any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_delete_mark_delete_rejects_hidden_object_paths_without_force() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-mark-delete-hidden-{}", Uuid::new_v4().simple());
+
+        create_bucket_with_object(&ecstore, &bucket, ".well-known/acme-challenge").await;
+        let mut reader = PutObjReader::from_vec(b"delete bucket semantics".to_vec());
+        ecstore
+            .put_object(&bucket, ".rustfs.sys/object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("second hidden object should be written");
+
+        let err = ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    srdelete_op: SRBucketDeleteOp::MarkDelete,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("MarkDelete should reject a hidden object path without force");
+
+        assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
+        assert!(any_disk_has_object_metadata(&disk_paths, &bucket).await);
     }
 
     #[tokio::test]
@@ -557,7 +648,12 @@ mod tests {
 
         create_bucket_with_object(&ecstore, &bucket, object).await;
         write_bucket_metadata_marker(&disk_paths, &metadata_prefix).await;
+        ecstore
+            .mark_bucket_deleted(&bucket)
+            .await
+            .expect("deleted-bucket marker should be created");
         assert!(any_disk_path_exists(&disk_paths, &metadata_prefix).await);
+        assert!(any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
 
         let generation_before_delete = ecstore.scanner_namespace_mutation_generation();
         ecstore
@@ -583,9 +679,31 @@ mod tests {
             "Purge should remove bucket metadata prefix"
         );
         assert!(
+            !any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await,
+            "Purge should remove the deleted-bucket marker"
+        );
+        assert!(
             metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_err(),
             "purged bucket metadata must be removed from the local cache"
         );
+        write_bucket_metadata_marker(&disk_paths, &metadata_prefix).await;
+        ecstore
+            .mark_bucket_deleted(&bucket)
+            .await
+            .expect("stale deleted-bucket marker should be recreated");
+        ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    srdelete_op: SRBucketDeleteOp::Purge,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retried Purge should remove stale metadata without a bucket volume");
+        assert!(!any_disk_path_exists(&disk_paths, &metadata_prefix).await);
+        assert!(!any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
     }
 
     #[tokio::test]

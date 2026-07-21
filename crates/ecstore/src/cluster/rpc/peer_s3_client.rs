@@ -23,7 +23,7 @@ use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::runtime::instance::{InstanceContext, bootstrap_ctx};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
-use crate::store::utils::is_reserved_or_invalid_bucket;
+use crate::store::{has_xlmeta_files, utils::is_reserved_or_invalid_bucket};
 use crate::{
     disk::{
         self, VolumeInfo,
@@ -614,13 +614,24 @@ impl PeerS3Client for LocalPeerS3Client {
             return Err(Error::ErasureWriteQuorum);
         }
 
+        let force = if opts.force_if_empty && !opts.force {
+            for disk in local_disks.iter() {
+                if has_xlmeta_files(&disk.path().join(bucket)).await.map_err(Error::Io)? {
+                    return Err(Error::VolumeNotEmpty);
+                }
+            }
+            true
+        } else {
+            opts.force
+        };
+
         let mut futures = Vec::with_capacity(local_disks.len());
 
         for disk in local_disks.iter() {
             // Non-force delete refuses a non-empty bucket (VolumeNotEmpty), which
             // the recreate loop below turns into BucketNotEmpty; only an explicit
             // force delete removes recursively (backlog#799 B1).
-            futures.push(disk.delete_volume(bucket, opts.force));
+            futures.push(disk.delete_volume(bucket, force));
         }
 
         let results = join_all(futures).await;
@@ -988,13 +999,15 @@ impl PeerS3Client for RemotePeerS3Client {
         .await
     }
 
-    async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         self.execute_with_timeout(
             || async {
+                let options = serde_json::to_string(opts)?;
                 let mut client = self.get_client().await?;
 
                 let request = Request::new(DeleteBucketRequest {
                     bucket: bucket.to_string(),
+                    options,
                 });
                 let response = client.delete_bucket(request).await?.into_inner();
                 if !response.success {

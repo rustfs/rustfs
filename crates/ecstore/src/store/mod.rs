@@ -40,8 +40,8 @@ use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
 use crate::error::{
-    StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
-    is_err_read_quorum, is_err_version_not_found, to_object_err,
+    StorageError, is_err_bucket_exists, is_err_invalid_upload_id, is_err_object_not_found, is_err_read_quorum,
+    is_err_strict_volume_not_found, is_err_version_not_found, to_object_err,
 };
 use crate::runtime::global::DISK_RESERVE_FRACTION;
 use crate::runtime::instance::InstanceContext;
@@ -91,7 +91,7 @@ type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
-async fn has_xlmeta_files(path: &std::path::Path) -> bool {
+pub(crate) async fn has_xlmeta_files(path: &std::path::Path) -> std::io::Result<bool> {
     use crate::disk::STORAGE_FORMAT_FILE;
     use tokio::fs;
 
@@ -100,33 +100,27 @@ async fn has_xlmeta_files(path: &std::path::Path) -> bool {
     while let Some(current_path) = stack.pop() {
         let mut entries = match fs::read_dir(&current_path).await {
             Ok(entries) => entries,
-            Err(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
         };
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        while let Some(entry) = entries.next_entry().await? {
             let file_name = entry.file_name();
             let file_name_str = file_name.to_string_lossy();
 
-            // Skip hidden files/directories (like .rustfs.sys)
-            if file_name_str.starts_with('.') {
-                continue;
-            }
-
             // Check if this is an xl.meta file
             if file_name_str == STORAGE_FORMAT_FILE {
-                return true;
+                return Ok(true);
             }
 
             // If it's a directory, add to stack for further exploration
-            if let Ok(file_type) = entry.file_type().await
-                && file_type.is_dir()
-            {
+            if entry.file_type().await?.is_dir() {
                 stack.push(entry.path());
             }
         }
     }
 
-    false
+    Ok(false)
 }
 
 async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEventSrc) -> Result<ObjectInfo> {
