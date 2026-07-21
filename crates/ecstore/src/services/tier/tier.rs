@@ -56,6 +56,8 @@ use crate::services::tier::{
     warm_backend::{WarmBackend, check_warm_backend, new_warm_backend},
 };
 use crate::storage_api_contracts::{
+    bucket::BucketOperations,
+    list::{ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     namespace::NamespaceLocking,
     object::{
         DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, HTTPPreconditions, ObjectIO, ObjectOperations, ObjectToDelete,
@@ -87,8 +89,11 @@ use super::{
 const TIER_CFG_REFRESH: Duration = Duration::from_secs(15 * 60);
 const TIER_OPERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_REMOTE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
+const TIER_REFERENCE_PROOF_LIST_LIMIT: i32 = 1000;
 const TIER_MUTATION_INTENT_RECOVERY_SCAN_LIMIT: usize = 1000;
 const TIER_MUTATION_BLOCK_MESSAGE: &str = "Remote tier configuration is being replaced";
+
+type TierReferenceProofWalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
 
 fn delayed_tier_refresh_interval(period: Duration) -> tokio::time::Interval {
     interval_at(Instant::now() + period, period)
@@ -575,6 +580,127 @@ fn validate_tier_mutation_target_shape(
 fn tier_backend_identity_admin_error(err: io::Error) -> AdminError {
     let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
     admin_err.message = err.to_string();
+    admin_err
+}
+
+trait TierReferenceProofStore:
+    EcstoreObjectIO
+    + BucketOperations<Error = Error>
+    + ListOperations<
+        Error = Error,
+        ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>,
+        ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>,
+        ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>,
+        WalkOptions = TierReferenceProofWalkOptions,
+        WalkCancellation = tokio_util::sync::CancellationToken,
+        WalkResultSender = tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>,
+    >
+{
+}
+
+impl<T> TierReferenceProofStore for T where
+    T: EcstoreObjectIO
+        + BucketOperations<Error = Error>
+        + ListOperations<
+            Error = Error,
+            ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>,
+            ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>,
+            ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>,
+            WalkOptions = TierReferenceProofWalkOptions,
+            WalkCancellation = tokio_util::sync::CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>,
+        >
+{
+}
+
+async fn ensure_no_authoritative_tier_object_references<S>(
+    api: Arc<S>,
+    affected_targets: &[TierMutationIntentTarget],
+) -> std::result::Result<(), AdminError>
+where
+    S: TierReferenceProofStore,
+{
+    for target in affected_targets {
+        if target.old_backend_identity.is_some() {
+            ensure_no_authoritative_target_references(api.clone(), target).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_no_authoritative_target_references<S>(
+    api: Arc<S>,
+    target: &TierMutationIntentTarget,
+) -> std::result::Result<(), AdminError>
+where
+    S: TierReferenceProofStore,
+{
+    let buckets = api
+        .list_bucket(&Default::default())
+        .await
+        .map_err(tier_reference_proof_admin_error)?;
+    for bucket in buckets {
+        let mut marker = None;
+        let mut version_marker = None;
+        loop {
+            let page = api
+                .clone()
+                .list_object_versions(
+                    &bucket.name,
+                    "",
+                    marker.take(),
+                    version_marker.take(),
+                    None,
+                    TIER_REFERENCE_PROOF_LIST_LIMIT,
+                )
+                .await
+                .map_err(tier_reference_proof_admin_error)?;
+            for object in &page.objects {
+                if tier_object_blocks_target_rebind(object, target).map_err(tier_reference_proof_admin_error)? {
+                    return Err(tier_reference_proof_in_use_error(&target.tier_name, object));
+                }
+            }
+            if !page.is_truncated {
+                break;
+            }
+            marker = page.next_marker;
+            version_marker = page.next_version_idmarker;
+            if marker.is_none() {
+                return Err(tier_reference_proof_admin_error(io::Error::other(
+                    "tier reference proof listing is truncated without a next marker",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tier_object_blocks_target_rebind(object: &ObjectInfo, target: &TierMutationIntentTarget) -> io::Result<bool> {
+    if object.transitioned_object.status != rustfs_filemeta::TRANSITION_COMPLETE
+        || object.transitioned_object.tier != target.tier_name
+    {
+        return Ok(false);
+    }
+    let current_identity = tier_destination_id_from_metadata(&object.user_defined)?;
+    Ok(match (&current_identity, &target.new_backend_identity) {
+        (_, None) => true,
+        (Some(current), Some(new)) => current != new,
+        (None, Some(_)) => true,
+    })
+}
+
+fn tier_reference_proof_in_use_error(tier_name: &str, object: &ObjectInfo) -> AdminError {
+    let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+    err.message = format!(
+        "Remote tier {tier_name} still has object references, for example {}/{}",
+        object.bucket, object.name
+    );
+    err
+}
+
+fn tier_reference_proof_admin_error(err: impl std::fmt::Display) -> AdminError {
+    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+    admin_err.message = format!("Remote tier reference proof failed: {err}");
     admin_err
 }
 
@@ -2140,7 +2266,7 @@ impl TierConfigMgr {
         mutation: TierCandidateMutation,
     ) -> std::result::Result<(), TierConfigUpdateError>
     where
-        S: EcstoreObjectIO + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + 'static,
+        S: TierReferenceProofStore + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + 'static,
     {
         let config_lock = Self::acquire_tier_config_write_lock(api.clone()).await?;
         let update = Self::admin_update_lock(handle).await;
@@ -2381,7 +2507,7 @@ impl TierConfigMgr {
         config_lock: Option<rustfs_lock::NamespaceLockGuard>,
     ) -> std::result::Result<(), TierConfigUpdateError>
     where
-        S: EcstoreObjectIO + 'static,
+        S: TierReferenceProofStore + 'static,
     {
         let handle = handle.clone();
         tokio::spawn(async move {
@@ -2414,9 +2540,12 @@ impl TierConfigMgr {
                         .map_err(TierConfigUpdateError::Mutation)?;
                 let proof_targets =
                     tier_mutation_proof_targets(mutation_kind, explicit_tier_name.as_deref(), &current_for_targets, &candidate);
-                let _affected_targets =
+                let affected_targets =
                     build_tier_mutation_affected_targets(mutation_kind, proof_targets, &current_for_targets, &candidate)
                         .map_err(TierConfigUpdateError::Publish)?;
+                ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets)
+                    .await
+                    .map_err(TierConfigUpdateError::Publish)?;
                 candidate
                     .save_tiering_config_if_current(api, version.as_deref())
                     .await
@@ -2558,7 +2687,7 @@ impl TierConfigMgr {
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError>
     where
-        S: EcstoreObjectIO + 'static,
+        S: TierReferenceProofStore + 'static,
     {
         let update = Self::admin_update_lock(handle).await;
         let (candidate, version) = load_tier_config_for_update(api.clone())
@@ -2590,7 +2719,7 @@ impl TierConfigMgr {
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError>
     where
-        S: EcstoreObjectIO + 'static,
+        S: TierReferenceProofStore + 'static,
     {
         let update = Self::admin_update_lock(handle).await;
         let (candidate, version) = load_tier_config_for_update(api.clone())
@@ -3803,6 +3932,90 @@ mod tests {
                 etag: Some("saved-etag".to_string()),
                 ..Default::default()
             })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BucketOperations for LockingTierConfigStore {
+        type Error = Error;
+
+        async fn make_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &crate::storage_api_contracts::bucket::MakeBucketOptions,
+        ) -> Result<()> {
+            Err(Error::NotImplemented)
+        }
+
+        async fn get_bucket_info(
+            &self,
+            _bucket: &str,
+            _opts: &crate::storage_api_contracts::bucket::BucketOptions,
+        ) -> Result<crate::storage_api_contracts::bucket::BucketInfo> {
+            Err(Error::NotImplemented)
+        }
+
+        async fn list_bucket(
+            &self,
+            _opts: &crate::storage_api_contracts::bucket::BucketOptions,
+        ) -> Result<Vec<crate::storage_api_contracts::bucket::BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &crate::storage_api_contracts::bucket::DeleteBucketOptions,
+        ) -> Result<()> {
+            Err(Error::NotImplemented)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ListOperations for LockingTierConfigStore {
+        type Error = Error;
+        type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+        type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+        type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+        type WalkOptions = TierReferenceProofWalkOptions;
+        type WalkCancellation = tokio_util::sync::CancellationToken;
+        type WalkResultSender = tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>;
+
+        async fn list_objects_v2(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+            _fetch_owner: bool,
+            _start_after: Option<String>,
+            _incl_deleted: bool,
+        ) -> Result<Self::ListObjectsV2Info> {
+            Ok(StorageListObjectsV2Info::default())
+        }
+
+        async fn list_object_versions(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _marker: Option<String>,
+            _version_marker: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+        ) -> Result<Self::ListObjectVersionsInfo> {
+            Ok(StorageListObjectVersionsInfo::default())
+        }
+
+        async fn walk(
+            self: Arc<Self>,
+            _rx: Self::WalkCancellation,
+            _bucket: &str,
+            _prefix: &str,
+            _result: Self::WalkResultSender,
+            _opts: Self::WalkOptions,
+        ) -> Result<()> {
+            Err(Error::NotImplemented)
         }
     }
 
@@ -5829,6 +6042,7 @@ mod tests {
         fail_put: AtomicBool,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
+        listed_versions: Mutex<Vec<ObjectInfo>>,
     }
 
     impl Default for CasConfigStore {
@@ -5839,7 +6053,17 @@ mod tests {
                 fail_put: AtomicBool::new(false),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 lock_requests: Mutex::new(Vec::new()),
+                listed_versions: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    impl CasConfigStore {
+        fn add_listed_version(&self, object: ObjectInfo) {
+            self.listed_versions
+                .lock()
+                .expect("tier reference fixture should not poison")
+                .push(object);
         }
     }
 
@@ -5921,6 +6145,175 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl BucketOperations for CasConfigStore {
+        type Error = Error;
+
+        async fn make_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &crate::storage_api_contracts::bucket::MakeBucketOptions,
+        ) -> Result<()> {
+            Err(Error::NotImplemented)
+        }
+
+        async fn get_bucket_info(
+            &self,
+            _bucket: &str,
+            _opts: &crate::storage_api_contracts::bucket::BucketOptions,
+        ) -> Result<crate::storage_api_contracts::bucket::BucketInfo> {
+            Err(Error::NotImplemented)
+        }
+
+        async fn list_bucket(
+            &self,
+            _opts: &crate::storage_api_contracts::bucket::BucketOptions,
+        ) -> Result<Vec<crate::storage_api_contracts::bucket::BucketInfo>> {
+            let mut seen = HashSet::new();
+            let mut buckets = Vec::new();
+            for object in self
+                .listed_versions
+                .lock()
+                .expect("tier reference fixture should not poison")
+                .iter()
+            {
+                if seen.insert(object.bucket.clone()) {
+                    buckets.push(crate::storage_api_contracts::bucket::BucketInfo {
+                        name: object.bucket.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+            Ok(buckets)
+        }
+
+        async fn delete_bucket(
+            &self,
+            _bucket: &str,
+            _opts: &crate::storage_api_contracts::bucket::DeleteBucketOptions,
+        ) -> Result<()> {
+            Err(Error::NotImplemented)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ListOperations for CasConfigStore {
+        type Error = Error;
+        type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+        type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+        type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+        type WalkOptions = TierReferenceProofWalkOptions;
+        type WalkCancellation = tokio_util::sync::CancellationToken;
+        type WalkResultSender = tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>;
+
+        async fn list_objects_v2(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+            _fetch_owner: bool,
+            _start_after: Option<String>,
+            _incl_deleted: bool,
+        ) -> Result<Self::ListObjectsV2Info> {
+            Ok(StorageListObjectsV2Info::default())
+        }
+
+        async fn list_object_versions(
+            self: Arc<Self>,
+            bucket: &str,
+            prefix: &str,
+            marker: Option<String>,
+            version_marker: Option<String>,
+            _delimiter: Option<String>,
+            max_keys: i32,
+        ) -> Result<Self::ListObjectVersionsInfo> {
+            let mut objects: Vec<_> = self
+                .listed_versions
+                .lock()
+                .expect("tier reference fixture should not poison")
+                .iter()
+                .filter(|object| object.bucket == bucket && object.name.starts_with(prefix))
+                .cloned()
+                .collect();
+            objects.sort_by(|left, right| tier_test_object_marker(left).cmp(&tier_test_object_marker(right)));
+            if marker.is_some() || version_marker.is_some() {
+                let marker = (marker.unwrap_or_default(), version_marker.unwrap_or_default());
+                objects.retain(|object| tier_test_object_marker(object) > marker);
+            }
+            let limit = match usize::try_from(max_keys) {
+                Ok(limit) => limit,
+                Err(_) => 0,
+            };
+            let is_truncated = objects.len() > limit;
+            if is_truncated {
+                objects.truncate(limit);
+            }
+            let (next_marker, next_version_idmarker) = if is_truncated {
+                objects
+                    .last()
+                    .map(|object| (Some(object.name.clone()), object.version_id.map(|version| version.to_string())))
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            Ok(StorageListObjectVersionsInfo {
+                is_truncated,
+                next_marker,
+                next_version_idmarker,
+                objects,
+                prefixes: Vec::new(),
+            })
+        }
+
+        async fn walk(
+            self: Arc<Self>,
+            _rx: Self::WalkCancellation,
+            _bucket: &str,
+            _prefix: &str,
+            _result: Self::WalkResultSender,
+            _opts: Self::WalkOptions,
+        ) -> Result<()> {
+            Err(Error::NotImplemented)
+        }
+    }
+
+    fn tier_test_object_marker(object: &ObjectInfo) -> (String, String) {
+        (
+            object.name.clone(),
+            object.version_id.map(|version| version.to_string()).unwrap_or_default(),
+        )
+    }
+
+    fn transitioned_tier_object(
+        bucket: &str,
+        object: &str,
+        tier_name: &str,
+        backend_identity: Option<TierDestinationId>,
+    ) -> ObjectInfo {
+        let mut user_defined = HashMap::new();
+        if let Some(identity) = backend_identity {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut user_defined,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                rustfs_utils::crypto::hex(identity),
+            );
+        }
+        ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            user_defined: Arc::new(user_defined),
+            transitioned_object: crate::storage_api_contracts::lifecycle::TransitionedObject {
+                name: object.to_string(),
+                tier: tier_name.to_string(),
+                status: rustfs_filemeta::TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[async_trait::async_trait]
     impl NamespaceLocking for CasConfigStore {
         type Error = Error;
         type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
@@ -5991,6 +6384,76 @@ mod tests {
                 .is_empty(),
             "forced clear must persist the empty candidate"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_reference_proof_blocks_remove_before_config_save() {
+        let store = Arc::new(CasConfigStore::default());
+        let tier = build_rustfs_tier("COLD-A");
+        let identity = tier_backend_identity(&tier).expect("test tier identity should encode");
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), tier.clone_with_credentials());
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("reference proof fixture should persist");
+        store.add_listed_version(transitioned_tier_object("photos", "2026/a.jpg", "COLD-A", Some(identity)));
+
+        let manager = TierConfigMgr::new();
+        manager.write().await.tiers.insert("COLD-A".to_string(), tier);
+        let err = TierConfigMgr::remove_and_save_with(&manager, store.clone(), "COLD-A", true)
+            .await
+            .expect_err("authoritative object reference must block tier removal");
+
+        match err {
+            TierConfigUpdateError::Publish(err) => {
+                assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+                assert!(err.message.contains("photos/2026/a.jpg"), "{}", err.message);
+            }
+            other => panic!("reference proof failures must be surfaced as publish errors: {other:?}"),
+        }
+        assert!(manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(
+            load_tier_config_for_update(store)
+                .await
+                .expect("blocked config should still reload")
+                .0
+                .tiers
+                .contains_key("COLD-A"),
+            "blocked removal must not persist the empty candidate"
+        );
+    }
+
+    #[test]
+    fn zero_reference_proof_rebind_identity_boundaries_fail_closed() {
+        let tier = build_rustfs_tier("COLD-A");
+        let current_identity = tier_backend_identity(&tier).expect("current identity should encode");
+        let replacement_identity =
+            tier_backend_identity(&build_azure_tier("account-a")).expect("replacement identity should encode");
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: Some(current_identity),
+        };
+        let object = transitioned_tier_object("photos", "2026/a.jpg", "COLD-A", Some(current_identity));
+        assert!(!tier_object_blocks_target_rebind(&object, &target).expect("matching identity should parse"));
+
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: Some(replacement_identity),
+        };
+        assert!(tier_object_blocks_target_rebind(&object, &target).expect("mismatched identity should parse"));
+
+        let object_without_identity = transitioned_tier_object("photos", "2026/b.jpg", "COLD-A", None);
+        assert!(
+            tier_object_blocks_target_rebind(&object_without_identity, &target)
+                .expect("missing identity means unknown reference owner")
+        );
+
+        let mut pending = transitioned_tier_object("photos", "2026/c.jpg", "COLD-A", Some(current_identity));
+        pending.transitioned_object.status = "pending".to_string();
+        assert!(!tier_object_blocks_target_rebind(&pending, &target).expect("non-complete status should not block"));
     }
 
     #[tokio::test]
