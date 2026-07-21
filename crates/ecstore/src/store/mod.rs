@@ -107,11 +107,6 @@ async fn has_xlmeta_files(path: &std::path::Path) -> bool {
             let file_name = entry.file_name();
             let file_name_str = file_name.to_string_lossy();
 
-            // Skip hidden files/directories (like .rustfs.sys)
-            if file_name_str.starts_with('.') {
-                continue;
-            }
-
             // Check if this is an xl.meta file
             if file_name_str == STORAGE_FORMAT_FILE {
                 return true;

@@ -74,6 +74,7 @@ message GetBucketInfoResponse {
 
 message DeleteBucketRequest {
   string bucket = 1;
+  string options = 2;
 }
 
 message DeleteBucketResponse {

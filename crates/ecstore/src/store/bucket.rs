@@ -609,6 +609,30 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn bucket_delete_mark_delete_rejects_hidden_object_paths_without_force() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-mark-delete-hidden-{}", Uuid::new_v4().simple());
+
+        create_bucket_with_object(&ecstore, &bucket, ".well-known/acme-challenge").await;
+        create_bucket_with_object(&ecstore, &bucket, ".rustfs.sys/object").await;
+
+        let err = ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    srdelete_op: SRBucketDeleteOp::MarkDelete,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("MarkDelete should reject a hidden object path without force");
+
+        assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
+        assert!(any_disk_has_object_metadata(&disk_paths, &bucket).await);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn bucket_delete_purge_removes_bucket_data_and_internal_metadata() {
         let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
         let bucket = format!("bucket-purge-{}", Uuid::new_v4().simple());

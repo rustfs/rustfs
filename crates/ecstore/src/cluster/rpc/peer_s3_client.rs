@@ -988,13 +988,15 @@ impl PeerS3Client for RemotePeerS3Client {
         .await
     }
 
-    async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         self.execute_with_timeout(
             || async {
+                let options = serde_json::to_string(opts)?;
                 let mut client = self.get_client().await?;
 
                 let request = Request::new(DeleteBucketRequest {
                     bucket: bucket.to_string(),
+                    options,
                 });
                 let response = client.delete_bucket(request).await?.into_inner();
                 if !response.success {

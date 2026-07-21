@@ -83,6 +83,8 @@ pub struct GetBucketInfoResponse {
 pub struct DeleteBucketRequest {
     #[prost(string, tag = "1")]
     pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub options: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteBucketResponse {

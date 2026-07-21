@@ -33,7 +33,7 @@ pub struct MakeBucketOptions {
 }
 
 /// Operation to perform on a bucket during site replication delete.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SRBucketDeleteOp {
     /// No operation.
     #[default]
@@ -45,7 +45,7 @@ pub enum SRBucketDeleteOp {
 }
 
 /// Options for deleting a bucket.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeleteBucketOptions {
     /// Skip acquiring namespace lock.
     pub no_lock: bool,
