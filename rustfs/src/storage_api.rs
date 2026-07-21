@@ -89,7 +89,10 @@ pub(crate) mod server {
             }
         }
 
-        pub(crate) use crate::storage::storage_api::{EventArgs, StorageObjectInfo, register_event_dispatch_hook};
+        pub(crate) use crate::storage::storage_api::{
+            EventArgs, StorageObjectInfo, read_existing_server_config_no_lock, register_event_dispatch_hook,
+            with_server_config_read_lock,
+        };
     }
 
     pub(crate) mod http {
@@ -151,7 +154,10 @@ pub(crate) mod server {
     }
 
     pub(crate) mod module_switch {
-        pub(crate) use crate::storage::storage_api::{Error, read_config, save_config};
+        pub(crate) use crate::storage::storage_api::{
+            Error, read_config, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
+            with_config_object_write_lock,
+        };
     }
 
     pub(crate) mod readiness {

@@ -12,7 +12,11 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use super::{module_switch::resolve_audit_module_state, refresh_persisted_module_switches_from_store, runtime_sources};
+use super::{
+    module_switch::resolve_audit_module_state, refresh_persisted_module_switches_from,
+    refresh_persisted_module_switches_from_store, runtime_sources,
+};
+use crate::runtime_sources::AppContext;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
@@ -21,6 +25,13 @@ static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT
 
 fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
     runtime_sources::current_server_config()
+}
+
+fn server_config_for_context(context: Option<&AppContext>) -> Option<rustfs_config::server_config::Config> {
+    match context {
+        Some(context) => context.server_config().get(),
+        None => server_config_from_context(),
+    }
 }
 
 pub fn refresh_audit_module_enabled() -> bool {
@@ -51,7 +62,15 @@ fn has_any_audit_targets(config: &rustfs_config::server_config::Config) -> bool 
 /// If not configured, it skips the initialization.
 /// It also handles cases where the audit system is already running or if the global configuration is not loaded.
 pub async fn start_audit_system() -> AuditResult<()> {
-    if let Err(err) = refresh_persisted_module_switches_from_store().await {
+    start_audit_system_for_context(None).await
+}
+
+pub(crate) async fn start_audit_system_for_context(context: Option<&AppContext>) -> AuditResult<()> {
+    let refresh_result = match context {
+        Some(context) => refresh_persisted_module_switches_from(context.object_store()).await,
+        None => refresh_persisted_module_switches_from_store().await,
+    };
+    if let Err(err) = refresh_result {
         warn!("Failed to refresh persisted audit module switch from store: {}", err);
     }
 
@@ -70,7 +89,7 @@ pub async fn start_audit_system() -> AuditResult<()> {
     );
 
     // 1. Get the global configuration loaded by ecstore
-    let server_config = match server_config_from_context() {
+    let server_config = match server_config_for_context(context) {
         Some(config) => config,
         None => {
             warn!(
@@ -163,5 +182,16 @@ pub async fn stop_audit_system() -> AuditResult<()> {
     } else {
         warn!("Audit system not initialized, cannot stop");
         Ok(())
+    }
+}
+
+pub(crate) async fn apply_audit_module_switch_for_context(context: Option<&AppContext>) -> AuditResult<()> {
+    if refresh_audit_module_enabled() {
+        match start_audit_system_for_context(context).await {
+            Ok(()) | Err(AuditError::AlreadyInitialized) => Ok(()),
+            Err(err) => Err(err),
+        }
+    } else {
+        stop_audit_system().await
     }
 }

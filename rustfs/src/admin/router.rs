@@ -628,7 +628,7 @@ fn resolve_object_lambda_webhook_config_from_server_config(
 
 async fn load_current_server_config() -> S3Result<Config> {
     if let Some(system) = notification_system() {
-        return Ok(system.config.read().await.clone());
+        return Ok(system.config_snapshot().await);
     }
 
     if let Some(store) = current_object_store_handle() {

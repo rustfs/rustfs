@@ -12,31 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::init_event_notifier;
+use crate::server::{init_event_notifier, is_event_notifier_reconciled};
 use rustfs_config::server_config::Config;
 use s3s::{S3Result, s3_error};
 use std::sync::Arc;
-use tokio::sync::Mutex;
-
-static NOTIFICATION_SYSTEM_INIT_LOCK: Mutex<()> = Mutex::const_new(());
 
 pub(crate) async fn get_notification_system() -> S3Result<Arc<rustfs_notify::NotificationSystem>> {
-    if let Some(system) = rustfs_notify::notification_system() {
+    if is_event_notifier_reconciled()
+        && let Some(system) = rustfs_notify::notification_system()
+        && system.runtime_lifecycle_is_converged()
+    {
         return Ok(system);
     }
 
-    let _guard = NOTIFICATION_SYSTEM_INIT_LOCK.lock().await;
-    if let Some(system) = rustfs_notify::notification_system() {
-        return Ok(system);
+    init_event_notifier()
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to reconcile notification runtime: {}", err))?;
+    let system =
+        rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))?;
+    if !system.runtime_lifecycle_is_converged() {
+        return Err(s3_error!(InternalError, "latest notification lifecycle generation has not converged"));
     }
-
-    init_event_notifier().await;
-    rustfs_notify::notification_system().ok_or_else(|| s3_error!(InternalError, "notification system not initialized"))
+    Ok(system)
 }
 
 pub(crate) async fn load_notification_config_snapshot() -> S3Result<(Arc<rustfs_notify::NotificationSystem>, Config)> {
     let system = get_notification_system().await?;
-    let config = system.config.read().await.clone();
+    let config = system.config_snapshot().await;
     Ok((system, config))
 }
 

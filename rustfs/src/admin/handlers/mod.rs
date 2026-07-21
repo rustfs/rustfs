@@ -63,6 +63,19 @@ pub mod user_iam;
 pub mod user_lifecycle;
 pub mod user_policy_binding;
 
+pub(crate) async fn supervise_admin_mutation<T>(
+    operation: &'static str,
+    mutation: impl std::future::Future<Output = s3s::S3Result<T>> + Send + 'static,
+) -> s3s::S3Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::spawn(mutation).await.map_err(|err| {
+        let outcome = if err.is_cancelled() { "cancelled" } else { "panicked" };
+        s3s::s3_error!(InternalError, "{} task {}", operation, outcome)
+    })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +125,44 @@ mod tests {
 
         // Just verify they can be created without panicking
         // Test passes if we reach this point without panicking
+    }
+
+    #[tokio::test]
+    async fn supervised_admin_mutation_survives_waiter_cancellation() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            supervise_admin_mutation("test mutation", async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let _ = completed_tx.send(());
+                Ok(())
+            })
+            .await
+        });
+
+        started_rx.await.expect("mutation started");
+        waiter.abort();
+        release_tx.send(()).expect("release mutation");
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed_rx)
+            .await
+            .expect("detached mutation should complete")
+            .expect("completion signal");
+    }
+
+    #[tokio::test]
+    async fn supervised_admin_mutation_does_not_expose_panic_payload() {
+        let error = supervise_admin_mutation::<()>("test mutation", async {
+            panic!("do-not-expose-payload");
+        })
+        .await
+        .expect_err("panicking mutation should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("panicked"));
+        assert!(!rendered.contains("do-not-expose-payload"));
     }
 
     // Note: Testing the actual async handler implementations requires:

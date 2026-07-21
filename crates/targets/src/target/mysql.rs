@@ -25,7 +25,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetType, build_queued_payload, delete_stored_payload, is_connectivity_error, open_target_queue_store,
-        persist_queued_payload_to_store, redacted_secret,
+        persist_queued_payload_to_store, redacted_secret, with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
@@ -47,6 +47,8 @@ use uuid::Uuid;
 /// `TargetError::Timeout`, a connectivity error, so the payload stays queued
 /// for replay.
 const MYSQL_CONN_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Absolute ceiling for one INSERT, including pool checkout and server execution.
+const MYSQL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Name of the optional idempotency-key column / primary key. Present on tables
 /// created by this target; absent on legacy two-column tables.
@@ -784,29 +786,33 @@ where
             "Inserting MySQL event"
         );
 
-        let pool = self.get_or_init_pool().await?;
-        // At this point the pool has already been initialized (get_or_init_pool
-        // succeeded above), so get_conn() failures are always transient: the
-        // connection was lost or the pool is temporarily exhausted.
-        let mut conn = checkout_conn(&pool).await?;
-
         let event_time = extract_event_time(body)?;
         let event_data =
             std::str::from_utf8(body).map_err(|e| TargetError::Serialization(format!("Event body is not valid UTF-8: {e}")))?;
 
         let quoted_table = quote_table_name(&self.args.table)?;
+        with_delivery_deadline(MYSQL_DELIVERY_TIMEOUT, "MySQL delivery", async {
+            let pool = self.get_or_init_pool().await?;
+            // At this point the pool has already been initialized (get_or_init_pool
+            // succeeded above), so get_conn() failures are always transient: the
+            // connection was lost or the pool is temporarily exhausted.
+            let mut conn = checkout_conn(&pool).await?;
 
-        if self.idempotency_supported.load(Ordering::Relaxed) {
-            let sql = mysql_insert_sql_with_event_id(&quoted_table);
-            conn.exec_drop(sql, (event_id, event_time.as_str(), event_data))
-                .await
-                .map_err(|err| map_mysql_error(err, "Failed to insert event"))?;
-        } else {
-            let sql = mysql_insert_sql_legacy(&quoted_table);
-            conn.exec_drop(sql, (event_time.as_str(), event_data))
-                .await
-                .map_err(|err| map_mysql_error(err, "Failed to insert event"))?;
-        }
+            if self.idempotency_supported.load(Ordering::Relaxed) {
+                let sql = mysql_insert_sql_with_event_id(&quoted_table);
+                conn.exec_drop(sql, (event_id, event_time.as_str(), event_data))
+                    .await
+                    .map_err(|err| map_mysql_error(err, "Failed to insert event"))?;
+            } else {
+                let sql = mysql_insert_sql_legacy(&quoted_table);
+                conn.exec_drop(sql, (event_time.as_str(), event_data))
+                    .await
+                    .map_err(|err| map_mysql_error(err, "Failed to insert event"))?;
+            }
+
+            Ok(())
+        })
+        .await?;
 
         self.delivery_counters.record_success();
         debug!(target_id = %self.id, "MySQL event inserted");

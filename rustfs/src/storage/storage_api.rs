@@ -220,11 +220,11 @@ pub(crate) mod rpc_consumer {
     pub(crate) mod node_service {
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore,
-            ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
-            ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt,
-            StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref,
-            get_local_server_property, load_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata,
-            set_bucket_metadata, validate_batch_read_version_item_count,
+            ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+            ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+            StorageDiskRpcExt, StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
+            find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
+            remove_bucket_metadata, set_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -477,9 +477,9 @@ pub(crate) mod ecstore_rio {
 
 pub(crate) mod ecstore_rpc {
     pub(crate) use rustfs_ecstore::api::rpc::{
-        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, sign_tonic_rpc_response_proof,
-        verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
+        LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
+        sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_signature,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -531,6 +531,7 @@ pub(crate) const BUCKET_VERSIONING_CONFIG: &str = ecstore_bucket::metadata::BUCK
 pub(crate) const BUCKET_WEBSITE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_WEBSITE_CONFIG;
 pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = ecstore_set_disk::DEFAULT_READ_BUFFER_SIZE;
 pub(crate) const OBJECT_LOCK_CONFIG: &str = ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
+pub(crate) const PEER_RESTDRY_RUN: &str = ecstore_rpc::PEER_RESTDRY_RUN;
 pub(crate) const PEER_RESTSIGNAL: &str = ecstore_rpc::PEER_RESTSIGNAL;
 pub(crate) const PEER_RESTSUB_SYS: &str = ecstore_rpc::PEER_RESTSUB_SYS;
 pub(crate) const SERVICE_SIGNAL_REFRESH_CONFIG: u64 = ecstore_rpc::SERVICE_SIGNAL_REFRESH_CONFIG;
@@ -871,6 +872,14 @@ pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>
     ecstore_config::com::read_config(api, file).await
 }
 
+pub(crate) async fn read_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
+    ecstore_config::com::read_config_no_lock(api, file).await
+}
+
+pub(crate) async fn read_existing_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
+    ecstore_config::com::read_existing_server_config_no_lock(api).await
+}
+
 pub(crate) async fn prewarm_local_disk_id_map_with_instance_ctx(instance_ctx: &Arc<InstanceContext>) {
     ecstore_storage::prewarm_local_disk_id_map_with_instance_ctx(instance_ctx).await;
 }
@@ -879,8 +888,35 @@ pub(crate) fn replication_queue_current_count() -> Option<i64> {
     get_global_replication_stats().and_then(|stats| stats.queue_current_count())
 }
 
-pub(crate) async fn save_config(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
-    ecstore_config::com::save_config(api, file, data).await
+pub(crate) async fn save_config_no_lock(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
+    ecstore_config::com::save_config_no_lock(api, file, data).await
+}
+
+pub(crate) async fn with_config_object_write_lock<F, Fut, T>(api: Arc<ECStore>, object: String, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    ecstore_config::com::with_config_object_write_lock(api, object, operation).await
+}
+
+pub(crate) async fn with_config_object_read_lock<F, Fut, T>(api: Arc<ECStore>, object: String, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    ecstore_config::com::with_config_object_read_lock(api, object, operation).await
+}
+
+pub(crate) async fn with_server_config_read_lock<F, Fut, T>(api: Arc<ECStore>, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    ecstore_config::com::with_server_config_read_lock(api, operation).await
 }
 
 pub(crate) fn shutdown_background_services() {
