@@ -355,7 +355,7 @@ fn peer_health_status_for_node(node: &ClusterNodeMembership) -> CapabilityStatus
         return CapabilityStatus::supported().with_reason(PEER_HEALTH_LOCAL_NODE);
     }
 
-    match rustfs_io_metrics::internode_metrics::cluster_peer_online_status(&node.grid_host) {
+    match rustfs_io_metrics::internode_metrics::cluster_peer_observed_online_status(&node.grid_host) {
         Some(true) => CapabilityStatus::supported().with_reason(PEER_HEALTH_REACHABLE),
         Some(false) => CapabilityStatus::unknown().with_reason(PEER_HEALTH_UNREACHABLE),
         None => CapabilityStatus::disabled().with_reason(PEER_HEALTH_NOT_REPORTED),

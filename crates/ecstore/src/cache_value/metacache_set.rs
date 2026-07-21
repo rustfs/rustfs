@@ -643,12 +643,11 @@ async fn list_path_raw_inner(
         // profile-aware consumer budget so the merge does not detach that reader
         // before the producer itself would have failed.
         let producer_stall_timeout = opts.walkdir_stall_timeout.unwrap_or_else(get_drive_walkdir_stall_timeout);
+        let configured_peek_timeout = get_drive_walkdir_peek_timeout().max(producer_stall_timeout);
         #[cfg(not(test))]
-        let peek_timeout = get_drive_walkdir_peek_timeout().max(producer_stall_timeout);
+        let peek_timeout = configured_peek_timeout;
         #[cfg(test)]
-        let peek_timeout = opts
-            .peek_timeout
-            .unwrap_or_else(|| get_drive_walkdir_peek_timeout().max(producer_stall_timeout));
+        let peek_timeout = opts.peek_timeout.unwrap_or(configured_peek_timeout);
         let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
             errs.push(None);
@@ -1274,9 +1273,11 @@ mod tests {
                     partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                         let seen = seen_clone.clone();
                         Box::pin(async move {
-                            let names = entries.0.iter().flatten().map(|entry| entry.name.clone()).collect::<Vec<_>>();
-                            if names.len() == 2 && names[0] == names[1] {
-                                seen.lock().expect("seen mutex poisoned").push(names[0].clone());
+                            let mut names = entries.0.iter().flatten().map(|entry| entry.name.as_str());
+                            if let (Some(first), Some(second), None) = (names.next(), names.next(), names.next()) {
+                                if first == second {
+                                    seen.lock().expect("seen mutex poisoned").push(first.to_owned());
+                                }
                             }
                         })
                     })),
