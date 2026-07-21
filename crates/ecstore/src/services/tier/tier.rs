@@ -6063,6 +6063,7 @@ mod tests {
         state: tokio::sync::Mutex<Option<(Vec<u8>, String)>>,
         next_etag: AtomicUsize,
         fail_put: AtomicBool,
+        truncate_reference_page_without_marker: AtomicBool,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
         listed_versions: Mutex<Vec<ObjectInfo>>,
@@ -6074,6 +6075,7 @@ mod tests {
                 state: tokio::sync::Mutex::new(None),
                 next_etag: AtomicUsize::new(0),
                 fail_put: AtomicBool::new(false),
+                truncate_reference_page_without_marker: AtomicBool::new(false),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 lock_requests: Mutex::new(Vec::new()),
                 listed_versions: Mutex::new(Vec::new()),
@@ -6087,6 +6089,10 @@ mod tests {
                 .lock()
                 .expect("tier reference fixture should not poison")
                 .push(object);
+        }
+
+        fn omit_truncated_reference_marker(&self) {
+            self.truncate_reference_page_without_marker.store(true, Ordering::SeqCst);
         }
     }
 
@@ -6272,7 +6278,7 @@ mod tests {
             if is_truncated {
                 objects.truncate(limit);
             }
-            let (next_marker, next_version_idmarker) = if is_truncated {
+            let (mut next_marker, next_version_idmarker) = if is_truncated {
                 objects
                     .last()
                     .map(|object| (Some(object.name.clone()), object.version_id.map(|version| version.to_string())))
@@ -6280,6 +6286,9 @@ mod tests {
             } else {
                 (None, None)
             };
+            if is_truncated && self.truncate_reference_page_without_marker.load(Ordering::SeqCst) {
+                next_marker = None;
+            }
             Ok(StorageListObjectVersionsInfo {
                 is_truncated,
                 next_marker,
@@ -6444,6 +6453,118 @@ mod tests {
                 .tiers
                 .contains_key("COLD-A"),
             "blocked removal must not persist the empty candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_reference_proof_blocks_clear_before_config_save() {
+        let store = Arc::new(CasConfigStore::default());
+        let tier_a = build_rustfs_tier("COLD-A");
+        let tier_b = build_rustfs_tier("COLD-B");
+        let identity_b = tier_backend_identity(&tier_b).expect("test tier identity should encode");
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), tier_a.clone_with_credentials());
+        persisted.tiers.insert("COLD-B".to_string(), tier_b.clone_with_credentials());
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("reference proof fixture should persist");
+        store.add_listed_version(transitioned_tier_object("photos", "2026/b.jpg", "COLD-B", Some(identity_b)));
+
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            guard.tiers.insert("COLD-A".to_string(), tier_a);
+            guard.tiers.insert("COLD-B".to_string(), tier_b);
+        }
+        let err = TierConfigMgr::clear_and_save_with(&manager, store.clone(), true)
+            .await
+            .expect_err("authoritative object reference must block tier clear");
+
+        match err {
+            TierConfigUpdateError::Publish(err) => {
+                assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+                assert!(err.message.contains("photos/2026/b.jpg"), "{}", err.message);
+            }
+            other => panic!("reference proof failures must be surfaced as publish errors: {other:?}"),
+        }
+        let guard = manager.read().await;
+        assert!(guard.tiers.contains_key("COLD-A"));
+        assert!(guard.tiers.contains_key("COLD-B"));
+        drop(guard);
+        let reloaded = load_tier_config_for_update(store)
+            .await
+            .expect("blocked config should still reload")
+            .0;
+        assert!(reloaded.tiers.contains_key("COLD-A"));
+        assert!(reloaded.tiers.contains_key("COLD-B"));
+    }
+
+    #[tokio::test]
+    async fn zero_reference_proof_rebind_allows_only_new_destination_references() {
+        let current = build_rustfs_tier("COLD-A");
+        let current_identity = tier_backend_identity(&current).expect("current identity should encode");
+        let mut replacement = build_rustfs_tier("COLD-A");
+        replacement.rustfs.as_mut().expect("replacement payload should exist").prefix = "new-prefix".to_string();
+        let replacement_identity = tier_backend_identity(&replacement).expect("replacement identity should encode");
+        assert_ne!(current_identity, replacement_identity);
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: Some(replacement_identity),
+        };
+
+        let store = Arc::new(CasConfigStore::default());
+        store.add_listed_version(transitioned_tier_object(
+            "photos",
+            "2026/new-destination.jpg",
+            "COLD-A",
+            Some(replacement_identity),
+        ));
+        ensure_no_authoritative_tier_object_references(store.clone(), std::slice::from_ref(&target))
+            .await
+            .expect("references already written with the new destination identity should not block rebind");
+
+        store.add_listed_version(transitioned_tier_object(
+            "photos",
+            "2026/old-destination.jpg",
+            "COLD-A",
+            Some(current_identity),
+        ));
+        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+            .await
+            .expect_err("references to the old destination identity must block rebind");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(err.message.contains("photos/2026/old-destination.jpg"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn zero_reference_proof_fails_closed_when_version_listing_marker_is_missing() {
+        let current = build_rustfs_tier("COLD-A");
+        let current_identity = tier_backend_identity(&current).expect("current identity should encode");
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: None,
+        };
+        let store = Arc::new(CasConfigStore::default());
+        for index in 0..=TIER_REFERENCE_PROOF_LIST_LIMIT {
+            store.add_listed_version(ObjectInfo {
+                bucket: "photos".to_string(),
+                name: format!("safe/{index:04}.jpg"),
+                ..Default::default()
+            });
+        }
+        store.omit_truncated_reference_marker();
+
+        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+            .await
+            .expect_err("truncated authoritative reference scan without a marker must fail closed");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert!(
+            err.message.contains("truncated without a next marker"),
+            "unexpected reference proof error: {}",
+            err.message
         );
     }
 
