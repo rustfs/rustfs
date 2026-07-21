@@ -1495,6 +1495,7 @@ mod tests {
         let mutation_id = uuid::Uuid::new_v4();
         let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [3; 32]);
         let prepare_payload = intent.encode().expect("prepare intent should encode");
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
 
         let prepared = handle_tier_mutation_peer_request(
             store.clone(),
@@ -1507,6 +1508,14 @@ mod tests {
         .expect("first prepare should create the peer intent");
         assert!(prepared.applied);
         assert_eq!(prepared.state, TierMutationPeerState::Prepared);
+        let blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("prepared peer mutation should block new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            blocked.message.contains("being replaced"),
+            "prepared peer mutation should reuse the existing blocked-tier error: {blocked}"
+        );
 
         let retried_prepare = handle_tier_mutation_peer_request(
             store.clone(),
@@ -1519,6 +1528,14 @@ mod tests {
         .expect("same prepare retry should be idempotent");
         assert!(!retried_prepare.applied);
         assert_eq!(retried_prepare.state, TierMutationPeerState::Prepared);
+        let retried_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("prepared retry should keep blocking new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            retried_blocked.message.contains("being replaced"),
+            "prepared retry should keep the existing blocked-tier error: {retried_blocked}"
+        );
 
         let committed = handle_tier_mutation_peer_request(
             store.clone(),
@@ -1531,6 +1548,11 @@ mod tests {
         .expect("commit should advance the prepared peer intent");
         assert!(committed.applied);
         assert_eq!(committed.state, TierMutationPeerState::Committed);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+                .await
+                .expect("committed peer mutation should clear the prepared runtime block"),
+        );
 
         let retried_commit = handle_tier_mutation_peer_request(
             store.clone(),
@@ -1555,6 +1577,11 @@ mod tests {
         .expect("delayed duplicate prepare should report the durable committed state");
         assert!(!delayed_prepare_retry.applied);
         assert_eq!(delayed_prepare_retry.state, TierMutationPeerState::Committed);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+                .await
+                .expect("delayed committed prepare retry must not recreate a runtime block"),
+        );
 
         let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
             .await
@@ -1565,6 +1592,7 @@ mod tests {
         let abort_id = uuid::Uuid::new_v4();
         let abort_intent = tier_mutation_peer_test_intent(abort_id, "COLD-B", [4; 32]);
         let abort_prepare_payload = abort_intent.encode().expect("abort prepare intent should encode");
+        register_mock_tier(&store.tier_config_mgr(), "COLD-B").await;
         handle_tier_mutation_peer_request(
             store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -1574,6 +1602,14 @@ mod tests {
         )
         .await
         .expect("abort target prepare should create the peer intent");
+        let abort_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
+            Ok(_) => panic!("abort target prepare should block new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            abort_blocked.message.contains("being replaced"),
+            "abort target prepare should reuse the existing blocked-tier error: {abort_blocked}"
+        );
 
         let aborted = handle_tier_mutation_peer_request(
             store.clone(),
@@ -1586,6 +1622,11 @@ mod tests {
         .expect("abort should advance the prepared peer intent");
         assert!(aborted.applied);
         assert_eq!(aborted.state, TierMutationPeerState::Aborted);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B")
+                .await
+                .expect("aborted peer mutation should clear the prepared runtime block"),
+        );
 
         let retried_abort = handle_tier_mutation_peer_request(
             store,
