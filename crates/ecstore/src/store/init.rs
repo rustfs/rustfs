@@ -535,9 +535,9 @@ mod tests {
             },
             tier_sweeper::Jentry,
             transition_transaction::{
-                TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionRemoteVersion, TransitionSourceIdentity,
-                TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit, TransitionTransactionState,
-                recover_transition_transaction_records, save_transition_transaction_record,
+                TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionCleanupDecision, TransitionCleanupProof, TransitionRemoteVersion,
+                TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit,
+                TransitionTransactionState, recover_transition_transaction_records, save_transition_transaction_record,
             },
         },
         client::transition_api::ReaderImpl,
@@ -1423,6 +1423,398 @@ mod tests {
         );
         assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.object_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_retries_cleanup_pending_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-cleanup", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUP";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        let uploaded_fence = transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        transaction
+            .mark_cleanup_pending(
+                uploaded_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let candidate = bytes::Bytes::from_static(b"cleanup pending candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(transaction.remote_object.clone(), remote_version)],
+            "cleanup pending recovery must retry the exact remote candidate delete"
+        );
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_retries_cleanup_pending_unversioned_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "transition-transaction-cleanup-unversioned",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUPUNVERSIONED";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: None,
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Unversioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        let uploaded_fence = transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::unversioned()),
+            )
+            .expect("transaction should enter uploaded state");
+        transaction
+            .mark_cleanup_pending(
+                uploaded_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        backend.set_put_remote_version(Some(String::new())).await;
+        let candidate = bytes::Bytes::from_static(b"cleanup pending unversioned candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(transaction.remote_object.clone(), String::new())],
+            "unversioned cleanup must not send a synthetic remote version"
+        );
+        assert_eq!(backend.exact_remove_count(), 0);
+        assert_eq!(backend.object_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_keeps_cleanup_pending_record_when_delete_fails() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-cleanup-fail", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUPFAIL";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        let uploaded_fence = transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version)),
+            )
+            .expect("transaction should enter uploaded state");
+        transaction
+            .mark_cleanup_pending(
+                uploaded_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        let candidate = bytes::Bytes::from_static(b"cleanup pending candidate retained after failure");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        backend.set_remove_failure(true);
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should keep scanning after cleanup failure");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 0, 1));
+        assert_eq!(
+            transition_transaction_record_count(store.clone()).await,
+            1,
+            "failed cleanup must keep the cleanup-pending transaction for retry"
+        );
+        assert_eq!(backend.remove_versions().await, Vec::<(String, String)>::new());
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 1);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_keeps_cleanup_pending_local_commit() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "transition-transaction-cleanup-committed",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUPCOMMITTED";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let bucket = "transition-transaction-cleanup-committed-bucket";
+        let object = "object.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"cleanup pending local commit record cleanup".repeat(1024));
+        let original = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.to_string(),
+                etag: original.etag.clone().expect("source object should have etag"),
+                ..Default::default()
+            },
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+        store
+            .transition_object(bucket, object, &opts)
+            .await
+            .expect("transition should commit");
+        let committed = store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("committed object info should be readable");
+        let mut remote_parts = committed.transitioned_object.name.rsplit('/');
+        let write_id = uuid::Uuid::parse_str(remote_parts.next().expect("remote object should contain write id"))
+            .expect("write id should parse");
+        let transaction_id = uuid::Uuid::parse_str(remote_parts.next().expect("remote object should contain transaction id"))
+            .expect("transaction id should parse");
+        let source = TransitionSourceIdentity {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: None,
+            data_dir: uuid::Uuid::new_v4(),
+            mod_time_unix_nanos: original
+                .mod_time
+                .expect("source object should have mod_time")
+                .unix_timestamp_nanos()
+                .try_into()
+                .expect("test timestamp should fit i64"),
+            size: original.size,
+            etag: original.etag.expect("source object should have etag"),
+            version_mode: TransitionSourceVersionMode::Unversioned,
+        };
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id,
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id,
+            source,
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::known_from_put_response(
+                    committed.transitioned_object.version_id.clone(),
+                )),
+            )
+            .expect("transaction should enter uploaded state");
+        let local_commit_fence = transaction
+            .advance(transaction.fence(), TransitionTransactionState::LocalCommitStarted, None)
+            .expect("transaction should enter local commit state");
+        transaction
+            .mark_cleanup_pending(
+                local_commit_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::SourceReconciledUnchanged {
+                        observed_source: transaction.source.clone(),
+                    },
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.object_count().await,
+            1,
+            "cleanup pending recovery must keep the remote body once local metadata references it"
+        );
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]

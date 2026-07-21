@@ -641,6 +641,23 @@ pub async fn process_transition_transaction_record(
             delete_transition_transaction_record(api, transaction.transaction_id).await?;
             Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
         }
+        TransitionTransactionState::CleanupPending => match local_commit_matches_transaction(api.clone(), transaction).await {
+            Ok(true) => {
+                delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
+            }
+            Ok(false) => {
+                delete_transition_remote_candidate(api.clone(), transaction).await?;
+                delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
+            }
+            Err(err) if transition_source_is_missing(&err) => {
+                delete_transition_remote_candidate(api.clone(), transaction).await?;
+                delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
+            }
+            Err(err) => Err(err),
+        },
         TransitionTransactionState::LocalCommitStarted if local_commit_matches_transaction(api.clone(), transaction).await? => {
             delete_transition_transaction_record(api, transaction.transaction_id).await?;
             Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
@@ -651,9 +668,19 @@ pub async fn process_transition_transaction_record(
         }
         TransitionTransactionState::UploadStarted
         | TransitionTransactionState::UploadOutcomeUnknown
-        | TransitionTransactionState::LocalCommitStarted
-        | TransitionTransactionState::CleanupPending => Ok(TransitionTransactionRecoveryOutcome::Retained),
+        | TransitionTransactionState::LocalCommitStarted => Ok(TransitionTransactionRecoveryOutcome::Retained),
     }
+}
+
+fn transition_source_is_missing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::FileNotFound
+            | Error::FileVersionNotFound
+            | Error::ObjectNotFound(_, _)
+            | Error::VersionNotFound(_, _, _)
+            | Error::BucketNotFound(_)
+    )
 }
 
 async fn local_commit_matches_transaction(api: Arc<ECStore>, transaction: &TransitionTransaction) -> EcstoreResult<bool> {
