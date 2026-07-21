@@ -617,7 +617,11 @@ mod tests {
         let bucket = format!("bucket-mark-delete-hidden-{}", Uuid::new_v4().simple());
 
         create_bucket_with_object(&ecstore, &bucket, ".well-known/acme-challenge").await;
-        create_bucket_with_object(&ecstore, &bucket, ".rustfs.sys/object").await;
+        let mut reader = PutObjReader::from_vec(b"delete bucket semantics".to_vec());
+        ecstore
+            .put_object(&bucket, ".rustfs.sys/object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("second hidden object should be written");
 
         let err = ecstore
             .delete_bucket(
