@@ -783,14 +783,10 @@ where
         }
 
         let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        if let Some(x) = users.get(&cred.access_key)
-            && x.credentials.is_service_account()
-        {
+        if cache.users.contains_key(&cred.access_key) || cache.sts_accounts.contains_key(&cred.access_key) {
             return Err(Error::AccessKeyAlreadyExists);
         }
         drop(cache);
-        drop(users);
 
         let u = UserIdentity::new(cred);
 

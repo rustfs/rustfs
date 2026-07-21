@@ -97,6 +97,23 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
+            evidence_fields: strings(["bucket", "path", "state", "timeout_ms", "drive"]),
+            anchors: strings(["Metacache listing quorum failed", "Metacache reader peek timed out"]),
+            min_count: 2,
+            ..base(
+                "metacache-listing-timeout",
+                P2Degraded,
+                "disk",
+                "metacache listing 多盘等待超时",
+                any([
+                    all([contains("Metacache listing quorum failed"), field("state", "quorum_failed")]),
+                    all([contains("Metacache reader peek timed out"), field("state", "peek_timed_out")]),
+                ]),
+                "对象 listing/scanner 期间 metacache reader 等待超时并可能导致 listing quorum failure;常见于宽前缀、高延迟盘或慢远端 reader。",
+                "先确认是否存在宽前缀/慢盘/高延迟远端 reader;再参考 docs/operations/drive-timeout-tuning.md 调整 RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS、RUSTFS_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS 或 RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency。",
+            )
+        },
+        Rule {
             anchors: strings(["Unformatted disk"]),
             ..base(
                 "unformatted-disk",

@@ -32,6 +32,9 @@ const FAILURE_DOMAIN_NOT_REPORTED: &str = "failure domain labels not reported by
 const NUMA_NOT_WIRED: &str = "NUMA topology not wired into runtime";
 const PROFILING_NOT_WIRED: &str = "profiling capability not wired into ECStore";
 const PEER_HEALTH_NOT_REPORTED: &str = "peer health not reported by endpoints";
+const PEER_HEALTH_LOCAL_NODE: &str = "local node does not require peer health probing";
+const PEER_HEALTH_REACHABLE: &str = "peer marked reachable by internode health tracker";
+const PEER_HEALTH_UNREACHABLE: &str = "peer marked unreachable by internode health tracker";
 const CONTROL_RPC_SEPARATED: &str = "control RPC remains on the gRPC control plane";
 const DATA_STREAM_RPC_SEPARATED: &str = "remote disk data streams remain on the internode data transport";
 
@@ -341,9 +344,21 @@ pub fn peer_health_snapshot_from_membership(membership: &ClusterMembershipSnapsh
             .map(|node| ClusterPeerHealth {
                 node_id: node.node_id.clone(),
                 is_local: node.is_local,
-                status: CapabilityStatus::unknown().with_reason(PEER_HEALTH_NOT_REPORTED),
+                status: peer_health_status_for_node(node),
             })
             .collect(),
+    }
+}
+
+fn peer_health_status_for_node(node: &ClusterNodeMembership) -> CapabilityStatus {
+    if node.is_local {
+        return CapabilityStatus::supported().with_reason(PEER_HEALTH_LOCAL_NODE);
+    }
+
+    match rustfs_io_metrics::internode_metrics::cluster_peer_observed_online_status(&node.grid_host) {
+        Some(true) => CapabilityStatus::supported().with_reason(PEER_HEALTH_REACHABLE),
+        Some(false) => CapabilityStatus::unknown().with_reason(PEER_HEALTH_UNREACHABLE),
+        None => CapabilityStatus::disabled().with_reason(PEER_HEALTH_NOT_REPORTED),
     }
 }
 
@@ -498,6 +513,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+    use crate::storage_api_contracts::topology::CapabilityState;
 
     #[test]
     fn topology_snapshot_maps_endpoint_sets_without_local_paths() {
@@ -588,16 +604,55 @@ mod tests {
     }
 
     #[test]
-    fn peer_health_snapshot_reports_static_unknown_status() {
-        let membership = membership_snapshot_from_endpoint_pools(&sample_url_endpoint_pools());
+    fn peer_health_snapshot_reports_observed_peer_status() {
+        let online_host = "http://cluster-control-plane-peer-online-test:9000";
+        let offline_host = "http://cluster-control-plane-peer-offline-test:9000";
+        rustfs_io_metrics::internode_metrics::record_peer_reachable(online_host);
+        rustfs_io_metrics::internode_metrics::record_peer_unreachable(offline_host, 1);
+        let membership = ClusterMembershipSnapshot {
+            nodes: vec![
+                ClusterNodeMembership {
+                    node_id: LOCAL_NODE_ID.to_string(),
+                    grid_host: String::new(),
+                    is_local: true,
+                    pools: vec![0],
+                },
+                ClusterNodeMembership {
+                    node_id: "cluster-control-plane-peer-online-test:9000".to_string(),
+                    grid_host: online_host.to_string(),
+                    is_local: false,
+                    pools: vec![0],
+                },
+                ClusterNodeMembership {
+                    node_id: "cluster-control-plane-peer-offline-test:9000".to_string(),
+                    grid_host: offline_host.to_string(),
+                    is_local: false,
+                    pools: vec![0],
+                },
+                ClusterNodeMembership {
+                    node_id: "cluster-control-plane-peer-unknown-test:9000".to_string(),
+                    grid_host: "http://cluster-control-plane-peer-unknown-test:9000".to_string(),
+                    is_local: false,
+                    pools: vec![0],
+                },
+            ],
+            drives: Vec::new(),
+        };
         let snapshot = peer_health_snapshot_from_membership(&membership);
 
-        assert_eq!(snapshot.peers.len(), 2);
-        assert_eq!(snapshot.peers[0].node_id, "node1.example:9000");
+        assert_eq!(snapshot.peers.len(), 4);
+        assert_eq!(snapshot.peers[0].node_id, LOCAL_NODE_ID);
         assert!(snapshot.peers[0].is_local);
-        assert_eq!(snapshot.peers[0].status.reason.as_deref(), Some(PEER_HEALTH_NOT_REPORTED));
-        assert_eq!(snapshot.peers[1].node_id, "node2.example:9000");
+        assert!(snapshot.peers[0].status.state.is_supported());
+        assert_eq!(snapshot.peers[0].status.reason.as_deref(), Some(PEER_HEALTH_LOCAL_NODE));
+        assert_eq!(snapshot.peers[1].node_id, "cluster-control-plane-peer-online-test:9000");
         assert!(!snapshot.peers[1].is_local);
+        assert!(snapshot.peers[1].status.state.is_supported());
+        assert_eq!(snapshot.peers[1].status.reason.as_deref(), Some(PEER_HEALTH_REACHABLE));
+        assert_eq!(snapshot.peers[2].status.reason.as_deref(), Some(PEER_HEALTH_UNREACHABLE));
+        assert!(!snapshot.peers[2].status.state.is_supported());
+        assert_eq!(snapshot.peers[3].status.reason.as_deref(), Some(PEER_HEALTH_NOT_REPORTED));
+        assert_eq!(snapshot.peers[3].status.state, CapabilityState::Disabled);
     }
 
     #[test]
