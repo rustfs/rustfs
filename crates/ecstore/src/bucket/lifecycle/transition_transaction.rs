@@ -12,12 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::{future::Future, sync::Arc, time::Duration};
+
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::bucket::lifecycle::config_boundary;
+use crate::bucket::lifecycle::tier_sweeper::delete_object_from_remote_tier_idempotent_with_manager_and_identity;
+use crate::disk::RUSTFS_META_BUCKET;
+use crate::error::{Error, Result as EcstoreResult};
+use crate::storage_api_contracts::list::ListOperations as _;
+use crate::store::ECStore;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_LIFECYCLE_TRANSITION_TRANSACTION_RECOVERY: &str = "lifecycle_transition_transaction_recovery";
+pub const DEFAULT_TRANSITION_TRANSACTION_RECOVERY_LIMIT: usize = 1_000;
+const TRANSITION_TRANSACTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+const TRANSITION_TRANSACTION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 pub const TRANSITION_TRANSACTION_SCHEMA: &str = "rustfs-transition-transaction-v1";
 pub const TRANSITION_TRANSACTION_PREFIX: &str = "ilm/transition-transactions";
+pub const TRANSITION_TRANSACTION_RECORD_PREFIX: &str = "ilm/transition-transactions/records";
 pub const MAX_TRANSITION_TRANSACTION_SIZE: usize = 64 * 1024;
 
 pub type Result<T> = std::result::Result<T, TransitionTransactionError>;
@@ -209,7 +227,7 @@ pub struct TransitionTransaction {
     pub write_id: Uuid,
     pub source: TransitionSourceIdentity,
     pub tier_name: String,
-    pub backend_fingerprint: String,
+    pub backend_fingerprint: [u8; 32],
     pub remote_object: String,
     pub remote_version: TransitionRemoteVersion,
     pub state: TransitionTransactionState,
@@ -224,7 +242,7 @@ pub struct TransitionTransactionInit {
     pub write_id: Uuid,
     pub source: TransitionSourceIdentity,
     pub tier_name: String,
-    pub backend_fingerprint: String,
+    pub backend_fingerprint: [u8; 32],
     pub not_after_unix_nanos: i64,
 }
 
@@ -276,9 +294,6 @@ impl TransitionTransaction {
         self.source.validate()?;
         if self.tier_name.is_empty() {
             return Err(TransitionTransactionError::Corrupt("tier name is empty"));
-        }
-        if !is_sha256_checksum(&self.backend_fingerprint) {
-            return Err(TransitionTransactionError::Corrupt("backend fingerprint is not a sha256 checksum"));
         }
         if self.remote_object
             != canonical_transition_remote_object(self.deployment_id, &self.source.bucket, self.transaction_id, self.write_id)?
@@ -479,7 +494,7 @@ pub struct TransitionCleanupProof {
     pub write_id: Uuid,
     pub remote_object: String,
     pub remote_version: TransitionRemoteVersion,
-    pub backend_fingerprint: String,
+    pub backend_fingerprint: [u8; 32],
     pub decision: TransitionCleanupDecision,
 }
 
@@ -533,6 +548,299 @@ pub fn canonical_transition_remote_object(
     ))
 }
 
+pub fn transition_transaction_record_object_name(transaction_id: Uuid) -> Result<String> {
+    if transaction_id.is_nil() {
+        return Err(TransitionTransactionError::Corrupt("transaction_id is nil"));
+    }
+    let transaction_key = transaction_id.simple().to_string();
+    Ok(format!(
+        "{}/{}/{}/{}.json",
+        TRANSITION_TRANSACTION_RECORD_PREFIX,
+        &transaction_key[..2],
+        &transaction_key[2..4],
+        transaction_key
+    ))
+}
+
+pub(crate) async fn save_transition_transaction_record(
+    api: Arc<ECStore>,
+    transaction: &TransitionTransaction,
+) -> EcstoreResult<()> {
+    let object =
+        transition_transaction_record_object_name(transaction.transaction_id).map_err(transition_transaction_store_error)?;
+    let data = transaction.encode().map_err(transition_transaction_store_error)?;
+    config_boundary::save_config(api, &object, data).await
+}
+
+pub(crate) async fn load_transition_transaction_record(
+    api: Arc<ECStore>,
+    transaction_id: Uuid,
+) -> EcstoreResult<TransitionTransaction> {
+    let object = transition_transaction_record_object_name(transaction_id).map_err(transition_transaction_store_error)?;
+    let data = config_boundary::read_config(api, &object).await?;
+    TransitionTransaction::decode(transaction_id, &data).map_err(transition_transaction_store_error)
+}
+
+pub(crate) async fn delete_transition_transaction_record(api: Arc<ECStore>, transaction_id: Uuid) -> EcstoreResult<()> {
+    let object = transition_transaction_record_object_name(transaction_id).map_err(transition_transaction_store_error)?;
+    match config_boundary::delete_config(api, &object).await {
+        Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn transition_transaction_store_error(err: TransitionTransactionError) -> Error {
+    Error::other(err)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionTransactionRecoveryStats {
+    pub scanned: usize,
+    pub recovered: usize,
+    pub retained: usize,
+    pub failed: usize,
+    pub next_marker: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionTransactionRecoveryOutcome {
+    RemoteCandidateDeleted,
+    RecordDeleted,
+    Retained,
+}
+
+fn transition_transaction_id_from_record_object_name(object: &str) -> Result<Uuid> {
+    let prefix = format!("{TRANSITION_TRANSACTION_RECORD_PREFIX}/");
+    let suffix = object
+        .strip_prefix(&prefix)
+        .ok_or(TransitionTransactionError::Corrupt("transaction record path has wrong prefix"))?;
+    let file_name = suffix
+        .rsplit('/')
+        .next()
+        .ok_or(TransitionTransactionError::Corrupt("transaction record path is incomplete"))?;
+    let transaction_key = file_name
+        .strip_suffix(".json")
+        .ok_or(TransitionTransactionError::Corrupt("transaction record path has wrong suffix"))?;
+    if transaction_key.len() != 32 || !transaction_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TransitionTransactionError::Corrupt("transaction record path has invalid transaction id"));
+    }
+    Uuid::parse_str(transaction_key).map_err(|_| TransitionTransactionError::Corrupt("transaction record path has invalid uuid"))
+}
+
+pub async fn process_transition_transaction_record(
+    api: Arc<ECStore>,
+    transaction: &TransitionTransaction,
+) -> EcstoreResult<TransitionTransactionRecoveryOutcome> {
+    transaction.validate().map_err(transition_transaction_store_error)?;
+    match transaction.state {
+        TransitionTransactionState::Uploaded => {
+            delete_transition_remote_candidate(api.clone(), transaction).await?;
+            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
+        }
+        TransitionTransactionState::AbortedNoRemote | TransitionTransactionState::Committed => {
+            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
+        }
+        TransitionTransactionState::UploadStarted
+        | TransitionTransactionState::UploadOutcomeUnknown
+        | TransitionTransactionState::LocalCommitStarted
+        | TransitionTransactionState::CleanupPending => Ok(TransitionTransactionRecoveryOutcome::Retained),
+    }
+}
+
+async fn delete_transition_remote_candidate(api: Arc<ECStore>, transaction: &TransitionTransaction) -> EcstoreResult<()> {
+    let version_id = transaction.remote_version.tier_delete_version_id().unwrap_or_default();
+    let version_id_exact = transaction.remote_version.kind == TransitionRemoteVersionKind::Versioned;
+    delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+        &transaction.remote_object,
+        version_id,
+        &transaction.tier_name,
+        transaction.backend_fingerprint,
+        &api.tier_config_mgr(),
+        version_id_exact,
+    )
+    .await
+    .map(|_| ())
+    .map_err(Error::other)
+}
+
+pub async fn recover_transition_transaction_records(
+    api: Arc<ECStore>,
+    limit: usize,
+    marker: Option<String>,
+) -> EcstoreResult<TransitionTransactionRecoveryStats> {
+    if limit == 0 {
+        return Err(Error::other("transition transaction recovery limit must be greater than zero"));
+    }
+
+    let list_limit = i32::try_from(limit).map_or(i32::MAX, |value| value);
+    let list = api
+        .clone()
+        .list_objects_v2(
+            RUSTFS_META_BUCKET,
+            TRANSITION_TRANSACTION_RECORD_PREFIX,
+            marker.clone(),
+            None,
+            list_limit,
+            false,
+            None,
+            false,
+        )
+        .await?;
+
+    let mut stats = TransitionTransactionRecoveryStats {
+        scanned: 0,
+        recovered: 0,
+        retained: 0,
+        failed: 0,
+        next_marker: list.next_continuation_token,
+        truncated: list.is_truncated,
+    };
+
+    for object in list.objects {
+        stats.scanned += 1;
+        let transaction_id = match transition_transaction_id_from_record_object_name(&object.name) {
+            Ok(transaction_id) => transaction_id,
+            Err(err) => {
+                stats.failed += 1;
+                warn!(
+                    event = EVENT_LIFECYCLE_TRANSITION_TRANSACTION_RECOVERY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    transaction_record = %object.name,
+                    error = ?err,
+                    "Failed to derive transition transaction id from record path"
+                );
+                continue;
+            }
+        };
+        let transaction = match load_transition_transaction_record(api.clone(), transaction_id).await {
+            Ok(transaction) => transaction,
+            Err(Error::ConfigNotFound) => continue,
+            Err(err) => {
+                stats.failed += 1;
+                warn!(
+                    event = EVENT_LIFECYCLE_TRANSITION_TRANSACTION_RECOVERY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    transaction_record = %object.name,
+                    transaction_id = %transaction_id,
+                    error = ?err,
+                    "Failed to load transition transaction record"
+                );
+                continue;
+            }
+        };
+
+        match process_transition_transaction_record(api.clone(), &transaction).await {
+            Ok(
+                TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted
+                | TransitionTransactionRecoveryOutcome::RecordDeleted,
+            ) => {
+                stats.recovered += 1;
+            }
+            Ok(TransitionTransactionRecoveryOutcome::Retained) => {
+                stats.retained += 1;
+                debug!(
+                    event = EVENT_LIFECYCLE_TRANSITION_TRANSACTION_RECOVERY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    transaction_record = %object.name,
+                    transaction_id = %transaction.transaction_id,
+                    state = ?transaction.state,
+                    "Transition transaction recovery retained record for a later reconcile pass"
+                );
+            }
+            Err(err) => {
+                stats.failed += 1;
+                debug!(
+                    event = EVENT_LIFECYCLE_TRANSITION_TRANSACTION_RECOVERY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    transaction_record = %object.name,
+                    transaction_id = %transaction.transaction_id,
+                    state = ?transaction.state,
+                    error = ?err,
+                    "Transition transaction recovery will retry later"
+                );
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+pub async fn run_transition_transaction_recovery_loop(api: Arc<ECStore>, cancel_token: CancellationToken) {
+    let mut interval = tokio::time::interval(TRANSITION_TRANSACTION_RECOVERY_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut marker: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return,
+            _ = interval.tick() => {},
+        }
+
+        let recovery =
+            recover_transition_transaction_records(api.clone(), DEFAULT_TRANSITION_TRANSACTION_RECOVERY_LIMIT, marker.clone());
+        let Some(result) =
+            await_transition_transaction_recovery(&cancel_token, TRANSITION_TRANSACTION_RECOVERY_TIMEOUT, recovery).await
+        else {
+            return;
+        };
+        match result {
+            Ok(stats) => {
+                marker = stats.next_marker;
+                debug!(
+                    event = EVENT_LIFECYCLE_TRANSITION_TRANSACTION_RECOVERY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    scanned = stats.scanned,
+                    recovered = stats.recovered,
+                    retained = stats.retained,
+                    failed = stats.failed,
+                    truncated = stats.truncated,
+                    next_marker = ?marker,
+                    "Recovered transition transaction records"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    event = EVENT_LIFECYCLE_TRANSITION_TRANSACTION_RECOVERY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    next_marker = ?marker,
+                    error = ?err,
+                    "Failed to recover transition transaction records"
+                );
+            }
+        }
+    }
+}
+
+async fn await_transition_transaction_recovery<T, F>(
+    cancel_token: &CancellationToken,
+    timeout: Duration,
+    recovery: F,
+) -> Option<EcstoreResult<T>>
+where
+    F: Future<Output = EcstoreResult<T>>,
+{
+    tokio::select! {
+        _ = cancel_token.cancelled() => None,
+        result = tokio::time::timeout(timeout, recovery) => Some(match result {
+            Ok(result) => result,
+            Err(_) => Err(Error::other(format!(
+                "transition transaction recovery timed out after {} seconds",
+                timeout.as_secs()
+            ))),
+        }),
+    }
+}
+
 fn state_change_allowed(from: TransitionTransactionState, to: TransitionTransactionState) -> bool {
     matches!(
         (from, to),
@@ -564,7 +872,7 @@ mod tests {
 
     use super::*;
 
-    const BACKEND_FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const BACKEND_FINGERPRINT: [u8; 32] = [7; 32];
 
     #[derive(Default)]
     struct MemoryTransactionStore {
@@ -633,7 +941,7 @@ mod tests {
             write_id: Uuid::new_v4(),
             source: source_identity(TransitionSourceVersionMode::Versioned),
             tier_name: "warm-tier".to_string(),
-            backend_fingerprint: BACKEND_FINGERPRINT.to_string(),
+            backend_fingerprint: BACKEND_FINGERPRINT,
             not_after_unix_nanos: 1_780_000_000_000_000_000,
         })
         .expect("valid transaction should be created")
@@ -656,7 +964,7 @@ mod tests {
             write_id: transaction.write_id,
             remote_object: transaction.remote_object.clone(),
             remote_version: transaction.remote_version.clone(),
-            backend_fingerprint: transaction.backend_fingerprint.clone(),
+            backend_fingerprint: transaction.backend_fingerprint,
             decision,
         }
     }
@@ -735,7 +1043,7 @@ mod tests {
                 write_id: Uuid::new_v4(),
                 source: source_identity(TransitionSourceVersionMode::Versioned),
                 tier_name: "warm-tier".to_string(),
-                backend_fingerprint: BACKEND_FINGERPRINT.to_string(),
+                backend_fingerprint: BACKEND_FINGERPRINT,
                 not_after_unix_nanos: 1,
             }),
             Err(TransitionTransactionError::Corrupt("deployment_id is nil"))
@@ -751,7 +1059,7 @@ mod tests {
                 write_id: Uuid::new_v4(),
                 source,
                 tier_name: "warm-tier".to_string(),
-                backend_fingerprint: BACKEND_FINGERPRINT.to_string(),
+                backend_fingerprint: BACKEND_FINGERPRINT,
                 not_after_unix_nanos: 1,
             }),
             Err(TransitionTransactionError::Corrupt("source version_id is nil"))
@@ -767,7 +1075,7 @@ mod tests {
                 write_id: Uuid::new_v4(),
                 source,
                 tier_name: "warm-tier".to_string(),
-                backend_fingerprint: BACKEND_FINGERPRINT.to_string(),
+                backend_fingerprint: BACKEND_FINGERPRINT,
                 not_after_unix_nanos: 1,
             }),
             Err(TransitionTransactionError::Corrupt("non-versioned source mode must not carry version_id"))
@@ -781,7 +1089,7 @@ mod tests {
                 write_id: Uuid::new_v4(),
                 source: source_identity(TransitionSourceVersionMode::VersionSuspended),
                 tier_name: "warm-tier".to_string(),
-                backend_fingerprint: BACKEND_FINGERPRINT.to_string(),
+                backend_fingerprint: BACKEND_FINGERPRINT,
                 not_after_unix_nanos: 1,
             })
             .is_ok()
@@ -920,6 +1228,21 @@ mod tests {
         assert!(matches!(
             TransitionTransaction::decode(transaction.transaction_id, &oversized),
             Err(TransitionTransactionError::Corrupt("encoded transaction exceeds maximum size"))
+        ));
+    }
+
+    #[test]
+    fn record_object_name_is_stable_and_sanitized() {
+        let transaction_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("test uuid should parse");
+
+        let object = transition_transaction_record_object_name(transaction_id).expect("record object should build");
+
+        assert_eq!(object, "ilm/transition-transactions/records/aa/aa/aaaaaaaabbbbccccddddeeeeeeeeeeee.json");
+        let file_name = object.rsplit('/').next().expect("record object should have file name");
+        assert!(!file_name.contains('-'));
+        assert!(matches!(
+            transition_transaction_record_object_name(Uuid::nil()),
+            Err(TransitionTransactionError::Corrupt("transaction_id is nil"))
         ));
     }
 }

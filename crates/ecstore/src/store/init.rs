@@ -534,12 +534,19 @@ mod tests {
                 TIER_DELETE_JOURNAL_PREFIX, persist_tier_delete_journal_entry, recover_tier_delete_journal_entries,
             },
             tier_sweeper::Jentry,
+            transition_transaction::{
+                TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionRemoteVersion, TransitionSourceIdentity,
+                TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit, TransitionTransactionState,
+                recover_transition_transaction_records, save_transition_transaction_record,
+            },
         },
+        client::transition_api::ReaderImpl,
         disk::RUSTFS_META_BUCKET,
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
             test_util::{MockWarmBackend, TransitionCleanupStoreBarrier, register_mock_tier},
             tier::TierConfigMgr,
+            warm_backend::WarmBackend,
         },
         storage_api_contracts::{
             bucket::{BucketOperations as _, MakeBucketOptions},
@@ -990,6 +997,25 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    async fn transition_transaction_record_count(store: Arc<crate::store::ECStore>) -> usize {
+        store
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TRANSITION_TRANSACTION_RECORD_PREFIX,
+                None,
+                None,
+                100,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("transition transaction records should be listable")
+            .objects
+            .len()
+    }
+
+    #[cfg(feature = "test-util")]
     async fn wait_for_tier_delete_journal_recovery(
         store: Arc<crate::store::ECStore>,
         backend: &MockWarmBackend,
@@ -1325,5 +1351,77 @@ mod tests {
             "store A recovery should delete the exact remote candidate"
         );
         assert!(!Arc::ptr_eq(&ctx_a, &ctx_b), "the regression requires two distinct instance contexts");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_deletes_uploaded_remote_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-recovery", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXRECOVERY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let candidate = bytes::Bytes::from_static(b"orphan candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(transaction.remote_object.clone(), remote_version)],
+            "recovery must delete the exact uploaded candidate"
+        );
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 0);
     }
 }
