@@ -181,7 +181,8 @@ mod tests {
             snapshot.runtime_status.degraded_reasons,
             vec![ReadinessDegradedReason::StorageAndLockUnavailable]
         );
-        assert_eq!(snapshot.peer_health.peers[0].status.state, CapabilityState::Unknown);
+        // Local node (peers[0]) is supported — no peer health probing needed.
+        assert_eq!(snapshot.peer_health.peers[0].status.state, CapabilityState::Supported);
         if cfg!(target_os = "linux") {
             assert_eq!(snapshot.observability.platform.numa.state, CapabilityState::Unknown);
         } else {
