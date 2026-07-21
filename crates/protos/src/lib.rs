@@ -166,6 +166,9 @@ pub fn internode_rpc_max_message_size() -> usize {
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
+pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
+pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
 
 pub fn heal_control_coordinator_epoch(topology_fingerprint: &str) -> Result<u64, &'static str> {
     let prefix = topology_fingerprint
@@ -293,6 +296,59 @@ pub fn canonical_tier_mutation_rpc_body(
     Ok(body)
 }
 
+pub struct TierMutationRpcResponseProofInput<'a> {
+    pub version: u32,
+    pub phase: TierMutationRpcPhase,
+    pub mutation_id: Uuid,
+    pub canonical_payload: &'a [u8],
+    pub success: bool,
+    pub state: i32,
+    pub applied: bool,
+    pub error_info: Option<&'a str>,
+}
+
+pub fn canonical_tier_mutation_rpc_response_body(
+    input: TierMutationRpcResponseProofInput<'_>,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-response-v1\0";
+
+    let phase = input.phase.as_wire_str().as_bytes();
+    let mutation_id = input.mutation_id.as_bytes();
+    let error_info = input.error_info.map(str::as_bytes);
+    let error_info_len = error_info.map_or(0, <[u8]>::len);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len()
+            + 4
+            + 8
+            + phase.len()
+            + mutation_id.len()
+            + 8
+            + input.canonical_payload.len()
+            + 1
+            + 4
+            + 1
+            + 1
+            + 8
+            + error_info_len,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&input.version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(phase.len())?.to_be_bytes());
+    body.extend_from_slice(phase);
+    body.extend_from_slice(mutation_id);
+    body.extend_from_slice(&u64::try_from(input.canonical_payload.len())?.to_be_bytes());
+    body.extend_from_slice(input.canonical_payload);
+    body.push(u8::from(input.success));
+    body.extend_from_slice(&input.state.to_be_bytes());
+    body.push(u8::from(input.applied));
+    body.push(u8::from(error_info.is_some()));
+    body.extend_from_slice(&u64::try_from(error_info_len)?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod heal_control_tests {
     use super::{
@@ -407,7 +463,11 @@ mod heal_control_tests {
 
 #[cfg(test)]
 mod tier_mutation_rpc_tests {
-    use super::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase, canonical_tier_mutation_rpc_body};
+    use super::{
+        TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase, TierMutationRpcResponseProofInput,
+        canonical_tier_mutation_rpc_body, canonical_tier_mutation_rpc_response_body,
+    };
+    use crate::proto_gen::node_service::TierMutationPeerState;
     use uuid::uuid;
 
     #[test]
@@ -465,6 +525,112 @@ mod tier_mutation_rpc_tests {
             )
             .expect("small mutation body should encode")
         );
+    }
+
+    #[test]
+    fn canonical_tier_mutation_response_binds_request_state_and_error() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let baseline = canonical_tier_mutation_rpc_response_body(TierMutationRpcResponseProofInput {
+            version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: TierMutationRpcPhase::Prepare,
+            mutation_id,
+            canonical_payload: payload,
+            success: true,
+            state: TierMutationPeerState::Prepared as i32,
+            applied: true,
+            error_info: None,
+        })
+        .expect("small mutation response should encode");
+
+        let cases = [
+            TierMutationRpcResponseProofInput {
+                version: 2,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Commit,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id: uuid!("22345678-1234-5678-9abc-def012345678"),
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: b"tampered-intent-record",
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Committed as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: false,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: Some("error"),
+            },
+        ];
+        for case in cases {
+            assert_ne!(
+                baseline,
+                canonical_tier_mutation_rpc_response_body(case).expect("small mutation response should encode")
+            );
+        }
     }
 }
 

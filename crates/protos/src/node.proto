@@ -865,6 +865,39 @@ message LoadTransitionTierConfigResponse {
   optional string error_info = 2;
 }
 
+message TierMutationPrepareRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  bytes canonical_payload = 3;
+}
+
+message TierMutationCommitRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  bytes canonical_payload = 3;
+}
+
+message TierMutationAbortRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  bytes canonical_payload = 3;
+}
+
+enum TierMutationPeerState {
+  TIER_MUTATION_PEER_STATE_UNSPECIFIED = 0;
+  TIER_MUTATION_PEER_STATE_PREPARED = 1;
+  TIER_MUTATION_PEER_STATE_COMMITTED = 2;
+  TIER_MUTATION_PEER_STATE_ABORTED = 3;
+}
+
+message TierMutationControlResponse {
+  bool success = 1;
+  TierMutationPeerState state = 2;
+  bool applied = 3;
+  optional string error_info = 4;
+  bytes response_proof = 5;
+}
+
 message GetLiveEventsRequest {
   uint64 after_sequence = 1;
   uint32 limit = 2;
@@ -982,4 +1015,10 @@ service NodeService {
 
 service HealControlService {
   rpc HealControl(HealControlRequest) returns (HealControlResponse) {};
+}
+
+service TierMutationControlService {
+  rpc PrepareTierMutation(TierMutationPrepareRequest) returns (TierMutationControlResponse) {};
+  rpc CommitTierMutation(TierMutationCommitRequest) returns (TierMutationControlResponse) {};
+  rpc AbortTierMutation(TierMutationAbortRequest) returns (TierMutationControlResponse) {};
 }

@@ -27,7 +27,7 @@ use crate::storage_api_contracts::{list::ListOperations as _, object::HTTPPrecon
 use crate::store::ECStore;
 
 pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-intent-v1";
-pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = 64 * 1024;
+pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
 pub(crate) const TIER_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/records";
 pub(crate) type TierMutationDigest = [u8; 32];
 
