@@ -346,6 +346,28 @@ pub(crate) async fn save_tier_mutation_intent_record(api: Arc<ECStore>, intent: 
     com::save_config(api, &object, data).await
 }
 
+pub(crate) async fn save_tier_mutation_intent_record_if_absent(
+    api: Arc<ECStore>,
+    intent: &TierMutationIntent,
+) -> EcstoreResult<()> {
+    let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
+    let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
+    com::save_config_with_opts(
+        api,
+        &object,
+        data,
+        &ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 pub(crate) async fn load_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<TierMutationIntent> {
     let (intent, _) = load_tier_mutation_intent_record_with_etag(api, mutation_id).await?;
     Ok(intent)
