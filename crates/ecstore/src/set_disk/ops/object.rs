@@ -1698,10 +1698,15 @@ fn transition_transaction_not_after_unix_nanos() -> Result<i64> {
     i64::try_from(not_after).map_err(|_| Error::other("transition transaction deadline timestamp overflow"))
 }
 
-fn transition_source_version_mode(opts: &ObjectOptions) -> TransitionSourceVersionMode {
-    if opts.versioned {
+fn transition_source_version_mode(opts: &ObjectOptions, source_version_id: Option<Uuid>) -> TransitionSourceVersionMode {
+    let requested_null_version = opts
+        .version_id
+        .as_deref()
+        .and_then(|version_id| Uuid::parse_str(version_id).ok())
+        .is_some_and(|version_id| version_id.is_nil());
+    if opts.versioned && source_version_id.is_none_or(|version_id| !version_id.is_nil()) && !requested_null_version {
         TransitionSourceVersionMode::Versioned
-    } else if opts.version_suspended {
+    } else if opts.version_suspended || opts.versioned {
         TransitionSourceVersionMode::VersionSuspended
     } else {
         TransitionSourceVersionMode::Unversioned
@@ -1715,16 +1720,18 @@ fn transition_source_identity(
     opts: &ObjectOptions,
     stored_etag: &str,
 ) -> Result<TransitionSourceIdentity> {
-    let version_mode = transition_source_version_mode(opts);
+    let version_mode = transition_source_version_mode(opts, fi.version_id);
     let mod_time = fi
         .mod_time
         .ok_or_else(|| Error::other("transition source identity requires mod_time"))?
         .unix_timestamp_nanos();
     let mod_time_unix_nanos =
         i64::try_from(mod_time).map_err(|_| Error::other("transition source mod_time timestamp overflow"))?;
-    let version_id = (version_mode == TransitionSourceVersionMode::Versioned)
-        .then_some(fi.version_id)
-        .flatten();
+    let version_id = if version_mode == TransitionSourceVersionMode::Versioned {
+        fi.version_id.filter(|version_id| !version_id.is_nil())
+    } else {
+        None
+    };
     let data_dir = fi
         .data_dir
         .ok_or_else(|| Error::other("transition source identity requires data_dir"))?;
@@ -6165,6 +6172,79 @@ mod transition_source_identity_matrix_tests {
     use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::register_mock_tier;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+    #[test]
+    fn transition_source_identity_treats_nil_version_as_null_source() {
+        let fi = FileInfo {
+            version_id: Some(Uuid::nil()),
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("nil source version should build a null-version identity");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::VersionSuspended);
+        assert_eq!(source.version_id, None);
+        source.validate().expect("null-version source identity should validate");
+    }
+
+    #[test]
+    fn transition_source_identity_treats_requested_nil_version_as_null_source() {
+        let fi = FileInfo {
+            version_id: None,
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::nil().to_string()),
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("requested nil source version should build a null-version identity");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::VersionSuspended);
+        assert_eq!(source.version_id, None);
+        source
+            .validate()
+            .expect("requested null-version source identity should validate");
+    }
+
+    #[test]
+    fn transition_source_identity_still_rejects_missing_versioned_source_id() {
+        let fi = FileInfo {
+            version_id: None,
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("source identity construction should preserve missing version evidence");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::Versioned);
+        assert!(matches!(
+            source.validate(),
+            Err(crate::bucket::lifecycle::transition_transaction::TransitionTransactionError::Corrupt(
+                "versioned source is missing version_id"
+            ))
+        ));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
