@@ -15,7 +15,10 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::{create_fresh_db, get_global_db, instance::make_rustfsms};
-    use datafusion::arrow::array::{Array, StringArray};
+    use datafusion::arrow::{
+        array::{Array, Int64Array, StringArray},
+        record_batch::RecordBatch,
+    };
     use rustfs_s3select_api::{
         QueryError,
         query::{Context, Query},
@@ -25,6 +28,52 @@ mod integration_tests {
         OutputSerialization, ParquetInput, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::sync::Arc;
+
+    fn assert_ages_descending(output: &[RecordBatch]) {
+        let ages: Vec<i64> = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("age column should be Int64")
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(ages, vec![40, 38, 35, 32, 30, 28, 26, 25, 24, 22]);
+    }
+
+    fn assert_department_counts(output: &[RecordBatch]) {
+        let mut counts: Vec<(&str, i64)> = output
+            .iter()
+            .flat_map(|batch| {
+                let departments = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("department column should be Utf8");
+                let counts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count column should be Int64");
+                departments.iter().zip(counts.iter()).map(|(department, count)| {
+                    (
+                        department.expect("department should not be null"),
+                        count.expect("count should not be null"),
+                    )
+                })
+            })
+            .collect();
+        counts.sort_unstable();
+
+        assert_eq!(counts, vec![("Finance", 3), ("HR", 2), ("IT", 3), ("Marketing", 2)]);
+    }
 
     fn create_test_input(sql: &str) -> SelectObjectContentInput {
         SelectObjectContentInput {
@@ -291,15 +340,22 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_group_by() {
-        let sql = "SELECT department, COUNT(*) as count FROM S3Object GROUP BY department";
+    async fn test_select_with_aggregation() {
+        let sql = "SELECT department, COUNT(*) FROM S3Object GROUP BY department";
         let input = create_test_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute grouped CSV query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect grouped CSV output");
 
-        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
+        assert_department_counts(&output);
     }
 
     #[tokio::test]
@@ -373,14 +429,23 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_order_by() {
-        let sql = "SELECT name, age FROM S3Object ORDER BY age DESC";
+    async fn test_query_with_order_by() {
+        let sql = "SELECT name, CAST(age AS BIGINT) AS age FROM S3Object ORDER BY CAST(age AS BIGINT) DESC";
         let input = create_test_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
-        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute ordered CSV query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect ordered CSV output");
+
+        assert_eq!(output.iter().map(|batch| batch.num_rows()).sum::<usize>(), 10);
+        assert_ages_descending(&output);
     }
 
     #[tokio::test]
@@ -574,15 +639,22 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_group_by_json() {
-        let sql = "SELECT department, COUNT(*) as count FROM S3Object GROUP BY department";
+    async fn test_select_with_aggregation_json() {
+        let sql = "SELECT department, COUNT(*) FROM S3Object GROUP BY department";
         let input = create_test_json_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute grouped JSON query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect grouped JSON output");
 
-        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
+        assert_department_counts(&output);
     }
 
     #[tokio::test]
@@ -652,14 +724,23 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_rejects_order_by_json() {
+    async fn test_query_with_order_by_json() {
         let sql = "SELECT name, age FROM S3Object ORDER BY age DESC";
         let input = create_test_json_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
-        assert!(matches!(result, Err(QueryError::UnsupportedSqlStructure { .. })));
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute ordered JSON query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect ordered JSON output");
+
+        assert_eq!(output.iter().map(|batch| batch.num_rows()).sum::<usize>(), 10);
+        assert_ages_descending(&output);
     }
 
     #[tokio::test]

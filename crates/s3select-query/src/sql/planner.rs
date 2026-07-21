@@ -18,7 +18,9 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::sql::{
     planner::SqlToRel,
-    sqlparser::ast::{GroupByExpr, ObjectNamePart, Query, Select, SelectFlavor, SetExpr, Statement, TableFactor, Visit, Visitor},
+    sqlparser::ast::{
+        GroupByExpr, ObjectNamePart, OrderByKind, Query, Select, SelectFlavor, SetExpr, Statement, TableFactor, Visit, Visitor,
+    },
 };
 use rustfs_s3select_api::{
     QueryError, QueryResult,
@@ -85,7 +87,13 @@ fn validate_s3_select_statement(statement: &Statement) -> QueryResult<()> {
     };
 
     if query.with.is_some()
-        || query.order_by.is_some()
+        || query.order_by.as_ref().is_some_and(|order_by| {
+            order_by.interpolate.is_some()
+                || match &order_by.kind {
+                    OrderByKind::Expressions(expressions) => expressions.iter().any(|expression| expression.with_fill.is_some()),
+                    OrderByKind::All(_) => true,
+                }
+        })
         || query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
@@ -114,6 +122,11 @@ fn validate_s3_select_statement(statement: &Statement) -> QueryResult<()> {
         return Err(unsupported_structure("LIMIT must be a non-negative integer"));
     }
 
+    let mut detector = SubqueryDetector { visited_root: false };
+    if query.visit(&mut detector).is_break() {
+        return Err(unsupported_structure("subqueries are not supported"));
+    }
+
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(unsupported_structure("set operations and nested queries are not supported"));
     };
@@ -138,10 +151,7 @@ fn validate_select(select: &Select) -> QueryResult<()> {
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
         || select.flavor != SelectFlavor::Standard
-        || !matches!(
-            &select.group_by,
-            GroupByExpr::Expressions(expressions, modifiers) if expressions.is_empty() && modifiers.is_empty()
-        )
+        || !matches!(&select.group_by, GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty())
     {
         return Err(unsupported_structure("the SELECT contains an unsupported clause"));
     }
@@ -192,10 +202,6 @@ fn validate_select(select: &Select) -> QueryResult<()> {
         return Err(unsupported_structure("the source must be S3Object"));
     }
 
-    let mut detector = SubqueryDetector;
-    if select.visit(&mut detector).is_break() {
-        return Err(unsupported_structure("subqueries are not supported"));
-    }
     Ok(())
 }
 
@@ -205,13 +211,20 @@ fn unsupported_structure(message: &str) -> QueryError {
     }
 }
 
-struct SubqueryDetector;
+struct SubqueryDetector {
+    visited_root: bool,
+}
 
 impl Visitor for SubqueryDetector {
     type Break = ();
 
     fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-        ControlFlow::Break(())
+        if self.visited_root {
+            ControlFlow::Break(())
+        } else {
+            self.visited_root = true;
+            ControlFlow::Continue(())
+        }
     }
 }
 
@@ -243,6 +256,13 @@ mod tests {
     }
 
     #[test]
+    fn accepts_group_by_and_order_by() {
+        let statement = parse_statement("SELECT department, COUNT(*) FROM S3Object GROUP BY department ORDER BY department");
+
+        assert!(validate_s3_select_statement(&statement).is_ok());
+    }
+
+    #[test]
     fn rejects_join() {
         let statement = parse_statement("SELECT * FROM S3Object a JOIN S3Object b ON a.id = b.id");
 
@@ -255,6 +275,16 @@ mod tests {
     #[test]
     fn rejects_subquery() {
         let statement = parse_statement("SELECT * FROM S3Object WHERE id IN (SELECT id FROM S3Object)");
+
+        assert!(matches!(
+            validate_s3_select_statement(&statement),
+            Err(QueryError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
+        ));
+    }
+
+    #[test]
+    fn rejects_subquery_in_order_by() {
+        let statement = parse_statement("SELECT id FROM S3Object ORDER BY (SELECT id FROM S3Object)");
 
         assert!(matches!(
             validate_s3_select_statement(&statement),
@@ -276,8 +306,6 @@ mod tests {
     fn rejects_unsupported_select_clauses() {
         for sql in [
             "SELECT DISTINCT id FROM S3Object",
-            "SELECT department, COUNT(*) FROM S3Object GROUP BY department",
-            "SELECT * FROM S3Object ORDER BY id",
             "SELECT * FROM S3Object OFFSET 1",
             "SELECT * FROM S3Object UNION SELECT * FROM S3Object",
         ] {

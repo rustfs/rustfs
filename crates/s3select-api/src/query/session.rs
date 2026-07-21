@@ -45,7 +45,6 @@ pub struct SessionCtxDesc {
     // maybe we need some info
 }
 
-#[derive(Default)]
 pub struct SessionCtxFactory {
     pub is_test: bool,
     pub target_partitions: usize,
@@ -53,6 +52,12 @@ pub struct SessionCtxFactory {
 }
 
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+impl Default for SessionCtxFactory {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
 
 impl SessionCtxFactory {
     pub fn new(is_test: bool) -> Self {
@@ -91,6 +96,7 @@ impl SessionCtxFactory {
             .with_memory_limit(self.memory_limit_bytes, 1.0)
             .build()?;
         let config = SessionConfig::new().with_target_partitions(self.target_partitions);
+        let memory_pool = Arc::clone(&rt.memory_pool);
         let df_session_state = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(Arc::new(rt))
@@ -140,8 +146,8 @@ impl SessionCtxFactory {
 
             df_session_state.with_object_store(&store_url, store).build()
         } else {
-            let store: EcObjectStore =
-                EcObjectStore::new(context.input.clone()).map_err(|_| QueryError::NotImplemented { err: String::new() })?;
+            let store: EcObjectStore = EcObjectStore::new(context.input.clone(), memory_pool)
+                .map_err(|_| QueryError::NotImplemented { err: String::new() })?;
             df_session_state.with_object_store(&store_url, Arc::new(store)).build()
         };
 
@@ -277,5 +283,14 @@ mod tests {
             session.inner().runtime_env().memory_pool.memory_limit(),
             MemoryLimit::Finite(1024)
         ));
+    }
+
+    #[test]
+    fn session_factory_default_uses_bounded_memory() {
+        let factory = SessionCtxFactory::default();
+
+        assert!(!factory.is_test);
+        assert_eq!(factory.target_partitions, 0);
+        assert_eq!(factory.memory_limit_bytes, DEFAULT_MEMORY_LIMIT_BYTES);
     }
 }

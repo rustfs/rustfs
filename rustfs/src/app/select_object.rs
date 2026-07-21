@@ -11,6 +11,7 @@ use datafusion::arrow::{
     record_batch::RecordBatch,
 };
 use datafusion::common::DataFusionError;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use http::{StatusCode, header::RANGE};
 use rustfs_s3select_api::{
@@ -18,6 +19,7 @@ use rustfs_s3select_api::{
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
+use rustfs_s3select_query::instance::s3_select_query_timeout;
 use s3s::dto::{
     CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
     JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,
@@ -27,6 +29,7 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, timeout_at};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
@@ -61,6 +64,8 @@ pub async fn execute_select_object_content(
     validate_scan_range_for_object_size(&input.request, metadata.size)?;
 
     let input = Arc::new(input);
+    let query_timeout = s3_select_query_timeout();
+    let query_deadline = Instant::now() + query_timeout;
     let db = current_s3select_db((*input).clone(), false)
         .await
         .map_err(map_query_error_to_s3)?;
@@ -75,69 +80,93 @@ pub async fn execute_select_object_content(
 
     let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(8);
     spawn_traced(async move {
-        let mut encoder = SelectOutputEncoder::new(validation.output_format);
-        let mut progress = SelectProgress::default();
-        let mut output = output;
-
-        if tx
-            .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        while let Some(result) = output.next().await {
-            let batch = match result {
-                Ok(batch) => batch,
-                Err(err) => {
-                    let _ = tx.send(Err(map_query_error_to_s3(err.into()))).await;
-                    return;
-                }
-            };
-
-            match encoder.encode_batch(&batch) {
-                Ok(payloads) => {
-                    for payload in payloads {
-                        progress.add_returned(payload.len());
-                        if tx
-                            .send(Ok(SelectObjectContentEvent::Records(RecordsEvent { payload: Some(payload) })))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if validation.progress_enabled
-                            && tx
-                                .send(Ok(SelectObjectContentEvent::Progress(ProgressEvent {
-                                    details: Some(progress.to_progress()),
-                                })))
-                                .await
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    return;
-                }
-            }
-        }
-
-        let stats = SelectObjectContentEvent::Stats(StatsEvent {
-            details: Some(progress.to_stats()),
-        });
-        if tx.send(Ok(stats)).await.is_err() {
-            return;
-        }
-        let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+        send_select_events_until_deadline(output, tx, validation, query_deadline, query_timeout.as_secs()).await;
     });
 
     Ok(S3Response::new(SelectObjectContentOutput {
         payload: Some(SelectObjectContentEventStream::new(ReceiverStream::new(rx))),
     }))
+}
+
+async fn send_select_events_until_deadline(
+    output: SendableRecordBatchStream,
+    tx: mpsc::Sender<S3Result<SelectObjectContentEvent>>,
+    validation: SelectValidation,
+    deadline: Instant,
+    timeout_seconds: u64,
+) {
+    if timeout_at(deadline, send_select_events(output, &tx, validation))
+        .await
+        .is_err()
+    {
+        let _ = tx.try_send(Err(map_query_error_to_s3(QueryError::QueryTimeout {
+            seconds: timeout_seconds,
+        })));
+    }
+}
+
+async fn send_select_events(
+    mut output: SendableRecordBatchStream,
+    tx: &mpsc::Sender<S3Result<SelectObjectContentEvent>>,
+    validation: SelectValidation,
+) {
+    let mut encoder = SelectOutputEncoder::new(validation.output_format);
+    let mut progress = SelectProgress::default();
+
+    if tx
+        .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    while let Some(result) = output.next().await {
+        let batch = match result {
+            Ok(batch) => batch,
+            Err(err) => {
+                let _ = tx.send(Err(map_query_error_to_s3(err.into()))).await;
+                return;
+            }
+        };
+
+        match encoder.encode_batch(&batch) {
+            Ok(payloads) => {
+                for payload in payloads {
+                    progress.add_returned(payload.len());
+                    if tx
+                        .send(Ok(SelectObjectContentEvent::Records(RecordsEvent { payload: Some(payload) })))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if validation.progress_enabled
+                        && tx
+                            .send(Ok(SelectObjectContentEvent::Progress(ProgressEvent {
+                                details: Some(progress.to_progress()),
+                            })))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+        }
+    }
+
+    let stats = SelectObjectContentEvent::Stats(StatsEvent {
+        details: Some(progress.to_stats()),
+    });
+    if tx.send(Ok(stats)).await.is_err() {
+        return;
+    }
+    let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
 }
 
 fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectContentInput) -> S3Result<SelectValidation> {
@@ -497,8 +526,12 @@ fn map_query_error_to_s3(err: QueryError) -> S3Error {
         QueryError::NotImplemented { .. } => S3Error::with_message(S3ErrorCode::NotImplemented, message),
         QueryError::QueryConcurrencyLimit => S3Error::with_message(S3ErrorCode::SlowDown, message),
         QueryError::QueryTimeout { .. } => S3Error::with_message(S3ErrorCode::Busy, message),
-        QueryError::Datafusion { source } if is_query_timeout(&source) => S3Error::with_message(S3ErrorCode::Busy, message),
-        QueryError::Datafusion { source } if is_resource_exhausted(&source) => S3Error::with_message(S3ErrorCode::Busy, message),
+        QueryError::Datafusion { source } if is_query_timeout(source.as_ref()) => {
+            S3Error::with_message(S3ErrorCode::Busy, message)
+        }
+        QueryError::Datafusion { source } if is_resource_exhausted(source.as_ref()) => {
+            S3Error::with_message(S3ErrorCode::Busy, message)
+        }
         QueryError::Datafusion { .. } if looks_like_invalid_scan_range(&message) => {
             S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
         }
@@ -527,26 +560,16 @@ fn looks_like_bucket_not_found(message: &str) -> bool {
     message.contains("NoSuchBucket") || message.contains("bucket not found") || message.contains("BucketNotFound")
 }
 
-fn is_resource_exhausted(err: &DataFusionError) -> bool {
-    match err {
-        DataFusionError::ResourcesExhausted(_) => true,
-        DataFusionError::Context(_, source) => is_resource_exhausted(source),
-        DataFusionError::External(source) => source.downcast_ref::<DataFusionError>().is_some_and(is_resource_exhausted),
-        _ => false,
-    }
+fn is_resource_exhausted(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<DataFusionError>()
+        .is_some_and(|err| matches!(err, DataFusionError::ResourcesExhausted(_)))
+        || err.source().is_some_and(is_resource_exhausted)
 }
 
-fn is_query_timeout(err: &DataFusionError) -> bool {
-    match err {
-        DataFusionError::Context(_, source) => is_query_timeout(source),
-        DataFusionError::External(source) => {
-            source
-                .downcast_ref::<QueryError>()
-                .is_some_and(|err| matches!(err, QueryError::QueryTimeout { .. }))
-                || source.downcast_ref::<DataFusionError>().is_some_and(is_query_timeout)
-        }
-        _ => false,
-    }
+fn is_query_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<QueryError>()
+        .is_some_and(|err| matches!(err, QueryError::QueryTimeout { .. }))
+        || err.source().is_some_and(is_query_timeout)
 }
 
 fn looks_like_object_not_found(message: &str) -> bool {
@@ -577,7 +600,9 @@ fn is_json_document(json: &JSONInput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::sql::sqlparser::parser::ParserError;
+    use datafusion::{
+        arrow::datatypes::Schema, physical_plan::stream::RecordBatchStreamAdapter, sql::sqlparser::parser::ParserError,
+    };
     use http::HeaderMap;
     use s3s::dto::{CSVInput, ParquetInput, ScanRange};
 
@@ -651,10 +676,10 @@ mod tests {
             source: Box::new(DataFusionError::External(Box::new(QueryError::QueryTimeout { seconds: 300 }))),
         });
         let exhausted = map_query_error_to_s3(QueryError::Datafusion {
-            source: Box::new(DataFusionError::Context(
-                "execute S3 Select query".to_string(),
-                Box::new(DataFusionError::ResourcesExhausted("memory limit".to_string())),
-            )),
+            source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(DataFusionError::ResourcesExhausted("memory limit".to_string())),
+            }))),
         });
 
         assert_eq!(unsupported.code(), &S3ErrorCode::UnsupportedSqlStructure);
@@ -662,6 +687,32 @@ mod tests {
         assert_eq!(timed_out.code(), &S3ErrorCode::Busy);
         assert_eq!(stream_timed_out.code(), &S3ErrorCode::Busy);
         assert_eq!(exhausted.code(), &S3ErrorCode::Busy);
+    }
+
+    #[tokio::test]
+    async fn producer_deadline_cancels_backpressured_send() {
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::pending::<Result<RecordBatch, DataFusionError>>(),
+        ));
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+            .await
+            .expect("test channel should accept the prefilled event");
+        let validation = SelectValidation {
+            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            progress_enabled: false,
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_select_events_until_deadline(output, tx, validation, Instant::now(), 300),
+        )
+        .await
+        .expect("expired producer should not remain blocked on send");
+
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]

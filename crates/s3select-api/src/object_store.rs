@@ -20,9 +20,13 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use datafusion::object_store::{
-    Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+use datafusion::{
+    common::DataFusionError,
+    execution::memory_pool::{MemoryConsumer, MemoryPool},
+    object_store::{
+        Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+        MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+    },
 };
 use futures::pin_mut;
 use futures::{Stream, StreamExt, future::ready, stream};
@@ -63,6 +67,7 @@ fn select_default_read_buffer_size_u64() -> u64 {
 /// Default: 128 MiB.  This matches the AWS S3 Select limit for JSON DOCUMENT
 /// inputs.
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
+const JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER: usize = 64;
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
 
@@ -79,6 +84,7 @@ pub struct EcObjectStore {
     /// expression.  When set, `flatten_json_document_to_ndjson` navigates to
     /// this key in the root JSON object before flattening.
     json_sub_path: Option<String>,
+    memory_pool: Arc<dyn MemoryPool>,
 
     store: Arc<SelectStore>,
 }
@@ -107,7 +113,7 @@ impl SelectScanRange {
 pub struct InvalidScanRange;
 
 impl EcObjectStore {
-    pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
+    pub fn new(input: Arc<SelectObjectContentInput>, memory_pool: Arc<dyn MemoryPool>) -> S3Result<Self> {
         let Some(store) = resolve_select_object_store_handle() else {
             return Err(s3_error!(InternalError, "ec store not inited"));
         };
@@ -151,6 +157,7 @@ impl EcObjectStore {
             delimiter,
             is_json_document,
             json_sub_path,
+            memory_pool,
             store,
         })
     }
@@ -486,7 +493,12 @@ impl ObjectStore for EcObjectStore {
                     .into(),
                 });
             }
-            let stream = json_document_ndjson_stream(reader.stream, original_size, self.json_sub_path.clone());
+            let stream = json_document_ndjson_stream(
+                reader.stream,
+                original_size,
+                self.json_sub_path.clone(),
+                Arc::clone(&self.memory_pool),
+            );
             GetResultPayload::Stream(stream)
         } else if let Some((_, scan_range)) = scan_context {
             let delimiter = self.record_delimiter();
@@ -855,11 +867,35 @@ fn json_document_ndjson_stream(
     stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
     original_size: u64,
     json_sub_path: Option<String>,
+    memory_pool: Arc<dyn MemoryPool>,
 ) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
+        // Compact JSON can expand substantially into a serde_json DOM and
+        // per-record output buffers, so reserve a conservative upper bound
+        // before the source buffer is allocated.
+        let buffer_capacity = usize::try_from(original_size).map_err(|_| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                "JSON DOCUMENT input size {original_size} does not fit in memory"
+            ))),
+        })?;
+        let reservation_bytes = buffer_capacity
+            .checked_mul(JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER)
+            .ok_or_else(|| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                    "JSON DOCUMENT memory reservation overflow for {original_size} input bytes"
+                ))),
+            })?;
+        let reservation = MemoryConsumer::new("S3 Select JSON document").register(&memory_pool);
+        reservation.try_resize(reservation_bytes).map_err(|err| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(err),
+        })?;
+
         pin_mut!(stream);
         // ── 1. Read phase (lazy: only runs when the stream is polled) ────
-        let mut all_bytes = Vec::with_capacity(original_size as usize);
+        let mut all_bytes = Vec::with_capacity(buffer_capacity);
         stream
             .take(original_size)
             .read_to_end(&mut all_bytes)
@@ -870,16 +906,18 @@ fn json_document_ndjson_stream(
             })?;
 
         // ── 2. Parse phase (blocking thread pool, non-blocking runtime) ──
-        let lines = tokio::task::spawn_blocking(move || parse_json_document_to_lines(&all_bytes, json_sub_path.as_deref()))
-            .await
-            .map_err(|e| o_Error::Generic {
-                store: "EcObjectStore",
-                source: e.to_string().into(),
-            })?
-            .map_err(|e| o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(e),
-            })?;
+        let (lines, _reservation) = tokio::task::spawn_blocking(move || {
+            parse_json_document_to_lines(&all_bytes, json_sub_path.as_deref()).map(|lines| (lines, reservation))
+        })
+        .await
+        .map_err(|e| o_Error::Generic {
+            store: "EcObjectStore",
+            source: e.to_string().into(),
+        })?
+        .map_err(|e| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(e),
+        })?;
 
         // ── 3. Yield phase (one Bytes per NDJSON line) ───────────────────
         for line in lines {
@@ -907,19 +945,11 @@ fn parse_json_document_to_lines(bytes: &[u8], json_sub_path: Option<&str>) -> st
 
     // Navigate into the sub-path when the root is an object and a path was
     // extracted from the SQL FROM clause (e.g. `FROM s3object.employees`).
-    let value = if let Some(path) = json_sub_path {
-        if let serde_json::Value::Object(ref obj) = root {
-            match obj.get(path) {
-                Some(sub) => sub.clone(),
-                // Path not found – fall back to emitting the whole root object.
-                None => root,
-            }
-        } else {
-            // Root is already an array or scalar; ignore the path hint.
-            root
+    let value = match (root, json_sub_path) {
+        (serde_json::Value::Object(mut object), Some(path)) => {
+            object.remove(path).unwrap_or_else(|| serde_json::Value::Object(object))
         }
-    } else {
-        root
+        (root, _) => root,
     };
 
     let mut lines: Vec<Bytes> = Vec::new();
@@ -994,15 +1024,19 @@ where
 #[cfg(test)]
 mod test {
     use super::{
-        SelectScanRange, bytes_stream, convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter,
-        flatten_json_document_to_ndjson, http_range_spec_from_get_range, replace_symbol, scan_range_from_bounds,
-        scan_range_read_start, scan_range_stream, select_read_headers,
+        JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, SelectScanRange, bytes_stream, convert_field_delimiter_stream,
+        extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
+        json_document_ndjson_stream, replace_symbol, scan_range_from_bounds, scan_range_read_start, scan_range_stream,
+        select_read_headers,
     };
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
     use bytes::Bytes;
-    use datafusion::object_store::{self, GetRange};
-    use datafusion::object_store::{GetOptions, GetResultPayload, ObjectStore as _, path::Path};
+    use datafusion::{
+        common::DataFusionError,
+        execution::memory_pool::{GreedyMemoryPool, MemoryPool},
+        object_store::{self, GetOptions, GetRange, GetResultPayload, ObjectStore as _, path::Path},
+    };
     use futures::{StreamExt, TryStreamExt, stream};
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
@@ -1300,6 +1334,47 @@ mod test {
         assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(source.to_string().contains("2 bytes remaining"));
         assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_json_document_stream_respects_query_memory_pool() {
+        let input = b"{}".to_vec();
+        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(required - 1));
+        let mut output =
+            json_document_ndjson_stream(Box::new(std::io::Cursor::new(input.clone())), input.len() as u64, None, memory_pool);
+
+        let err = output
+            .next()
+            .await
+            .expect("memory error")
+            .expect_err("reservation should exceed the pool");
+        let object_store::Error::Generic { source, .. } = err else {
+            panic!("expected generic object store error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<DataFusionError>(),
+            Some(DataFusionError::ResourcesExhausted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_json_document_stream_releases_memory_reservation() {
+        let input = b"[1,2]".to_vec();
+        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
+        let memory_pool = Arc::new(GreedyMemoryPool::new(required));
+        let output: Vec<Bytes> = json_document_ndjson_stream(
+            Box::new(std::io::Cursor::new(input.clone())),
+            input.len() as u64,
+            None,
+            memory_pool.clone(),
+        )
+        .try_collect()
+        .await
+        .expect("JSON conversion should fit the pool");
+
+        assert_eq!(output, vec![Bytes::from_static(b"1\n"), Bytes::from_static(b"2\n")]);
+        assert_eq!(memory_pool.reserved(), 0);
     }
 
     /// A JSON array is split into one NDJSON line per element.

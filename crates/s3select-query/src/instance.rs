@@ -124,11 +124,7 @@ impl S3SelectRuntimeConfig {
                 DEFAULT_MEMORY_LIMIT_BYTES,
                 usize::MAX,
             ),
-            query_timeout: Duration::from_secs(bounded_u64_from_env_value(
-                std::env::var(ENV_RUSTFS_S3SELECT_QUERY_TIMEOUT_SECS).ok().as_deref(),
-                DEFAULT_QUERY_TIMEOUT_SECS,
-                MAX_QUERY_TIMEOUT_SECS,
-            )),
+            query_timeout: s3_select_query_timeout(),
             max_concurrent_queries: bounded_usize_from_env_value(
                 std::env::var(ENV_RUSTFS_S3SELECT_MAX_CONCURRENT_QUERIES).ok().as_deref(),
                 DEFAULT_MAX_CONCURRENT_QUERIES,
@@ -136,6 +132,14 @@ impl S3SelectRuntimeConfig {
             ),
         }
     }
+}
+
+pub fn s3_select_query_timeout() -> Duration {
+    Duration::from_secs(bounded_u64_from_env_value(
+        std::env::var(ENV_RUSTFS_S3SELECT_QUERY_TIMEOUT_SECS).ok().as_deref(),
+        DEFAULT_QUERY_TIMEOUT_SECS,
+        MAX_QUERY_TIMEOUT_SECS,
+    ))
 }
 
 fn target_partitions_from_env_value(value: Option<&str>) -> usize {

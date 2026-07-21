@@ -16,7 +16,10 @@ use std::{
     future::Future,
     ops::Deref,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -35,7 +38,8 @@ use datafusion::{
     execution::{RecordBatchStream, SendableRecordBatchStream},
     sql::sqlparser::parser::ParserError,
 };
-use futures::{Stream, StreamExt};
+use futures::Stream;
+use parking_lot::Mutex;
 use rustfs_s3select_api::{
     QueryError, QueryResult,
     query::{
@@ -310,25 +314,60 @@ impl SimpleQueryDispatcher {
 }
 
 pub struct TrackedRecordBatchStream {
-    inner: Option<SendableRecordBatchStream>,
+    state: Arc<TrackedRecordBatchState>,
     schema: SchemaRef,
-    permit: Option<OwnedSemaphorePermit>,
     deadline: Pin<Box<Sleep>>,
+    deadline_task: tokio::task::JoinHandle<()>,
     timeout_seconds: u64,
     done: bool,
+}
+
+struct TrackedRecordBatchState {
+    inner: Mutex<Option<SendableRecordBatchStream>>,
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    timed_out: AtomicBool,
+}
+
+impl TrackedRecordBatchState {
+    fn finish(&self) {
+        self.permit.lock().take();
+        self.inner.lock().take();
+    }
+
+    fn expire(&self) {
+        self.timed_out.store(true, Ordering::Release);
+        self.finish();
+    }
 }
 
 impl TrackedRecordBatchStream {
     fn new(inner: SendableRecordBatchStream, permit: OwnedSemaphorePermit, deadline: Instant, timeout_seconds: u64) -> Self {
         let schema = inner.schema();
+        let state = Arc::new(TrackedRecordBatchState {
+            inner: Mutex::new(Some(inner)),
+            permit: Mutex::new(Some(permit)),
+            timed_out: AtomicBool::new(false),
+        });
+        let deadline_state = Arc::clone(&state);
+        let deadline_task = tokio::spawn(async move {
+            sleep_until(deadline).await;
+            deadline_state.expire();
+        });
         Self {
-            inner: Some(inner),
+            state,
             schema,
-            permit: Some(permit),
             deadline: Box::pin(sleep_until(deadline)),
+            deadline_task,
             timeout_seconds,
             done: false,
         }
+    }
+}
+
+impl Drop for TrackedRecordBatchStream {
+    fn drop(&mut self) {
+        self.state.finish();
+        self.deadline_task.abort();
     }
 }
 
@@ -345,25 +384,27 @@ impl Stream for TrackedRecordBatchStream {
         if self.done {
             return Poll::Ready(None);
         }
-        if self.deadline.as_mut().poll(cx).is_ready() {
+        if self.state.timed_out.load(Ordering::Acquire) || self.deadline.as_mut().poll(cx).is_ready() {
             self.done = true;
-            self.inner.take();
-            self.permit.take();
+            self.state.expire();
+            self.deadline_task.abort();
             return Poll::Ready(Some(Err(datafusion::common::DataFusionError::External(Box::new(
                 QueryError::QueryTimeout {
                     seconds: self.timeout_seconds,
                 },
             )))));
         }
-        let Some(inner) = self.inner.as_mut() else {
-            self.done = true;
-            return Poll::Ready(None);
+        let poll = {
+            let mut inner = self.state.inner.lock();
+            match inner.as_mut() {
+                Some(inner) => inner.as_mut().poll_next(cx),
+                None => Poll::Ready(None),
+            }
         };
-        let poll = inner.poll_next_unpin(cx);
         if matches!(poll, Poll::Ready(None)) {
             self.done = true;
-            self.inner.take();
-            self.permit.take();
+            self.state.finish();
+            self.deadline_task.abort();
         }
         poll
     }
@@ -662,6 +703,34 @@ mod tests {
         assert!(inner_dropped.load(Ordering::SeqCst));
         assert_eq!(admission.available_permits(), 1);
         assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_deadline_releases_resources_without_polling_stream() {
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("admission permit should be available");
+        let inner_dropped = Arc::new(AtomicBool::new(false));
+        let drop_signal = DropSignal(Arc::clone(&inner_dropped));
+        let inner = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            stream::poll_fn(move |_| {
+                let _drop_signal = &drop_signal;
+                Poll::Pending::<Option<Result<RecordBatch, DataFusionError>>>
+            }),
+        ));
+        let _output = TrackedRecordBatchStream::new(inner, permit, Instant::now(), 300);
+
+        let recovered_permit = tokio::time::timeout(Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
+            .await
+            .expect("deadline should release the admission permit")
+            .expect("admission semaphore should remain open");
+
+        assert!(inner_dropped.load(Ordering::SeqCst));
+        drop(recovered_permit);
+        assert_eq!(admission.available_permits(), 1);
     }
 
     #[tokio::test]
