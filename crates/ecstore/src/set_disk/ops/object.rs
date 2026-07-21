@@ -1698,13 +1698,14 @@ fn transition_transaction_not_after_unix_nanos() -> Result<i64> {
     i64::try_from(not_after).map_err(|_| Error::other("transition transaction deadline timestamp overflow"))
 }
 
-fn transition_source_version_mode(opts: &ObjectOptions, source_version_id: Option<Uuid>) -> TransitionSourceVersionMode {
+fn transition_source_version_mode(opts: &ObjectOptions, fi: &FileInfo) -> TransitionSourceVersionMode {
     let requested_null_version = opts
         .version_id
         .as_deref()
         .and_then(|version_id| Uuid::parse_str(version_id).ok())
         .is_some_and(|version_id| version_id.is_nil());
-    if opts.versioned && source_version_id.is_none_or(|version_id| !version_id.is_nil()) && !requested_null_version {
+    let source_version_id = fi.version_id.filter(|version_id| !version_id.is_nil());
+    if opts.versioned && (source_version_id.is_some() || (fi.versioned && !requested_null_version)) {
         TransitionSourceVersionMode::Versioned
     } else if opts.version_suspended || opts.versioned {
         TransitionSourceVersionMode::VersionSuspended
@@ -1720,7 +1721,7 @@ fn transition_source_identity(
     opts: &ObjectOptions,
     stored_etag: &str,
 ) -> Result<TransitionSourceIdentity> {
-    let version_mode = transition_source_version_mode(opts, fi.version_id);
+    let version_mode = transition_source_version_mode(opts, fi);
     let mod_time = fi
         .mod_time
         .ok_or_else(|| Error::other("transition source identity requires mod_time"))?
@@ -6221,9 +6222,35 @@ mod transition_source_identity_matrix_tests {
     }
 
     #[test]
+    fn transition_source_identity_treats_unversioned_fileinfo_as_null_source() {
+        let fi = FileInfo {
+            version_id: None,
+            versioned: false,
+            data_dir: Some(Uuid::new_v4()),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            size: 1,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let source = transition_source_identity("bucket", "object", &fi, &opts, "etag")
+            .expect("unversioned fileinfo should build a null-version identity");
+
+        assert_eq!(source.version_mode, TransitionSourceVersionMode::VersionSuspended);
+        assert_eq!(source.version_id, None);
+        source
+            .validate()
+            .expect("unversioned fileinfo null-version source identity should validate");
+    }
+
+    #[test]
     fn transition_source_identity_still_rejects_missing_versioned_source_id() {
         let fi = FileInfo {
             version_id: None,
+            versioned: true,
             data_dir: Some(Uuid::new_v4()),
             mod_time: Some(OffsetDateTime::now_utc()),
             size: 1,
