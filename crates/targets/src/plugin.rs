@@ -14,8 +14,9 @@
 
 use crate::{
     PluginRuntimeAdapter, RuntimeActivation, Target, TargetError,
-    config::collect_target_configs,
+    config::try_collect_target_configs,
     manifest::{TargetPluginManifest, builtin_target_manifest},
+    target::with_deferred_queue_store_open,
 };
 use hashbrown::HashMap;
 use rustfs_config::server_config::{Config, KVS};
@@ -317,39 +318,68 @@ where
         config: &Config,
         route_prefix: &str,
     ) -> Result<Vec<BoxedTarget<E>>, TargetError> {
+        self.create_targets_from_config_with_store_mode(config, route_prefix, false)
+            .await
+            .map(|(targets, _)| targets)
+    }
+
+    /// Creates targets while deferring queue-store open until runtime handoff.
+    /// Unlike the compatibility activation API, lifecycle preparation reports
+    /// any invalid or unconstructable configured instance so the originating
+    /// Admin request cannot report a false success.
+    pub async fn create_dormant_targets_from_config(
+        &self,
+        config: &Config,
+        route_prefix: &str,
+    ) -> Result<(Vec<BoxedTarget<E>>, Vec<String>), TargetError> {
+        self.create_targets_from_config_with_store_mode(config, route_prefix, true)
+            .await
+    }
+
+    async fn create_targets_from_config_with_store_mode(
+        &self,
+        config: &Config,
+        route_prefix: &str,
+        defer_store_open: bool,
+    ) -> Result<(Vec<BoxedTarget<E>>, Vec<String>), TargetError> {
         let mut successful_targets = Vec::new();
-        let mut failed_targets = 0usize;
+        let mut failures = Vec::new();
 
         for (target_type, plugin) in &self.plugins {
             info!(target_type = %target_type, "Start working on target type");
-            for (id, merged_config) in collect_target_configs(config, route_prefix, target_type, plugin.valid_fields_set()) {
+            for (id, merged_config) in try_collect_target_configs(config, route_prefix, target_type, plugin.valid_fields_set())? {
                 info!(target_type = %target_type, instance_id = %id, "Target is enabled, ready to create");
-                match self.create_target(target_type, id.clone(), &merged_config) {
+                let created = if defer_store_open {
+                    with_deferred_queue_store_open(|| self.create_target(target_type, id.clone(), &merged_config))
+                } else {
+                    self.create_target(target_type, id.clone(), &merged_config)
+                };
+                match created {
                     Ok(target) => {
                         info!(target_type = %target.id().name, instance_id = %id, "Create target successfully");
                         successful_targets.push(target);
                     }
-                    Err(err) => {
-                        failed_targets += 1;
-                        error!(target_type = %target_type, instance_id = %id, error = %err, "Failed to create target");
+                    Err(_) => {
+                        failures.push(format!("{target_type}/{id}: target construction failed"));
+                        error!(target_type = %target_type, instance_id = %id, reason = "construction_failed", "Failed to create target");
                     }
                 }
             }
         }
 
-        if failed_targets > 0 {
+        if !failures.is_empty() {
             warn!(
                 created = successful_targets.len(),
-                failed = failed_targets,
+                failed = failures.len(),
                 "Some configured targets failed to create and were skipped"
             );
         }
         info!(
             count = successful_targets.len(),
-            failed = failed_targets,
+            failed = failures.len(),
             "All target processing completed"
         );
-        Ok(successful_targets)
+        Ok((successful_targets, failures))
     }
 
     pub async fn create_activation_from_config<A>(

@@ -52,7 +52,10 @@ use crate::server::ShutdownHandle;
 use crate::startup_embedded::{EmbeddedStartedServer, EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
 use crate::startup_lifecycle::embedded_endpoint_address;
 use crate::startup_server::find_embedded_available_port;
-use crate::startup_shutdown::{run_embedded_server_drop_cleanup, run_embedded_server_shutdown};
+use crate::startup_shutdown::{
+    EmbeddedRuntimeOwner, register_embedded_runtime_owner, run_embedded_server_drop_cleanup, run_embedded_server_shutdown,
+    run_embedded_shutdown_cleanup,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -215,14 +218,21 @@ impl RustFSServerBuilder {
     }
 
     async fn do_build(self) -> Result<RustFSServer, ServerError> {
-        let started = run_embedded_startup(self.startup_args).await?;
-
-        Ok(started.into())
+        let mut runtime_owner = register_embedded_runtime_owner().await;
+        match run_embedded_startup(self.startup_args).await {
+            Ok(started) => Ok(RustFSServer::from_started(started, runtime_owner)),
+            Err(err) => {
+                if let Some(cleanup) = runtime_owner.release() {
+                    run_embedded_shutdown_cleanup(cleanup).await;
+                }
+                Err(err.into())
+            }
+        }
     }
 }
 
-impl From<EmbeddedStartedServer> for RustFSServer {
-    fn from(started: EmbeddedStartedServer) -> Self {
+impl RustFSServer {
+    fn from_started(started: EmbeddedStartedServer, runtime_owner: EmbeddedRuntimeOwner) -> Self {
         Self {
             address: started.bound_addr,
             access_key: started.access_key,
@@ -231,6 +241,7 @@ impl From<EmbeddedStartedServer> for RustFSServer {
             shutdown_handle: Some(started.shutdown_handle),
             cancel_token: started.cancel_token,
             temp_dir: started.temp_dir,
+            runtime_owner: Some(runtime_owner),
         }
     }
 }
@@ -250,6 +261,7 @@ pub struct RustFSServer {
     shutdown_handle: Option<ShutdownHandle>,
     cancel_token: CancellationToken,
     temp_dir: Option<PathBuf>,
+    runtime_owner: Option<EmbeddedRuntimeOwner>,
 }
 
 impl RustFSServer {
@@ -290,13 +302,34 @@ impl RustFSServer {
     }
 
     async fn do_shutdown(&mut self) {
-        run_embedded_server_shutdown(&self.cancel_token, &mut self.shutdown_handle, self.temp_dir.as_deref()).await;
+        let Some(runtime_owner) = self.runtime_owner.take() else {
+            return;
+        };
+        let runtime = runtime_owner.cleanup_runtime_handle();
+        run_embedded_server_shutdown(
+            &runtime,
+            &self.cancel_token,
+            &mut self.shutdown_handle,
+            &mut self.temp_dir,
+            Some(runtime_owner),
+        )
+        .await;
     }
 }
 
 impl Drop for RustFSServer {
     fn drop(&mut self) {
-        run_embedded_server_drop_cleanup(&self.cancel_token, &mut self.shutdown_handle, self.temp_dir.as_deref());
+        let Some(runtime_owner) = self.runtime_owner.take() else {
+            return;
+        };
+        let runtime = runtime_owner.cleanup_runtime_handle();
+        run_embedded_server_drop_cleanup(
+            &runtime,
+            &self.cancel_token,
+            &mut self.shutdown_handle,
+            &mut self.temp_dir,
+            Some(runtime_owner),
+        );
     }
 }
 
