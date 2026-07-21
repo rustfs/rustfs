@@ -42,7 +42,7 @@ e2e-reliability = { max-threads = 1 }
 
 # --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.overrides]]
-filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/))'
+filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the multipart crash-consistency scenarios (dist-2, backlog#1150):
@@ -99,7 +99,7 @@ retries = 2
 # QUARANTINE: OPEN backlog#937 — store::bucket::tests::bucket_delete_* race
 # make_bucket into InsufficientWriteQuorum via shared global state under load.
 [[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/)'
+filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(mark_delete|purge_removes|default_s3_delete)/)'
 test-group = 'ecstore-serial-flaky'
 retries = 2
 
