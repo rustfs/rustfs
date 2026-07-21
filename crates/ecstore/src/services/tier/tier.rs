@@ -2629,6 +2629,29 @@ impl TierConfigMgr {
         Ok(())
     }
 
+    pub(crate) async fn apply_prepared_mutation_intent_block(
+        handle: &Arc<RwLock<Self>>,
+        intent: &TierMutationIntent,
+    ) -> std::result::Result<(), AdminError> {
+        let manager = handle.read().await;
+        let runtime = tier_driver_runtime(handle, &manager);
+        let mut runtime = lock_unpoisoned(&runtime);
+        let mut prepared_mutation_blocks = runtime.prepared_mutation_blocks.clone();
+        Self::collect_prepared_mutation_intent_block(&mut prepared_mutation_blocks, intent)?;
+        runtime.prepared_mutation_blocks = prepared_mutation_blocks;
+        Ok(())
+    }
+
+    pub(crate) async fn clear_prepared_mutation_intent_block(handle: &Arc<RwLock<Self>>, mutation_id: uuid::Uuid) {
+        let manager = handle.read().await;
+        let Some(runtime) = registered_tier_driver_runtime(&manager) else {
+            return;
+        };
+        lock_unpoisoned(&runtime)
+            .prepared_mutation_blocks
+            .retain(|_, blocked_mutation_id| *blocked_mutation_id != mutation_id);
+    }
+
     fn collect_prepared_mutation_intent_block(
         prepared_mutation_blocks: &mut HashMap<String, uuid::Uuid>,
         intent: &TierMutationIntent,
