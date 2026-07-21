@@ -506,7 +506,7 @@ fn tier_mutation_proof_targets(
     current: &TierConfigMgr,
     candidate: &TierConfigMgr,
 ) -> HashSet<String> {
-    let mut targets = changed_tier_names(current, candidate);
+    let mut targets = HashSet::new();
     match kind {
         TierMutationIntentKind::Add | TierMutationIntentKind::Edit | TierMutationIntentKind::Remove => {
             if let Some(tier_name) = explicit_tier_name
