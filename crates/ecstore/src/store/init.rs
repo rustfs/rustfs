@@ -546,6 +546,10 @@ mod tests {
         services::tier::{
             test_util::{MockWarmBackend, TransitionCleanupStoreBarrier, register_mock_tier},
             tier::TierConfigMgr,
+            tier_mutation_intent::{
+                TierMutationIntent, TierMutationIntentKind, TierMutationIntentState, TierMutationIntentTarget,
+                delete_tier_mutation_intent_record, load_tier_mutation_intent_record, save_tier_mutation_intent_record,
+            },
             warm_backend::WarmBackend,
         },
         storage_api_contracts::{
@@ -1227,6 +1231,51 @@ mod tests {
         );
 
         shutdown_b.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_round_trips_through_config_store() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-record", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: "COLD-A".to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("tier mutation intent record should persist");
+        let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record should load");
+
+        assert_eq!(loaded, intent);
+
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record delete should be idempotent");
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record delete should tolerate missing records");
+        let err = load_tier_mutation_intent_record(store, mutation_id)
+            .await
+            .expect_err("deleted tier mutation intent record should not load");
+        assert!(matches!(err, Error::ConfigNotFound));
     }
 
     #[cfg(feature = "test-util")]
