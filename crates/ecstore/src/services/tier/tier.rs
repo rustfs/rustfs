@@ -56,6 +56,7 @@ use crate::services::tier::{
     warm_backend::{WarmBackend, check_warm_backend, new_warm_backend},
 };
 use crate::storage_api_contracts::{
+    namespace::NamespaceLocking,
     object::{
         DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, HTTPPreconditions, ObjectIO, ObjectOperations, ObjectToDelete,
     },
@@ -66,6 +67,7 @@ use crate::{
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     runtime::sources as runtime_sources,
+    set_disk::get_lock_acquire_timeout,
     store::ECStore,
 };
 use rustfs_filemeta::FileInfo;
@@ -75,6 +77,7 @@ use s3s::S3ErrorCode;
 
 use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
+    tier_mutation_intent::{TierMutationIntentKind, TierMutationIntentTarget},
     warm_backend::WarmBackendImpl,
 };
 
@@ -403,20 +406,56 @@ enum TierCandidateMutation {
 }
 
 impl TierCandidateMutation {
+    fn intent_kind(&self) -> TierMutationIntentKind {
+        match self {
+            Self::Add(_, _) => TierMutationIntentKind::Add,
+            Self::Edit(_, _) => TierMutationIntentKind::Edit,
+            Self::Remove(_, _) => TierMutationIntentKind::Remove,
+            Self::Clear(_) => TierMutationIntentKind::Clear,
+        }
+    }
+
+    fn explicit_tier_name(&self) -> Option<&str> {
+        match self {
+            Self::Add(config, _) => Some(&config.name),
+            Self::Edit(tier_name, _) | Self::Remove(tier_name, _) => Some(tier_name),
+            Self::Clear(_) => None,
+        }
+    }
+
     fn target_tiers(&self, manager: &TierConfigMgr, candidate: &TierConfigMgr) -> HashSet<String> {
         let mut targets = changed_tier_names(manager, candidate);
         match self {
             Self::Add(config, _) => {
                 targets.insert(config.name.clone());
             }
-            Self::Edit(tier_name, _) | Self::Remove(tier_name, _) => {
+            Self::Edit(tier_name, _) => {
                 targets.insert(tier_name.clone());
+            }
+            Self::Remove(tier_name, _) => {
+                if manager.tiers.contains_key(tier_name) || candidate.tiers.contains_key(tier_name) {
+                    targets.insert(tier_name.clone());
+                }
             }
             Self::Clear(_) => {
                 targets.extend(manager.tiers.keys().chain(candidate.tiers.keys()).cloned());
             }
         }
         targets
+    }
+
+    fn affected_targets(
+        &self,
+        manager: &TierConfigMgr,
+        candidate: &TierConfigMgr,
+    ) -> std::result::Result<Vec<TierMutationIntentTarget>, AdminError> {
+        let explicit_tier_name = self.explicit_tier_name();
+        build_tier_mutation_affected_targets(
+            self.intent_kind(),
+            tier_mutation_proof_targets(self.intent_kind(), explicit_tier_name, manager, candidate),
+            manager,
+            candidate,
+        )
     }
 
     async fn apply(self, candidate: &mut TierConfigMgr) -> std::result::Result<Option<String>, AdminError> {
@@ -440,6 +479,89 @@ impl TierCandidateMutation {
             }
         }
     }
+}
+
+fn tier_mutation_proof_targets(
+    kind: TierMutationIntentKind,
+    explicit_tier_name: Option<&str>,
+    current: &TierConfigMgr,
+    candidate: &TierConfigMgr,
+) -> HashSet<String> {
+    let mut targets = changed_tier_names(current, candidate);
+    match kind {
+        TierMutationIntentKind::Add | TierMutationIntentKind::Edit | TierMutationIntentKind::Remove => {
+            if let Some(tier_name) = explicit_tier_name
+                && (current.tiers.contains_key(tier_name) || candidate.tiers.contains_key(tier_name))
+            {
+                targets.insert(tier_name.to_string());
+            }
+        }
+        TierMutationIntentKind::Clear => {
+            targets.extend(current.tiers.keys().chain(candidate.tiers.keys()).cloned());
+        }
+    }
+    targets
+}
+
+fn build_tier_mutation_affected_targets(
+    kind: TierMutationIntentKind,
+    target_tiers: HashSet<String>,
+    current: &TierConfigMgr,
+    candidate: &TierConfigMgr,
+) -> std::result::Result<Vec<TierMutationIntentTarget>, AdminError> {
+    let mut targets = target_tiers.into_iter().collect::<Vec<_>>();
+    targets.sort();
+    let mut out = Vec::with_capacity(targets.len());
+    for tier_name in targets {
+        let old_backend_identity = current
+            .tiers
+            .get(&tier_name)
+            .map(tier_backend_identity)
+            .transpose()
+            .map_err(tier_backend_identity_admin_error)?;
+        let new_backend_identity = candidate
+            .tiers
+            .get(&tier_name)
+            .map(tier_backend_identity)
+            .transpose()
+            .map_err(tier_backend_identity_admin_error)?;
+        if old_backend_identity.is_none() && new_backend_identity.is_none() {
+            continue;
+        }
+        let target = TierMutationIntentTarget {
+            tier_name,
+            old_backend_identity,
+            new_backend_identity,
+        };
+        validate_tier_mutation_target_shape(kind, &target)?;
+        out.push(target);
+    }
+    Ok(out)
+}
+
+fn validate_tier_mutation_target_shape(
+    kind: TierMutationIntentKind,
+    target: &TierMutationIntentTarget,
+) -> std::result::Result<(), AdminError> {
+    let valid = match kind {
+        TierMutationIntentKind::Add => target.old_backend_identity.is_none() && target.new_backend_identity.is_some(),
+        TierMutationIntentKind::Edit => target.old_backend_identity.is_some() && target.new_backend_identity.is_some(),
+        TierMutationIntentKind::Remove | TierMutationIntentKind::Clear => {
+            target.old_backend_identity.is_some() && target.new_backend_identity.is_none()
+        }
+    };
+    if valid {
+        return Ok(());
+    }
+    let mut err = ERR_TIER_INVALID_CONFIG.clone();
+    err.message = "Remote tier mutation target identity proof does not match mutation kind".to_string();
+    Err(err)
+}
+
+fn tier_backend_identity_admin_error(err: io::Error) -> AdminError {
+    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+    admin_err.message = err.to_string();
+    admin_err
 }
 
 async fn apply_tier_candidate_mutation(
@@ -981,6 +1103,10 @@ struct ExternalTierCompatible {
 
 fn tier_config_path(file: &str) -> String {
     format!("{}{}{}", CONFIG_PREFIX, SLASH_SEPARATOR, file)
+}
+
+fn tier_config_lock_path() -> String {
+    format!("{}.lock", tier_config_path(TIER_CONFIG_FILE))
 }
 
 fn tier_hint_for_type(tier_type: TierType) -> Option<&'static str> {
@@ -1977,6 +2103,39 @@ impl TierConfigMgr {
         update_lock.lock_owned().await
     }
 
+    async fn acquire_tier_config_write_lock<S>(
+        api: Arc<S>,
+    ) -> std::result::Result<rustfs_lock::NamespaceLockGuard, TierConfigUpdateError>
+    where
+        S: NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + 'static,
+    {
+        let config_file = tier_config_lock_path();
+        let ns_lock = api
+            .new_ns_lock(RUSTFS_META_BUCKET, &config_file)
+            .await
+            .map_err(|err| TierConfigUpdateError::Load(io::Error::other(err)))?;
+        ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|err| TierConfigUpdateError::Load(io::Error::other(err)))
+    }
+
+    async fn update_candidate_with_config_lock<S>(
+        handle: &Arc<RwLock<Self>>,
+        api: Arc<S>,
+        mutation: TierCandidateMutation,
+    ) -> std::result::Result<(), TierConfigUpdateError>
+    where
+        S: EcstoreObjectIO + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + 'static,
+    {
+        let config_lock = Self::acquire_tier_config_write_lock(api.clone()).await?;
+        let update = Self::admin_update_lock(handle).await;
+        let (candidate, version) = load_tier_config_for_update(api.clone())
+            .await
+            .map_err(TierConfigUpdateError::Load)?;
+        Self::update_candidate_owned(handle, api, candidate, version, mutation, update, Some(config_lock)).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn publish_candidate(
         handle: &Arc<RwLock<Self>>,
@@ -2205,6 +2364,7 @@ impl TierConfigMgr {
         version: Option<String>,
         mutation: TierCandidateMutation,
         update: tokio::sync::OwnedMutexGuard<()>,
+        config_lock: Option<rustfs_lock::NamespaceLockGuard>,
     ) -> std::result::Result<(), TierConfigUpdateError>
     where
         S: EcstoreObjectIO + 'static,
@@ -2212,7 +2372,19 @@ impl TierConfigMgr {
         let handle = handle.clone();
         tokio::spawn(async move {
             match AssertUnwindSafe(async move {
+                let _config_lock = config_lock;
                 let _update = update;
+                let mutation_kind = mutation.intent_kind();
+                let explicit_tier_name = mutation.explicit_tier_name().map(str::to_string);
+                let current_for_targets = TierConfigMgr {
+                    driver_cache: HashMap::new(),
+                    tiers: candidate
+                        .tiers
+                        .iter()
+                        .map(|(tier_name, config)| (tier_name.clone(), config.clone_with_credentials()))
+                        .collect(),
+                    last_refreshed_at: candidate.last_refreshed_at,
+                };
                 let transition = {
                     let mut manager = handle.write().await;
                     let target_tiers = mutation.target_tiers(&manager, &candidate);
@@ -2226,6 +2398,11 @@ impl TierConfigMgr {
                     apply_tier_candidate_mutation(mutation, &mut candidate, Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT)
                         .await
                         .map_err(TierConfigUpdateError::Mutation)?;
+                let proof_targets =
+                    tier_mutation_proof_targets(mutation_kind, explicit_tier_name.as_deref(), &current_for_targets, &candidate);
+                let _affected_targets =
+                    build_tier_mutation_affected_targets(mutation_kind, proof_targets, &current_for_targets, &candidate)
+                        .map_err(TierConfigUpdateError::Publish)?;
                 candidate
                     .save_tiering_config_if_current(api, version.as_deref())
                     .await
@@ -2268,12 +2445,7 @@ impl TierConfigMgr {
         tier_config: TierConfig,
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        let update = Self::admin_update_lock(handle).await;
-        let (candidate, version) = load_tier_config_for_update(api.clone())
-            .await
-            .map_err(TierConfigUpdateError::Load)?;
-        Self::update_candidate_owned(handle, api, candidate, version, TierCandidateMutation::Add(tier_config, force), update)
-            .await
+        Self::update_candidate_with_config_lock(handle, api, TierCandidateMutation::Add(tier_config, force)).await
     }
 
     pub async fn edit_and_save(
@@ -2282,19 +2454,8 @@ impl TierConfigMgr {
         tier_name: &str,
         credentials: TierCreds,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        let update = Self::admin_update_lock(handle).await;
-        let (candidate, version) = load_tier_config_for_update(api.clone())
+        Self::update_candidate_with_config_lock(handle, api, TierCandidateMutation::Edit(tier_name.to_string(), credentials))
             .await
-            .map_err(TierConfigUpdateError::Load)?;
-        Self::update_candidate_owned(
-            handle,
-            api,
-            candidate,
-            version,
-            TierCandidateMutation::Edit(tier_name.to_string(), credentials),
-            update,
-        )
-        .await
     }
 
     pub async fn remove_and_save(
@@ -2303,7 +2464,7 @@ impl TierConfigMgr {
         tier_name: &str,
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        Self::remove_and_save_with(handle, api, tier_name, force).await
+        Self::update_candidate_with_config_lock(handle, api, TierCandidateMutation::Remove(tier_name.to_string(), force)).await
     }
 
     async fn remove_and_save_with<S>(
@@ -2326,6 +2487,7 @@ impl TierConfigMgr {
             version,
             TierCandidateMutation::Remove(tier_name.to_string(), force),
             update,
+            None,
         )
         .await
     }
@@ -2335,7 +2497,7 @@ impl TierConfigMgr {
         api: Arc<ECStore>,
         force: bool,
     ) -> std::result::Result<(), TierConfigUpdateError> {
-        Self::clear_and_save_with(handle, api, force).await
+        Self::update_candidate_with_config_lock(handle, api, TierCandidateMutation::Clear(force)).await
     }
 
     async fn clear_and_save_with<S>(
@@ -2350,7 +2512,7 @@ impl TierConfigMgr {
         let (candidate, version) = load_tier_config_for_update(api.clone())
             .await
             .map_err(TierConfigUpdateError::Load)?;
-        Self::update_candidate_owned(handle, api, candidate, version, TierCandidateMutation::Clear(force), update).await
+        Self::update_candidate_owned(handle, api, candidate, version, TierCandidateMutation::Clear(force), update, None).await
     }
 
     pub async fn verify_without_manager_lock(handle: &Arc<RwLock<Self>>, tier_name: &str) -> std::result::Result<(), io::Error> {
@@ -3482,6 +3644,154 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[derive(Debug)]
+    struct LockingTierConfigStore {
+        locks: Mutex<Vec<(String, String)>>,
+        put_after_lock: AtomicBool,
+        lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+    }
+
+    impl LockingTierConfigStore {
+        fn new() -> Self {
+            Self {
+                locks: Mutex::new(Vec::new()),
+                put_after_lock: AtomicBool::new(false),
+                lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
+            }
+        }
+
+        fn lock_events(&self) -> Vec<(String, String)> {
+            self.locks
+                .lock()
+                .expect("tier config lock recorder should not poison")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for LockingTierConfigStore {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: HeaderMap,
+            _opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            Err(Error::ObjectNotFound(bucket.to_string(), object.to_string()))
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            _data: &mut PutObjReader,
+            opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            let expected_lock = (RUSTFS_META_BUCKET.to_string(), tier_config_lock_path());
+            let saw_expected_lock = self
+                .locks
+                .lock()
+                .expect("tier config lock recorder should not poison")
+                .contains(&expected_lock);
+            self.put_after_lock.store(saw_expected_lock, Ordering::SeqCst);
+            assert!(opts.max_parity, "tier config save must retain max parity");
+            assert!(
+                opts.http_preconditions
+                    .as_ref()
+                    .and_then(|preconditions| preconditions.if_none_match.as_deref())
+                    == Some("*"),
+                "initial tier config save must retain if-none-match protection"
+            );
+            Ok(ObjectInfo {
+                bucket: bucket.to_string(),
+                name: object.to_string(),
+                etag: Some("saved-etag".to_string()),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NamespaceLocking for LockingTierConfigStore {
+        type Error = Error;
+        type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
+
+        async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<rustfs_lock::NamespaceLockWrapper> {
+            self.locks
+                .lock()
+                .expect("tier config lock recorder should not poison")
+                .push((bucket.to_string(), object.to_string()));
+            Ok(rustfs_lock::NamespaceLockWrapper::new(
+                rustfs_lock::NamespaceLock::with_local_manager("tier-config-test".to_string(), self.lock_manager.clone()),
+                rustfs_lock::ObjectKey {
+                    bucket: Arc::from(bucket),
+                    object: Arc::from(object),
+                    version: None,
+                },
+                "tier-config-test-owner".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_config_update_path_acquires_meta_namespace_sidecar_lock_before_save() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(LockingTierConfigStore::new());
+
+        TierConfigMgr::update_candidate_with_config_lock(&manager, store.clone(), TierCandidateMutation::Clear(true))
+            .await
+            .expect("empty clear should still acquire and save through the coordinator lock");
+
+        assert_eq!(store.lock_events(), vec![(RUSTFS_META_BUCKET.to_string(), tier_config_lock_path())]);
+        assert!(
+            store.put_after_lock.load(Ordering::SeqCst),
+            "tier config save must happen after the coordinator namespace lock is acquired"
+        );
+    }
+
+    #[test]
+    fn tier_mutation_targets_prove_remove_and_rebind_authoritative_identity() {
+        let mut current = empty_mgr();
+        current.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+
+        let mut rebound = empty_mgr();
+        let mut replacement = build_rustfs_tier("COLD-A");
+        replacement.rustfs.as_mut().expect("replacement payload should exist").prefix = "new-prefix".to_string();
+        rebound.tiers.insert("COLD-A".to_string(), replacement);
+
+        let edit_targets = TierCandidateMutation::Edit("COLD-A".to_string(), TierCreds::default())
+            .affected_targets(&current, &rebound)
+            .expect("rebind target proof should build");
+        assert_eq!(edit_targets.len(), 1);
+        assert_eq!(edit_targets[0].tier_name, "COLD-A");
+        assert!(edit_targets[0].old_backend_identity.is_some());
+        assert!(edit_targets[0].new_backend_identity.is_some());
+        assert_ne!(edit_targets[0].old_backend_identity, edit_targets[0].new_backend_identity);
+
+        let removed = empty_mgr();
+        let remove_targets = TierCandidateMutation::Remove("COLD-A".to_string(), true)
+            .affected_targets(&current, &removed)
+            .expect("remove target proof should build");
+        assert_eq!(remove_targets.len(), 1);
+        assert_eq!(remove_targets[0].tier_name, "COLD-A");
+        assert!(remove_targets[0].old_backend_identity.is_some());
+        assert!(remove_targets[0].new_backend_identity.is_none());
+
+        let noop_targets = TierCandidateMutation::Remove("MISSING".to_string(), true)
+            .affected_targets(&current, &current)
+            .expect("idempotent remove of a missing tier should not require an identity proof");
+        assert!(noop_targets.is_empty());
     }
 
     /// A fully offline `WarmBackend` used to exercise the driver-facing
@@ -5324,11 +5634,25 @@ mod tests {
         assert!(lock_unpoisoned(&runtime).generations.get("COLD-A").is_none());
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct CasConfigStore {
         state: tokio::sync::Mutex<Option<(Vec<u8>, String)>>,
         next_etag: AtomicUsize,
         fail_put: AtomicBool,
+        lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+        lock_requests: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Default for CasConfigStore {
+        fn default() -> Self {
+            Self {
+                state: tokio::sync::Mutex::new(None),
+                next_etag: AtomicUsize::new(0),
+                fail_put: AtomicBool::new(false),
+                lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
+                lock_requests: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -5408,6 +5732,26 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl NamespaceLocking for CasConfigStore {
+        type Error = Error;
+        type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
+
+        async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<Self::NamespaceLock> {
+            self.lock_requests
+                .lock()
+                .expect("tier config lock request log should not poison")
+                .push((bucket.to_string(), object.to_string()));
+            let lock =
+                rustfs_lock::NamespaceLock::with_local_manager("tier-config-update-test".to_string(), self.lock_manager.clone());
+            Ok(rustfs_lock::NamespaceLockWrapper::new(
+                lock,
+                rustfs_lock::ObjectKey::new(bucket.to_string(), object.to_string()),
+                "tier-config-update-test-owner".to_string(),
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn remove_and_clear_full_update_paths_preserve_force() {
         let remove_store = Arc::new(CasConfigStore::default());
@@ -5462,6 +5806,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_target_proof_uses_persisted_config_snapshot_not_stale_manager() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        candidate.tiers.insert("COLD-B".to_string(), build_rustfs_tier("COLD-B"));
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
+
+        TierConfigMgr::update_candidate_owned(
+            &manager,
+            store.clone(),
+            candidate,
+            None,
+            TierCandidateMutation::Remove("COLD-A".to_string(), true),
+            update,
+            None,
+        )
+        .await
+        .expect("authoritative proof should use the loaded config even when the local manager is stale");
+        assert!(!manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(manager.read().await.tiers.contains_key("COLD-B"));
+        let reloaded = load_tier_config_for_update(store)
+            .await
+            .expect("removed config should reload")
+            .0;
+        assert!(!reloaded.tiers.contains_key("COLD-A"));
+        assert!(reloaded.tiers.contains_key("COLD-B"));
+    }
+
+    #[test]
+    fn add_target_proof_ignores_unchanged_persisted_tiers_when_manager_is_stale() {
+        let mut current = empty_mgr();
+        current.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        candidate.tiers.insert("COLD-B".to_string(), build_rustfs_tier("COLD-B"));
+
+        let targets = TierCandidateMutation::Add(build_rustfs_tier("COLD-B"), true)
+            .affected_targets(&current, &candidate)
+            .expect("add proof should ignore unchanged durable tiers");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].tier_name, "COLD-B");
+        assert!(targets[0].old_backend_identity.is_none());
+        assert!(targets[0].new_backend_identity.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_with_config_lock_add_uses_loaded_snapshot_for_target_proof() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("add fixture should persist");
+
+        TierConfigMgr::update_candidate_with_config_lock(
+            &manager,
+            store.clone(),
+            TierCandidateMutation::Add(build_rustfs_tier("COLD-B"), true),
+        )
+        .await
+        .expect("add proof must ignore unchanged durable tiers missing from the stale manager");
+
+        let reloaded = load_tier_config_for_update(store)
+            .await
+            .expect("updated config should reload")
+            .0;
+        assert!(reloaded.tiers.contains_key("COLD-A"));
+        assert!(reloaded.tiers.contains_key("COLD-B"));
+    }
+
+    #[tokio::test]
     async fn failed_owned_update_restores_generation_and_reports_save_error() {
         let manager = TierConfigMgr::new();
         {
@@ -5484,6 +5903,7 @@ mod tests {
             None,
             TierCandidateMutation::Remove("COLD-A".to_string(), true),
             update,
+            None,
         )
         .await
         .expect_err("save failure must be observable to the admin caller");
@@ -5513,6 +5933,7 @@ mod tests {
             None,
             TierCandidateMutation::Remove("COLD-A".to_string(), true),
             update,
+            None,
         )
         .await
         .expect("a later update must succeed after save failure recovery");
@@ -5546,6 +5967,7 @@ mod tests {
                 None,
                 TierCandidateMutation::Remove("COLD-A".to_string(), true),
                 update,
+                None,
             )
             .await
         });
@@ -5573,6 +5995,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_write_lock_survives_cancelled_wrapped_update_until_detached_publish_finishes() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let old = TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("old generation lease should be available");
+        let store = Arc::new(CasConfigStore::default());
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let update_manager = manager.clone();
+        let update_store = store.clone();
+        let caller = tokio::spawn(async move {
+            TierConfigMgr::update_candidate_with_config_lock(
+                &update_manager,
+                update_store,
+                TierCandidateMutation::Remove("COLD-A".to_string(), true),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old.is_current(&manager).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned update should revoke before caller cancellation");
+        caller.abort();
+
+        let config_file = tier_config_lock_path();
+        let competing_lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &config_file)
+            .await
+            .expect("competing tier config lock should be created");
+        let err = competing_lock
+            .get_write_lock(Duration::from_millis(20))
+            .await
+            .expect_err("detached update must keep the config write lock until it finishes");
+        assert!(matches!(err, rustfs_lock::LockError::Timeout { .. }));
+
+        drop(old);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.read().await.tiers.contains_key("COLD-A") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached update must finish after its operation lease drains");
+        competing_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("tier config lock should release after detached update finishes");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tier_config_update_waits_for_config_namespace_lock_before_loading() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        let config_file = tier_config_lock_path();
+        let outer_lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &config_file)
+            .await
+            .expect("outer tier config lock should be created");
+        let _outer_guard = outer_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer tier config lock should be acquired");
+
+        let result = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            TierConfigMgr::update_candidate_with_config_lock(&manager, store.clone(), TierCandidateMutation::Clear(true)).await
+        })
+        .await;
+        let TierConfigUpdateError::Load(err) = result.expect_err("config mutation must wait behind the config namespace lock")
+        else {
+            panic!("config lock contention should fail before candidate load or mutation");
+        };
+        let rendered = err.to_string();
+        assert!(rendered.to_ascii_lowercase().contains("timeout"), "{rendered}");
+        assert!(rendered.contains(&config_file), "{rendered}");
+        assert_eq!(
+            store
+                .lock_requests
+                .lock()
+                .expect("tier config lock request log should not poison")
+                .as_slice(),
+            &[
+                (RUSTFS_META_BUCKET.to_string(), config_file.clone()),
+                (RUSTFS_META_BUCKET.to_string(), config_file),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn panicked_owned_update_restores_generation_and_reports_error() {
         let manager = TierConfigMgr::new();
         {
@@ -5594,6 +6116,7 @@ mod tests {
             None,
             TierCandidateMutation::Remove("COLD-A".to_string(), false),
             update,
+            None,
         )
         .await
         .expect_err("mutation panic must be observable to the admin caller");
