@@ -81,6 +81,11 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
+const LIST_MERGED_INPUT_BUFFER: usize = 1;
+
+fn list_merged_entry_channel() -> (Sender<MetaCacheEntry>, Receiver<MetaCacheEntry>) {
+    mpsc::channel(LIST_MERGED_INPUT_BUFFER)
+}
 
 fn normalize_max_keys(max_keys: i32) -> i32 {
     max_keys.min(MAX_OBJECT_LIST)
@@ -4168,7 +4173,7 @@ impl ECStore {
 
         for sets in self.pools.iter() {
             for set in sets.disk_set.iter() {
-                let (send, recv) = mpsc::channel(100);
+                let (send, recv) = list_merged_entry_channel();
 
                 inputs.push(recv);
                 let opts = opts.clone();
@@ -5423,7 +5428,7 @@ impl Sets {
         let mut inputs = Vec::new();
 
         for set in &self.disk_set {
-            let (send, recv) = mpsc::channel(100);
+            let (send, recv) = list_merged_entry_channel();
             inputs.push(recv);
             let opts = opts.clone();
             let rx_clone = rx.clone();
@@ -6687,14 +6692,14 @@ mod test {
         VerifiedIndexCandidateStats, VersionMarker, current_list_objects_mutation_sequence,
         encode_persistent_list_metadata_object, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
         fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
-        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_marker_key, list_metadata_resolution_params,
-        list_objects_from_metadata_snapshot_candidates, list_objects_from_verified_index_candidates,
-        list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
-        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
-        list_objects_key_only_provider_health, list_objects_metadata_fast_guardrails_from_env, list_objects_paginate,
-        list_objects_quorum_from_env, list_quorum_from_env, load_namespace_mutation_journal_state,
-        load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
-        namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
+        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_marker_key, list_merged_entry_channel,
+        list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
+        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
+        list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
+        list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
+        list_objects_metadata_fast_guardrails_from_env, list_objects_paginate, list_objects_quorum_from_env,
+        list_quorum_from_env, load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one,
+        merge_entry_channels, namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
         namespace_mutation_journal_chaos_enabled_from_env, namespace_mutation_journal_chaos_sequence_from_env,
         namespace_mutation_journal_chaos_status_from_env, normalize_list_quorum, observe_list_objects_mutations_with_store,
         parse_namespace_mutation_journal_state, parse_persistent_key_only_index, parse_persistent_list_metadata_object,
@@ -6836,6 +6841,22 @@ mod test {
             name: name.to_owned(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn list_merged_entry_channel_backpressures_after_one_head() {
+        let (tx, mut rx) = list_merged_entry_channel();
+        tx.try_send(test_meta_entry("object-a"))
+            .expect("first merge head should fit in the input buffer");
+
+        match tx.try_send(test_meta_entry("object-b")) {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(entry)) => assert_eq!(entry.name, "object-b"),
+            other => panic!("second merge head should wait for the k-way merge refill, got {other:?}"),
+        }
+
+        assert_eq!(rx.recv().await.expect("first merge head should remain available").name, "object-a");
+        tx.try_send(test_meta_entry("object-b"))
+            .expect("input buffer should accept the next head after refill");
     }
 
     fn test_live_object_info(name: &str, etag: &str) -> ObjectInfo {
