@@ -513,7 +513,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
-    use rustfs_storage_api::CapabilityState;
+    use crate::storage_api_contracts::topology::CapabilityState;
 
     #[test]
     fn topology_snapshot_maps_endpoint_sets_without_local_paths() {
