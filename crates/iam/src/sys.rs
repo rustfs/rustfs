@@ -456,7 +456,7 @@ impl<T: Store> IamSys<T> {
         }
 
         if parent_user == opts.access_key {
-            return Err(IamError::IAMActionNotAllowed);
+            return Err(IamError::AccessKeyAlreadyExists);
         }
 
         if opts.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT && !opts.allow_site_replicator_account {
@@ -1684,6 +1684,80 @@ mod tests {
         if crate::root_credentials::credentials().is_none() {
             let _ = init_global_action_credentials(Some("TESTROOTACCESSKEY".to_string()), Some("TESTROOTSECRET123".to_string()));
         }
+    }
+
+    async fn test_iam_sys() -> IamSys<StsTestMockStore> {
+        let store = StsTestMockStore::new(false);
+        let cache = IamCache::new(store).await.expect("IAM cache should initialize");
+        IamSys::new(cache)
+    }
+
+    fn service_account_opts(access_key: &str, secret_key: &str) -> NewServiceAccountOpts {
+        NewServiceAccountOpts {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn new_service_account_rejects_parent_access_key() {
+        ensure_test_global_credentials();
+
+        let iam_sys = test_iam_sys().await;
+        let access_key = "PARENTACCESSKEY123";
+
+        let err = iam_sys
+            .new_service_account(access_key, None, service_account_opts(access_key, "parentAccessKeySecret123"))
+            .await
+            .expect_err("a service account must not reuse its parent access key");
+
+        assert_eq!(err, Error::AccessKeyAlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn duplicate_service_account_returns_access_key_already_exists() {
+        ensure_test_global_credentials();
+
+        let iam_sys = test_iam_sys().await;
+        let access_key = "DUPLICATESERVICEKEY1";
+
+        iam_sys
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "firstServiceSecret123"))
+            .await
+            .expect("initial service account should be created");
+
+        let err = iam_sys
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "secondServiceSecret123"))
+            .await
+            .expect_err("duplicate service account should fail");
+
+        assert_eq!(err, Error::AccessKeyAlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn user_creation_rejects_service_account_access_key() {
+        ensure_test_global_credentials();
+
+        let iam_sys = test_iam_sys().await;
+        let access_key = "SERVICEACCOUNTKEY123";
+
+        iam_sys
+            .new_service_account("svc-parent-user", None, service_account_opts(access_key, "serviceAccountSecret123"))
+            .await
+            .expect("service account should be created");
+
+        let user = AddOrUpdateUserReq {
+            secret_key: "regularUserSecret123".to_string(),
+            policy: None,
+            status: rustfs_madmin::AccountStatus::Enabled,
+        };
+        let err = iam_sys
+            .create_user(access_key, &user)
+            .await
+            .expect_err("user creation must reject a service-account access key");
+
+        assert_eq!(err, Error::AccessKeyAlreadyExists);
     }
 
     #[tokio::test]
