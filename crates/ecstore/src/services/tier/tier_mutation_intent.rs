@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::config::com;
+use crate::disk::RUSTFS_META_BUCKET;
+use crate::error::{Error, Result as EcstoreResult};
 use crate::services::tier::tier::TierDestinationId;
+use crate::storage_api_contracts::list::ListOperations as _;
+use crate::store::ECStore;
 
 pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-intent-v1";
 pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = 64 * 1024;
+pub(crate) const TIER_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/records";
 pub(crate) type TierMutationDigest = [u8; 32];
 
 pub(crate) type Result<T> = std::result::Result<T, TierMutationIntentError>;
@@ -100,6 +108,15 @@ pub(crate) struct TierMutationIntent {
     pub candidate_digest: TierMutationDigest,
     pub affected_targets: Vec<TierMutationIntentTarget>,
     pub expires_at_unix_nanos: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TierMutationIntentRecordScan {
+    pub intents: Vec<TierMutationIntent>,
+    pub scanned: usize,
+    pub failed: usize,
+    pub next_marker: Option<String>,
+    pub truncated: bool,
 }
 
 impl TierMutationIntent {
@@ -236,6 +253,127 @@ impl TierMutationIntent {
         persisted.intent.validate()?;
         Ok(persisted.intent)
     }
+}
+
+pub(crate) fn tier_mutation_intent_record_object_name(mutation_id: Uuid) -> Result<String> {
+    if mutation_id.is_nil() {
+        return Err(TierMutationIntentError::Corrupt("mutation_id is nil"));
+    }
+    let mutation_key = mutation_id.simple().to_string();
+    Ok(format!(
+        "{}/{}/{}/{}.json",
+        TIER_MUTATION_INTENT_RECORD_PREFIX,
+        &mutation_key[..2],
+        &mutation_key[2..4],
+        mutation_key
+    ))
+}
+
+pub(crate) fn tier_mutation_intent_id_from_record_object_name(object: &str) -> Result<Uuid> {
+    let prefix = format!("{TIER_MUTATION_INTENT_RECORD_PREFIX}/");
+    let suffix = object
+        .strip_prefix(&prefix)
+        .ok_or(TierMutationIntentError::Corrupt("intent record path has wrong prefix"))?;
+    let mut parts = suffix.split('/');
+    let shard_a = parts
+        .next()
+        .ok_or(TierMutationIntentError::Corrupt("intent record path is incomplete"))?;
+    let shard_b = parts
+        .next()
+        .ok_or(TierMutationIntentError::Corrupt("intent record path is incomplete"))?;
+    let file_name = parts
+        .next()
+        .ok_or(TierMutationIntentError::Corrupt("intent record path is incomplete"))?;
+    if parts.next().is_some() {
+        return Err(TierMutationIntentError::Corrupt("intent record path is not canonical"));
+    }
+    let mutation_key = file_name
+        .strip_suffix(".json")
+        .ok_or(TierMutationIntentError::Corrupt("intent record path has wrong suffix"))?;
+    if mutation_key.len() != 32
+        || !mutation_key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TierMutationIntentError::Corrupt("intent record path has invalid mutation id"));
+    }
+    if shard_a != &mutation_key[..2] || shard_b != &mutation_key[2..4] {
+        return Err(TierMutationIntentError::Corrupt("intent record path shard does not match mutation id"));
+    }
+    Uuid::parse_str(mutation_key).map_err(|_| TierMutationIntentError::Corrupt("intent record path has invalid uuid"))
+}
+
+pub(crate) async fn save_tier_mutation_intent_record(api: Arc<ECStore>, intent: &TierMutationIntent) -> EcstoreResult<()> {
+    let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
+    let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
+    com::save_config(api, &object, data).await
+}
+
+pub(crate) async fn load_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<TierMutationIntent> {
+    let object = tier_mutation_intent_record_object_name(mutation_id).map_err(tier_mutation_intent_store_error)?;
+    let data = com::read_config(api, &object).await?;
+    TierMutationIntent::decode(mutation_id, &data).map_err(tier_mutation_intent_store_error)
+}
+
+pub(crate) async fn delete_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<()> {
+    let object = tier_mutation_intent_record_object_name(mutation_id).map_err(tier_mutation_intent_store_error)?;
+    match com::delete_config(api, &object).await {
+        Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) async fn list_tier_mutation_intent_records(
+    api: Arc<ECStore>,
+    limit: usize,
+    marker: Option<String>,
+) -> EcstoreResult<TierMutationIntentRecordScan> {
+    if limit == 0 {
+        return Err(Error::other("tier mutation intent scan limit must be greater than zero"));
+    }
+
+    let list = api
+        .clone()
+        .list_objects_v2(
+            RUSTFS_META_BUCKET,
+            TIER_MUTATION_INTENT_RECORD_PREFIX,
+            marker,
+            None,
+            i32::try_from(limit).map_or(i32::MAX, |value| value),
+            false,
+            None,
+            false,
+        )
+        .await?;
+    let mut scan = TierMutationIntentRecordScan {
+        intents: Vec::with_capacity(list.objects.len()),
+        scanned: 0,
+        failed: 0,
+        next_marker: list.next_continuation_token,
+        truncated: list.is_truncated,
+    };
+
+    for object in list.objects {
+        scan.scanned += 1;
+        let mutation_id = match tier_mutation_intent_id_from_record_object_name(&object.name) {
+            Ok(mutation_id) => mutation_id,
+            Err(_) => {
+                scan.failed += 1;
+                continue;
+            }
+        };
+        match load_tier_mutation_intent_record(api.clone(), mutation_id).await {
+            Ok(intent) => scan.intents.push(intent),
+            Err(Error::ConfigNotFound) => {}
+            Err(_) => scan.failed += 1,
+        }
+    }
+
+    Ok(scan)
+}
+
+fn tier_mutation_intent_store_error(err: TierMutationIntentError) -> Error {
+    Error::other(err)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +520,65 @@ mod tests {
 
         assert_eq!(decoded.old_config_etag, None);
         assert_eq!(decoded.kind, TierMutationIntentKind::Add);
+    }
+
+    #[test]
+    fn intent_record_object_name_is_canonical_and_reversible() {
+        let mutation_id = Uuid::parse_str("12345678-1234-5678-9abc-def012345678").expect("test uuid should parse");
+
+        let object = tier_mutation_intent_record_object_name(mutation_id).expect("record object should build");
+        let parsed = tier_mutation_intent_id_from_record_object_name(&object).expect("record object should parse");
+
+        assert_eq!(object, "tier/mutation-intents/records/12/34/12345678123456789abcdef012345678.json");
+        assert_eq!(parsed, mutation_id);
+    }
+
+    #[test]
+    fn intent_record_object_name_rejects_nil_and_malformed_paths() {
+        assert!(matches!(
+            tier_mutation_intent_record_object_name(Uuid::nil()),
+            Err(TierMutationIntentError::Corrupt("mutation_id is nil"))
+        ));
+        assert!(matches!(
+            tier_mutation_intent_id_from_record_object_name("tier/mutation-intents/records/12/34/not-a-uuid.json"),
+            Err(TierMutationIntentError::Corrupt("intent record path has invalid mutation id"))
+        ));
+        assert!(matches!(
+            tier_mutation_intent_id_from_record_object_name(
+                "tier/mutation-intents/records/12/34/12345678123456789abcdef012345678"
+            ),
+            Err(TierMutationIntentError::Corrupt("intent record path has wrong suffix"))
+        ));
+        assert!(matches!(
+            tier_mutation_intent_id_from_record_object_name(
+                "tier/mutation-intents/records/12/35/12345678123456789abcdef012345678.json"
+            ),
+            Err(TierMutationIntentError::Corrupt("intent record path shard does not match mutation id"))
+        ));
+        assert!(matches!(
+            tier_mutation_intent_id_from_record_object_name(
+                "tier/mutation-intents/records/12/34/12345678123456789abcdef012345678/extra.json"
+            ),
+            Err(TierMutationIntentError::Corrupt("intent record path is not canonical"))
+        ));
+        assert!(matches!(
+            tier_mutation_intent_id_from_record_object_name(
+                "tier/mutation-intents/records/12/34/12345678123456789ABCDEF012345678.json"
+            ),
+            Err(TierMutationIntentError::Corrupt("intent record path has invalid mutation id"))
+        ));
+    }
+
+    #[test]
+    fn intent_decode_rejects_record_key_mismatch() {
+        let intent = prepared_intent();
+        let encoded = intent.encode().expect("intent should encode");
+        let wrong_id = Uuid::new_v4();
+
+        assert!(matches!(
+            TierMutationIntent::decode(wrong_id, &encoded),
+            Err(TierMutationIntentError::Corrupt("mutation_id does not match intent key"))
+        ));
     }
 
     #[test]

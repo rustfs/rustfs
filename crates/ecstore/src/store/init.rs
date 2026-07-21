@@ -541,11 +541,17 @@ mod tests {
             },
         },
         client::transition_api::ReaderImpl,
+        config::com,
         disk::RUSTFS_META_BUCKET,
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
             test_util::{MockWarmBackend, TransitionCleanupStoreBarrier, register_mock_tier},
             tier::TierConfigMgr,
+            tier_mutation_intent::{
+                TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
+                TierMutationIntentTarget, delete_tier_mutation_intent_record, list_tier_mutation_intent_records,
+                load_tier_mutation_intent_record, save_tier_mutation_intent_record,
+            },
             warm_backend::WarmBackend,
         },
         storage_api_contracts::{
@@ -1227,6 +1233,111 @@ mod tests {
         );
 
         shutdown_b.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_round_trips_through_config_store() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-record", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: "COLD-A".to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("tier mutation intent record should persist");
+        let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record should load");
+
+        assert_eq!(loaded, intent);
+
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record delete should be idempotent");
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record delete should tolerate missing records");
+        let err = load_tier_mutation_intent_record(store, mutation_id)
+            .await
+            .expect_err("deleted tier mutation intent record should not load");
+        assert!(matches!(err, Error::ConfigNotFound));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_scan_retains_good_records_and_counts_bad_records() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan", &[4])).await;
+        let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: tier_name.to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        let first_id = uuid::Uuid::parse_str("12345678-1234-5678-9abc-def012345678").expect("first uuid should parse");
+        let second_id = uuid::Uuid::parse_str("22345678-1234-5678-9abc-def012345678").expect("second uuid should parse");
+        let first = build_intent(first_id, "COLD-A");
+        let second = build_intent(second_id, "COLD-B");
+        save_tier_mutation_intent_record(store.clone(), &first)
+            .await
+            .expect("first tier mutation intent record should persist");
+        save_tier_mutation_intent_record(store.clone(), &second)
+            .await
+            .expect("second tier mutation intent record should persist");
+        com::save_config(
+            store.clone(),
+            &format!("{TIER_MUTATION_INTENT_RECORD_PREFIX}/00/00/33345678123456789abcdef012345678.json"),
+            b"{}".to_vec(),
+        )
+        .await
+        .expect("malformed-shard intent record should persist");
+        com::save_config(
+            store.clone(),
+            &format!("{TIER_MUTATION_INTENT_RECORD_PREFIX}/44/44/44445678123456789abcdef012345678.json"),
+            b"{".to_vec(),
+        )
+        .await
+        .expect("corrupt-json intent record should persist");
+
+        let scan = list_tier_mutation_intent_records(store, 100, None)
+            .await
+            .expect("tier mutation intent records should scan");
+        let mut loaded_ids: Vec<_> = scan.intents.into_iter().map(|intent| intent.mutation_id).collect();
+        loaded_ids.sort();
+
+        assert_eq!(scan.scanned, 4);
+        assert_eq!(scan.failed, 2);
+        assert_eq!(loaded_ids, vec![first_id, second_id]);
+        assert!(!scan.truncated);
+        assert_eq!(scan.next_marker, None);
     }
 
     #[cfg(feature = "test-util")]
