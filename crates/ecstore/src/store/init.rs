@@ -553,6 +553,7 @@ mod tests {
                 list_tier_mutation_intent_records, load_tier_mutation_intent_record, load_tier_mutation_intent_record_with_etag,
                 save_tier_mutation_intent_record, save_tier_mutation_intent_record_if_current,
             },
+            tier_mutation_peer::{TierMutationPeerError, TierMutationPeerState, handle_tier_mutation_peer_request},
             warm_backend::WarmBackend,
         },
         storage_api_contracts::{
@@ -572,6 +573,8 @@ mod tests {
     };
     use http::HeaderMap;
     use rustfs_config::server_config::KVS;
+    #[cfg(feature = "test-util")]
+    use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use std::{
         future::Future,
         io::Cursor,
@@ -1457,6 +1460,225 @@ mod tests {
                 .expect("same abort retry should be idempotent");
         assert!(!retry_abort_advanced);
         assert_eq!(aborted_retry, aborted);
+    }
+
+    #[cfg(feature = "test-util")]
+    fn tier_mutation_peer_test_intent(
+        mutation_id: uuid::Uuid,
+        tier_name: &str,
+        candidate_digest: [u8; 32],
+    ) -> TierMutationIntent {
+        TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest,
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: tier_name.to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-peer-handler", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [3; 32]);
+        let prepare_payload = intent.encode().expect("prepare intent should encode");
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+
+        let prepared = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("first prepare should create the peer intent");
+        assert!(prepared.applied);
+        assert_eq!(prepared.state, TierMutationPeerState::Prepared);
+        let blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("prepared peer mutation should block new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            blocked.message.contains("being replaced"),
+            "prepared peer mutation should reuse the existing blocked-tier error: {blocked}"
+        );
+
+        let retried_prepare = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("same prepare retry should be idempotent");
+        assert!(!retried_prepare.applied);
+        assert_eq!(retried_prepare.state, TierMutationPeerState::Prepared);
+        let retried_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("prepared retry should keep blocking new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            retried_blocked.message.contains("being replaced"),
+            "prepared retry should keep the existing blocked-tier error: {retried_blocked}"
+        );
+
+        let committed = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"new-etag",
+        )
+        .await
+        .expect("commit should advance the prepared peer intent");
+        assert!(committed.applied);
+        assert_eq!(committed.state, TierMutationPeerState::Committed);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+                .await
+                .expect("committed peer mutation should clear the prepared runtime block"),
+        );
+
+        let retried_commit = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"new-etag",
+        )
+        .await
+        .expect("same commit retry should be idempotent");
+        assert!(!retried_commit.applied);
+        assert_eq!(retried_commit.state, TierMutationPeerState::Committed);
+
+        let delayed_prepare_retry = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("delayed duplicate prepare should report the durable committed state");
+        assert!(!delayed_prepare_retry.applied);
+        assert_eq!(delayed_prepare_retry.state, TierMutationPeerState::Committed);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+                .await
+                .expect("delayed committed prepare retry must not recreate a runtime block"),
+        );
+
+        let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("committed peer intent should remain durable");
+        assert_eq!(loaded.state, TierMutationIntentState::Committed);
+        assert_eq!(loaded.committed_config_etag.as_deref(), Some("new-etag"));
+
+        let abort_id = uuid::Uuid::new_v4();
+        let abort_intent = tier_mutation_peer_test_intent(abort_id, "COLD-B", [4; 32]);
+        let abort_prepare_payload = abort_intent.encode().expect("abort prepare intent should encode");
+        register_mock_tier(&store.tier_config_mgr(), "COLD-B").await;
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            abort_id,
+            &abort_prepare_payload,
+        )
+        .await
+        .expect("abort target prepare should create the peer intent");
+        let abort_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
+            Ok(_) => panic!("abort target prepare should block new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            abort_blocked.message.contains("being replaced"),
+            "abort target prepare should reuse the existing blocked-tier error: {abort_blocked}"
+        );
+
+        let aborted = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            abort_id,
+            b"",
+        )
+        .await
+        .expect("abort should advance the prepared peer intent");
+        assert!(aborted.applied);
+        assert_eq!(aborted.state, TierMutationPeerState::Aborted);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B")
+                .await
+                .expect("aborted peer mutation should clear the prepared runtime block"),
+        );
+
+        let retried_abort = handle_tier_mutation_peer_request(
+            store,
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            abort_id,
+            b"",
+        )
+        .await
+        .expect("same abort retry should be idempotent");
+        assert!(!retried_abort.applied);
+        assert_eq!(retried_abort.state, TierMutationPeerState::Aborted);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_handler_rejects_conflicting_prepare_without_overwrite() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-peer-conflict", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [3; 32]);
+        let prepare_payload = intent.encode().expect("prepare intent should encode");
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("first prepare should create the peer intent");
+
+        let conflicting = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [4; 32]);
+        let conflicting_payload = conflicting.encode().expect("conflicting intent should encode");
+        let conflict = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &conflicting_payload,
+        )
+        .await
+        .expect_err("conflicting prepare must fail closed");
+        assert!(matches!(conflict, TierMutationPeerError::ConflictingIntent));
+
+        let loaded = load_tier_mutation_intent_record(store, mutation_id)
+            .await
+            .expect("conflicting prepare must not overwrite the first record");
+        assert_eq!(loaded.candidate_digest, [3; 32]);
+        assert_eq!(loaded.state, TierMutationIntentState::Prepared);
     }
 
     #[cfg(feature = "test-util")]
