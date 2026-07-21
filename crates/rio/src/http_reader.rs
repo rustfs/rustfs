@@ -1496,6 +1496,7 @@ mod tests {
     use axum::{Router, body::Body, extract::State, http::StatusCode, response::IntoResponse, routing::get};
     use futures::stream::{self, StreamExt as _};
     use http_body_util::BodyExt as _;
+    use rustfs_io_metrics::internode_metrics::global_internode_metrics;
     use std::io::{self, IoSlice};
     use std::sync::{
         Arc,
@@ -1741,6 +1742,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route(WALK_DIR_PATH, get(get_stream))
             .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
             .route("/delayed-first", get(get_delayed_first_chunk))
@@ -1797,6 +1799,33 @@ mod tests {
         assert_eq!(buf, b"hello");
         assert_eq!(state.head_count.load(Ordering::SeqCst), 0);
         assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_reader_records_walk_dir_recv_bytes() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let metrics = global_internode_metrics();
+        let before = metrics.snapshot().recv_bytes_total;
+        let url = base_url.replace("/stream", WALK_DIR_PATH);
+
+        let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None)
+            .await
+            .expect("walk_dir reader should open");
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.expect("walk_dir body should read to EOF");
+        let after = metrics.snapshot().recv_bytes_total;
+
+        assert_eq!(buf, b"hello");
+        assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+        assert!(
+            after >= before.saturating_add(5),
+            "walk_dir HttpReader should record streamed bytes as internode recv bytes: before={before}, after={after}"
+        );
 
         handle.abort();
     }

@@ -17,7 +17,10 @@ use crate::runtime_sources as root_runtime_sources;
 use crate::storage::storage_api::runtime_sources_consumer::ECStore;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{error::Result as IamResult, store::object::ObjectStore, sys::IamSys};
-use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
+use rustfs_io_metrics::{
+    PerformanceMetrics,
+    internode_metrics::{InternodeMetrics, global_internode_metrics},
+};
 use rustfs_kms::ObjectEncryptionService;
 use rustfs_lock::LockClient;
 use std::sync::Arc;
@@ -41,7 +44,7 @@ pub(crate) fn current_buffer_config() -> RustFSBufferConfig {
 }
 
 pub(crate) fn current_internode_metrics() -> Arc<InternodeMetrics> {
-    root_runtime_sources::current_internode_metrics().unwrap_or_else(|| Arc::new(InternodeMetrics::default()))
+    root_runtime_sources::current_internode_metrics().unwrap_or_else(|| global_internode_metrics().clone())
 }
 
 pub(crate) async fn current_local_node_name() -> String {

@@ -840,6 +840,7 @@ mod tests {
     use http_body_util::BodyExt;
     use rustfs_io_metrics::internode_metrics::{
         INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+        global_internode_metrics,
     };
     use sha2::Digest as _;
     use tokio::io;
@@ -986,6 +987,30 @@ mod tests {
             .to_bytes();
 
         assert_eq!(bytes, Bytes::from_static(b"complete walk data"));
+    }
+
+    #[tokio::test]
+    async fn walk_dir_body_records_operation_sent_bytes() {
+        let metrics = global_internode_metrics();
+        let before = metrics.snapshot().sent_bytes_total;
+        let payload = Bytes::from_static(b"metered walk data");
+        let expected_len = u64::try_from(payload.len()).expect("test payload length should fit u64");
+        let body = walk_dir_response_body(true, move |mut writer| async move {
+            writer.write_all(&payload).await?;
+            Ok(())
+        });
+
+        let bytes = BodyExt::collect(body)
+            .await
+            .expect("successful completion should preserve the metered body")
+            .to_bytes();
+        let after = metrics.snapshot().sent_bytes_total;
+
+        assert_eq!(bytes, Bytes::from_static(b"metered walk data"));
+        assert!(
+            after >= before.saturating_add(expected_len),
+            "walk_dir response body should record streamed bytes as internode sent bytes: before={before}, after={after}, expected_delta={expected_len}"
+        );
     }
 
     #[tokio::test]
