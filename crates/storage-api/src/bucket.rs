@@ -53,6 +53,8 @@ pub struct DeleteBucketOptions {
     pub no_recreate: bool,
     /// Force deletion even if bucket is not empty.
     pub force: bool,
+    /// Force deletion only after the local peer verifies the bucket is empty.
+    pub force_if_empty: bool,
     /// Site replication delete operation.
     pub srdelete_op: SRBucketDeleteOp,
 }

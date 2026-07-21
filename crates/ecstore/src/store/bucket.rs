@@ -40,16 +40,16 @@ fn validate_table_bucket_delete_allowed(
     Ok(())
 }
 
-async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> bool {
+async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
     let local_disks = runtime_sources::local_disks_in(ctx).await;
     for disk in local_disks.iter() {
         let catalog_path = disk.path().join(bucket).join(BUCKET_TABLE_RESERVED_PREFIX);
-        if has_xlmeta_files(&catalog_path).await {
-            return true;
+        if has_xlmeta_files(&catalog_path).await? {
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 async fn validate_table_bucket_delete_guard(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<()> {
@@ -57,7 +57,7 @@ async fn validate_table_bucket_delete_guard(ctx: &crate::runtime::instance::Inst
         .await
         .is_ok_and(|metadata| metadata.table_bucket_enabled());
     if table_bucket_enabled {
-        validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(ctx, bucket).await)?;
+        validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(ctx, bucket).await?)?;
     }
 
     Ok(())
@@ -286,16 +286,16 @@ impl ECStore {
                 let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
                 for disk in local_disks.iter() {
                     let bucket_path = disk.path().join(bucket);
-                    if has_xlmeta_files(&bucket_path).await {
+                    if has_xlmeta_files(&bucket_path).await? {
                         return Err(StorageError::BucketNotEmpty(bucket.to_string()));
                     }
                 }
-                delete_opts.force = true;
+                delete_opts.force_if_empty = true;
             }
         }
 
         if sr_delete && !bucket_exists {
-            delete_opts.force = true;
+            delete_opts.force_if_empty = true;
         }
 
         if sr_mark_delete {
@@ -456,7 +456,10 @@ mod tests {
 
     async fn any_disk_has_object_metadata(disk_paths: &[PathBuf], bucket: &str) -> bool {
         for disk_path in disk_paths {
-            if super::has_xlmeta_files(&disk_path.join(bucket)).await {
+            if super::has_xlmeta_files(&disk_path.join(bucket))
+                .await
+                .expect("object metadata scan should succeed")
+            {
                 return true;
             }
         }
