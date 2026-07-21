@@ -21,8 +21,9 @@ use uuid::Uuid;
 use crate::config::com;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
+use crate::object_api::ObjectOptions;
 use crate::services::tier::tier::TierDestinationId;
-use crate::storage_api_contracts::list::ListOperations as _;
+use crate::storage_api_contracts::{list::ListOperations as _, object::HTTPPreconditions};
 use crate::store::ECStore;
 
 pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-intent-v1";
@@ -215,6 +216,42 @@ impl TierMutationIntent {
         self.validate()
     }
 
+    pub(crate) fn advance_idempotent(
+        &mut self,
+        next: TierMutationIntentState,
+        committed_config_etag: Option<String>,
+    ) -> Result<bool> {
+        match (self.state, next) {
+            (TierMutationIntentState::Prepared, TierMutationIntentState::Committed | TierMutationIntentState::Aborted) => {
+                self.advance(next, committed_config_etag)?;
+                Ok(true)
+            }
+            (TierMutationIntentState::Committed, TierMutationIntentState::Committed) => {
+                let committed_config_etag =
+                    committed_config_etag.ok_or(TierMutationIntentError::Corrupt("commit requires config etag"))?;
+                if committed_config_etag.is_empty() {
+                    return Err(TierMutationIntentError::Corrupt("commit config etag is empty"));
+                }
+                if self.committed_config_etag.as_deref() != Some(committed_config_etag.as_str()) {
+                    return Err(TierMutationIntentError::Corrupt("committed config etag does not match"));
+                }
+                self.validate()?;
+                Ok(false)
+            }
+            (TierMutationIntentState::Aborted, TierMutationIntentState::Aborted) => {
+                if committed_config_etag.is_some() {
+                    return Err(TierMutationIntentError::Corrupt("abort must not carry committed config etag"));
+                }
+                self.validate()?;
+                Ok(false)
+            }
+            _ => Err(TierMutationIntentError::InvalidStateChange {
+                from: self.state,
+                to: next,
+            }),
+        }
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let intent_bytes = serde_json::to_vec(self)?;
@@ -310,9 +347,48 @@ pub(crate) async fn save_tier_mutation_intent_record(api: Arc<ECStore>, intent: 
 }
 
 pub(crate) async fn load_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<TierMutationIntent> {
+    let (intent, _) = load_tier_mutation_intent_record_with_etag(api, mutation_id).await?;
+    Ok(intent)
+}
+
+pub(crate) async fn load_tier_mutation_intent_record_with_etag(
+    api: Arc<ECStore>,
+    mutation_id: Uuid,
+) -> EcstoreResult<(TierMutationIntent, String)> {
     let object = tier_mutation_intent_record_object_name(mutation_id).map_err(tier_mutation_intent_store_error)?;
-    let data = com::read_config(api, &object).await?;
-    TierMutationIntent::decode(mutation_id, &data).map_err(tier_mutation_intent_store_error)
+    let (data, object_info) = com::read_config_with_metadata(api, &object, &ObjectOptions::default()).await?;
+    let etag = object_info
+        .etag
+        .filter(|etag| !etag.trim().is_empty())
+        .ok_or_else(|| Error::other("tier mutation intent record is missing an ETag"))?;
+    let intent = TierMutationIntent::decode(mutation_id, &data).map_err(tier_mutation_intent_store_error)?;
+    Ok((intent, etag))
+}
+
+pub(crate) async fn save_tier_mutation_intent_record_if_current(
+    api: Arc<ECStore>,
+    intent: &TierMutationIntent,
+    current_etag: &str,
+) -> EcstoreResult<()> {
+    if current_etag.trim().is_empty() {
+        return Err(Error::other("tier mutation intent current ETag is empty"));
+    }
+    let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
+    let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
+    com::save_config_with_opts(
+        api,
+        &object,
+        data,
+        &ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(current_etag.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 pub(crate) async fn delete_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<()> {
@@ -321,6 +397,22 @@ pub(crate) async fn delete_tier_mutation_intent_record(api: Arc<ECStore>, mutati
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+pub(crate) async fn advance_tier_mutation_intent_record_idempotent(
+    api: Arc<ECStore>,
+    mutation_id: Uuid,
+    next: TierMutationIntentState,
+    committed_config_etag: Option<String>,
+) -> EcstoreResult<(TierMutationIntent, bool)> {
+    let (mut intent, current_etag) = load_tier_mutation_intent_record_with_etag(api.clone(), mutation_id).await?;
+    let advanced = intent
+        .advance_idempotent(next, committed_config_etag)
+        .map_err(tier_mutation_intent_store_error)?;
+    if advanced {
+        save_tier_mutation_intent_record_if_current(api, &intent, &current_etag).await?;
+    }
+    Ok((intent, advanced))
 }
 
 pub(crate) async fn list_tier_mutation_intent_records(
@@ -493,6 +585,64 @@ mod tests {
             Err(TierMutationIntentError::InvalidStateChange {
                 from: TierMutationIntentState::Committed,
                 to: TierMutationIntentState::Aborted,
+            })
+        ));
+    }
+
+    #[test]
+    fn intent_idempotent_commit_retry_keeps_revision_and_rejects_conflicts() {
+        let mut intent = prepared_intent();
+
+        assert!(
+            intent
+                .advance_idempotent(TierMutationIntentState::Committed, Some("new-etag".to_string()))
+                .expect("initial commit should advance")
+        );
+        assert_eq!(intent.revision, 2);
+        assert!(
+            !intent
+                .advance_idempotent(TierMutationIntentState::Committed, Some("new-etag".to_string()))
+                .expect("same commit retry should be idempotent")
+        );
+        assert_eq!(intent.revision, 2);
+        assert!(matches!(
+            intent.advance_idempotent(TierMutationIntentState::Committed, Some("other-etag".to_string())),
+            Err(TierMutationIntentError::Corrupt("committed config etag does not match"))
+        ));
+        assert!(matches!(
+            intent.advance_idempotent(TierMutationIntentState::Aborted, None),
+            Err(TierMutationIntentError::InvalidStateChange {
+                from: TierMutationIntentState::Committed,
+                to: TierMutationIntentState::Aborted,
+            })
+        ));
+    }
+
+    #[test]
+    fn intent_idempotent_abort_retry_keeps_revision_and_rejects_commit() {
+        let mut intent = prepared_intent();
+
+        assert!(
+            intent
+                .advance_idempotent(TierMutationIntentState::Aborted, None)
+                .expect("initial abort should advance")
+        );
+        assert_eq!(intent.revision, 2);
+        assert!(
+            !intent
+                .advance_idempotent(TierMutationIntentState::Aborted, None)
+                .expect("same abort retry should be idempotent")
+        );
+        assert_eq!(intent.revision, 2);
+        assert!(matches!(
+            intent.advance_idempotent(TierMutationIntentState::Aborted, Some("unexpected-etag".to_string())),
+            Err(TierMutationIntentError::Corrupt("abort must not carry committed config etag"))
+        ));
+        assert!(matches!(
+            intent.advance_idempotent(TierMutationIntentState::Committed, Some("new-etag".to_string())),
+            Err(TierMutationIntentError::InvalidStateChange {
+                from: TierMutationIntentState::Aborted,
+                to: TierMutationIntentState::Committed,
             })
         ));
     }

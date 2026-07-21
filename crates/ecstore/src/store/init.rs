@@ -549,8 +549,9 @@ mod tests {
             tier::TierConfigMgr,
             tier_mutation_intent::{
                 TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
-                TierMutationIntentTarget, delete_tier_mutation_intent_record, list_tier_mutation_intent_records,
-                load_tier_mutation_intent_record, save_tier_mutation_intent_record,
+                TierMutationIntentTarget, advance_tier_mutation_intent_record_idempotent, delete_tier_mutation_intent_record,
+                list_tier_mutation_intent_records, load_tier_mutation_intent_record, load_tier_mutation_intent_record_with_etag,
+                save_tier_mutation_intent_record, save_tier_mutation_intent_record_if_current,
             },
             warm_backend::WarmBackend,
         },
@@ -1338,6 +1339,194 @@ mod tests {
         assert_eq!(loaded_ids, vec![first_id, second_id]);
         assert!(!scan.truncated);
         assert_eq!(scan.next_marker, None);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_advance_is_idempotent_in_config_store() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-advance", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: "COLD-A".to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("prepared tier mutation intent record should persist");
+        let (loaded_before_advance, stale_etag) = load_tier_mutation_intent_record_with_etag(store.clone(), mutation_id)
+            .await
+            .expect("prepared tier mutation intent record should load with etag");
+        assert_eq!(loaded_before_advance, intent);
+        assert!(!stale_etag.is_empty());
+
+        let (committed, first_advanced) = advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("new-etag".to_string()),
+        )
+        .await
+        .expect("first commit should advance the record");
+        assert!(first_advanced);
+        assert_eq!(committed.state, TierMutationIntentState::Committed);
+        assert_eq!(committed.revision, 2);
+        assert_eq!(committed.committed_config_etag.as_deref(), Some("new-etag"));
+
+        let (retried, retry_advanced) = advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("new-etag".to_string()),
+        )
+        .await
+        .expect("same commit retry should be idempotent");
+        assert!(!retry_advanced);
+        assert_eq!(retried, committed);
+
+        let conflict = advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("other-etag".to_string()),
+        )
+        .await
+        .expect_err("conflicting commit retry should fail closed");
+        assert!(matches!(conflict, Error::Io(_)));
+        assert!(conflict.to_string().contains("committed config etag does not match"));
+
+        let mut stale_conflict = intent;
+        stale_conflict
+            .advance_idempotent(TierMutationIntentState::Committed, Some("other-etag".to_string()))
+            .expect("stale conflicting intent should advance locally");
+        let stale_save = save_tier_mutation_intent_record_if_current(store.clone(), &stale_conflict, &stale_etag)
+            .await
+            .expect_err("stale etag must fail closed instead of overwriting the committed record");
+        assert!(matches!(stale_save, Error::PreconditionFailed));
+
+        let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("conflicting retry must not overwrite the durable record");
+        assert_eq!(loaded, committed);
+
+        let abort_id = uuid::Uuid::new_v4();
+        let abort_intent = TierMutationIntent {
+            mutation_id: abort_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [4; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: "COLD-B".to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        save_tier_mutation_intent_record(store.clone(), &abort_intent)
+            .await
+            .expect("prepared abort intent record should persist");
+
+        let (aborted, first_abort_advanced) =
+            advance_tier_mutation_intent_record_idempotent(store.clone(), abort_id, TierMutationIntentState::Aborted, None)
+                .await
+                .expect("first abort should advance the record");
+        assert!(first_abort_advanced);
+        assert_eq!(aborted.state, TierMutationIntentState::Aborted);
+        assert_eq!(aborted.revision, 2);
+        assert_eq!(aborted.committed_config_etag, None);
+
+        let (aborted_retry, retry_abort_advanced) =
+            advance_tier_mutation_intent_record_idempotent(store, abort_id, TierMutationIntentState::Aborted, None)
+                .await
+                .expect("same abort retry should be idempotent");
+        assert!(!retry_abort_advanced);
+        assert_eq!(aborted_retry, aborted);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_scan_paginates_exact_limit() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan-page", &[4])).await;
+        let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: tier_name.to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        let intent_ids = vec![
+            uuid::Uuid::parse_str("11345678-1234-5678-9abc-def012345678").expect("first uuid should parse"),
+            uuid::Uuid::parse_str("22345678-1234-5678-9abc-def012345678").expect("second uuid should parse"),
+            uuid::Uuid::parse_str("33345678-1234-5678-9abc-def012345678").expect("third uuid should parse"),
+        ];
+        for (index, mutation_id) in intent_ids.iter().copied().enumerate() {
+            let intent = build_intent(mutation_id, &format!("COLD-{index}"));
+            save_tier_mutation_intent_record(store.clone(), &intent)
+                .await
+                .expect("tier mutation intent record should persist");
+        }
+
+        let exact_page = list_tier_mutation_intent_records(store.clone(), 3, None)
+            .await
+            .expect("exact full page should scan");
+        assert_eq!(exact_page.scanned, 3);
+        assert_eq!(exact_page.intents.len(), 3);
+        assert_eq!(exact_page.failed, 0);
+        assert!(!exact_page.truncated);
+        assert_eq!(exact_page.next_marker, None);
+
+        let first_page = list_tier_mutation_intent_records(store.clone(), 2, None)
+            .await
+            .expect("first page should scan");
+        assert_eq!(first_page.scanned, 2);
+        assert_eq!(first_page.intents.len(), 2);
+        assert_eq!(first_page.failed, 0);
+        assert!(first_page.truncated);
+        assert!(first_page.next_marker.is_some());
+
+        let second_page = list_tier_mutation_intent_records(store, 2, first_page.next_marker)
+            .await
+            .expect("second page should scan");
+        let mut loaded_ids: Vec<_> = first_page
+            .intents
+            .into_iter()
+            .chain(second_page.intents.into_iter())
+            .map(|intent| intent.mutation_id)
+            .collect();
+        loaded_ids.sort();
+
+        assert_eq!(second_page.scanned, 1);
+        assert_eq!(second_page.failed, 0);
+        assert!(!second_page.truncated);
+        assert_eq!(second_page.next_marker, None);
+        assert_eq!(loaded_ids, intent_ids);
     }
 
     #[cfg(feature = "test-util")]
