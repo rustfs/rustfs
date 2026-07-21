@@ -86,4 +86,19 @@ impl CapturingRecorder {
             .map(|(_, samples)| samples.0.lock().expect("samples should be lockable").len())
             .sum()
     }
+
+    pub(crate) fn histogram_values(&self, name: &str, labels: &[(&str, &str)]) -> Vec<f64> {
+        self.histograms
+            .lock()
+            .expect("histogram map should be lockable")
+            .iter()
+            .filter(|(key, _)| {
+                key.name() == name
+                    && labels
+                        .iter()
+                        .all(|(lk, lv)| key.labels().any(|label| label.key() == *lk && label.value() == *lv))
+            })
+            .flat_map(|(_, samples)| samples.0.lock().expect("samples should be lockable").clone())
+            .collect()
+    }
 }

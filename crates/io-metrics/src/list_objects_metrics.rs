@@ -42,6 +42,13 @@ const LIST_OBJECTS_INDEX_LIVE_VERIFY_FAILURE_TOTAL: &str = "rustfs_s3_list_objec
 const LIST_OBJECTS_INDEX_RETURNED_OBJECTS: &str = "rustfs_s3_list_objects_index_returned_objects";
 const LIST_OBJECTS_INDEX_RETURNED_PREFIXES: &str = "rustfs_s3_list_objects_index_returned_prefixes";
 const LIST_OBJECTS_INDEX_VERIFICATION_IO_AMPLIFICATION: &str = "rustfs_s3_list_objects_index_verification_io_amplification";
+const LIST_OBJECTS_LOCAL_READ_DIR_TOTAL: &str = "rustfs_s3_list_objects_local_read_dir_total";
+const LIST_OBJECTS_LOCAL_READ_DIR_DURATION_MS: &str = "rustfs_s3_list_objects_local_read_dir_duration_ms";
+const LIST_OBJECTS_LOCAL_READ_DIR_ENTRIES: &str = "rustfs_s3_list_objects_local_read_dir_entries";
+const LIST_OBJECTS_LOCAL_READ_DIR_LIMIT: &str = "rustfs_s3_list_objects_local_read_dir_limit";
+
+pub const LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK: &str = "ok";
+pub const LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR: &str = "error";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ListObjectsGatherObservation {
@@ -69,6 +76,17 @@ pub struct ListObjectsIndexPageObservation {
     pub is_truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ListObjectsLocalReadDirObservation {
+    pub outcome: &'static str,
+    pub requested_count: i32,
+    pub returned_entries: usize,
+    pub duration_ms: f64,
+    pub is_root: bool,
+    pub has_filter_prefix: bool,
+    pub has_forward: bool,
+}
+
 #[inline(always)]
 fn bool_label(value: bool) -> &'static str {
     if value { "true" } else { "false" }
@@ -82,6 +100,16 @@ fn count_as_f64(value: usize) -> f64 {
 #[inline(always)]
 fn limit_as_f64(value: i32) -> f64 {
     value.max(0) as f64
+}
+
+#[inline(always)]
+fn count_mode_label(count: i32) -> &'static str {
+    if count < 0 { "whole" } else { "bounded" }
+}
+
+#[inline(always)]
+fn read_dir_count_as_f64(value: i32) -> f64 {
+    f64::from(value)
 }
 
 pub fn init_list_objects_metrics() {
@@ -154,6 +182,22 @@ pub fn init_list_objects_metrics() {
         describe_histogram!(
             LIST_OBJECTS_INDEX_VERIFICATION_IO_AMPLIFICATION,
             "Ratio of live verification attempts to returned objects for opt-in ListObjects index serving."
+        );
+        describe_counter!(
+            LIST_OBJECTS_LOCAL_READ_DIR_TOTAL,
+            "Total number of local read_dir calls made while serving live-walker ListObjects pages."
+        );
+        describe_histogram!(
+            LIST_OBJECTS_LOCAL_READ_DIR_DURATION_MS,
+            "Duration in milliseconds of local read_dir calls made while serving live-walker ListObjects pages."
+        );
+        describe_histogram!(
+            LIST_OBJECTS_LOCAL_READ_DIR_ENTRIES,
+            "Number of immediate directory entries returned by local read_dir while serving live-walker ListObjects pages."
+        );
+        describe_histogram!(
+            LIST_OBJECTS_LOCAL_READ_DIR_LIMIT,
+            "Requested local read_dir count used while serving live-walker ListObjects pages; negative counts mean whole-directory enumeration."
         );
     });
 }
@@ -324,6 +368,38 @@ pub fn record_list_objects_index_served(observation: ListObjectsIndexPageObserva
     .record(verification_io_amplification);
 }
 
+pub fn record_list_objects_local_read_dir(observation: ListObjectsLocalReadDirObservation) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
+    let count_mode = count_mode_label(observation.requested_count);
+
+    counter!(
+        LIST_OBJECTS_LOCAL_READ_DIR_TOTAL,
+        "outcome" => observation.outcome,
+        "count_mode" => count_mode,
+        "is_root" => bool_label(observation.is_root),
+        "has_filter_prefix" => bool_label(observation.has_filter_prefix),
+        "has_forward" => bool_label(observation.has_forward),
+    )
+    .increment(1);
+    histogram!(
+        LIST_OBJECTS_LOCAL_READ_DIR_DURATION_MS,
+        "outcome" => observation.outcome,
+        "count_mode" => count_mode,
+    )
+    .record(observation.duration_ms);
+    histogram!(
+        LIST_OBJECTS_LOCAL_READ_DIR_ENTRIES,
+        "outcome" => observation.outcome,
+        "count_mode" => count_mode,
+    )
+    .record(count_as_f64(observation.returned_entries));
+    histogram!(LIST_OBJECTS_LOCAL_READ_DIR_LIMIT, "count_mode" => count_mode)
+        .record(read_dir_count_as_f64(observation.requested_count));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +448,28 @@ mod tests {
             is_truncated: true,
         });
         record_list_objects_index_live_verify_failure("index_key_only", "read_error");
+    }
+
+    #[test]
+    fn record_local_read_dir_observation_accepts_whole_directory_counts() {
+        init_list_objects_metrics();
+        record_list_objects_local_read_dir(ListObjectsLocalReadDirObservation {
+            outcome: LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK,
+            requested_count: -1,
+            returned_entries: 4096,
+            duration_ms: 12.5,
+            is_root: true,
+            has_filter_prefix: false,
+            has_forward: false,
+        });
+        record_list_objects_local_read_dir(ListObjectsLocalReadDirObservation {
+            outcome: LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR,
+            requested_count: -1,
+            returned_entries: 0,
+            duration_ms: 5000.0,
+            is_root: true,
+            has_filter_prefix: false,
+            has_forward: true,
+        });
     }
 }

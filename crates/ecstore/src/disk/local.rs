@@ -5172,7 +5172,25 @@ impl LocalDisk {
         // larger `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or the high-latency
         // drive-timeout profile; a streaming readdir rewrite is a separate,
         // higher-risk follow-up and is intentionally not done here.
-        let mut entries = match with_walk_stall_timeout(stall, self.list_dir("", &opts.bucket, &current, -1)).await {
+        let read_dir_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let read_dir_result = with_walk_stall_timeout(stall, self.list_dir("", &opts.bucket, &current, -1)).await;
+        if let Some(started) = read_dir_started {
+            rustfs_io_metrics::record_list_objects_local_read_dir(rustfs_io_metrics::ListObjectsLocalReadDirObservation {
+                outcome: if read_dir_result.is_ok() {
+                    rustfs_io_metrics::LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK
+                } else {
+                    rustfs_io_metrics::LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR
+                },
+                requested_count: -1,
+                returned_entries: read_dir_result.as_ref().map_or(0, Vec::len),
+                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+                is_root: current.trim_matches('/').is_empty(),
+                has_filter_prefix: !prefix.is_empty(),
+                has_forward: forward.is_some(),
+            });
+        }
+
+        let mut entries = match read_dir_result {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
@@ -11961,6 +11979,90 @@ mod test {
         assert!(names.contains(&"foo/bar".to_string()));
         assert!(names.contains(&"foo/bar/xyzzy".to_string()));
         assert!(names.contains(&"quux/thud".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scan_dir_records_whole_parent_read_dir_before_page_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should be created");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                use rustfs_filemeta::MetacacheReader;
+                use tempfile::tempdir;
+
+                let dir = tempdir().expect("tempdir should be created");
+                let bucket = "test-bucket";
+                let bucket_dir = dir.path().join(bucket);
+                const OBJECTS: usize = 12;
+
+                for index in 0..OBJECTS {
+                    let object_dir = bucket_dir.join(format!("object-{index:04}"));
+                    fs::create_dir_all(&object_dir)
+                        .await
+                        .expect("object directory should be created");
+                    fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                        .await
+                        .expect("object metadata should be written");
+                }
+
+                let endpoint =
+                    Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+                let (reader, mut writer) = tokio::io::duplex(4096);
+                let mut out = MetacacheWriter::new(&mut writer);
+                let opts = WalkDirOptions {
+                    bucket: bucket.to_string(),
+                    base_dir: String::new(),
+                    recursive: true,
+                    limit: 1,
+                    ..Default::default()
+                };
+                let mut objs_returned = 0;
+
+                disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, false, None)
+                    .await
+                    .expect("scan_dir should succeed");
+                out.close().await.expect("metacache writer should close");
+                drop(out);
+                drop(writer);
+
+                let mut reader = MetacacheReader::new(reader);
+                let visible_objects = reader
+                    .read_all()
+                    .await
+                    .expect("scan output should decode")
+                    .into_iter()
+                    .filter(|entry| !entry.metadata.is_empty())
+                    .count();
+
+                assert_eq!(visible_objects, 1);
+                assert_eq!(objs_returned, 1);
+            });
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(
+            recorder.counter_value(
+                "rustfs_s3_list_objects_local_read_dir_total",
+                &[("outcome", "ok"), ("count_mode", "whole"), ("is_root", "true")]
+            ),
+            1
+        );
+        assert_eq!(
+            recorder.histogram_values(
+                "rustfs_s3_list_objects_local_read_dir_entries",
+                &[("outcome", "ok"), ("count_mode", "whole")]
+            ),
+            vec![12.0]
+        );
     }
 
     #[tokio::test]
