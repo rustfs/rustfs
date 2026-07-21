@@ -21,6 +21,7 @@ use crate::runtime::sources as runtime_sources;
 use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::services::rebalance::RebalSaveOpt;
 use crate::storage_api_contracts::admin::StorageAdminApi;
+use bytes::Bytes;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
@@ -35,6 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// After this many consecutive admin-call failures, mark the peer as offline.
 const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
@@ -111,6 +113,17 @@ impl NotificationSys {
 pub struct NotificationPeerErr {
     pub host: String,
     pub err: Option<Error>,
+}
+
+fn notification_peer_result<T>(host: String, result: Result<T>) -> NotificationPeerErr {
+    NotificationPeerErr { host, err: result.err() }
+}
+
+fn unreachable_notification_peer_err() -> NotificationPeerErr {
+    NotificationPeerErr {
+        host: String::new(),
+        err: Some(Error::other("peer is not reachable")),
+    }
 }
 
 impl NotificationSys {
@@ -1070,6 +1083,50 @@ impl NotificationSys {
         }
         join_all(futures).await
     }
+
+    pub async fn prepare_tier_mutation(&self, mutation_id: Uuid, canonical_payload: Bytes) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            let payload = canonical_payload.clone();
+            futures.push(async move {
+                if let Some(client) = client {
+                    notification_peer_result(client.host.to_string(), client.prepare_tier_mutation(mutation_id, payload).await)
+                } else {
+                    unreachable_notification_peer_err()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn commit_tier_mutation(&self, mutation_id: Uuid, canonical_payload: Bytes) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            let payload = canonical_payload.clone();
+            futures.push(async move {
+                if let Some(client) = client {
+                    notification_peer_result(client.host.to_string(), client.commit_tier_mutation(mutation_id, payload).await)
+                } else {
+                    unreachable_notification_peer_err()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn abort_tier_mutation(&self, mutation_id: Uuid) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    notification_peer_result(client.host.to_string(), client.abort_tier_mutation(mutation_id).await)
+                } else {
+                    unreachable_notification_peer_err()
+                }
+            });
+        }
+        join_all(futures).await
+    }
 }
 
 async fn scanner_activity_with_timeout<F>(timeout_duration: Duration, host: &str, activity: F) -> Result<ScannerPeerActivity>
@@ -1724,6 +1781,36 @@ mod tests {
         assert!(results[0].host.is_empty());
         assert!(results[0].err.is_some());
         assert!(results[0].err.as_ref().unwrap().to_string().contains("peer is not reachable"));
+    }
+
+    #[tokio::test]
+    async fn tier_mutation_fanout_reports_unreachable_peers_fail_closed() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+        };
+        let mutation_id = Uuid::from_u128(1);
+
+        let prepare = sys.prepare_tier_mutation(mutation_id, Bytes::from_static(b"prepare")).await;
+        assert_eq!(prepare.len(), 1);
+        assert!(prepare[0].host.is_empty());
+        assert!(
+            prepare[0]
+                .err
+                .as_ref()
+                .expect("unreachable prepare peer should carry an error")
+                .to_string()
+                .contains("peer is not reachable")
+        );
+
+        let commit = sys.commit_tier_mutation(mutation_id, Bytes::from_static(b"commit")).await;
+        assert_eq!(commit.len(), 1);
+        assert!(commit[0].err.is_some());
+
+        let abort = sys.abort_tier_mutation(mutation_id).await;
+        assert_eq!(abort.len(), 1);
+        assert!(abort[0].err.is_some());
     }
 
     // --- Tests for handle_peer_failure / handle_server_info_failure caching ---
