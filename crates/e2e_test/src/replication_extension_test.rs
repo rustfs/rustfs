@@ -1971,7 +1971,10 @@ async fn wait_for_site_replication_enabled(
 ) -> Result<SiteReplicationInfo, Box<dyn Error + Send + Sync>> {
     for _ in 0..40 {
         let info = site_replication_info(env).await?;
-        if info.enabled && info.sites.len() == expected_sites {
+        if info.enabled
+            && info.sites.len() == expected_sites
+            && info.sites.iter().all(|peer| peer.sync_state == SyncStatus::Enable)
+        {
             return Ok(info);
         }
         sleep(Duration::from_millis(250)).await;

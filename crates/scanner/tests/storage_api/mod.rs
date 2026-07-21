@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::recover_tier_delete_journal_entries;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::{
     bucket_lifecycle_audit::LcEventSrc,
     bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, expire_transitioned_object, init_background_expiry},
-    lifecycle::{Event as LcEvent, IlmAction, TransitionOptions},
+    lifecycle::{Event as LcEvent, IlmAction, TRANSITION_PENDING, TransitionOptions},
 };
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
@@ -32,8 +33,8 @@ pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 // backend and xl.meta assertion helpers now live in ecstore behind the
 // `test-util` feature instead of being copied into this crate.
 pub(crate) use rustfs_ecstore::api::tier::test_util::{
-    MockWarmBackend, assert_transition_meta_consistent, free_version_count, register_mock_tier as register_mock_tier_util,
-    wait_for_free_version_absence,
+    MockWarmBackend, TransitionCleanupStoreBarrier, assert_transition_meta_consistent, free_version_count,
+    register_mock_tier as register_mock_tier_util, wait_for_free_version_absence,
 };
 use rustfs_storage_api as storage_contracts;
 
@@ -45,10 +46,11 @@ pub(crate) mod lifecycle {
 
     pub(crate) use super::{
         BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools,
-        Endpoints, IlmAction, LcEvent, LcEventSrc, MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, TransitionOptions,
-        assert_transition_meta_consistent, enqueue_transition_for_existing_objects, expire_transitioned_object,
-        free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys,
-        init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk, path2_bucket_object_with_base_path,
+        Endpoints, IlmAction, LcEvent, LcEventSrc, MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING,
+        TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
+        enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
+        get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
+        is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_tier_delete_journal_entries,
         register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
     };
 }

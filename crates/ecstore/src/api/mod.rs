@@ -67,6 +67,8 @@ pub mod bucket {
         }
 
         pub mod tier_delete_journal {
+            #[cfg(feature = "test-util")]
+            pub use crate::bucket::lifecycle::tier_delete_journal::recover_tier_delete_journal_entries;
             pub use crate::bucket::lifecycle::tier_delete_journal::{
                 persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
             };
@@ -424,7 +426,7 @@ pub mod tier {
     pub mod tier_config {
         pub use crate::services::tier::tier_config::{
             ServicePrincipalAuth, TierAliyun, TierAzure, TierConfig, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS,
-            TierS3, TierTencent, TierType,
+            TierS3, TierTencent, TierType, TierWasabi,
         };
     }
 
@@ -444,9 +446,9 @@ pub mod tier {
     #[cfg(feature = "test-util")]
     pub mod test_util {
         pub use crate::services::tier::test_util::{
-            FaultConfig, MockStoredObject, MockWarmBackend, MockWarmOp, TransitionMeta, assert_transition_meta_consistent,
-            free_version_count, read_transition_meta, register_mock_tier, register_mock_tier_backend,
-            wait_for_free_version_absence,
+            FaultConfig, MockStoredObject, MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, TransitionMeta,
+            assert_transition_meta_consistent, free_version_count, read_transition_meta, register_mock_tier,
+            register_mock_tier_backend, wait_for_free_version_absence,
         };
     }
 }

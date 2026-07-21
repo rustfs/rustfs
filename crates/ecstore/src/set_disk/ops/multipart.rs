@@ -1043,6 +1043,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         if expected_restore_operation_id.is_some() {
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_OPERATION_ID);
         }
+        if opts.versioned {
+            fi.version_id = Some(
+                fi.version_id
+                    .filter(|version_id| !version_id.is_nil())
+                    .unwrap_or_else(Uuid::new_v4),
+            );
+        } else {
+            fi.version_id = None;
+        }
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
@@ -1380,6 +1389,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 meta.parts.clone_from(&fi.parts);
                 meta.metadata = fi.metadata.clone();
                 meta.versioned = opts.versioned || opts.version_suspended;
+                meta.version_id = fi.version_id;
                 meta.checksum = fi.checksum.clone();
             }
         }
@@ -1629,7 +1639,7 @@ mod tests {
     #[serial(metadata_cache_invalidation_probe)]
     async fn complete_multipart_generation_retires_cached_snapshot() {
         use crate::storage_api_contracts::multipart::MultipartOperations as _;
-        use crate::storage_api_contracts::object::ObjectIO as _;
+        use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "multipart-metadata-generation-bucket";
@@ -2358,14 +2368,15 @@ mod tests {
         /// Stage a single-part multipart upload without completing it. A single
         /// part is the last part, so the 5 MiB minimum-part-size gate does not
         /// apply. Returns the upload id and the `CompletePart` list.
-        async fn stage_upload(
+        async fn stage_upload_with_create_opts(
             set_disks: &Arc<SetDisks>,
             bucket: &str,
             object: &str,
             content: &[u8],
+            create_opts: &ObjectOptions,
         ) -> (String, Vec<CompletePart>) {
             let upload = set_disks
-                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .new_multipart_upload(bucket, object, create_opts)
                 .await
                 .expect("multipart upload should be created");
             let mut reader = PutObjReader::new(
@@ -2393,6 +2404,43 @@ mod tests {
             )
         }
 
+        async fn stage_upload(
+            set_disks: &Arc<SetDisks>,
+            bucket: &str,
+            object: &str,
+            content: &[u8],
+        ) -> (String, Vec<CompletePart>) {
+            stage_upload_with_create_opts(set_disks, bucket, object, content, &ObjectOptions::default()).await
+        }
+
+        async fn rewrite_staged_upload_version_id(
+            set_disks: &Arc<SetDisks>,
+            bucket: &str,
+            object: &str,
+            upload_id: &str,
+            version_id: Option<Uuid>,
+        ) {
+            let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, upload_id);
+            let disks = set_disks.disks.read().await.clone();
+            let (fi, mut files_metas) = set_disks
+                .check_upload_id_exists(bucket, object, upload_id, true)
+                .await
+                .expect("staged upload metadata should be readable");
+            for meta in files_metas.iter_mut() {
+                meta.version_id = version_id;
+            }
+            SetDisks::write_unique_file_info(
+                &disks,
+                bucket,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &upload_id_path,
+                &files_metas,
+                fi.write_quorum(set_disks.default_write_quorum()),
+            )
+            .await
+            .expect("staged upload metadata should be rewritten");
+        }
+
         async fn complete(
             set_disks: &Arc<SetDisks>,
             bucket: &str,
@@ -2404,6 +2452,118 @@ mod tests {
                 .clone()
                 .complete_multipart_upload(bucket, object, upload_id, parts, &ObjectOptions::default())
                 .await
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_assigns_completion_version_id() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-versioned-complete-bucket";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            let (upload_id, parts) = stage_upload(&set_disks, bucket, object, b"versioned multipart body").await;
+            let complete_opts = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
+
+            let completed = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
+                .await
+                .expect("versioned multipart completion should succeed");
+            let version_id = completed.version_id.expect("versioned completion must return a version id");
+
+            assert!(!version_id.is_nil(), "versioned completion must not use a null version id");
+
+            let lookup_opts = ObjectOptions {
+                versioned: true,
+                version_id: Some(version_id.to_string()),
+                ..Default::default()
+            };
+            let current = set_disks
+                .get_object_info(bucket, object, &lookup_opts)
+                .await
+                .expect("completed version should be addressable by exact version id");
+
+            assert_eq!(current.version_id, Some(version_id));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_replaces_staged_nil_version_id() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-nil-versioned-complete-bucket";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            let (upload_id, parts) = stage_upload(&set_disks, bucket, object, b"versioned multipart body").await;
+            rewrite_staged_upload_version_id(&set_disks, bucket, object, &upload_id, Some(Uuid::nil())).await;
+            let complete_opts = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
+
+            let completed = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
+                .await
+                .expect("versioned multipart completion should succeed");
+            let version_id = completed.version_id.expect("versioned completion must return a version id");
+
+            assert!(!version_id.is_nil(), "versioned completion must replace a staged null version id");
+
+            let lookup_opts = ObjectOptions {
+                versioned: true,
+                version_id: Some(version_id.to_string()),
+                ..Default::default()
+            };
+            let current = set_disks
+                .get_object_info(bucket, object, &lookup_opts)
+                .await
+                .expect("completed version should be addressable by exact version id");
+
+            assert_eq!(current.version_id, Some(version_id));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_suspended_clears_staged_version_id() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-suspended-complete-bucket";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            let create_opts = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
+
+            let (upload_id, parts) =
+                stage_upload_with_create_opts(&set_disks, bucket, object, b"suspended multipart body", &create_opts).await;
+            let (staged_fi, _) = set_disks
+                .check_upload_id_exists(bucket, object, &upload_id, true)
+                .await
+                .expect("staged upload metadata should be readable");
+            assert!(
+                staged_fi.version_id.is_some_and(|version_id| !version_id.is_nil()),
+                "enabled multipart create should stage a concrete version id"
+            );
+            let complete_opts = ObjectOptions {
+                version_suspended: true,
+                ..Default::default()
+            };
+
+            let completed = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
+                .await
+                .expect("suspended multipart completion should succeed");
+
+            assert!(
+                completed.version_id.is_some_and(|version_id| version_id.is_nil()),
+                "suspended completion must publish a null-version object internally"
+            );
         }
 
         /// Read the whole committed object back; returns `(body, etag)`. The full

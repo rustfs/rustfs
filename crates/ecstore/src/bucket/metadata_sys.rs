@@ -412,6 +412,10 @@ impl BucketMetadataSys {
         }
     }
 
+    pub(crate) fn object_store(&self) -> Arc<ECStore> {
+        self.api.clone()
+    }
+
     pub async fn init(&mut self, buckets: Vec<String>) {
         let _ = self.init_internal(buckets).await;
     }

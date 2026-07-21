@@ -50,7 +50,7 @@ use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -159,6 +159,10 @@ pub struct InstanceContext {
     /// workers (scanner/heal/tier/lifecycle) without touching another instance.
     /// Replaces the process-global cancel-token static.
     background_cancel_token: OnceLock<CancellationToken>,
+    tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
+    transition_transaction_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
+    #[cfg(test)]
+    tier_delete_journal_recovery_wakeup: tokio::sync::Notify,
 }
 
 impl InstanceContext {
@@ -193,6 +197,10 @@ impl InstanceContext {
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
+            tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
+            transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            tier_delete_journal_recovery_wakeup: tokio::sync::Notify::new(),
         }
     }
 
@@ -353,6 +361,34 @@ impl InstanceContext {
         self.background_cancel_token.get().cloned()
     }
 
+    pub(crate) fn bind_background_cancel_token(&self, token: CancellationToken) -> CancellationToken {
+        self.background_cancel_token.get_or_init(|| token).clone()
+    }
+
+    pub(crate) fn mark_tier_delete_journal_recovery_started(&self, store_id: Uuid) -> bool {
+        self.tier_delete_journal_recovery_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(store_id)
+    }
+
+    pub(crate) fn mark_transition_transaction_recovery_started(&self, store_id: Uuid) -> bool {
+        self.transition_transaction_recovery_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(store_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wake_tier_delete_journal_recovery(&self) {
+        self.tier_delete_journal_recovery_wakeup.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_tier_delete_journal_recovery(&self) {
+        self.tier_delete_journal_recovery_wakeup.notified().await;
+    }
+
     /// Update this instance's erasure setup type.
     pub async fn update_erasure_type(&self, setup_type: SetupType) {
         *self.erasure_kind.write().await = setup_type;
@@ -406,6 +442,20 @@ impl std::fmt::Debug for InstanceContext {
             .field("replication_stats_set", &self.replication_stats.get().is_some())
             .field("replication_pool_set", &self.replication_pool.get().is_some())
             .field("background_cancel_token_set", &self.background_cancel_token.get().is_some())
+            .field(
+                "tier_delete_journal_recovery_store_count",
+                &self
+                    .tier_delete_journal_recovery_stores
+                    .lock()
+                    .map_or(0, |stores| stores.len()),
+            )
+            .field(
+                "transition_transaction_recovery_store_count",
+                &self
+                    .transition_transaction_recovery_stores
+                    .lock()
+                    .map_or(0, |stores| stores.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -738,6 +788,36 @@ mod tests {
 
         token.cancel();
         assert!(ctx_a.background_cancel_token().unwrap().is_cancelled());
+    }
+
+    #[test]
+    fn tier_delete_journal_recovery_is_deduplicated_per_store_and_instance() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        let store_a = Uuid::new_v4();
+        let store_b = Uuid::new_v4();
+
+        assert!(ctx_a.mark_tier_delete_journal_recovery_started(store_a));
+        assert!(!ctx_a.mark_tier_delete_journal_recovery_started(store_a));
+        assert!(ctx_a.mark_tier_delete_journal_recovery_started(store_b));
+        assert!(ctx_b.mark_tier_delete_journal_recovery_started(store_a));
+    }
+
+    #[test]
+    fn background_cancel_token_binds_the_provided_shutdown_token() {
+        let ctx = InstanceContext::new();
+        let shutdown = CancellationToken::new();
+        let first = ctx.bind_background_cancel_token(shutdown.clone());
+        let second = ctx.bind_background_cancel_token(CancellationToken::new());
+
+        shutdown.cancel();
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert!(
+            ctx.background_cancel_token()
+                .expect("shutdown token should be published")
+                .is_cancelled()
+        );
     }
 
     // Phase 5 acceptance (backlog#939): two independent instance contexts share

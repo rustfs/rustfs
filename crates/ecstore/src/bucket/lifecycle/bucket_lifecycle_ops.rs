@@ -27,9 +27,12 @@ use crate::bucket::lifecycle::replication_sink::{
     replication_statuses_map, version_purge_statuses_map,
 };
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
-use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
+use crate::bucket::lifecycle::tier_free_version_recovery::{
+    DEFAULT_FREE_VERSION_RECOVERY_LIMIT, FreeVersionRecoveryStats, recover_tier_free_versions_with_cancel,
+};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
+use crate::bucket::lifecycle::transition_transaction::run_transition_transaction_recovery_loop;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -42,11 +45,14 @@ use crate::services::tier::{
     tier::{TierConfigMgr, TierOperationLease, tier_destination_id_from_metadata},
     warm_backend::WarmBackendGetOpts,
 };
-use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
+use crate::set_disk::{
+    MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks, get_lock_acquire_timeout,
+};
 use crate::storage_api_contracts::{
     lifecycle::ExpirationOptions,
     list::ListOperations as _,
     multipart::MultipartOperations as _,
+    namespace::NamespaceLocking as _,
     object::{DeletedObject, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
@@ -54,6 +60,7 @@ use crate::store::ECStore;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
+use rand::RngExt as _;
 use rustfs_common::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
@@ -83,7 +90,7 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
@@ -107,7 +114,6 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
-static TIER_DELETE_JOURNAL_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
@@ -120,6 +126,11 @@ const ENV_STALE_UPLOADS_EXPIRY: &str = "RUSTFS_API_STALE_UPLOADS_EXPIRY";
 const ENV_STALE_UPLOADS_CLEANUP_INTERVAL: &str = "RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL";
 const DEFAULT_STALE_UPLOADS_EXPIRY: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
+const TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL: StdDuration = StdDuration::from_secs(60);
+// Recovery notifications are process-local, so bound the additional idle gap
+// before another full sweep can discover work persisted by another node.
+const TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL: StdDuration = StdDuration::from_secs(10 * 60);
+const TIER_FREE_VERSION_RECOVERY_JITTER_PERCENT: u64 = 10;
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 
@@ -419,6 +430,7 @@ async fn delete_free_version_remote_object(
         &oi.transitioned_object.tier,
         identity,
         tier_config_mgr,
+        false,
     )
     .await?;
     Ok(())
@@ -460,6 +472,7 @@ pub struct ExpiryState {
     tasks_tx: Vec<Sender<Option<ExpiryOpType>>>,
     tasks_rx: Vec<Arc<tokio::sync::Mutex<Receiver<Option<ExpiryOpType>>>>>,
     stats: Arc<ExpiryStats>,
+    recovery_notify: Arc<Notify>,
 }
 
 impl ExpiryState {
@@ -468,6 +481,7 @@ impl ExpiryState {
         Arc::new(RwLock::new(Self {
             tasks_tx: vec![],
             tasks_rx: vec![],
+            recovery_notify: Arc::new(Notify::new()),
             stats: Arc::new(ExpiryStats {
                 missed_expiry_tasks: AtomicI64::new(0),
                 missed_freevers_tasks: AtomicI64::new(0),
@@ -485,6 +499,7 @@ impl ExpiryState {
         Arc::new(RwLock::new(Self {
             tasks_tx: vec![tx],
             tasks_rx: vec![Arc::new(tokio::sync::Mutex::new(rx))],
+            recovery_notify: Arc::new(Notify::new()),
             stats: Arc::new(ExpiryStats {
                 missed_expiry_tasks: AtomicI64::new(0),
                 missed_freevers_tasks: AtomicI64::new(0),
@@ -535,12 +550,14 @@ impl ExpiryState {
         if wrkr.is_none() {
             self.stats.increment_missed_freevers_tasks();
             self.stats.record_scanner_expiry_state();
+            self.recovery_notify.notify_one();
             return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
         let queued = self.send_expiry_task(wrkr, Box::new(task));
         if !queued {
             self.stats.increment_missed_freevers_tasks();
+            self.recovery_notify.notify_one();
         }
         self.stats.record_scanner_expiry_state();
         queued
@@ -628,13 +645,14 @@ impl ExpiryState {
             let api = api.clone();
             let rx = Arc::new(tokio::sync::Mutex::new(rx));
             let stats = Arc::clone(&state.stats);
+            let recovery_notify = Arc::clone(&state.recovery_notify);
             state.tasks_tx.push(tx);
             state.tasks_rx.push(rx.clone());
             state.stats.increment_workers();
             tokio::spawn(async move {
                 let mut rx = rx.lock().await;
                 //let mut expiry_state = runtime_sources::expiry_state_handle().read().await;
-                ExpiryState::worker(&mut rx, api, stats).await;
+                ExpiryState::worker(&mut rx, api, stats, recovery_notify).await;
             });
         }
 
@@ -650,7 +668,12 @@ impl ExpiryState {
         state.stats.record_scanner_expiry_state();
     }
 
-    async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>, stats: Arc<ExpiryStats>) {
+    async fn worker(
+        rx: &mut Receiver<Option<ExpiryOpType>>,
+        api: Arc<ECStore>,
+        stats: Arc<ExpiryStats>,
+        recovery_notify: Arc<Notify>,
+    ) {
         let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new).clone()
@@ -715,60 +738,8 @@ impl ExpiryState {
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("FreeVersionTask downcast failed");
                         let oi = v.0.clone();
-                        let cleanup = delete_free_version_remote_object_then(&oi, &api.tier_config_mgr(), || async {
-                            let mut fi = FileInfo {
-                                name: oi.name.clone(),
-                                version_id: oi.version_id,
-                                deleted: true,
-                                ..Default::default()
-                            };
-                            fi.set_tier_free_version();
-
-                            let mut deleted_locally = false;
-                            for pool in api.pools.iter() {
-                                let set = pool.get_disks_by_key(&oi.name);
-                                match set.delete_object_version(&oi.bucket, &oi.name, &fi, false).await {
-                                    Ok(()) => {
-                                        deleted_locally = true;
-                                        break;
-                                    }
-                                    Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
-                                    Err(err) => {
-                                        debug!(
-                                            event = EVENT_LIFECYCLE_WORKER_STATE,
-                                            component = LOG_COMPONENT_ECSTORE,
-                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                            bucket = %oi.bucket,
-                                            object = %oi.name,
-                                            remote_object = %oi.transitioned_object.name,
-                                            remote_version_id = %oi.transitioned_object.version_id,
-                                            tier = %oi.transitioned_object.tier,
-                                            error = ?err,
-                                            reason = "local_free_version_delete_failed",
-                                            "Lifecycle worker failed local free-version cleanup"
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !deleted_locally {
-                                debug!(
-                                    event = EVENT_LIFECYCLE_WORKER_STATE,
-                                    component = LOG_COMPONENT_ECSTORE,
-                                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                    bucket = %oi.bucket,
-                                    object = %oi.name,
-                                    remote_object = %oi.transitioned_object.name,
-                                    remote_version_id = %oi.transitioned_object.version_id,
-                                    tier = %oi.transitioned_object.tier,
-                                    reason = "local_free_version_missing",
-                                    "Lifecycle worker could not find transitioned free version locally"
-                                );
-                            }
-                        })
-                        .await;
-                        if let Err(err) = cleanup {
+                        if let Err(err) = delete_free_version_remote_object(&oi, &api.tier_config_mgr()).await {
+                            recovery_notify.notify_one();
                             debug!(
                                 bucket = %oi.bucket,
                                 object = %oi.name,
@@ -783,6 +754,103 @@ impl ExpiryState {
                                 "Lifecycle worker skipped remote tier delete"
                             );
                             continue;
+                        }
+
+                        let local_object = encode_dir_object(&oi.name);
+                        let mut fi = FileInfo {
+                            name: local_object.clone(),
+                            version_id: oi.version_id,
+                            ..Default::default()
+                        };
+                        // This removes an existing internal cleanup marker. Keeping
+                        // `deleted` false makes duplicate tasks return not-found
+                        // instead of creating an ordinary delete marker.
+                        fi.set_tier_free_version();
+
+                        let mut deleted_locally = false;
+                        for pool in &api.pools {
+                            let set = pool.get_disks_by_key(&local_object);
+                            let ns_lock = match set.new_ns_lock(&oi.bucket, &local_object).await {
+                                Ok(lock) => lock,
+                                Err(err) => {
+                                    recovery_notify.notify_one();
+                                    debug!(
+                                        event = EVENT_LIFECYCLE_WORKER_STATE,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                        bucket = %oi.bucket,
+                                        object = %oi.name,
+                                        pool_index = pool.pool_idx,
+                                        set_index = set.set_index,
+                                        error = ?err,
+                                        reason = "local_free_version_lock_failed",
+                                        "Lifecycle worker failed to create local free-version cleanup lock"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let _object_lock_guard =
+                                match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
+                                    Ok(guard) => guard,
+                                    Err(err) => {
+                                        recovery_notify.notify_one();
+                                        debug!(
+                                            event = EVENT_LIFECYCLE_WORKER_STATE,
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                            bucket = %oi.bucket,
+                                            object = %oi.name,
+                                            pool_index = pool.pool_idx,
+                                            set_index = set.set_index,
+                                            error = ?err,
+                                            reason = "local_free_version_lock_failed",
+                                            "Lifecycle worker failed to acquire local free-version cleanup lock"
+                                        );
+                                        continue;
+                                    }
+                                };
+                            match set
+                                .delete_object_version(&oi.bucket, &local_object, &fi, false)
+                                .await
+                            {
+                                Ok(()) => {
+                                    deleted_locally = true;
+                                    break;
+                                }
+                                Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
+                                Err(err) => {
+                                    recovery_notify.notify_one();
+                                    debug!(
+                                        event = EVENT_LIFECYCLE_WORKER_STATE,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                        bucket = %oi.bucket,
+                                        object = %oi.name,
+                                        remote_object = %oi.transitioned_object.name,
+                                        remote_version_id = %oi.transitioned_object.version_id,
+                                        tier = %oi.transitioned_object.tier,
+                                        error = ?err,
+                                        reason = "local_free_version_delete_failed",
+                                        "Lifecycle worker failed local free-version cleanup"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !deleted_locally {
+                            debug!(
+                                event = EVENT_LIFECYCLE_WORKER_STATE,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                bucket = %oi.bucket,
+                                object = %oi.name,
+                                remote_object = %oi.transitioned_object.name,
+                                remote_version_id = %oi.transitioned_object.version_id,
+                                tier = %oi.transitioned_object.tier,
+                                reason = "local_free_version_missing",
+                                "Lifecycle worker could not find transitioned free version locally"
+                            );
                         }
                     }
                     else {
@@ -824,9 +892,50 @@ async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryStat
     queued
 }
 
+#[cfg(test)]
+type RecoveredFreeVersionEnqueueObserver = Box<dyn Fn(bool) + Send + Sync>;
+
+#[cfg(test)]
+static RECOVERED_FREE_VERSION_ENQUEUE_OBSERVER: Mutex<Option<RecoveredFreeVersionEnqueueObserver>> = Mutex::new(None);
+
+#[cfg(test)]
+struct RecoveredFreeVersionEnqueueObserverGuard;
+
+#[cfg(test)]
+impl Drop for RecoveredFreeVersionEnqueueObserverGuard {
+    fn drop(&mut self) {
+        let mut observer = RECOVERED_FREE_VERSION_ENQUEUE_OBSERVER
+            .lock()
+            .expect("recovered free-version enqueue observer lock should not poison");
+        *observer = None;
+    }
+}
+
+#[cfg(test)]
+fn set_recovered_free_version_enqueue_observer(
+    observer_fn: impl Fn(bool) + Send + Sync + 'static,
+) -> RecoveredFreeVersionEnqueueObserverGuard {
+    let mut observer = RECOVERED_FREE_VERSION_ENQUEUE_OBSERVER
+        .lock()
+        .expect("recovered free-version enqueue observer lock should not poison");
+    *observer = Some(Box::new(observer_fn));
+    RecoveredFreeVersionEnqueueObserverGuard
+}
+
 pub async fn enqueue_recovered_free_version(oi: ObjectInfo) -> bool {
     let expiry_state = runtime_sources::expiry_state_handle();
-    enqueue_recovered_free_version_with_state(&expiry_state, oi).await
+    let queued = enqueue_recovered_free_version_with_state(&expiry_state, oi).await;
+
+    #[cfg(test)]
+    if let Some(observer) = RECOVERED_FREE_VERSION_ENQUEUE_OBSERVER
+        .lock()
+        .expect("recovered free-version enqueue observer lock should not poison")
+        .as_ref()
+    {
+        observer(queued);
+    }
+
+    queued
 }
 
 struct TransitionTask {
@@ -1426,91 +1535,291 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     }
 
     ExpiryState::resize_workers(workers, api.clone()).await;
-    spawn_tier_free_version_recovery_once(api.clone());
-    spawn_tier_delete_journal_recovery_once(api);
+    let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
+    spawn_tier_delete_journal_recovery_once(api.clone());
+    spawn_transition_transaction_recovery_once(api);
 }
 
-fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
-    if TIER_FREE_VERSION_RECOVERY_STARTED.set(()).is_err() {
-        return;
+fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<()>) -> Option<JoinHandle<()>> {
+    if started.set(()).is_err() {
+        return None;
     }
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_default();
-        let mut interval = tokio::time::interval(StdDuration::from_secs(60));
-        let mut bucket_marker: Option<String> = None;
-        let mut object_marker: Option<String> = None;
-
-        loop {
-            select! {
-                _ = cancel_token.cancelled() => return,
-                _ = interval.tick() => {}
-            }
-
-            let started_at = std::time::Instant::now();
-            match recover_tier_free_versions(
-                api.clone(),
-                DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
-                bucket_marker.clone(),
-                object_marker.clone(),
-            )
-            .await
-            {
-                Ok(stats) => {
-                    bucket_marker = stats.next_bucket_marker;
-                    object_marker = stats.next_object_marker;
-                    let (pending_tasks, active_tasks) = {
-                        let expiry_state = runtime_sources::expiry_state_handle();
-                        let state = expiry_state.read().await;
-                        (state.pending_tasks(), state.stats.active_tasks())
-                    };
-                    debug!(
-                        event = EVENT_LIFECYCLE_WORKER_STATE,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        duration_ms = started_at.elapsed().as_millis(),
-                        scanned = stats.scanned,
-                        scanned_entries = stats.scanned_entries,
-                        buckets_scanned = stats.buckets_scanned,
-                        enqueued = stats.enqueued,
-                        failed = stats.failed,
-                        truncated = stats.truncated,
-                        next_bucket_marker = ?bucket_marker,
-                        next_object_marker = ?object_marker,
-                        pending_tasks,
-                        active_tasks,
-                        "Recovered tier free-version cleanup tasks"
-                    );
+        let expiry_state = runtime_sources::expiry_state_handle();
+        run_tier_free_version_recovery_loop(
+            cancel_token,
+            expiry_state,
+            jitter_tier_free_version_recovery_delay,
+            move |bucket_marker, object_marker, recovery_cancel| {
+                let api = Arc::clone(&api);
+                async move {
+                    recover_tier_free_versions_with_cancel(
+                        api,
+                        DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
+                        bucket_marker,
+                        object_marker,
+                        recovery_cancel,
+                    )
+                    .await
                 }
-                Err(err) => {
-                    rustfs_io_metrics::record_stage_duration(
-                        "lifecycle_free_version_recovery_failed",
-                        started_at.elapsed().as_secs_f64() * 1000.0,
-                    );
-                    warn!(
-                        event = EVENT_LIFECYCLE_WORKER_STATE,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                        duration_ms = started_at.elapsed().as_millis(),
-                        next_bucket_marker = ?bucket_marker,
-                        next_object_marker = ?object_marker,
-                        error = ?err,
-                        "Failed to recover tier free-version cleanup tasks"
-                    );
+            },
+        )
+        .await;
+    }))
+}
+
+async fn run_tier_free_version_recovery_loop<F, Fut>(
+    cancel_token: CancellationToken,
+    expiry_state: Arc<RwLock<ExpiryState>>,
+    jitter_delay: fn(StdDuration) -> StdDuration,
+    mut recover: F,
+) where
+    F: FnMut(Option<String>, Option<String>, CancellationToken) -> Fut,
+    Fut: Future<Output = crate::error::Result<FreeVersionRecoveryStats>>,
+{
+    let recovery_notify = Arc::clone(&expiry_state.read().await.recovery_notify);
+    let mut schedule = TierFreeVersionRecoverySchedule::default();
+
+    loop {
+        if !wait_for_tier_free_version_recovery(&cancel_token, recovery_notify.as_ref(), &mut schedule, jitter_delay).await {
+            return;
+        }
+
+        let started_at = tokio::time::Instant::now();
+        let recovery_cancel = cancel_token.child_token();
+        let recovery_result =
+            recover(schedule.bucket_marker.clone(), schedule.object_marker.clone(), recovery_cancel.clone()).await;
+        recovery_cancel.cancel();
+        if cancel_token.is_cancelled() {
+            return;
+        }
+
+        match recovery_result {
+            Ok(stats) => {
+                let elapsed = started_at.elapsed();
+                schedule.record_success(&stats, elapsed);
+                let (pending_tasks, active_tasks) = {
+                    let state = expiry_state.read().await;
+                    (state.pending_tasks(), state.stats.active_tasks())
+                };
+                debug!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    duration_ms = elapsed.as_millis(),
+                    scanned = stats.scanned,
+                    scanned_entries = stats.scanned_entries,
+                    buckets_scanned = stats.buckets_scanned,
+                    enqueued = stats.enqueued,
+                    failed = stats.failed,
+                    truncated = stats.truncated,
+                    next_bucket_marker = ?schedule.bucket_marker,
+                    next_object_marker = ?schedule.object_marker,
+                    pending_tasks,
+                    active_tasks,
+                    nominal_next_recovery_delay_secs = schedule.next_delay.as_secs(),
+                    idle_backoff_multiplier =
+                        schedule.next_delay.as_secs() / TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL.as_secs(),
+                    follow_up_sweep = schedule.follow_up_sweep,
+                    "Recovered tier free-version cleanup tasks"
+                );
+            }
+            Err(err) => {
+                let elapsed = started_at.elapsed();
+                schedule.record_failure(elapsed);
+                rustfs_io_metrics::record_stage_duration(
+                    "lifecycle_free_version_recovery_failed",
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+                warn!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    duration_ms = elapsed.as_millis(),
+                    next_bucket_marker = ?schedule.bucket_marker,
+                    next_object_marker = ?schedule.object_marker,
+                    nominal_next_recovery_delay_secs = schedule.next_delay.as_secs(),
+                    error = ?err,
+                    "Failed to recover tier free-version cleanup tasks"
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_tier_free_version_recovery(
+    cancel_token: &CancellationToken,
+    recovery_notify: &Notify,
+    schedule: &mut TierFreeVersionRecoverySchedule,
+    jitter_delay: fn(StdDuration) -> StdDuration,
+) -> bool {
+    let next_delay = if schedule.jitter_next_delay {
+        jitter_delay(schedule.next_delay)
+    } else {
+        schedule.next_delay
+    };
+    let sleep_delay = next_delay.saturating_sub(schedule.previous_run_duration);
+    schedule.previous_run_duration = StdDuration::ZERO;
+    schedule.jitter_next_delay = false;
+    let sleep = tokio::time::sleep(sleep_delay);
+    tokio::pin!(sleep);
+    let mut recovery_request_consumed = false;
+
+    loop {
+        select! {
+            biased;
+            _ = cancel_token.cancelled() => return false,
+            _ = &mut sleep => return true,
+            _ = recovery_notify.notified(), if !recovery_request_consumed => {
+                schedule.request_retry();
+                recovery_request_consumed = true;
+                let requested_deadline = tokio::time::Instant::now() + schedule.next_delay;
+                if requested_deadline < sleep.deadline() {
+                    sleep.as_mut().reset(requested_deadline);
                 }
             }
         }
-    });
+    }
+}
+
+fn jitter_tier_free_version_recovery_delay(delay: StdDuration) -> StdDuration {
+    if delay.is_zero() {
+        return delay;
+    }
+    let delay = delay.clamp(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
+
+    let delay_millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    let jitter_window_millis = delay_millis.saturating_mul(TIER_FREE_VERSION_RECOVERY_JITTER_PERCENT) / 100;
+    if jitter_window_millis == 0 {
+        return delay;
+    }
+
+    let lower_bound = delay
+        .saturating_sub(StdDuration::from_millis(jitter_window_millis))
+        .max(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+    let upper_bound = delay
+        .saturating_add(StdDuration::from_millis(jitter_window_millis))
+        .min(TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
+    let lower_millis = u64::try_from(lower_bound.as_millis()).unwrap_or(u64::MAX);
+    let upper_millis = u64::try_from(upper_bound.as_millis()).unwrap_or(u64::MAX);
+
+    StdDuration::from_millis(rand::rng().random_range(lower_millis..=upper_millis))
+}
+
+#[derive(Debug, Clone)]
+struct TierFreeVersionRecoverySchedule {
+    next_delay: StdDuration,
+    idle_interval: StdDuration,
+    previous_run_duration: StdDuration,
+    jitter_next_delay: bool,
+    bucket_marker: Option<String>,
+    object_marker: Option<String>,
+    follow_up_sweep: bool,
+}
+
+impl Default for TierFreeVersionRecoverySchedule {
+    fn default() -> Self {
+        Self {
+            next_delay: StdDuration::ZERO,
+            idle_interval: TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
+            previous_run_duration: StdDuration::ZERO,
+            jitter_next_delay: false,
+            bucket_marker: None,
+            object_marker: None,
+            follow_up_sweep: false,
+        }
+    }
+}
+
+impl TierFreeVersionRecoverySchedule {
+    fn reset_idle_interval(&mut self) {
+        self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
+        self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
+        self.previous_run_duration = StdDuration::ZERO;
+        self.jitter_next_delay = false;
+    }
+
+    fn request_retry(&mut self) {
+        if self.bucket_marker.is_some() || self.object_marker.is_some() {
+            self.follow_up_sweep = true;
+        }
+        self.reset_idle_interval();
+    }
+
+    fn record_failure(&mut self, run_duration: StdDuration) {
+        self.reset_idle_interval();
+        self.previous_run_duration = run_duration;
+    }
+
+    fn record_success(&mut self, stats: &FreeVersionRecoveryStats, run_duration: StdDuration) {
+        if stats.enqueued > 0 || stats.failed > 0 {
+            self.follow_up_sweep = true;
+        }
+
+        self.bucket_marker = stats.next_bucket_marker.clone();
+        self.object_marker = stats.next_object_marker.clone();
+        if stats.truncated {
+            self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
+            self.previous_run_duration = run_duration;
+            self.jitter_next_delay = false;
+            return;
+        }
+
+        self.bucket_marker = None;
+        self.object_marker = None;
+        if self.follow_up_sweep {
+            self.follow_up_sweep = false;
+            self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
+            self.next_delay = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
+            self.previous_run_duration = run_duration;
+            self.jitter_next_delay = false;
+            return;
+        }
+
+        self.next_delay = self.idle_interval;
+        self.previous_run_duration = run_duration;
+        self.jitter_next_delay = true;
+        self.idle_interval = std::cmp::min(self.idle_interval.saturating_mul(2), TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
+    }
 }
 
 fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
-    if TIER_DELETE_JOURNAL_RECOVERY_STARTED.set(()).is_err() {
+    let Some(cancel_token) = api.ctx.background_cancel_token() else {
+        error!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            store_id = %api.id,
+            "Tier delete journal recovery was not started because the store shutdown token is unavailable"
+        );
+        return;
+    };
+    if !api.ctx.mark_tier_delete_journal_recovery_started(api.id) {
         return;
     }
-
     tokio::spawn(async move {
-        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_default();
         run_tier_delete_journal_recovery_loop(api, cancel_token).await;
+    });
+}
+
+fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
+    let Some(cancel_token) = api.ctx.background_cancel_token() else {
+        error!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            store_id = %api.id,
+            "Transition transaction recovery was not started because the store shutdown token is unavailable"
+        );
+        return;
+    };
+    if !api.ctx.mark_transition_transaction_recovery_started(api.id) {
+        return;
+    }
+    tokio::spawn(async move {
+        run_transition_transaction_recovery_loop(api, cancel_token).await;
     });
 }
 
@@ -1989,7 +2298,7 @@ fn transitioned_cleanup_tuple(oi: &ObjectInfo) -> Result<(&str, &str, &str), std
     if transitioned.status != lifecycle::TRANSITION_COMPLETE {
         return Err(std::io::Error::other("transitioned object cleanup tuple is not complete"));
     }
-    if transitioned.name.is_empty() || transitioned.version_id.is_empty() || transitioned.tier.is_empty() {
+    if transitioned.name.is_empty() || transitioned.tier.is_empty() {
         return Err(std::io::Error::other("transitioned object cleanup tuple is incomplete"));
     }
     Ok((&transitioned.name, &transitioned.version_id, &transitioned.tier))
@@ -3148,31 +3457,38 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, StaleMultipartUploadCandidate, TransitionState, TransitionedObject,
-        VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
-        enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, eval_action_from_lifecycle,
-        lifecycle_action_blocked_by_replication, lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object,
-        lifecycle_replication_blocks_action, lifecycle_rule_has_date_expiration,
-        lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_queue_capacity,
-        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
-        select_restore_s3_location, should_defer_date_expiry_for_recent_config_update,
+        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, FreeVersionTask, StaleMultipartUploadCandidate,
+        TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TierFreeVersionRecoverySchedule,
+        TransitionState, TransitionedObject, VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks,
+        cleanup_stale_multipart_uploads_once_at, enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle,
+        eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
+        lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
+        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
+        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
         should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
+        wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
-    use super::{delete_free_version_remote_object_then, get_transitioned_object_reader_with_tier_manager};
+    use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
     };
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
+    use crate::bucket::lifecycle::tier_free_version_recovery::{
+        FreeVersionRecoveryStats, RecoveryWalkTestAction, list_tier_free_versions, recover_tier_free_versions_with_cancel,
+        set_recovery_bucket_list_wait_hook, set_recovery_walk_test_hook,
+    };
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
     #[cfg(feature = "test-util")]
     use crate::client::transition_api::ReaderImpl;
-    use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
     use crate::disk::endpoint::Endpoint;
+    use crate::disk::{RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
     use crate::error::is_err_invalid_upload_id;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
@@ -3183,10 +3499,13 @@ mod tests {
     #[cfg(feature = "test-util")]
     use crate::services::tier::warm_backend::WarmBackend as _;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
+    #[cfg(feature = "test-util")]
+    use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::{
-        bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
+        bucket::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
         lifecycle::ExpirationOptions,
         multipart::MultipartOperations as _,
+        object::{ObjectIO as _, ObjectOperations as _},
     };
     use crate::store::ECStore;
     #[cfg(feature = "test-util")]
@@ -3196,6 +3515,7 @@ mod tests {
     use http::HeaderMap;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
+    use rustfs_filemeta::{FileInfo, FileMeta};
     use s3s::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
         RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
@@ -3205,8 +3525,8 @@ mod tests {
     use std::collections::HashMap;
     use std::env;
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
     use tokio::fs;
@@ -3214,6 +3534,455 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn free_version_recovery_stats(enqueued: usize, failed: usize, truncated: bool) -> FreeVersionRecoveryStats {
+        FreeVersionRecoveryStats {
+            scanned: enqueued.saturating_add(failed),
+            enqueued,
+            failed,
+            next_bucket_marker: truncated.then(|| "bucket".to_string()),
+            next_object_marker: truncated.then(|| "object".to_string()),
+            scanned_entries: 1,
+            buckets_scanned: 1,
+            truncated,
+        }
+    }
+
+    static RECOVERY_JITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_recovery_delay(delay: StdDuration) -> StdDuration {
+        RECOVERY_JITTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        delay
+    }
+
+    #[test]
+    fn tier_free_version_recovery_backs_off_only_after_complete_idle_sweeps() {
+        let idle = free_version_recovery_stats(0, 0, false);
+        let mut schedule = TierFreeVersionRecoverySchedule::default();
+
+        assert_eq!(schedule.next_delay, StdDuration::ZERO);
+        for expected in [60, 120, 240, 480, 600, 600, 600, 600] {
+            schedule.record_success(&idle, StdDuration::ZERO);
+            assert_eq!(schedule.next_delay, StdDuration::from_secs(expected));
+        }
+        assert_eq!(schedule.next_delay.as_secs() / TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL.as_secs(), 10);
+    }
+
+    #[test]
+    fn tier_free_version_recovery_pagination_preserves_full_sweep_backoff() {
+        let idle = free_version_recovery_stats(0, 0, false);
+        let mut schedule = TierFreeVersionRecoverySchedule::default();
+        schedule.record_success(&idle, StdDuration::ZERO);
+        schedule.record_success(&idle, StdDuration::ZERO);
+        assert_eq!(schedule.next_delay, StdDuration::from_secs(120));
+        assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
+
+        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+        assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
+        assert_eq!(schedule.bucket_marker.as_deref(), Some("bucket"));
+        assert_eq!(schedule.object_marker.as_deref(), Some("object"));
+
+        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+        assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+        assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
+
+        schedule.record_success(&idle, StdDuration::ZERO);
+        assert_eq!(schedule.next_delay, StdDuration::from_secs(240));
+        assert_eq!(schedule.idle_interval, StdDuration::from_secs(480));
+        assert!(schedule.bucket_marker.is_none());
+        assert!(schedule.object_marker.is_none());
+    }
+
+    #[test]
+    fn tier_free_version_recovery_wake_during_pagination_keeps_one_full_follow_up() {
+        let mut schedule = TierFreeVersionRecoverySchedule::default();
+        schedule.record_success(&free_version_recovery_stats(0, 0, true), StdDuration::ZERO);
+
+        schedule.request_retry();
+        schedule.request_retry();
+        assert!(schedule.follow_up_sweep);
+        assert_eq!(schedule.bucket_marker.as_deref(), Some("bucket"));
+        assert_eq!(schedule.object_marker.as_deref(), Some("object"));
+
+        schedule.record_success(&free_version_recovery_stats(0, 0, false), StdDuration::ZERO);
+        assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+        assert!(!schedule.follow_up_sweep);
+        assert!(schedule.bucket_marker.is_none());
+        assert!(schedule.object_marker.is_none());
+    }
+
+    #[test]
+    fn tier_free_version_recovery_work_during_pagination_keeps_one_full_follow_up() {
+        let idle = free_version_recovery_stats(0, 0, false);
+        for work in [
+            free_version_recovery_stats(1, 0, true),
+            free_version_recovery_stats(0, 1, true),
+        ] {
+            let mut schedule = TierFreeVersionRecoverySchedule::default();
+            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle, StdDuration::ZERO);
+            assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
+
+            schedule.record_success(&work, StdDuration::ZERO);
+            assert!(schedule.follow_up_sweep);
+            assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
+            assert!(!schedule.jitter_next_delay);
+
+            schedule.record_success(&idle, StdDuration::ZERO);
+            assert!(!schedule.follow_up_sweep);
+            assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert_eq!(schedule.idle_interval, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert!(!schedule.jitter_next_delay);
+
+            schedule.record_success(&idle, StdDuration::ZERO);
+            assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert_eq!(schedule.idle_interval, StdDuration::from_secs(120));
+        }
+    }
+
+    #[test]
+    fn tier_free_version_recovery_work_on_complete_page_gets_full_follow_up() {
+        let idle = free_version_recovery_stats(0, 0, false);
+        for work in [
+            free_version_recovery_stats(1, 0, false),
+            free_version_recovery_stats(0, 1, false),
+        ] {
+            let mut schedule = TierFreeVersionRecoverySchedule::default();
+            schedule.record_success(&idle, StdDuration::ZERO);
+            schedule.record_success(&idle, StdDuration::ZERO);
+            assert_eq!(schedule.idle_interval, StdDuration::from_secs(240));
+
+            schedule.record_success(&work, StdDuration::ZERO);
+            assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert_eq!(schedule.idle_interval, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert!(!schedule.follow_up_sweep);
+            assert!(!schedule.jitter_next_delay);
+
+            schedule.record_success(&idle, StdDuration::ZERO);
+            assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert_eq!(schedule.idle_interval, StdDuration::from_secs(120));
+        }
+    }
+
+    #[test]
+    fn tier_free_version_recovery_jitter_stays_within_bounded_window() {
+        assert_eq!(jitter_tier_free_version_recovery_delay(StdDuration::ZERO), StdDuration::ZERO);
+        for _ in 0..100 {
+            let below_base = jitter_tier_free_version_recovery_delay(StdDuration::from_secs(1));
+            assert!(below_base >= TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert!(below_base <= StdDuration::from_secs(66));
+
+            let base = jitter_tier_free_version_recovery_delay(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert!(base >= TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+            assert!(base <= StdDuration::from_secs(66));
+
+            let max = jitter_tier_free_version_recovery_delay(TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
+            assert!(max >= StdDuration::from_secs(9 * 60));
+            assert!(max <= TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
+
+            let above_max = jitter_tier_free_version_recovery_delay(StdDuration::from_secs(2 * 60 * 60));
+            assert!(above_max >= StdDuration::from_secs(9 * 60));
+            assert!(above_max <= TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn tier_free_version_recovery_coalesces_notify_bursts_per_wait() {
+        RECOVERY_JITTER_CALLS.store(0, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut schedule = TierFreeVersionRecoverySchedule {
+            next_delay: TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
+            idle_interval: TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
+            jitter_next_delay: true,
+            ..Default::default()
+        };
+        let wait_notify = Arc::clone(&notify);
+        let wait_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            let ready =
+                wait_for_tier_free_version_recovery(&wait_cancel, wait_notify.as_ref(), &mut schedule, counting_recovery_delay)
+                    .await;
+            (ready, schedule)
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(RECOVERY_JITTER_CALLS.load(Ordering::SeqCst), 1);
+        notify.notify_one();
+        notify.notify_one();
+        notify.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(RECOVERY_JITTER_CALLS.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(StdDuration::from_secs(59)).await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+
+        let (ready, schedule) = waiter.await.expect("recovery wait task should complete");
+        assert!(ready);
+        assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+        assert_eq!(RECOVERY_JITTER_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_loop_uses_exponential_idle_schedule() {
+        let cancel = CancellationToken::new();
+        let state = ExpiryState::new();
+        let recovery_notify = Arc::clone(&state.read().await.recovery_notify);
+        let started_at = tokio::time::Instant::now();
+        let call_times = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_call_times = Arc::clone(&call_times);
+        let loop_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(loop_cancel, state, std::convert::identity, move |_, _, _| {
+                recorded_call_times
+                    .lock()
+                    .expect("recovery call times lock should not be poisoned")
+                    .push(tokio::time::Instant::now().duration_since(started_at));
+                async { Ok(free_version_recovery_stats(0, 0, false)) }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            call_times
+                .lock()
+                .expect("recovery call times lock should not be poisoned")
+                .as_slice(),
+            &[StdDuration::ZERO]
+        );
+
+        tokio::time::advance(StdDuration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        for delay in [240, 480, 600, 600, 600] {
+            tokio::time::advance(StdDuration::from_secs(delay)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(StdDuration::from_secs(5 * 60)).await;
+        recovery_notify.notify_one();
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(59)).await;
+        assert_eq!(
+            call_times
+                .lock()
+                .expect("recovery call times lock should not be poisoned")
+                .len(),
+            8
+        );
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        worker.await.expect("recovery loop should stop after cancellation");
+
+        assert_eq!(
+            call_times
+                .lock()
+                .expect("recovery call times lock should not be poisoned")
+                .as_slice(),
+            &[
+                StdDuration::ZERO,
+                StdDuration::from_secs(60),
+                StdDuration::from_secs(180),
+                StdDuration::from_secs(420),
+                StdDuration::from_secs(900),
+                StdDuration::from_secs(1_500),
+                StdDuration::from_secs(2_100),
+                StdDuration::from_secs(2_700),
+                StdDuration::from_secs(3_060),
+            ]
+        );
+    }
+
+    async fn tier_free_version_recovery_page_call_times(run_duration: StdDuration) -> Vec<StdDuration> {
+        RECOVERY_JITTER_CALLS.store(0, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let state = ExpiryState::new();
+        let started_at = tokio::time::Instant::now();
+        let call_times = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_call_times = Arc::clone(&call_times);
+        let call_index = Arc::new(AtomicUsize::new(0));
+        let recorded_call_index = Arc::clone(&call_index);
+        let loop_cancel = cancel.clone();
+        let recovery_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(loop_cancel, state, counting_recovery_delay, move |_, _, _| {
+                recorded_call_times
+                    .lock()
+                    .expect("recovery call times lock should not be poisoned")
+                    .push(tokio::time::Instant::now().duration_since(started_at));
+                let index = recorded_call_index.fetch_add(1, Ordering::SeqCst);
+                let cancel = recovery_cancel.clone();
+                async move {
+                    if index == 0 {
+                        tokio::time::sleep(run_duration).await;
+                        Ok(free_version_recovery_stats(0, 0, true))
+                    } else {
+                        cancel.cancel();
+                        Ok(free_version_recovery_stats(0, 0, false))
+                    }
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(run_duration).await;
+        tokio::task::yield_now().await;
+        if run_duration < TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL {
+            let remaining = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL - run_duration;
+            tokio::time::advance(remaining - StdDuration::from_secs(1)).await;
+            assert_eq!(call_index.load(Ordering::SeqCst), 1);
+            tokio::time::advance(StdDuration::from_secs(1)).await;
+        }
+        tokio::task::yield_now().await;
+        worker.await.expect("recovery loop should stop after cancellation");
+        assert_eq!(
+            RECOVERY_JITTER_CALLS.load(Ordering::SeqCst),
+            0,
+            "active pagination must not invoke idle jitter"
+        );
+
+        Arc::try_unwrap(call_times)
+            .expect("recovery loop should release the call-time log")
+            .into_inner()
+            .expect("recovery call times lock should not be poisoned")
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn tier_free_version_recovery_preserves_start_to_start_page_cadence() {
+        assert_eq!(
+            tier_free_version_recovery_page_call_times(StdDuration::from_secs(45)).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(60)]
+        );
+        assert_eq!(
+            tier_free_version_recovery_page_call_times(StdDuration::from_secs(75)).await,
+            vec![StdDuration::ZERO, StdDuration::from_secs(75)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_loop_resets_high_backoff_after_error() {
+        let cancel = CancellationToken::new();
+        let state = ExpiryState::new();
+        let call_index = Arc::new(AtomicUsize::new(0));
+        let recorded_call_index = Arc::clone(&call_index);
+        let loop_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(loop_cancel, state, std::convert::identity, move |_, _, _| {
+                let index = recorded_call_index.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if index == 2 {
+                        Err(std::io::Error::other("injected recovery failure").into())
+                    } else {
+                        Ok(free_version_recovery_stats(0, 0, false))
+                    }
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 3);
+
+        tokio::time::advance(StdDuration::from_secs(59)).await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 3);
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 4);
+
+        cancel.cancel();
+        worker.await.expect("recovery loop should stop after cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_loop_carries_markers_across_errors() {
+        let cancel = CancellationToken::new();
+        let state = ExpiryState::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_calls = Arc::clone(&calls);
+        let call_index = Arc::new(AtomicUsize::new(0));
+        let recorded_call_index = Arc::clone(&call_index);
+        let loop_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(loop_cancel, state, std::convert::identity, move |bucket, object, _| {
+                recorded_calls
+                    .lock()
+                    .expect("recovery call log lock should not be poisoned")
+                    .push((bucket, object));
+                let index = recorded_call_index.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match index {
+                        0 => Ok(free_version_recovery_stats(0, 0, true)),
+                        1 => Err(std::io::Error::other("injected recovery failure").into()),
+                        _ => Ok(free_version_recovery_stats(0, 0, false)),
+                    }
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 1);
+        tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 2);
+        tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(call_index.load(Ordering::SeqCst), 3);
+
+        cancel.cancel();
+        worker.await.expect("recovery loop should stop after cancellation");
+        assert_eq!(
+            calls
+                .lock()
+                .expect("recovery call log lock should not be poisoned")
+                .as_slice(),
+            &[
+                (None, None),
+                (Some("bucket".to_string()), Some("object".to_string())),
+                (Some("bucket".to_string()), Some("object".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_loop_cancels_active_sweep() {
+        let cancel = CancellationToken::new();
+        let state = ExpiryState::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let loop_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(loop_cancel, state, std::convert::identity, move |_, _, recovery_cancel| {
+                started_tx
+                    .take()
+                    .expect("recovery should start only once")
+                    .send(recovery_cancel.clone())
+                    .expect("test should receive active recovery token");
+                async move {
+                    recovery_cancel.cancelled().await;
+                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled").into())
+                }
+            })
+            .await;
+        });
+
+        let active_recovery = started_rx.await.expect("recovery loop should start immediately");
+        cancel.cancel();
+        worker.await.expect("recovery loop should stop after cancellation");
+
+        assert!(active_recovery.is_cancelled());
+    }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
@@ -3576,6 +4345,7 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([1; 32]),
+            version_id_exact: false,
         };
 
         let err = state
@@ -3589,6 +4359,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_free_version_reports_false_without_worker_channel() {
         let state = ExpiryState::new();
+        let recovery_notify = Arc::clone(&state.read().await.recovery_notify);
         let mut state = state.write().await;
         let oi = ObjectInfo {
             bucket: "bucket".to_string(),
@@ -3607,6 +4378,7 @@ mod tests {
 
         assert!(!queued);
         assert_eq!(state.stats.missed_free_vers_tasks(), 1);
+        assert!(recovery_notify.notified().now_or_never().is_some());
     }
 
     #[tokio::test]
@@ -3664,6 +4436,7 @@ mod tests {
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
             backend_identity: Some([1; 32]),
+            version_id_exact: false,
         };
 
         state
@@ -3705,8 +4478,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_free_version_recovery_enqueue_reports_retryable_queue_failure() {
+    async fn enqueue_free_version_notifies_recovery_when_worker_queue_full() {
         let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let recovery_notify = Arc::clone(&state.read().await.recovery_notify);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut state = state.write().await;
+
+        assert!(state.enqueue_free_version(oi.clone()));
+        assert!(recovery_notify.notified().now_or_never().is_none());
+        assert!(!state.enqueue_free_version(oi));
+        assert_eq!(state.stats.pending_tasks(), 1);
+        assert_eq!(state.stats.missed_free_vers_tasks(), 1);
+        assert!(recovery_notify.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn free_version_worker_failure_notifies_recovery() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let state = ExpiryState::new();
+        let (stats, recovery_notify) = {
+            let state = state.read().await;
+            (Arc::clone(&state.stats), Arc::clone(&state.recovery_notify))
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let worker_stats = Arc::clone(&stats);
+        let worker_notify = Arc::clone(&recovery_notify);
+        let worker = tokio::spawn(async move {
+            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+        });
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: format!("missing-tier-{}", Uuid::new_v4()),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        stats.increment_pending_tasks();
+        tx.send(Some(Box::new(FreeVersionTask(oi))))
+            .await
+            .expect("free-version task should reach the worker");
+        tx.send(None).await.expect("worker stop signal should be delivered");
+        worker.await.expect("free-version worker should stop cleanly");
+
+        assert!(recovery_notify.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resize_workers_wires_recovery_notify_to_worker_failures() {
+        // A recovered free version without a persisted durable backend identity
+        // fails closed during remote cleanup, which must wake recovery.
+        let (_paths, ecstore) = setup_test_env().await;
+        let runtime_state = reset_runtime_expiry_state(&ecstore).await;
+        ExpiryState::resize_workers(1, Arc::clone(&ecstore)).await;
+        let (recovery_notify, stop_tx) = {
+            let state = runtime_state.read().await;
+            assert_eq!(state.tasks_tx.len(), 1);
+            (Arc::clone(&state.recovery_notify), state.tasks_tx[0].clone())
+        };
         let oi = ObjectInfo {
             bucket: "bucket".to_string(),
             name: "object".to_string(),
@@ -3720,14 +4567,357 @@ mod tests {
             ..Default::default()
         };
 
-        let first = enqueue_recovered_free_version_with_state(&state, oi.clone()).await;
-        let second = enqueue_recovered_free_version_with_state(&state, oi).await;
-        let state = state.read().await;
+        assert!(
+            super::enqueue_recovered_free_version(oi).await,
+            "the resized production worker queue should accept the task"
+        );
+        stop_tx.send(None).await.expect("worker stop signal should be delivered");
+        if tokio::time::timeout(StdDuration::from_secs(30), recovery_notify.notified())
+            .await
+            .is_err()
+        {
+            let state = runtime_state.read().await;
+            panic!(
+                "worker failure did not wake recovery: pending={}, active={}, workers={}",
+                state.stats.pending_tasks(),
+                state.stats.active_tasks(),
+                state.stats.num_workers()
+            );
+        }
 
-        assert!(first);
-        assert!(!second);
-        assert_eq!(state.stats.pending_tasks(), 1);
-        assert_eq!(state.stats.missed_free_vers_tasks(), 1);
+        reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn free_version_worker_success_does_not_notify_recovery() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-worker-success-{}", Uuid::new_v4());
+        let object = "free-version/";
+        let local_object = encode_dir_object(object);
+        create_test_bucket(&ecstore, &bucket).await;
+        let (_backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, &local_object, None, Some(identity_hex)).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("seeded free version should be listed");
+        let oi = page
+            .items
+            .into_iter()
+            .next()
+            .expect("seeded free version should be recoverable");
+        assert_eq!(oi.name, object);
+
+        let state = ExpiryState::new();
+        let (stats, recovery_notify) = {
+            let state = state.read().await;
+            (Arc::clone(&state.stats), Arc::clone(&state.recovery_notify))
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let worker_stats = Arc::clone(&stats);
+        let worker_notify = Arc::clone(&recovery_notify);
+        let worker = tokio::spawn(async move {
+            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+        });
+
+        stats.increment_pending_tasks();
+        tx.send(Some(Box::new(FreeVersionTask(oi))))
+            .await
+            .expect("free-version task should reach the worker");
+        tx.send(None).await.expect("worker stop signal should be delivered");
+        worker.await.expect("free-version worker should stop cleanly");
+
+        assert!(recovery_notify.notified().now_or_never().is_none());
+        for disk_path in &disk_paths {
+            assert!(
+                !fs::try_exists(disk_path.join(&bucket).join(&local_object))
+                    .await
+                    .expect("free-version path existence check should succeed")
+            );
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn free_version_worker_serializes_cleanup_with_object_writes() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-worker-lock-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (remote_backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity_hex)).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("seeded free version should be listed");
+        let oi = page
+            .items
+            .into_iter()
+            .next()
+            .expect("seeded free version should be recoverable");
+        let target_set = ecstore.pools[0].get_disks_by_key(object);
+        let ns_lock = target_set
+            .new_ns_lock(&bucket, object)
+            .await
+            .expect("target erasure-set object namespace lock should be created");
+        let object_lock_guard = ns_lock
+            .get_write_lock(StdDuration::from_secs(1))
+            .await
+            .expect("competing object writer lock should be acquired");
+
+        let state = ExpiryState::new();
+        let (stats, recovery_notify) = {
+            let state = state.read().await;
+            (Arc::clone(&state.stats), Arc::clone(&state.recovery_notify))
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let worker_stats = Arc::clone(&stats);
+        let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::clone(&ecstore);
+        let worker = tokio::spawn(async move {
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
+        });
+
+        stats.increment_pending_tasks();
+        tx.send(Some(Box::new(FreeVersionTask(oi))))
+            .await
+            .expect("free-version task should reach the worker");
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            while remote_backend.remove_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should complete remote cleanup before taking the local lock");
+        let completed_while_locked = tokio::time::timeout(StdDuration::from_millis(100), async {
+            while stats.active_tasks() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            completed_while_locked.is_err(),
+            "local cleanup must wait while a competing object writer owns the namespace lock"
+        );
+        for disk_path in &disk_paths {
+            assert!(
+                fs::try_exists(disk_path.join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("free-version metadata existence check should succeed")
+            );
+        }
+
+        drop(object_lock_guard);
+        tx.send(None).await.expect("worker stop signal should be delivered");
+        worker.await.expect("free-version worker should stop cleanly");
+
+        assert!(recovery_notify.notified().now_or_never().is_none());
+        for disk_path in &disk_paths {
+            assert!(
+                !fs::try_exists(disk_path.join(&bucket).join(object))
+                    .await
+                    .expect("free-version path existence check should succeed")
+            );
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn free_version_worker_duplicate_does_not_create_delete_marker_or_notify() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-worker-idempotent-{}", Uuid::new_v4());
+        let object = "already-removed";
+        let retained_version = Uuid::new_v4();
+        create_test_bucket(&ecstore, &bucket).await;
+        let (_backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, Some(retained_version), Some(identity_hex)).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("seeded free version should be listed");
+        let oi = page
+            .items
+            .into_iter()
+            .next()
+            .expect("seeded free version should be recoverable");
+        let state = ExpiryState::new();
+        let (stats, recovery_notify) = {
+            let state = state.read().await;
+            (Arc::clone(&state.stats), Arc::clone(&state.recovery_notify))
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let worker_stats = Arc::clone(&stats);
+        let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::clone(&ecstore);
+        let worker = tokio::spawn(async move {
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
+        });
+
+        for _ in 0..2 {
+            stats.increment_pending_tasks();
+            tx.send(Some(Box::new(FreeVersionTask(oi.clone()))))
+                .await
+                .expect("duplicate free-version task should reach the worker");
+        }
+        tx.send(None).await.expect("worker stop signal should be delivered");
+        worker.await.expect("free-version worker should stop cleanly");
+
+        assert!(recovery_notify.notified().now_or_never().is_none());
+        for disk_path in &disk_paths {
+            let encoded = fs::read(disk_path.join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("retained object metadata should remain readable");
+            let metadata = FileMeta::load(&encoded).expect("retained object metadata should decode");
+            let versions = metadata
+                .get_file_info_versions(&bucket, object, true)
+                .expect("retained object versions should parse");
+            assert_eq!(versions.versions.len(), 1);
+            assert_eq!(versions.versions[0].version_id, Some(retained_version));
+            assert!(versions.versions[0].deleted);
+            assert!(!versions.versions[0].tier_free_version());
+        }
+
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn free_version_worker_stale_task_does_not_delete_same_id_marker() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-worker-stale-{}", Uuid::new_v4());
+        let object = "same-id-marker";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (_backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity_hex)).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("seeded free version should be listed");
+        let oi = page
+            .items
+            .into_iter()
+            .next()
+            .expect("seeded free version should be recoverable");
+        let stale_version_id = oi.version_id.expect("free version should have a concrete UUID");
+
+        for disk_path in &disk_paths {
+            let metadata_path = disk_path.join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let encoded = fs::read(&metadata_path)
+                .await
+                .expect("free-version metadata should remain readable");
+            let mut metadata = FileMeta::load(&encoded).expect("free-version metadata should decode");
+            metadata
+                .add_version(FileInfo {
+                    volume: bucket.clone(),
+                    name: object.to_string(),
+                    version_id: Some(stale_version_id),
+                    deleted: true,
+                    mod_time: Some(OffsetDateTime::now_utc()),
+                    ..Default::default()
+                })
+                .expect("same-ID ordinary marker should replace the stale free version");
+            fs::write(
+                &metadata_path,
+                metadata
+                    .marshal_msg()
+                    .expect("same-ID ordinary marker metadata should encode"),
+            )
+            .await
+            .expect("same-ID ordinary marker metadata should be written");
+        }
+
+        let state = ExpiryState::new();
+        let (stats, recovery_notify) = {
+            let state = state.read().await;
+            (Arc::clone(&state.stats), Arc::clone(&state.recovery_notify))
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let worker_stats = Arc::clone(&stats);
+        let worker_notify = Arc::clone(&recovery_notify);
+        let worker_store = Arc::clone(&ecstore);
+        let worker = tokio::spawn(async move {
+            ExpiryState::worker(&mut rx, worker_store, worker_stats, worker_notify).await;
+        });
+
+        stats.increment_pending_tasks();
+        tx.send(Some(Box::new(FreeVersionTask(oi))))
+            .await
+            .expect("stale free-version task should reach the worker");
+        tx.send(None).await.expect("worker stop signal should be delivered");
+        worker.await.expect("free-version worker should stop cleanly");
+
+        assert!(recovery_notify.notified().now_or_never().is_none());
+        for disk_path in &disk_paths {
+            let encoded = fs::read(disk_path.join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("same-ID ordinary marker should remain readable");
+            let metadata = FileMeta::load(&encoded).expect("same-ID ordinary marker metadata should decode");
+            let versions = metadata
+                .get_file_info_versions(&bucket, object, true)
+                .expect("same-ID ordinary marker should parse");
+            assert_eq!(versions.versions.len(), 1);
+            assert_eq!(versions.versions[0].version_id, Some(stale_version_id));
+            assert!(versions.versions[0].deleted);
+            assert!(!versions.versions[0].tier_free_version());
+        }
+
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn free_version_worker_local_cleanup_failure_notifies_recovery() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let (_backend, identity_hex) = register_recovery_mock_tier(&ecstore).await;
+        let mut user_defined = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            identity_hex,
+        );
+        let state = ExpiryState::new();
+        let (stats, recovery_notify) = {
+            let state = state.read().await;
+            (Arc::clone(&state.stats), Arc::clone(&state.recovery_notify))
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let worker_stats = Arc::clone(&stats);
+        let worker_notify = Arc::clone(&recovery_notify);
+        let worker = tokio::spawn(async move {
+            ExpiryState::worker(&mut rx, ecstore, worker_stats, worker_notify).await;
+        });
+        let oi = ObjectInfo {
+            bucket: format!("missing-bucket-{}", Uuid::new_v4()),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        stats.increment_pending_tasks();
+        tx.send(Some(Box::new(FreeVersionTask(oi))))
+            .await
+            .expect("free-version task should reach the worker");
+        tx.send(None).await.expect("worker stop signal should be delivered");
+        worker.await.expect("free-version worker should stop cleanly");
+
+        assert!(recovery_notify.notified().now_or_never().is_some());
     }
 
     #[tokio::test]
@@ -3814,7 +5004,7 @@ mod tests {
     }
 
     #[test]
-    fn transitioned_cleanup_tuple_requires_remote_name_version_and_tier() {
+    fn transitioned_cleanup_tuple_preserves_versioned_remote() {
         let mut oi = ObjectInfo::default();
         oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
         oi.transitioned_object.name = "remote/object".to_string();
@@ -3827,15 +5017,29 @@ mod tests {
     }
 
     #[test]
-    fn transitioned_cleanup_tuple_rejects_missing_remote_version() {
+    fn transitioned_cleanup_tuple_accepts_unversioned_remote() {
         let mut oi = ObjectInfo::default();
         oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
         oi.transitioned_object.name = "remote/object".to_string();
         oi.transitioned_object.tier = "WARM".to_string();
 
-        let err = transitioned_cleanup_tuple(&oi).expect_err("missing version must be rejected");
+        let tuple = transitioned_cleanup_tuple(&oi).expect("an empty remote version identifies an unversioned tier bucket");
 
-        assert!(err.to_string().contains("cleanup tuple is incomplete"));
+        assert_eq!(tuple, ("remote/object", "", "WARM"));
+    }
+
+    #[test]
+    fn transitioned_cleanup_tuple_rejects_missing_remote_name_or_tier() {
+        for (name, tier) in [("", "WARM"), ("remote/object", "")] {
+            let mut oi = ObjectInfo::default();
+            oi.transitioned_object.status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+            oi.transitioned_object.name = name.to_string();
+            oi.transitioned_object.tier = tier.to_string();
+
+            let err = transitioned_cleanup_tuple(&oi).expect_err("remote name and tier must remain required");
+
+            assert!(err.to_string().contains("cleanup tuple is incomplete"));
+        }
     }
 
     #[test]
@@ -4916,6 +6120,681 @@ mod tests {
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
+    }
+
+    async fn reset_runtime_expiry_state(ecstore: &Arc<ECStore>) -> Arc<tokio::sync::RwLock<ExpiryState>> {
+        let runtime_state = runtime_sources::expiry_state_handle();
+        assert!(
+            Arc::ptr_eq(&runtime_state, &ecstore.ctx.expiry_state()),
+            "recovery enqueue tests must exercise the ECStore runtime state"
+        );
+        {
+            let mut state = runtime_state.write().await;
+            state.tasks_tx.clear();
+            state.tasks_rx.clear();
+            state.stats.missed_expiry_tasks.store(0, Ordering::SeqCst);
+            state.stats.missed_freevers_tasks.store(0, Ordering::SeqCst);
+            state.stats.missed_tier_journal_tasks.store(0, Ordering::SeqCst);
+            state.stats.pending_tasks.store(0, Ordering::SeqCst);
+            state.stats.active_tasks.store(0, Ordering::SeqCst);
+            state.stats.workers.store(0, Ordering::SeqCst);
+            state.recovery_notify = Arc::new(tokio::sync::Notify::new());
+        }
+        runtime_state
+    }
+
+    async fn install_unconsumed_runtime_expiry_worker(
+        ecstore: &Arc<ECStore>,
+        capacity: usize,
+    ) -> Arc<tokio::sync::RwLock<ExpiryState>> {
+        let runtime_state = reset_runtime_expiry_state(ecstore).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let mut state = runtime_state.write().await;
+        state.tasks_tx.push(tx);
+        state.tasks_rx.push(Arc::new(tokio::sync::Mutex::new(rx)));
+        state.stats.workers.store(1, Ordering::SeqCst);
+        drop(state);
+        runtime_state
+    }
+
+    /// Register a MinIO-typed mock `WARM` tier on `ecstore`'s tier manager and
+    /// return the backend handle together with the hex-encoded durable backend
+    /// identity to persist on seeded free versions so the worker's fail-closed
+    /// remote cleanup can acquire an identity-bound lease.
+    #[cfg(feature = "test-util")]
+    async fn register_recovery_mock_tier(ecstore: &Arc<ECStore>) -> (crate::services::tier::test_util::MockWarmBackend, String) {
+        let backend = crate::services::tier::test_util::register_mock_tier(&ecstore.tier_config_mgr(), "WARM").await;
+        let identity = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("mock WARM tier lease should be available")
+            .backend_identity();
+        let identity_hex = identity.iter().map(|byte| format!("{byte:02x}")).collect();
+        (backend, identity_hex)
+    }
+
+    async fn seed_recoverable_free_version(
+        disk_paths: &[PathBuf],
+        bucket: &str,
+        object: &str,
+        retained_delete_marker: Option<Uuid>,
+        backend_identity: Option<String>,
+    ) {
+        let object_version_id = Uuid::new_v4();
+        // Persist the durable backend identity on the transitioned version so the
+        // recovered free version carries it (matching a registered mock tier);
+        // free-version remote cleanup fails closed without it.
+        let mut transitioned_metadata = HashMap::new();
+        if let Some(identity) = backend_identity {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut transitioned_metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                identity,
+            );
+        }
+        let mut metadata = FileMeta::new();
+        metadata
+            .add_version(FileInfo {
+                volume: bucket.to_string(),
+                name: object.to_string(),
+                version_id: Some(object_version_id),
+                transition_status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                transitioned_objname: format!("remote/{bucket}/{object}"),
+                transition_version_id: Some(Uuid::new_v4()),
+                transition_tier: "WARM".to_string(),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                metadata: transitioned_metadata,
+                ..Default::default()
+            })
+            .expect("transitioned object metadata should be created");
+        let mut delete_info = FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_info.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        metadata
+            .delete_version(&delete_info)
+            .expect("transitioned delete should create a recoverable free version");
+        if let Some(version_id) = retained_delete_marker {
+            metadata
+                .add_version(FileInfo {
+                    volume: bucket.to_string(),
+                    name: object.to_string(),
+                    version_id: Some(version_id),
+                    deleted: true,
+                    mod_time: Some(OffsetDateTime::now_utc()),
+                    ..Default::default()
+                })
+                .expect("retained delete marker should be created");
+        }
+        let encoded = metadata.marshal_msg().expect("free-version metadata should encode");
+
+        for disk_path in disk_paths {
+            let object_dir = disk_path.join(bucket).join(object);
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("free-version object directory should be created");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &encoded)
+                .await
+                .expect("free-version xl.meta should be written");
+        }
+    }
+
+    async fn remove_seeded_free_version(disk_paths: &[PathBuf], bucket: &str, object: &str) {
+        for disk_path in disk_paths {
+            fs::remove_dir_all(disk_path.join(bucket).join(object))
+                .await
+                .expect("seeded free-version object directory should be removed");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_production_entrypoint_enqueues_seeded_item() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        let recovery_rx = {
+            let state = runtime_state.read().await;
+            Arc::clone(&state.tasks_rx[0])
+        };
+        let bucket = format!("recovery-entrypoint-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+
+        let started = OnceLock::new();
+        let recovery = super::spawn_tier_free_version_recovery_once(Arc::clone(&ecstore), &started)
+            .expect("production recovery entrypoint should start once");
+        let task = tokio::time::timeout(StdDuration::from_secs(30), async { recovery_rx.lock().await.recv().await })
+            .await
+            .expect("production recovery entrypoint should enqueue the seeded item")
+            .expect("recovery queue should remain open");
+        let task = task.expect("recovery queue should contain a task");
+        let recovered = task
+            .as_any()
+            .downcast_ref::<FreeVersionTask>()
+            .expect("production recovery entrypoint should enqueue a free-version task");
+        assert_eq!(recovered.0.bucket, bucket);
+        assert_eq!(recovered.0.name, object);
+
+        recovery.abort();
+        let join_error = recovery
+            .await
+            .expect_err("aborted production recovery task should report cancellation");
+        assert!(join_error.is_cancelled());
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+        reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_real_enqueue_failure_retries_same_object() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        assert!(
+            super::enqueue_recovered_free_version(ObjectInfo {
+                bucket: "prefill".to_string(),
+                name: "prefill".to_string(),
+                ..Default::default()
+            })
+            .await,
+            "the production recovery queue should accept its first task"
+        );
+        let bucket = format!("recovery-enqueue-failure-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+
+        let first = recover_tier_free_versions_with_cancel(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("queue failure should return retry markers");
+        assert_eq!(first.scanned, 1);
+        assert_eq!(first.enqueued, 0);
+        assert_eq!(first.failed, 1);
+        assert!(first.truncated);
+        assert_eq!(first.next_bucket_marker.as_deref(), Some(bucket.as_str()));
+        assert!(first.next_object_marker.is_none());
+
+        let retried = recover_tier_free_versions_with_cancel(
+            Arc::clone(&ecstore),
+            1,
+            first.next_bucket_marker,
+            first.next_object_marker,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("retry markers should revisit the failed free version");
+        assert_eq!(retried.scanned, 1);
+        assert_eq!(retried.failed, 1);
+
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+        reset_runtime_expiry_state(&ecstore).await;
+        drop(runtime_state);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_cancels_between_enqueues() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 2).await;
+        let bucket = format!("recovery-enqueue-cancel-{}", Uuid::new_v4());
+        let objects = ["free-version-a", "free-version-b"];
+        create_test_bucket(&ecstore, &bucket).await;
+        for object in objects {
+            seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+        }
+
+        let cancel = CancellationToken::new();
+        let hook_cancel = cancel.clone();
+        let enqueue_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls = Arc::clone(&enqueue_calls);
+        let _enqueue = set_recovered_free_version_enqueue_observer(move |_queued| {
+            if hook_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                hook_cancel.cancel();
+            }
+        });
+        let err = recover_tier_free_versions_with_cancel(Arc::clone(&ecstore), 2, None, None, cancel)
+            .await
+            .expect_err("cancellation after the first enqueue should stop the recovery page");
+
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
+        assert_eq!(enqueue_calls.load(Ordering::SeqCst), 1);
+
+        for object in objects {
+            remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        }
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+        reset_runtime_expiry_state(&ecstore).await;
+        drop(runtime_state);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_real_path_honors_cancellation() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-cancel-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = recover_tier_free_versions_with_cancel(ecstore, 1, None, None, cancel)
+            .await
+            .expect_err("cancelled recovery should stop before walking buckets");
+
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_cancels_blocked_bucket_listing() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let list_started = Arc::new(tokio::sync::Notify::new());
+        let _list_wait = set_recovery_bucket_list_wait_hook(Arc::clone(&list_started));
+        let cancel = CancellationToken::new();
+        let list_cancel = cancel.clone();
+        let recovery = tokio::spawn(async move { list_tier_free_versions(ecstore, 1, None, None, list_cancel).await });
+
+        list_started.notified().await;
+        cancel.cancel();
+        let err = tokio::time::timeout(StdDuration::from_secs(30), recovery)
+            .await
+            .expect("blocked bucket listing should stop promptly")
+            .expect("recovery task should not panic")
+            .expect_err("blocked bucket listing should return cancellation");
+
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_exact_limit_is_not_truncated() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-exact-limit-{}", Uuid::new_v4());
+        let objects = ["free-version-a", "free-version-b"];
+        create_test_bucket(&ecstore, &bucket).await;
+        for object in objects {
+            seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+        }
+
+        let page = list_tier_free_versions(Arc::clone(&ecstore), objects.len(), None, None, CancellationToken::new())
+            .await
+            .expect("an exactly full final page should be listed");
+
+        assert_eq!(page.items.len(), objects.len());
+        assert!(!page.truncated);
+        assert!(page.next_bucket_marker.is_none());
+        assert!(page.next_object_marker.is_none());
+
+        for object in objects {
+            remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        }
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_propagates_walk_item_error() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-walk-error-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let injected_bucket = bucket.clone();
+        let _walk_error = set_recovery_walk_test_hook(move |walk_bucket| {
+            (walk_bucket == injected_bucket.as_str())
+                .then(|| RecoveryWalkTestAction::SendItemsThenError(Vec::new(), crate::error::Error::DiskNotFound))
+        });
+
+        let err = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect_err("walk errors must not become a partial successful page");
+        assert!(matches!(err, crate::error::Error::DiskNotFound));
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_propagates_error_queued_after_truncation() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-post-error-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let injected_bucket = bucket.clone();
+        let _walk_error = set_recovery_walk_test_hook(move |walk_bucket| {
+            (walk_bucket == injected_bucket.as_str()).then(|| {
+                RecoveryWalkTestAction::SendItemsThenError(
+                    vec![
+                        ObjectInfo {
+                            bucket: injected_bucket.clone(),
+                            name: "recoverable-a".to_string(),
+                            transitioned_object: TransitionedObject {
+                                name: "remote/recoverable-a".to_string(),
+                                tier: "WARM".to_string(),
+                                free_version: true,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        ObjectInfo {
+                            bucket: injected_bucket.clone(),
+                            name: "nonrecoverable-b".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    crate::error::Error::FaultyDisk,
+                )
+            })
+        });
+
+        let err = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect_err("errors queued after pagination truncation must still propagate");
+        assert!(matches!(err, crate::error::Error::FaultyDisk));
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_propagates_walk_task_error() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-walk-task-error-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let injected_bucket = bucket.clone();
+        let _walk_error = set_recovery_walk_test_hook(move |walk_bucket| {
+            (walk_bucket == injected_bucket.as_str())
+                .then(|| RecoveryWalkTestAction::ReturnError(crate::error::Error::FaultyDisk))
+        });
+
+        let err = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect_err("walk task errors must not become a partial successful page");
+        assert!(matches!(err, crate::error::Error::FaultyDisk));
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_cancels_active_walk() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-active-cancel-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let injected_bucket = bucket.clone();
+        let walk_started = Arc::new(tokio::sync::Notify::new());
+        let hook_started = Arc::clone(&walk_started);
+        let _walk = set_recovery_walk_test_hook(move |walk_bucket| {
+            (walk_bucket == injected_bucket.as_str())
+                .then(|| RecoveryWalkTestAction::WaitForCancellation(Arc::clone(&hook_started)))
+        });
+        let cancel = CancellationToken::new();
+        let list_cancel = cancel.clone();
+        let list_store = Arc::clone(&ecstore);
+        let recovery = tokio::spawn(async move { list_tier_free_versions(list_store, 1, None, None, list_cancel).await });
+
+        walk_started.notified().await;
+        cancel.cancel();
+        let err = tokio::time::timeout(StdDuration::from_secs(30), recovery)
+            .await
+            .expect("active recovery walk should stop promptly")
+            .expect("recovery task should not panic")
+            .expect_err("active recovery walk should return cancellation");
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_aborts_walk_that_ignores_cancellation() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-stuck-cancel-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let injected_bucket = bucket.clone();
+        let walk_started = Arc::new(tokio::sync::Notify::new());
+        let hook_started = Arc::clone(&walk_started);
+        let _walk = set_recovery_walk_test_hook(move |walk_bucket| {
+            (walk_bucket == injected_bucket.as_str())
+                .then(|| RecoveryWalkTestAction::SendItemsThenHang(Vec::new(), Arc::clone(&hook_started)))
+        });
+        let cancel = CancellationToken::new();
+        let list_cancel = cancel.clone();
+        let list_store = Arc::clone(&ecstore);
+        let recovery = tokio::spawn(async move { list_tier_free_versions(list_store, 1, None, None, list_cancel).await });
+
+        walk_started.notified().await;
+        cancel.cancel();
+        let err = tokio::time::timeout(StdDuration::from_secs(2), recovery)
+            .await
+            .expect("unresponsive recovery walk should be aborted after cancellation")
+            .expect("recovery task should not panic")
+            .expect_err("cancelled recovery walk should return cancellation");
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_bounds_truncated_page_drain() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-stuck-drain-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let injected_bucket = bucket.clone();
+        let walk_started = Arc::new(tokio::sync::Notify::new());
+        let hook_started = Arc::clone(&walk_started);
+        let _walk = set_recovery_walk_test_hook(move |walk_bucket| {
+            (walk_bucket == injected_bucket.as_str()).then(|| {
+                RecoveryWalkTestAction::SendItemsThenHang(
+                    vec![
+                        ObjectInfo {
+                            bucket: injected_bucket.clone(),
+                            name: "recoverable-a".to_string(),
+                            transitioned_object: TransitionedObject {
+                                name: "remote/recoverable-a".to_string(),
+                                tier: "WARM".to_string(),
+                                free_version: true,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        ObjectInfo {
+                            bucket: injected_bucket.clone(),
+                            name: "nonrecoverable-b".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    Arc::clone(&hook_started),
+                )
+            })
+        });
+        let list_store = Arc::clone(&ecstore);
+        let recovery =
+            tokio::spawn(async move { list_tier_free_versions(list_store, 1, None, None, CancellationToken::new()).await });
+
+        walk_started.notified().await;
+        let err = tokio::time::timeout(StdDuration::from_secs(2), recovery)
+            .await
+            .expect("truncated-page drain should stop after its shutdown deadline")
+            .expect("recovery task should not panic")
+            .expect_err("an unresponsive truncated-page walk should return a timeout");
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::TimedOut
+        ));
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_cancellation_unblocks_backpressured_walk() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("recovery-bp-cancel-{}", Uuid::new_v4());
+        create_test_bucket(&ecstore, &bucket).await;
+        let injected_bucket = bucket.clone();
+        let walk_started = Arc::new(tokio::sync::Notify::new());
+        let hook_started = Arc::clone(&walk_started);
+        let _walk = set_recovery_walk_test_hook(move |walk_bucket| {
+            (walk_bucket == injected_bucket.as_str())
+                .then(|| RecoveryWalkTestAction::SendItemsUntilReceiverCloses(Arc::clone(&hook_started)))
+        });
+        let cancel = CancellationToken::new();
+        let list_cancel = cancel.clone();
+        let list_store = Arc::clone(&ecstore);
+        let recovery = tokio::spawn(async move { list_tier_free_versions(list_store, 1, None, None, list_cancel).await });
+
+        walk_started.notified().await;
+        cancel.cancel();
+        let err = tokio::time::timeout(StdDuration::from_secs(30), recovery)
+            .await
+            .expect("backpressured recovery walk should stop promptly")
+            .expect("recovery task should not panic")
+            .expect_err("backpressured recovery walk should return cancellation");
+        assert!(matches!(
+            err,
+            crate::error::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
+
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("empty recovery test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_continues_after_deleted_marker_bucket() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let suffix = Uuid::new_v4().simple();
+        let earlier_bucket = format!("zzzz-recovery-{suffix}-a");
+        let deleted_marker = format!("zzzz-recovery-{suffix}-m");
+        let later_bucket = format!("zzzz-recovery-{suffix}-z");
+        let later_object = "a-before-stale-marker";
+        create_test_bucket(&ecstore, &earlier_bucket).await;
+        create_test_bucket(&ecstore, &later_bucket).await;
+        let mut reader = PutObjReader::from_vec(b"cursor reset probe".to_vec());
+        ecstore
+            .put_object(&later_bucket, later_object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("successor bucket object should be created");
+
+        let page = list_tier_free_versions(
+            Arc::clone(&ecstore),
+            1,
+            Some(deleted_marker),
+            Some("z-stale-object-marker".to_string()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("recovery should resume at the first bucket after a deleted marker bucket");
+
+        assert_eq!(page.buckets_scanned, 1, "the later bucket must not be skipped");
+        assert_eq!(
+            page.scanned_entries, 1,
+            "the deleted bucket's object marker must not skip objects in the successor bucket"
+        );
+        ecstore
+            .delete_object(&later_bucket, later_object, ObjectOptions::default())
+            .await
+            .expect("successor bucket object should be removed");
+        for bucket in [&earlier_bucket, &later_bucket] {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("empty recovery test bucket should be removed");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_limit_holds_across_buckets_with_same_object_key() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let suffix = Uuid::new_v4().simple();
+        let first_bucket = format!("zzzz-recovery-{suffix}-a");
+        let second_bucket = format!("zzzz-recovery-{suffix}-b");
+        let object = "same-key";
+        for bucket in [&first_bucket, &second_bucket] {
+            create_test_bucket(&ecstore, bucket).await;
+            seed_recoverable_free_version(&disk_paths, bucket, object, None, None).await;
+        }
+
+        let first_page = list_tier_free_versions(Arc::clone(&ecstore), 1, None, None, CancellationToken::new())
+            .await
+            .expect("first recovery page should be listed");
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.items[0].bucket, first_bucket);
+        assert!(first_page.truncated);
+        assert_eq!(first_page.next_bucket_marker.as_deref(), Some(first_bucket.as_str()));
+        assert_eq!(first_page.next_object_marker.as_deref(), Some(object));
+
+        remove_seeded_free_version(&disk_paths, &first_bucket, object).await;
+        let second_page = list_tier_free_versions(
+            Arc::clone(&ecstore),
+            1,
+            first_page.next_bucket_marker,
+            first_page.next_object_marker,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second recovery page should resume without loss");
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].bucket, second_bucket);
+
+        remove_seeded_free_version(&disk_paths, &second_bucket, object).await;
+        for bucket in [&first_bucket, &second_bucket] {
+            ecstore
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("empty recovery test bucket should be removed");
+        }
     }
 
     async fn set_abort_incomplete_lifecycle(bucket: &str, prefix: &str, days_after_initiation: i32) {

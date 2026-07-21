@@ -180,6 +180,7 @@ impl SimpleQueryDispatcher {
                 let mut need_rename_volume_name = false;
                 let mut need_ignore_volume_name = false;
                 let mut file_format = CsvFormat::default()
+                    .with_schema_infer_max_rec(0)
                     .with_comment(
                         csv.comments
                             .clone()

@@ -60,6 +60,7 @@ impl ProviderVersionCapabilities {
             || tier_type.eq_ignore_ascii_case("rustfs")
             || tier_type.eq_ignore_ascii_case("minio")
             || tier_type.eq_ignore_ascii_case("r2")
+            || tier_type.eq_ignore_ascii_case("wasabi")
         {
             Self {
                 raw_version_header: Some(X_AMZ_VERSION_ID),
@@ -156,6 +157,8 @@ mod tests {
             ("MinIO", "x-amz-version-id"),
             ("r2", "x-amz-version-id"),
             ("R2", "x-amz-version-id"),
+            ("wasabi", "x-amz-version-id"),
+            ("Wasabi", "x-amz-version-id"),
             ("aliyun", "x-oss-version-id"),
             ("Aliyun", "x-oss-version-id"),
             ("tencent", "x-cos-version-id"),

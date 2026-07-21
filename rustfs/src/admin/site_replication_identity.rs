@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_madmin::PeerInfo;
+use rustfs_madmin::{PeerInfo, SyncStatus};
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use url::Url;
@@ -74,6 +74,14 @@ pub fn deployment_id_for_endpoint(endpoint: &str) -> String {
 
 pub fn same_identity_endpoint(left: &str, right: &str) -> bool {
     site_identity_key(left) == site_identity_key(right)
+}
+
+pub(crate) fn mark_unknown_peer_sync_enabled(peers: &mut BTreeMap<String, PeerInfo>) {
+    for peer in peers.values_mut() {
+        if peer.sync_state == SyncStatus::Unknown {
+            peer.sync_state = SyncStatus::Enable;
+        }
+    }
 }
 
 fn is_https_endpoint(endpoint: &str) -> bool {
