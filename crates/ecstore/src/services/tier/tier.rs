@@ -79,7 +79,10 @@ use s3s::S3ErrorCode;
 
 use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
-    tier_mutation_intent::{TierMutationIntentKind, TierMutationIntentTarget},
+    tier_mutation_intent::{
+        TierMutationIntent, TierMutationIntentKind, TierMutationIntentState, TierMutationIntentTarget,
+        list_tier_mutation_intent_records,
+    },
     warm_backend::WarmBackendImpl,
 };
 
@@ -87,6 +90,8 @@ const TIER_CFG_REFRESH: Duration = Duration::from_secs(15 * 60);
 const TIER_OPERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_REMOTE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_REFERENCE_PROOF_LIST_LIMIT: i32 = 1000;
+const TIER_MUTATION_INTENT_RECOVERY_SCAN_LIMIT: usize = 1000;
+const TIER_MUTATION_BLOCK_MESSAGE: &str = "Remote tier configuration is being replaced";
 
 type TierReferenceProofWalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
 
@@ -201,6 +206,7 @@ type SharedWarmBackend = Arc<dyn WarmBackend + Send + Sync + 'static>;
 struct TierDriverRuntime {
     generations: HashMap<String, Arc<TierDriverGeneration>>,
     draining: HashMap<String, u64>,
+    prepared_mutation_blocks: HashMap<String, uuid::Uuid>,
     next_generation: u64,
     next_drain_epoch: u64,
     admin_updates: Arc<tokio::sync::Mutex<()>>,
@@ -372,6 +378,14 @@ fn registered_tier_driver_runtime(manager: &TierConfigMgr) -> Option<Arc<Mutex<T
         registry.remove(&key);
     }
     None
+}
+
+fn runtime_blocks_tier(runtime: &TierDriverRuntime, tier_name: &str) -> bool {
+    runtime.draining.contains_key(tier_name) || runtime.prepared_mutation_blocks.contains_key(tier_name)
+}
+
+fn runtime_has_mutation_block(runtime: &TierDriverRuntime) -> bool {
+    !runtime.draining.is_empty() || !runtime.prepared_mutation_blocks.is_empty()
 }
 
 type TierDriverFingerprint = [u8; 32];
@@ -2092,10 +2106,10 @@ impl TierConfigMgr {
     }
 
     pub async fn get_driver<'a>(&'a mut self, tier_name: &str) -> std::result::Result<&'a WarmBackendImpl, AdminError> {
-        if registered_tier_driver_runtime(self).is_some_and(|runtime| lock_unpoisoned(&runtime).draining.contains_key(tier_name))
+        if registered_tier_driver_runtime(self).is_some_and(|runtime| runtime_blocks_tier(&lock_unpoisoned(&runtime), tier_name))
         {
             let mut err = ERR_TIER_INVALID_CONFIG.clone();
-            err.message = "Remote tier configuration is being replaced".to_string();
+            err.message = TIER_MUTATION_BLOCK_MESSAGE.to_string();
             return Err(err);
         }
         // Return cached driver if present
@@ -2123,9 +2137,9 @@ impl TierConfigMgr {
             let manager = handle.read().await;
             let runtime = tier_driver_runtime(handle, &manager);
             let runtime_guard = lock_unpoisoned(&runtime);
-            if runtime_guard.draining.contains_key(tier_name) {
+            if runtime_blocks_tier(&runtime_guard, tier_name) {
                 let mut err = ERR_TIER_INVALID_CONFIG.clone();
-                err.message = "Remote tier configuration is being replaced".to_string();
+                err.message = TIER_MUTATION_BLOCK_MESSAGE.to_string();
                 return Err(err);
             }
             if let Some(generation) = runtime_guard
@@ -2143,9 +2157,9 @@ impl TierConfigMgr {
         let (config, config_fingerprint) = {
             let mut manager = handle.write().await;
             let runtime = tier_driver_runtime(handle, &manager);
-            if lock_unpoisoned(&runtime).draining.contains_key(tier_name) {
+            if runtime_blocks_tier(&lock_unpoisoned(&runtime), tier_name) {
                 let mut err = ERR_TIER_INVALID_CONFIG.clone();
-                err.message = "Remote tier configuration is being replaced".to_string();
+                err.message = TIER_MUTATION_BLOCK_MESSAGE.to_string();
                 return Err(err);
             }
             if let Some(driver) = manager.driver_cache.remove(tier_name) {
@@ -2178,9 +2192,9 @@ impl TierConfigMgr {
         let mut manager = handle.write().await;
         let runtime = tier_driver_runtime(handle, &manager);
         let runtime_guard = lock_unpoisoned(&runtime);
-        if runtime_guard.draining.contains_key(tier_name) {
+        if runtime_blocks_tier(&runtime_guard, tier_name) {
             let mut err = ERR_TIER_INVALID_CONFIG.clone();
-            err.message = "Remote tier configuration is being replaced".to_string();
+            err.message = TIER_MUTATION_BLOCK_MESSAGE.to_string();
             return Err(err);
         }
         if let Some(generation) = runtime_guard
@@ -2318,7 +2332,7 @@ impl TierConfigMgr {
             err
         })?;
         let mut runtime_guard = lock_unpoisoned(&runtime);
-        if changed.iter().any(|tier_name| runtime_guard.draining.contains_key(tier_name)) {
+        if changed.iter().any(|tier_name| runtime_blocks_tier(&runtime_guard, tier_name)) {
             let mut err = ERR_TIER_INVALID_CONFIG.clone();
             err.message = "Remote tier configuration is already being replaced".to_string();
             return Err(err);
@@ -2561,11 +2575,81 @@ impl TierConfigMgr {
     }
 
     pub async fn reload_handle(handle: &Arc<RwLock<Self>>, api: Arc<ECStore>) -> io::Result<()> {
+        let prepared_intents = Self::load_prepared_mutation_intents(api.clone()).await?;
         let update = Self::admin_update_lock(handle).await;
         let candidate = load_tier_config(api).await?;
         Self::publish_candidate_owned(handle, candidate, None, update)
             .await
+            .map_err(io::Error::other)?;
+        Self::reconcile_prepared_mutation_intents(handle, &prepared_intents)
+            .await
             .map_err(io::Error::other)
+    }
+
+    async fn load_prepared_mutation_intents(api: Arc<ECStore>) -> io::Result<Vec<TierMutationIntent>> {
+        let mut marker = None;
+        let mut prepared = Vec::new();
+        loop {
+            let scan = list_tier_mutation_intent_records(api.clone(), TIER_MUTATION_INTENT_RECOVERY_SCAN_LIMIT, marker)
+                .await
+                .map_err(io::Error::other)?;
+            if scan.failed != 0 {
+                return Err(io::Error::other(format!(
+                    "failed to scan {} tier mutation intent record(s) during recovery",
+                    scan.failed
+                )));
+            }
+            prepared.extend(
+                scan.intents
+                    .into_iter()
+                    .filter(|intent| intent.state == TierMutationIntentState::Prepared),
+            );
+            if !scan.truncated {
+                return Ok(prepared);
+            }
+            let next_marker = scan.next_marker.ok_or_else(|| {
+                io::Error::other("tier mutation intent recovery scan was truncated without a continuation marker")
+            })?;
+            marker = Some(next_marker);
+        }
+    }
+
+    async fn reconcile_prepared_mutation_intents(
+        handle: &Arc<RwLock<Self>>,
+        intents: &[TierMutationIntent],
+    ) -> std::result::Result<(), AdminError> {
+        let mut prepared_mutation_blocks = HashMap::new();
+        for intent in intents {
+            Self::collect_prepared_mutation_intent_block(&mut prepared_mutation_blocks, intent)?;
+        }
+        let manager = handle.read().await;
+        let runtime = tier_driver_runtime(handle, &manager);
+        let mut runtime = lock_unpoisoned(&runtime);
+        runtime.prepared_mutation_blocks = prepared_mutation_blocks;
+        Ok(())
+    }
+
+    fn collect_prepared_mutation_intent_block(
+        prepared_mutation_blocks: &mut HashMap<String, uuid::Uuid>,
+        intent: &TierMutationIntent,
+    ) -> std::result::Result<(), AdminError> {
+        if intent.state != TierMutationIntentState::Prepared {
+            return Ok(());
+        }
+        for target in &intent.affected_targets {
+            match prepared_mutation_blocks.entry(target.tier_name.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(intent.mutation_id);
+                }
+                Entry::Occupied(entry) if *entry.get() == intent.mutation_id => {}
+                Entry::Occupied(_) => {
+                    let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+                    err.message = format!("Remote tier {} already has another prepared mutation", target.tier_name);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn add_and_save(
@@ -2758,7 +2842,7 @@ impl TierConfigMgr {
             return Ok(());
         };
         let runtime = lock_unpoisoned(&runtime);
-        let blocked = runtime.draining.contains_key(tier_name)
+        let blocked = runtime_blocks_tier(&runtime, tier_name)
             || runtime
                 .generations
                 .get(tier_name)
@@ -2846,7 +2930,7 @@ impl TierConfigMgr {
     }
 
     fn apply_reloaded_tiers(&mut self, tiers: HashMap<String, TierConfig>) -> std::result::Result<(), AdminError> {
-        if registered_tier_driver_runtime(self).is_some_and(|runtime| !lock_unpoisoned(&runtime).draining.is_empty()) {
+        if registered_tier_driver_runtime(self).is_some_and(|runtime| runtime_has_mutation_block(&lock_unpoisoned(&runtime))) {
             return Err(ERR_TIER_BACKEND_IN_USE.clone());
         }
         let changed_or_removed = self
@@ -2876,7 +2960,7 @@ impl TierConfigMgr {
             Err(err) => {
                 if let Some(runtime) = registered_tier_driver_runtime(self) {
                     let runtime = lock_unpoisoned(&runtime);
-                    if !runtime.draining.is_empty()
+                    if runtime_has_mutation_block(&runtime)
                         || runtime
                             .generations
                             .values()
@@ -2895,7 +2979,7 @@ impl TierConfigMgr {
     }
 
     pub async fn clear_tier(&mut self, force: bool) -> std::result::Result<(), AdminError> {
-        if registered_tier_driver_runtime(self).is_some_and(|runtime| !lock_unpoisoned(&runtime).draining.is_empty()) {
+        if registered_tier_driver_runtime(self).is_some_and(|runtime| runtime_has_mutation_block(&lock_unpoisoned(&runtime))) {
             return Err(ERR_TIER_BACKEND_IN_USE.clone());
         }
         self.ensure_generations_are_idle(self.tiers.keys())?;
@@ -4851,6 +4935,110 @@ mod tests {
         manager
             .replace_driver(tier_name, Box::new(backend))
             .expect("test driver generation should install");
+    }
+
+    fn prepared_remove_intent(tier_name: &str, mutation_id: uuid::Uuid) -> TierMutationIntent {
+        TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Remove,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("etag-old".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [1; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: tier_name.to_string(),
+                old_backend_identity: Some([2; 32]),
+                new_backend_identity: None,
+            }],
+            expires_at_unix_nanos: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_mutation_recovery_blocks_new_operation_lease() {
+        let manager = TierConfigMgr::new();
+        manager
+            .write()
+            .await
+            .tiers
+            .insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        let mutation_id = uuid::Uuid::from_u128(1);
+        TierConfigMgr::reconcile_prepared_mutation_intents(&manager, &[prepared_remove_intent("COLD-A", mutation_id)])
+            .await
+            .expect("prepared recovery block should apply");
+
+        let err = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+            Ok(_) => panic!("prepared mutation must block new operation leases"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert_eq!(err.message, TIER_MUTATION_BLOCK_MESSAGE);
+        let guard = manager.read().await;
+        let runtime = registered_tier_driver_runtime(&guard).expect("runtime should be registered by recovery block");
+        assert_eq!(lock_unpoisoned(&runtime).prepared_mutation_blocks.get("COLD-A"), Some(&mutation_id));
+    }
+
+    #[tokio::test]
+    async fn prepared_mutation_recovery_blocks_admin_publish() {
+        let manager = TierConfigMgr::new();
+        manager
+            .write()
+            .await
+            .tiers
+            .insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        TierConfigMgr::reconcile_prepared_mutation_intents(
+            &manager,
+            &[prepared_remove_intent("COLD-A", uuid::Uuid::from_u128(1))],
+        )
+        .await
+        .expect("prepared recovery block should apply");
+        let candidate = empty_mgr();
+
+        let err = TierConfigMgr::publish_candidate(&manager, candidate, None)
+            .await
+            .expect_err("prepared mutation must block conflicting admin publishes");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert!(manager.read().await.tiers.contains_key("COLD-A"));
+    }
+
+    #[tokio::test]
+    async fn prepared_mutation_recovery_is_idempotent_and_rejects_conflicts() {
+        let manager = TierConfigMgr::new();
+        let first = prepared_remove_intent("COLD-A", uuid::Uuid::from_u128(1));
+        TierConfigMgr::reconcile_prepared_mutation_intents(&manager, &[first.clone(), first])
+            .await
+            .expect("same prepared mutation should be idempotent");
+
+        let first = prepared_remove_intent("COLD-A", uuid::Uuid::from_u128(1));
+        let second = prepared_remove_intent("COLD-A", uuid::Uuid::from_u128(2));
+        let err = TierConfigMgr::reconcile_prepared_mutation_intents(&manager, &[first, second])
+            .await
+            .expect_err("a second prepared mutation for the same tier must fail closed");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+    }
+
+    #[tokio::test]
+    async fn prepared_mutation_recovery_clears_resolved_intents() {
+        let manager = TierConfigMgr::new();
+        manager
+            .write()
+            .await
+            .tiers
+            .insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        TierConfigMgr::reconcile_prepared_mutation_intents(
+            &manager,
+            &[prepared_remove_intent("COLD-A", uuid::Uuid::from_u128(1))],
+        )
+        .await
+        .expect("prepared recovery block should apply");
+        TierConfigMgr::reconcile_prepared_mutation_intents(&manager, &[])
+            .await
+            .expect("resolved recovery scan should clear stale blocks");
+
+        let guard = manager.read().await;
+        let runtime = registered_tier_driver_runtime(&guard).expect("runtime should stay registered");
+        assert!(lock_unpoisoned(&runtime).prepared_mutation_blocks.is_empty());
     }
 
     #[tokio::test]
