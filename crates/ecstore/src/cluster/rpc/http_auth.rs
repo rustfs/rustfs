@@ -1161,18 +1161,27 @@ mod tests {
             .metadata()
             .get(RPC_CONTENT_SHA256_HEADER)
             .and_then(|value| value.to_str().ok());
-        let headers =
-            gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "PrepareTierMutation", content_sha256)
-                .expect("body-bound tier mutation auth headers should build");
+        let headers = gen_tonic_signature_headers(
+            "node-a:9000",
+            "node_service.TierMutationControlService",
+            "PrepareTierMutation",
+            content_sha256,
+        )
+        .expect("body-bound tier mutation auth headers should build");
         request.metadata_mut().as_mut().extend(headers.clone());
 
         assert!(
-            verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/PrepareTierMutation", &headers).is_ok(),
+            verify_tonic_rpc_signature("node-a:9000", "/node_service.TierMutationControlService/PrepareTierMutation", &headers)
+                .is_ok(),
             "tier mutation RPC signature must bind destination, service, method, nonce, and body digest"
         );
-        let method_replay = verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/CommitTierMutation", &headers)
-            .expect_err("prepare auth must not replay to commit");
+        let method_replay =
+            verify_tonic_rpc_signature("node-a:9000", "/node_service.TierMutationControlService/CommitTierMutation", &headers)
+                .expect_err("prepare auth must not replay to commit");
         assert_eq!(method_replay.to_string(), "Invalid RPC v2 signature");
+        let service_replay = verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/PrepareTierMutation", &headers)
+            .expect_err("tier mutation auth must not replay to the legacy node service path");
+        assert_eq!(service_replay.to_string(), "Invalid RPC v2 signature");
         let tampered_body = rustfs_protos::canonical_tier_mutation_rpc_body(
             rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
             rustfs_protos::TierMutationRpcPhase::Commit,

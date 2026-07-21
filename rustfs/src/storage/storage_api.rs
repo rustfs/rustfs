@@ -333,7 +333,9 @@ pub(crate) mod timeout_wrapper_consumer {
 pub(crate) mod tonic_service_consumer {
     #[cfg(test)]
     pub(crate) use super::super::tonic_service::{heal_topology_fingerprint, make_heal_control_server_for_source};
-    pub(crate) use super::super::tonic_service::{make_heal_control_server_with_cache, make_server};
+    pub(crate) use super::super::tonic_service::{
+        make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server,
+    };
 }
 
 #[cfg(test)]
@@ -512,7 +514,7 @@ pub(crate) mod ecstore_storage {
 
 pub(crate) mod ecstore_tier {
     pub(crate) use rustfs_ecstore::api::tier::tier::{TierConfigMgr, TierConfigUpdateError};
-    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers};
+    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers, tier_mutation_peer};
     // Shared lifecycle/tier test utilities behind ecstore's `test-util` feature
     // (rustfs/backlog#1148 ilm-6). Only linked into test builds.
     #[cfg(test)]

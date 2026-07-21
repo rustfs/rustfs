@@ -24,7 +24,7 @@ use super::tier_mutation_intent::{
 use crate::error::{Error, StorageError};
 use crate::store::ECStore;
 
-pub const MAX_TIER_MUTATION_PEER_COMMIT_ETAG_SIZE: usize = 1024;
+pub const MAX_TIER_MUTATION_PEER_COMMIT_ETAG_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TierMutationPeerState {
