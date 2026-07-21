@@ -24,7 +24,9 @@ use crate::storage_api::cluster::control_plane::{
     ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot,
 };
 use crate::workload_admission::workload_admission_registry_snapshot;
+use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
+use rustfs_io_metrics::internode_metrics::{InternodeMetricsSnapshot, global_internode_metrics};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterReadOnlySnapshot {
@@ -37,6 +39,8 @@ pub struct ClusterReadOnlySnapshot {
     pub observability: ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub runtime_status: ClusterRuntimeStatusSnapshot,
+    pub usage_freshness: ClusterUsageFreshnessSnapshot,
+    pub listing_diagnostics: ClusterListingDiagnosticsSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +55,46 @@ pub enum ClusterRuntimeReadinessState {
     Ready,
     Degraded,
     Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterUsageFreshnessSnapshot {
+    pub dirty_pending_buckets: u64,
+    pub last_dirty_mark_unix_secs: u64,
+    pub last_dirty_clear_unix_secs: u64,
+    pub last_cycle_dirty_buckets: u64,
+    pub last_cycle_cleared_dirty_buckets: u64,
+    pub last_usage_save_unix_secs: u64,
+    pub last_usage_save_result: String,
+    pub last_usage_save_result_code: u64,
+}
+
+impl From<&ScannerMetricsReport> for ClusterUsageFreshnessSnapshot {
+    fn from(report: &ScannerMetricsReport) -> Self {
+        Self {
+            dirty_pending_buckets: report.usage_freshness.dirty_pending_buckets,
+            last_dirty_mark_unix_secs: report.usage_freshness.last_dirty_mark_unix_secs,
+            last_dirty_clear_unix_secs: report.usage_freshness.last_dirty_clear_unix_secs,
+            last_cycle_dirty_buckets: report.usage_freshness.last_cycle_dirty_buckets,
+            last_cycle_cleared_dirty_buckets: report.usage_freshness.last_cycle_cleared_dirty_buckets,
+            last_usage_save_unix_secs: report.usage_freshness.last_usage_save_unix_secs,
+            last_usage_save_result: report.usage_freshness.last_usage_save_result.clone(),
+            last_usage_save_result_code: report.usage_freshness.last_usage_save_result_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClusterListingDiagnosticsSnapshot {
+    pub internode_stall_timeouts_total: u64,
+}
+
+impl From<InternodeMetricsSnapshot> for ClusterListingDiagnosticsSnapshot {
+    fn from(snapshot: InternodeMetricsSnapshot) -> Self {
+        Self {
+            internode_stall_timeouts_total: snapshot.operation_stall_timeouts_total,
+        }
+    }
 }
 
 impl ClusterRuntimeReadinessState {
@@ -103,12 +147,30 @@ pub fn cluster_read_only_snapshot_from_control_plane(
         observability: runtime_observability_snapshot(),
         workload_admission: workload_admission_registry_snapshot(),
         runtime_status,
+        usage_freshness: ClusterUsageFreshnessSnapshot::default(),
+        listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
     }
 }
 
 pub async fn collect_cluster_read_only_snapshot(endpoint_pools: &EndpointServerPools) -> Option<ClusterReadOnlySnapshot> {
     let runtime_status = ClusterRuntimeStatusSnapshot::from_readiness_report(snapshot_dependency_readiness_report().await);
-    Some(cluster_read_only_snapshot_from_endpoint_pools(endpoint_pools, runtime_status))
+    let mut snapshot = cluster_read_only_snapshot_from_endpoint_pools(endpoint_pools, runtime_status);
+    snapshot.usage_freshness = current_usage_freshness_snapshot().await;
+    snapshot.listing_diagnostics = current_listing_diagnostics_snapshot();
+    Some(snapshot)
+}
+
+async fn current_usage_freshness_snapshot() -> ClusterUsageFreshnessSnapshot {
+    let report = match crate::runtime_sources::current_scanner_metrics_report().await {
+        Some(report) => report,
+        None => global_metrics().report().await,
+    };
+    ClusterUsageFreshnessSnapshot::from(&report)
+}
+
+fn current_listing_diagnostics_snapshot() -> ClusterListingDiagnosticsSnapshot {
+    let metrics = crate::runtime_sources::current_internode_metrics().unwrap_or_else(|| global_internode_metrics().clone());
+    ClusterListingDiagnosticsSnapshot::from(metrics.snapshot())
 }
 
 pub fn cluster_has_actionable_pressure(snapshot: &ClusterReadOnlySnapshot) -> bool {
@@ -181,8 +243,20 @@ mod tests {
             snapshot.runtime_status.degraded_reasons,
             vec![ReadinessDegradedReason::StorageAndLockUnavailable]
         );
-        // Local node (peers[0]) is supported — no peer health probing needed.
-        assert_eq!(snapshot.peer_health.peers[0].status.state, CapabilityState::Supported);
+        assert!(
+            snapshot
+                .peer_health
+                .peers
+                .iter()
+                .any(|peer| peer.is_local && peer.status.state == CapabilityState::Supported)
+        );
+        assert!(
+            snapshot
+                .peer_health
+                .peers
+                .iter()
+                .any(|peer| !peer.is_local && peer.status.state == CapabilityState::Disabled)
+        );
         if cfg!(target_os = "linux") {
             assert_eq!(snapshot.observability.platform.numa.state, CapabilityState::Unknown);
         } else {
@@ -221,6 +295,8 @@ mod tests {
                 state: ClusterRuntimeReadinessState::Ready,
                 degraded_reasons: Vec::new(),
             },
+            usage_freshness: ClusterUsageFreshnessSnapshot::default(),
+            listing_diagnostics: ClusterListingDiagnosticsSnapshot::default(),
         };
         assert!(!cluster_has_actionable_pressure(&no_pressure));
 

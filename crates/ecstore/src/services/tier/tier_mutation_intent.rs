@@ -27,7 +27,7 @@ use crate::storage_api_contracts::{list::ListOperations as _, object::HTTPPrecon
 use crate::store::ECStore;
 
 pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-intent-v1";
-pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = 64 * 1024;
+pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
 pub(crate) const TIER_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/records";
 pub(crate) type TierMutationDigest = [u8; 32];
 
@@ -344,6 +344,28 @@ pub(crate) async fn save_tier_mutation_intent_record(api: Arc<ECStore>, intent: 
     let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
     let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
     com::save_config(api, &object, data).await
+}
+
+pub(crate) async fn save_tier_mutation_intent_record_if_absent(
+    api: Arc<ECStore>,
+    intent: &TierMutationIntent,
+) -> EcstoreResult<()> {
+    let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
+    let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
+    com::save_config_with_opts(
+        api,
+        &object,
+        data,
+        &ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 pub(crate) async fn load_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<TierMutationIntent> {

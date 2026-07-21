@@ -135,7 +135,7 @@ pub(crate) mod server {
                 heal_topology_fingerprint, make_heal_control_server_for_source,
             };
             pub(crate) use crate::storage::storage_api::tonic_service_consumer::{
-                make_heal_control_server_with_cache, make_server,
+                make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server,
             };
         }
     }

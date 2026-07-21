@@ -437,6 +437,13 @@ pub mod tier {
         };
     }
 
+    pub mod tier_mutation_peer {
+        pub use crate::services::tier::tier_mutation_peer::{
+            MAX_TIER_MUTATION_PEER_COMMIT_ETAG_SIZE, TierMutationPeerError, TierMutationPeerOutcome, TierMutationPeerResult,
+            TierMutationPeerState, handle_tier_mutation_peer_request,
+        };
+    }
+
     pub mod warm_backend {
         pub use crate::services::tier::warm_backend::{
             WarmBackend, WarmBackendGetOpts, WarmBackendImpl, build_transition_put_options, check_warm_backend, new_warm_backend,

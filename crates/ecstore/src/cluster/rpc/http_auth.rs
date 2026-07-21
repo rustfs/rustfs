@@ -1145,6 +1145,56 @@ mod tests {
     }
 
     #[test]
+    fn tier_mutation_rpc_contract_requires_method_bound_v2_body_digest() {
+        ensure_test_rpc_secret();
+        let mutation_id = uuid::uuid!("12345678-1234-5678-9abc-def012345678");
+        let body = rustfs_protos::canonical_tier_mutation_rpc_body(
+            rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            rustfs_protos::TierMutationRpcPhase::Prepare,
+            mutation_id,
+            b"canonical-tier-mutation-prepare",
+        )
+        .expect("small tier mutation body should encode");
+        let mut request = tonic::Request::new(());
+        set_tonic_canonical_body_digest(&mut request, &body).expect("canonical body digest should be attached");
+        let content_sha256 = request
+            .metadata()
+            .get(RPC_CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let headers = gen_tonic_signature_headers(
+            "node-a:9000",
+            "node_service.TierMutationControlService",
+            "PrepareTierMutation",
+            content_sha256,
+        )
+        .expect("body-bound tier mutation auth headers should build");
+        request.metadata_mut().as_mut().extend(headers.clone());
+
+        assert!(
+            verify_tonic_rpc_signature("node-a:9000", "/node_service.TierMutationControlService/PrepareTierMutation", &headers)
+                .is_ok(),
+            "tier mutation RPC signature must bind destination, service, method, nonce, and body digest"
+        );
+        let method_replay =
+            verify_tonic_rpc_signature("node-a:9000", "/node_service.TierMutationControlService/CommitTierMutation", &headers)
+                .expect_err("prepare auth must not replay to commit");
+        assert_eq!(method_replay.to_string(), "Invalid RPC v2 signature");
+        let service_replay = verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/PrepareTierMutation", &headers)
+            .expect_err("tier mutation auth must not replay to the legacy node service path");
+        assert_eq!(service_replay.to_string(), "Invalid RPC v2 signature");
+        let tampered_body = rustfs_protos::canonical_tier_mutation_rpc_body(
+            rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            rustfs_protos::TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"canonical-tier-mutation-prepare",
+        )
+        .expect("small tier mutation body should encode");
+        let tampered =
+            verify_tonic_canonical_body_digest(&request, &tampered_body).expect_err("commit body must not match prepare digest");
+        assert_eq!(tampered.to_string(), "RPC content SHA-256 mismatch");
+    }
+
+    #[test]
     fn partial_v2_metadata_fails_closed() {
         ensure_test_rpc_secret();
         let mut headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
