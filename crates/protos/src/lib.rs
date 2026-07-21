@@ -35,6 +35,7 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -251,6 +252,47 @@ pub fn canonical_heal_control_response_body(
     Ok(body)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TierMutationRpcPhase {
+    Prepare,
+    Commit,
+    Abort,
+}
+
+impl TierMutationRpcPhase {
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Commit => "commit",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+pub const TIER_MUTATION_RPC_PROTOCOL_VERSION: u32 = 1;
+
+pub fn canonical_tier_mutation_rpc_body(
+    version: u32,
+    phase: TierMutationRpcPhase,
+    mutation_id: Uuid,
+    canonical_payload: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-v1\0";
+
+    let phase = phase.as_wire_str().as_bytes();
+    let mutation_id = mutation_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + phase.len() + mutation_id.len() + 8 + canonical_payload.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(phase.len())?.to_be_bytes());
+    body.extend_from_slice(phase);
+    body.extend_from_slice(mutation_id);
+    body.extend_from_slice(&u64::try_from(canonical_payload.len())?.to_be_bytes());
+    body.extend_from_slice(canonical_payload);
+    Ok(body)
+}
+
 #[cfg(test)]
 mod heal_control_tests {
     use super::{
@@ -360,6 +402,69 @@ mod heal_control_tests {
             assert!(execution > Duration::ZERO);
             assert!(execution < normalized_transport);
         }
+    }
+}
+
+#[cfg(test)]
+mod tier_mutation_rpc_tests {
+    use super::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase, canonical_tier_mutation_rpc_body};
+    use uuid::uuid;
+
+    #[test]
+    fn canonical_tier_mutation_body_binds_phase_id_and_payload() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let baseline = canonical_tier_mutation_rpc_body(
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+        )
+        .expect("small mutation body should encode");
+        let mut golden = b"rustfs-tier-mutation-rpc-v1\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&7_u64.to_be_bytes());
+        golden.extend_from_slice(b"prepare");
+        golden.extend_from_slice(mutation_id.as_bytes());
+        golden.extend_from_slice(&u64::try_from(payload.len()).expect("payload length should fit").to_be_bytes());
+        golden.extend_from_slice(payload);
+        assert_eq!(baseline, golden);
+
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(2, TierMutationRpcPhase::Prepare, mutation_id, payload)
+                .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Commit,
+                mutation_id,
+                payload,
+            )
+            .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                uuid!("22345678-1234-5678-9abc-def012345678"),
+                payload,
+            )
+            .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                b"canonical-intent-record-tampered",
+            )
+            .expect("small mutation body should encode")
+        );
     }
 }
 
