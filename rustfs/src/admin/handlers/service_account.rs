@@ -398,9 +398,9 @@ impl Operation for AddServiceAccount {
                     "admin service account state"
                 );
                 match e {
-                    rustfs_iam::error::Error::InvalidAccessKeyLength | rustfs_iam::error::Error::InvalidSecretKeyLength => {
-                        iam_error_to_s3_error(e)
-                    }
+                    rustfs_iam::error::Error::InvalidAccessKeyLength
+                    | rustfs_iam::error::Error::InvalidSecretKeyLength
+                    | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(e),
                     err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
                 }
             })?;
@@ -1580,8 +1580,8 @@ mod tests {
         let create_block = &create_block[..create_end];
 
         assert!(
-            create_block.contains("iam_error_to_s3_error(e)"),
-            "service-account create validation errors must map to client S3 errors"
+            create_block.contains("AccessKeyAlreadyExists") && create_block.contains("iam_error_to_s3_error(e)"),
+            "duplicate access keys must map to client S3 errors"
         );
     }
 

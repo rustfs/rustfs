@@ -787,7 +787,7 @@ where
         if let Some(x) = users.get(&cred.access_key)
             && x.credentials.is_service_account()
         {
-            return Err(Error::IAMActionNotAllowed);
+            return Err(Error::AccessKeyAlreadyExists);
         }
         drop(cache);
         drop(users);
@@ -1336,7 +1336,7 @@ where
         if let Some(x) = users.get(access_key) {
             warn!(error = ?x, "IAM user already exists");
             if x.credentials.is_temp() {
-                return Err(Error::IAMActionNotAllowed);
+                return Err(Error::AccessKeyAlreadyExists);
             }
         }
         drop(cache);

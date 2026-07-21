@@ -90,6 +90,10 @@ pub enum Error {
 
     #[error("invalid access_key")]
     InvalidAccessKey,
+
+    #[error("access key is already in use")]
+    AccessKeyAlreadyExists,
+
     #[error("action not allowed")]
     IAMActionNotAllowed,
 
@@ -159,6 +163,7 @@ impl Clone for Error {
             Error::NoAccessKey => Error::NoAccessKey,
             Error::InvalidToken => Error::InvalidToken,
             Error::InvalidAccessKey => Error::InvalidAccessKey,
+            Error::AccessKeyAlreadyExists => Error::AccessKeyAlreadyExists,
             Error::IAMActionNotAllowed => Error::IAMActionNotAllowed,
             Error::InvalidExpiration => Error::InvalidExpiration,
             Error::NoSecretKeyWithAccessKey => Error::NoSecretKeyWithAccessKey,
@@ -297,6 +302,7 @@ mod tests {
             Error::NoSuchUser("testuser".to_string()),
             Error::NoSuchAccount("testaccount".to_string()),
             Error::InvalidArgument,
+            Error::AccessKeyAlreadyExists,
             Error::IAMActionNotAllowed,
             Error::PolicyTooLarge,
             Error::ConfigNotFound,
@@ -415,6 +421,7 @@ mod tests {
             (Error::NoSuchUser("testuser".to_string()), "user 'testuser' does not exist"),
             (Error::NoSuchAccount("testaccount".to_string()), "account 'testaccount' does not exist"),
             (Error::InvalidArgument, "invalid arguments specified"),
+            (Error::AccessKeyAlreadyExists, "access key is already in use"),
             (Error::IAMActionNotAllowed, "action not allowed"),
             (Error::ConfigNotFound, "config not found"),
         ];

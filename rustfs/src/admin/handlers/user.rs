@@ -183,6 +183,14 @@ fn imported_service_account_access_key_failure(entry_access_key: &str, payload_a
 }
 
 pub struct AddUser {}
+
+fn map_add_user_create_error(err: rustfs_iam::error::Error) -> S3Error {
+    match err {
+        rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(err),
+        err => S3Error::with_message(S3ErrorCode::InternalError, format!("failed to create user: {err}")),
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for AddUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -274,10 +282,7 @@ impl Operation for AddUser {
         )
         .await?;
 
-        let updated_at = iam_store
-            .create_user(ak, &args)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to create user: {e}")))?;
+        let updated_at = iam_store.create_user(ak, &args).await.map_err(map_add_user_create_error)?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "iam-user".to_string(),
@@ -1335,14 +1340,37 @@ mod tests {
     use super::{
         GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
         imported_service_account_access_key_failure, imported_service_account_parent_allowed,
-        imported_service_account_parent_scope_failure, imported_service_account_status, should_check_deny_only,
-        should_reject_group_import_name, should_restore_group_as_disabled,
+        imported_service_account_parent_scope_failure, imported_service_account_status, map_add_user_create_error,
+        should_check_deny_only, should_reject_group_import_name, should_restore_group_as_disabled,
     };
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
     use rustfs_madmin::user::SRSvcAccCreate;
+    use s3s::S3ErrorCode;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn add_user_maps_duplicate_access_keys_to_s3_errors() {
+        let err = map_add_user_create_error(IamError::AccessKeyAlreadyExists);
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("access key is already in use"));
+    }
+
+    #[test]
+    fn add_user_preserves_internal_error_fallback() {
+        let err = map_add_user_create_error(IamError::IamSysNotInitialized);
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("failed to create user: not initialized"));
+    }
+
+    #[test]
+    fn add_user_operation_maps_create_errors() {
+        let mapper_call = concat!("map_err(map_add_user_", "create_error)");
+        assert!(include_str!("user.rs").contains(mapper_call));
+    }
 
     #[test]
     fn test_should_check_deny_only_for_regular_self_request() {
