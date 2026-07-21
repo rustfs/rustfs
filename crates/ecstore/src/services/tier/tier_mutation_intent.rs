@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::com;
+use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
 use crate::services::tier::tier::TierDestinationId;
+use crate::storage_api_contracts::list::ListOperations as _;
 use crate::store::ECStore;
 
 pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-intent-v1";
@@ -106,6 +108,15 @@ pub(crate) struct TierMutationIntent {
     pub candidate_digest: TierMutationDigest,
     pub affected_targets: Vec<TierMutationIntentTarget>,
     pub expires_at_unix_nanos: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TierMutationIntentRecordScan {
+    pub intents: Vec<TierMutationIntent>,
+    pub scanned: usize,
+    pub failed: usize,
+    pub next_marker: Option<String>,
+    pub truncated: bool,
 }
 
 impl TierMutationIntent {
@@ -310,6 +321,55 @@ pub(crate) async fn delete_tier_mutation_intent_record(api: Arc<ECStore>, mutati
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+pub(crate) async fn list_tier_mutation_intent_records(
+    api: Arc<ECStore>,
+    limit: usize,
+    marker: Option<String>,
+) -> EcstoreResult<TierMutationIntentRecordScan> {
+    if limit == 0 {
+        return Err(Error::other("tier mutation intent scan limit must be greater than zero"));
+    }
+
+    let list = api
+        .clone()
+        .list_objects_v2(
+            RUSTFS_META_BUCKET,
+            TIER_MUTATION_INTENT_RECORD_PREFIX,
+            marker,
+            None,
+            i32::try_from(limit).map_or(i32::MAX, |value| value),
+            false,
+            None,
+            false,
+        )
+        .await?;
+    let mut scan = TierMutationIntentRecordScan {
+        intents: Vec::with_capacity(list.objects.len()),
+        scanned: 0,
+        failed: 0,
+        next_marker: list.next_continuation_token,
+        truncated: list.is_truncated,
+    };
+
+    for object in list.objects {
+        scan.scanned += 1;
+        let mutation_id = match tier_mutation_intent_id_from_record_object_name(&object.name) {
+            Ok(mutation_id) => mutation_id,
+            Err(_) => {
+                scan.failed += 1;
+                continue;
+            }
+        };
+        match load_tier_mutation_intent_record(api.clone(), mutation_id).await {
+            Ok(intent) => scan.intents.push(intent),
+            Err(Error::ConfigNotFound) => {}
+            Err(_) => scan.failed += 1,
+        }
+    }
+
+    Ok(scan)
 }
 
 fn tier_mutation_intent_store_error(err: TierMutationIntentError) -> Error {
