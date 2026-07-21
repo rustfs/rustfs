@@ -242,6 +242,9 @@ mod console_smoke_test;
 #[cfg(test)]
 mod admin_iam_crud_test;
 
+#[cfg(test)]
+mod admin_pools_test;
+
 // Replication extension end-to-end regression tests
 #[cfg(test)]
 mod replication_extension_test;
