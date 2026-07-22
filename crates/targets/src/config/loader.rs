@@ -37,6 +37,22 @@ pub fn try_collect_target_configs(
     try_collect_target_configs_from_env(config, route_prefix, target_type, valid_fields, std::env::vars())
 }
 
+/// Collects enabled target instance configs with per-instance fault isolation.
+///
+/// Unlike [`try_collect_target_configs`], an instance with an invalid
+/// configuration (for example an unparseable `enable` value) does not abort the
+/// whole target type. The enabled `(id, config)` pairs are returned alongside a
+/// summary line for every instance that could not be collected, so callers can
+/// load the healthy instances while still surfacing the failed ones.
+pub fn collect_target_config_results(
+    config: &Config,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+) -> (Vec<(String, KVS)>, Vec<String>) {
+    collect_target_config_results_from_env(config, route_prefix, target_type, valid_fields, std::env::vars())
+}
+
 fn is_sensitive_target_field(field_name: &str) -> bool {
     let field_name = field_name.to_ascii_lowercase();
     field_name.contains("password")
@@ -169,6 +185,35 @@ where
     .filter(|record| record.enabled)
     .map(|record| (record.instance_id, record.effective_config))
     .collect())
+}
+
+pub fn collect_target_config_results_from_env<I>(
+    config: &Config,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+    env_vars: I,
+) -> (Vec<(String, KVS)>, Vec<String>)
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut configs = Vec::new();
+    let mut failures = Vec::new();
+    for result in collect_merged_target_config_results_from_env(
+        config,
+        &format!("{route_prefix}{target_type}").to_lowercase(),
+        route_prefix,
+        target_type,
+        valid_fields,
+        env_vars,
+    ) {
+        match result {
+            Ok(record) if record.enabled => configs.push((record.instance_id, record.effective_config)),
+            Ok(_) => {}
+            Err((record, err)) => failures.push(format!("{target_type}/{}: {err}", record.instance_id)),
+        }
+    }
+    (configs, failures)
 }
 
 pub(crate) fn collect_merged_target_configs_from_env<I>(
@@ -330,8 +375,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_env_target_instance_ids_from_env, collect_target_configs_from_env, redact_target_field_value,
-        redacted_target_config, try_collect_target_configs_from_env,
+        collect_env_target_instance_ids_from_env, collect_target_config_results_from_env, collect_target_configs_from_env,
+        redact_target_field_value, redacted_target_config, try_collect_target_configs_from_env,
     };
     use crate::TargetError;
     use rustfs_config::notify::{
@@ -514,6 +559,48 @@ mod tests {
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].0, "good");
+    }
+
+    #[test]
+    fn collect_target_config_results_isolates_invalid_instance_and_reports_it() {
+        let (configs, failures) = collect_target_config_results_from_env(
+            &Config(HashMap::new()),
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_GOOD".to_string(), "on".to_string()),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_GOOD".to_string(), "https://example.com/good".to_string()),
+                // "enable" is a common typo: EnableState accepts "enabled"/"on", not "enable".
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_BAD".to_string(), "enable".to_string()),
+            ],
+        );
+
+        // The healthy instance still loads even though a sibling is malformed...
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].0, "good");
+        // ...and the malformed instance is surfaced (not silently dropped, not
+        // aborting the whole target type) so callers can fail-report it.
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("webhook/bad") && failures[0].contains("enable"),
+            "unexpected failure summary: {}",
+            failures[0]
+        );
+    }
+
+    #[test]
+    fn collect_target_config_results_does_not_report_validly_disabled_instances() {
+        let (configs, failures) = collect_target_config_results_from_env(
+            &Config(HashMap::new()),
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(), "off".to_string())],
+        );
+
+        assert!(configs.is_empty());
+        assert!(failures.is_empty(), "a validly disabled instance is not a failure");
     }
 
     #[test]
