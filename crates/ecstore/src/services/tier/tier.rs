@@ -6306,6 +6306,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_handle_clears_resolved_prepared_intent_from_store_scan() {
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+
+        let mutation_id = uuid::Uuid::from_u128(23);
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(
+            store.clone(),
+            &prepared_remove_intent("COLD-A", mutation_id),
+        )
+        .await
+        .expect("prepared intent fixture should persist");
+        let handle = TierConfigMgr::new();
+
+        TierConfigMgr::reload_handle_with(&handle, store.clone())
+            .await
+            .expect("reload should restore prepared intent from store");
+        let blocked = match TierConfigMgr::acquire_operation_lease(&handle, "COLD-A").await {
+            Ok(_) => panic!("prepared intent restored from store must block new operation leases"),
+            Err(err) => err,
+        };
+        assert_eq!(blocked.message, TIER_MUTATION_BLOCK_MESSAGE);
+
+        crate::services::tier::tier_mutation_intent::delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("prepared intent fixture should delete");
+        TierConfigMgr::reload_handle_with(&handle, store)
+            .await
+            .expect("reload should clear resolved prepared intent blocks");
+        let guard = handle.read().await;
+        let runtime = registered_tier_driver_runtime(&guard).expect("runtime should stay registered");
+        assert!(lock_unpoisoned(&runtime).prepared_mutation_blocks.is_empty());
+    }
+
+    #[tokio::test]
     async fn registry_steady_state_lookup_does_not_scan_misses() {
         let manager = TierConfigMgr::new();
         TIER_REGISTRY_MISS_SCAN_COUNT
