@@ -152,13 +152,13 @@ pub(crate) fn tier_delete_journal_object_name(je: &Jentry) -> String {
     )
 }
 
-fn decode_tier_delete_journal_entry(data: &[u8]) -> Result<Jentry> {
+pub(crate) fn decode_tier_delete_journal_entry(data: &[u8]) -> Result<Jentry> {
     let persisted: PersistedTierDeleteJournalEntry =
         serde_json::from_slice(data).map_err(|err| Error::other(format!("decode tier delete journal failed: {err}")))?;
     persisted.into_jentry()
 }
 
-fn encode_tier_delete_journal_entry(je: &Jentry) -> Result<Vec<u8>> {
+pub(crate) fn encode_tier_delete_journal_entry(je: &Jentry) -> Result<Vec<u8>> {
     serde_json::to_vec(&PersistedTierDeleteJournalEntry::from_jentry(je))
         .map_err(|err| Error::other(format!("encode tier delete journal failed: {err}")))
 }

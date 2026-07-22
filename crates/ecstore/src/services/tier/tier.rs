@@ -65,6 +65,10 @@ use crate::storage_api_contracts::{
     range::HTTPRangeSpec,
 };
 use crate::{
+    bucket::lifecycle::{
+        tier_delete_journal::{TIER_DELETE_JOURNAL_PREFIX, decode_tier_delete_journal_entry},
+        transition_transaction::{TRANSITION_TRANSACTION_RECORD_PREFIX, decode_transition_transaction_record},
+    },
     cluster::rpc::peer_rest_client::{PeerRestClient, PeerTierMutationState},
     config::com::{CONFIG_PREFIX, read_config, read_config_with_metadata},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
@@ -639,17 +643,20 @@ async fn ensure_no_authoritative_tier_object_references<S>(
 where
     S: TierReferenceProofStore,
 {
-    for target in affected_targets {
-        if target.old_backend_identity.is_some() {
-            ensure_no_authoritative_target_references(api.clone(), target).await?;
-        }
+    let targets = affected_targets
+        .iter()
+        .filter(|target| target.old_backend_identity.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    ensure_no_authoritative_target_references(api, &targets).await
 }
 
 async fn ensure_no_authoritative_target_references<S>(
     api: Arc<S>,
-    target: &TierMutationIntentTarget,
+    targets: &[TierMutationIntentTarget],
 ) -> std::result::Result<(), AdminError>
 where
     S: TierReferenceProofStore,
@@ -675,8 +682,8 @@ where
                 .await
                 .map_err(tier_reference_proof_admin_error)?;
             for object in &page.objects {
-                if tier_object_blocks_target_rebind(object, target).map_err(tier_reference_proof_admin_error)? {
-                    return Err(tier_reference_proof_in_use_error(&target.tier_name, object));
+                if tier_object_blocks_any_target_rebind(object, targets).map_err(tier_reference_proof_admin_error)? {
+                    return Err(tier_reference_proof_in_use_error(&object.transitioned_object.tier, object));
                 }
             }
             if !page.is_truncated {
@@ -691,21 +698,122 @@ where
             }
         }
     }
-    Ok(())
+    ensure_no_authoritative_persisted_references(api, targets).await
 }
 
-fn tier_object_blocks_target_rebind(object: &ObjectInfo, target: &TierMutationIntentTarget) -> io::Result<bool> {
-    if object.transitioned_object.status != rustfs_filemeta::TRANSITION_COMPLETE
-        || object.transitioned_object.tier != target.tier_name
+async fn ensure_no_authoritative_persisted_references<S>(
+    api: Arc<S>,
+    targets: &[TierMutationIntentTarget],
+) -> std::result::Result<(), AdminError>
+where
+    S: TierReferenceProofStore,
+{
+    ensure_no_authoritative_persisted_references_with(api.clone(), TIER_DELETE_JOURNAL_PREFIX, |_object, data| {
+        let journal = decode_tier_delete_journal_entry(data).map_err(io::Error::other)?;
+        Ok((
+            journal.tier_name.clone(),
+            tier_persisted_reference_blocks_any_target(&journal.tier_name, journal.backend_identity, targets),
+        ))
+    })
+    .await?;
+    ensure_no_authoritative_persisted_references_with(api, TRANSITION_TRANSACTION_RECORD_PREFIX, |object, data| {
+        let transaction = decode_transition_transaction_record(object, data).map_err(io::Error::other)?;
+        Ok((
+            transaction.tier_name.clone(),
+            tier_persisted_reference_blocks_any_target(&transaction.tier_name, Some(transaction.backend_fingerprint), targets),
+        ))
+    })
+    .await
+}
+
+async fn ensure_no_authoritative_persisted_references_with<S, F>(
+    api: Arc<S>,
+    prefix: &str,
+    blocks_target: F,
+) -> std::result::Result<(), AdminError>
+where
+    S: TierReferenceProofStore,
+    F: Fn(&str, &[u8]) -> io::Result<(String, bool)>,
+{
+    let mut marker = None;
+    loop {
+        let page = api
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                prefix,
+                marker.take(),
+                None,
+                TIER_REFERENCE_PROOF_LIST_LIMIT,
+                false,
+                None,
+                false,
+            )
+            .await
+            .map_err(tier_reference_proof_admin_error)?;
+        for object in &page.objects {
+            let data = read_config(api.clone(), &object.name)
+                .await
+                .map_err(tier_reference_proof_admin_error)?;
+            let (tier_name, blocks) = blocks_target(&object.name, &data).map_err(tier_reference_proof_admin_error)?;
+            if blocks {
+                return Err(tier_reference_proof_persisted_in_use_error(&tier_name, &object.name));
+            }
+        }
+        if !page.is_truncated {
+            return Ok(());
+        }
+        marker = page.next_continuation_token;
+        if marker.is_none() {
+            return Err(tier_reference_proof_admin_error(io::Error::other(
+                "tier persisted reference proof listing is truncated without a next marker",
+            )));
+        }
+    }
+}
+
+fn tier_object_blocks_any_target_rebind(object: &ObjectInfo, targets: &[TierMutationIntentTarget]) -> io::Result<bool> {
+    if object.transitioned_object.status != rustfs_filemeta::TRANSITION_COMPLETE && !object.transitioned_object.free_version {
+        return Ok(false);
+    }
+    if !targets
+        .iter()
+        .any(|target| target.tier_name == object.transitioned_object.tier)
     {
         return Ok(false);
     }
     let current_identity = tier_destination_id_from_metadata(&object.user_defined)?;
-    Ok(match (&current_identity, &target.new_backend_identity) {
-        (_, None) => true,
-        (Some(current), Some(new)) => current != new,
-        (None, Some(_)) => true,
-    })
+    Ok(tier_persisted_reference_blocks_any_target(
+        &object.transitioned_object.tier,
+        current_identity,
+        targets,
+    ))
+}
+
+fn tier_persisted_reference_blocks_any_target(
+    tier_name: &str,
+    backend_identity: Option<TierDestinationId>,
+    targets: &[TierMutationIntentTarget],
+) -> bool {
+    targets
+        .iter()
+        .any(|target| tier_persisted_reference_blocks_target(tier_name, backend_identity, target))
+}
+
+fn tier_object_blocks_target_rebind(object: &ObjectInfo, target: &TierMutationIntentTarget) -> io::Result<bool> {
+    tier_object_blocks_any_target_rebind(object, std::slice::from_ref(target))
+}
+
+fn tier_persisted_reference_blocks_target(
+    tier_name: &str,
+    backend_identity: Option<TierDestinationId>,
+    target: &TierMutationIntentTarget,
+) -> bool {
+    tier_name == target.tier_name
+        && match target.new_backend_identity {
+            None => true,
+            Some(new_backend_identity) => backend_identity != Some(new_backend_identity),
+        }
 }
 
 fn tier_reference_proof_in_use_error(tier_name: &str, object: &ObjectInfo) -> AdminError {
@@ -714,6 +822,12 @@ fn tier_reference_proof_in_use_error(tier_name: &str, object: &ObjectInfo) -> Ad
         "Remote tier {tier_name} still has object references, for example {}/{}",
         object.bucket, object.name
     );
+    err
+}
+
+fn tier_reference_proof_persisted_in_use_error(tier_name: &str, object: &str) -> AdminError {
+    let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+    err.message = format!("Remote tier {tier_name} still has a persisted reference, for example {object}");
     err
 }
 
@@ -7804,6 +7918,13 @@ mod tests {
                 .push(object);
         }
 
+        async fn insert_config_object(&self, object: String, data: Vec<u8>) {
+            self.objects
+                .lock()
+                .await
+                .insert(object, (data, "reference-proof-etag".to_string()));
+        }
+
         fn omit_truncated_reference_marker(&self) {
             self.truncate_reference_page_without_marker.store(true, Ordering::SeqCst);
         }
@@ -8414,6 +8535,92 @@ mod tests {
             .expect_err("references to the old destination identity must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
         assert!(err.message.contains("photos/2026/old-destination.jpg"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn zero_reference_proof_blocks_persisted_journal_transaction_and_free_version_references() {
+        let current = build_rustfs_tier("COLD-A");
+        let current_identity = tier_backend_identity(&current).expect("current identity should encode");
+        let replacement = build_azure_tier("account-a");
+        let replacement_identity = tier_backend_identity(&replacement).expect("replacement identity should encode");
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: Some(replacement_identity),
+        };
+
+        let journal_store = Arc::new(CasConfigStore::default());
+        let journal = crate::bucket::lifecycle::tier_sweeper::Jentry {
+            obj_name: "remote/journal-object".to_string(),
+            version_id: "v1".to_string(),
+            tier_name: "COLD-A".to_string(),
+            backend_identity: Some(current_identity),
+            version_id_exact: false,
+        };
+        journal_store
+            .insert_config_object(
+                crate::bucket::lifecycle::tier_delete_journal::tier_delete_journal_object_name(&journal),
+                crate::bucket::lifecycle::tier_delete_journal::encode_tier_delete_journal_entry(&journal)
+                    .expect("journal record should encode"),
+            )
+            .await;
+        let err = ensure_no_authoritative_tier_object_references(journal_store, std::slice::from_ref(&target))
+            .await
+            .expect_err("unfinished delete journal for the old backend must block rebind");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(err.message.contains(TIER_DELETE_JOURNAL_PREFIX), "{}", err.message);
+
+        let transaction_store = Arc::new(CasConfigStore::default());
+        let transaction = crate::bucket::lifecycle::transition_transaction::TransitionTransaction::new(
+            crate::bucket::lifecycle::transition_transaction::TransitionTransactionInit {
+                deployment_id: uuid::Uuid::new_v4(),
+                transaction_id: uuid::Uuid::new_v4(),
+                owner_epoch: uuid::Uuid::new_v4(),
+                write_id: uuid::Uuid::new_v4(),
+                source: crate::bucket::lifecycle::transition_transaction::TransitionSourceIdentity {
+                    bucket: "photos".to_string(),
+                    object: "2026/transaction.jpg".to_string(),
+                    version_id: None,
+                    data_dir: uuid::Uuid::new_v4(),
+                    mod_time_unix_nanos: 1,
+                    size: 1,
+                    etag: "etag".to_string(),
+                    version_mode: crate::bucket::lifecycle::transition_transaction::TransitionSourceVersionMode::Unversioned,
+                },
+                tier_name: "COLD-A".to_string(),
+                backend_fingerprint: current_identity,
+                not_after_unix_nanos: 2,
+            },
+        )
+        .expect("transaction record should initialize");
+        transaction_store
+            .insert_config_object(
+                crate::bucket::lifecycle::transition_transaction::transition_transaction_record_object_name(
+                    transaction.transaction_id,
+                )
+                .expect("transaction record path should build"),
+                transaction.encode().expect("transaction record should encode"),
+            )
+            .await;
+        let err = ensure_no_authoritative_tier_object_references(transaction_store, std::slice::from_ref(&target))
+            .await
+            .expect_err("unfinished transition transaction for the old backend must block rebind");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(err.message.contains(TRANSITION_TRANSACTION_RECORD_PREFIX), "{}", err.message);
+
+        let free_version_store = Arc::new(CasConfigStore::default());
+        let mut free_version = transitioned_tier_object("photos", "2026/free-version.jpg", "COLD-A", Some(current_identity));
+        free_version.transitioned_object.status = "pending".to_string();
+        free_version.transitioned_object.free_version = true;
+        ensure_no_authoritative_tier_object_references(free_version_store.clone(), std::slice::from_ref(&target))
+            .await
+            .expect("empty free-version fixture should permit rebind");
+        free_version_store.add_listed_version(free_version);
+        let err = ensure_no_authoritative_tier_object_references(free_version_store, &[target])
+            .await
+            .expect_err("recoverable free version for the old backend must block rebind");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(err.message.contains("photos/2026/free-version.jpg"), "{}", err.message);
     }
 
     #[tokio::test]
