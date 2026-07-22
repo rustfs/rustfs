@@ -5612,6 +5612,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_replay_mixed_version_peer_matrix_fails_before_local_publish() {
+        for (case, peer_error, expected_error) in [
+            (
+                "old_unimplemented",
+                "peer tier mutation commit RPC failed: status: Unimplemented, message: \"old peer has no tier mutation control service\"",
+                "old peer",
+            ),
+            (
+                "deadline_exceeded",
+                "peer tier mutation commit RPC failed: status: DeadlineExceeded, message: \"peer tier mutation control timed out\"",
+                "timed out",
+            ),
+            (
+                "unavailable",
+                "peer tier mutation commit RPC failed: status: Unavailable, message: \"peer tier mutation control unavailable\"",
+                "unavailable",
+            ),
+        ] {
+            let store = Arc::new(CasConfigStore::default());
+            let mut persisted = empty_mgr();
+            persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+            persisted
+                .save_tiering_config_if_current(store.clone(), None)
+                .await
+                .expect("tier config fixture should persist");
+
+            let mutation_id = uuid::Uuid::from_u128(match case {
+                "old_unimplemented" => 31,
+                "deadline_exceeded" => 32,
+                "unavailable" => 33,
+                _ => unreachable!("matrix cases are enumerated above"),
+            });
+            let intent = committed_remove_intent("COLD-A", mutation_id, "etag-new");
+            crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &intent)
+                .await
+                .expect("committed intent fixture should persist");
+            let writes_after_fixture = store.next_etag.load(Ordering::SeqCst);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let handle = TierConfigMgr::new();
+
+            let err = TIER_MUTATION_TEST_COMMIT_PEERS
+                .scope(vec![FakeTierMutationCommitPeer::boxed("peer-a", calls.clone(), Err(peer_error))], async {
+                    TierConfigMgr::reload_handle_with(&handle, store.clone()).await
+                })
+                .await
+                .expect_err("mixed-version peer failure must abort committed replay");
+
+            assert!(err.to_string().contains(expected_error), "{case} returned {err}");
+            assert_eq!(lock_unpoisoned(&calls).as_slice(), &[format!("peer-a:commit:{mutation_id}:etag-new")]);
+            assert!(
+                !handle.read().await.tiers.contains_key("COLD-A"),
+                "{case} must not publish the local tier config after peer replay fails"
+            );
+            assert_eq!(
+                store.next_etag.load(Ordering::SeqCst),
+                writes_after_fixture,
+                "{case} must not perform a second tier-config CAS write after replay fails"
+            );
+            let reloaded = TierConfigMgr::load_tier_mutation_intents(store)
+                .await
+                .expect("intent scan should succeed after failed mixed-version replay");
+            assert!(
+                reloaded.iter().any(|intent| intent.mutation_id == mutation_id),
+                "{case} must keep the committed intent for retry"
+            );
+            let blocked = match TierConfigMgr::acquire_operation_lease(&handle, "COLD-A").await {
+                Ok(_) => panic!("{case} must keep committed replay blocking old tier operations"),
+                Err(err) => err,
+            };
+            assert!(blocked.message.contains("being replaced"), "{case} returned {blocked}");
+        }
+    }
+
+    #[tokio::test]
     async fn committed_mutation_recovery_requires_every_peer_to_commit() {
         let mutation_id = uuid::Uuid::from_u128(17);
         let intent = committed_remove_intent("COLD-A", mutation_id, "etag-new");

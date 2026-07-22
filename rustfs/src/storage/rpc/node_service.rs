@@ -2319,6 +2319,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tier_mutation_control_rejects_old_protocol_version_before_store_lookup() {
+        let service = make_tier_mutation_control_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4();
+        let payload = Bytes::from_static(b"intent");
+        let mut request = Request::new(TierMutationPrepareRequest {
+            version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION - 1,
+            mutation_id: mutation_id.to_string(),
+            canonical_payload: payload,
+        });
+        let body = rustfs_protos::canonical_tier_mutation_rpc_body(
+            request.get_ref().version,
+            rustfs_protos::TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &request.get_ref().canonical_payload,
+        )
+        .expect("old-version request should encode for rejection test");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+
+        let error = service
+            .prepare_tier_mutation(request)
+            .await
+            .expect_err("old tier mutation protocol version must fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
     async fn tier_mutation_control_rejects_oversized_prepare_before_auth_and_store_lookup() {
         let service = make_tier_mutation_control_server_for_context(None);
         let mutation_id = uuid::Uuid::new_v4();
