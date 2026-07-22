@@ -727,6 +727,12 @@ fn tier_mutation_replay_error(err: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("Remote tier mutation committed replay failed: {err}"))
 }
 
+fn tier_mutation_fanout_admin_error(action: &str, err: impl std::fmt::Display) -> AdminError {
+    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+    admin_err.message = format!("Remote tier mutation {action} failed: {err}");
+    admin_err
+}
+
 fn ensure_complete_tier_mutation_commit_peer_set(peer_count: usize, remote_host_count: usize) -> io::Result<()> {
     if peer_count != remote_host_count {
         return Err(tier_mutation_replay_error(
@@ -737,15 +743,23 @@ fn ensure_complete_tier_mutation_commit_peer_set(peer_count: usize, remote_host_
 }
 
 #[async_trait::async_trait]
-trait TierMutationCommitPeer: Send + Sync {
+trait TierMutationPeer: Send + Sync {
     fn peer_label(&self) -> String;
+    async fn prepare_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState>;
     async fn commit_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState>;
+    async fn abort_tier_mutation(&self, mutation_id: uuid::Uuid) -> Result<PeerTierMutationState>;
 }
 
 #[async_trait::async_trait]
-impl TierMutationCommitPeer for PeerRestClient {
+impl TierMutationPeer for PeerRestClient {
     fn peer_label(&self) -> String {
         self.grid_host.clone()
+    }
+
+    async fn prepare_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState> {
+        Ok(PeerRestClient::prepare_tier_mutation(self, mutation_id, canonical_payload)
+            .await?
+            .state)
     }
 
     async fn commit_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState> {
@@ -753,17 +767,24 @@ impl TierMutationCommitPeer for PeerRestClient {
             .await?
             .state)
     }
+
+    async fn abort_tier_mutation(&self, mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
+        Ok(PeerRestClient::abort_tier_mutation(self, mutation_id).await?.state)
+    }
 }
 
 #[cfg(test)]
 tokio::task_local! {
-    static TIER_MUTATION_TEST_COMMIT_PEERS: Vec<Arc<dyn TierMutationCommitPeer>>;
+    static TIER_MUTATION_TEST_PEERS: Vec<Arc<dyn TierMutationPeer>>;
 }
 
-async fn remote_tier_mutation_commit_peers() -> io::Result<Vec<Arc<dyn TierMutationCommitPeer>>> {
+async fn remote_tier_mutation_peers() -> io::Result<Vec<Arc<dyn TierMutationPeer>>> {
     #[cfg(test)]
-    if let Ok(peers) = TIER_MUTATION_TEST_COMMIT_PEERS.try_with(|peers| peers.clone()) {
+    if let Ok(peers) = TIER_MUTATION_TEST_PEERS.try_with(|peers| peers.clone()) {
         return Ok(peers);
+    }
+    if !runtime_sources::setup_is_dist_erasure().await {
+        return Ok(Vec::new());
     }
     let Some(endpoints) = runtime_sources::endpoint_pools() else {
         return Err(tier_mutation_replay_error("cluster endpoint topology is not initialized"));
@@ -773,15 +794,73 @@ async fn remote_tier_mutation_commit_peers() -> io::Result<Vec<Arc<dyn TierMutat
     let peers = peers
         .into_iter()
         .flatten()
-        .map(|peer| Arc::new(peer) as Arc<dyn TierMutationCommitPeer>)
+        .map(|peer| Arc::new(peer) as Arc<dyn TierMutationPeer>)
         .collect::<Vec<_>>();
     ensure_complete_tier_mutation_commit_peer_set(peers.len(), remote_host_count)?;
     Ok(peers)
 }
 
+async fn prepare_tier_mutation_peers(
+    mutation_id: uuid::Uuid,
+    peers: Vec<Arc<dyn TierMutationPeer>>,
+    intent: &TierMutationIntent,
+) -> std::result::Result<Vec<Arc<dyn TierMutationPeer>>, AdminError> {
+    let payload = Bytes::from(
+        intent
+            .encode()
+            .map_err(|err| tier_mutation_fanout_admin_error("prepare", err))?,
+    );
+    let results = join_all(peers.into_iter().map(|peer| {
+        let payload = payload.clone();
+        async move {
+            let label = peer.peer_label();
+            let result = peer.prepare_tier_mutation(mutation_id, payload).await;
+            (peer, label, result)
+        }
+    }))
+    .await;
+
+    let mut prepared = Vec::with_capacity(results.len());
+    let mut failure = None;
+    for (peer, label, result) in results {
+        match result {
+            Ok(PeerTierMutationState::Prepared) => prepared.push(peer),
+            Ok(state) => {
+                failure = Some(tier_mutation_fanout_admin_error(
+                    "prepare",
+                    format!("peer {label} returned unexpected state {state:?}"),
+                ));
+            }
+            Err(err) => failure = Some(tier_mutation_fanout_admin_error("prepare", format!("peer {label}: {err}"))),
+        }
+    }
+
+    if let Some(err) = failure {
+        abort_tier_mutation_peers(mutation_id, prepared).await;
+        return Err(err);
+    }
+    Ok(prepared)
+}
+
+async fn abort_tier_mutation_peers(mutation_id: uuid::Uuid, peers: Vec<Arc<dyn TierMutationPeer>>) {
+    let results = join_all(peers.into_iter().map(|peer| async move {
+        let label = peer.peer_label();
+        let result = peer.abort_tier_mutation(mutation_id).await;
+        (label, result)
+    }))
+    .await;
+    for (label, result) in results {
+        match result {
+            Ok(PeerTierMutationState::Aborted) => {}
+            Ok(state) => warn!(peer = %label, ?state, "remote tier mutation peer returned unexpected abort state"),
+            Err(err) => warn!(peer = %label, error = ?err, "failed to abort prepared remote tier mutation peer"),
+        }
+    }
+}
+
 async fn commit_tier_mutation_peers(
     mutation_id: uuid::Uuid,
-    peers: Vec<Arc<dyn TierMutationCommitPeer>>,
+    peers: Vec<Arc<dyn TierMutationPeer>>,
     committed_config_etag: &str,
 ) -> io::Result<()> {
     let payload = Bytes::copy_from_slice(committed_config_etag.as_bytes());
@@ -2765,89 +2844,140 @@ impl TierConfigMgr {
         S: TierReferenceProofStore + 'static,
     {
         let handle = handle.clone();
+        #[cfg(test)]
+        let test_peers = TIER_MUTATION_TEST_PEERS.try_with(|peers| peers.clone()).ok();
         tokio::spawn(async move {
-            match AssertUnwindSafe(async move {
-                let _config_lock = config_lock;
-                let _update = update;
-                let mutation_kind = mutation.intent_kind();
-                if version.is_none() && !candidate.tiers.is_empty() && mutation_kind != TierMutationIntentKind::Add {
-                    return Err(TierConfigUpdateError::Load(io::Error::other(
-                        "tier configuration mutation requires an existing config ETag",
-                    )));
-                }
-                let explicit_tier_name = mutation.explicit_tier_name().map(str::to_string);
-                let current_for_targets = TierConfigMgr {
-                    driver_cache: HashMap::new(),
-                    tiers: candidate
-                        .tiers
-                        .iter()
-                        .map(|(tier_name, config)| (tier_name.clone(), config.clone_with_credentials()))
-                        .collect(),
-                    last_refreshed_at: candidate.last_refreshed_at,
-                };
-                let transition = {
-                    let mut manager = handle.write().await;
-                    let target_tiers = mutation.target_tiers(&manager, &candidate);
-                    Self::begin_tier_transition(&handle, &mut manager, target_tiers).map_err(TierConfigUpdateError::Publish)?
-                };
-                transition
-                    .wait_for_active_leases()
-                    .await
-                    .map_err(TierConfigUpdateError::Publish)?;
-                let driver_tier =
-                    apply_tier_candidate_mutation(mutation, &mut candidate, Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT)
-                        .await
-                        .map_err(TierConfigUpdateError::Mutation)?;
-                let proof_targets =
-                    tier_mutation_proof_targets(mutation_kind, explicit_tier_name.as_deref(), &current_for_targets, &candidate);
-                let affected_targets =
-                    build_tier_mutation_affected_targets(mutation_kind, proof_targets, &current_for_targets, &candidate)
-                        .map_err(TierConfigUpdateError::Publish)?;
-                ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets)
-                    .await
-                    .map_err(TierConfigUpdateError::Publish)?;
-                let coordinator_intent =
-                    build_coordinator_tier_mutation_intent(mutation_kind, version.clone(), &candidate, affected_targets)
-                        .map_err(TierConfigUpdateError::Save)?;
-                save_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref())
-                    .await
-                    .map_err(TierConfigUpdateError::Save)?;
-                let saved = match candidate
-                    .save_tiering_config_if_current_with_info(api.clone(), version.as_deref())
-                    .await
-                {
-                    Ok(saved) => saved,
-                    Err(err) => {
-                        abort_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref()).await;
-                        return Err(TierConfigUpdateError::Save(err));
+            let update_task = async move {
+                match AssertUnwindSafe(async move {
+                    let _config_lock = config_lock;
+                    let _update = update;
+                    let mutation_kind = mutation.intent_kind();
+                    if version.is_none() && !candidate.tiers.is_empty() && mutation_kind != TierMutationIntentKind::Add {
+                        return Err(TierConfigUpdateError::Load(io::Error::other(
+                            "tier configuration mutation requires an existing config ETag",
+                        )));
                     }
-                };
-                let committed_config_etag = saved
-                    .etag
-                    .filter(|etag| !etag.trim().is_empty())
-                    .ok_or_else(|| io::Error::other("tier configuration object is missing an ETag after save"))
-                    .map_err(TierConfigUpdateError::Save)?;
-                commit_coordinator_tier_mutation_intent(api, coordinator_intent.as_ref(), &committed_config_etag)
-                    .await
-                    .map_err(TierConfigUpdateError::Save)?;
-                Self::publish_candidate_after_drain(&handle, candidate, driver_tier.as_deref(), transition)
-                    .await
-                    .map_err(TierConfigUpdateError::Publish)
-            })
-            .catch_unwind()
-            .await
+                    let explicit_tier_name = mutation.explicit_tier_name().map(str::to_string);
+                    let current_for_targets = TierConfigMgr {
+                        driver_cache: HashMap::new(),
+                        tiers: candidate
+                            .tiers
+                            .iter()
+                            .map(|(tier_name, config)| (tier_name.clone(), config.clone_with_credentials()))
+                            .collect(),
+                        last_refreshed_at: candidate.last_refreshed_at,
+                    };
+                    let transition = {
+                        let mut manager = handle.write().await;
+                        let target_tiers = mutation.target_tiers(&manager, &candidate);
+                        Self::begin_tier_transition(&handle, &mut manager, target_tiers)
+                            .map_err(TierConfigUpdateError::Publish)?
+                    };
+                    transition
+                        .wait_for_active_leases()
+                        .await
+                        .map_err(TierConfigUpdateError::Publish)?;
+                    let driver_tier =
+                        apply_tier_candidate_mutation(mutation, &mut candidate, Instant::now() + TIER_REMOTE_VALIDATION_TIMEOUT)
+                            .await
+                            .map_err(TierConfigUpdateError::Mutation)?;
+                    let proof_targets = tier_mutation_proof_targets(
+                        mutation_kind,
+                        explicit_tier_name.as_deref(),
+                        &current_for_targets,
+                        &candidate,
+                    );
+                    let affected_targets =
+                        build_tier_mutation_affected_targets(mutation_kind, proof_targets, &current_for_targets, &candidate)
+                            .map_err(TierConfigUpdateError::Publish)?;
+                    ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets)
+                        .await
+                        .map_err(TierConfigUpdateError::Publish)?;
+                    let coordinator_intent =
+                        build_coordinator_tier_mutation_intent(mutation_kind, version.clone(), &candidate, affected_targets)
+                            .map_err(TierConfigUpdateError::Save)?;
+                    save_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref())
+                        .await
+                        .map_err(TierConfigUpdateError::Save)?;
+                    let prepared_peers = if let Some(intent) = coordinator_intent.as_ref() {
+                        let peers = remote_tier_mutation_peers()
+                            .await
+                            .map_err(|err| TierConfigUpdateError::Publish(tier_mutation_fanout_admin_error("prepare", err)))?;
+                        if peers.is_empty() {
+                            Vec::new()
+                        } else {
+                            match prepare_tier_mutation_peers(intent.mutation_id, peers, intent).await {
+                                Ok(prepared) => prepared,
+                                Err(err) => {
+                                    abort_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref()).await;
+                                    return Err(TierConfigUpdateError::Publish(err));
+                                }
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let saved = match candidate
+                        .save_tiering_config_if_current_with_info(api.clone(), version.as_deref())
+                        .await
+                    {
+                        Ok(saved) => saved,
+                        Err(err) => {
+                            if let Some(intent) = coordinator_intent.as_ref()
+                                && !prepared_peers.is_empty()
+                            {
+                                abort_tier_mutation_peers(intent.mutation_id, prepared_peers).await;
+                            }
+                            abort_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref()).await;
+                            return Err(TierConfigUpdateError::Save(err));
+                        }
+                    };
+                    let committed_config_etag = saved
+                        .etag
+                        .filter(|etag| !etag.trim().is_empty())
+                        .ok_or_else(|| io::Error::other("tier configuration object is missing an ETag after save"))
+                        .map_err(TierConfigUpdateError::Save)?;
+                    commit_coordinator_tier_mutation_intent(api, coordinator_intent.as_ref(), &committed_config_etag)
+                        .await
+                        .map_err(TierConfigUpdateError::Save)?;
+                    if let Some(intent) = coordinator_intent.as_ref()
+                        && !prepared_peers.is_empty()
+                    {
+                        commit_tier_mutation_peers(intent.mutation_id, prepared_peers, &committed_config_etag)
+                            .await
+                            .map_err(|err| TierConfigUpdateError::Publish(tier_mutation_fanout_admin_error("commit", err)))?;
+                    }
+                    Self::publish_candidate_after_drain(&handle, candidate, driver_tier.as_deref(), transition)
+                        .await
+                        .map_err(TierConfigUpdateError::Publish)
+                })
+                .catch_unwind()
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => {
+                        error!(error = ?err, "remote tier configuration update failed");
+                        Err(err)
+                    }
+                    Err(_) => {
+                        error!("remote tier configuration update panicked");
+                        let mut err = ERR_TIER_INVALID_CONFIG.clone();
+                        err.message = "Remote tier configuration update panicked".to_string();
+                        Err(TierConfigUpdateError::Publish(err))
+                    }
+                }
+            };
+            #[cfg(test)]
             {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(err)) => {
-                    error!(error = ?err, "remote tier configuration update failed");
-                    Err(err)
+                if let Some(peers) = test_peers {
+                    TIER_MUTATION_TEST_PEERS.scope(peers, update_task).await
+                } else {
+                    update_task.await
                 }
-                Err(_) => {
-                    error!("remote tier configuration update panicked");
-                    let mut err = ERR_TIER_INVALID_CONFIG.clone();
-                    err.message = "Remote tier configuration update panicked".to_string();
-                    Err(TierConfigUpdateError::Publish(err))
-                }
+            }
+            #[cfg(not(test))]
+            {
+                update_task.await
             }
         })
         .await
@@ -2889,7 +3019,7 @@ impl TierConfigMgr {
         let mut all_mutation_intents = peer_mutation_intents.clone();
         all_mutation_intents.extend(coordinator_mutation_intents.iter().cloned());
         Self::reconcile_committed_mutation_intent_blocks(handle, &all_mutation_intents).await?;
-        Self::replay_committed_mutation_intents(&peer_mutation_intents).await?;
+        Self::replay_committed_mutation_intents(&all_mutation_intents).await?;
         let allowed_mutation_blocks = all_mutation_intents
             .iter()
             .filter(|intent| matches!(intent.state, TierMutationIntentState::Prepared | TierMutationIntentState::Committed))
@@ -3007,7 +3137,10 @@ impl TierConfigMgr {
         {
             return Ok(());
         }
-        let peers = remote_tier_mutation_commit_peers().await?;
+        let peers = remote_tier_mutation_peers().await?;
+        if peers.is_empty() {
+            return Ok(());
+        }
         for intent in intents
             .iter()
             .filter(|intent| intent.state == TierMutationIntentState::Committed)
@@ -5528,19 +5661,36 @@ mod tests {
         intent
     }
 
-    struct FakeTierMutationCommitPeer {
+    struct FakeTierMutationPeer {
         label: &'static str,
         calls: Arc<Mutex<Vec<String>>>,
+        prepare: std::result::Result<PeerTierMutationState, &'static str>,
         commit: std::result::Result<PeerTierMutationState, &'static str>,
+        abort: std::result::Result<PeerTierMutationState, &'static str>,
     }
 
-    impl FakeTierMutationCommitPeer {
+    impl FakeTierMutationPeer {
         fn boxed(
             label: &'static str,
             calls: Arc<Mutex<Vec<String>>>,
             commit: std::result::Result<PeerTierMutationState, &'static str>,
-        ) -> Arc<dyn TierMutationCommitPeer> {
-            Arc::new(Self { label, calls, commit })
+        ) -> Arc<dyn TierMutationPeer> {
+            Self::boxed_with_prepare_commit(label, calls, Ok(PeerTierMutationState::Prepared), commit)
+        }
+
+        fn boxed_with_prepare_commit(
+            label: &'static str,
+            calls: Arc<Mutex<Vec<String>>>,
+            prepare: std::result::Result<PeerTierMutationState, &'static str>,
+            commit: std::result::Result<PeerTierMutationState, &'static str>,
+        ) -> Arc<dyn TierMutationPeer> {
+            Arc::new(Self {
+                label,
+                calls,
+                prepare,
+                commit,
+                abort: Ok(PeerTierMutationState::Aborted),
+            })
         }
 
         fn record(&self, call: String) {
@@ -5549,9 +5699,18 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl TierMutationCommitPeer for FakeTierMutationCommitPeer {
+    impl TierMutationPeer for FakeTierMutationPeer {
         fn peer_label(&self) -> String {
             self.label.to_string()
+        }
+
+        async fn prepare_tier_mutation(
+            &self,
+            mutation_id: uuid::Uuid,
+            canonical_payload: Bytes,
+        ) -> Result<PeerTierMutationState> {
+            self.record(format!("{}:prepare:{}:{}", self.label, mutation_id, canonical_payload.len()));
+            self.prepare.map_err(Error::other)
         }
 
         async fn commit_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState> {
@@ -5563,6 +5722,11 @@ mod tests {
             ));
             self.commit.map_err(Error::other)
         }
+
+        async fn abort_tier_mutation(&self, mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
+            self.record(format!("{}:abort:{}", self.label, mutation_id));
+            self.abort.map_err(Error::other)
+        }
     }
 
     #[tokio::test]
@@ -5571,9 +5735,9 @@ mod tests {
         let intent = committed_remove_intent("COLD-A", mutation_id, "etag-new");
         let calls = Arc::new(Mutex::new(Vec::new()));
 
-        TIER_MUTATION_TEST_COMMIT_PEERS
+        TIER_MUTATION_TEST_PEERS
             .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
+                vec![FakeTierMutationPeer::boxed(
                     "peer-a",
                     calls.clone(),
                     Ok(PeerTierMutationState::Committed),
@@ -5595,15 +5759,10 @@ mod tests {
         let intent = committed_remove_intent("COLD-A", mutation_id, "etag-new");
         let calls = Arc::new(Mutex::new(Vec::new()));
 
-        let err = TIER_MUTATION_TEST_COMMIT_PEERS
-            .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
-                    "peer-a",
-                    calls.clone(),
-                    Err("network down"),
-                )],
-                async { TierConfigMgr::replay_committed_mutation_intents(&[intent]).await },
-            )
+        let err = TIER_MUTATION_TEST_PEERS
+            .scope(vec![FakeTierMutationPeer::boxed("peer-a", calls.clone(), Err("network down"))], async {
+                TierConfigMgr::replay_committed_mutation_intents(&[intent]).await
+            })
             .await
             .expect_err("committed recovery must fail closed when peer commit cannot replay");
 
@@ -5617,11 +5776,11 @@ mod tests {
         let intent = committed_remove_intent("COLD-A", mutation_id, "etag-new");
         let calls = Arc::new(Mutex::new(Vec::new()));
 
-        let err = TIER_MUTATION_TEST_COMMIT_PEERS
+        let err = TIER_MUTATION_TEST_PEERS
             .scope(
                 vec![
-                    FakeTierMutationCommitPeer::boxed("peer-a", calls.clone(), Ok(PeerTierMutationState::Committed)),
-                    FakeTierMutationCommitPeer::boxed("peer-b", calls.clone(), Ok(PeerTierMutationState::Prepared)),
+                    FakeTierMutationPeer::boxed("peer-a", calls.clone(), Ok(PeerTierMutationState::Committed)),
+                    FakeTierMutationPeer::boxed("peer-b", calls.clone(), Ok(PeerTierMutationState::Prepared)),
                 ],
                 async { TierConfigMgr::replay_committed_mutation_intents(&[intent]).await },
             )
@@ -5647,6 +5806,245 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_fanout_prepare_failure_aborts_prepared_peers_without_cas() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (mut candidate, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should reload");
+        let original_version = version.clone();
+        candidate
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("candidate")));
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let err = TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![
+                    FakeTierMutationPeer::boxed_with_prepare_commit(
+                        "peer-a",
+                        calls.clone(),
+                        Ok(PeerTierMutationState::Prepared),
+                        Ok(PeerTierMutationState::Committed),
+                    ),
+                    FakeTierMutationPeer::boxed_with_prepare_commit(
+                        "peer-b",
+                        calls.clone(),
+                        Err("prepare unavailable"),
+                        Ok(PeerTierMutationState::Committed),
+                    ),
+                ],
+                async {
+                    TierConfigMgr::update_candidate_owned(
+                        &manager,
+                        store.clone(),
+                        candidate,
+                        version,
+                        TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                        update,
+                        None,
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect_err("partial prepare failure must fail before config CAS");
+
+        let TierConfigUpdateError::Publish(err) = err else {
+            panic!("prepare fanout failure should be reported as publish failure");
+        };
+        assert!(err.message.contains("peer-b"), "{}", err.message);
+        let calls = lock_unpoisoned(&calls).clone();
+        assert!(calls.iter().any(|call| call.starts_with("peer-a:prepare:")), "{calls:?}");
+        assert!(calls.iter().any(|call| call.starts_with("peer-b:prepare:")), "{calls:?}");
+        assert!(calls.iter().any(|call| call.starts_with("peer-a:abort:")), "{calls:?}");
+        assert!(!calls.iter().any(|call| call.contains(":commit:")), "{calls:?}");
+        let (persisted, current_version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config should remain readable");
+        assert_eq!(current_version, original_version, "prepare failure must not CAS the tier config object");
+        assert!(persisted.tiers.contains_key("COLD-A"));
+        let intents = TierConfigMgr::load_coordinator_mutation_intents(store)
+            .await
+            .expect("coordinator intent scan should succeed");
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, TierMutationIntentState::Aborted);
+    }
+
+    #[tokio::test]
+    async fn coordinator_fanout_commit_failure_keeps_committed_intent_for_reload_retry() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (mut candidate, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should reload");
+        candidate
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("candidate")));
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let err = TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed_with_prepare_commit(
+                    "peer-a",
+                    calls.clone(),
+                    Ok(PeerTierMutationState::Prepared),
+                    Err("commit unavailable"),
+                )],
+                async {
+                    TierConfigMgr::update_candidate_owned(
+                        &manager,
+                        store.clone(),
+                        candidate,
+                        version,
+                        TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                        update,
+                        None,
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect_err("commit peer failure must fail closed before local publish");
+
+        let TierConfigUpdateError::Publish(err) = err else {
+            panic!("commit fanout failure should be reported as publish failure");
+        };
+        assert!(err.message.contains("commit unavailable"), "{}", err.message);
+        assert!(
+            manager.read().await.tiers.contains_key("COLD-A"),
+            "failed peer commit must not publish the new generation locally"
+        );
+        let intents = TierConfigMgr::load_coordinator_mutation_intents(store.clone())
+            .await
+            .expect("coordinator intent scan should succeed after commit failure");
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, TierMutationIntentState::Committed);
+        let committed_id = intents[0].mutation_id;
+        let committed_etag = intents[0]
+            .committed_config_etag
+            .clone()
+            .expect("committed coordinator intent should carry the saved tier config ETag");
+
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed(
+                    "peer-a",
+                    calls.clone(),
+                    Ok(PeerTierMutationState::Committed),
+                )],
+                async {
+                    TierConfigMgr::reload_handle_with(&manager, store.clone())
+                        .await
+                        .expect("reload should retry committed coordinator peer fanout and publish");
+                },
+            )
+            .await;
+
+        assert!(
+            lock_unpoisoned(&calls)
+                .iter()
+                .any(|call| call == &format!("peer-a:commit:{committed_id}:{committed_etag}")),
+            "reload should retry the committed coordinator peer commit: {:?}",
+            lock_unpoisoned(&calls)
+        );
+        assert!(
+            !manager.read().await.tiers.contains_key("COLD-A"),
+            "reload retry should publish the committed tier removal"
+        );
+        let intents = TierConfigMgr::load_coordinator_mutation_intents(store)
+            .await
+            .expect("coordinator intent scan should succeed after retry cleanup");
+        assert!(intents.iter().all(|intent| intent.mutation_id != committed_id));
+    }
+
+    #[tokio::test]
+    async fn coordinator_fanout_success_commits_peers_before_publish() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (mut candidate, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should reload");
+        candidate
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("candidate")));
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed(
+                    "peer-a",
+                    calls.clone(),
+                    Ok(PeerTierMutationState::Committed),
+                )],
+                async {
+                    TierConfigMgr::update_candidate_owned(
+                        &manager,
+                        store.clone(),
+                        candidate,
+                        version,
+                        TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                        update,
+                        None,
+                    )
+                    .await
+                    .expect("successful peer fanout should publish the tier mutation");
+                },
+            )
+            .await;
+
+        let calls = lock_unpoisoned(&calls).clone();
+        let prepare_index = calls
+            .iter()
+            .position(|call| call.starts_with("peer-a:prepare:"))
+            .expect("successful update should prepare the peer");
+        let commit_index = calls
+            .iter()
+            .position(|call| call.contains(":commit:"))
+            .expect("successful update should commit the peer");
+        assert!(prepare_index < commit_index, "{calls:?}");
+        let saved_etag = load_tier_config_for_update(store)
+            .await
+            .expect("saved tier config should reload")
+            .1
+            .expect("saved tier config should have an ETag");
+        assert!(calls.iter().any(|call| call.ends_with(&format!(":{saved_etag}"))), "{calls:?}");
+        assert!(
+            !manager.read().await.tiers.contains_key("COLD-A"),
+            "local manager should publish only after peer commit succeeds"
+        );
+    }
+
+    #[tokio::test]
     async fn reload_handle_replays_committed_mutation_and_removes_intent_record() {
         let store = Arc::new(CasConfigStore::default());
         let mut persisted = empty_mgr();
@@ -5664,9 +6062,9 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handle = TierConfigMgr::new();
 
-        TIER_MUTATION_TEST_COMMIT_PEERS
+        TIER_MUTATION_TEST_PEERS
             .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
+                vec![FakeTierMutationPeer::boxed(
                     "peer-a",
                     calls.clone(),
                     Ok(PeerTierMutationState::Committed),
@@ -5714,9 +6112,9 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handle = TierConfigMgr::new();
 
-        TIER_MUTATION_TEST_COMMIT_PEERS
+        TIER_MUTATION_TEST_PEERS
             .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
+                vec![FakeTierMutationPeer::boxed(
                     "peer-a",
                     calls.clone(),
                     Ok(PeerTierMutationState::Committed),
@@ -5765,9 +6163,9 @@ mod tests {
             .await
             .expect("old generation lease should be available before recovery");
 
-        TIER_MUTATION_TEST_COMMIT_PEERS
+        TIER_MUTATION_TEST_PEERS
             .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
+                vec![FakeTierMutationPeer::boxed(
                     "peer-a",
                     calls.clone(),
                     Ok(PeerTierMutationState::Committed),
@@ -5841,9 +6239,9 @@ mod tests {
             .await
             .expect("old generation lease should be available before recovery");
 
-        TIER_MUTATION_TEST_COMMIT_PEERS
+        TIER_MUTATION_TEST_PEERS
             .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
+                vec![FakeTierMutationPeer::boxed(
                     "peer-a",
                     calls.clone(),
                     Ok(PeerTierMutationState::Committed),
@@ -5909,9 +6307,9 @@ mod tests {
         let left = TierConfigMgr::new();
         let right = TierConfigMgr::new();
 
-        TIER_MUTATION_TEST_COMMIT_PEERS
+        TIER_MUTATION_TEST_PEERS
             .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
+                vec![FakeTierMutationPeer::boxed(
                     "peer-a",
                     calls.clone(),
                     Ok(PeerTierMutationState::Committed),
@@ -6086,15 +6484,10 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let handle = TierConfigMgr::new();
 
-        let err = TIER_MUTATION_TEST_COMMIT_PEERS
-            .scope(
-                vec![FakeTierMutationCommitPeer::boxed(
-                    "peer-a",
-                    calls.clone(),
-                    Err("network down"),
-                )],
-                async { TierConfigMgr::reload_handle_with(&handle, store.clone()).await },
-            )
+        let err = TIER_MUTATION_TEST_PEERS
+            .scope(vec![FakeTierMutationPeer::boxed("peer-a", calls.clone(), Err("network down"))], async {
+                TierConfigMgr::reload_handle_with(&handle, store.clone()).await
+            })
             .await
             .expect_err("reload must fail closed when committed replay fails");
 
