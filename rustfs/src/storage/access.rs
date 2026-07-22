@@ -262,6 +262,27 @@ fn secondary_tag_hint_action(action: Action, version_id: Option<&str>) -> Option
     }
 }
 
+/// GHSA-3ppv: select the IAM action for an object read by whether the request
+/// names an explicit object version. A read that targets a specific version must
+/// authorize against `s3:GetObjectVersion`; a current-object read authorizes
+/// against `s3:GetObject`. Reading a historical version while only holding
+/// `s3:GetObject` is an information-disclosure bypass, so the two must not be
+/// conflated at the authorization boundary.
+///
+/// Note: `ActionSet::is_match` still maps a `s3:GetObjectVersion` grant onto a
+/// `s3:GetObject` request. That mapping is intentionally left in place until the
+/// remaining version-aware read paths (HeadObject, GetObjectAcl, tagging) get the
+/// same treatment — see the GHSA-3ppv follow-up audit. It does not re-open this
+/// disclosure: it only broadens a Version grant toward current reads, never the
+/// reverse.
+fn versioned_read_action(version_id: Option<&str>) -> Action {
+    if version_id.is_some() {
+        Action::S3Action(S3Action::GetObjectVersionAction)
+    } else {
+        Action::S3Action(S3Action::GetObjectAction)
+    }
+}
+
 async fn get_or_fetch_object_tag_conditions<T>(
     req: &mut S3Request<T>,
     bucket: &str,
@@ -1025,7 +1046,9 @@ impl S3Access for FS {
             req_info.object = Some(src_key.clone());
             req_info.version_id = version_id.clone();
 
-            authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+            // GHSA-3ppv: a versioned copy source must authorize against
+            // s3:GetObjectVersion, not s3:GetObject.
+            authorize_request(req, versioned_read_action(version_id.as_deref())).await?;
         }
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
@@ -1470,7 +1493,9 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await
+        // GHSA-3ppv: a versioned read (?versionId=...) must authorize against
+        // s3:GetObjectVersion, not s3:GetObject.
+        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await
     }
 
     /// Checks whether the GetObjectAcl request has accesses to the resources.
@@ -2050,7 +2075,9 @@ impl S3Access for FS {
             req_info.object = Some(src_key.clone());
             req_info.version_id = version_id.clone();
 
-            authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+            // GHSA-3ppv: a versioned copy source must authorize against
+            // s3:GetObjectVersion, not s3:GetObject.
+            authorize_request(req, versioned_read_action(version_id.as_deref())).await?;
         }
 
         let req_info = ext_req_info_mut(&mut req.extensions)?;
@@ -2080,7 +2107,7 @@ mod tests {
         legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
         merge_list_bucket_query_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
         put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested, secondary_tag_hint_action,
-        table_data_plane_admin_action, validate_post_object_success_controls,
+        table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
     use http::{Extensions, HeaderMap, Method, Uri};
@@ -2111,6 +2138,29 @@ mod tests {
     #[test]
     fn get_bucket_policy_uses_get_bucket_policy_action() {
         assert_eq!(get_bucket_policy_authorize_action(), Action::S3Action(S3Action::GetBucketPolicyAction));
+    }
+
+    #[test]
+    fn ghsa_3ppv_versioned_read_selects_get_object_version_action() {
+        // Regression (GHSA-3ppv): a read that names an explicit version must
+        // authorize against s3:GetObjectVersion so that a principal holding only
+        // s3:GetObject cannot read historical versions. Applies to GetObject and
+        // the CopyObject / UploadPartCopy sources.
+        assert_eq!(
+            versioned_read_action(Some("0194e0f1-0000-7000-8000-000000000000")),
+            Action::S3Action(S3Action::GetObjectVersionAction),
+            "an explicit versionId must require GetObjectVersion"
+        );
+        assert_eq!(
+            versioned_read_action(Some("null")),
+            Action::S3Action(S3Action::GetObjectVersionAction),
+            "the sentinel `null` version is still an explicit version selector"
+        );
+        assert_eq!(
+            versioned_read_action(None),
+            Action::S3Action(S3Action::GetObjectAction),
+            "a current-object read (no versionId) authorizes against GetObject"
+        );
     }
 
     #[test]
