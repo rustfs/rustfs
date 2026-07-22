@@ -936,7 +936,13 @@ mod tests {
         let health = probe_health_url(&client, &url).await;
 
         assert_eq!(health.state, TargetHealthState::Error);
-        assert_eq!(health.reason, TargetHealthReason::DnsFailure);
+        // On systems with DNS interception (common on macOS), `.invalid` may resolve
+        // to an interception address, producing `Unreachable` instead of `DnsFailure`.
+        assert!(
+            matches!(health.reason, TargetHealthReason::DnsFailure | TargetHealthReason::Unreachable),
+            "expected DnsFailure or Unreachable, got {:?}",
+            health.reason
+        );
     }
 
     #[tokio::test(start_paused = true)]
