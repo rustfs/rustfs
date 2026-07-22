@@ -613,6 +613,11 @@ pub enum TransitionTransactionRecoveryOutcome {
     Retained,
 }
 
+pub(crate) fn decode_transition_transaction_record(object: &str, data: &[u8]) -> Result<TransitionTransaction> {
+    let transaction_id = transition_transaction_id_from_record_object_name(object)?;
+    TransitionTransaction::decode(transaction_id, data)
+}
+
 fn transition_transaction_id_from_record_object_name(object: &str) -> Result<Uuid> {
     let prefix = format!("{TRANSITION_TRANSACTION_RECORD_PREFIX}/");
     let suffix = object
