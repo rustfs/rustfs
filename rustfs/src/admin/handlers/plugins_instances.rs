@@ -869,7 +869,8 @@ mod tests {
         parse_plugin_instance_id, parse_plugin_instance_source, resolve_plugin_instance_target,
     };
     use crate::admin::handlers::target_descriptor::{
-        TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id, collect_target_instances,
+        RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, canonical_target_instance_id,
+        collect_target_instances,
     };
     use crate::admin::plugin_contract::{
         PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry, PluginInstanceSource,
