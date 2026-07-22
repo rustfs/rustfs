@@ -234,6 +234,178 @@ fn get_encrypted_offsets(oi: &ObjectInfo, offset: i64) -> Result<(i64, usize, us
     )))
 }
 
+/// Metric path label for a Legacy encrypted Range GET that kept the conservative full-object read.
+const ENCRYPTED_RANGE_READ_PATH_FULL: &str = "full";
+/// Metric path label for a Legacy encrypted Range GET served by the part-boundary seek.
+const ENCRYPTED_RANGE_READ_PATH_PART_SEEK: &str = "part_seek";
+
+/// Kill switch for the Legacy (rio v1) encrypted multipart part-boundary Range seek
+/// (https://github.com/rustfs/backlog/issues/1316 Phase A). Defaults to on; setting
+/// `RUSTFS_ENCRYPTED_RANGE_SEEK=false` restores the previous conservative full-object
+/// read for every encrypted Range GET on the Legacy backend.
+const ENV_RUSTFS_ENCRYPTED_RANGE_SEEK: &str = "RUSTFS_ENCRYPTED_RANGE_SEEK";
+const DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK: bool = true;
+
+fn legacy_encrypted_range_seek_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK)
+}
+
+/// True when a Legacy (rio v1) encrypted Range GET may seek to the covering part
+/// boundary instead of streaming the whole ciphertext.
+///
+/// Every condition is required for correctness, not merely for benefit:
+/// - `is_multipart`: single-part rio v1 streams have variable-length encrypted blocks
+///   with no closed-form plaintext-to-physical mapping, so only part boundaries
+///   (recorded in metadata) are safe seek targets.
+/// - `!is_compressed`: under compression the requested offset addresses the
+///   decompressed stream, not per-part plaintext, so stay on the full read.
+/// - non-empty parts with `actual_size > 0` for every part: a part with
+///   `actual_size <= 0` would make `part_plaintext_size` fall back to the physical
+///   size and poison the plaintext cumulative sums.
+/// - physical part sizes must add up to `oi.size`: guards against inconsistent
+///   metadata scheduling reads past the object end in the erasure layer.
+/// - `requested_length > 0`: degenerate empty ranges keep their existing full-read
+///   behavior (and its error surface) unchanged.
+fn legacy_encrypted_seek_eligible(oi: &ObjectInfo, is_multipart: bool, is_compressed: bool, requested_length: i64) -> bool {
+    is_multipart
+        && !is_compressed
+        && requested_length > 0
+        && !oi.parts.is_empty()
+        && oi.parts.iter().all(|part| part.actual_size > 0)
+        && oi.parts.iter().map(|part| part.size as i64).sum::<i64>() == oi.size
+        && legacy_encrypted_range_seek_enabled()
+}
+
+/// Part-boundary seek offsets for a Legacy (rio v1) encrypted multipart object.
+///
+/// Uses only the two per-part metadata facts — `size` (physical encrypted bytes on
+/// disk) and `actual_size` (plaintext bytes) — and makes zero assumptions about the
+/// encrypted block layout inside a part. Returns `(physical_offset, physical_length,
+/// plaintext_skip_in_part, part_start_index, remaining_plaintext)` where
+/// `physical_offset` is the ciphertext offset of the first part covering `offset`,
+/// `physical_length` extends to the physical end of the last part covering
+/// `offset + length - 1`, `plaintext_skip_in_part` is the decrypted plaintext to
+/// discard before the range starts, and `remaining_plaintext` is the total plaintext
+/// from the covering part through the end of the object (the same contract
+/// `get_encrypted_offsets` hands to `into_reader`).
+///
+/// Returns `None` when the range does not fall inside the parts table; the caller
+/// must then keep the conservative full-object read. With the
+/// `legacy_encrypted_seek_eligible` gate satisfied this cannot happen, because the
+/// range spec already clamps `offset + length` to the summed part plaintext.
+fn get_legacy_encrypted_offsets(oi: &ObjectInfo, offset: i64, length: i64) -> Option<(i64, i64, usize, usize, i64)> {
+    let mut cumulative_plaintext_size = 0_i64;
+    let mut cumulative_encrypted_size = 0_i64;
+
+    for (part_index, part) in oi.parts.iter().enumerate() {
+        let current_part_plaintext_size = part.actual_size;
+        if offset < cumulative_plaintext_size + current_part_plaintext_size {
+            let end_plaintext = offset + length - 1;
+            let mut covered_plaintext_end = cumulative_plaintext_size;
+            let mut physical_end = cumulative_encrypted_size;
+            let mut remaining_plaintext = 0_i64;
+            let mut covered = false;
+            for tail_part in &oi.parts[part_index..] {
+                remaining_plaintext += tail_part.actual_size;
+                if !covered {
+                    physical_end += tail_part.size as i64;
+                    covered_plaintext_end += tail_part.actual_size;
+                    if end_plaintext < covered_plaintext_end {
+                        covered = true;
+                    }
+                }
+            }
+            if !covered {
+                return None;
+            }
+            let plaintext_skip_in_part = usize::try_from(offset - cumulative_plaintext_size).ok()?;
+            return Some((
+                cumulative_encrypted_size,
+                physical_end - cumulative_encrypted_size,
+                plaintext_skip_in_part,
+                part_index,
+                remaining_plaintext,
+            ));
+        }
+
+        cumulative_plaintext_size += current_part_plaintext_size;
+        cumulative_encrypted_size += part.size as i64;
+    }
+
+    None
+}
+
+/// Encrypted-range plan tuple shared by both Legacy (rio v1) build arms:
+/// `(storage_offset, storage_length, decrypt_skip, plaintext_offset,
+/// plaintext_length, total_plaintext_size, sequence_number, part_numbers)`.
+type EncryptedRangePlan = (usize, i64, usize, usize, i64, usize, u32, Vec<usize>);
+
+/// Range plan for a Legacy (rio v1) encrypted object
+/// (https://github.com/rustfs/backlog/issues/1316 Phase A).
+///
+/// Eligible multipart objects seek to the covering part boundary: per-part physical
+/// sizes are exact metadata facts, and the rio v1 multipart decrypt reader already
+/// decrypts a stream that starts at any part boundary once it is handed the part
+/// numbers from that part onward. Everything else — single-part objects, compressed
+/// payloads, defective parts tables, the kill switch — keeps the conservative
+/// full-object read: rio v1 encrypted blocks are variable-length, so existing
+/// objects have no safe sub-part seek.
+fn legacy_encrypted_range_plan(
+    oi: &ObjectInfo,
+    is_multipart: bool,
+    is_compressed: bool,
+    requested_offset: usize,
+    requested_length: i64,
+    full_plaintext_size: usize,
+) -> Result<EncryptedRangePlan> {
+    if legacy_encrypted_seek_eligible(oi, is_multipart, is_compressed, requested_length)
+        && let Some((physical_offset, physical_length, plaintext_skip_in_part, part_start_index, remaining_plaintext)) =
+            get_legacy_encrypted_offsets(oi, requested_offset as i64, requested_length)
+    {
+        let storage_offset = usize::try_from(physical_offset)
+            .map_err(|_| Error::other(format!("invalid legacy encrypted offset {physical_offset}")))?;
+        let total_plaintext_size = usize::try_from(remaining_plaintext)
+            .map_err(|_| Error::other(format!("invalid legacy remaining decrypted size {remaining_plaintext}")))?;
+        record_encrypted_range_read_amplification(ENCRYPTED_RANGE_READ_PATH_PART_SEEK, physical_length, requested_length);
+        return Ok((
+            storage_offset,
+            physical_length,
+            0,
+            plaintext_skip_in_part,
+            requested_length,
+            total_plaintext_size,
+            0,
+            multipart_part_numbers(&oi.parts[part_start_index..]),
+        ));
+    }
+
+    // Skip the metric for compressed payloads: their requested length addresses
+    // the decompressed stream, so the physical/plaintext ratio would mix
+    // coordinate systems and pollute the histogram.
+    if !is_compressed {
+        record_encrypted_range_read_amplification(ENCRYPTED_RANGE_READ_PATH_FULL, oi.size, requested_length);
+    }
+    Ok((
+        0,
+        oi.size,
+        0,
+        requested_offset,
+        requested_length,
+        full_plaintext_size,
+        0,
+        multipart_part_numbers(&oi.parts),
+    ))
+}
+
+/// Record path and physical/plaintext read amplification for one Legacy encrypted
+/// Range GET at the ReadPlan decision point.
+fn record_encrypted_range_read_amplification(path: &'static str, physical_length: i64, requested_length: i64) {
+    if requested_length <= 0 || physical_length < 0 {
+        return;
+    }
+    rustfs_io_metrics::record_get_encrypted_range_read_amplification(path, physical_length as f64 / requested_length as f64);
+}
+
 pub struct PutObjReader {
     pub stream: HashReader,
 }
@@ -465,16 +637,14 @@ impl ReadPlan {
                 #[cfg(feature = "rio-v2")]
                 {
                     if encryption_backend == crate::io_support::rio::ReadEncryptionBackend::Legacy {
-                        (
-                            0,
-                            oi.size,
-                            0,
+                        legacy_encrypted_range_plan(
+                            oi,
+                            is_multipart,
+                            is_compressed,
                             requested_offset,
                             requested_length,
                             full_plaintext_size,
-                            0,
-                            multipart_part_numbers(&oi.parts),
-                        )
+                        )?
                     } else if is_compressed {
                         let (physical_off, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
                             get_compressed_offsets(oi, requested_offset as i64);
@@ -512,16 +682,14 @@ impl ReadPlan {
                 }
                 #[cfg(not(feature = "rio-v2"))]
                 {
-                    (
-                        0,
-                        oi.size,
-                        0,
+                    legacy_encrypted_range_plan(
+                        oi,
+                        is_multipart,
+                        is_compressed,
                         requested_offset,
                         requested_length,
                         full_plaintext_size,
-                        0,
-                        multipart_part_numbers(&oi.parts),
-                    )
+                    )?
                 }
             } else {
                 (
@@ -3164,6 +3332,631 @@ mod tests {
         assert_eq!(length, encrypted.len() as i64);
         assert_eq!(reader.object_info.size, 7);
         assert_eq!(actual, b"56789ab");
+    }
+
+    /// Counts every byte pulled from the underlying ciphertext stream, standing in
+    /// for the physical bytes the erasure layer would decode for this read.
+    struct SpyReader<R> {
+        inner: R,
+        bytes_read: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl<R> SpyReader<R> {
+        fn new(inner: R) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
+            let bytes_read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            (
+                Self {
+                    inner,
+                    bytes_read: bytes_read.clone(),
+                },
+                bytes_read,
+            )
+        }
+    }
+
+    impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for SpyReader<R> {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = &poll {
+                let filled = (buf.filled().len() - before) as u64;
+                self.bytes_read.fetch_add(filled, std::sync::atomic::Ordering::Relaxed);
+            }
+            poll
+        }
+    }
+
+    struct LegacyMultipartFixture {
+        plaintext: Vec<u8>,
+        ciphertext: Vec<u8>,
+        object_info: ObjectInfo,
+        part_physical_sizes: Vec<usize>,
+    }
+
+    impl LegacyMultipartFixture {
+        /// Physical ciphertext offset where the given zero-based part starts.
+        fn physical_part_start(&self, part_index: usize) -> usize {
+            self.part_physical_sizes[..part_index].iter().sum()
+        }
+    }
+
+    const LEGACY_FIXTURE_BASE_NONCE: [u8; 12] = [0x5A; 12];
+
+    fn legacy_fixture_part_plaintext(part_number: usize, size: usize) -> Vec<u8> {
+        (0..size).map(|i| ((i * 31 + part_number * 7) % 251) as u8).collect()
+    }
+
+    /// Encrypts every part as its own rio v1 segment with the per-part nonce,
+    /// exactly like `WritePlan::apply` does for multipart uploads, and records the
+    /// physical/plaintext part sizes the way `PutObjectPart` persists them.
+    async fn build_legacy_multipart_fixture(
+        bucket: &str,
+        object: &str,
+        key_bytes: [u8; 32],
+        part_plain_sizes: &[usize],
+        user_defined: HashMap<String, String>,
+    ) -> LegacyMultipartFixture {
+        let mut plaintext = Vec::new();
+        let mut ciphertext = Vec::new();
+        let mut parts = Vec::new();
+        let mut part_physical_sizes = Vec::new();
+
+        for (part_index, &part_plain_size) in part_plain_sizes.iter().enumerate() {
+            let part_number = part_index + 1;
+            let part_plain = legacy_fixture_part_plaintext(part_number, part_plain_size);
+            let mut part_cipher = Vec::new();
+            rustfs_rio::EncryptReader::new_multipart(
+                Cursor::new(part_plain.clone()),
+                key_bytes,
+                LEGACY_FIXTURE_BASE_NONCE,
+                part_number,
+            )
+            .read_to_end(&mut part_cipher)
+            .await
+            .expect("encrypt multipart fixture part");
+
+            parts.push(ObjectPartInfo {
+                number: part_number,
+                size: part_cipher.len(),
+                actual_size: part_plain.len() as i64,
+                ..Default::default()
+            });
+            part_physical_sizes.push(part_cipher.len());
+            plaintext.extend_from_slice(&part_plain);
+            ciphertext.extend_from_slice(&part_cipher);
+        }
+
+        let object_info = ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            size: ciphertext.len() as i64,
+            etag: Some(format!("d41d8cd98f00b204e9800998ecf8427e-{}", parts.len())),
+            parts: Arc::new(parts),
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        LegacyMultipartFixture {
+            plaintext,
+            ciphertext,
+            object_info,
+            part_physical_sizes,
+        }
+    }
+
+    fn legacy_ssec_multipart_metadata(key_bytes: [u8; 32], total_plaintext: usize) -> HashMap<String, String> {
+        HashMap::from([
+            ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+            (
+                "x-amz-server-side-encryption-customer-key-md5".to_string(),
+                BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-original-size".to_string(),
+                total_plaintext.to_string(),
+            ),
+            (
+                INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+                BASE64_STANDARD.encode(LEGACY_FIXTURE_BASE_NONCE),
+            ),
+        ])
+    }
+
+    async fn build_legacy_ssec_multipart_fixture(key_bytes: [u8; 32], part_plain_sizes: &[usize]) -> LegacyMultipartFixture {
+        let total_plaintext: usize = part_plain_sizes.iter().sum();
+        build_legacy_multipart_fixture(
+            "bucket",
+            "legacy-multipart",
+            key_bytes,
+            part_plain_sizes,
+            legacy_ssec_multipart_metadata(key_bytes, total_plaintext),
+        )
+        .await
+    }
+
+    /// Serves exactly the ciphertext window the plan schedules — the contract the
+    /// erasure layer honors for `(storage_offset, storage_length)` — then decodes
+    /// the body end to end. Returns the body, the plan offsets, and the reported
+    /// object size.
+    async fn read_via_seek_window(
+        fixture: &LegacyMultipartFixture,
+        rs: Option<HTTPRangeSpec>,
+        opts: &ObjectOptions,
+        headers: &HeaderMap<HeaderValue>,
+    ) -> (Vec<u8>, usize, i64, i64) {
+        let plan = ReadPlan::build(rs.clone(), &fixture.object_info, opts, headers)
+            .await
+            .expect("plan should build for seek window read");
+        let start = plan.storage_offset;
+        let window_len = usize::try_from(plan.storage_length).expect("storage length fits usize");
+        assert!(
+            start + window_len <= fixture.ciphertext.len(),
+            "plan window [{start}, {}) exceeds ciphertext length {}",
+            start + window_len,
+            fixture.ciphertext.len()
+        );
+        let window = fixture.ciphertext[start..start + window_len].to_vec();
+
+        let (mut reader, offset, length) =
+            GetObjectReader::new(Box::new(Cursor::new(window)), rs, &fixture.object_info, opts, headers)
+                .await
+                .expect("seek window read should build a reader");
+        assert_eq!(offset, start, "reader offsets must match the probed plan");
+        assert_eq!(length, plan.storage_length, "reader length must match the probed plan");
+
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("decode seek window body");
+        (body, offset, length, reader.object_info.size)
+    }
+
+    fn range(start: i64, end: i64) -> HTTPRangeSpec {
+        HTTPRangeSpec {
+            is_suffix_length: false,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn test_get_legacy_encrypted_offsets_math() {
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: 1_000,
+                actual_size: 800,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: 700,
+                actual_size: 500,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 3,
+                size: 400,
+                actual_size: 300,
+                ..Default::default()
+            },
+        ];
+        let oi = ObjectInfo {
+            size: 2_100,
+            parts: Arc::new(parts),
+            ..Default::default()
+        };
+
+        // Head range inside part 1 covers only part 1 but exposes the full tail plaintext.
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 0, 10), Some((0, 1_000, 0, 0, 1_600)));
+        // Range ending exactly on the part 1 plaintext boundary stays within part 1.
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 700, 100), Some((0, 1_000, 700, 0, 1_600)));
+        // One byte further crosses into part 2.
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 700, 101), Some((0, 1_700, 700, 0, 1_600)));
+        // Range starting exactly at the part 2 boundary skips part 1 physically.
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 800, 10), Some((1_000, 700, 0, 1, 800)));
+        // Last byte of the object covers only part 3.
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 1_599, 1), Some((1_700, 400, 299, 2, 300)));
+        // Range spanning all parts covers the whole physical object.
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 10, 1_590), Some((0, 2_100, 10, 0, 1_600)));
+        // Out-of-bounds offset yields no seek plan.
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 1_600, 1), None);
+        assert_eq!(get_legacy_encrypted_offsets(&oi, 1_599, 2), None);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ssec_multipart_range_seek_byte_exact_matrix() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x71; 32];
+            // Part plaintexts exercise multi-block (2 x 8192 + tail), block + tail,
+            // and short single-block segments.
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let headers = ssec_headers_from_key(key_bytes);
+            let opts = ObjectOptions::default();
+            let total_plaintext = fixture.plaintext.len() as i64;
+            let phys = &fixture.part_physical_sizes;
+
+            // (range, expected physical offset, expected physical length)
+            let cases: Vec<(HTTPRangeSpec, usize, i64, &str)> = vec![
+                (range(0, 9), 0, phys[0] as i64, "head of part 1"),
+                (range(20_100, 20_199), fixture.physical_part_start(1), phys[1] as i64, "inside part 2"),
+                (range(33_900, 33_999), fixture.physical_part_start(2), phys[2] as i64, "tail of part 3"),
+                (
+                    HTTPRangeSpec {
+                        is_suffix_length: true,
+                        start: 100,
+                        end: -1,
+                    },
+                    fixture.physical_part_start(2),
+                    phys[2] as i64,
+                    "suffix range",
+                ),
+                (range(19_999, 20_000), 0, (phys[0] + phys[1]) as i64, "part 1/2 boundary straddle"),
+                (
+                    range(8_191, 8_193),
+                    0,
+                    phys[0] as i64,
+                    "8 KiB encrypted-block boundary straddle in part 1",
+                ),
+                (range(19_999, 19_999), 0, phys[0] as i64, "last byte of part 1"),
+                (
+                    range(20_000, 20_000),
+                    fixture.physical_part_start(1),
+                    phys[1] as i64,
+                    "first byte of part 2",
+                ),
+                (range(100, 33_950), 0, fixture.ciphertext.len() as i64, "range spanning all parts"),
+                (range(0, total_plaintext - 1), 0, fixture.ciphertext.len() as i64, "full range"),
+                (
+                    range(29_000, total_plaintext - 1),
+                    fixture.physical_part_start(2),
+                    phys[2] as i64,
+                    "aligned suffix from part 3 start",
+                ),
+                (
+                    range(20_000, 29_100),
+                    fixture.physical_part_start(1),
+                    (phys[1] + phys[2]) as i64,
+                    "part 2 into part 3",
+                ),
+            ];
+
+            for (rs, expected_offset, expected_length, label) in cases {
+                let (start, len) = rs.get_offset_length(total_plaintext).expect("valid case range");
+                let expected_body = &fixture.plaintext[start..start + usize::try_from(len).unwrap()];
+
+                let (body, offset, length, reported_size) = read_via_seek_window(&fixture, Some(rs), &opts, &headers).await;
+
+                assert_eq!(offset, expected_offset, "{label}: physical offset");
+                assert_eq!(length, expected_length, "{label}: physical length");
+                assert_eq!(reported_size, len, "{label}: reported plaintext size");
+                assert_eq!(body.len(), expected_body.len(), "{label}: body length");
+                assert_eq!(body, expected_body, "{label}: body bytes");
+            }
+        })
+        .await;
+    }
+
+    /// The amplification-inversion guard: a small Range inside part 2 must schedule
+    /// only part 2 and must not pull more than part 2's ciphertext. The stream is
+    /// served from the planned offset all the way to the object end WITHOUT an end
+    /// truncation, so the covering-part bound is a real measurement of what the
+    /// decode chain pulls, not an artifact of window slicing. Reverting the Legacy
+    /// plan to the conservative `(0, oi.size)` full read fails the offset/length
+    /// assertions, and the pull bound as well: skipping the 20_100-byte plaintext
+    /// prefix would force the chain to pull all of part 1 first.
+    #[tokio::test]
+    async fn test_legacy_ssec_multipart_mid_range_reads_only_covering_part() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x72; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let headers = ssec_headers_from_key(key_bytes);
+            let opts = ObjectOptions::default();
+            // 100 plaintext bytes inside part 2 (global plaintext [20_100, 20_200)).
+            let rs = range(20_100, 20_199);
+
+            let plan = ReadPlan::build(Some(rs.clone()), &fixture.object_info, &opts, &headers)
+                .await
+                .expect("plan should build for mid range");
+            let covering_part_physical = fixture.part_physical_sizes[1] as u64;
+            let object_physical = fixture.ciphertext.len() as u64;
+            assert_eq!(
+                plan.storage_offset,
+                fixture.physical_part_start(1),
+                "must seek to the covering part boundary"
+            );
+            assert_eq!(plan.storage_length as u64, covering_part_physical, "must schedule only the covering part");
+
+            // Serve everything from the planned offset to the object end; the chain
+            // itself decides how much to pull.
+            let (spy, spy_bytes) = SpyReader::new(Cursor::new(fixture.ciphertext[plan.storage_offset..].to_vec()));
+            let (mut reader, _, _) = GetObjectReader::new(Box::new(spy), Some(rs), &fixture.object_info, &opts, &headers)
+                .await
+                .expect("mid range read should build a reader");
+            let mut body = Vec::new();
+            reader.read_to_end(&mut body).await.expect("decode mid range body");
+            let pulled = spy_bytes.load(std::sync::atomic::Ordering::Relaxed);
+
+            assert_eq!(body, &fixture.plaintext[20_100..20_200], "mid range body must stay byte-exact");
+            assert!(
+                pulled <= covering_part_physical,
+                "physical read {pulled} exceeds covering part {covering_part_physical}"
+            );
+            assert!(
+                pulled < object_physical,
+                "physical read {pulled} must stay below the whole object {object_physical}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ssec_multipart_part_number_get_seeks_to_part() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x73; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let headers = ssec_headers_from_key(key_bytes);
+            let opts = ObjectOptions {
+                part_number: Some(2),
+                ..Default::default()
+            };
+
+            let (body, offset, length, reported_size) = read_via_seek_window(&fixture, None, &opts, &headers).await;
+
+            assert_eq!(offset, fixture.physical_part_start(1), "partNumber GET must seek to part 2");
+            assert_eq!(length, fixture.part_physical_sizes[1] as i64, "partNumber GET must cover only part 2");
+            assert_eq!(reported_size, 9_000);
+            assert_eq!(body, &fixture.plaintext[20_000..29_000], "partNumber body must stay byte-exact");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_managed_multipart_range_seek_byte_exact() {
+        async_with_vars(
+            [
+                ("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([0u8; 32]))),
+                (ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true".to_string())),
+            ],
+            async {
+                let data_key = [0x74; 32];
+                let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+                let total_plaintext: usize = 20_000 + 9_000 + 5_000;
+                let metadata = HashMap::from([
+                    (
+                        INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+                        BASE64_STANDARD.encode(encrypted_dek.as_bytes()),
+                    ),
+                    (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "default".to_string()),
+                    (
+                        INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+                        BASE64_STANDARD.encode(LEGACY_FIXTURE_BASE_NONCE),
+                    ),
+                    (INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_string(), total_plaintext.to_string()),
+                ]);
+                let fixture =
+                    build_legacy_multipart_fixture("bucket", "managed-multipart", data_key, &[20_000, 9_000, 5_000], metadata)
+                        .await;
+                let headers = HeaderMap::new();
+                let opts = ObjectOptions::default();
+
+                for (rs, expected_offset, expected_length, label) in [
+                    (
+                        range(33_900, 33_999),
+                        fixture.physical_part_start(2),
+                        fixture.part_physical_sizes[2] as i64,
+                        "managed tail range",
+                    ),
+                    (
+                        range(19_990, 20_010),
+                        0,
+                        (fixture.part_physical_sizes[0] + fixture.part_physical_sizes[1]) as i64,
+                        "managed boundary straddle",
+                    ),
+                ] {
+                    let (start, len) = rs.get_offset_length(total_plaintext as i64).expect("valid managed range");
+                    let expected_body = &fixture.plaintext[start..start + usize::try_from(len).unwrap()];
+
+                    let (body, offset, length, reported_size) = read_via_seek_window(&fixture, Some(rs), &opts, &headers).await;
+
+                    assert_eq!(offset, expected_offset, "{label}: physical offset");
+                    assert_eq!(length, expected_length, "{label}: physical length");
+                    assert_eq!(reported_size, len, "{label}: reported plaintext size");
+                    assert_eq!(body, expected_body, "{label}: body bytes");
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_single_part_multipart_object_keeps_full_read_shape() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x75; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000]).await;
+            let headers = ssec_headers_from_key(key_bytes);
+            let opts = ObjectOptions::default();
+            let rs = range(5_000, 5_099);
+
+            let (body, offset, length, reported_size) = read_via_seek_window(&fixture, Some(rs), &opts, &headers).await;
+
+            // A single-part object degenerates to the previous full-object plan.
+            assert_eq!(offset, 0);
+            assert_eq!(length, fixture.ciphertext.len() as i64);
+            assert_eq!(reported_size, 100);
+            assert_eq!(body, &fixture.plaintext[5_000..5_100]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_range_seek_kill_switch_restores_full_read() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("false"))], async {
+            let key_bytes = [0x76; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let headers = ssec_headers_from_key(key_bytes);
+            let opts = ObjectOptions::default();
+            let rs = range(33_900, 33_999);
+
+            let (body, offset, length, reported_size) = read_via_seek_window(&fixture, Some(rs), &opts, &headers).await;
+
+            assert_eq!(offset, 0, "kill switch must restore the conservative full read");
+            assert_eq!(length, fixture.ciphertext.len() as i64);
+            assert_eq!(reported_size, 100);
+            assert_eq!(body, &fixture.plaintext[33_900..34_000], "kill switch path must stay byte-exact");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_range_seek_gate_rejects_zero_actual_size_part() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x77; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let mut object_info = fixture.object_info.clone();
+            {
+                let parts = Arc::make_mut(&mut object_info.parts);
+                parts[1].actual_size = 0;
+            }
+            let headers = ssec_headers_from_key(key_bytes);
+
+            let plan = ReadPlan::build(Some(range(0, 9)), &object_info, &ObjectOptions::default(), &headers)
+                .await
+                .expect("plan should build for zero actual_size sample");
+
+            assert_eq!(plan.storage_offset, 0, "a poisoned parts table must fall back to the full read");
+            assert_eq!(plan.storage_length, object_info.size);
+        })
+        .await;
+    }
+
+    /// The physical part sizes must add up to `oi.size` for a seek to be safe;
+    /// inconsistent metadata must fall back to the previous full-object read
+    /// instead of scheduling an erasure read past the object end.
+    #[tokio::test]
+    async fn test_legacy_range_seek_gate_rejects_inconsistent_physical_sum() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x7B; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let mut object_info = fixture.object_info.clone();
+            object_info.size -= 3;
+            let headers = ssec_headers_from_key(key_bytes);
+
+            let plan = ReadPlan::build(Some(range(33_900, 33_999)), &object_info, &ObjectOptions::default(), &headers)
+                .await
+                .expect("plan should build for inconsistent physical sum sample");
+
+            assert_eq!(plan.storage_offset, 0, "an inconsistent physical sum must fall back to the full read");
+            assert_eq!(plan.storage_length, object_info.size);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_range_seek_gate_rejects_compressed_encrypted_object() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x78; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let mut user_defined = fixture.object_info.user_defined.as_ref().clone();
+            // "lz4" parses in both the default and the rio-v2 build (the MinIO
+            // "klauspost/compress/s2" token is only recognized under rio-v2).
+            user_defined.insert("x-minio-internal-compression".to_string(), "lz4".to_string());
+            user_defined.insert("x-minio-internal-actual-size".to_string(), "34000".to_string());
+            let mut object_info = fixture.object_info.clone();
+            object_info.user_defined = Arc::new(user_defined);
+            let headers = ssec_headers_from_key(key_bytes);
+
+            let plan = ReadPlan::build(Some(range(33_900, 33_999)), &object_info, &ObjectOptions::default(), &headers)
+                .await
+                .expect("plan should build for compressed encrypted sample");
+
+            assert_eq!(plan.storage_offset, 0, "compressed + encrypted must keep the conservative full read");
+            assert_eq!(plan.storage_length, object_info.size);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ssec_multipart_range_rejects_wrong_or_missing_key() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x79; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let rs = range(33_900, 33_999);
+
+            let missing = match GetObjectReader::new(
+                Box::new(Cursor::new(fixture.ciphertext.clone())),
+                Some(rs.clone()),
+                &fixture.object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
+            .await
+            {
+                Ok(_) => panic!("missing SSE-C key must fail before any body is produced"),
+                Err(err) => err,
+            };
+            assert!(
+                missing.to_string().contains("SSE-C"),
+                "missing-key failure must come from SSE-C validation: {missing}"
+            );
+
+            let wrong = match GetObjectReader::new(
+                Box::new(Cursor::new(fixture.ciphertext.clone())),
+                Some(rs),
+                &fixture.object_info,
+                &ObjectOptions::default(),
+                &ssec_headers_from_key([0x00; 32]),
+            )
+            .await
+            {
+                Ok(_) => panic!("wrong SSE-C key must fail before any body is produced"),
+                Err(err) => err,
+            };
+            assert!(
+                wrong.to_string().contains("SSE-C key does not match object metadata"),
+                "wrong-key failure must come from the stored key check: {wrong}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ssec_multipart_seek_tamper_fails_hard_with_no_plaintext() {
+        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let key_bytes = [0x7A; 32];
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let headers = ssec_headers_from_key(key_bytes);
+            let opts = ObjectOptions::default();
+            let rs = range(33_900, 33_999);
+
+            let plan = ReadPlan::build(Some(rs.clone()), &fixture.object_info, &opts, &headers)
+                .await
+                .expect("plan should build for tamper test");
+            let start = plan.storage_offset;
+            let window_len = usize::try_from(plan.storage_length).unwrap();
+            assert_eq!(start, fixture.physical_part_start(2), "tamper test must exercise the seek path");
+
+            let mut window = fixture.ciphertext[start..start + window_len].to_vec();
+            // Flip one ciphertext byte inside the first encrypted block the seek
+            // lands on (past the 8-byte header and the length prefix).
+            window[64] ^= 0xFF;
+
+            let (mut reader, _, _) =
+                GetObjectReader::new(Box::new(Cursor::new(window)), Some(rs), &fixture.object_info, &opts, &headers)
+                    .await
+                    .expect("reader builds before the tampered block is decrypted");
+
+            let mut body = Vec::new();
+            let err = reader
+                .read_to_end(&mut body)
+                .await
+                .expect_err("tampered ciphertext must fail the read");
+            assert!(body.is_empty(), "no unauthenticated plaintext may be emitted, got {} bytes", body.len());
+            let message = err.to_string();
+            assert!(
+                message.contains("decrypt") || message.contains("CRC32") || message.contains("Invalid encrypted block"),
+                "unexpected tamper error: {message}"
+            );
+        })
+        .await;
     }
 
     #[cfg(feature = "rio-v2")]
