@@ -49,6 +49,7 @@ mod object_api;
 mod runtime;
 mod services;
 mod set_disk;
+mod sse;
 mod storage_api_contracts;
 mod store;
 

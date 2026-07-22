@@ -133,8 +133,8 @@ async fn read_fixture_plaintext(encrypted: Vec<u8>, object_info: ObjectInfo, kms
 
     async_with_vars(
         [
-            ("__RUSTFS_SSE_SIMPLE_CMK", Some(kms_key_b64)),
-            ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
+            ("RUSTFS_SSE_S3_MASTER_KEY", Some(kms_key_b64)),
+            ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
         ],
         async move {
             let (mut reader, offset, length) = GetObjectReader::new(

@@ -70,6 +70,7 @@ mod cache;
 pub mod config;
 mod encryption;
 mod error;
+mod managed_context;
 pub mod manager;
 pub mod service;
 pub mod service_manager;
@@ -83,7 +84,11 @@ pub use api_types::{
     TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
+pub use encryption::is_data_key_envelope;
 pub use error::{KmsError, Result};
+pub use managed_context::{
+    MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, RUSTFS_ENCRYPTION_CONTEXT_HEADER, decode_managed_kms_context,
+};
 pub use manager::KmsManager;
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{

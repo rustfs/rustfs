@@ -56,7 +56,7 @@ moka = { workspace = true, features = ["future"] }
 # Additional dependencies
 md5 = { workspace = true }
 arc-swap = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-utils = { workspace = true, features = ["http"] }
 rustfs-security-governance = { workspace = true }
 
 # HTTP client for Vault

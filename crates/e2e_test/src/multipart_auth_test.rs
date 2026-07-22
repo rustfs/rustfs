@@ -1068,7 +1068,8 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_s3() -> Result<(), B
 
 #[tokio::test]
 #[serial]
-async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_anonymous_post_object_bucket_default_sse_kms_requires_kms() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1128,14 +1129,23 @@ async fn test_anonymous_post_object_uses_bucket_default_sse_kms() -> Result<(), 
         .send()
         .await?;
 
-    assert_eq!(post_resp.status(), reqwest::StatusCode::NO_CONTENT);
-
-    let head = admin_client.head_object().bucket(bucket).key(object_key).send().await?;
-    assert_eq!(head.server_side_encryption().map(|value| value.as_str()), Some("aws:kms"));
-
-    let uploaded = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
-    let uploaded = uploaded.body.collect().await?.into_bytes();
-    assert_eq!(uploaded.as_ref(), expected_body.as_slice());
+    let status = post_resp.status();
+    let response_body = post_resp.text().await?;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        response_body.contains("configured KMS service"),
+        "unexpected response body: {response_body}"
+    );
+    assert!(
+        admin_client
+            .head_object()
+            .bucket(bucket)
+            .key(object_key)
+            .send()
+            .await
+            .is_err(),
+        "failed SSE-KMS POST must not create an object"
+    );
 
     Ok(())
 }

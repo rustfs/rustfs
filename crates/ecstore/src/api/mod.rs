@@ -398,6 +398,10 @@ pub mod set_disk {
     pub use crate::set_disk::{DEFAULT_READ_BUFFER_SIZE, SetDisks, get_lock_acquire_timeout, is_valid_storage_class};
 }
 
+pub mod sse {
+    pub use crate::sse::{ManagedDekProvider, ManagedSseScheme, managed_dek_provider};
+}
+
 pub mod store_list {
     pub use crate::store::list_objects::{ListPathOptions, max_keys_plus_one};
 }

@@ -502,6 +502,10 @@ pub(crate) mod ecstore_set_disk {
     pub(crate) use rustfs_ecstore::api::set_disk::{DEFAULT_READ_BUFFER_SIZE, get_lock_acquire_timeout, is_valid_storage_class};
 }
 
+pub(crate) mod ecstore_sse {
+    pub(crate) use rustfs_ecstore::api::sse::{ManagedDekProvider, ManagedSseScheme, managed_dek_provider};
+}
+
 pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;

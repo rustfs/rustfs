@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::sse::{ManagedDekProvider, ManagedSseScheme, managed_dek_provider as classify_managed_dek_provider};
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
 use aes_gcm::{
@@ -26,7 +27,11 @@ use chacha20poly1305::ChaCha20Poly1305;
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use rustfs_kms::types::ObjectEncryptionContext;
-use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+#[cfg(feature = "rio-v2")]
+use rustfs_kms::{MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, RUSTFS_ENCRYPTION_CONTEXT_HEADER, decode_managed_kms_context};
+use rustfs_utils::http::{
+    AMZ_SERVER_SIDE_ENCRYPTION, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, get_consistent_metadata_value,
+};
 use rustfs_utils::path::path_join_buf;
 #[cfg(feature = "rio-v2")]
 use serde::Deserialize;
@@ -39,11 +44,11 @@ use crate::io_support::rio::Index;
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
-const INTERNAL_ENCRYPTION_CONTEXT_HEADER: &str = "x-rustfs-encryption-context";
 const INTERNAL_ENCRYPTION_IV_HEADER: &str = "x-rustfs-encryption-iv";
 const INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER: &str = "x-rustfs-encryption-original-size";
 const SSEC_ORIGINAL_SIZE_HEADER: &str = "x-amz-server-side-encryption-customer-original-size";
 const DEFAULT_SSE_ALGORITHM: &str = "AES256";
+const SSE_KMS_ALGORITHM: &str = "aws:kms";
 #[cfg(feature = "rio-v2")]
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
 #[cfg(feature = "rio-v2")]
@@ -59,8 +64,6 @@ const MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER: &str = "X-Minio-Internal-
 const MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id";
 #[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key";
-#[cfg(feature = "rio-v2")]
-const MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Context";
 #[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Sealed-Key";
 #[cfg(feature = "rio-v2")]
@@ -1381,31 +1384,30 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
 
     let kms_key_id = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_KEY_ID_HEADER).unwrap_or("default");
     #[cfg(feature = "rio-v2")]
-    let kms_context = metadata_get(&normalized_metadata, INTERNAL_ENCRYPTION_CONTEXT_HEADER)
-        .map(|value| {
-            serde_json::from_str::<HashMap<String, String>>(value)
-                .map_err(|e| Error::other(format!("failed to parse managed KMS context: {e}")))
-        })
-        .transpose()?;
+    let kms_context = decode_managed_kms_context(metadata).map_err(|err| Error::other(err.to_string()))?;
     #[cfg(not(feature = "rio-v2"))]
     let kms_context: Option<HashMap<String, String>> = None;
     let object_context = build_object_encryption_context(bucket, object, kms_context.as_ref());
 
-    let decrypted_key = if let Some(service) = crate::runtime::sources::object_encryption_service().await {
-        #[cfg(feature = "rio-v2")]
-        let data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
-            service.decrypt_legacy_data_key(&encrypted_dek).await
-        } else {
-            service.decrypt_data_key(&encrypted_dek, &object_context).await
-        };
-        #[cfg(not(feature = "rio-v2"))]
-        let data_key = service.decrypt_data_key(&encrypted_dek, &object_context).await;
+    let decrypted_key = match managed_dek_provider(metadata, &encrypted_dek)? {
+        ManagedDekProvider::LocalSseS3 => decrypt_local_sse_dek(&encrypted_dek, kms_key_id, &object_context)?,
+        ManagedDekProvider::Kms => {
+            let service = crate::runtime::sources::object_encryption_service()
+                .await
+                .ok_or_else(|| Error::other("KMS encryption service is required to decrypt this object"))?;
+            #[cfg(feature = "rio-v2")]
+            let data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
+                service.decrypt_legacy_data_key(&encrypted_dek).await
+            } else {
+                service.decrypt_data_key(&encrypted_dek, &object_context).await
+            };
+            #[cfg(not(feature = "rio-v2"))]
+            let data_key = service.decrypt_data_key(&encrypted_dek, &object_context).await;
 
-        data_key
-            .map_err(|e| Error::other(format!("failed to decrypt managed data key: {e}")))?
-            .plaintext_key
-    } else {
-        decrypt_local_sse_dek(&encrypted_dek, kms_key_id, &object_context)?
+            data_key
+                .map_err(|e| Error::other(format!("failed to decrypt managed data key: {e}")))?
+                .plaintext_key
+        }
     };
 
     #[cfg(feature = "rio-v2")]
@@ -1436,6 +1438,19 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
     })
 }
 
+fn managed_dek_provider(metadata: &HashMap<String, String>, encrypted_dek: &[u8]) -> Result<ManagedDekProvider> {
+    let algorithm = get_consistent_metadata_value(metadata, AMZ_SERVER_SIDE_ENCRYPTION)
+        .map_err(|_| Error::other(format!("conflicting managed encryption metadata for {AMZ_SERVER_SIDE_ENCRYPTION}")))?;
+    let scheme = match algorithm {
+        Some(SSE_KMS_ALGORITHM) => ManagedSseScheme::SseKms,
+        Some(DEFAULT_SSE_ALGORITHM) | None => ManagedSseScheme::SseS3,
+        Some(algorithm) => return Err(Error::other(format!("unsupported stored server-side encryption {algorithm}"))),
+    };
+    // RUSTFS_COMPAT_TODO(rustfs-5063): Keep legacy SSE-S3 KMS envelopes readable. Remove after SSE-S3 migration rewraps every referenced legacy DEK.
+    let has_kms_envelope = rustfs_kms::is_data_key_envelope(encrypted_dek);
+    Ok(classify_managed_dek_provider(scheme, has_kms_envelope))
+}
+
 fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<String, String> {
     #[cfg(feature = "rio-v2")]
     {
@@ -1460,13 +1475,13 @@ fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<Str
             normalized.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), value.to_string());
         }
 
-        if metadata_get(&normalized, INTERNAL_ENCRYPTION_CONTEXT_HEADER).is_none()
+        if metadata_get(&normalized, RUSTFS_ENCRYPTION_CONTEXT_HEADER).is_none()
             && let Some(value) = metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
             && let Ok(decoded) = BASE64_STANDARD.decode(value)
             && let Ok(context) = serde_json::from_slice::<HashMap<String, String>>(&decoded)
             && let Ok(encoded) = serde_json::to_string(&context)
         {
-            normalized.insert(INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(), encoded);
+            normalized.insert(RUSTFS_ENCRYPTION_CONTEXT_HEADER.to_string(), encoded);
         }
 
         normalized
@@ -1624,15 +1639,21 @@ fn marshal_minio_kms_context(context: &HashMap<String, String>) -> Vec<u8> {
 }
 
 fn local_sse_master_key() -> Result<[u8; 32]> {
+    #[cfg(test)]
     if let Some(key) = decode_master_key_env("__RUSTFS_SSE_SIMPLE_CMK")? {
         return Ok(key);
     }
 
     if let Some(key) = decode_master_key_env("RUSTFS_SSE_S3_MASTER_KEY")? {
+        if key == [0u8; 32] {
+            return Err(Error::other("RUSTFS_SSE_S3_MASTER_KEY must not be an all-zero key"));
+        }
         return Ok(key);
     }
 
-    Ok([0u8; 32])
+    Err(Error::other(
+        "SSE-S3 requires RUSTFS_SSE_S3_MASTER_KEY to decrypt locally managed objects",
+    ))
 }
 
 fn decode_master_key_env(name: &str) -> Result<Option<[u8; 32]>> {
@@ -2106,6 +2127,57 @@ mod tests {
         let nonce = Nonce::from([0u8; 12]);
         let ciphertext = cipher.encrypt(&nonce, dek.as_slice()).expect("encrypt managed dek");
         format!("{}:{}", BASE64_STANDARD.encode(nonce), BASE64_STANDARD.encode(ciphertext))
+    }
+
+    #[test]
+    fn managed_dek_provider_routes_by_algorithm_and_persisted_envelope() {
+        let local_dek = encrypt_managed_dek_for_test([0x24; 32], [0x42; 32]);
+        let kms_dek = serde_json::to_vec(&serde_json::json!({
+            "key_id": "legacy-data-key",
+            "master_key_id": "legacy-master-key",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }))
+        .expect("legacy KMS envelope should serialize");
+
+        assert_eq!(
+            managed_dek_provider(
+                &HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), DEFAULT_SSE_ALGORITHM.to_string())]),
+                local_dek.as_bytes(),
+            )
+            .expect("SSE-S3 local DEK should be classified"),
+            ManagedDekProvider::LocalSseS3
+        );
+        assert_eq!(
+            managed_dek_provider(
+                &HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), SSE_KMS_ALGORITHM.to_string())]),
+                local_dek.as_bytes(),
+            )
+            .expect("SSE-KMS should be classified by its stored algorithm"),
+            ManagedDekProvider::Kms
+        );
+        assert_eq!(
+            managed_dek_provider(
+                &HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), DEFAULT_SSE_ALGORITHM.to_string())]),
+                &kms_dek,
+            )
+            .expect("legacy SSE-S3 KMS envelope should be classified"),
+            ManagedDekProvider::Kms
+        );
+        assert_eq!(
+            managed_dek_provider(&HashMap::new(), &kms_dek).expect("legacy KMS envelope without algorithm should be classified"),
+            ManagedDekProvider::Kms
+        );
+        assert!(
+            managed_dek_provider(
+                &HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "unsupported".to_string())]),
+                local_dek.as_bytes(),
+            )
+            .is_err()
+        );
     }
 
     #[cfg(feature = "rio-v2")]
@@ -2622,12 +2694,12 @@ mod tests {
         async_with_vars(
             [
                 ("__RUSTFS_SSE_SIMPLE_CMK", None::<String>),
-                ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode([0u8; 32]))),
+                ("RUSTFS_SSE_S3_MASTER_KEY", Some(BASE64_STANDARD.encode([0x33u8; 32]))),
             ],
             async {
                 let plaintext = b"managed-local-fallback".to_vec();
                 let data_key = [0x22; 32];
-                let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0u8; 32]);
+                let encrypted_dek = encrypt_managed_dek_for_test(data_key, [0x33; 32]);
                 let bucket = "bucket";
                 let object = "managed-local-fallback";
 

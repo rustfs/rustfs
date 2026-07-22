@@ -44,6 +44,23 @@ pub struct DataKeyEnvelope {
     pub created_at: Zoned,
 }
 
+/// Return whether bytes contain a complete RustFS KMS data-key envelope.
+pub fn is_data_key_envelope(ciphertext: &[u8]) -> bool {
+    const MAX_ENVELOPE_SIZE: usize = 64 * 1024;
+
+    if ciphertext.is_empty() || ciphertext.len() > MAX_ENVELOPE_SIZE {
+        return false;
+    }
+
+    serde_json::from_slice::<DataKeyEnvelope>(ciphertext).is_ok_and(|envelope| {
+        !envelope.key_id.trim().is_empty()
+            && !envelope.master_key_id.trim().is_empty()
+            && envelope.key_spec == "AES_256"
+            && !envelope.encrypted_key.is_empty()
+            && (envelope.nonce.is_empty() || envelope.nonce.len() == 12)
+    })
+}
+
 /// Trait for encrypting and decrypting data encryption keys (DEK)
 ///
 /// This trait abstracts the encryption operations used to protect
@@ -293,6 +310,24 @@ mod tests {
         assert_eq!(deserialized.key_id, envelope.key_id);
         assert_eq!(deserialized.master_key_id, envelope.master_key_id);
         assert_eq!(deserialized.encrypted_key, envelope.encrypted_key);
+        assert!(is_data_key_envelope(&serialized));
+        assert!(!is_data_key_envelope(b"not-a-kms-envelope"));
+        let mut boundary_envelope = serialized;
+        boundary_envelope.resize(64 * 1024, b' ');
+        assert!(is_data_key_envelope(&boundary_envelope));
+        boundary_envelope.push(b' ');
+        assert!(!is_data_key_envelope(&boundary_envelope));
+
+        let mut invalid = serde_json::to_value(&envelope).expect("Envelope should convert to JSON");
+        invalid["key_spec"] = serde_json::Value::String("AES_128".to_string());
+        assert!(!is_data_key_envelope(
+            &serde_json::to_vec(&invalid).expect("Invalid envelope should serialize")
+        ));
+        invalid["key_spec"] = serde_json::Value::String("AES_256".to_string());
+        invalid["unknown"] = serde_json::Value::Bool(true);
+        assert!(is_data_key_envelope(
+            &serde_json::to_vec(&invalid).expect("Envelope with unknown field should serialize")
+        ));
     }
 
     #[tokio::test]

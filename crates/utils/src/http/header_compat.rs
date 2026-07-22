@@ -20,11 +20,25 @@
 
 use http::{HeaderMap, HeaderValue};
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 
 const RUSTFS_PREFIX: &str = "x-rustfs-";
 const MINIO_PREFIX: &str = "x-minio-";
 const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
 const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictingMetadataValue;
+
+impl Display for ConflictingMetadataValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("metadata contains conflicting values for the same case-insensitive key")
+    }
+}
+
+impl Error for ConflictingMetadataValue {}
 
 // Suffix constants (part after x-rustfs- or x-minio-). Use with get_header/insert_header.
 pub const SUFFIX_FORCE_DELETE: &str = "force-delete";
@@ -84,6 +98,24 @@ pub fn get_header_map(map: &std::collections::HashMap<String, String>, suffix: &
     map.get(&rk).cloned().or_else(|| map.get(&mk).cloned())
 }
 
+/// Returns the value when every case-insensitive occurrence of `name` agrees.
+pub fn get_consistent_metadata_value<'a>(
+    metadata: &'a HashMap<String, String>,
+    name: &str,
+) -> Result<Option<&'a str>, ConflictingMetadataValue> {
+    let mut value = None;
+    for (candidate, candidate_value) in metadata {
+        if !candidate.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if value.is_some_and(|existing| existing != candidate_value) {
+            return Err(ConflictingMetadataValue);
+        }
+        value = Some(candidate_value.as_str());
+    }
+    Ok(value)
+}
+
 /// Insert into HashMap with both x-rustfs-{suffix} and x-minio-{suffix}.
 pub fn insert_header_map(map: &mut std::collections::HashMap<String, String>, suffix: &str, value: impl Into<String>) {
     let v = value.into();
@@ -119,5 +151,29 @@ mod tests {
         let mut headers2 = HeaderMap::new();
         headers2.insert("X-Rustfs-Force-Delete", HeaderValue::from_static("true"));
         assert_eq!(get_header(&headers2, SUFFIX_FORCE_DELETE).as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn test_get_consistent_metadata_value() {
+        let mut metadata = HashMap::new();
+        assert_eq!(
+            get_consistent_metadata_value(&metadata, "x-test").expect("missing value should be valid"),
+            None
+        );
+
+        metadata.insert("X-Test".to_string(), "value".to_string());
+        assert_eq!(
+            get_consistent_metadata_value(&metadata, "x-test").expect("single value should be valid"),
+            Some("value")
+        );
+
+        metadata.insert("x-test".to_string(), "value".to_string());
+        assert_eq!(
+            get_consistent_metadata_value(&metadata, "x-test").expect("matching values should be valid"),
+            Some("value")
+        );
+
+        metadata.insert("x-TEST".to_string(), "other".to_string());
+        assert!(get_consistent_metadata_value(&metadata, "x-test").is_err());
     }
 }
