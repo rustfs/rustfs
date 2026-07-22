@@ -389,7 +389,10 @@ impl NotificationSys {
                 .unwrap_or_default();
             futures.push(async move {
                 let Some(client) = client else {
-                    return PeerServerInfoProbe::NoClient { host };
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::NoClient),
+                    };
                 };
 
                 // First attempt. A single evicted or half-open internode channel
@@ -399,10 +402,7 @@ impl NotificationSys {
                 // before falling back (rustfs/backlog#1049, P1-B).
                 match timeout(peer_timeout, client.server_info()).await {
                     Ok(Ok(info)) => {
-                        return PeerServerInfoProbe::Success {
-                            host,
-                            info: Box::new(info),
-                        };
+                        return PeerServerInfoProbe { host, result: Ok(info) };
                     }
                     Ok(Err(err)) => debug!("peer {host} server_info failed (attempt 1/2): {err}"),
                     Err(_) => debug!("peer {host} server_info timed out (attempt 1/2) after {peer_timeout:?}"),
@@ -418,20 +418,23 @@ impl NotificationSys {
 
                 // Second and final attempt on the fresh channel.
                 match timeout(peer_timeout, client.server_info()).await {
-                    Ok(Ok(info)) => PeerServerInfoProbe::Success {
-                        host,
-                        info: Box::new(info),
-                    },
+                    Ok(Ok(info)) => PeerServerInfoProbe { host, result: Ok(info) },
                     Ok(Err(err)) => {
                         warn!("peer {host} server_info failed after retry: {err}");
                         let health = peer_disk_health(&host).await;
-                        PeerServerInfoProbe::Failure { host, health }
+                        PeerServerInfoProbe {
+                            host,
+                            result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                        }
                     }
                     Err(_) => {
                         warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
                         client.evict_connection().await;
                         let health = peer_disk_health(&host).await;
-                        PeerServerInfoProbe::Failure { host, health }
+                        PeerServerInfoProbe {
+                            host,
+                            result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                        }
                     }
                 }
             });
@@ -1261,10 +1264,14 @@ struct PeerDiskHealth {
     disks: Vec<rustfs_madmin::Disk>,
 }
 
-enum PeerServerInfoProbe {
-    Success { host: String, info: Box<ServerProperties> },
-    Failure { host: String, health: Option<PeerDiskHealth> },
-    NoClient { host: String },
+struct PeerServerInfoProbe {
+    host: String,
+    result: std::result::Result<ServerProperties, PeerServerInfoProbeFailure>,
+}
+
+enum PeerServerInfoProbeFailure {
+    Rpc { health: Option<PeerDiskHealth> },
+    NoClient,
 }
 
 /// Consult the local disk-health state for `host` without issuing any RPC.
@@ -1438,15 +1445,15 @@ fn publish_server_info_probe_round(
         .enumerate()
         .map(|(idx, probe)| {
             let cache = caches.get(idx);
-            match probe {
-                PeerServerInfoProbe::Success { host, info } => {
-                    update_server_info_cache(cache, &host, &info);
-                    *info
+            match probe.result {
+                Ok(info) => {
+                    update_server_info_cache(cache, &probe.host, &info);
+                    info
                 }
-                PeerServerInfoProbe::Failure { host, health } => {
-                    handle_server_info_failure(cache, &host, endpoints, health.as_ref())
+                Err(PeerServerInfoProbeFailure::Rpc { health }) => {
+                    handle_server_info_failure(cache, &probe.host, endpoints, health.as_ref())
                 }
-                PeerServerInfoProbe::NoClient { host } => unknown_server_properties(&host, endpoints),
+                Err(PeerServerInfoProbeFailure::NoClient) => unknown_server_properties(&probe.host, endpoints),
             }
         })
         .collect()
@@ -2081,9 +2088,9 @@ mod tests {
     fn server_info_probe_round_commits_failures_only_when_published() {
         let caches = vec![Mutex::new(PeerAdminCache::new())];
         let endpoints = EndpointServerPools::default();
-        let probes = vec![PeerServerInfoProbe::Failure {
+        let probes = vec![PeerServerInfoProbe {
             host: "peer-1".to_string(),
-            health: None,
+            result: Err(PeerServerInfoProbeFailure::Rpc { health: None }),
         }];
 
         assert_eq!(
@@ -2112,8 +2119,9 @@ mod tests {
     fn server_info_probe_round_does_not_count_no_client_slots_as_rpc_failures() {
         let caches = vec![Mutex::new(PeerAdminCache::new())];
         let endpoints = EndpointServerPools::default();
-        let probes = vec![PeerServerInfoProbe::NoClient {
+        let probes = vec![PeerServerInfoProbe {
             host: "node-a:9000".to_string(),
+            result: Err(PeerServerInfoProbeFailure::NoClient),
         }];
 
         let replies = publish_server_info_probe_round(&caches, &endpoints, probes);
