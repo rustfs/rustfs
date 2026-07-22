@@ -1152,7 +1152,7 @@ fn apply_delete_directives(config: &mut ServerConfig, directives: &[ConfigDirect
 }
 
 fn render_entry_value(entry: &KV, redact_secrets: bool) -> String {
-    if redact_secrets && (entry.hidden_if_empty || is_sensitive_key_name(&entry.key)) && !entry.value.trim().is_empty() {
+    if redact_secrets && is_sensitive_key_name(&entry.key) && !entry.value.trim().is_empty() {
         REDACTED_VALUE.to_string()
     } else {
         entry.value.clone()
@@ -2274,7 +2274,7 @@ identity_openid config_url="https://issuer.example" client_id="console""#,
                     sub_system: SCANNER_SUB_SYS.to_string(),
                     target: Some(DEFAULT_DELIMITER.to_string()),
                 },
-                false,
+                true,
             )
             .expect("render scanner cycle config"),
         )
