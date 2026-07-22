@@ -15,7 +15,11 @@
 use crate::cluster::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend_cached};
 use crate::error::{Error, Result};
-use crate::{disk::endpoint::Endpoint, runtime::sources as runtime_sources};
+use crate::{
+    disk::endpoint::{Endpoint, EndpointType},
+    layout::endpoints::EndpointServerPools,
+    runtime::sources as runtime_sources,
+};
 
 use crate::data_usage::load_data_usage_cache;
 use crate::storage_api_contracts::admin::StorageAdminApi;
@@ -291,6 +295,21 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         let after4 = OffsetDateTime::now_utc();
 
         warn!("backend_info end {:?}", after4 - after3);
+        if let Some(endpoints) = runtime_sources::endpoint_pools() {
+            let added = reconcile_servers_with_endpoint_topology(&mut servers, &endpoints);
+            let report = server_topology_completeness_report(&servers, &endpoints);
+            if added > 0 || !report.is_complete() {
+                warn!(
+                    event = "admin_v3_info_topology_incomplete",
+                    synthesized_servers = added,
+                    expected_drives = report.expected_drives,
+                    observed_drives = report.observed_drives,
+                    missing_drives = report.missing_drive_ids.len(),
+                    duplicate_drives = report.duplicate_drive_ids.len(),
+                    "admin v3 server_info reconciled endpoint topology before computing backend counters"
+                );
+            }
+        }
 
         let mut all_disks: Vec<Disk> = Vec::new();
         for server in servers.iter() {
@@ -397,6 +416,191 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
     (BackendDisks(online_disks), BackendDisks(offline_disks), BackendDisks(unknown_disks))
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TopologyCompletenessReport {
+    expected_drives: usize,
+    observed_drives: usize,
+    missing_drive_ids: Vec<String>,
+    duplicate_drive_ids: Vec<String>,
+}
+
+impl TopologyCompletenessReport {
+    fn is_complete(&self) -> bool {
+        self.expected_drives == self.observed_drives && self.missing_drive_ids.is_empty() && self.duplicate_drive_ids.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct TopologyMember {
+    display_endpoint: String,
+    disks: Vec<Disk>,
+}
+
+fn reconcile_servers_with_endpoint_topology(servers: &mut Vec<ServerProperties>, endpoints: &EndpointServerPools) -> usize {
+    let (members, aliases) = topology_members(endpoints);
+    if members.is_empty() {
+        return 0;
+    }
+
+    let mut observed = HashSet::with_capacity(members.len());
+    for server in servers.iter() {
+        collect_observed_topology_members(server, &aliases, &mut observed);
+    }
+
+    let mut missing: Vec<_> = members
+        .into_iter()
+        .filter(|(host, _)| !observed.contains(host))
+        .map(|(_, member)| ServerProperties {
+            endpoint: member.display_endpoint,
+            state: ITEM_UNKNOWN.to_string(),
+            disks: member.disks,
+            ..Default::default()
+        })
+        .collect();
+    missing.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+
+    let added = missing.len();
+    servers.extend(missing);
+    added
+}
+
+fn topology_members(endpoints: &EndpointServerPools) -> (HashMap<String, TopologyMember>, HashMap<String, String>) {
+    let mut members: HashMap<String, TopologyMember> = HashMap::new();
+    let mut aliases = HashMap::new();
+
+    for pool in endpoints.as_ref() {
+        for ep in pool.endpoints.as_ref() {
+            if ep.get_type() != EndpointType::Url {
+                continue;
+            }
+            let host_port = ep.host_port();
+            if host_port.is_empty() {
+                continue;
+            }
+            let display_endpoint = ep.url.host_str().map(str::to_owned).unwrap_or_else(|| host_port.clone());
+            aliases.entry(host_port.clone()).or_insert_with(|| host_port.clone());
+            aliases.entry(display_endpoint.clone()).or_insert_with(|| host_port.clone());
+            aliases.entry(ep.to_string()).or_insert_with(|| host_port.clone());
+
+            members
+                .entry(host_port)
+                .or_insert_with(|| TopologyMember {
+                    display_endpoint,
+                    disks: Vec::new(),
+                })
+                .disks
+                .push(Disk {
+                    endpoint: ep.to_string(),
+                    state: ITEM_UNKNOWN.to_string(),
+                    pool_index: ep.pool_idx,
+                    set_index: ep.set_idx,
+                    disk_index: ep.disk_idx,
+                    ..Default::default()
+                });
+        }
+    }
+
+    (members, aliases)
+}
+
+fn collect_observed_topology_members(
+    server: &ServerProperties,
+    aliases: &HashMap<String, String>,
+    observed: &mut HashSet<String>,
+) {
+    if let Some(host) = aliases.get(&server.endpoint) {
+        observed.insert(host.clone());
+    }
+
+    for disk in &server.disks {
+        if let Some(host) = topology_host_from_disk_endpoint(&disk.endpoint, aliases) {
+            observed.insert(host);
+        }
+    }
+}
+
+fn topology_host_from_disk_endpoint(endpoint: &str, aliases: &HashMap<String, String>) -> Option<String> {
+    if let Some(host) = aliases.get(endpoint) {
+        return Some(host.clone());
+    }
+
+    Endpoint::try_from(endpoint)
+        .ok()
+        .and_then(|ep| aliases.get(&ep.host_port()).cloned())
+}
+
+fn server_topology_completeness_report(
+    servers: &[ServerProperties],
+    endpoints: &EndpointServerPools,
+) -> TopologyCompletenessReport {
+    let expected = expected_topology_drive_ids(endpoints);
+    if expected.is_empty() {
+        return TopologyCompletenessReport::default();
+    }
+
+    let mut observed_counts: HashMap<String, usize> = HashMap::with_capacity(expected.len());
+    for server in servers {
+        for disk in &server.disks {
+            if let Some(id) = server_disk_topology_id(disk)
+                && expected.contains(&id)
+            {
+                *observed_counts.entry(id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut missing_drive_ids = Vec::new();
+    let mut duplicate_drive_ids = Vec::new();
+    for id in &expected {
+        match observed_counts.get(id).copied().unwrap_or(0) {
+            0 => missing_drive_ids.push(id.clone()),
+            1 => {}
+            _ => duplicate_drive_ids.push(id.clone()),
+        }
+    }
+    missing_drive_ids.sort();
+    duplicate_drive_ids.sort();
+
+    TopologyCompletenessReport {
+        expected_drives: expected.len(),
+        observed_drives: observed_counts.values().sum(),
+        missing_drive_ids,
+        duplicate_drive_ids,
+    }
+}
+
+fn expected_topology_drive_ids(endpoints: &EndpointServerPools) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for pool in endpoints.as_ref() {
+        for ep in pool.endpoints.as_ref() {
+            if ep.get_type() != EndpointType::Url {
+                continue;
+            }
+            if let Some(id) = endpoint_topology_drive_id(ep) {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
+fn endpoint_topology_drive_id(endpoint: &Endpoint) -> Option<String> {
+    let host_port = endpoint.host_port();
+    if host_port.is_empty() {
+        return None;
+    }
+    Some(format!("{}:{}:{}:{host_port}", endpoint.pool_idx, endpoint.set_idx, endpoint.disk_idx))
+}
+
+fn server_disk_topology_id(disk: &Disk) -> Option<String> {
+    let endpoint = Endpoint::try_from(disk.endpoint.as_str()).ok()?;
+    let host_port = endpoint.host_port();
+    if host_port.is_empty() {
+        return None;
+    }
+    Some(format!("{}:{}:{}:{host_port}", disk.pool_index, disk.set_index, disk.disk_index))
+}
+
 async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, ErasureSetInfo>>> {
     let Some(store) = runtime_sources::object_store_handle() else {
         return Err(Error::other("ServerNotInitialized"));
@@ -449,18 +653,63 @@ pub fn get_commit_id() -> String {
 mod tests {
     use serial_test::serial;
 
+    use crate::layout::{
+        endpoint::Endpoint,
+        endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+    };
     use crate::runtime::sources as runtime_sources;
-    use rustfs_madmin::{Disk, ITEM_OFFLINE, ITEM_UNKNOWN};
+    use rustfs_madmin::{Disk, ITEM_OFFLINE, ITEM_ONLINE, ITEM_UNKNOWN, ServerProperties};
 
     use super::{
         DATA_USAGE_UNAVAILABLE_ERROR, apply_data_usage_result, get_local_server_property, get_online_offline_disks_stats,
-        get_server_info,
+        get_server_info, reconcile_servers_with_endpoint_topology, server_topology_completeness_report,
     };
 
     fn disk_with_state(endpoint: &str, state: &str) -> Disk {
         Disk {
             endpoint: endpoint.to_string(),
             state: state.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn topology_endpoint(host: &str, pool_index: usize, set_index: usize, disk_index: usize) -> Endpoint {
+        let mut endpoint =
+            Endpoint::try_from(format!("http://{host}:9000/data{disk_index}").as_str()).expect("URL endpoint should parse");
+        endpoint.set_pool_index(pool_index);
+        endpoint.set_set_index(set_index);
+        endpoint.set_disk_index(disk_index);
+        endpoint
+    }
+
+    fn topology_with_hosts(hosts: &[&str]) -> EndpointServerPools {
+        let endpoints: Vec<Endpoint> = hosts
+            .iter()
+            .enumerate()
+            .map(|(disk_index, host)| topology_endpoint(host, 0, 0, disk_index))
+            .collect();
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: hosts.len(),
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }])
+    }
+
+    fn server_with_disk(host: &str, disk_index: i32, state: &str) -> ServerProperties {
+        ServerProperties {
+            endpoint: host.to_string(),
+            state: ITEM_ONLINE.to_string(),
+            disks: vec![Disk {
+                endpoint: format!("http://{host}:9000/data{disk_index}"),
+                state: state.to_string(),
+                pool_index: 0,
+                set_index: 0,
+                disk_index,
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
@@ -491,6 +740,64 @@ mod tests {
             disks.len(),
             "online + offline + unknown must equal the total drive count"
         );
+    }
+
+    #[test]
+    fn topology_reconcile_synthesizes_missing_member_as_unknown() {
+        let endpoints = topology_with_hosts(&["rustfs-1", "rustfs-2", "rustfs-3", "rustfs-4"]);
+        let mut servers = vec![
+            server_with_disk("rustfs-1", 0, "ok"),
+            server_with_disk("rustfs-2", 1, "ok"),
+            server_with_disk("rustfs-3", 2, "ok"),
+        ];
+
+        let added = reconcile_servers_with_endpoint_topology(&mut servers, &endpoints);
+        let (_, _, unknown) =
+            get_online_offline_disks_stats(&servers.iter().flat_map(|server| server.disks.clone()).collect::<Vec<_>>());
+
+        assert_eq!(added, 1, "the missing fourth topology member must be synthesized");
+        assert_eq!(servers.len(), 4, "v3 server list must preserve topology membership length");
+        let synthesized = servers
+            .iter()
+            .find(|server| server.endpoint == "rustfs-4")
+            .expect("missing member should be present");
+        assert_eq!(synthesized.state, ITEM_UNKNOWN);
+        assert_eq!(synthesized.disks.len(), 1);
+        assert_eq!(synthesized.disks[0].endpoint, "http://rustfs-4:9000/data3");
+        assert_eq!(synthesized.disks[0].disk_index, 3);
+        assert_eq!(unknown.sum(), 1, "the synthesized drive must land in unknownDisks");
+    }
+
+    #[test]
+    fn topology_reconcile_does_not_duplicate_existing_synthesized_rows() {
+        let endpoints = topology_with_hosts(&["rustfs-1", "rustfs-2"]);
+        let mut servers = vec![
+            server_with_disk("rustfs-1", 0, "ok"),
+            server_with_disk("rustfs-2", 1, ITEM_UNKNOWN),
+        ];
+        servers[1].state = ITEM_UNKNOWN.to_string();
+
+        let added = reconcile_servers_with_endpoint_topology(&mut servers, &endpoints);
+
+        assert_eq!(
+            added, 0,
+            "an existing unknown/degraded/offline row with topology drives already represents the member"
+        );
+        assert_eq!(servers.len(), 2);
+    }
+
+    #[test]
+    fn topology_report_detects_duplicate_drive_identity_with_balanced_total() {
+        let endpoints = topology_with_hosts(&["rustfs-1", "rustfs-2"]);
+        let servers = vec![server_with_disk("rustfs-1", 0, "ok"), server_with_disk("rustfs-1", 0, "ok")];
+
+        let report = server_topology_completeness_report(&servers, &endpoints);
+
+        assert_eq!(report.expected_drives, 2);
+        assert_eq!(report.observed_drives, 2, "a plain total-count check would look balanced");
+        assert_eq!(report.missing_drive_ids.len(), 1, "rustfs-2's drive identity is absent");
+        assert_eq!(report.duplicate_drive_ids.len(), 1, "rustfs-1's drive identity is duplicated");
+        assert!(!report.is_complete());
     }
 
     #[test]
