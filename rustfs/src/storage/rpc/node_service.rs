@@ -1855,13 +1855,12 @@ impl Node for NodeService {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService, PEER_RESTSIGNAL,
-        PEER_RESTDRY_RUN, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
-        admit_heal_control_replay, background_rebalance_start_error_message,
+        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService,
+        PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+        STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
         execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, make_heal_control_server,
         make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server_for_context,
-        remove_heal_control_replay, scanner_activity_response,
-        stop_rebalance_response,
+        remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
