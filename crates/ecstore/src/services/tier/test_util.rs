@@ -163,6 +163,8 @@ struct MockWarmBackendInner {
     faults: Mutex<FaultConfig>,
     put_read_limit: Mutex<Option<usize>>,
     put_remote_version: Mutex<Option<String>>,
+    response_loss_after_put: AtomicBool,
+    transition_candidate_probe_override: Mutex<Option<TransitionCandidateProbe>>,
     reject_non_empty_remote_versions: AtomicBool,
     fail_remove: AtomicBool,
     exact_remove_count: AtomicUsize,
@@ -381,6 +383,16 @@ impl MockWarmBackend {
         *self.inner.put_remote_version.lock().await = remote_version;
     }
 
+    /// Make the next PUT persist its body remotely but lose its response.
+    pub fn lose_next_put_response(&self) {
+        self.inner.response_loss_after_put.store(true, Ordering::Release);
+    }
+
+    /// Override candidate probing for transition-recovery fail-closed tests.
+    pub async fn set_transition_candidate_probe_override(&self, probe: Option<TransitionCandidateProbe>) {
+        *self.inner.transition_candidate_probe_override.lock().await = probe;
+    }
+
     /// Reject non-empty remote versions before transition metadata is committed.
     pub fn set_reject_non_empty_remote_versions(&self, reject: bool) {
         self.inner.reject_non_empty_remote_versions.store(reject, Ordering::Release);
@@ -583,6 +595,16 @@ impl MockWarmBackend {
             }
         }
     }
+
+    fn maybe_lose_put_response(&self) -> Result<(), std::io::Error> {
+        if self.inner.response_loss_after_put.swap(false, Ordering::AcqRel) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "mock warm backend lost PUT response after storing remote object",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -607,6 +629,7 @@ impl WarmBackend for MockWarmBackend {
             object: object.to_string(),
         })
         .await;
+        self.maybe_lose_put_response()?;
         Ok(version)
     }
 
@@ -657,6 +680,7 @@ impl WarmBackend for MockWarmBackend {
             object: object.to_string(),
         })
         .await;
+        self.maybe_lose_put_response()?;
         Ok(version)
     }
 
@@ -739,6 +763,9 @@ impl WarmBackend for MockWarmBackend {
             object: object.to_string(),
         })
         .await;
+        if let Some(probe) = self.inner.transition_candidate_probe_override.lock().await.clone() {
+            return Ok(probe);
+        }
         let objects = self.inner.objects.lock().await;
         let Some(stored) = objects.get(object) else {
             return Ok(TransitionCandidateProbe::Missing);

@@ -537,7 +537,8 @@ mod tests {
             transition_transaction::{
                 TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionCleanupDecision, TransitionCleanupProof, TransitionRemoteVersion,
                 TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit,
-                TransitionTransactionState, recover_transition_transaction_records, save_transition_transaction_record,
+                TransitionTransactionState, load_transition_transaction_record, recover_transition_transaction_records,
+                save_transition_transaction_record,
             },
         },
         client::transition_api::ReaderImpl,
@@ -545,7 +546,7 @@ mod tests {
         disk::RUSTFS_META_BUCKET,
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
-            test_util::{MockWarmBackend, TransitionCleanupStoreBarrier, register_mock_tier},
+            test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
             tier::{TIER_CONFIG_FILE, TierConfigMgr},
             tier_mutation_intent::{
                 TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
@@ -554,7 +555,7 @@ mod tests {
                 save_tier_mutation_intent_record, save_tier_mutation_intent_record_if_current,
             },
             tier_mutation_peer::{TierMutationPeerError, TierMutationPeerState, handle_tier_mutation_peer_request},
-            warm_backend::WarmBackend,
+            warm_backend::{TransitionCandidateProbe, WarmBackend},
         },
         storage_api_contracts::{
             bucket::{BucketOperations as _, MakeBucketOptions},
@@ -2665,5 +2666,135 @@ mod tests {
                 usize::from(removed.first().is_some_and(|(_, version)| !version.is_empty()))
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_response_loss_persists_unknown_outcome_for_provider_recovery() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-response-loss", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXRESPONSELOSS";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "transition-response-loss-bucket";
+        let object = "source.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("source bucket should be created");
+        let payload = b"a response-lost tier PUT must remain recoverable".repeat(1024);
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let source = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        backend.lose_next_put_response();
+
+        let error = store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("source object should have an ETag"),
+                        ..Default::default()
+                    },
+                    version_id: source.version_id.map(|version| version.to_string()),
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a lost tier PUT response must fail the transition request");
+        assert!(
+            matches!(error, StorageError::Io(ref err) if err.kind() == std::io::ErrorKind::ConnectionReset),
+            "the response-loss error must remain visible to the caller: {error:?}"
+        );
+
+        let records = store
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TRANSITION_TRANSACTION_RECORD_PREFIX,
+                None,
+                None,
+                10,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("transition transaction records should be listable");
+        assert_eq!(records.objects.len(), 1, "response loss must leave one durable transaction record");
+        let transaction_id = records.objects[0]
+            .name
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|name| uuid::Uuid::parse_str(name).ok())
+            .expect("transaction record name should contain a UUID");
+        let transaction = load_transition_transaction_record(store.clone(), transaction_id)
+            .await
+            .expect("response loss transaction record should load");
+        assert_eq!(
+            transaction.state,
+            TransitionTransactionState::UploadOutcomeUnknown,
+            "a response-lost PUT must not remain in UploadStarted"
+        );
+        assert!(
+            backend.contains(&transaction.remote_object).await,
+            "the test backend must retain the remote candidate"
+        );
+
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::Unsupported))
+            .await;
+        let unsupported_stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("unsupported provider recovery should fail closed");
+        assert_eq!(
+            (
+                unsupported_stats.scanned,
+                unsupported_stats.recovered,
+                unsupported_stats.retained,
+                unsupported_stats.failed
+            ),
+            (1, 0, 1, 0),
+            "an unsupported provider probe must retain the unknown upload"
+        );
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 1);
+        assert!(
+            backend.contains(&transaction.remote_object).await,
+            "unsupported recovery must not delete the candidate"
+        );
+        assert_eq!(backend.remove_count().await, 0, "unsupported recovery must not attempt cleanup");
+
+        backend.set_transition_candidate_probe_override(None).await;
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("provider-authoritative recovery should run");
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0, "recovery must delete the provider-confirmed candidate");
+        let op_log = backend.op_log().await;
+        assert!(
+            op_log.iter().any(|operation| matches!(operation, MockWarmOp::Probe { .. })),
+            "response-loss recovery must enter the provider probe branch"
+        );
+        assert!(
+            op_log.iter().any(|operation| matches!(operation, MockWarmOp::Put { .. })),
+            "response-loss fixture must record that the remote PUT reached the backend"
+        );
+        let source_after = store
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("recovery must preserve the local source object");
+        assert_eq!(source_after.size, i64::try_from(payload.len()).expect("payload length should fit i64"));
     }
 }

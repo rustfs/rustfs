@@ -3346,6 +3346,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, self.ctx.clone());
+        advance_and_save_transition_transaction(
+            transaction_api.as_ref(),
+            &mut transaction,
+            TransitionTransactionState::UploadOutcomeUnknown,
+            None,
+        )
+        .await?;
         let remote_upload = {
             let lease = &upload_cleanup.lease;
             let recorded_candidate = &mut upload_cleanup.candidate;
