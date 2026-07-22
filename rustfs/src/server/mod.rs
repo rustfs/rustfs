@@ -32,6 +32,7 @@ pub mod tls_material;
 use tracing::warn;
 
 // Items used by main.rs (binary crate) and/or embedded.rs — must be fully pub.
+pub(crate) use audit::apply_audit_module_switch_for_context;
 pub use audit::{is_audit_module_enabled, refresh_audit_module_enabled, start_audit_system, stop_audit_system};
 pub use event::{init_event_notifier, is_notify_module_enabled, refresh_notify_module_enabled, shutdown_event_notifier};
 pub use http::start_http_server;
@@ -45,6 +46,10 @@ pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
 pub(crate) use event::convert_ecstore_object_info;
+pub(crate) use event::{
+    is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
+    reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler,
+};
 #[cfg(test)]
 pub(crate) use health::{
     HealthPayloadContext, HealthReadinessSource, build_component_details, build_health_payload, health_check_state,
@@ -55,8 +60,9 @@ pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
 pub(crate) use layer::RequestContextLayer;
 pub(crate) use module_switch::{
-    ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot,
-    refresh_persisted_module_switches_from_store, save_persisted_module_switches_to_store, validate_module_switch_update,
+    MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
+    current_module_switch_snapshot, refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store,
+    save_persisted_module_switches_to, validate_module_switch_update,
 };
 pub(crate) use prefix::{
     ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE,

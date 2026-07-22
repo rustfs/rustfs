@@ -253,7 +253,7 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn reload_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+    async fn signal_dynamic_config(&self, sub_sys: &str, dry_run: bool) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter() {
             let sub_sys = sub_sys.to_string();
@@ -263,7 +263,7 @@ impl NotificationSys {
                         .signal_service(
                             crate::cluster::rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC,
                             &sub_sys,
-                            false,
+                            dry_run,
                             SystemTime::UNIX_EPOCH,
                         )
                         .await
@@ -286,6 +286,14 @@ impl NotificationSys {
             });
         }
         join_all(futures).await
+    }
+
+    pub async fn preflight_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+        self.signal_dynamic_config(sub_sys, true).await
+    }
+
+    pub async fn reload_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+        self.signal_dynamic_config(sub_sys, false).await
     }
 
     pub async fn refresh_config_snapshot(&self) -> Vec<NotificationPeerErr> {

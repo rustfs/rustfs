@@ -872,6 +872,8 @@ impl ECStore {
         let idx = if opts.data_movement && opts.version_id.is_some() {
             self.select_data_movement_pool_idx(bucket, &object, data.size(), opts, false)
                 .await?
+        } else if opts.no_lock {
+            self.get_pool_idx_no_lock(bucket, &object, data.size()).await?
         } else {
             self.get_pool_idx(bucket, &object, data.size()).await?
         };

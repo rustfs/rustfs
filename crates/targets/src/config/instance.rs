@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::loader::collect_merged_target_configs_from_env;
+use super::loader::{
+    MergedTargetConfigRecord, collect_merged_target_configs_compat_from_env, collect_merged_target_configs_from_env,
+};
+use crate::TargetError;
 use crate::domain::TargetDomain;
 use rustfs_config::server_config::{Config, KVS};
 use std::collections::HashSet;
@@ -86,6 +89,13 @@ pub fn normalize_target_plugin_instances(
     normalize_target_plugin_instances_from_env(config, descriptor, std::env::vars())
 }
 
+pub fn try_normalize_target_plugin_instances(
+    config: &Config,
+    descriptor: &TargetPluginInstanceCompatDescriptor<'_>,
+) -> Result<Vec<TargetPluginInstanceRecord>, TargetError> {
+    try_normalize_target_plugin_instances_from_env(config, descriptor, std::env::vars())
+}
+
 pub fn normalize_target_plugin_instances_from_env<I>(
     config: &Config,
     descriptor: &TargetPluginInstanceCompatDescriptor<'_>,
@@ -100,7 +110,7 @@ where
         .map(|field| (*field).to_string())
         .collect::<HashSet<_>>();
 
-    collect_merged_target_configs_from_env(
+    collect_merged_target_configs_compat_from_env(
         config,
         descriptor.subsystem,
         descriptor.route_prefix,
@@ -109,7 +119,42 @@ where
         env_vars,
     )
     .into_iter()
-    .map(|record| TargetPluginInstanceRecord {
+    .map(|record| target_plugin_instance_record(descriptor, record))
+    .collect()
+}
+
+pub fn try_normalize_target_plugin_instances_from_env<I>(
+    config: &Config,
+    descriptor: &TargetPluginInstanceCompatDescriptor<'_>,
+    env_vars: I,
+) -> Result<Vec<TargetPluginInstanceRecord>, TargetError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let valid_fields = descriptor
+        .valid_fields
+        .iter()
+        .map(|field| (*field).to_string())
+        .collect::<HashSet<_>>();
+
+    Ok(collect_merged_target_configs_from_env(
+        config,
+        descriptor.subsystem,
+        descriptor.route_prefix,
+        descriptor.target_type,
+        &valid_fields,
+        env_vars,
+    )?
+    .into_iter()
+    .map(|record| target_plugin_instance_record(descriptor, record))
+    .collect())
+}
+
+fn target_plugin_instance_record(
+    descriptor: &TargetPluginInstanceCompatDescriptor<'_>,
+    record: MergedTargetConfigRecord,
+) -> TargetPluginInstanceRecord {
+    TargetPluginInstanceRecord {
         domain: descriptor.domain,
         plugin_id: descriptor.plugin_id.to_string(),
         target_type: descriptor.target_type.to_string(),
@@ -123,8 +168,7 @@ where
             has_env_instance: record.has_env_instance,
         },
         effective_config: record.effective_config,
-    })
-    .collect()
+    }
 }
 
 pub fn normalize_legacy_target_instances(
@@ -149,8 +193,9 @@ where
 mod tests {
     use super::{
         TargetInstanceSourceClass, TargetPluginInstanceCompatDescriptor, normalize_legacy_target_instances_from_env,
-        normalize_target_plugin_instances_from_env,
+        try_normalize_target_plugin_instances_from_env,
     };
+    use crate::TargetError;
     use crate::domain::TargetDomain;
     use crate::manifest::builtin_target_manifest;
     use rustfs_config::audit::{AUDIT_ROUTE_PREFIX, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
@@ -338,9 +383,50 @@ mod tests {
         let descriptor = notify_webhook_descriptor();
         let env = vec![("RUSTFS_NOTIFY_WEBHOOK_QUEUE_LIMIT".to_string(), "7".to_string())];
 
-        let canonical = normalize_target_plugin_instances_from_env(&cfg, &descriptor, env.clone());
+        let canonical = try_normalize_target_plugin_instances_from_env(&cfg, &descriptor, env.clone())
+            .expect("canonical normalization should succeed");
         let compatibility = normalize_legacy_target_instances_from_env(&cfg, &descriptor, env);
 
         assert_eq!(canonical, compatibility);
+    }
+
+    #[test]
+    fn normalize_instances_rejects_invalid_enable_value() {
+        let error = try_normalize_target_plugin_instances_from_env(
+            &Config(HashMap::new()),
+            &notify_webhook_descriptor(),
+            vec![("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(), "invalid".to_string())],
+        )
+        .expect_err("invalid enable value must be propagated by the public normalizer");
+
+        match error {
+            TargetError::Configuration(detail) => assert_eq!(detail, "Invalid enable value 'invalid'"),
+            other => panic!("expected a configuration error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn legacy_normalizer_keeps_valid_instance_when_one_enable_is_invalid() {
+        let instances = normalize_legacy_target_instances_from_env(
+            &Config(HashMap::new()),
+            &notify_webhook_descriptor(),
+            vec![
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_GOOD".to_string(), "on".to_string()),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_GOOD".to_string(), "https://example.com/good".to_string()),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_BAD".to_string(), "invalid".to_string()),
+            ],
+        );
+
+        assert_eq!(instances.len(), 2);
+        let good = instances
+            .iter()
+            .find(|instance| instance.instance_id == "good")
+            .expect("valid instance should remain present");
+        let bad = instances
+            .iter()
+            .find(|instance| instance.instance_id == "bad")
+            .expect("invalid legacy instance should remain visible");
+        assert!(good.enabled);
+        assert!(!bad.enabled);
     }
 }

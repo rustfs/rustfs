@@ -19,18 +19,21 @@ use crate::admin::runtime_sources::{
 use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::runtime::ECStore;
+use crate::server::{
+    MODULE_SWITCHES_SIGNAL_SUBSYSTEM, apply_audit_module_switch_for_context, reconcile_event_notifier_from_store,
+};
 use rustfs_audit::reload_audit_config;
+use rustfs_config::AUDIT_DEFAULT_DIR;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
-use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::notify::{NOTIFY_ROUTE_PREFIX, NOTIFY_SUB_SYSTEMS};
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
-use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
 use rustfs_targets::config::{
-    validate_amqp_config, validate_kafka_config, validate_mqtt_config, validate_mysql_config, validate_nats_config,
-    validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
+    try_collect_target_configs, validate_amqp_config, validate_kafka_config, validate_mqtt_config, validate_mysql_config,
+    validate_nats_config, validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::future::Future;
@@ -38,10 +41,11 @@ use tracing::warn;
 use url::Url;
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
-    matches!(
-        sub_system,
-        STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS | SCANNER_SUB_SYS | HEAL_SUB_SYS
-    )
+    NOTIFY_SUB_SYSTEMS.contains(&sub_system)
+        || matches!(
+            sub_system,
+            STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS | SCANNER_SUB_SYS | HEAL_SUB_SYS
+        )
 }
 
 pub(crate) const FULL_CONFIG_WORKER_SUBSYSTEMS: [&str; 2] = [AUDIT_WEBHOOK_SUB_SYS, SCANNER_SUB_SYS];
@@ -179,30 +183,20 @@ fn target_kvs(config: &ServerConfig, sub_system: &str, target: &str) -> KVS {
 }
 
 fn validate_notify_subsystem_config(config: &ServerConfig, sub_system: &str) -> S3Result<()> {
-    let Some(targets) = config.0.get(sub_system) else {
+    let Some(descriptor) = rustfs_notify::factory::builtin_target_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.subsystem() == sub_system)
+    else {
         return Ok(());
     };
+    let plugin = descriptor.plugin();
 
-    for target in targets.keys() {
-        let kvs = target_kvs(config, sub_system, target);
-        if !target_enabled(&kvs) {
-            continue;
-        }
-
-        let result = match sub_system {
-            "notify_webhook" => validate_webhook_config(&kvs, EVENT_DEFAULT_DIR),
-            "notify_amqp" => validate_amqp_config(&kvs, EVENT_DEFAULT_DIR),
-            "notify_kafka" => validate_kafka_config(&kvs, EVENT_DEFAULT_DIR),
-            "notify_mqtt" => validate_mqtt_config(&kvs),
-            "notify_mysql" => validate_mysql_config(&kvs, EVENT_DEFAULT_DIR),
-            "notify_nats" => validate_nats_config(&kvs, EVENT_DEFAULT_DIR),
-            "notify_postgres" => validate_postgres_config(&kvs, EVENT_DEFAULT_DIR),
-            "notify_pulsar" => validate_pulsar_config(&kvs, EVENT_DEFAULT_DIR),
-            "notify_redis" => validate_redis_config(&kvs, EVENT_DEFAULT_DIR, NOTIFY_REDIS_DEFAULT_CHANNEL),
-            _ => return Ok(()),
-        };
-
-        result.map_err(|err| invalid_request(format!("invalid {sub_system} config for target '{target}': {err}")))?;
+    for (target, kvs) in try_collect_target_configs(config, NOTIFY_ROUTE_PREFIX, plugin.target_type(), plugin.valid_fields_set())
+        .map_err(|err| invalid_request(format!("invalid {sub_system} config: {err}")))?
+    {
+        plugin
+            .validate_config(&kvs)
+            .map_err(|err| invalid_request(format!("invalid {sub_system} config for target '{target}': {err}")))?;
     }
 
     Ok(())
@@ -314,8 +308,7 @@ pub(crate) async fn prepare_server_config_for_context(
         Some(STORAGE_CLASS_SUB_SYS) => {
             prepared.storage_class = Some(prepare_storage_class_runtime_config_for_context(context, config).await?);
         }
-        Some(NOTIFY_WEBHOOK_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS)?,
-        Some(NOTIFY_MQTT_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS)?,
+        Some(sub_system) if NOTIFY_SUB_SYSTEMS.contains(&sub_system) => validate_notify_subsystem_config(config, sub_system)?,
         Some(AUDIT_WEBHOOK_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?,
         Some(AUDIT_MQTT_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS)?,
         Some(IDENTITY_OPENID_SUB_SYS) => validate_identity_openid_config(config)?,
@@ -324,8 +317,9 @@ pub(crate) async fn prepare_server_config_for_context(
         Some(_) => {}
         None => {
             prepared.storage_class = Some(prepare_storage_class_runtime_config_for_context(context, config).await?);
-            validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS)?;
-            validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS)?;
+            for sub_system in NOTIFY_SUB_SYSTEMS {
+                validate_notify_subsystem_config(config, sub_system)?;
+            }
             validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?;
             validate_audit_subsystem_config(config, AUDIT_MQTT_SUB_SYS)?;
             validate_identity_openid_config(config)?;
@@ -371,6 +365,18 @@ pub async fn apply_dynamic_config_for_subsystem_for_context(
         AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS => reload_audit_config(config.clone())
             .await
             .map_err(|err| internal_error(format!("failed to reload audit config: {err}")))?,
+        sub_system if NOTIFY_SUB_SYSTEMS.contains(&sub_system) => {
+            // The notify lifecycle is intentionally process-wide. The explicit
+            // store keeps the persisted snapshot bound to the request context;
+            // the ECStore NotificationSys resolved below is the peer-broadcast
+            // service, not the notify target runtime.
+            let system = rustfs_notify::ensure_live_events();
+            let store = resolve_runtime_config_store_for_context(context)?;
+            system
+                .reload_persisted_config_from_store(store)
+                .await
+                .map_err(|err| internal_error(format!("failed to reload notification config: {err}")))?;
+        }
         SCANNER_SUB_SYS => rustfs_scanner::apply_scanner_runtime_config(config)
             .map_err(|err| internal_error(format!("failed to reload scanner config: {err}")))?,
         HEAL_SUB_SYS => rustfs_scanner::apply_scanner_runtime_config(config)
@@ -387,6 +393,18 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
 }
 
 pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
+    if sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM {
+        let store = resolve_runtime_config_store_for_context(context)?;
+        let notify_result = reconcile_event_notifier_from_store(store).await;
+        let audit_result = apply_audit_module_switch_for_context(context).await;
+        return match (notify_result, audit_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(_), Ok(())) => Err(internal_error("failed to reconcile notification module switch")),
+            (Ok(()), Err(_)) => Err(internal_error("failed to reconcile audit module switch")),
+            (Err(_), Err(_)) => Err(internal_error("failed to reconcile notification and audit module switches")),
+        };
+    }
+
     if !is_dynamic_config_subsystem(sub_system) {
         return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
     }
@@ -398,9 +416,8 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
     })?;
     apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
         .await
-        .map_err(|err| {
-            warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
-            err
+        .inspect_err(|_| {
+            warn!(config_subsystem = sub_system, reason = "apply_failed", "Peer dynamic config apply failed");
         })?;
     Ok(())
 }
@@ -428,19 +445,19 @@ where
     let (config, prepared) = prepare(config).await?;
     publish(&config, prepared)?;
 
-    // Worker reloads mutate live state and have no rollback contract. They are
-    // therefore best-effort after the validated storage/server snapshots are
-    // published; a transient worker failure must not leave this peer on stale
-    // erasure geometry.
+    // Worker reloads mutate live state and have no rollback contract, so the
+    // validated snapshots stay published. The RPC still reports convergence
+    // failure explicitly so the originating Admin request cannot claim success.
     if let Err(err) = apply_workers(config).await {
         warn!(
             event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_CONFIG,
             state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
-            error = ?err,
+            reason = "apply_failed",
             "Runtime config snapshot was published but a worker reload failed"
         );
+        return Err(err);
     }
     Ok(())
 }
@@ -468,20 +485,29 @@ pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppCont
             Ok(())
         },
         |config| async move {
+            let mut failures = Vec::new();
             for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
-                if let Err(err) = apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system).await {
+                if apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
+                    .await
+                    .is_err()
+                {
+                    failures.push(sub_system);
                     warn!(
                         event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
                         component = LOG_COMPONENT_ADMIN,
                         subsystem = LOG_SUBSYSTEM_CONFIG,
                         config_subsystem = sub_system,
                         state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
-                        error = ?err,
+                        reason = "apply_failed",
                         "Peer runtime config snapshot was published but a subsystem worker reload failed"
                     );
                 }
             }
-            Ok(())
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(internal_error(format!("runtime worker reload failed: {}", failures.join("; "))))
+            }
         },
     )
     .await
@@ -492,19 +518,76 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
     reload_runtime_config_snapshot_for_context(context.as_deref()).await
 }
 
-pub async fn signal_dynamic_config_reload_for_context(context: Option<&AppContext>, sub_system: &str) {
-    if !is_dynamic_config_subsystem(sub_system) {
-        return;
+pub async fn preflight_dynamic_config_reload_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
+    if sub_system != MODULE_SWITCHES_SIGNAL_SUBSYSTEM && !is_dynamic_config_subsystem(sub_system) {
+        return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
     }
 
     let Some(notification_sys) = current_notification_system_for_context(context) else {
-        return;
+        return Ok(());
     };
 
-    for failure in notification_sys.reload_dynamic_config(sub_system).await {
-        if let Some(err) = failure.err {
-            tracing::warn!("peer {} dynamic config reload for {} failed: {}", failure.host, sub_system, err);
+    let mut failed = 0usize;
+    for failure in notification_sys.preflight_dynamic_config(sub_system).await {
+        if failure.err.is_some() {
+            failed += 1;
+            let host = if failure.host.is_empty() { "<unknown>" } else { &failure.host };
+            warn!(
+                peer = host,
+                config_subsystem = sub_system,
+                reason = "unsupported",
+                "Peer does not support dynamic config convergence"
+            );
         }
+    }
+
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(internal_error(format!(
+            "{failed} peer(s) do not support dynamic config convergence for {sub_system}"
+        )))
+    }
+}
+
+pub async fn preflight_dynamic_config_reload(sub_system: &str) -> S3Result<()> {
+    let context = current_app_context();
+    preflight_dynamic_config_reload_for_context(context.as_deref(), sub_system).await
+}
+
+pub async fn signal_dynamic_config_reload_checked_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
+    if sub_system != MODULE_SWITCHES_SIGNAL_SUBSYSTEM && !is_dynamic_config_subsystem(sub_system) {
+        return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
+    }
+
+    let Some(notification_sys) = current_notification_system_for_context(context) else {
+        return Ok(());
+    };
+
+    let mut failed = 0usize;
+    for failure in notification_sys.reload_dynamic_config(sub_system).await {
+        if failure.err.is_some() {
+            failed += 1;
+            let host = if failure.host.is_empty() { "<unknown>" } else { &failure.host };
+            warn!(
+                peer = host,
+                config_subsystem = sub_system,
+                reason = "reload_failed",
+                "Peer dynamic config convergence failed"
+            );
+        }
+    }
+
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(internal_error(format!("{failed} peer(s) failed dynamic config reload for {sub_system}")))
+    }
+}
+
+pub async fn signal_dynamic_config_reload_for_context(context: Option<&AppContext>, sub_system: &str) {
+    if let Err(err) = signal_dynamic_config_reload_checked_for_context(context, sub_system).await {
+        tracing::warn!("peer dynamic config reload for {} failed: {}", sub_system, err);
     }
 }
 
@@ -513,15 +596,35 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
     signal_dynamic_config_reload_for_context(context.as_deref(), sub_system).await;
 }
 
-pub async fn signal_config_snapshot_reload_for_context(context: Option<&AppContext>) {
+pub async fn signal_dynamic_config_reload_checked(sub_system: &str) -> S3Result<()> {
+    let context = current_app_context();
+    signal_dynamic_config_reload_checked_for_context(context.as_deref(), sub_system).await
+}
+
+pub async fn signal_config_snapshot_reload_checked_for_context(context: Option<&AppContext>) -> S3Result<()> {
     let Some(notification_sys) = current_notification_system_for_context(context) else {
-        return;
+        return Ok(());
     };
 
+    let mut failed = 0usize;
     for failure in notification_sys.refresh_config_snapshot().await {
-        if let Some(err) = failure.err {
-            tracing::warn!("peer config snapshot refresh failed for {}: {}", failure.host, err);
+        if failure.err.is_some() {
+            failed += 1;
+            let host = if failure.host.is_empty() { "<unknown>" } else { &failure.host };
+            warn!(peer = host, reason = "reload_failed", "Peer config snapshot refresh failed");
         }
+    }
+
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(internal_error(format!("{failed} peer(s) failed config snapshot reload")))
+    }
+}
+
+pub async fn signal_config_snapshot_reload_for_context(context: Option<&AppContext>) {
+    if let Err(err) = signal_config_snapshot_reload_checked_for_context(context).await {
+        tracing::warn!("peer config snapshot refresh failed: {err}");
     }
 }
 
@@ -530,30 +633,46 @@ pub async fn signal_config_snapshot_reload() {
     signal_config_snapshot_reload_for_context(context.as_deref()).await;
 }
 
+pub async fn signal_config_snapshot_reload_checked() -> S3Result<()> {
+    let context = current_app_context();
+    signal_config_snapshot_reload_checked_for_context(context.as_deref()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::admin::runtime_sources::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
     use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
-    use crate::admin::storage_api::config::save_admin_server_config;
+    use crate::admin::storage_api::config::{
+        read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_server_config,
+        save_admin_server_config_no_lock, with_admin_server_config_write_lock,
+    };
+    use crate::admin::storage_api::error::StorageError;
+    use crate::server::{
+        ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot, is_event_notifier_reconciled,
+        refresh_persisted_module_switches_from, save_persisted_module_switches_to,
+    };
     use crate::storage_api::cluster::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::storage_api::startup::storage::{init_local_disks_with_instance_ctx, new_instance_ctx};
-    use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
+    use rustfs_config::notify::{ENV_NOTIFY_WEBHOOK_ENABLE, ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_kms::KmsServiceManager;
     use std::collections::HashMap;
+    use std::future::{Future, poll_fn};
     use std::path::Path;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::task::Poll;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     const LIFECYCLE_RELOAD_LABEL: &str = "lifecycle";
+    const REAL_STORE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     const REPLICATION_RELOAD_LABEL: &str = "replication";
 
     fn without_storage_class_env<R>(f: impl FnOnce() -> R) -> R {
@@ -748,6 +867,139 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_real_store_config_rmw_preserves_notify_and_oidc_updates() {
+        let temp_dir = TempDir::new().expect("server config RMW temp dir");
+        let store = build_isolated_heterogeneous_store(temp_dir.path()).await;
+        save_admin_server_config(store.clone(), &ServerConfig::new())
+            .await
+            .expect("persist baseline server config");
+
+        let notify_entered = Arc::new(tokio::sync::Notify::new());
+        let release_notify = Arc::new(tokio::sync::Notify::new());
+        let (oidc_polled_tx, oidc_polled_rx) = tokio::sync::oneshot::channel();
+        let (oidc_entered_tx, mut oidc_entered_rx) = tokio::sync::oneshot::channel();
+        let transaction_order = Arc::new(Mutex::new(Vec::new()));
+
+        let notify_task = {
+            let store = store.clone();
+            let notify_entered = notify_entered.clone();
+            let release_notify = release_notify.clone();
+            let transaction_order = transaction_order.clone();
+            tokio::spawn(async move {
+                let transaction_store = store.clone();
+                with_admin_server_config_write_lock(store, move || async move {
+                    let mut config = read_admin_config_without_migrate_no_lock(transaction_store.clone()).await?;
+                    transaction_order.lock().expect("transaction order lock").push("notify-read");
+                    notify_entered.notify_one();
+                    release_notify.notified().await;
+
+                    let mut target = KVS::new();
+                    target.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+                    target.insert(WEBHOOK_ENDPOINT.to_string(), "https://notify.example.test/hook".to_string());
+                    config
+                        .0
+                        .entry(NOTIFY_WEBHOOK_SUB_SYS.to_string())
+                        .or_default()
+                        .insert("concurrent-notify".to_string(), target);
+                    save_admin_server_config_no_lock(transaction_store, &config).await?;
+                    transaction_order.lock().expect("transaction order lock").push("notify-save");
+                    Ok::<(), StorageError>(())
+                })
+                .await
+                .expect("notify transaction should acquire config locks")
+                .expect("notify transaction should persist");
+            })
+        };
+
+        tokio::time::timeout(REAL_STORE_TEST_TIMEOUT, notify_entered.notified())
+            .await
+            .expect("notify transaction should enter");
+
+        let oidc_task = {
+            let store = store.clone();
+            let transaction_order = transaction_order.clone();
+            tokio::spawn(async move {
+                let transaction_store = store.clone();
+                let transaction = with_admin_server_config_write_lock(store, move || async move {
+                    let _ = oidc_entered_tx.send(());
+                    let mut config = read_admin_config_without_migrate_no_lock(transaction_store.clone()).await?;
+                    transaction_order.lock().expect("transaction order lock").push("oidc-read");
+
+                    let mut provider = KVS::new();
+                    provider.insert(
+                        OIDC_CONFIG_URL.to_string(),
+                        "https://identity.example.test/.well-known/openid-configuration".to_string(),
+                    );
+                    provider.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+                    config
+                        .0
+                        .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+                        .or_default()
+                        .insert("concurrent-oidc".to_string(), provider);
+                    save_admin_server_config_no_lock(transaction_store, &config).await?;
+                    transaction_order.lock().expect("transaction order lock").push("oidc-save");
+                    Ok::<(), StorageError>(())
+                });
+                tokio::pin!(transaction);
+                let mut oidc_polled_tx = Some(oidc_polled_tx);
+                poll_fn(|cx| match transaction.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        if let Some(tx) = oidc_polled_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        Poll::Ready(())
+                    }
+                    Poll::Ready(_) => panic!("OIDC transaction entered while notify held the config lock"),
+                })
+                .await;
+                transaction
+                    .await
+                    .expect("OIDC transaction should acquire config locks")
+                    .expect("OIDC transaction should persist");
+            })
+        };
+
+        tokio::time::timeout(REAL_STORE_TEST_TIMEOUT, oidc_polled_rx)
+            .await
+            .expect("OIDC transaction should be polled")
+            .expect("OIDC transaction poll signal should be delivered");
+        assert!(
+            matches!(oidc_entered_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "OIDC RMW must not enter while the notify RMW owns the server-config transaction"
+        );
+
+        release_notify.notify_one();
+        tokio::time::timeout(REAL_STORE_TEST_TIMEOUT, async {
+            notify_task.await.expect("notify task should not panic");
+            oidc_task.await.expect("OIDC task should not panic");
+        })
+        .await
+        .expect("both server-config transactions should finish");
+
+        let persisted = read_admin_config_without_migrate(store)
+            .await
+            .expect("read final server config");
+        assert_eq!(
+            persisted
+                .get_value(NOTIFY_WEBHOOK_SUB_SYS, "concurrent-notify")
+                .expect("notify update should survive")
+                .get(WEBHOOK_ENDPOINT),
+            "https://notify.example.test/hook"
+        );
+        assert_eq!(
+            persisted
+                .get_value(IDENTITY_OPENID_SUB_SYS, "concurrent-oidc")
+                .expect("OIDC update should survive")
+                .get(OIDC_CLIENT_ID),
+            "console"
+        );
+        assert_eq!(
+            *transaction_order.lock().expect("transaction order lock"),
+            vec!["notify-read", "notify-save", "oidc-read", "oidc-save"]
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn peer_dynamic_reload_rejects_later_pool_without_publishing() {
@@ -812,6 +1064,67 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_module_switch_reload_uses_its_explicit_context_store() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, None::<&str>),
+                (rustfs_config::ENV_AUDIT_ENABLE, None::<&str>),
+            ],
+            async {
+                let selected = runtime_config_reload_fixture().await;
+                let fallback = runtime_config_reload_fixture().await;
+                save_persisted_module_switches_to(
+                    selected.context.object_store(),
+                    PersistedModuleSwitches {
+                        notify_enabled: true,
+                        audit_enabled: true,
+                    },
+                    || (),
+                )
+                .await
+                .expect("persist selected module switches");
+
+                refresh_persisted_module_switches_from(fallback.context.object_store())
+                    .await
+                    .expect("refresh absent fallback module switches");
+                assert!(
+                    !current_module_switch_snapshot().notify_enabled,
+                    "fallback store should resolve the default"
+                );
+
+                reload_dynamic_config_runtime_state_for_context(Some(&selected.context), MODULE_SWITCHES_SIGNAL_SUBSYSTEM)
+                    .await
+                    .expect("peer module switch reload should converge");
+
+                let selected_snapshot = current_module_switch_snapshot();
+                assert!(selected_snapshot.notify_enabled);
+                assert!(selected_snapshot.persisted_audit_enabled);
+                assert_eq!(selected_snapshot.notify_source, ModuleSwitchSource::Console);
+                assert!(matches!(
+                    rustfs_notify::notification_system()
+                        .expect("notification singleton should exist")
+                        .runtime_lifecycle_state(),
+                    rustfs_notify::NotificationRuntimeState::TargetsEnabled { .. }
+                ));
+                assert!(is_event_notifier_reconciled());
+
+                reload_dynamic_config_runtime_state_for_context(Some(&fallback.context), MODULE_SWITCHES_SIGNAL_SUBSYSTEM)
+                    .await
+                    .expect("restore default module switch state");
+                assert!(!current_module_switch_snapshot().notify_enabled);
+                assert_eq!(
+                    rustfs_notify::notification_system()
+                        .expect("notification singleton should remain stable")
+                        .runtime_lifecycle_state(),
+                    rustfs_notify::NotificationRuntimeState::LiveOnly
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn peer_full_reload_rejects_later_pool_without_publishing() {
         temp_env::async_with_vars(
@@ -835,12 +1148,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_reload_publishes_snapshots_before_best_effort_worker_failure() {
+    async fn full_reload_publishes_snapshots_before_reporting_worker_failure() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let publish_events = events.clone();
         let worker_events = events.clone();
 
-        reload_runtime_config_snapshot_with(
+        let err = reload_runtime_config_snapshot_with(
             async { Ok(ServerConfig::new()) },
             |config| async { Ok((config, PreparedRuntimeConfig::default())) },
             move |_config, _prepared| {
@@ -855,8 +1168,9 @@ mod tests {
             },
         )
         .await
-        .expect("worker failure must not roll back validated storage/server snapshots");
+        .expect_err("worker failure must be reported after publishing validated snapshots");
 
+        assert_eq!(err.message(), Some("injected worker reload failure"));
         assert_eq!(
             *events.lock().expect("reload result lock"),
             ["publish", "worker-1-applied", "worker-2-failed"]
@@ -871,7 +1185,9 @@ mod tests {
         assert!(is_dynamic_config_subsystem(HEAL_SUB_SYS));
         assert!(is_dynamic_config_subsystem(STORAGE_CLASS_SUB_SYS));
         assert!(!is_dynamic_config_subsystem("identity_openid"));
-        assert!(!is_dynamic_config_subsystem("notify_webhook"));
+        for sub_system in NOTIFY_SUB_SYSTEMS {
+            assert!(is_dynamic_config_subsystem(sub_system));
+        }
     }
 
     #[test]
@@ -885,6 +1201,7 @@ mod tests {
             STORAGE_CLASS_SUB_SYS,
             AUDIT_WEBHOOK_SUB_SYS,
             AUDIT_MQTT_SUB_SYS,
+            NOTIFY_WEBHOOK_SUB_SYS,
             SCANNER_SUB_SYS,
             HEAL_SUB_SYS,
         ] {
@@ -1014,17 +1331,52 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(notify_config_env)]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
         crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
-        let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
+        let kvs = targets.entry("primary".to_string()).or_default();
         kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
         kvs.insert(WEBHOOK_ENDPOINT.to_string(), "not-a-url".to_string());
         kvs.insert(WEBHOOK_QUEUE_DIR.to_string(), "/tmp/rustfs-notify".to_string());
 
-        let err = validate_notify_subsystem_config(&config, NOTIFY_WEBHOOK_SUB_SYS).expect_err("invalid endpoint should fail");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        temp_env::with_vars_unset(
+            [
+                format!("{ENV_NOTIFY_WEBHOOK_ENABLE}_PRIMARY"),
+                format!("{ENV_NOTIFY_WEBHOOK_ENDPOINT}_PRIMARY"),
+            ],
+            || {
+                let err =
+                    validate_notify_subsystem_config(&config, NOTIFY_WEBHOOK_SUB_SYS).expect_err("invalid endpoint should fail");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(notify_config_env)]
+    fn validate_notify_subsystem_config_uses_enabled_env_overlay() {
+        crate::admin::storage_api::config::init_admin_config_defaults();
+        let mut config = ServerConfig::new();
+        let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
+        let kvs = targets.entry("primary".to_string()).or_default();
+        kvs.insert(ENABLE_KEY.to_string(), EnableState::Off.to_string());
+        kvs.insert(WEBHOOK_ENDPOINT.to_string(), "https://example.com/hook".to_string());
+        kvs.insert(WEBHOOK_QUEUE_DIR.to_string(), "/tmp/rustfs-notify".to_string());
+
+        temp_env::with_vars(
+            [
+                (format!("{ENV_NOTIFY_WEBHOOK_ENABLE}_PRIMARY"), Some("on")),
+                (format!("{ENV_NOTIFY_WEBHOOK_ENDPOINT}_PRIMARY"), Some("not-a-url")),
+            ],
+            || {
+                let err = validate_notify_subsystem_config(&config, NOTIFY_WEBHOOK_SUB_SYS)
+                    .expect_err("invalid environment endpoint should fail");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                assert!(err.message().is_some_and(|message| message.contains("target 'primary'")));
+            },
+        );
     }
 
     #[test]

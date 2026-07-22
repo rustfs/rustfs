@@ -14,7 +14,7 @@
 
 use crate::storage_api::startup::lifecycle::ECStore;
 use crate::{
-    server::{ServiceStateManager, ShutdownHandle, wait_for_shutdown},
+    server::{ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
     startup_services::StartupServiceRuntime,
@@ -142,6 +142,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     );
     publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
     startup_runtime_sources::publish_init_time_now().await;
+    let event_notifier_reconciler = start_persisted_event_notifier_reconciler(store.clone(), shutdown_token.clone());
 
     if enable_scanner {
         init_data_scanner(shutdown_token.clone(), store).await;
@@ -157,6 +158,17 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         shutdown_token,
     )
     .await;
+    if let Err(err) = event_notifier_reconciler.await {
+        tracing::warn!(
+            target: "rustfs::main::run",
+            event = "notify_runtime_reconcile",
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "join_failed",
+            reason = if err.is_cancelled() { "task_cancelled" } else { "task_panicked" },
+            "Persisted notification runtime reconciler task failed to join"
+        );
+    }
 
     info!(
         target: "rustfs::main::run",

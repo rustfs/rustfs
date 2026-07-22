@@ -25,7 +25,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
-        open_target_queue_store_typed, persist_queued_payload_to_store, redacted_secret,
+        open_target_queue_store_typed, persist_queued_payload_to_store, redacted_secret, with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
@@ -51,6 +51,8 @@ use publish_error::{classify_nats_flush_error, classify_nats_publish_error};
 
 pub(crate) use jetstream::resolve_dedup_id;
 pub(crate) use validation::{validate_jetstream_settings, validate_jetstream_stream};
+
+const NATS_CORE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct NATSArgs {
@@ -397,22 +399,25 @@ where
     }
 
     async fn send_body(&self, body: Vec<u8>) -> Result<(), TargetError> {
-        let client = self.get_or_connect().await?;
-        if let Err(e) = client.publish(self.args.subject.clone(), body.into()).await {
-            let err = classify_nats_publish_error(&e);
+        let result = with_delivery_deadline(NATS_CORE_DELIVERY_TIMEOUT, "NATS delivery", async {
+            let client = self.get_or_connect().await?;
+            client
+                .publish(self.args.subject.clone(), body.into())
+                .await
+                .map_err(|err| classify_nats_publish_error(&err))?;
+
+            // publish only enqueues the message on the client's outbound channel. Flush to confirm the
+            // message reached the server before delivery is treated as successful (backlog#971).
+            client.flush().await.map_err(|err| classify_nats_flush_error(&err))?;
+            Ok(())
+        })
+        .await;
+
+        if let Err(err) = result {
             if is_connectivity_error(&err) {
                 self.invalidate_cached_client_connection().await;
                 self.connected.store(false, Ordering::SeqCst);
             }
-            return Err(err);
-        }
-
-        // publish only enqueues the message on the client's outbound channel. Flush to confirm the
-        // message reached the server before delivery is treated as successful (backlog#971).
-        if let Err(e) = client.flush().await {
-            let err = classify_nats_flush_error(&e);
-            self.invalidate_cached_client_connection().await;
-            self.connected.store(false, Ordering::SeqCst);
             return Err(err);
         }
 

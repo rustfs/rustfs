@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::supervise_admin_mutation;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     current_app_context, current_object_store_handle_for_context, current_server_config_for_context, publish_server_config,
@@ -20,12 +21,14 @@ use crate::admin::runtime_sources::{
 use crate::admin::service::config::{
     CONFIG_WORKER_RELOAD_FAILURE_STATE, EVENT_CONFIG_WORKER_RELOAD_FAILED, FULL_CONFIG_WORKER_SUBSYSTEMS, LOG_COMPONENT_ADMIN,
     LOG_SUBSYSTEM_CONFIG, PreparedRuntimeConfig, apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem,
-    prepare_server_config, signal_config_snapshot_reload, signal_dynamic_config_reload,
+    preflight_dynamic_config_reload, prepare_server_config, signal_config_snapshot_reload_checked,
+    signal_dynamic_config_reload_checked,
 };
 use crate::admin::storage_api::config::storageclass::{INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV};
 use crate::admin::storage_api::config::{
     RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config, read_admin_config, read_admin_config_without_migrate,
-    save_admin_config, save_admin_server_config,
+    read_admin_config_without_migrate_no_lock, save_admin_config, save_admin_server_config_no_lock,
+    with_admin_server_config_write_lock,
 };
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
@@ -47,7 +50,7 @@ use rustfs_config::notify::{
     ENV_NOTIFY_MQTT_QOS, ENV_NOTIFY_MQTT_QUEUE_DIR, ENV_NOTIFY_MQTT_QUEUE_LIMIT, ENV_NOTIFY_MQTT_RECONNECT_INTERVAL,
     ENV_NOTIFY_MQTT_TOPIC, ENV_NOTIFY_MQTT_USERNAME, ENV_NOTIFY_WEBHOOK_AUTH_TOKEN, ENV_NOTIFY_WEBHOOK_CLIENT_CERT,
     ENV_NOTIFY_WEBHOOK_CLIENT_KEY, ENV_NOTIFY_WEBHOOK_ENABLE, ENV_NOTIFY_WEBHOOK_ENDPOINT, ENV_NOTIFY_WEBHOOK_QUEUE_DIR,
-    ENV_NOTIFY_WEBHOOK_QUEUE_LIMIT, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    ENV_NOTIFY_WEBHOOK_QUEUE_LIMIT, NOTIFY_MQTT_SUB_SYS, NOTIFY_SUB_SYSTEMS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::oidc::{
     ENV_IDENTITY_OPENID_CLAIM_NAME, ENV_IDENTITY_OPENID_CLAIM_PREFIX, ENV_IDENTITY_OPENID_CLIENT_ID,
@@ -726,6 +729,14 @@ async fn load_server_config_from_store() -> S3Result<ServerConfig> {
         .map_err(Into::into)
 }
 
+async fn load_server_config_from_store_locked() -> S3Result<ServerConfig> {
+    let store = object_store()?;
+    read_admin_config_without_migrate_no_lock(store)
+        .await
+        .map_err(ApiError::from)
+        .map_err(Into::into)
+}
+
 async fn load_active_server_config() -> S3Result<ServerConfig> {
     if let Ok(config) = load_server_config_from_store().await {
         return Ok(config);
@@ -736,9 +747,9 @@ async fn load_active_server_config() -> S3Result<ServerConfig> {
         .ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))
 }
 
-async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
+async fn save_server_config_to_store_locked(config: &ServerConfig) -> S3Result<()> {
     let store = object_store()?;
-    save_admin_server_config(store, config)
+    save_admin_server_config_no_lock(store, config)
         .await
         .map_err(ApiError::from)
         .map_err(Into::into)
@@ -1563,20 +1574,144 @@ async fn commit_prepared_config(
 /// Re-apply local mutable worker families after a full-config replacement.
 /// Peers receive one full-snapshot signal after this returns; signaling each
 /// family here as well would recreate audit/scanner targets twice per peer.
-async fn apply_dynamic_subsystems(config: &ServerConfig) {
+fn publish_notify_config_intent(
+    config: &ServerConfig,
+    sub_system: Option<&str>,
+) -> Option<rustfs_notify::NotificationLifecycleTransition> {
+    (sub_system.is_none() || sub_system.is_some_and(|sub_system| NOTIFY_SUB_SYSTEMS.contains(&sub_system)))
+        .then(|| rustfs_notify::ensure_live_events().publish_config(config.clone()))
+}
+
+async fn preflight_notify_config_intent(sub_system: Option<&str>) -> S3Result<()> {
+    if sub_system.is_none() || sub_system.is_some_and(|sub_system| NOTIFY_SUB_SYSTEMS.contains(&sub_system)) {
+        preflight_dynamic_config_reload(sub_system.unwrap_or(NOTIFY_WEBHOOK_SUB_SYS)).await?;
+    }
+    Ok(())
+}
+
+async fn wait_notify_config_intent(transition: Option<rustfs_notify::NotificationLifecycleTransition>) -> S3Result<bool> {
+    let Some(transition) = transition else {
+        return Ok(false);
+    };
+    transition.wait().await.map_err(|err| {
+        warn!(error = %err, "Failed to apply local notification config");
+        s3_error!(InternalError, "failed to apply notification config")
+    })?;
+    Ok(true)
+}
+
+async fn apply_non_notify_dynamic_subsystems(config: &ServerConfig) -> Vec<String> {
+    let mut failures = Vec::new();
     for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
-        if let Err(err) = apply_dynamic_config_for_subsystem(config, sub_system).await {
+        if NOTIFY_SUB_SYSTEMS.contains(&sub_system) {
+            continue;
+        }
+        if apply_dynamic_config_for_subsystem(config, sub_system).await.is_err() {
+            failures.push(format!("local {sub_system}"));
             warn!(
                 event = EVENT_CONFIG_WORKER_RELOAD_FAILED,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_CONFIG,
                 config_subsystem = sub_system,
                 state = CONFIG_WORKER_RELOAD_FAILURE_STATE,
-                error = %err,
+                reason = "apply_failed",
                 "Published server config but failed to reload a local worker subsystem"
             );
         }
     }
+    failures
+}
+
+fn finish_config_reconciliation(errors: Vec<String>) -> S3Result<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(s3_error!(
+            InternalError,
+            "server config persisted but runtime convergence failed: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+async fn reconcile_targeted_config(
+    config: ServerConfig,
+    sub_system: Option<String>,
+    storage_class_applied: bool,
+    notify_transition: Option<rustfs_notify::NotificationLifecycleTransition>,
+) -> S3Result<bool> {
+    let mut errors = Vec::new();
+    let notify_applied = notify_transition.is_some();
+    if let Err(err) = wait_notify_config_intent(notify_transition).await {
+        warn!(error = %err, "Local notification config failed to converge");
+        errors.push("local notify".to_string());
+    }
+
+    let config_applied = if notify_applied {
+        if let Some(sub_system) = sub_system.as_deref()
+            && let Err(err) = signal_dynamic_config_reload_checked(sub_system).await
+        {
+            warn!(config_subsystem = sub_system, error = %err, "Peer config reload failed");
+            errors.push(format!("peer {sub_system}"));
+        }
+        true
+    } else if storage_class_applied {
+        if let Err(err) = signal_dynamic_config_reload_checked(STORAGE_CLASS_SUB_SYS).await {
+            warn!(error = %err, "Peer storage-class reload failed");
+            errors.push(format!("peer {STORAGE_CLASS_SUB_SYS}"));
+        }
+        true
+    } else if let Some(sub_system) = sub_system.as_deref()
+        && is_dynamic_config_subsystem(sub_system)
+    {
+        let config_applied = match apply_dynamic_config_for_subsystem(&config, sub_system).await {
+            Ok(applied) => applied,
+            Err(_) => {
+                warn!(config_subsystem = sub_system, reason = "apply_failed", "Local config reload failed");
+                errors.push(format!("local {sub_system}"));
+                false
+            }
+        };
+        if let Err(err) = signal_dynamic_config_reload_checked(sub_system).await {
+            warn!(config_subsystem = sub_system, error = %err, "Peer config reload failed");
+            errors.push(format!("peer {sub_system}"));
+        }
+        config_applied
+    } else {
+        if let Err(err) = signal_config_snapshot_reload_checked().await {
+            warn!(error = %err, "Peer config snapshot reload failed");
+            errors.push("peer config snapshot".to_string());
+        }
+        false
+    };
+
+    finish_config_reconciliation(errors)?;
+    Ok(config_applied)
+}
+
+async fn reconcile_full_config(
+    config: ServerConfig,
+    notify_transition: Option<rustfs_notify::NotificationLifecycleTransition>,
+) -> S3Result<()> {
+    let mut errors = Vec::new();
+    if let Err(err) = wait_notify_config_intent(notify_transition).await {
+        warn!(error = %err, "Local notification config failed to converge");
+        errors.push("local notify".to_string());
+    }
+    if let Err(err) = signal_dynamic_config_reload_checked(STORAGE_CLASS_SUB_SYS).await {
+        warn!(error = %err, "Peer storage-class reload failed");
+        errors.push(format!("peer {STORAGE_CLASS_SUB_SYS}"));
+    }
+    errors.extend(apply_non_notify_dynamic_subsystems(&config).await);
+    if let Err(err) = signal_dynamic_config_reload_checked(NOTIFY_WEBHOOK_SUB_SYS).await {
+        warn!(error = %err, "Peer notification config reload failed");
+        errors.push("peer notify".to_string());
+    }
+    if let Err(err) = signal_config_snapshot_reload_checked().await {
+        warn!(error = %err, "Peer config snapshot reload failed");
+        errors.push("peer config snapshot".to_string());
+    }
+    finish_config_reconciliation(errors)
 }
 
 pub struct GetConfigKVHandler {}
@@ -1611,37 +1746,39 @@ impl Operation for SetConfigKVHandler {
         }
         validate_config_directives(&directives)?;
 
-        let sub_system = config_update_sub_system(&directives)?;
-        let mut config = load_server_config_from_store().await?;
-        apply_set_directives(&mut config, &directives)?;
-        let prepared = prepare_server_config(&config, sub_system).await?;
-        save_server_config_history(&body).await?;
-        let config_applied = if sub_system == Some(STORAGE_CLASS_SUB_SYS) {
-            commit_prepared_config(
-                config.clone(),
-                prepared,
-                save_server_config_to_store(&config),
-                publish_prepared_config_snapshots,
-            )
-            .await?;
-            signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
-            true
-        } else {
-            save_server_config_to_store(&config).await?;
-            publish_server_config(config.clone());
-            if let Some(sub_system) = sub_system
-                && is_dynamic_config_subsystem(sub_system)
-            {
-                let config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
-                if config_applied {
-                    signal_dynamic_config_reload(sub_system).await;
-                }
-                config_applied
-            } else {
-                signal_config_snapshot_reload().await;
-                false
-            }
-        };
+        let sub_system = config_update_sub_system(&directives)?.map(str::to_owned);
+        let transaction_sub_system = sub_system.clone();
+        let config_store = object_store()?;
+        let config_applied = supervise_admin_mutation("config mutation", async move {
+            preflight_notify_config_intent(sub_system.as_deref()).await?;
+            let (config, storage_class_applied, notify_transition) =
+                with_admin_server_config_write_lock(config_store, move || async move {
+                    let sub_system = transaction_sub_system.as_deref();
+                    let mut config = load_server_config_from_store_locked().await?;
+                    apply_set_directives(&mut config, &directives)?;
+                    let prepared = prepare_server_config(&config, sub_system).await?;
+                    save_server_config_history(&body).await?;
+                    if sub_system == Some(STORAGE_CLASS_SUB_SYS) {
+                        commit_prepared_config(
+                            config.clone(),
+                            prepared,
+                            save_server_config_to_store_locked(&config),
+                            publish_prepared_config_snapshots,
+                        )
+                        .await?;
+                    } else {
+                        save_server_config_to_store_locked(&config).await?;
+                        publish_server_config(config.clone());
+                    }
+                    let notify_transition = publish_notify_config_intent(&config, sub_system);
+                    Ok::<_, S3Error>((config, sub_system == Some(STORAGE_CLASS_SUB_SYS), notify_transition))
+                })
+                .await
+                .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
+
+            reconcile_targeted_config(config, sub_system, storage_class_applied, notify_transition).await
+        })
+        .await?;
 
         success_response(config_applied)
     }
@@ -1660,37 +1797,39 @@ impl Operation for DelConfigKVHandler {
         }
         validate_config_directives(&directives)?;
 
-        let sub_system = config_update_sub_system(&directives)?;
-        let mut config = load_server_config_from_store().await?;
-        apply_delete_directives(&mut config, &directives);
-        let prepared = prepare_server_config(&config, sub_system).await?;
-        save_server_config_history(&body).await?;
-        let config_applied = if sub_system == Some(STORAGE_CLASS_SUB_SYS) {
-            commit_prepared_config(
-                config.clone(),
-                prepared,
-                save_server_config_to_store(&config),
-                publish_prepared_config_snapshots,
-            )
-            .await?;
-            signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
-            true
-        } else {
-            save_server_config_to_store(&config).await?;
-            publish_server_config(config.clone());
-            if let Some(sub_system) = sub_system
-                && is_dynamic_config_subsystem(sub_system)
-            {
-                let config_applied = apply_dynamic_config_for_subsystem(&config, sub_system).await?;
-                if config_applied {
-                    signal_dynamic_config_reload(sub_system).await;
-                }
-                config_applied
-            } else {
-                signal_config_snapshot_reload().await;
-                false
-            }
-        };
+        let sub_system = config_update_sub_system(&directives)?.map(str::to_owned);
+        let transaction_sub_system = sub_system.clone();
+        let config_store = object_store()?;
+        let config_applied = supervise_admin_mutation("config mutation", async move {
+            preflight_notify_config_intent(sub_system.as_deref()).await?;
+            let (config, storage_class_applied, notify_transition) =
+                with_admin_server_config_write_lock(config_store, move || async move {
+                    let sub_system = transaction_sub_system.as_deref();
+                    let mut config = load_server_config_from_store_locked().await?;
+                    apply_delete_directives(&mut config, &directives);
+                    let prepared = prepare_server_config(&config, sub_system).await?;
+                    save_server_config_history(&body).await?;
+                    if sub_system == Some(STORAGE_CLASS_SUB_SYS) {
+                        commit_prepared_config(
+                            config.clone(),
+                            prepared,
+                            save_server_config_to_store_locked(&config),
+                            publish_prepared_config_snapshots,
+                        )
+                        .await?;
+                    } else {
+                        save_server_config_to_store_locked(&config).await?;
+                        publish_server_config(config.clone());
+                    }
+                    let notify_transition = publish_notify_config_intent(&config, sub_system);
+                    Ok::<_, S3Error>((config, sub_system == Some(STORAGE_CLASS_SUB_SYS), notify_transition))
+                })
+                .await
+                .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
+
+            reconcile_targeted_config(config, sub_system, storage_class_applied, notify_transition).await
+        })
+        .await?;
 
         success_response(config_applied)
     }
@@ -1776,16 +1915,26 @@ impl Operation for RestoreConfigHistoryKVHandler {
         let mut config = ServerConfig::new();
         apply_set_directives(&mut config, &directives)?;
         let prepared = prepare_server_config(&config, None).await?;
-        commit_prepared_config(
-            config.clone(),
-            prepared,
-            save_server_config_to_store(&config),
-            publish_prepared_config_snapshots,
-        )
+        let config_store = object_store()?;
+        supervise_admin_mutation("config mutation", async move {
+            preflight_notify_config_intent(None).await?;
+            let persisted_config = config.clone();
+            let notify_transition = with_admin_server_config_write_lock(config_store, move || async move {
+                commit_prepared_config(
+                    persisted_config.clone(),
+                    prepared,
+                    save_server_config_to_store_locked(&persisted_config),
+                    publish_prepared_config_snapshots,
+                )
+                .await?;
+                Ok::<_, S3Error>(publish_notify_config_intent(&persisted_config, None))
+            })
+            .await
+            .map_err(|err| s3_error!(InternalError, "failed to lock server config restore: {}", err))??;
+
+            reconcile_full_config(config, notify_transition).await
+        })
         .await?;
-        signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
-        apply_dynamic_subsystems(&config).await;
-        signal_config_snapshot_reload().await;
 
         success_response(false)
     }
@@ -1820,17 +1969,27 @@ impl Operation for SetConfigHandler {
         let mut config = ServerConfig::new();
         apply_set_directives(&mut config, &directives)?;
         let prepared = prepare_server_config(&config, None).await?;
-        save_server_config_history(&body).await?;
-        commit_prepared_config(
-            config.clone(),
-            prepared,
-            save_server_config_to_store(&config),
-            publish_prepared_config_snapshots,
-        )
+        let config_store = object_store()?;
+        supervise_admin_mutation("config mutation", async move {
+            preflight_notify_config_intent(None).await?;
+            save_server_config_history(&body).await?;
+            let persisted_config = config.clone();
+            let notify_transition = with_admin_server_config_write_lock(config_store, move || async move {
+                commit_prepared_config(
+                    persisted_config.clone(),
+                    prepared,
+                    save_server_config_to_store_locked(&persisted_config),
+                    publish_prepared_config_snapshots,
+                )
+                .await?;
+                Ok::<_, S3Error>(publish_notify_config_intent(&persisted_config, None))
+            })
+            .await
+            .map_err(|err| s3_error!(InternalError, "failed to lock full server config update: {}", err))??;
+
+            reconcile_full_config(config, notify_transition).await
+        })
         .await?;
-        signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await;
-        apply_dynamic_subsystems(&config).await;
-        signal_config_snapshot_reload().await;
 
         success_response(false)
     }
@@ -1888,92 +2047,6 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(*events.lock().expect("result events lock"), ["persist"]);
-    }
-
-    #[test]
-    fn storage_config_write_handlers_persist_before_publishing() {
-        const SOURCE: &str = include_str!("config_admin.rs");
-
-        for (handler, next_handler, follow_up) in [
-            (
-                "SetConfigKVHandler",
-                "DelConfigKVHandler",
-                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
-            ),
-            (
-                "DelConfigKVHandler",
-                "HelpConfigKVHandler",
-                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
-            ),
-            (
-                "RestoreConfigHistoryKVHandler",
-                "GetConfigHandler",
-                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
-            ),
-            (
-                "SetConfigHandler",
-                "#[cfg(test)]",
-                "signal_dynamic_config_reload(STORAGE_CLASS_SUB_SYS).await",
-            ),
-        ] {
-            let start_marker = format!("impl Operation for {handler}");
-            let start = SOURCE
-                .find(&start_marker)
-                .unwrap_or_else(|| panic!("missing {handler} implementation"));
-            let tail = &SOURCE[start..];
-            let end = tail
-                .find(next_handler)
-                .unwrap_or_else(|| panic!("missing {next_handler} after {handler}"));
-            let implementation = &tail[..end];
-            let prepared_commit_path = if matches!(handler, "SetConfigKVHandler" | "DelConfigKVHandler") {
-                let branch_start = implementation
-                    .find("if sub_system == Some(STORAGE_CLASS_SUB_SYS)")
-                    .unwrap_or_else(|| panic!("missing storage-class branch in {handler}"));
-                let branch = &implementation[branch_start..];
-                let branch_end = branch
-                    .find("} else {")
-                    .unwrap_or_else(|| panic!("missing non-storage branch in {handler}"));
-                &branch[..branch_end]
-            } else {
-                implementation
-            };
-
-            assert_eq!(prepared_commit_path.matches("commit_prepared_config(").count(), 1, "{handler}");
-            let commit_start = prepared_commit_path.find("commit_prepared_config(").expect("commit call");
-            let commit_end = prepared_commit_path[commit_start..].find(';').expect("commit terminator") + commit_start;
-            let commit_statement = &prepared_commit_path[commit_start..=commit_end];
-            assert!(commit_statement.contains(".await?;"), "{handler} must propagate commit failure");
-
-            let follow_up_start = prepared_commit_path
-                .find(follow_up)
-                .unwrap_or_else(|| panic!("missing follow-up in {handler}"));
-            assert!(follow_up_start > commit_end, "{handler} must run follow-up only after commit");
-            assert!(
-                !prepared_commit_path.contains("publish_server_config("),
-                "{handler} must not publish directly"
-            );
-            assert!(
-                !prepared_commit_path.contains(".publish_storage_class("),
-                "{handler} must not publish directly"
-            );
-
-            if matches!(handler, "RestoreConfigHistoryKVHandler" | "SetConfigHandler") {
-                let worker_start = prepared_commit_path
-                    .find("apply_dynamic_subsystems(&config).await")
-                    .unwrap_or_else(|| panic!("missing local worker apply in {handler}"));
-                let signal_start = prepared_commit_path
-                    .find("signal_config_snapshot_reload().await")
-                    .unwrap_or_else(|| panic!("missing snapshot signal in {handler}"));
-                assert!(
-                    worker_start > follow_up_start,
-                    "{handler} must converge peer parity before local worker apply"
-                );
-                assert!(
-                    signal_start > worker_start,
-                    "{handler} must signal the full snapshot after local worker apply"
-                );
-            }
-        }
     }
 
     #[test]

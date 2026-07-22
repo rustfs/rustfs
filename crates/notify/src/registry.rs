@@ -38,6 +38,11 @@ impl TargetRegistry {
         TargetRegistry { plugins }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_plugins(plugins: TargetPluginRegistry<Event>) -> Self {
+        Self { plugins }
+    }
+
     pub fn supports_target_type(&self, target_type: &str) -> bool {
         self.plugins.supports_target_type(target_type)
     }
@@ -66,6 +71,15 @@ impl TargetRegistry {
         config: &Config,
     ) -> Result<Vec<Box<dyn Target<Event> + Send + Sync>>, TargetError> {
         self.plugins.create_targets_from_config(config, NOTIFY_ROUTE_PREFIX).await
+    }
+
+    pub(crate) async fn create_dormant_targets_from_config(
+        &self,
+        config: &Config,
+    ) -> Result<(Vec<Box<dyn Target<Event> + Send + Sync>>, Vec<String>), TargetError> {
+        self.plugins
+            .create_dormant_targets_from_config(config, NOTIFY_ROUTE_PREFIX)
+            .await
     }
 }
 

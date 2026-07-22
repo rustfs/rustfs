@@ -19,7 +19,10 @@ use crate::admin::runtime_sources::{
     current_server_config_for_context,
 };
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
-use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
+use crate::admin::storage_api::config::{
+    read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_server_config_no_lock,
+    with_admin_server_config_write_lock,
+};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
@@ -368,13 +371,20 @@ impl Operation for PutOidcConfigHandler {
         if is_env_managed_provider(provider_id) {
             return Err(s3_error!(AccessDenied, "provider is managed by environment variables"));
         }
+        let provider_id = provider_id.to_owned();
 
         let request: OidcConfigUpsertRequest = parse_json_body(&mut req).await?;
-        let mut config = load_server_config_from_store().await?;
-        let existing_secret = persisted_provider_secret(&config, provider_id);
-        let provider_config = build_provider_config_from_upsert(provider_id, request, existing_secret)?;
-        upsert_persisted_provider_config(&mut config, &provider_config);
-        save_server_config_to_store(&config).await?;
+        let store = oidc_config_store()?;
+        let lock_store = store.clone();
+        with_admin_server_config_write_lock(lock_store, move || async move {
+            let mut config = load_server_config_from_store_locked(store.clone()).await?;
+            let existing_secret = persisted_provider_secret(&config, &provider_id);
+            let provider_config = build_provider_config_from_upsert(&provider_id, request, existing_secret)?;
+            upsert_persisted_provider_config(&mut config, &provider_config);
+            save_server_config_to_store_locked(store, &config).await
+        })
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
 
         json_response(
             StatusCode::OK,
@@ -403,10 +413,17 @@ impl Operation for DeleteOidcConfigHandler {
         if is_env_managed_provider(provider_id) {
             return Err(s3_error!(AccessDenied, "provider is managed by environment variables"));
         }
+        let provider_id = provider_id.to_owned();
 
-        let mut config = load_server_config_from_store().await?;
-        delete_persisted_provider_config(&mut config, provider_id)?;
-        save_server_config_to_store(&config).await?;
+        let store = oidc_config_store()?;
+        let lock_store = store.clone();
+        with_admin_server_config_write_lock(lock_store, move || async move {
+            let mut config = load_server_config_from_store_locked(store.clone()).await?;
+            delete_persisted_provider_config(&mut config, &provider_id)?;
+            save_server_config_to_store_locked(store, &config).await
+        })
+        .await
+        .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
 
         json_response(
             StatusCode::OK,
@@ -881,23 +898,32 @@ fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> S3Result<S3Re
 }
 
 async fn load_server_config_from_store() -> S3Result<ServerConfig> {
-    let context = current_app_context();
-    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
-        return Err(s3_error!(InternalError, "storage layer not initialized"));
-    };
+    let store = oidc_config_store()?;
 
     read_admin_config_without_migrate(store)
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load server config: {e}")))
 }
 
-async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
+fn oidc_config_store() -> S3Result<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>> {
     let context = current_app_context();
-    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
-        return Err(s3_error!(InternalError, "storage layer not initialized"));
-    };
+    current_object_store_handle_for_context(context.as_deref())
+        .ok_or_else(|| s3_error!(InternalError, "storage layer not initialized"))
+}
 
-    save_admin_server_config(store, config)
+async fn load_server_config_from_store_locked(
+    store: std::sync::Arc<crate::admin::storage_api::runtime::ECStore>,
+) -> S3Result<ServerConfig> {
+    read_admin_config_without_migrate_no_lock(store)
+        .await
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load server config: {e}")))
+}
+
+async fn save_server_config_to_store_locked(
+    store: std::sync::Arc<crate::admin::storage_api::runtime::ECStore>,
+    config: &ServerConfig,
+) -> S3Result<()> {
+    save_admin_server_config_no_lock(store, config)
         .await
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to save server config: {e}")))
 }
