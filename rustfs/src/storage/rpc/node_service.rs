@@ -16,15 +16,15 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
+use crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM;
 use crate::storage::storage_api::ecstore_tier::tier_mutation_peer::{self, TierMutationPeerState as EcTierMutationPeerState};
-#[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_SYS;
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
-    reload_transition_tier_config,
+    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path,
+    find_local_disk_by_ref, reload_transition_tier_config,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
 use crate::storage::storage_api::{sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest};
@@ -32,6 +32,9 @@ use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
+use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+use rustfs_config::notify::NOTIFY_SUB_SYSTEMS;
+use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_filemeta::MetacacheReader;
 use rustfs_iam::store::UserType;
 use rustfs_lock::LockClient;
@@ -74,6 +77,14 @@ const TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE: i32 = 0;
 const TIER_MUTATION_PEER_STATE_PREPARED_WIRE: i32 = 1;
 const TIER_MUTATION_PEER_STATE_COMMITTED_WIRE: i32 = 2;
 const TIER_MUTATION_PEER_STATE_ABORTED_WIRE: i32 = 3;
+
+fn supports_dynamic_config_rpc(sub_system: &str) -> bool {
+    NOTIFY_SUB_SYSTEMS.contains(&sub_system)
+        || matches!(
+            sub_system,
+            STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS | SCANNER_SUB_SYS | HEAL_SUB_SYS
+        )
+}
 
 #[derive(Debug)]
 struct HealControlReplayEntry {
@@ -1517,6 +1528,18 @@ impl Node for NodeService {
         let raw_signal = vars.get(PEER_RESTSIGNAL).map(String::as_str);
         let signal = raw_signal.and_then(|value| value.parse::<u64>().ok());
         let sub_system = vars.get(PEER_RESTSUB_SYS).map(String::as_str).unwrap_or_default();
+        let dry_run = match vars.get(PEER_RESTDRY_RUN).map(String::as_str) {
+            None => false,
+            Some(value) => match value.parse::<bool>() {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(Response::new(SignalServiceResponse {
+                        success: false,
+                        error_info: Some(format!("invalid dry-run value: {value}")),
+                    }));
+                }
+            },
+        };
 
         match signal {
             Some(SERVICE_SIGNAL_REFRESH_CONFIG) => match reload_runtime_config_snapshot().await {
@@ -1524,21 +1547,36 @@ impl Node for NodeService {
                     success: true,
                     error_info: None,
                 })),
-                Err(err) => Ok(Response::new(SignalServiceResponse {
+                Err(_) => Ok(Response::new(SignalServiceResponse {
                     success: false,
-                    error_info: Some(err.to_string()),
+                    error_info: Some("runtime config snapshot reload failed".to_string()),
                 })),
             },
-            Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => match reload_dynamic_config_runtime_state(sub_system).await {
-                Ok(()) => Ok(Response::new(SignalServiceResponse {
-                    success: true,
-                    error_info: None,
-                })),
-                Err(err) => Ok(Response::new(SignalServiceResponse {
-                    success: false,
-                    error_info: Some(err.to_string()),
-                })),
-            },
+            Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => {
+                let supported = sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM || supports_dynamic_config_rpc(sub_system);
+                if !supported {
+                    return Ok(Response::new(SignalServiceResponse {
+                        success: false,
+                        error_info: Some(format!("unsupported dynamic config subsystem: {sub_system}")),
+                    }));
+                }
+                if dry_run {
+                    return Ok(Response::new(SignalServiceResponse {
+                        success: true,
+                        error_info: None,
+                    }));
+                }
+                match reload_dynamic_config_runtime_state(sub_system).await {
+                    Ok(()) => Ok(Response::new(SignalServiceResponse {
+                        success: true,
+                        error_info: None,
+                    })),
+                    Err(_) => Ok(Response::new(SignalServiceResponse {
+                        success: false,
+                        error_info: Some(format!("dynamic config reload failed for {sub_system}")),
+                    })),
+                }
+            }
             Some(other) => Ok(Response::new(SignalServiceResponse {
                 success: false,
                 error_info: Some(format!("unsupported service signal: {other}")),
@@ -1817,12 +1855,12 @@ impl Node for NodeService {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService, PEER_RESTSIGNAL,
-        PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
-        admit_heal_control_replay, background_rebalance_start_error_message, execute_heal_control_envelope_with_manager,
-        initialize_heal_topology_fingerprint, make_heal_control_server, make_heal_control_server_with_cache, make_server,
-        make_tier_mutation_control_server_for_context, remove_heal_control_replay, scanner_activity_response,
-        stop_rebalance_response,
+        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService,
+        PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+        STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
+        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, make_heal_control_server,
+        make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server_for_context,
+        remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
@@ -4185,6 +4223,44 @@ mod tests {
         assert!(error_info.contains("unsupported dynamic config subsystem: identity_openid"));
     }
 
+    #[test]
+    fn dynamic_config_rpc_allowlist_matches_supported_subsystems() {
+        for sub_system in rustfs_config::notify::NOTIFY_SUB_SYSTEMS {
+            assert!(super::supports_dynamic_config_rpc(sub_system));
+        }
+        for sub_system in [
+            STORAGE_CLASS_SUB_SYS,
+            rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS,
+            rustfs_config::audit::AUDIT_MQTT_SUB_SYS,
+            rustfs_config::SCANNER_SUB_SYS,
+            rustfs_config::HEAL_SUB_SYS,
+        ] {
+            assert!(super::supports_dynamic_config_rpc(sub_system));
+        }
+        assert!(!super::supports_dynamic_config_rpc("identity_openid"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_dry_run_accepts_notify_without_runtime_mutation() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
+        vars.insert(PEER_RESTSUB_SYS.to_string(), rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS.to_string());
+        vars.insert(PEER_RESTDRY_RUN.to_string(), true.to_string());
+
+        let response = service
+            .signal_service(Request::new(SignalServiceRequest {
+                vars: Some(Mss { value: vars }),
+            }))
+            .await
+            .expect("notify capability probe should return a response")
+            .into_inner();
+
+        assert!(response.success, "new nodes must advertise notify lifecycle reload support");
+        assert!(response.error_info.is_none());
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
@@ -4204,7 +4280,7 @@ mod tests {
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
-        assert!(error_info.contains("storage layer not initialized"));
+        assert_eq!(error_info, "runtime config snapshot reload failed");
     }
 
     #[tokio::test]
@@ -4227,7 +4303,7 @@ mod tests {
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
-        assert!(error_info.contains("storage layer not initialized"));
+        assert_eq!(error_info, format!("dynamic config reload failed for {STORAGE_CLASS_SUB_SYS}"));
     }
 
     fn assert_unimplemented_status<T>(response: Result<Response<T>, Status>, method: &str) {

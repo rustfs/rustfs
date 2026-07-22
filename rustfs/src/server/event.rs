@@ -12,20 +12,48 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store, runtime_sources};
-use crate::storage_api::server::event::{EventArgs as EcstoreEventArgs, StorageObjectInfo, register_event_dispatch_hook};
+use super::{
+    module_switch::{resolve_notify_module_state, validate_notify_module_env, with_refreshed_notify_module_state_from},
+    refresh_persisted_module_switches_from_store, runtime_sources,
+};
+use crate::storage_api::server::event::{
+    EventArgs as EcstoreEventArgs, StorageObjectInfo, read_existing_server_config_no_lock, register_event_dispatch_hook,
+    with_server_config_read_lock,
+};
 use chrono::{DateTime, Utc};
-use rustfs_notify::{EventArgs as NotifyEventArgs, NotifyObjectInfo};
+use rustfs_notify::{
+    EventArgs as NotifyEventArgs, NotificationError, NotificationRuntimeState, NotificationSystem, NotifyObjectInfo,
+};
 use rustfs_s3_types::EventName;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::spawn;
-use tracing::{error, info, instrument, warn};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, instrument, warn};
 
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
+static NOTIFY_RUNTIME_RECONCILED: AtomicBool = AtomicBool::new(false);
+static ECSTORE_EVENT_DISPATCH_HOOK: OnceLock<()> = OnceLock::new();
 
-fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
-    runtime_sources::current_server_config()
+const EVENT_NOTIFIER_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const EVENT_NOTIFIER_RECONCILE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+const EVENT_NOTIFY_RUNTIME_RECONCILE: &str = "notify_runtime_reconcile";
+
+pub(crate) fn is_event_notifier_reconciled() -> bool {
+    NOTIFY_RUNTIME_RECONCILED.load(Ordering::Acquire)
+}
+
+pub(crate) fn mark_event_notifier_reconciled() {
+    NOTIFY_RUNTIME_RECONCILED.store(true, Ordering::Release);
+}
+
+pub(crate) fn mark_event_notifier_unreconciled() {
+    NOTIFY_RUNTIME_RECONCILED.store(false, Ordering::Release);
 }
 
 pub fn refresh_notify_module_enabled() -> bool {
@@ -112,79 +140,201 @@ fn parse_host_and_port(host: String) -> (String, u16) {
 }
 
 fn install_ecstore_event_dispatch_hook() {
-    let installed = register_event_dispatch_hook(|args| {
-        let Some(notify_args) = convert_ecstore_event_args(args) else {
-            return;
-        };
-        spawn(async move {
-            runtime_sources::current_notify_interface().notify(notify_args).await;
+    ECSTORE_EVENT_DISPATCH_HOOK.get_or_init(|| {
+        let installed = register_event_dispatch_hook(|args| {
+            let Some(notify_args) = convert_ecstore_event_args(args) else {
+                return;
+            };
+            spawn(async move {
+                runtime_sources::current_notify_interface().notify(notify_args).await;
+            });
         });
+
+        if !installed {
+            warn!("ECStore event dispatch hook was already registered");
+        }
     });
+}
 
-    if !installed {
-        warn!("ECStore event dispatch hook was already registered");
+fn ensure_live_events_initialized() -> std::sync::Arc<NotificationSystem> {
+    let system = rustfs_notify::ensure_live_events();
+    install_ecstore_event_dispatch_hook();
+    system
+}
+
+fn ensure_event_notifier_converged(system: &NotificationSystem) -> Result<(), NotificationError> {
+    if system.runtime_lifecycle_is_converged() {
+        Ok(())
+    } else {
+        Err(NotificationError::Initialization(
+            "Latest notification lifecycle generation has not converged".to_string(),
+        ))
     }
 }
 
-fn ensure_live_events_initialized() -> bool {
-    if rustfs_notify::notification_system().is_some() {
-        return true;
-    }
+pub(crate) async fn reconcile_event_notifier_from_store(
+    store: std::sync::Arc<rustfs_notify::NotifyStore>,
+) -> Result<(), NotificationError> {
+    let result = async {
+        validate_notify_module_env().map_err(NotificationError::Initialization)?;
+        let system = ensure_live_events_initialized();
+        let transition_system = system.clone();
+        let transition_store = store.clone();
+        let transition = with_refreshed_notify_module_state_from(store, move |resolution| async move {
+            NOTIFY_MODULE_ENABLED.store(resolution.enabled, Ordering::Relaxed);
+            let read_store = transition_store.clone();
+            let config_system = transition_system.clone();
+            with_server_config_read_lock(transition_store, move || async move {
+                let config = read_existing_server_config_no_lock(read_store)
+                    .await
+                    .map_err(|err| NotificationError::ReadConfig(err.to_string()))?;
+                let mode_matches = match config_system.runtime_lifecycle_state() {
+                    NotificationRuntimeState::LiveOnly => !resolution.enabled,
+                    NotificationRuntimeState::TargetsEnabled { .. } => resolution.enabled,
+                    NotificationRuntimeState::Terminated => false,
+                };
+                if config_system.config_snapshot().await == config
+                    && mode_matches
+                    && config_system.runtime_lifecycle_is_converged()
+                {
+                    Ok::<_, NotificationError>(None)
+                } else {
+                    Ok(Some(config_system.publish_targets_enabled(resolution.enabled, Some(config))))
+                }
+            })
+            .await
+            .map_err(|err| NotificationError::StorageNotAvailable(err.to_string()))?
+        })
+        .await
+        .map_err(|err| NotificationError::Initialization(format!("failed to refresh notify module switch: {err}")))??;
 
-    match rustfs_notify::initialize_live_events() {
-        Ok(()) => {
-            install_ecstore_event_dispatch_hook();
-            true
+        if let Some(transition) = transition {
+            transition.wait().await?;
         }
-        Err(e) => {
-            error!("Failed to initialize live event stream support: {}", e);
-            false
+
+        ensure_event_notifier_converged(&system)
+    }
+    .await;
+
+    if result.is_ok() {
+        mark_event_notifier_reconciled();
+    } else {
+        mark_event_notifier_unreconciled();
+    }
+    result
+}
+
+pub(crate) fn start_persisted_event_notifier_reconciler(
+    store: std::sync::Arc<rustfs_notify::NotifyStore>,
+    cancellation: CancellationToken,
+) -> JoinHandle<()> {
+    spawn(run_persisted_event_notifier_reconciler(
+        cancellation,
+        EVENT_NOTIFIER_RECONCILE_INTERVAL,
+        move || {
+            let store = store.clone();
+            async move { reconcile_event_notifier_from_store(store).await }
+        },
+    ))
+}
+
+async fn run_persisted_event_notifier_reconciler<Reconcile, ReconcileFuture>(
+    cancellation: CancellationToken,
+    reconcile_interval: Duration,
+    mut reconcile: Reconcile,
+) where
+    Reconcile: FnMut() -> ReconcileFuture,
+    ReconcileFuture: Future<Output = Result<(), NotificationError>>,
+{
+    let first_tick = Instant::now() + reconcile_interval;
+    let mut ticker = tokio::time::interval_at(first_tick, reconcile_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut failure_reported = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            result = tokio::time::timeout(EVENT_NOTIFIER_RECONCILE_ATTEMPT_TIMEOUT, reconcile()) => result,
+        };
+
+        match result {
+            Ok(Ok(())) => {
+                if failure_reported {
+                    info!(
+                        event = EVENT_NOTIFY_RUNTIME_RECONCILE,
+                        component = "notify",
+                        subsystem = "lifecycle",
+                        state = "recovered",
+                        "Persisted notification runtime reconciliation recovered"
+                    );
+                }
+                failure_reported = false;
+            }
+            Ok(Err(_)) | Err(_) => {
+                if !failure_reported {
+                    warn!(
+                        event = EVENT_NOTIFY_RUNTIME_RECONCILE,
+                        component = "notify",
+                        subsystem = "lifecycle",
+                        state = "degraded",
+                        reason = "reconcile_failed_or_timed_out",
+                        "Persisted notification runtime reconciliation failed"
+                    );
+                }
+                failure_reported = true;
+            }
         }
     }
 }
 
-/// Shuts down the event notifier system gracefully
-pub async fn shutdown_event_notifier() {
+/// Irreversibly shuts down the event notifier target runtime for process exit.
+pub async fn shutdown_event_notifier() -> Result<(), NotificationError> {
     info!("Shutting down event notifier system...");
-
-    if !rustfs_notify::is_notification_system_initialized() {
+    let Some(system) = rustfs_notify::notification_system() else {
         info!("Event notifier system is not initialized, nothing to shut down.");
-        return;
-    }
-
-    let system = match rustfs_notify::notification_system() {
-        Some(sys) => sys,
-        None => {
-            info!("Event notifier system is not initialized.");
-            return;
-        }
+        return Ok(());
     };
 
-    // Call the shutdown function from the rustfs_notify module
-    system.shutdown().await;
+    system.shutdown_checked().await?;
     info!("Event notifier system shut down successfully.");
+    Ok(())
 }
 
 #[instrument]
-pub async fn init_event_notifier() {
-    if let Err(err) = refresh_persisted_module_switches_from_store().await {
-        warn!("Failed to refresh persisted notify module switch from store: {}", err);
-    }
+pub async fn init_event_notifier() -> Result<(), NotificationError> {
+    mark_event_notifier_unreconciled();
+    validate_notify_module_env().map_err(NotificationError::Initialization)?;
+    let system = ensure_live_events_initialized();
+    refresh_persisted_module_switches_from_store()
+        .await
+        .map_err(|err| NotificationError::Initialization(format!("failed to refresh notify module switch: {err}")))?;
 
     let enabled = refresh_notify_module_enabled();
+
     if !enabled {
         info!(
             target: "rustfs::main::init_event_notifier",
             "Notify module is disabled, initializing live event stream support only. Set {}=true to enable notification targets.",
             rustfs_config::ENV_NOTIFY_ENABLE
         );
-        if ensure_live_events_initialized() {
-            info!(
-                target: "rustfs::main::init_event_notifier",
-                "Live event stream support initialized successfully."
-            );
+        if system.runtime_lifecycle_state() != NotificationRuntimeState::LiveOnly {
+            system.set_targets_enabled(false, None).await?;
         }
-        return;
+        system.reload_persisted_config().await?;
+        info!(
+            target: "rustfs::main::init_event_notifier",
+            "Live event stream support initialized successfully."
+        );
+        ensure_event_notifier_converged(&system)?;
+        mark_event_notifier_reconciled();
+        return Ok(());
     }
 
     info!(
@@ -192,53 +342,44 @@ pub async fn init_event_notifier() {
         "Initializing event notifier..."
     );
 
-    // 1. Get the global configuration loaded by ecstore
-    let server_config = match server_config_from_context() {
-        Some(config) => config,
-        None => {
-            warn!("Event notifier initialization failed: Global server config not loaded.");
-            return;
-        }
-    };
-
     info!(
         target: "rustfs::main::init_event_notifier",
         "Event notifier configuration found, proceeding with initialization."
     );
 
-    if let Some(system) = rustfs_notify::notification_system() {
-        // Reuse the existing global system on re-enable so bucket rules, metrics,
-        // and stream lifecycle stay aligned with the current process singleton.
-        if let Err(e) = system.reload_config(server_config).await {
-            error!("Failed to reload event notifier system: {}", e);
-        } else {
-            info!(
-                target: "rustfs::main::init_event_notifier",
-                "Event notifier system reloaded successfully."
-            );
-        }
-    } else {
-        match rustfs_notify::initialize(server_config).await {
-            Ok(()) => {
-                install_ecstore_event_dispatch_hook();
-                info!(
-                    target: "rustfs::main::init_event_notifier",
-                    "Event notifier system initialized successfully."
-                );
-            }
-            Err(e) => error!("Failed to initialize event notifier system: {}", e),
-        }
+    system.reload_persisted_config().await?;
+    let runtime_state = system.runtime_lifecycle_state();
+    if !matches!(runtime_state, NotificationRuntimeState::TargetsEnabled { .. }) {
+        system.set_targets_enabled(true, None).await?;
     }
+    info!(
+        target: "rustfs::main::init_event_notifier",
+        "Event notifier system initialized successfully."
+    );
+    ensure_event_notifier_converged(&system)?;
+    mark_event_notifier_reconciled();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_ecstore_object_info, parse_host_and_port};
+    use super::{convert_ecstore_object_info, parse_host_and_port, run_persisted_event_notifier_reconciler};
     use crate::storage_api::server::event::StorageObjectInfo;
     use crate::storage_api::server::event::contract::lifecycle::TransitionedObject;
     use chrono::{DateTime, Utc};
-    use std::{collections::HashMap, sync::Arc};
+    use rustfs_notify::NotificationError;
+    use std::{
+        collections::HashMap,
+        future::pending,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration as StdDuration,
+    };
     use time::{Duration, OffsetDateTime};
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn parse_host_and_port_with_ipv4_and_port() {
@@ -302,5 +443,89 @@ mod tests {
         assert_eq!(converted.restore_expires, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
         assert_eq!(converted.storage_class.as_deref(), Some("GLACIER"));
         assert_eq!(converted.transitioned_tier.as_deref(), Some("DEEP_ARCHIVE"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_reconciler_converges_after_one_injected_tick() {
+        let persisted_generation = Arc::new(AtomicUsize::new(1));
+        let runtime_generation = Arc::new(AtomicUsize::new(1));
+        let runtime_converged = Arc::new(AtomicBool::new(true));
+        let reconcile_calls = Arc::new(AtomicUsize::new(0));
+        let reconciled = Arc::new(Notify::new());
+        let cancellation = CancellationToken::new();
+
+        let task = tokio::spawn(run_persisted_event_notifier_reconciler(
+            cancellation.clone(),
+            StdDuration::from_secs(5),
+            {
+                let persisted_generation = persisted_generation.clone();
+                let runtime_generation = runtime_generation.clone();
+                let runtime_converged = runtime_converged.clone();
+                let reconcile_calls = reconcile_calls.clone();
+                let reconciled = reconciled.clone();
+                move || {
+                    let persisted_generation = persisted_generation.clone();
+                    let runtime_generation = runtime_generation.clone();
+                    let runtime_converged = runtime_converged.clone();
+                    let reconcile_calls = reconcile_calls.clone();
+                    let reconciled = reconciled.clone();
+                    async move {
+                        runtime_generation.store(persisted_generation.load(Ordering::SeqCst), Ordering::SeqCst);
+                        runtime_converged.store(true, Ordering::SeqCst);
+                        reconcile_calls.fetch_add(1, Ordering::SeqCst);
+                        reconciled.notify_one();
+                        Ok(())
+                    }
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+
+        persisted_generation.store(2, Ordering::SeqCst);
+        runtime_converged.store(false, Ordering::SeqCst);
+        assert_eq!(
+            reconcile_calls.load(Ordering::SeqCst),
+            0,
+            "the first tick must wait for the configured interval"
+        );
+
+        tokio::time::advance(StdDuration::from_secs(5)).await;
+        reconciled.notified().await;
+
+        assert_eq!(reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime_generation.load(Ordering::SeqCst), 2);
+        assert!(runtime_converged.load(Ordering::SeqCst));
+
+        cancellation.cancel();
+        task.await.expect("persisted reconciler should stop after cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_reconciler_cancellation_interrupts_an_inflight_attempt() {
+        let entered = Arc::new(Notify::new());
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(run_persisted_event_notifier_reconciler(
+            cancellation.clone(),
+            StdDuration::from_secs(5),
+            {
+                let entered = entered.clone();
+                move || {
+                    let entered = entered.clone();
+                    async move {
+                        entered.notify_one();
+                        pending::<Result<(), NotificationError>>().await
+                    }
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(StdDuration::from_secs(5)).await;
+        entered.notified().await;
+
+        cancellation.cancel();
+        tokio::time::timeout(StdDuration::from_secs(1), task)
+            .await
+            .expect("cancellation should stop an in-flight reconciliation attempt")
+            .expect("persisted reconciler should not panic");
     }
 }

@@ -14,11 +14,15 @@
 
 use crate::admin::handlers::target_descriptor::AdminTargetSpec;
 use crate::admin::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
-use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
+use crate::admin::storage_api::config::{
+    read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_server_config_no_lock,
+    with_admin_server_config_write_lock,
+};
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::server_config::Config;
 use s3s::{S3Result, s3_error};
+use tracing::warn;
 
 pub(crate) async fn load_server_config_from_store_for_context(context: Option<&AppContext>) -> S3Result<Config> {
     let Some(store) = current_object_store_handle_for_context(context) else {
@@ -51,30 +55,31 @@ pub(crate) async fn apply_audit_runtime_config(specs: &[AdminTargetSpec], config
         match system.get_state().await {
             AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
                 if has_targets {
-                    system
-                        .reload_config(config)
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to reload audit config: {}", e))?;
+                    system.reload_config(config).await.map_err(|_| {
+                        warn!(reason = "reload_failed", "Failed to reload local audit runtime");
+                        s3_error!(InternalError, "failed to reload audit config")
+                    })?;
                 } else {
-                    system
-                        .close()
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to stop audit system: {}", e))?;
+                    system.close().await.map_err(|_| {
+                        warn!(reason = "stop_failed", "Failed to stop local audit runtime");
+                        s3_error!(InternalError, "failed to stop audit system")
+                    })?;
                 }
             }
             AuditSystemState::Stopped | AuditSystemState::Stopping => {
                 if has_targets {
-                    system
-                        .start(config)
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
+                    system.start(config).await.map_err(|_| {
+                        warn!(reason = "start_failed", "Failed to start local audit runtime");
+                        s3_error!(InternalError, "failed to start audit system")
+                    })?;
                 }
             }
         }
     } else if has_targets {
-        start_global_audit_system(config)
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
+        start_global_audit_system(config).await.map_err(|_| {
+            warn!(reason = "start_failed", "Failed to start global audit runtime");
+            s3_error!(InternalError, "failed to start audit system")
+        })?;
     }
 
     Ok(())
@@ -86,30 +91,40 @@ async fn update_audit_config_and_reload_for_context<F>(
     mut modifier: F,
 ) -> S3Result<()>
 where
-    F: FnMut(&mut Config) -> bool,
+    F: FnMut(&mut Config) -> bool + Send + 'static,
 {
     let Some(store) = current_object_store_handle_for_context(context) else {
         return Err(s3_error!(InternalError, "server storage not initialized"));
     };
 
-    let mut config = read_admin_config_without_migrate(store.clone())
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
+    let specs = specs.to_vec();
+    let lock_store = store.clone();
+    with_admin_server_config_write_lock(lock_store, move || async move {
+        let mut config = read_admin_config_without_migrate_no_lock(store.clone())
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
 
-    if !modifier(&mut config) {
-        return Ok(());
-    }
+        if !modifier(&mut config) {
+            return Ok(());
+        }
 
-    save_admin_server_config(store, &config)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
+        save_admin_server_config_no_lock(store, &config)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
 
-    apply_audit_runtime_config(specs, config).await
+        // Keep persistence and runtime publication in one detached, serialized
+        // mutation. Otherwise a cancelled caller or two concurrent updates can
+        // leave the persisted config and active audit generation disagreeing.
+        apply_audit_runtime_config(&specs, config).await
+    })
+    .await
+    .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
+    Ok(())
 }
 
 pub(crate) async fn update_audit_config_and_reload<F>(specs: &[AdminTargetSpec], modifier: F) -> S3Result<()>
 where
-    F: FnMut(&mut Config) -> bool,
+    F: FnMut(&mut Config) -> bool + Send + 'static,
 {
     let context = current_app_context();
     update_audit_config_and_reload_for_context(context.as_deref(), specs, modifier).await
@@ -121,26 +136,30 @@ pub(crate) async fn set_audit_target_config(
     target_name: &str,
     kvs: rustfs_config::server_config::KVS,
 ) -> S3Result<()> {
-    update_audit_config_and_reload(specs, |config| {
+    let subsystem = subsystem.to_lowercase();
+    let target_name = target_name.to_lowercase();
+    update_audit_config_and_reload(specs, move |config| {
         config
             .0
-            .entry(subsystem.to_lowercase())
+            .entry(subsystem.clone())
             .or_default()
-            .insert(target_name.to_lowercase(), kvs.clone());
+            .insert(target_name.clone(), kvs.clone());
         true
     })
     .await
 }
 
 pub(crate) async fn remove_audit_target_config(specs: &[AdminTargetSpec], subsystem: &str, target_name: &str) -> S3Result<()> {
-    update_audit_config_and_reload(specs, |config| {
+    let subsystem = subsystem.to_lowercase();
+    let target_name = target_name.to_lowercase();
+    update_audit_config_and_reload(specs, move |config| {
         let mut changed = false;
-        if let Some(targets) = config.0.get_mut(&subsystem.to_lowercase()) {
-            if targets.remove(&target_name.to_lowercase()).is_some() {
+        if let Some(targets) = config.0.get_mut(&subsystem) {
+            if targets.remove(&target_name).is_some() {
                 changed = true;
             }
             if targets.is_empty() {
-                config.0.remove(&subsystem.to_lowercase());
+                config.0.remove(&subsystem);
             }
         }
         changed

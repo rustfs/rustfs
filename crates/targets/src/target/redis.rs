@@ -26,6 +26,7 @@ use crate::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetType, build_queued_payload, invalidate_cache_on_connectivity_error, is_connectivity_error,
         mark_target_disconnected_on_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
+        with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
@@ -47,6 +48,19 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 use url::Url;
+
+const REDIS_CONNECTION_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+const REDIS_RESPONSE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+
+fn redis_total_delivery_timeout(args: &RedisArgs) -> Duration {
+    let attempts = u32::try_from(args.max_retry_attempts).unwrap_or(u32::MAX);
+    let per_attempt = args
+        .connection_timeout
+        .unwrap_or(REDIS_CONNECTION_TIMEOUT_DEFAULT)
+        .saturating_add(args.response_timeout.unwrap_or(REDIS_RESPONSE_TIMEOUT_DEFAULT))
+        .saturating_add(args.max_retry_delay.unwrap_or(Duration::from_secs(2)));
+    per_attempt.saturating_mul(attempts)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedisTlsPolicy {
@@ -212,6 +226,16 @@ impl RedisArgs {
             return Err(TargetError::Configuration(
                 "Redis max_retry_attempts must be greater than zero".to_string(),
             ));
+        }
+
+        if self.connection_timeout == Some(Duration::ZERO) {
+            return Err(TargetError::Configuration(
+                "Redis connection_timeout must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.response_timeout == Some(Duration::ZERO) {
+            return Err(TargetError::Configuration("Redis response_timeout must be greater than zero".to_string()));
         }
 
         if self.pipeline_buffer_size == Some(0) {
@@ -464,71 +488,97 @@ where
             "Sending Redis payload"
         );
 
-        let mut attempt = 0usize;
-        let mut last_error = None;
-        while attempt < self.args.max_retry_attempts {
-            attempt += 1;
+        let result = with_delivery_deadline(redis_total_delivery_timeout(&self.args), "Redis delivery", async {
+            let mut attempt = 0usize;
+            let mut last_error = None;
+            while attempt < self.args.max_retry_attempts {
+                attempt += 1;
 
-            let mut publisher = self.get_or_create_publisher().await?;
-            match publisher
-                .publish::<_, _, i64>(self.args.channel.as_str(), body.as_slice())
+                let connection_timeout = self.args.connection_timeout.unwrap_or(REDIS_CONNECTION_TIMEOUT_DEFAULT);
+                let mut publisher = match with_delivery_deadline(
+                    connection_timeout,
+                    "Redis connection",
+                    self.get_or_create_publisher(),
+                )
                 .await
-            {
-                Ok(receiver_count) => {
-                    // PUBLISH returns the number of subscribers that received the
-                    // message. Redis pub/sub is best-effort: with zero subscribers
-                    // the event is delivered to no one, yet the durable copy is
-                    // deleted. Warn so operators relying on reliable delivery are
-                    // not silently losing events (backlog#982).
-                    if receiver_count == 0 {
+                {
+                    Ok(publisher) => publisher,
+                    Err(err) => {
+                        invalidate_cache_on_connectivity_error(&err, || self.invalidate_cached_publisher()).await;
+                        return Err(err);
+                    }
+                };
+                let response_timeout = self.args.response_timeout.unwrap_or(REDIS_RESPONSE_TIMEOUT_DEFAULT);
+                match with_delivery_deadline(response_timeout, "Redis publish response", async {
+                    publisher
+                        .publish::<_, _, i64>(self.args.channel.as_str(), body.as_slice())
+                        .await
+                        .map_err(map_redis_error)
+                })
+                .await
+                {
+                    Ok(receiver_count) => {
+                        // PUBLISH returns the number of subscribers that received the
+                        // message. Redis pub/sub is best-effort: with zero subscribers
+                        // the event is delivered to no one, yet the durable copy is
+                        // deleted. Warn so operators relying on reliable delivery are
+                        // not silently losing events (backlog#982).
+                        if receiver_count == 0 {
+                            warn!(
+                                target_id = %self.id,
+                                channel = %self.args.channel,
+                                "Redis PUBLISH reached 0 subscribers; the event was not received by any consumer (pub/sub is best-effort)"
+                            );
+                        }
+                        debug!(
+                            target_id = %self.id,
+                            channel = %self.args.channel,
+                            attempt,
+                            receiver_count,
+                            "Event published to Redis channel"
+                        );
+                        self.delivery_counters.record_success();
+                        return Ok(());
+                    }
+                    Err(mapped) => {
+                        invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
+
                         warn!(
                             target_id = %self.id,
                             channel = %self.args.channel,
-                            "Redis PUBLISH reached 0 subscribers; the event was not received by any consumer (pub/sub is best-effort)"
+                            attempt,
+                            max_attempts = self.args.max_retry_attempts,
+                            error = %mapped,
+                            "Redis publish attempt failed"
                         );
-                    }
-                    debug!(
-                        target_id = %self.id,
-                        channel = %self.args.channel,
-                        attempt,
-                        receiver_count,
-                        "Event published to Redis channel"
-                    );
-                    self.delivery_counters.record_success();
-                    return Ok(());
-                }
-                Err(err) => {
-                    let mapped = map_redis_error(err);
-                    invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
 
-                    warn!(
-                        target_id = %self.id,
-                        channel = %self.args.channel,
-                        attempt,
-                        max_attempts = self.args.max_retry_attempts,
-                        error = %mapped,
-                        "Redis publish attempt failed"
-                    );
+                        if !is_connectivity_error(&mapped) || attempt >= self.args.max_retry_attempts {
+                            last_error = Some(mapped);
+                            break;
+                        }
 
-                    if !is_connectivity_error(&mapped) || attempt >= self.args.max_retry_attempts {
                         last_error = Some(mapped);
-                        break;
+                        tokio::time::sleep(compute_retry_delay(
+                            attempt,
+                            self.args.min_retry_delay.unwrap_or(Duration::from_millis(100)),
+                            self.args.max_retry_delay.unwrap_or(Duration::from_secs(2)),
+                        ))
+                        .await;
                     }
-
-                    last_error = Some(mapped);
-                    tokio::time::sleep(compute_retry_delay(
-                        attempt,
-                        self.args.min_retry_delay.unwrap_or(Duration::from_millis(100)),
-                        self.args.max_retry_delay.unwrap_or(Duration::from_secs(2)),
-                    ))
-                    .await;
                 }
             }
+
+            Err(last_error.unwrap_or(TargetError::Unknown(
+                "Redis publish failed without a captured error".to_string(),
+            )))
+        })
+        .await;
+
+        if let Err(err) = &result {
+            invalidate_cache_on_connectivity_error(err, || self.invalidate_cached_publisher()).await;
+            self.connected.store(false, Ordering::SeqCst);
         }
-
-        self.connected.store(false, Ordering::SeqCst);
-
-        Err(last_error.unwrap_or(TargetError::Unknown("Redis publish failed without a captured error".to_string())))
+        result
     }
 }
 
@@ -551,7 +601,7 @@ where
         // thus a fresh TCP+TLS handshake — on every health check (backlog#982).
         // ensure_publisher_ready already invalidates the cached manager on a
         // connectivity error so the next attempt rebuilds it.
-        match tokio::time::timeout(Duration::from_secs(5), self.ensure_publisher_ready()).await {
+        match tokio::time::timeout(REDIS_CONNECTION_TIMEOUT_DEFAULT, self.ensure_publisher_ready()).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
                 Ok(true)
@@ -918,6 +968,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_zero_connection_timeout() {
+        let args = RedisArgs {
+            connection_timeout: Some(Duration::ZERO),
+            ..base_args()
+        };
+
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_response_timeout() {
+        let args = RedisArgs {
+            response_timeout: Some(Duration::ZERO),
+            ..base_args()
+        };
+
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
     fn validate_accepts_custom_ca_tls_policy() {
         let args = RedisArgs {
             url: Url::parse("rediss://127.0.0.1:6379").unwrap(),
@@ -1235,6 +1305,23 @@ mod tests {
 
         assert!(target.connected.load(Ordering::SeqCst));
         assert_eq!(target.delivery_snapshot().total_messages, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_budget_respects_response_timeout_longer_than_sixty_seconds() {
+        let mut args = base_args();
+        args.max_retry_attempts = 1;
+        args.response_timeout = Some(Duration::from_secs(90));
+        let manager_config = build_redis_connection_manager_config(&args);
+
+        assert_eq!(manager_config.response_timeout(), Some(Duration::from_secs(90)));
+        assert_eq!(redis_total_delivery_timeout(&args), Duration::from_secs(97));
+        with_delivery_deadline(redis_total_delivery_timeout(&args), "Redis delivery", async {
+            tokio::time::sleep(Duration::from_secs(70)).await;
+            Ok::<_, TargetError>(())
+        })
+        .await
+        .expect("the configured delivery budget must not impose a fixed sixty-second cap");
     }
 
     #[tokio::test]

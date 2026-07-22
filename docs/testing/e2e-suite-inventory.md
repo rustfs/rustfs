@@ -19,19 +19,24 @@
 |---|---|---|
 | admin_auth_test | 3 | ✅ |
 | admin_iam_crud_test | 2 | ✅ |
+| admin_pools_test | 1 | ✅ |
 | admin_timeout_regression_test | 1 |  |
 | anonymous_access_test | 3 | ✅ |
+| api_rate_limit_test | 3 |  |
 | archive_download_integrity_test | 13 |  |
 | bucket_logging_test | 3 |  |
 | bucket_policy_check_test | 1 | ✅ |
 | checksum_upload_test | 7 |  |
 | cluster_concurrency_test | 2 |  |
-| common | 3 |  |
+| cluster_multidrive_pool_test | 2 |  |
+| common | 10 |  |
 | compression_test | 1 |  |
+| connection_cap_test | 2 |  |
 | console_smoke_test | 1 | ✅ |
 | content_encoding_test | 3 | ✅ |
+| copy_object_checksum_test | 3 |  |
 | copy_object_metadata_test | 1 | ✅ |
-| copy_object_version_restore_test | 1 |  |
+| copy_object_version_restore_test | 2 |  |
 | copy_source_invalid_date_test | 1 | ✅ |
 | create_bucket_region_test | 2 | ✅ |
 | degraded_read_eof_regression_test | 3 |  |
@@ -40,6 +45,7 @@
 | delete_objects_versioning_test | 2 | ✅ |
 | existing_object_tag_policy_test | 4 |  |
 | fake_s3_target | 4 | ✅ |
+| fault_proxy | 7 |  |
 | get_codec_streaming_compat_test | 1 |  |
 | head_object_consistency_test | 1 | ✅ |
 | head_object_range_test | 1 | ✅ |
@@ -56,13 +62,13 @@
 | multipart_auth_test | 109 |  |
 | namespace_lock_quorum_test | 2 |  |
 | negative_sigv4_test | 6 | ✅ |
-| notification_webhook_test | 1 | ✅ |
+| notification_webhook_test | 2 | ✅ |
 | object_lambda_test | 16 |  |
 | object_lock | 33 |  |
 | overwrite_cleanup_regression_test | 1 |  |
 | presigned_negative_test | 7 | ✅ |
 | protocols | 16 |  |
-| quota_test | 13 |  |
+| quota_test | 14 |  |
 | reliability_disk_fault_test | 3 |  |
 | reliant | 10 | 4 ✅ |
 | replication_extension_test | 47 | 20 ✅ +27 🌙 |
@@ -75,4 +81,6 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 439 tests across 57 modules · PR smoke subset: 112 tests / 27 modules** (25 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-16.
+`notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
+
+**Total listed: 467 tests across 63 modules · PR smoke subset: 114 tests / 28 modules** (26 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-21.

@@ -124,6 +124,24 @@ fn classify_listing_quorum_failure(errors: &[DiskError]) -> DiskError {
     DiskError::ErasureReadQuorum
 }
 
+/// Returns true when a metacache listing missed quorum purely because the
+/// volume or path is absent on a quorum of drives, i.e. every recorded failure
+/// is [`DiskError::VolumeNotFound`] or [`DiskError::FileNotFound`].
+///
+/// This is a benign, expected outcome: the caller is handed
+/// `VolumeNotFound`/`FileNotFound` and decides how to react. The most common
+/// trigger is a startup race where the system bucket has not yet been created
+/// on every drive when an early reader (e.g. the IAM config loader) lists it.
+/// It must be distinguished from a listing that failed for a real reason (I/O,
+/// timeout, corruption) so the former is not surfaced at `error`. See
+/// rustfs/rustfs#5076.
+fn is_benign_not_found_listing_failure(errors: &[DiskError]) -> bool {
+    !errors.is_empty()
+        && errors
+            .iter()
+            .all(|err| matches!(err, DiskError::VolumeNotFound | DiskError::FileNotFound))
+}
+
 struct PublishedBytesWriter<W> {
     inner: W,
     published: bool,
@@ -840,17 +858,38 @@ async fn list_path_raw_inner(
                     _ => {}
                 });
 
-                error!(
-                    event = EVENT_METACACHE_LISTING,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_METACACHE,
-                    bucket = %opts.bucket,
-                    path = %opts.path,
-                    state = "quorum_failed",
-                    error = %combined_err.join(", "),
-                    "Metacache listing quorum failed"
-                );
                 let failures = errs.iter().flatten().cloned().collect::<Vec<_>>();
+                // A listing that misses quorum purely because the volume/path is
+                // absent on a quorum of drives is benign and expected — the caller
+                // receives VolumeNotFound/FileNotFound and decides how to react.
+                // The common trigger is a startup race where the system bucket is
+                // not yet created on every drive when an early reader (e.g. the IAM
+                // config loader) lists it, so surfacing it at `error` is misleading
+                // noise (rustfs/rustfs#5076). Keep `error` for listings that failed
+                // for a real reason (I/O, timeout, corruption).
+                if is_benign_not_found_listing_failure(&failures) {
+                    debug!(
+                        event = EVENT_METACACHE_LISTING,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_METACACHE,
+                        bucket = %opts.bucket,
+                        path = %opts.path,
+                        state = "quorum_not_found",
+                        error = %combined_err.join(", "),
+                        "Metacache listing quorum not reached (volume/path absent)"
+                    );
+                } else {
+                    error!(
+                        event = EVENT_METACACHE_LISTING,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_METACACHE,
+                        bucket = %opts.bucket,
+                        path = %opts.path,
+                        state = "quorum_failed",
+                        error = %combined_err.join(", "),
+                        "Metacache listing quorum failed"
+                    );
+                }
                 return Err(classify_listing_quorum_failure(&failures));
             }
 
@@ -1036,6 +1075,21 @@ mod tests {
     use std::sync::Mutex;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn benign_not_found_listing_failure_detection() {
+        // Pure not-found quorum misses are benign (the volume/path simply does
+        // not exist on a quorum of drives) and must not be logged at ERROR.
+        assert!(is_benign_not_found_listing_failure(&[DiskError::VolumeNotFound]));
+        assert!(is_benign_not_found_listing_failure(
+            &[DiskError::VolumeNotFound, DiskError::FileNotFound,]
+        ));
+        // No recorded failure is not a not-found case.
+        assert!(!is_benign_not_found_listing_failure(&[]));
+        // Any real error must keep the failure at ERROR severity.
+        assert!(!is_benign_not_found_listing_failure(&[DiskError::VolumeNotFound, DiskError::Timeout,]));
+        assert!(!is_benign_not_found_listing_failure(&[DiskError::DiskNotFound]));
+    }
 
     #[tokio::test]
     async fn list_path_raw_empty_disks_returns_read_quorum() {
