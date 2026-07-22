@@ -45,6 +45,7 @@ use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
 };
+use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, insert_str};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::fmt::Debug;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -56,7 +57,9 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
-use crate::app::storage_api::object_usecase::bucket::replication::{must_replicate_object, schedule_object_replication};
+use crate::app::storage_api::object_usecase::bucket::replication::{
+    ReplicateDecision, must_replicate_object, schedule_object_replication,
+};
 use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
 #[derive(Debug, Clone)]
@@ -1283,32 +1286,49 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let eval_metadata = parse_object_lock_legal_hold(legal_hold)?;
-
-        let popts = ObjectOptions {
+        let mut popts = ObjectOptions {
             mod_time: opts.mod_time,
-            version_id: opts.version_id,
-            eval_metadata: Some(eval_metadata),
+            version_id: opts.version_id.clone(),
             ..Default::default()
         };
+
+        // PutObjectLegalHold only rewrites metadata, so replication is not scheduled by the
+        // object PUT path. Schedule it explicitly, otherwise the legal hold never reaches the
+        // replica and the peer copy remains deletable.
+        //
+        // Mirror the PUT path ordering (see object_usecase::put_object): compute the decision
+        // once BEFORE the commit and persist the pending marker with it, so a restart between
+        // the commit and the worker write-back leaves a Pending status on disk for the scanner
+        // to re-drive. Scheduling without that marker would lose the task silently.
+        let dsc = match store.get_object_info(&bucket, &key, &opts).await.ok() {
+            Some(info) => {
+                must_replicate_object(
+                    &bucket,
+                    &key,
+                    &info.user_defined,
+                    info.user_tags.as_ref().clone(),
+                    popts.delete_marker_replication_status(),
+                    popts.clone(),
+                )
+                .await
+            }
+            None => ReplicateDecision::new(),
+        };
+
+        let mut eval_metadata = parse_object_lock_legal_hold(legal_hold)?;
+        if dsc.replicate_any() {
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+        }
+        popts.eval_metadata = Some(eval_metadata);
 
         let info = store.put_object_metadata(&bucket, &key, &popts).await.map_err(|e| {
             error!("put_object_metadata failed, {}", e.to_string());
             s3_error!(InternalError, "{}", e.to_string())
         })?;
 
-        // PutObjectLegalHold only rewrites metadata, so replication is not scheduled by the
-        // object PUT path. Schedule it explicitly, otherwise the legal hold never reaches the
-        // replica and the peer copy remains deletable.
-        let dsc = must_replicate_object(
-            &bucket,
-            &key,
-            &info.user_defined,
-            info.user_tags.as_ref().clone(),
-            popts.delete_marker_replication_status(),
-            popts.clone(),
-        )
-        .await;
+        // This replicates the whole object, not just the changed metadata: metadata-only
+        // replication is not implemented yet, so the lock change triggers a full re-upload.
         if dsc.replicate_any() {
             schedule_object_replication(info.clone(), store.clone(), dsc).await;
         }
@@ -1455,7 +1475,9 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        if let Ok(existing_obj_info) = store.get_object_info(&bucket, &key, &check_opts).await
+        let existing_obj_info = store.get_object_info(&bucket, &key, &check_opts).await.ok();
+
+        if let Some(existing_obj_info) = existing_obj_info.as_ref()
             && let Some(block_reason) = check_retention_for_modification(
                 &existing_obj_info.user_defined,
                 new_mode.as_deref(),
@@ -1466,36 +1488,53 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
         }
 
-        let eval_metadata = parse_object_lock_retention(retention)?;
-
         let mut opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-        opts.eval_metadata = Some(eval_metadata);
         opts.object_lock_retention = Some(ObjectLockRetentionOptions {
             mode: new_mode,
             retain_until: new_retain_until,
             bypass_governance,
         });
 
+        // PutObjectRetention only rewrites metadata, so the object PUT path that normally
+        // computes a replication decision and schedules replication never runs for it. Without
+        // scheduling here the peer keeps the previous, unprotected lock state and a
+        // WORM-protected object stays deletable on the replica.
+        //
+        // Mirror the PUT path ordering (see object_usecase::put_object): compute the decision
+        // once BEFORE the commit and persist the pending marker with it, so a restart between
+        // the commit and the worker write-back leaves a Pending status on disk for the scanner
+        // to re-drive. Scheduling without that marker would lose the task silently.
+        let dsc = match existing_obj_info.as_ref() {
+            Some(info) => {
+                must_replicate_object(
+                    &bucket,
+                    &key,
+                    &info.user_defined,
+                    info.user_tags.as_ref().clone(),
+                    opts.delete_marker_replication_status(),
+                    opts.clone(),
+                )
+                .await
+            }
+            None => ReplicateDecision::new(),
+        };
+
+        let mut eval_metadata = parse_object_lock_retention(retention)?;
+        if dsc.replicate_any() {
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
+        }
+        opts.eval_metadata = Some(eval_metadata);
+
         let object_info = store.put_object_metadata(&bucket, &key, &opts).await.map_err(|e| {
             error!("put_object_metadata failed, {}", e.to_string());
             S3Error::from(ApiError::from(e))
         })?;
 
-        // PutObjectRetention only rewrites metadata, so the object PUT path that normally
-        // computes a replication decision and schedules replication never runs for it.
-        // Without scheduling here the peer keeps the previous, unprotected lock state and a
-        // WORM-protected object stays deletable on the replica.
-        let dsc = must_replicate_object(
-            &bucket,
-            &key,
-            &object_info.user_defined,
-            object_info.user_tags.as_ref().clone(),
-            opts.delete_marker_replication_status(),
-            opts.clone(),
-        )
-        .await;
+        // This replicates the whole object, not just the changed metadata: metadata-only
+        // replication is not implemented yet, so the lock change triggers a full re-upload.
         if dsc.replicate_any() {
             schedule_object_replication(object_info.clone(), store.clone(), dsc).await;
         }
