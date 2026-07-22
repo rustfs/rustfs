@@ -225,14 +225,21 @@ impl PeerRestClient {
         }
 
         let eps = eps.clone();
-        let hosts = eps.hosts_sorted();
+        let hosts = eps.peer_host_ports_sorted();
         let mut remote = Vec::with_capacity(hosts.len());
         let mut all = vec![None; hosts.len()];
-        for (i, hs_host) in hosts.iter().enumerate() {
-            if let Some(host) = hs_host
-                && let Some(grid_host) = eps.find_grid_hosts_from_peer(host)
+        for (i, peer_host_port) in hosts.iter().enumerate() {
+            if let Some(peer_host_port) = peer_host_port
+                && let Some(grid_host) = eps.find_grid_host_from_peer_host_port(peer_host_port)
             {
-                let client = PeerRestClient::new(host.clone(), grid_host);
+                let host = match XHost::try_from(peer_host_port.clone()) {
+                    Ok(host) => host,
+                    Err(err) => {
+                        warn!(peer = %peer_host_port, "Xhost parse failed while constructing peer client: {err:?}");
+                        continue;
+                    }
+                };
+                let client = PeerRestClient::new(host, grid_host);
 
                 all[i] = Some(client.clone());
                 remote.push(Some(client));
