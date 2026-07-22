@@ -1746,7 +1746,8 @@ where
             ObjectInfo = ObjectInfo,
             GetObjectReader = GetObjectReader,
             PutObjectReader = PutObjReader,
-        > + StorageAdminApi,
+        > + StorageAdminApi
+        + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
     read_config_without_migrate_inner(api, true).await
 }
@@ -1768,7 +1769,8 @@ where
             ObjectInfo = ObjectInfo,
             GetObjectReader = GetObjectReader,
             PutObjectReader = PutObjReader,
-        > + StorageAdminApi,
+        > + StorageAdminApi
+        + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
     let config_file = server_config_path();
 

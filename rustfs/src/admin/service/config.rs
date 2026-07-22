@@ -717,7 +717,7 @@ mod tests {
             .await
             .expect_err("scanner config must not report success when a peer did not reload it");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert_eq!(err.message(), Some("dynamic config reload for scanner failed on peers: unreachable-peer"));
+        assert_eq!(err.message(), Some("1 peer(s) failed dynamic config reload for scanner"));
     }
 
     fn without_storage_class_env<R>(f: impl FnOnce() -> R) -> R {
