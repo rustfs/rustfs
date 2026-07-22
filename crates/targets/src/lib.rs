@@ -67,10 +67,10 @@ pub use plugin::{
 };
 pub use runtime::{
     OpenedActivation, PreparedActivation, ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot,
-    RuntimeTargetHealthSnapshot, RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager,
-    activate_targets_with_replay,
+    RuntimeTargetHealthReason, RuntimeTargetHealthSnapshot, RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget,
+    TargetRuntimeManager, activate_targets_with_replay,
     adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
-    init_target_and_optionally_start_replay,
+    health_snapshots_for_targets, init_target_and_optionally_start_replay,
     ops_diagnostics::{
         OpsDiagnosticsAccessDecision, OpsDiagnosticsReadRequest, OpsDiagnosticsRegistration, OpsDiagnosticsRegistry,
         OpsDiagnosticsRegistryError,
@@ -87,6 +87,7 @@ pub use rustfs_s3_types::EventName;
 use serde::{Deserialize, Serialize};
 pub use sys::user_agent::*;
 pub use target::{Target, TargetDeliverySnapshot};
+pub use target::{TargetHealth, TargetHealthReason, TargetHealthState};
 
 /// Represents a log of events for sending to targets
 #[derive(Debug, Clone, Serialize, Deserialize)]

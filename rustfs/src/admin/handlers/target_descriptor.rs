@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -22,12 +21,11 @@ use rustfs_config::{
     MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
     MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
-use rustfs_targets::SharedTarget;
 use rustfs_targets::{
-    BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
-    check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
-    check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
-    check_redis_server_available,
+    BuiltinTargetAdminDescriptor, SharedTarget, TargetAdminMetadata, TargetDomain, TargetError, TargetHealthReason,
+    TargetHealthState, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
+    check_mqtt_broker_available_with_tls, check_mysql_server_available, check_nats_server_available,
+    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
     config::{
         TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, build_amqp_args, build_kafka_args, build_mysql_args,
         build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, try_normalize_target_plugin_instances,
@@ -42,11 +40,36 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep, timeout};
 use url::Url;
 
 pub(crate) type EndpointKey = (String, String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeHealthStatus {
+    pub status: String,
+    pub state: String,
+    pub reason: String,
+}
+
+impl RuntimeHealthStatus {
+    fn disabled() -> Self {
+        Self {
+            status: TargetHealthState::Disabled.status().to_string(),
+            state: TargetHealthState::Disabled.as_str().to_string(),
+            reason: TargetHealthReason::Disabled.as_str().to_string(),
+        }
+    }
+
+    fn not_loaded() -> Self {
+        Self {
+            status: TargetHealthState::Offline.status().to_string(),
+            state: TargetHealthState::Offline.as_str().to_string(),
+            reason: TargetHealthReason::NotLoadedInRuntime.as_str().to_string(),
+        }
+    }
+}
+
 type AdminRequestValidatorFn =
     Arc<dyn for<'a> Fn(&'a HashMap<String, String>, &'a str) -> BoxFuture<'a, S3Result<()>> + Send + Sync>;
 type DomainScopedValidatorFn = for<'a> fn(&'a HashMap<String, String>, &'a str, TargetDomain) -> BoxFuture<'a, S3Result<()>>;
@@ -64,6 +87,8 @@ pub(crate) struct MergedTargetEndpoint {
     pub account_id: String,
     pub service: String,
     pub status: String,
+    pub health_state: String,
+    pub health_reason: String,
     pub source: TargetEndpointSource,
 }
 
@@ -76,6 +101,8 @@ pub(crate) struct TargetInstanceReadModel {
     pub account_id: String,
     pub service: String,
     pub status: String,
+    pub health_state: String,
+    pub health_reason: String,
     pub runtime_present: bool,
     pub source: TargetEndpointSource,
     pub enabled: bool,
@@ -272,43 +299,36 @@ pub(crate) fn build_json_response(
     S3Response::with_headers((status, body), header)
 }
 
-pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, String>
+pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, RuntimeHealthStatus>
 where
-    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
+    E: rustfs_targets::PluginEvent,
 {
-    let semaphore = Arc::new(Semaphore::new(10));
-    let mut futures = futures::stream::FuturesUnordered::new();
-
-    for target in targets {
-        let sem = Arc::clone(&semaphore);
-        futures.push(async move {
-            let _permit = sem.acquire().await;
-            let status = match tokio::time::timeout(Duration::from_secs(3), target.is_active()).await {
-                Ok(Ok(true)) => "online",
-                _ => "offline",
-            };
-            ((target.id().id, target.id().name), status.to_string())
-        });
-    }
-
-    let mut runtime_statuses = HashMap::new();
-    while let Some((key, status)) = futures.next().await {
-        runtime_statuses.insert(key, status);
-    }
-
-    runtime_statuses
+    rustfs_targets::health_snapshots_for_targets(targets)
+        .await
+        .into_iter()
+        .map(|snapshot| {
+            (
+                (snapshot.account_id, snapshot.target_type),
+                RuntimeHealthStatus {
+                    status: snapshot.state.status().to_string(),
+                    state: snapshot.state.as_str().to_string(),
+                    reason: snapshot.reason.as_str().to_string(),
+                },
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn merge_target_endpoints(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, String>,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
 ) -> S3Result<Vec<MergedTargetEndpoint>> {
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
     let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
-    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
+    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, RuntimeHealthStatus)> = HashMap::new();
 
     for ((account_id, service), status) in runtime_statuses {
         let normalized = normalized_endpoint_key(&account_id, &service);
@@ -323,15 +343,17 @@ pub(crate) fn merge_target_endpoints(
             continue;
         }
 
-        let status = normalized_runtime_statuses
+        let health = normalized_runtime_statuses
             .remove(&normalized)
             .map(|(_, _, status)| status)
-            .unwrap_or_else(|| "offline".to_string());
+            .unwrap_or_else(RuntimeHealthStatus::not_loaded);
 
         endpoints.push(MergedTargetEndpoint {
             account_id: key.0,
             service: key.1,
-            status,
+            status: health.status,
+            health_state: health.state,
+            health_reason: health.reason,
             source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
         });
     }
@@ -341,7 +363,9 @@ pub(crate) fn merge_target_endpoints(
             endpoints.push(MergedTargetEndpoint {
                 account_id,
                 service,
-                status,
+                status: status.status,
+                health_state: status.state,
+                health_reason: status.reason,
                 source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
             });
         }
@@ -356,6 +380,8 @@ pub(crate) fn merge_target_endpoints(
             account_id: key.0.clone(),
             service: key.1.clone(),
             status: "offline".to_string(),
+            health_state: TargetHealthState::Offline.as_str().to_string(),
+            health_reason: TargetHealthReason::NotLoadedInRuntime.as_str().to_string(),
             source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, key),
         });
     }
@@ -372,11 +398,11 @@ pub(crate) fn collect_target_instances(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, String>,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
 ) -> S3Result<Vec<TargetInstanceReadModel>> {
     let mut instances = Vec::new();
     let mut seen = HashSet::new();
-    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
+    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, RuntimeHealthStatus)> = HashMap::new();
     let domain = inferred_target_domain(route_prefix);
     let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
 
@@ -394,10 +420,16 @@ pub(crate) fn collect_target_instances(
         }
 
         let runtime_present = normalized_runtime_statuses.contains_key(&key);
-        let status = normalized_runtime_statuses
+        let health = normalized_runtime_statuses
             .remove(&key)
             .map(|(_, _, status)| status)
-            .unwrap_or_else(|| "offline".to_string());
+            .unwrap_or_else(|| {
+                if instance.enabled {
+                    RuntimeHealthStatus::not_loaded()
+                } else {
+                    RuntimeHealthStatus::disabled()
+                }
+            });
         let source = classify_endpoint_source_flags(instance_has_config_entry(&instance), instance_has_env_entry(&instance));
 
         instances.push(TargetInstanceReadModel {
@@ -407,7 +439,9 @@ pub(crate) fn collect_target_instances(
             subsystem: instance.subsystem,
             account_id: instance.instance_id,
             service: instance.target_type,
-            status,
+            status: health.status,
+            health_state: health.state,
+            health_reason: health.reason,
             runtime_present,
             source,
             enabled: instance.enabled,
@@ -430,7 +464,9 @@ pub(crate) fn collect_target_instances(
             subsystem,
             account_id,
             service,
-            status,
+            status: status.status,
+            health_state: status.state,
+            health_reason: status.reason,
             runtime_present: true,
             source: TargetEndpointSource::Runtime,
             enabled: true,
@@ -446,7 +482,7 @@ pub(crate) fn find_target_instance(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, String>,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
     canonical_id: &str,
 ) -> S3Result<Option<TargetInstanceReadModel>> {
     Ok(collect_target_instances(specs, route_prefix, config, runtime_statuses)?

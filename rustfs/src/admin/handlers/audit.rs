@@ -16,8 +16,8 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::audit_runtime_config::{load_server_config_from_store, update_audit_config_and_reload},
     handlers::target_descriptor::{
-        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
-        build_json_response, collect_runtime_statuses, extract_supported_target_params,
+        AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
+        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
@@ -192,6 +192,8 @@ struct AuditEndpoint {
     account_id: String,
     service: String,
     status: String,
+    health_state: String,
+    health_reason: String,
     source: TargetEndpointSource,
 }
 
@@ -248,7 +250,10 @@ async fn audit_target_operation_block_reason(action: &str) -> Option<String> {
     target_module_disabled_reason("audit", rustfs_config::ENV_AUDIT_ENABLE, is_audit_module_enabled(), action)
 }
 
-fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> S3Result<Vec<AuditEndpoint>> {
+fn merge_audit_endpoints(
+    config: &Config,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<AuditEndpoint>> {
     Ok(
         shared_merge_target_endpoints(audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)?
             .into_iter()
@@ -256,6 +261,8 @@ fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey,
                 account_id: endpoint.account_id,
                 service: endpoint.service,
                 status: endpoint.status,
+                health_state: endpoint.health_state,
+                health_reason: endpoint.health_reason,
                 source: endpoint.source,
             })
             .collect(),
@@ -428,6 +435,14 @@ mod tests {
         }])
     }
 
+    fn online_health() -> RuntimeHealthStatus {
+        RuntimeHealthStatus {
+            status: "online".to_string(),
+            state: "online".to_string(),
+            reason: "reachable".to_string(),
+        }
+    }
+
     fn with_audit_webhook_target_env_cleared<F>(target_name: &str, f: F)
     where
         F: FnOnce(),
@@ -472,8 +487,8 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-target".to_string(), "webhook".to_string()), "online".to_string()),
-                    (("env-only".to_string(), "webhook".to_string()), "online".to_string()),
+                    (("mixed-target".to_string(), "webhook".to_string()), online_health()),
+                    (("env-only".to_string(), "webhook".to_string()), online_health()),
                 ]);
                 let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
@@ -515,8 +530,8 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-kafka".to_string(), "kafka".to_string()), "online".to_string()),
-                    (("env-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                    (("mixed-kafka".to_string(), "kafka".to_string()), online_health()),
+                    (("env-kafka".to_string(), "kafka".to_string()), online_health()),
                 ]);
                 let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
@@ -552,8 +567,8 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-amqp".to_string(), "amqp".to_string()), "online".to_string()),
-                    (("env-amqp".to_string(), "amqp".to_string()), "online".to_string()),
+                    (("mixed-amqp".to_string(), "amqp".to_string()), online_health()),
+                    (("env-amqp".to_string(), "amqp".to_string()), online_health()),
                 ]);
                 let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
@@ -775,7 +790,7 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARYCASE", Some("https://example.com/hook")),
             ],
             || {
-                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), "online".to_string())]);
+                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), online_health())]);
                 let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
                 let mixed = merged
                     .iter()

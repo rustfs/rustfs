@@ -292,8 +292,8 @@ impl AuditPipeline {
     }
 
     pub async fn snapshot_target_health(&self) -> Vec<rustfs_targets::RuntimeTargetHealthSnapshot> {
-        let registry = self.registry.lock().await;
-        registry.runtime_manager().health_snapshots().await
+        let targets = self.registry.lock().await.list_target_values();
+        rustfs_targets::health_snapshots_for_targets(targets).await
     }
 }
 
@@ -570,7 +570,7 @@ mod tests {
     use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
     use rustfs_targets::{StoreError, Target, TargetError};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     /// Mock target whose `save()` outcome is fixed at construction so tests can
     /// force full-success / full-failure / partial-failure fan-outs.
@@ -578,6 +578,7 @@ mod tests {
     struct MockTarget {
         id: TargetID,
         fail: bool,
+        health_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     }
 
     impl MockTarget {
@@ -585,7 +586,13 @@ mod tests {
             Self {
                 id: TargetID::new(id.to_string(), "webhook".to_string()),
                 fail,
+                health_gate: None,
             }
+        }
+
+        fn with_health_gate(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+            self.health_gate = Some((started, release));
+            self
         }
     }
 
@@ -599,6 +606,10 @@ mod tests {
         }
 
         async fn is_active(&self) -> Result<bool, TargetError> {
+            if let Some((started, release)) = &self.health_gate {
+                started.notify_one();
+                release.notified().await;
+            }
             Ok(true)
         }
 
@@ -671,6 +682,24 @@ mod tests {
     async fn dispatch_returns_ok_with_no_targets() {
         let pipeline = pipeline_with(vec![]);
         pipeline.dispatch(entry()).await.expect("no targets should return Ok");
+    }
+
+    #[tokio::test]
+    async fn health_probe_does_not_hold_the_registry_lock() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let pipeline = pipeline_with(vec![MockTarget::new("blocked", false).with_health_gate(started.clone(), release.clone())]);
+        let registry = Arc::clone(&pipeline.registry);
+        let snapshot_task = tokio::spawn(async move { pipeline.snapshot_target_health().await });
+        started.notified().await;
+
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(1), registry.lock())
+            .await
+            .expect("network health probe must not retain the audit registry lock");
+        drop(guard);
+        release.notify_one();
+
+        assert_eq!(snapshot_task.await.expect("snapshot task should finish").len(), 1);
     }
 
     // backlog#962: dispatch_batch must mirror dispatch and propagate a

@@ -486,6 +486,8 @@ mod tests {
             account_id: "primary".to_string(),
             service: "webhook".to_string(),
             status: "offline".to_string(),
+            health_state: "offline".to_string(),
+            health_reason: "not_loaded_in_runtime".to_string(),
             source: PluginInstanceSource::Config,
             enabled: true,
             config: HashMap::from([("endpoint".to_string(), "https://example.test/webhook".to_string())]),
