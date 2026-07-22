@@ -53,7 +53,7 @@ use crate::services::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType, TierWasabi},
     tier_handlers::{ERR_TIER_ALREADY_EXISTS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME},
-    warm_backend::{WarmBackend, check_warm_backend, new_warm_backend},
+    warm_backend::{TransitionCandidateProbe, WarmBackend, check_warm_backend, new_warm_backend},
 };
 use crate::storage_api_contracts::{
     bucket::BucketOperations,
@@ -1111,6 +1111,10 @@ impl WarmBackend for SharedWarmBackendProxy {
 
     async fn remove_exact(&self, object: &str, rv: &str) -> io::Result<()> {
         self.0.remove_exact(object, rv).await
+    }
+
+    async fn probe_transition_candidate(&self, object: &str) -> io::Result<TransitionCandidateProbe> {
+        self.0.probe_transition_candidate(object).await
     }
 
     async fn in_use(&self) -> io::Result<bool> {

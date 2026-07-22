@@ -74,7 +74,9 @@ use crate::disk::format::FormatV3;
 use crate::disk::{DiskAPI, DiskOption, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, new_disk};
 use crate::services::tier::tier::TierConfigMgr;
 use crate::services::tier::tier_config::{TierConfig, TierMinIO, TierType};
-use crate::services::tier::warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options};
+use crate::services::tier::warm_backend::{
+    TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
+};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::path_join_buf;
 
@@ -142,6 +144,7 @@ pub enum MockWarmOp {
     Put { object: String },
     Get { object: String },
     Remove { object: String },
+    Probe { object: String },
     ExternalRemove { object: String },
     InUse,
 }
@@ -444,6 +447,11 @@ impl MockWarmBackend {
         self.inner.remove_versions.lock().await.clone()
     }
 
+    /// Return the provider-authoritative view of a remote transition candidate.
+    pub async fn probe_transition_candidate_state(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        self.probe_transition_candidate(object).await
+    }
+
     /// Number of `get` calls recorded — useful to assert restore reads hit the
     /// local copy rather than the remote tier.
     pub async fn get_count(&self) -> usize {
@@ -725,6 +733,23 @@ impl WarmBackend for MockWarmBackend {
         self.remove(object, rv).await
     }
 
+    async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        self.precondition().await?;
+        self.record(MockWarmOp::Probe {
+            object: object.to_string(),
+        })
+        .await;
+        let objects = self.inner.objects.lock().await;
+        let Some(stored) = objects.get(object) else {
+            return Ok(TransitionCandidateProbe::Missing);
+        };
+        if stored.remote_version_id.is_empty() {
+            Ok(TransitionCandidateProbe::UnversionedPresent)
+        } else {
+            Ok(TransitionCandidateProbe::VersionedPresent(stored.remote_version_id.clone()))
+        }
+    }
+
     async fn in_use(&self) -> Result<bool, std::io::Error> {
         self.precondition().await?;
         self.record(MockWarmOp::InUse).await;
@@ -907,5 +932,75 @@ pub async fn wait_for_free_version_absence(disk_path: &Path, bucket: &str, objec
             return false;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn mock_probe_distinguishes_missing_unversioned_and_versioned_candidates() {
+        let backend = MockWarmBackend::new();
+
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("missing")
+                .await
+                .expect("probe missing candidate"),
+            TransitionCandidateProbe::Missing
+        );
+
+        backend.set_put_remote_version(Some(String::new())).await;
+        backend
+            .put("unversioned", ReaderImpl::Body(Bytes::new()), 0)
+            .await
+            .expect("put unversioned candidate");
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("unversioned")
+                .await
+                .expect("probe unversioned candidate"),
+            TransitionCandidateProbe::UnversionedPresent
+        );
+
+        let remote_version = Uuid::new_v4().to_string();
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        backend
+            .put("versioned", ReaderImpl::Body(Bytes::new()), 0)
+            .await
+            .expect("put versioned candidate");
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("versioned")
+                .await
+                .expect("probe versioned candidate"),
+            TransitionCandidateProbe::VersionedPresent(remote_version)
+        );
+
+        assert_eq!(
+            backend
+                .op_log()
+                .await
+                .into_iter()
+                .filter(|op| matches!(op, MockWarmOp::Probe { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_probe_preserves_fault_fail_closed_behavior() {
+        let backend = MockWarmBackend::new();
+        backend.set_reject_credentials(true).await;
+
+        let err = backend
+            .probe_transition_candidate("remote-object")
+            .await
+            .expect_err("credential rejection must fail the authoritative probe");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(backend.op_log().await.is_empty());
     }
 }

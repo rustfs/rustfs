@@ -64,6 +64,15 @@ pub struct WarmBackendGetOpts {
     pub length: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransitionCandidateProbe {
+    Missing,
+    UnversionedPresent,
+    VersionedPresent(String),
+    Ambiguous,
+    Unsupported,
+}
+
 #[async_trait::async_trait]
 pub trait WarmBackend {
     async fn validate(&self) -> Result<(), std::io::Error> {
@@ -100,6 +109,9 @@ pub trait WarmBackend {
             ));
         }
         self.remove(object, rv).await
+    }
+    async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        Ok(TransitionCandidateProbe::Unsupported)
     }
     async fn in_use(&self) -> Result<bool, std::io::Error>;
 }
@@ -613,6 +625,22 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(removes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn default_transition_candidate_probe_is_unsupported() {
+        let backend = RejectingValidationBackend {
+            validations: Arc::new(AtomicUsize::new(0)),
+            puts: Arc::new(AtomicUsize::new(0)),
+            removes: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let probe = backend
+            .probe_transition_candidate("remote-object")
+            .await
+            .expect("default candidate probe should be a safe capability response");
+
+        assert_eq!(probe, TransitionCandidateProbe::Unsupported);
     }
 
     #[tokio::test]
