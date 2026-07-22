@@ -2515,7 +2515,7 @@ impl TierConfigMgr {
                 let _config_lock = config_lock;
                 let _update = update;
                 let mutation_kind = mutation.intent_kind();
-                if version.is_none() && mutation_kind != TierMutationIntentKind::Add {
+                if version.is_none() && !candidate.tiers.is_empty() && mutation_kind != TierMutationIntentKind::Add {
                     return Err(TierConfigUpdateError::Load(io::Error::other(
                         "tier configuration mutation requires an existing config ETag",
                     )));
