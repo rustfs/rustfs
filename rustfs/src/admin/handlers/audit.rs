@@ -16,8 +16,8 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::audit_runtime_config::{load_server_config_from_store, update_audit_config_and_reload},
     handlers::target_descriptor::{
-        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
-        build_json_response, collect_runtime_statuses, extract_supported_target_params,
+        AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
+        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
@@ -192,6 +192,8 @@ struct AuditEndpoint {
     account_id: String,
     service: String,
     status: String,
+    health_state: String,
+    health_reason: String,
     source: TargetEndpointSource,
 }
 
@@ -248,13 +250,18 @@ async fn audit_target_operation_block_reason(action: &str) -> Option<String> {
     target_module_disabled_reason("audit", rustfs_config::ENV_AUDIT_ENABLE, is_audit_module_enabled(), action)
 }
 
-fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<AuditEndpoint> {
+fn merge_audit_endpoints<V>(config: &Config, runtime_statuses: HashMap<EndpointKey, V>) -> Vec<AuditEndpoint>
+where
+    V: Into<RuntimeHealthStatus>,
+{
     shared_merge_target_endpoints(audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)
         .into_iter()
         .map(|endpoint| AuditEndpoint {
             account_id: endpoint.account_id,
             service: endpoint.service,
             status: endpoint.status,
+            health_state: endpoint.health_state,
+            health_reason: endpoint.health_reason,
             source: endpoint.source,
         })
         .collect()
@@ -633,7 +640,7 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MIXED-DISABLED", Some("https://example.com/hook")),
             ],
             || {
-                let merged = merge_audit_endpoints(&config, HashMap::new());
+                let merged = merge_audit_endpoints(&config, HashMap::<EndpointKey, String>::new());
                 let mixed = merged
                     .iter()
                     .find(|entry| entry.account_id == "mixed-disabled")
@@ -655,7 +662,7 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
             ],
             || {
-                let merged = merge_audit_endpoints(&config, HashMap::new());
+                let merged = merge_audit_endpoints(&config, HashMap::<EndpointKey, String>::new());
                 let env_only = merged
                     .iter()
                     .find(|entry| entry.account_id == "env-only")

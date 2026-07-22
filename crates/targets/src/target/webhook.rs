@@ -24,8 +24,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store, redacted_secret,
+        TargetHealth, TargetHealthReason, TargetHealthState, TargetTlsState, TargetType, build_queued_payload,
+        build_target_tls_fingerprint, open_target_queue_store, persist_queued_payload_to_store, redacted_secret,
     },
 };
 use async_trait::async_trait;
@@ -34,6 +34,7 @@ use reqwest::{Client, StatusCode, Url};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use rustfs_utils::egress::validate_outbound_url;
 use std::{
+    error::Error as StdError,
     fmt,
     marker::PhantomData,
     sync::{
@@ -49,6 +50,79 @@ const LOG_COMPONENT_TARGETS: &str = "targets";
 const LOG_SUBSYSTEM_WEBHOOK: &str = "webhook";
 const EVENT_WEBHOOK_TARGET_STATE: &str = "webhook_target_state";
 const EVENT_WEBHOOK_DELIVERY_STATE: &str = "webhook_delivery_state";
+const WEBHOOK_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn endpoint_origin(endpoint: &Url) -> String {
+    endpoint.origin().ascii_serialization()
+}
+
+fn classify_probe_error(err: &reqwest::Error) -> TargetHealthReason {
+    if err.is_timeout() {
+        return TargetHealthReason::TimedOut;
+    }
+
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if cause.downcast_ref::<rustls::Error>().is_some() {
+            return TargetHealthReason::TlsFailure;
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            match io_error.kind() {
+                std::io::ErrorKind::ConnectionRefused => return TargetHealthReason::ConnectionRefused,
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::AddrNotAvailable => {
+                    return TargetHealthReason::DnsFailure;
+                }
+                _ => {}
+            }
+        }
+
+        let label = cause.to_string().to_ascii_lowercase();
+        if label.contains("dns error") || label.contains("failed to lookup") || label.contains("name or service not known") {
+            return TargetHealthReason::DnsFailure;
+        }
+        if label.contains("certificate") || label.contains("tls") {
+            return TargetHealthReason::TlsFailure;
+        }
+        source = cause.source();
+    }
+
+    TargetHealthReason::Unreachable
+}
+
+async fn probe_health_url(client: &Client, health_check_url: &Url) -> TargetHealth {
+    match tokio::time::timeout(WEBHOOK_HEALTH_TIMEOUT, client.head(health_check_url.as_str()).send()).await {
+        Ok(Ok(_)) => TargetHealth::online(TargetHealthReason::Reachable),
+        Ok(Err(err)) => TargetHealth::error(classify_probe_error(&err)),
+        Err(_) => TargetHealth::error(TargetHealthReason::TimedOut),
+    }
+}
+
+fn health_policy_rejection(health_check_url: &Url) -> Option<TargetHealth> {
+    validate_outbound_url(health_check_url)
+        .is_err()
+        .then(|| TargetHealth::error(TargetHealthReason::PolicyRejected))
+}
+
+fn classify_delivery_status(status: StatusCode) -> Result<(), TargetError> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_redirection() {
+        Err(TargetError::Request(format!(
+            "Webhook endpoint returned redirect '{}'; redirects are not followed for webhook delivery",
+            status
+        )))
+    } else if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
+        Err(TargetError::Authentication(format!(
+            "Webhook endpoint returned '{}', please check if your auth token is correctly set",
+            status
+        )))
+    } else {
+        Err(TargetError::Request(format!(
+            "Webhook endpoint returned '{}', please check your endpoint configuration",
+            status
+        )))
+    }
+}
 
 /// Arguments for configuring a Webhook target
 #[derive(Clone)]
@@ -79,7 +153,7 @@ impl fmt::Debug for WebhookArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebhookArgs")
             .field("enable", &self.enable)
-            .field("endpoint", &self.endpoint)
+            .field("endpoint_origin", &endpoint_origin(&self.endpoint))
             .field("auth_token", &redacted_secret(&self.auth_token))
             .field("queue_dir", &self.queue_dir)
             .field("queue_limit", &self.queue_limit)
@@ -243,7 +317,6 @@ where
                 event = EVENT_WEBHOOK_TARGET_STATE,
                 component = LOG_COMPONENT_TARGETS,
                 subsystem = LOG_SUBSYSTEM_WEBHOOK,
-                endpoint = %args.endpoint,
                 state = "tls_verification_skipped",
                 fallback = "danger_accept_invalid_certs",
                 "webhook target state"
@@ -308,8 +381,14 @@ where
     fn health_check_url(endpoint: &Url) -> Result<Url, TargetError> {
         endpoint
             .host()
-            .ok_or_else(|| TargetError::Configuration(format!("Webhook endpoint '{}' is missing a host", endpoint)))?;
+            .ok_or_else(|| TargetError::Configuration("Webhook endpoint is missing a host".to_string()))?;
         let mut health_check_url = endpoint.clone();
+        health_check_url
+            .set_username("")
+            .map_err(|_| TargetError::Configuration("Webhook endpoint contains invalid user information".to_string()))?;
+        health_check_url
+            .set_password(None)
+            .map_err(|_| TargetError::Configuration("Webhook endpoint contains invalid user information".to_string()))?;
         health_check_url.set_path("/");
         health_check_url.set_query(None);
         health_check_url.set_fragment(None);
@@ -317,39 +396,41 @@ where
         Ok(health_check_url)
     }
 
-    async fn probe_reachability(&self) -> Result<bool, TargetError> {
+    async fn probe_health(&self) -> TargetHealth {
         let Some(health_check_url) = self.health_check_url.as_ref() else {
-            return Ok(false);
+            return TargetHealth::offline(TargetHealthReason::Unreachable);
         };
+        if let Some(rejection) = health_policy_rejection(health_check_url) {
+            return rejection;
+        }
 
         let client = self.http_client.lock().clone();
-        match tokio::time::timeout(Duration::from_secs(5), client.head(health_check_url.as_str()).send()).await {
-            Ok(Ok(resp)) => {
-                debug!(
-                    event = EVENT_WEBHOOK_TARGET_STATE,
-                    component = LOG_COMPONENT_TARGETS,
-                    subsystem = LOG_SUBSYSTEM_WEBHOOK,
-                    target_id = %self.id,
-                    status = %resp.status(),
-                    health_check_url = %health_check_url,
-                    state = "reachability_probe_succeeded",
-                    "webhook target state"
-                );
-                Ok(true)
-            }
-            Ok(Err(err)) if err.is_timeout() => Err(TargetError::Timeout(format!(
-                "Webhook health check request to {} timed out",
-                health_check_url
-            ))),
-            Ok(Err(err)) if err.is_connect() => Ok(false),
-            Ok(Err(err)) => Err(TargetError::Network(format!(
-                "Webhook health check request to {} failed: {}",
-                health_check_url, err
-            ))),
-            Err(_) => Err(TargetError::Timeout(format!(
-                "Webhook health check request to {} timed out",
-                health_check_url
-            ))),
+        let health = probe_health_url(&client, health_check_url).await;
+        if health.state == TargetHealthState::Online {
+            debug!(
+                event = EVENT_WEBHOOK_TARGET_STATE,
+                component = LOG_COMPONENT_TARGETS,
+                subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                target_id = %self.id,
+                state = "reachability_probe_succeeded",
+                "webhook target state"
+            );
+        }
+        health
+    }
+
+    async fn probe_reachability(&self) -> Result<bool, TargetError> {
+        let health = self.probe_health().await;
+        match health.state {
+            TargetHealthState::Online => Ok(true),
+            TargetHealthState::Offline | TargetHealthState::Disabled => Ok(false),
+            TargetHealthState::Error => match health.reason {
+                TargetHealthReason::TimedOut => Err(TargetError::Timeout("Webhook health check timed out".to_string())),
+                TargetHealthReason::PolicyRejected => Err(TargetError::Configuration(
+                    "Webhook endpoint is not allowed by outbound policy".to_string(),
+                )),
+                _ => Err(TargetError::Network(format!("Webhook health check failed: {}", health.reason.as_str()))),
+            },
         }
     }
 
@@ -371,7 +452,6 @@ where
                     component = LOG_COMPONENT_TARGETS,
                     subsystem = LOG_SUBSYSTEM_WEBHOOK,
                     target_id = %self.id,
-                    health_check_url = ?self.health_check_url,
                     state = "reachable",
                     "webhook target state"
                 );
@@ -447,7 +527,7 @@ where
             if e.is_timeout() || e.is_connect() {
                 TargetError::NotConnected
             } else {
-                TargetError::Request(format!("Failed to send request: {e}"))
+                TargetError::Request("Webhook delivery request failed".to_string())
             }
         })?;
 
@@ -456,7 +536,8 @@ where
         // pool and can be reused (keep-alive) instead of being closed mid-stream
         // (backlog#983). The body content is not needed for delivery accounting.
         let _ = resp.bytes().await;
-        if status.is_success() {
+        let result = classify_delivery_status(status);
+        if result.is_ok() {
             debug!(
                 event = EVENT_WEBHOOK_DELIVERY_STATE,
                 component = LOG_COMPONENT_TARGETS,
@@ -467,26 +548,8 @@ where
                 "webhook delivery state"
             );
             self.delivery_counters.record_success();
-            Ok(())
-        } else if status.is_redirection() {
-            // SSRF hardening (backlog#974): redirects are intentionally not followed
-            // (see build_http_client). Treat a 3xx response as a delivery failure rather
-            // than silently chasing the redirect to a potentially internal target.
-            Err(TargetError::Request(format!(
-                "{} returned redirect '{}'; redirects are not followed for webhook delivery",
-                self.args.endpoint, status
-            )))
-        } else if status == StatusCode::FORBIDDEN {
-            Err(TargetError::Authentication(format!(
-                "{} returned '{}', please check if your auth token is correctly set",
-                self.args.endpoint, status
-            )))
-        } else {
-            Err(TargetError::Request(format!(
-                "{} returned '{}', please check your endpoint configuration",
-                self.args.endpoint, status
-            )))
         }
+        result
     }
 }
 
@@ -505,6 +568,13 @@ where
         }
 
         self.probe_reachability().await
+    }
+
+    async fn health(&self) -> TargetHealth {
+        if !self.args.enable {
+            return TargetHealth::disabled();
+        }
+        self.probe_health().await
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
@@ -700,8 +770,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{WebhookArgs, WebhookTarget};
-    use crate::target::{REDACTED_SECRET, Target, TargetType, decode_object_name};
+    use super::{WebhookArgs, WebhookTarget, classify_delivery_status, health_policy_rejection, probe_health_url};
+    use crate::target::{REDACTED_SECRET, Target, TargetHealthReason, TargetHealthState, TargetType, decode_object_name};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
     use url::form_urlencoded;
 
@@ -720,9 +791,25 @@ mod tests {
         }
     }
 
+    async fn http_status_url(status: u16) -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept health probe");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+                .await
+                .expect("write health response");
+        });
+        Url::parse(&format!("http://{address}/")).expect("health probe URL")
+    }
+
     #[test]
     fn debug_redacts_webhook_secret_fields() {
         let args = WebhookArgs {
+            endpoint: Url::parse("https://user:password@example.com/private?token=query-secret").expect("debug URL"),
             auth_token: "webhook-token".to_string(),
             client_key: "/etc/rustfs/webhook.key".to_string(),
             ..base_args()
@@ -732,7 +819,11 @@ mod tests {
 
         assert!(!rendered.contains("webhook-token"));
         assert!(!rendered.contains("/etc/rustfs/webhook.key"));
+        assert!(!rendered.contains("password"));
+        assert!(!rendered.contains("/private"));
+        assert!(!rendered.contains("query-secret"));
         assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("https://example.com"));
         assert!(rendered.contains("WebhookArgs"));
     }
 
@@ -824,10 +915,131 @@ mod tests {
 
     #[test]
     fn test_health_check_url_ignores_endpoint_path() {
-        let endpoint = Url::parse("https://example.com:9443/hook/path").unwrap();
+        let endpoint = Url::parse("https://user:password@example.com:9443/hook/path?token=secret").unwrap();
         let health_check_url = WebhookTarget::<serde_json::Value>::health_check_url(&endpoint).unwrap();
 
         assert_eq!(health_check_url.as_str(), "https://example.com:9443/");
+    }
+
+    #[tokio::test]
+    async fn head_http_responses_only_measure_reachability() {
+        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+        for status in [401, 404, 500] {
+            let health = probe_health_url(&client, &http_status_url(status).await).await;
+            assert_eq!(health.state, TargetHealthState::Online, "HEAD {status} is reachable");
+            assert_eq!(health.reason, TargetHealthReason::Reachable);
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_connection_has_stable_health_reason() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve refused port");
+        let address = listener.local_addr().expect("refused address");
+        drop(listener);
+        let url = Url::parse(&format!("http://{address}/")).expect("refused URL");
+        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+
+        let health = probe_health_url(&client, &url).await;
+
+        assert_eq!(health.state, TargetHealthState::Error);
+        assert_eq!(health.reason, TargetHealthReason::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn dns_failure_has_stable_health_reason() {
+        let url = Url::parse("http://rustfs-health-check.invalid/").expect("invalid test domain URL");
+        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+
+        let health = probe_health_url(&client, &url).await;
+
+        assert_eq!(health.state, TargetHealthState::Error);
+        assert_eq!(health.reason, TargetHealthReason::DnsFailure);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn webhook_health_probe_has_a_five_second_total_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled server");
+        let address = listener.local_addr().expect("stalled server address");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept stalled probe");
+            std::future::pending::<()>().await;
+        });
+        let url = Url::parse(&format!("http://{address}/")).expect("stalled URL");
+        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+        let started = tokio::time::Instant::now();
+
+        let health = probe_health_url(&client, &url).await;
+
+        assert_eq!(started.elapsed(), super::WEBHOOK_HEALTH_TIMEOUT);
+        assert_eq!(health.state, TargetHealthState::Error);
+        assert_eq!(health.reason, TargetHealthReason::TimedOut);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tls_failure_has_stable_health_reason() {
+        use rustls::{
+            ServerConfig, ServerConnection, StreamOwned,
+            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+        use std::io::Read;
+        use std::sync::{Arc, Once};
+
+        static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
+        INSTALL_CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert should generate");
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+                )
+                .expect("server cert should be valid"),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TLS server");
+        let address = listener.local_addr().expect("TLS server address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept TLS client");
+            let connection = ServerConnection::new(server_config).expect("server connection");
+            let mut tls_stream = StreamOwned::new(connection, stream);
+            let mut request = [0u8; 1024];
+            let _ = tls_stream.read(&mut request);
+        });
+        let url = Url::parse(&format!("https://localhost:{}/", address.port())).expect("TLS health URL");
+        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+
+        let health = probe_health_url(&client, &url).await;
+
+        assert_eq!(health.state, TargetHealthState::Error);
+        assert_eq!(health.reason, TargetHealthReason::TlsFailure);
+        server.join().expect("TLS server thread");
+    }
+
+    #[test]
+    fn outbound_policy_rejection_has_stable_health_reason() {
+        let url = Url::parse("http://127.0.0.1/").expect("loopback URL");
+        let health = health_policy_rejection(&url).expect("loopback must be rejected");
+
+        assert_eq!(health.state, TargetHealthState::Error);
+        assert_eq!(health.reason, TargetHealthReason::PolicyRejected);
+    }
+
+    #[test]
+    fn post_status_classification_requires_success() {
+        assert!(classify_delivery_status(reqwest::StatusCode::NO_CONTENT).is_ok());
+        for status in [
+            reqwest::StatusCode::MOVED_PERMANENTLY,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(classify_delivery_status(status).is_err(), "POST {status} must fail");
+        }
     }
 
     #[tokio::test]

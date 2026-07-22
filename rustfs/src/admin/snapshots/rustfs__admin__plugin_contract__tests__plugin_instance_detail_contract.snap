@@ -18,6 +18,8 @@ expression: value
   ],
   "domain": "notify",
   "enabled": true,
+  "health_reason": "not_loaded_in_runtime",
+  "health_state": "offline",
   "id": "builtin:webhook:notify:primary",
   "plugin_id": "builtin:webhook",
   "service": "webhook",

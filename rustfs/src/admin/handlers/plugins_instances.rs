@@ -19,8 +19,8 @@ use crate::admin::{
         load_notification_config_snapshot, remove_notification_target_config, set_notification_target_config,
     },
     handlers::target_descriptor::{
-        AdminTargetSpec, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin, build_enabled_target_kvs,
-        build_json_response, collect_runtime_statuses, collect_target_instances, find_target_instance,
+        AdminTargetSpec, RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin,
+        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, collect_target_instances, find_target_instance,
         target_module_disabled_reason, target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     plugin_contract::{
@@ -205,6 +205,8 @@ fn map_instance(instance: TargetInstanceReadModel) -> PluginInstanceEntry {
         account_id: instance.account_id,
         service: instance.service,
         status: instance.status,
+        health_state: instance.health_state,
+        health_reason: instance.health_reason,
         source: map_instance_source(instance.source),
         enabled: instance.enabled,
         config,
@@ -639,7 +641,9 @@ async fn plugin_instance_operation_block_reason(context: PluginInstanceDomainCon
     module_disabled_block_reason(context.domain, action)
 }
 
-async fn plugin_instance_runtime_statuses(context: PluginInstanceDomainContext) -> S3Result<HashMap<(String, String), String>> {
+async fn plugin_instance_runtime_statuses(
+    context: PluginInstanceDomainContext,
+) -> S3Result<HashMap<(String, String), RuntimeHealthStatus>> {
     match context.domain {
         PluginContractDomain::Notify => {
             let (ns, _) = load_notification_config_snapshot().await?;
@@ -964,8 +968,12 @@ mod tests {
             )]),
         )]));
 
-        let instances =
-            collect_target_instances(super::notification_target_specs(), NOTIFY_ROUTE_PREFIX, &config, HashMap::new());
+        let instances = collect_target_instances(
+            super::notification_target_specs(),
+            NOTIFY_ROUTE_PREFIX,
+            &config,
+            HashMap::<(String, String), String>::new(),
+        );
         let primary = instances
             .into_iter()
             .find(|instance| instance.account_id == "primary" && instance.service == "webhook")
@@ -987,7 +995,7 @@ mod tests {
                     super::notification_target_specs(),
                     NOTIFY_ROUTE_PREFIX,
                     &Config(HashMap::new()),
-                    HashMap::new(),
+                    HashMap::<(String, String), String>::new(),
                 );
                 let env_only = instances
                     .into_iter()
@@ -1017,6 +1025,8 @@ mod tests {
 
         assert_eq!(runtime_only.source, TargetEndpointSource::Runtime);
         assert_eq!(runtime_only.status, "online");
+        assert_eq!(runtime_only.health_state, "online");
+        assert_eq!(runtime_only.health_reason, "reachable");
         assert_eq!(runtime_only.plugin_id, "builtin:webhook");
         assert_eq!(runtime_only.subsystem, NOTIFY_WEBHOOK_SUB_SYS);
     }
@@ -1031,6 +1041,8 @@ mod tests {
             account_id: "Primary".to_string(),
             service: "webhook".to_string(),
             status: "offline".to_string(),
+            health_state: "offline".to_string(),
+            health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
             source: TargetEndpointSource::Config,
             enabled: true,
@@ -1053,6 +1065,8 @@ mod tests {
             account_id: "primary".to_string(),
             service: "webhook".to_string(),
             status: "online".to_string(),
+            health_state: "online".to_string(),
+            health_reason: "reachable".to_string(),
             runtime_present: true,
             source: TargetEndpointSource::Config,
             enabled: true,
@@ -1484,6 +1498,8 @@ mod tests {
             account_id: "primary".to_string(),
             service: "webhook".to_string(),
             status: "offline".to_string(),
+            health_state: "offline".to_string(),
+            health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
             source: TargetEndpointSource::Config,
             enabled: true,
@@ -1508,6 +1524,8 @@ mod tests {
             account_id: "primary".to_string(),
             service: "webhook".to_string(),
             status: "offline".to_string(),
+            health_state: "offline".to_string(),
+            health_reason: "unreachable".to_string(),
             runtime_present: true,
             source: TargetEndpointSource::Runtime,
             enabled: true,
@@ -1532,6 +1550,8 @@ mod tests {
             account_id: "primary".to_string(),
             service: "webhook".to_string(),
             status: "offline".to_string(),
+            health_state: "disabled".to_string(),
+            health_reason: "disabled".to_string(),
             runtime_present: false,
             source: TargetEndpointSource::Mixed,
             enabled: false,
@@ -1573,6 +1593,8 @@ mod tests {
             account_id: "primary".to_string(),
             service: "webhook".to_string(),
             status: "offline".to_string(),
+            health_state: "offline".to_string(),
+            health_reason: "not_loaded_in_runtime".to_string(),
             runtime_present: false,
             source: TargetEndpointSource::Config,
             enabled: true,
@@ -1686,6 +1708,13 @@ mod tests {
             account_id: input.account_id.to_string(),
             service: input.service.to_string(),
             status: input.status.to_string(),
+            health_state: input.status.to_string(),
+            health_reason: if input.status == "online" {
+                "reachable"
+            } else {
+                "unreachable"
+            }
+            .to_string(),
             source: input.source,
             enabled: input.enabled,
             config: HashMap::new(),

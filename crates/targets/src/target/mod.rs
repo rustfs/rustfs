@@ -70,6 +70,127 @@ pub struct TargetDeliveryCounters {
     total_messages: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetHealthState {
+    Disabled,
+    Error,
+    Offline,
+    Online,
+}
+
+impl TargetHealthState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Error => "error",
+            Self::Offline => "offline",
+            Self::Online => "online",
+        }
+    }
+
+    pub const fn status(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Disabled | Self::Error | Self::Offline => "offline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetHealthReason {
+    AuthenticationFailed,
+    ConfigurationInvalid,
+    ConnectionRefused,
+    Disabled,
+    DnsFailure,
+    HealthCheckFailed,
+    InitializationFailed,
+    NotLoadedInRuntime,
+    PolicyRejected,
+    Reachable,
+    RequestFailed,
+    TimedOut,
+    TlsFailure,
+    Unreachable,
+}
+
+impl TargetHealthReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::ConfigurationInvalid => "configuration_invalid",
+            Self::ConnectionRefused => "connection_refused",
+            Self::Disabled => "disabled",
+            Self::DnsFailure => "dns_failure",
+            Self::HealthCheckFailed => "health_check_failed",
+            Self::InitializationFailed => "initialization_failed",
+            Self::NotLoadedInRuntime => "not_loaded_in_runtime",
+            Self::PolicyRejected => "policy_rejected",
+            Self::Reachable => "reachable",
+            Self::RequestFailed => "request_failed",
+            Self::TimedOut => "timed_out",
+            Self::TlsFailure => "tls_failure",
+            Self::Unreachable => "unreachable",
+        }
+    }
+
+    fn from_target_error(err: &TargetError) -> Self {
+        match err {
+            TargetError::Authentication(_) => Self::AuthenticationFailed,
+            TargetError::Configuration(_) | TargetError::ParseError(_) => Self::ConfigurationInvalid,
+            TargetError::Initialization(_) | TargetError::ServerNotInitialized(_) => Self::InitializationFailed,
+            TargetError::Network(_) | TargetError::NotConnected => Self::Unreachable,
+            TargetError::Request(_) => Self::RequestFailed,
+            TargetError::Timeout(_) => Self::TimedOut,
+            TargetError::Storage(_)
+            | TargetError::JetStreamPublish { .. }
+            | TargetError::Encoding(_)
+            | TargetError::Serialization(_)
+            | TargetError::InvalidARN(_)
+            | TargetError::Unknown(_)
+            | TargetError::Disabled
+            | TargetError::Dropped(_)
+            | TargetError::SaveConfig(_) => Self::HealthCheckFailed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetHealth {
+    pub state: TargetHealthState,
+    pub reason: TargetHealthReason,
+}
+
+impl TargetHealth {
+    pub const fn disabled() -> Self {
+        Self {
+            state: TargetHealthState::Disabled,
+            reason: TargetHealthReason::Disabled,
+        }
+    }
+
+    pub const fn error(reason: TargetHealthReason) -> Self {
+        Self {
+            state: TargetHealthState::Error,
+            reason,
+        }
+    }
+
+    pub const fn offline(reason: TargetHealthReason) -> Self {
+        Self {
+            state: TargetHealthState::Offline,
+            reason,
+        }
+    }
+
+    pub const fn online(reason: TargetHealthReason) -> Self {
+        Self {
+            state: TargetHealthState::Online,
+            reason,
+        }
+    }
+}
+
 pub(crate) type BoxedQueuedStore = Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>;
 
 impl TargetDeliveryCounters {
@@ -110,6 +231,19 @@ where
 
     /// Checks if the target is active and reachable
     async fn is_active(&self) -> Result<bool, TargetError>;
+
+    /// Returns a credential-free, machine-readable health result.
+    async fn health(&self) -> TargetHealth {
+        if !self.is_enabled() {
+            return TargetHealth::disabled();
+        }
+
+        match self.is_active().await {
+            Ok(true) => TargetHealth::online(TargetHealthReason::Reachable),
+            Ok(false) => TargetHealth::offline(TargetHealthReason::Unreachable),
+            Err(err) => TargetHealth::error(TargetHealthReason::from_target_error(&err)),
+        }
+    }
 
     /// Saves an event (either sends it immediately or stores it for later)
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError>;

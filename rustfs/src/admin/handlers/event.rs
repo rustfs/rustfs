@@ -16,8 +16,8 @@ use crate::admin::{
     auth::validate_admin_request,
     handlers::notify_runtime_access::{get_notification_system, load_notification_config_snapshot},
     handlers::target_descriptor::{
-        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, build_enabled_target_kvs,
-        build_json_response, collect_runtime_statuses, extract_supported_target_params,
+        AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
+        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
@@ -198,6 +198,8 @@ struct NotificationEndpoint {
     account_id: String,
     service: String,
     status: String,
+    health_state: String,
+    health_reason: String,
     source: TargetEndpointSource,
 }
 
@@ -256,13 +258,18 @@ async fn notification_target_operation_block_reason(action: &str) -> Option<Stri
     target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
 }
 
-fn merge_notification_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<NotificationEndpoint> {
+fn merge_notification_endpoints<V>(config: &Config, runtime_statuses: HashMap<EndpointKey, V>) -> Vec<NotificationEndpoint>
+where
+    V: Into<RuntimeHealthStatus>,
+{
     shared_merge_target_endpoints(notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)
         .into_iter()
         .map(|endpoint| NotificationEndpoint {
             account_id: endpoint.account_id,
             service: endpoint.service,
             status: endpoint.status,
+            health_state: endpoint.health_state,
+            health_reason: endpoint.health_reason,
             source: endpoint.source,
         })
         .collect()
@@ -388,7 +395,7 @@ impl Operation for ListTargetsArns {
         let target_statuses = collect_runtime_statuses(ns.get_target_values().await)
             .await
             .into_iter()
-            .map(|((account_id, service), status)| (rustfs_targets::arn::TargetID::new(account_id, service), status))
+            .map(|((account_id, service), health)| (rustfs_targets::arn::TargetID::new(account_id, service), health.status))
             .collect();
 
         let data_target_arn_list = collect_online_target_arns(region.as_str(), target_statuses);
@@ -477,7 +484,14 @@ mod tests {
         );
         let config = Config(cfg_map);
 
-        let runtime = HashMap::from([(("webhook-a".to_string(), "webhook".to_string()), "online".to_string())]);
+        let runtime = HashMap::from([(
+            ("webhook-a".to_string(), "webhook".to_string()),
+            RuntimeHealthStatus {
+                status: "offline".to_string(),
+                state: "error".to_string(),
+                reason: "timed_out".to_string(),
+            },
+        )]);
         let merged = merge_notification_endpoints(&config, runtime);
 
         let mqtt = merged
@@ -491,7 +505,9 @@ mod tests {
             .iter()
             .find(|entry| entry.account_id == "webhook-a" && entry.service == "webhook")
             .expect("webhook-a should be present");
-        assert_eq!(webhook.status, "online");
+        assert_eq!(webhook.status, "offline");
+        assert_eq!(webhook.health_state, "error");
+        assert_eq!(webhook.health_reason, "timed_out");
         assert_eq!(webhook.source, TargetEndpointSource::Config);
     }
 
@@ -726,7 +742,7 @@ mod tests {
                 ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_MIXED-DISABLED", Some("https://example.com/hook")),
             ],
             || {
-                let merged = merge_notification_endpoints(&config, HashMap::new());
+                let merged = merge_notification_endpoints(&config, HashMap::<EndpointKey, String>::new());
                 let mixed = merged
                     .iter()
                     .find(|entry| entry.account_id == "mixed-disabled")
@@ -748,7 +764,7 @@ mod tests {
                 ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
             ],
             || {
-                let merged = merge_notification_endpoints(&config, HashMap::new());
+                let merged = merge_notification_endpoints(&config, HashMap::<EndpointKey, String>::new());
                 let env_only = merged
                     .iter()
                     .find(|entry| entry.account_id == "env-only")

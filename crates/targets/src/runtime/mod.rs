@@ -26,6 +26,7 @@ use crate::plugin::PluginEvent;
 use crate::store::{Key, Store, ensure_store_entry_raw_readable};
 use crate::target::QueuedPayload;
 use crate::target::TargetDeliverySnapshot;
+use crate::target::{TargetHealth, TargetHealthReason, TargetHealthState};
 use crate::{StoreError, TargetError};
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
@@ -73,6 +74,8 @@ type ReplayHook<E> = Arc<dyn Fn(ReplayEvent<E>) -> Pin<Box<dyn Future<Output = (
 /// aborted. Workers observe cancellation promptly (including during retry
 /// backoff), so this only guards against a wedged task.
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const HEALTH_COLLECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const HEALTH_PROBE_CONCURRENCY: usize = 10;
 
 /// Tracks a running replay worker: its cancel channel and, when the worker was
 /// spawned in-process, the [`JoinHandle`] used to await its exit on shutdown.
@@ -201,19 +204,16 @@ pub struct RuntimeTargetSnapshot {
     pub total_messages: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeTargetHealthState {
-    Disabled,
-    Error,
-    Offline,
-    Online,
-}
+pub type RuntimeTargetHealthState = TargetHealthState;
+pub type RuntimeTargetHealthReason = TargetHealthReason;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTargetHealthSnapshot {
+    pub account_id: String,
     pub enabled: bool,
     pub error_message: Option<String>,
     pub state: RuntimeTargetHealthState,
+    pub reason: RuntimeTargetHealthReason,
     pub target_id: String,
     pub target_type: String,
 }
@@ -389,31 +389,59 @@ where
     }
 
     pub async fn health_snapshots(&self) -> Vec<RuntimeTargetHealthSnapshot> {
-        let mut snapshots = Vec::with_capacity(self.targets.len());
-        for target in self.targets.values() {
-            let enabled = target.is_enabled();
-            let target_id = target.id();
-            let (state, error_message) = if !enabled {
-                (RuntimeTargetHealthState::Disabled, None)
-            } else {
-                match target.is_active().await {
-                    Ok(true) => (RuntimeTargetHealthState::Online, None),
-                    Ok(false) => (RuntimeTargetHealthState::Offline, None),
-                    Err(err) => (RuntimeTargetHealthState::Error, Some(err.to_string())),
-                }
-            };
-
-            snapshots.push(RuntimeTargetHealthSnapshot {
-                enabled,
-                error_message,
-                state,
-                target_id: target_id.to_string(),
-                target_type: target_id.name,
-            });
-        }
-        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
-        snapshots
+        health_snapshots_for_targets(self.values()).await
     }
+}
+
+pub async fn health_snapshots_for_targets<E>(targets: Vec<SharedTarget<E>>) -> Vec<RuntimeTargetHealthSnapshot>
+where
+    E: PluginEvent,
+{
+    let deadline = tokio::time::Instant::now() + HEALTH_COLLECTION_TIMEOUT;
+    let permits = Arc::new(Semaphore::new(HEALTH_PROBE_CONCURRENCY));
+    let mut tasks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let permits = Arc::clone(&permits);
+        let enabled = target.is_enabled();
+        let target_id = target.id();
+        let task = tokio::spawn(async move {
+            if enabled {
+                match tokio::time::timeout_at(deadline, async {
+                    let Ok(_permit) = permits.acquire_owned().await else {
+                        return TargetHealth::error(TargetHealthReason::HealthCheckFailed);
+                    };
+                    target.health().await
+                })
+                .await
+                {
+                    Ok(health) => health,
+                    Err(_) => TargetHealth::error(TargetHealthReason::TimedOut),
+                }
+            } else {
+                TargetHealth::disabled()
+            }
+        });
+        tasks.push((enabled, target_id, task));
+    }
+
+    let mut snapshots = Vec::with_capacity(tasks.len());
+    for (enabled, target_id, task) in tasks {
+        let health = task
+            .await
+            .unwrap_or_else(|_| TargetHealth::error(TargetHealthReason::HealthCheckFailed));
+        snapshots.push(RuntimeTargetHealthSnapshot {
+            account_id: target_id.id.clone(),
+            enabled,
+            error_message: (health.state == TargetHealthState::Error).then(|| health.reason.as_str().to_string()),
+            state: health.state,
+            reason: health.reason,
+            target_id: target_id.to_string(),
+            target_type: target_id.name,
+        });
+    }
+
+    snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+    snapshots
 }
 
 fn snapshot_from_delivery(target_id: TargetID, delivery: TargetDeliverySnapshot) -> RuntimeTargetSnapshot {
@@ -826,16 +854,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::TargetRuntimeManager;
+    use super::{HEALTH_PROBE_CONCURRENCY, TargetRuntimeManager, health_snapshots_for_targets};
     use crate::PluginEvent;
     use crate::StoreError;
     use crate::arn::TargetID;
     use crate::store::{Key, Store};
     use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use crate::{Target, TargetError};
+    use crate::{SharedTarget, Target, TargetError};
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[tokio::test(start_paused = true)]
     async fn seed_interval_start_backdates_by_one_interval() {
@@ -901,6 +930,8 @@ mod tests {
     struct TestTarget {
         id: TargetID,
         close_calls: Arc<AtomicUsize>,
+        enabled: bool,
+        health_delay: Duration,
     }
 
     impl TestTarget {
@@ -908,6 +939,22 @@ mod tests {
             Self {
                 id: TargetID::new(id.to_string(), name.to_string()),
                 close_calls: Arc::new(AtomicUsize::new(0)),
+                enabled: true,
+                health_delay: Duration::ZERO,
+            }
+        }
+
+        fn with_health_delay(id: &str, delay: Duration) -> Self {
+            Self {
+                health_delay: delay,
+                ..Self::new(id, "webhook")
+            }
+        }
+
+        fn disabled(id: &str) -> Self {
+            Self {
+                enabled: false,
+                ..Self::new(id, "webhook")
             }
         }
     }
@@ -922,6 +969,7 @@ mod tests {
         }
 
         async fn is_active(&self) -> Result<bool, TargetError> {
+            tokio::time::sleep(self.health_delay).await;
             Ok(true)
         }
 
@@ -947,7 +995,7 @@ mod tests {
         }
 
         fn is_enabled(&self) -> bool {
-            true
+            self.enabled
         }
     }
 
@@ -975,6 +1023,72 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].target_id, "primary:webhook");
         assert_eq!(snapshots[0].target_type, "webhook");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_snapshot_allows_a_four_second_probe() {
+        let mut manager = TargetRuntimeManager::<String>::new();
+        manager.add_boxed(Box::new(TestTarget::with_health_delay("slow", Duration::from_secs(4))));
+
+        let snapshots = manager.health_snapshots().await;
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, crate::TargetHealthState::Online);
+        assert_eq!(snapshots[0].reason, crate::TargetHealthReason::Reachable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_snapshot_times_out_after_five_seconds() {
+        let mut manager = TargetRuntimeManager::<String>::new();
+        manager.add_boxed(Box::new(TestTarget::with_health_delay("stalled", Duration::from_secs(6))));
+
+        let snapshots = manager.health_snapshots().await;
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, crate::TargetHealthState::Error);
+        assert_eq!(snapshots[0].reason, crate::TargetHealthReason::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_collection_deadline_does_not_scale_with_target_count() {
+        let mut manager = TargetRuntimeManager::<String>::new();
+        for index in 0..24 {
+            manager.add_boxed(Box::new(TestTarget::with_health_delay(
+                &format!("stalled-{index}"),
+                Duration::from_secs(30),
+            )));
+        }
+        let started = tokio::time::Instant::now();
+
+        let snapshots = manager.health_snapshots().await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(snapshots.len(), 24);
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot.reason == crate::TargetHealthReason::TimedOut)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_target_does_not_wait_for_probe_capacity() {
+        let mut targets: Vec<SharedTarget<String>> = (0..HEALTH_PROBE_CONCURRENCY)
+            .map(|index| {
+                Arc::new(TestTarget::with_health_delay(&format!("stalled-{index}"), Duration::from_secs(30)))
+                    as SharedTarget<String>
+            })
+            .collect();
+        targets.push(Arc::new(TestTarget::disabled("disabled")));
+
+        let snapshots = health_snapshots_for_targets(targets).await;
+        let disabled = snapshots
+            .iter()
+            .find(|snapshot| snapshot.target_id == "disabled:webhook")
+            .expect("disabled target snapshot");
+
+        assert_eq!(disabled.state, crate::TargetHealthState::Disabled);
+        assert_eq!(disabled.reason, crate::TargetHealthReason::Disabled);
     }
 
     #[tokio::test]
