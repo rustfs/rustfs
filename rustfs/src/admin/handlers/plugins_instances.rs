@@ -971,7 +971,44 @@ mod tests {
             .expect("configured instance should be present");
 
         assert_eq!(primary.status, "offline");
+        assert_eq!(primary.health_state, "offline");
+        assert_eq!(primary.health_reason, "not_loaded_in_runtime");
         assert_eq!(primary.source, TargetEndpointSource::Config);
+    }
+
+    #[test]
+    fn disabled_instance_without_runtime_reports_disabled_health() {
+        let config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([(
+                "primary".to_string(),
+                KVS(vec![
+                    KV {
+                        key: ENABLE_KEY.to_string(),
+                        value: "off".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    KV {
+                        key: WEBHOOK_ENDPOINT.to_string(),
+                        value: "https://example.com/webhook".to_string(),
+                        hidden_if_empty: false,
+                    },
+                ]),
+            )]),
+        )]));
+
+        let instances =
+            collect_target_instances(super::notification_target_specs(), NOTIFY_ROUTE_PREFIX, &config, HashMap::new())
+                .expect("collect target instances");
+        let primary = instances
+            .into_iter()
+            .find(|instance| instance.account_id == "primary" && instance.service == "webhook")
+            .expect("disabled instance should be present");
+
+        assert_eq!(primary.status, "offline");
+        assert_eq!(primary.health_state, "disabled");
+        assert_eq!(primary.health_reason, "disabled");
+        assert!(!primary.runtime_present);
     }
 
     #[test]
@@ -1002,7 +1039,14 @@ mod tests {
 
     #[test]
     fn runtime_only_instance_appears_with_runtime_source() {
-        let runtime_statuses = HashMap::from([(("runtime-only".to_string(), "webhook".to_string()), "online".to_string())]);
+        let runtime_statuses = HashMap::from([(
+            ("runtime-only".to_string(), "webhook".to_string()),
+            RuntimeHealthStatus {
+                status: "online".to_string(),
+                state: "online".to_string(),
+                reason: "reachable".to_string(),
+            },
+        )]);
         let instances = collect_target_instances(
             super::notification_target_specs(),
             NOTIFY_ROUTE_PREFIX,

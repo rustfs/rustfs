@@ -52,10 +52,6 @@ const EVENT_WEBHOOK_TARGET_STATE: &str = "webhook_target_state";
 const EVENT_WEBHOOK_DELIVERY_STATE: &str = "webhook_delivery_state";
 const WEBHOOK_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn endpoint_origin(endpoint: &Url) -> String {
-    endpoint.origin().ascii_serialization()
-}
-
 fn classify_probe_error(err: &reqwest::Error) -> TargetHealthReason {
     if err.is_timeout() {
         return TargetHealthReason::TimedOut;
@@ -95,12 +91,6 @@ async fn probe_health_url(client: &Client, health_check_url: &Url) -> TargetHeal
         Ok(Err(err)) => TargetHealth::error(classify_probe_error(&err)),
         Err(_) => TargetHealth::error(TargetHealthReason::TimedOut),
     }
-}
-
-fn health_policy_rejection(health_check_url: &Url) -> Option<TargetHealth> {
-    validate_outbound_url(health_check_url)
-        .is_err()
-        .then(|| TargetHealth::error(TargetHealthReason::PolicyRejected))
 }
 
 fn classify_delivery_status(status: StatusCode) -> Result<(), TargetError> {
@@ -153,7 +143,7 @@ impl fmt::Debug for WebhookArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebhookArgs")
             .field("enable", &self.enable)
-            .field("endpoint_origin", &endpoint_origin(&self.endpoint))
+            .field("endpoint_origin", &self.endpoint.origin().ascii_serialization())
             .field("auth_token", &redacted_secret(&self.auth_token))
             .field("queue_dir", &self.queue_dir)
             .field("queue_limit", &self.queue_limit)
@@ -400,10 +390,6 @@ where
         let Some(health_check_url) = self.health_check_url.as_ref() else {
             return TargetHealth::offline(TargetHealthReason::Unreachable);
         };
-        if let Some(rejection) = health_policy_rejection(health_check_url) {
-            return rejection;
-        }
-
         let client = self.http_client.lock().clone();
         let health = probe_health_url(&client, health_check_url).await;
         if health.state == TargetHealthState::Online {
@@ -426,9 +412,6 @@ where
             TargetHealthState::Offline | TargetHealthState::Disabled => Ok(false),
             TargetHealthState::Error => match health.reason {
                 TargetHealthReason::TimedOut => Err(TargetError::Timeout("Webhook health check timed out".to_string())),
-                TargetHealthReason::PolicyRejected => Err(TargetError::Configuration(
-                    "Webhook endpoint is not allowed by outbound policy".to_string(),
-                )),
                 _ => Err(TargetError::Network(format!("Webhook health check failed: {}", health.reason.as_str()))),
             },
         }
@@ -770,7 +753,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{WebhookArgs, WebhookTarget, classify_delivery_status, health_policy_rejection, probe_health_url};
+    use super::{WebhookArgs, WebhookTarget, classify_delivery_status, probe_health_url};
     use crate::target::{REDACTED_SECRET, Target, TargetHealthReason, TargetHealthState, TargetType, decode_object_name};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
@@ -915,8 +898,8 @@ mod tests {
 
     #[test]
     fn test_health_check_url_ignores_endpoint_path() {
-        let endpoint = Url::parse("https://user:password@example.com:9443/hook/path?token=secret").unwrap();
-        let health_check_url = WebhookTarget::<serde_json::Value>::health_check_url(&endpoint).unwrap();
+        let endpoint = Url::parse("https://user:password@example.com:9443/hook/path?token=secret").expect("webhook endpoint URL");
+        let health_check_url = WebhookTarget::<serde_json::Value>::health_check_url(&endpoint).expect("webhook health-check URL");
 
         assert_eq!(health_check_url.as_str(), "https://example.com:9443/");
     }
@@ -1019,15 +1002,6 @@ mod tests {
         assert_eq!(health.state, TargetHealthState::Error);
         assert_eq!(health.reason, TargetHealthReason::TlsFailure);
         server.join().expect("TLS server thread");
-    }
-
-    #[test]
-    fn outbound_policy_rejection_has_stable_health_reason() {
-        let url = Url::parse("http://127.0.0.1/").expect("loopback URL");
-        let health = health_policy_rejection(&url).expect("loopback must be rejected");
-
-        assert_eq!(health.state, TargetHealthState::Error);
-        assert_eq!(health.reason, TargetHealthReason::PolicyRejected);
     }
 
     #[test]

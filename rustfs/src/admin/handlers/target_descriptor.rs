@@ -53,6 +53,14 @@ pub(crate) struct RuntimeHealthStatus {
 }
 
 impl RuntimeHealthStatus {
+    fn disabled() -> Self {
+        Self {
+            status: TargetHealthState::Disabled.status().to_string(),
+            state: TargetHealthState::Disabled.as_str().to_string(),
+            reason: TargetHealthReason::Disabled.as_str().to_string(),
+        }
+    }
+
     fn not_loaded() -> Self {
         Self {
             status: TargetHealthState::Offline.status().to_string(),
@@ -62,16 +70,6 @@ impl RuntimeHealthStatus {
     }
 }
 
-impl From<String> for RuntimeHealthStatus {
-    fn from(status: String) -> Self {
-        let online = status.eq_ignore_ascii_case("online");
-        Self {
-            status,
-            state: if online { "online" } else { "offline" }.to_string(),
-            reason: if online { "reachable" } else { "unreachable" }.to_string(),
-        }
-    }
-}
 type AdminRequestValidatorFn =
     Arc<dyn for<'a> Fn(&'a HashMap<String, String>, &'a str) -> BoxFuture<'a, S3Result<()>> + Send + Sync>;
 type DomainScopedValidatorFn = for<'a> fn(&'a HashMap<String, String>, &'a str, TargetDomain) -> BoxFuture<'a, S3Result<()>>;
@@ -321,15 +319,12 @@ where
         .collect()
 }
 
-pub(crate) fn merge_target_endpoints<V>(
+pub(crate) fn merge_target_endpoints(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, V>,
-) -> S3Result<Vec<MergedTargetEndpoint>>
-where
-    V: Into<RuntimeHealthStatus>,
-{
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<MergedTargetEndpoint>> {
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
     let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
@@ -339,7 +334,7 @@ where
         let normalized = normalized_endpoint_key(&account_id, &service);
         normalized_runtime_statuses
             .entry(normalized)
-            .or_insert((account_id, service, status.into()));
+            .or_insert((account_id, service, status));
     }
 
     for key in snapshot.configured_keys {
@@ -399,15 +394,12 @@ pub(crate) fn canonical_target_instance_id(plugin_id: &str, domain: TargetDomain
     format!("{plugin_id}:{}:{}", canonical_domain_label(domain), instance_id.to_lowercase())
 }
 
-pub(crate) fn collect_target_instances<V>(
+pub(crate) fn collect_target_instances(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, V>,
-) -> S3Result<Vec<TargetInstanceReadModel>>
-where
-    V: Into<RuntimeHealthStatus>,
-{
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<TargetInstanceReadModel>> {
     let mut instances = Vec::new();
     let mut seen = HashSet::new();
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, RuntimeHealthStatus)> = HashMap::new();
@@ -418,7 +410,7 @@ where
         let normalized = normalized_endpoint_key(&account_id, &service);
         normalized_runtime_statuses
             .entry(normalized)
-            .or_insert((account_id, service, status.into()));
+            .or_insert((account_id, service, status));
     }
 
     for instance in snapshot.normalized_instances {
@@ -431,7 +423,13 @@ where
         let health = normalized_runtime_statuses
             .remove(&key)
             .map(|(_, _, status)| status)
-            .unwrap_or_else(RuntimeHealthStatus::not_loaded);
+            .unwrap_or_else(|| {
+                if instance.enabled {
+                    RuntimeHealthStatus::not_loaded()
+                } else {
+                    RuntimeHealthStatus::disabled()
+                }
+            });
         let source = classify_endpoint_source_flags(instance_has_config_entry(&instance), instance_has_env_entry(&instance));
 
         instances.push(TargetInstanceReadModel {
@@ -480,16 +478,13 @@ where
     Ok(instances)
 }
 
-pub(crate) fn find_target_instance<V>(
+pub(crate) fn find_target_instance(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, V>,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
     canonical_id: &str,
-) -> S3Result<Option<TargetInstanceReadModel>>
-where
-    V: Into<RuntimeHealthStatus>,
-{
+) -> S3Result<Option<TargetInstanceReadModel>> {
     Ok(collect_target_instances(specs, route_prefix, config, runtime_statuses)?
         .into_iter()
         .find(|instance| instance.canonical_id == canonical_id))

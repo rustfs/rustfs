@@ -301,13 +301,10 @@ async fn notification_target_operation_block_reason(action: &str) -> Option<Stri
     target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
 }
 
-fn merge_notification_endpoints<V>(
+fn merge_notification_endpoints(
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, V>,
-) -> S3Result<Vec<NotificationEndpoint>>
-where
-    V: Into<RuntimeHealthStatus>,
-{
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<NotificationEndpoint>> {
     Ok(
         shared_merge_target_endpoints(notification_target_specs(), NOTIFY_ROUTE_PREFIX, config, runtime_statuses)?
             .into_iter()
@@ -555,6 +552,15 @@ mod tests {
         }])
     }
 
+    fn runtime_health(status: &str) -> RuntimeHealthStatus {
+        let online = status == "online";
+        RuntimeHealthStatus {
+            status: status.to_string(),
+            state: if online { "online" } else { "offline" }.to_string(),
+            reason: if online { "reachable" } else { "unreachable" }.to_string(),
+        }
+    }
+
     #[test]
     fn notification_target_subsystem_resolves_admin_route_type() {
         assert_eq!(
@@ -572,6 +578,8 @@ mod tests {
                 account_id: "primary".to_string(),
                 service: "webhook".to_string(),
                 status: "online".to_string(),
+                health_state: "online".to_string(),
+                health_reason: "reachable".to_string(),
                 source: TargetEndpointSource::Config,
             }],
         };
@@ -584,6 +592,8 @@ mod tests {
                     "account_id": "primary",
                     "service": "webhook",
                     "status": "online",
+                    "health_state": "online",
+                    "health_reason": "reachable",
                     "source": "config"
                 }]
             })
@@ -639,8 +649,8 @@ mod tests {
         let config = Config(HashMap::from([(NOTIFY_WEBHOOK_SUB_SYS.to_string(), webhook_targets)]));
 
         let runtime = HashMap::from([
-            (("webhook-enabled".to_string(), "webhook".to_string()), "online".to_string()),
-            (("env-only".to_string(), "mqtt".to_string()), "offline".to_string()),
+            (("webhook-enabled".to_string(), "webhook".to_string()), runtime_health("online")),
+            (("env-only".to_string(), "mqtt".to_string()), runtime_health("offline")),
         ]);
         let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
 
@@ -681,8 +691,8 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-target".to_string(), "webhook".to_string()), "online".to_string()),
-                    (("env-only".to_string(), "webhook".to_string()), "online".to_string()),
+                    (("mixed-target".to_string(), "webhook".to_string()), runtime_health("online")),
+                    (("env-only".to_string(), "webhook".to_string()), runtime_health("online")),
                 ]);
                 let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
 
@@ -724,8 +734,8 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-kafka".to_string(), "kafka".to_string()), "online".to_string()),
-                    (("env-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                    (("mixed-kafka".to_string(), "kafka".to_string()), runtime_health("online")),
+                    (("env-kafka".to_string(), "kafka".to_string()), runtime_health("online")),
                 ]);
                 let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
 
@@ -761,8 +771,8 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-amqp".to_string(), "amqp".to_string()), "online".to_string()),
-                    (("env-amqp".to_string(), "amqp".to_string()), "online".to_string()),
+                    (("mixed-amqp".to_string(), "amqp".to_string()), runtime_health("online")),
+                    (("env-amqp".to_string(), "amqp".to_string()), runtime_health("online")),
                 ]);
                 let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
 
@@ -938,7 +948,7 @@ mod tests {
                 ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARYCASE", Some("https://example.com/hook")),
             ],
             || {
-                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), "online".to_string())]);
+                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), runtime_health("online"))]);
                 let merged = merge_notification_endpoints(&config, runtime).expect("merge notification endpoints");
                 let mixed = merged
                     .iter()

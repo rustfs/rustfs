@@ -470,36 +470,32 @@ where
 {
     let deadline = tokio::time::Instant::now() + HEALTH_COLLECTION_TIMEOUT;
     let permits = Arc::new(Semaphore::new(HEALTH_PROBE_CONCURRENCY));
-    let mut tasks = Vec::with_capacity(targets.len());
+    let mut probes = FuturesUnordered::new();
     for target in targets {
         let permits = Arc::clone(&permits);
         let enabled = target.is_enabled();
         let target_id = target.id();
-        let task = tokio::spawn(async move {
-            if enabled {
-                match tokio::time::timeout_at(deadline, async {
-                    let Ok(_permit) = permits.acquire_owned().await else {
-                        return TargetHealth::error(TargetHealthReason::HealthCheckFailed);
-                    };
-                    target.health().await
-                })
-                .await
-                {
-                    Ok(health) => health,
-                    Err(_) => TargetHealth::error(TargetHealthReason::TimedOut),
+        probes.push(async move {
+            let health = if !enabled {
+                TargetHealth::disabled()
+            } else if let Ok(Ok(_permit)) = tokio::time::timeout_at(deadline, permits.acquire_owned()).await {
+                if tokio::time::Instant::now() >= deadline {
+                    TargetHealth::error(TargetHealthReason::HealthCheckFailed)
+                } else {
+                    match tokio::time::timeout_at(deadline, target.health()).await {
+                        Ok(health) => health,
+                        Err(_) => TargetHealth::error(TargetHealthReason::TimedOut),
+                    }
                 }
             } else {
-                TargetHealth::disabled()
-            }
+                TargetHealth::error(TargetHealthReason::HealthCheckFailed)
+            };
+            (enabled, target_id, health)
         });
-        tasks.push((enabled, target_id, task));
     }
 
-    let mut snapshots = Vec::with_capacity(tasks.len());
-    for (enabled, target_id, task) in tasks {
-        let health = task
-            .await
-            .unwrap_or_else(|_| TargetHealth::error(TargetHealthReason::HealthCheckFailed));
+    let mut snapshots = Vec::with_capacity(probes.len());
+    while let Some((enabled, target_id, health)) = probes.next().await {
         snapshots.push(RuntimeTargetHealthSnapshot {
             account_id: target_id.id.clone(),
             enabled,
@@ -1044,7 +1040,17 @@ mod tests {
         close_calls: Arc<AtomicUsize>,
         enabled: bool,
         health_delay: Duration,
+        health_drops: Arc<AtomicUsize>,
+        health_started: Arc<Notify>,
         close_started: Arc<Notify>,
+    }
+
+    struct HealthDropGuard(Arc<AtomicUsize>);
+
+    impl Drop for HealthDropGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl TestTarget {
@@ -1056,6 +1062,8 @@ mod tests {
                 close_calls: Arc::new(AtomicUsize::new(0)),
                 enabled: true,
                 health_delay: Duration::ZERO,
+                health_drops: Arc::new(AtomicUsize::new(0)),
+                health_started: Arc::new(Notify::new()),
                 close_started: Arc::new(Notify::new()),
             }
         }
@@ -1085,6 +1093,8 @@ mod tests {
         }
 
         async fn is_active(&self) -> Result<bool, TargetError> {
+            self.health_started.notify_one();
+            let _drop_guard = HealthDropGuard(Arc::clone(&self.health_drops));
             tokio::time::sleep(self.health_delay).await;
             Ok(true)
         }
@@ -1226,7 +1236,21 @@ mod tests {
         assert!(
             snapshots
                 .iter()
-                .all(|snapshot| snapshot.reason == crate::TargetHealthReason::TimedOut)
+                .all(|snapshot| snapshot.state == crate::TargetHealthState::Error)
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter(|snapshot| snapshot.reason == crate::TargetHealthReason::TimedOut)
+                .count(),
+            HEALTH_PROBE_CONCURRENCY
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter(|snapshot| snapshot.reason == crate::TargetHealthReason::HealthCheckFailed)
+                .count(),
+            24 - HEALTH_PROBE_CONCURRENCY
         );
     }
 
@@ -1248,6 +1272,24 @@ mod tests {
 
         assert_eq!(disabled.state, crate::TargetHealthState::Disabled);
         assert_eq!(disabled.reason, crate::TargetHealthReason::Disabled);
+    }
+
+    #[tokio::test]
+    async fn cancelling_health_collection_drops_in_flight_probe() {
+        let target = TestTarget::with_health_delay("slow", Duration::from_secs(30));
+        let health_drops = Arc::clone(&target.health_drops);
+        let health_started = Arc::clone(&target.health_started);
+        let targets: Vec<SharedTarget<String>> = vec![Arc::new(target)];
+        let collector = tokio::spawn(health_snapshots_for_targets(targets));
+
+        tokio::time::timeout(Duration::from_secs(1), health_started.notified())
+            .await
+            .expect("health probe should start");
+        collector.abort();
+        let join_error = collector.await.expect_err("health collector should be cancelled");
+
+        assert!(join_error.is_cancelled());
+        assert_eq!(health_drops.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
