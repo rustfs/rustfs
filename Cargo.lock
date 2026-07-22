@@ -9470,6 +9470,7 @@ dependencies = [
  "crossbeam-queue",
  "futures",
  "parking_lot",
+ "rand 0.10.2",
  "rustfs-io-metrics",
  "rustfs-utils",
  "serde",
