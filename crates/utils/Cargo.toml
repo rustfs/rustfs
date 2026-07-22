@@ -42,6 +42,7 @@ lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true, features = ["fs"] }
 serde = { workspace = true, optional = true, features = ["derive"] }
 sha1 = { workspace = true, optional = true }
@@ -50,7 +51,7 @@ convert_case = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["io-util", "time"] }
+tokio = { workspace = true, optional = true, features = ["io-util", "net", "time"] }
 tracing = { workspace = true }
 transform-stream = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
@@ -72,7 +73,7 @@ workspace = true
 default = ["ip"]  # features that are enabled by default
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:hyper", "dep:tokio"]  # network features with DNS resolver
-egress = ["ip", "dep:url"]
+egress = ["ip", "dep:reqwest", "dep:tokio", "dep:url"]
 io = ["dep:tokio"]
 path = []  # path manipulation features
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]

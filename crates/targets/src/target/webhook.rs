@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use reqwest::{Client, StatusCode, Url};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::OutboundPolicy;
 use std::{
     error::Error as StdError,
     fmt,
@@ -166,7 +166,8 @@ impl WebhookArgs {
         if self.endpoint.as_str().is_empty() {
             return Err(TargetError::Configuration("endpoint empty".to_string()));
         }
-        validate_outbound_url(&self.endpoint)
+        outbound_policy()?
+            .validate_url(&self.endpoint)
             .map_err(|err| TargetError::Configuration(format!("webhook endpoint is not allowed: {err}")))?;
 
         if !self.queue_dir.is_empty() {
@@ -247,8 +248,16 @@ where
             None
         };
 
-        // Build HTTP client using the helper function
-        let http_client = Arc::new(Mutex::new(Self::build_http_client(&args)?));
+        let http_client = if args.enable {
+            Self::build_http_client(&args)?
+        } else {
+            Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| TargetError::Configuration(format!("Failed to build disabled webhook HTTP client: {e}")))?
+        };
+        let http_client = Arc::new(Mutex::new(http_client));
 
         let queue_store = open_target_queue_store(
             &args.queue_dir,
@@ -285,7 +294,19 @@ where
     }
 
     fn build_http_client(args: &WebhookArgs) -> Result<Client, TargetError> {
+        let resolver = outbound_policy()?
+            .resolver_for(&args.endpoint)
+            .map_err(|err| TargetError::Configuration(format!("webhook endpoint is not allowed: {err}")))?;
+        Self::build_http_client_with_resolver(args, resolver)
+    }
+
+    fn build_http_client_with_resolver(
+        args: &WebhookArgs,
+        resolver: impl reqwest::dns::Resolve + 'static,
+    ) -> Result<Client, TargetError> {
         let mut client_builder = Client::builder()
+            .no_proxy()
+            .dns_resolver(resolver)
             .timeout(Duration::from_secs(30))
             // SSRF hardening (backlog#974): never follow HTTP redirects on webhook delivery.
             // reqwest follows up to 10 redirects by default, which lets a malicious or
@@ -294,11 +315,6 @@ where
             // bypassing the outbound-endpoint validation performed on the configured URL.
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(crate::get_user_agent(crate::ServiceType::Basis));
-        #[cfg(test)]
-        {
-            client_builder = client_builder.no_proxy();
-        }
-
         // 1. Configure server certificate verification
         if args.skip_tls_verify {
             // DANGEROUS: For testing only, skip all certificate verification
@@ -307,6 +323,7 @@ where
                 event = EVENT_WEBHOOK_TARGET_STATE,
                 component = LOG_COMPONENT_TARGETS,
                 subsystem = LOG_SUBSYSTEM_WEBHOOK,
+                endpoint_origin = %args.endpoint.origin().ascii_serialization(),
                 state = "tls_verification_skipped",
                 fallback = "danger_accept_invalid_certs",
                 "webhook target state"
@@ -536,6 +553,10 @@ where
     }
 }
 
+fn outbound_policy() -> Result<&'static OutboundPolicy, TargetError> {
+    OutboundPolicy::from_env_cached().map_err(|err| TargetError::Configuration(format!("invalid outbound policy: {err}")))
+}
+
 #[async_trait]
 impl<E> Target<E> for WebhookTarget<E>
 where
@@ -755,9 +776,60 @@ where
 mod tests {
     use super::{WebhookArgs, WebhookTarget, classify_delivery_status, probe_health_url};
     use crate::target::{REDACTED_SECRET, Target, TargetHealthReason, TargetHealthState, TargetType, decode_object_name};
+    use std::net::{IpAddr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use url::Url;
     use url::form_urlencoded;
+
+    #[derive(Clone)]
+    struct StaticResolver(IpAddr);
+
+    impl reqwest::dns::Resolve for StaticResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let address = SocketAddr::new(self.0, 0);
+            Box::pin(async move { Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingResolver;
+
+    impl reqwest::dns::Resolve for FailingResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::NotFound, "test DNS failure").into()) })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log lock").clone()).expect("captured logs must be UTF-8")
+        }
+    }
 
     fn base_args() -> WebhookArgs {
         WebhookArgs {
@@ -810,6 +882,103 @@ mod tests {
         assert!(rendered.contains("WebhookArgs"));
     }
 
+    #[tokio::test]
+    async fn webhook_client_uses_the_supplied_connection_resolver() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind resolver test listener");
+        let address = listener.local_addr().expect("resolver test listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept resolved webhook request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).await.expect("read webhook request");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /hook HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write webhook response");
+        });
+        let args = WebhookArgs {
+            endpoint: Url::parse(&format!("http://webhook.test:{}/hook", address.port())).expect("endpoint should parse"),
+            ..base_args()
+        };
+        let client = WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(&args, StaticResolver(address.ip()))
+            .expect("webhook client should build");
+
+        let response = client
+            .get(args.endpoint)
+            .send()
+            .await
+            .expect("resolver should route request to test listener");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        server.await.expect("resolver test server should finish");
+    }
+
+    #[test]
+    fn webhook_client_ignores_environment_proxies_before_dns_filtering() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_WEBHOOK_PROXY_CHILD";
+        const TARGET_URL_ENV: &str = "RUSTFS_TEST_WEBHOOK_PROXY_TARGET_URL";
+        const TARGET_ADDR_ENV: &str = "RUSTFS_TEST_WEBHOOK_PROXY_TARGET_ADDR";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let endpoint = Url::parse(&std::env::var(TARGET_URL_ENV).expect("child target URL")).expect("target URL");
+            let address = std::env::var(TARGET_ADDR_ENV)
+                .expect("child target address")
+                .parse::<SocketAddr>()
+                .expect("target address");
+            let args = WebhookArgs { endpoint, ..base_args() };
+            let client = WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(&args, StaticResolver(address.ip()))
+                .expect("webhook client should build");
+            tokio::runtime::Runtime::new().expect("child runtime").block_on(async {
+                let response = client
+                    .get(args.endpoint)
+                    .send()
+                    .await
+                    .expect("webhook request should bypass environment proxy");
+                assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+            });
+            return;
+        }
+
+        use std::io::{Read, Write};
+        use std::net::TcpListener as StdTcpListener;
+
+        let target_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind webhook target listener");
+        let target_address = target_listener.local_addr().expect("webhook target address");
+        let target = std::thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("accept direct webhook request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).expect("read direct webhook request");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /hook HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write direct webhook response");
+        });
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve refused proxy address");
+        let proxy_address = proxy_listener.local_addr().expect("proxy address");
+        drop(proxy_listener);
+        let target_url = format!("http://webhook.test:{}/hook", target_address.port());
+        let proxy_url = format!("http://{proxy_address}");
+        let output = std::process::Command::new(std::env::current_exe().expect("resolve current test executable"))
+            .arg("webhook_client_ignores_environment_proxies_before_dns_filtering")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(TARGET_URL_ENV, target_url)
+            .env(TARGET_ADDR_ENV, target_address.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("NO_PROXY", "")
+            .output()
+            .expect("run isolated proxy test child");
+
+        assert!(
+            output.status.success(),
+            "proxy test child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        target.join().expect("direct webhook target should finish");
+    }
+
     #[test]
     fn test_validate_skip_tls_verify_and_client_ca_mutually_exclusive() {
         let args = WebhookArgs {
@@ -842,6 +1011,36 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_tls_warning_redacts_endpoint_details() {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(captured.clone())
+            .finish();
+        let args = WebhookArgs {
+            endpoint: Url::parse("https://webhook.test/private?token=secret").expect("webhook endpoint"),
+            skip_tls_verify: true,
+            ..base_args()
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(
+                &args,
+                StaticResolver(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            )
+            .expect("webhook client should build");
+        });
+
+        let logs = captured.contents();
+        assert!(logs.contains("https://webhook.test"));
+        for secret in ["/private", "token=secret"] {
+            assert!(!logs.contains(secret), "TLS warning leaked {secret}: {logs}");
+        }
     }
 
     #[test]
@@ -930,8 +1129,9 @@ mod tests {
 
     #[tokio::test]
     async fn dns_failure_has_stable_health_reason() {
-        let url = Url::parse("http://rustfs-health-check.invalid/").expect("invalid test domain URL");
-        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+        let url = Url::parse("http://unresolvable.test/").expect("invalid test domain URL");
+        let client = WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(&base_args(), FailingResolver)
+            .expect("build client");
 
         let health = probe_health_url(&client, &url).await;
 
@@ -1001,7 +1201,9 @@ mod tests {
             let _ = tls_stream.read(&mut request);
         });
         let url = Url::parse(&format!("https://localhost:{}/", address.port())).expect("TLS health URL");
-        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+        let client =
+            WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(&base_args(), StaticResolver(address.ip()))
+                .expect("build client");
 
         let health = probe_health_url(&client, &url).await;
 
@@ -1133,12 +1335,14 @@ mod tests {
         });
 
         let args = WebhookArgs {
+            endpoint: Url::parse(&format!("https://localhost:{}/hook", addr.port())).expect("endpoint should parse"),
             client_ca: ca_path.to_string_lossy().into_owned(),
             ..base_args()
         };
-        let client = WebhookTarget::<serde_json::Value>::build_http_client(&args).expect("build https client");
+        let client = WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(&args, StaticResolver(addr.ip()))
+            .expect("build https client");
         let resp = client
-            .head(format!("https://localhost:{}/hook", addr.port()))
+            .head(args.endpoint)
             .send()
             .await
             .expect("https webhook probe should trust configured ca");

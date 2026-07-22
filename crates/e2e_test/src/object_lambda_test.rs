@@ -18,6 +18,7 @@ use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::{pre_sign_v4, sign_v4};
+use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use s3s::Body;
 use serial_test::serial;
 use std::collections::HashMap;
@@ -49,7 +50,7 @@ fn find_header_terminator(buf: &[u8]) -> Option<usize> {
 
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
-) -> Result<(HashMap<String, String>, Vec<u8>), Box<dyn Error + Send + Sync>> {
+) -> Result<(String, HashMap<String, String>, Vec<u8>), Box<dyn Error + Send + Sync>> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
 
@@ -67,7 +68,7 @@ async fn read_http_request(
     let header_bytes = &buffer[..header_end];
     let header_text = std::str::from_utf8(header_bytes)?;
     let mut lines = header_text.split("\r\n");
-    let _request_line = lines.next().ok_or("missing request line")?;
+    let request_line = lines.next().ok_or("missing request line")?.to_string();
     let mut headers = HashMap::new();
     for line in lines {
         if line.is_empty() {
@@ -79,8 +80,9 @@ async fn read_http_request(
 
     let content_length = headers
         .get("content-length")
-        .ok_or("missing content-length header")?
-        .parse::<usize>()?;
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or_default();
     let body_offset = header_end + 4;
     while buffer.len().saturating_sub(body_offset) < content_length {
         let read = stream.read(&mut chunk).await?;
@@ -90,7 +92,7 @@ async fn read_http_request(
         buffer.extend_from_slice(&chunk[..read]);
     }
 
-    Ok((headers, buffer[body_offset..body_offset + content_length].to_vec()))
+    Ok((request_line, headers, buffer[body_offset..body_offset + content_length].to_vec()))
 }
 
 async fn spawn_object_lambda_webhook_server() -> Result<
@@ -130,9 +132,17 @@ async fn spawn_object_lambda_webhook_server_with_response(
     let handle = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await?;
-            let Ok(Ok((headers, body))) = timeout(Duration::from_secs(2), read_http_request(&mut stream)).await else {
+            let Ok(Ok((request_line, headers, body))) = timeout(Duration::from_secs(2), read_http_request(&mut stream)).await
+            else {
                 continue;
             };
+            if request_line == "HEAD / HTTP/1.1" {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await?;
+                stream.shutdown().await?;
+                continue;
+            }
             let payload: serde_json::Value = serde_json::from_slice(&body)?;
 
             let output_route = payload["getObjectContext"]["outputRoute"]
@@ -412,9 +422,33 @@ async fn wait_for_target_absence(
     Err(format!("target {target_name} remained visible in admin APIs; targets={last_targets}, arns={last_arns:?}").into())
 }
 
-async fn restart_rustfs_server(env: &mut RustFSTestEnvironment) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn endpoint_origin(endpoint: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    Ok(reqwest::Url::parse(endpoint)?.origin().ascii_serialization())
+}
+
+async fn start_rustfs_server_for_endpoint(
+    env: &mut RustFSTestEnvironment,
+    endpoint: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let origin = endpoint_origin(endpoint)?;
+    env.start_rustfs_server_with_env(
+        vec![],
+        &[
+            (ENV_OUTBOUND_ALLOW_ORIGINS, origin.as_str()),
+            ("RUSTFS_NOTIFY_ENABLE", "true"),
+        ],
+    )
+    .await
+}
+
+async fn restart_rustfs_server(env: &mut RustFSTestEnvironment, endpoint: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let origin = endpoint_origin(endpoint)?;
     env.stop_server();
-    env.start_rustfs_server_without_cleanup(vec![]).await
+    env.start_rustfs_server_without_cleanup_with_env(&[
+        (ENV_OUTBOUND_ALLOW_ORIGINS, origin.as_str()),
+        ("RUSTFS_NOTIFY_ENABLE", "true"),
+    ])
+    .await
 }
 
 async fn spawn_http_origin_probe_server() -> Result<
@@ -521,7 +555,7 @@ async fn test_notification_target_persists_across_restart_and_delete() -> Result
     let (webhook_url, _request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let target_name = "restart-target";
     configure_webhook_target(&env, target_name, &webhook_url, "secret-token").await?;
@@ -535,7 +569,7 @@ async fn test_notification_target_persists_across_restart_and_delete() -> Result
         "target ARN missing after initial configure: {visible_arns:?}"
     );
 
-    restart_rustfs_server(&mut env).await?;
+    restart_rustfs_server(&mut env, &webhook_url).await?;
 
     let (targets_after_restart, arns_after_restart) = wait_for_target_visibility(&env, target_name).await?;
     assert!(notification_target_is_listed(&targets_after_restart, target_name));
@@ -556,7 +590,7 @@ async fn test_notification_target_persists_across_restart_and_delete() -> Result
         "target ARN still visible after delete: {arns_after_delete:?}"
     );
 
-    restart_rustfs_server(&mut env).await?;
+    restart_rustfs_server(&mut env, &webhook_url).await?;
 
     let (targets_after_delete_restart, arns_after_delete_restart) = wait_for_target_absence(&env, target_name).await?;
     assert!(!notification_target_is_listed(&targets_after_delete_restart, target_name));
@@ -581,8 +615,7 @@ async fn test_notification_target_with_path_is_online_via_transport_probe() -> R
     let (webhook_url, mut probe_rx, probe_handle) = spawn_http_origin_probe_server().await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
-        .await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let target_name = "path-probe";
     configure_webhook_target(&env, target_name, &webhook_url, "secret-token").await?;
@@ -615,7 +648,7 @@ async fn test_get_object_lambda_accepts_presigned_requests() -> Result<(), Box<d
     let (webhook_url, request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let bucket = "object-lambda-e2e-presigned";
     let key = "input.txt";
@@ -656,7 +689,7 @@ async fn test_get_object_lambda_accepts_named_webhook_target_arn() -> Result<(),
     let (webhook_url, request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let bucket = "object-lambda-e2e-named-target";
     let key = "input.txt";
@@ -696,7 +729,7 @@ async fn test_get_object_lambda_invokes_runtime_webhook_target() -> Result<(), B
     let (webhook_url, request_rx, webhook_handle) = spawn_object_lambda_webhook_server().await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let bucket = "object-lambda-e2e";
     let key = "input.txt";
@@ -777,7 +810,7 @@ async fn test_get_object_lambda_passthroughs_non_success_webhook_response() -> R
     .await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let bucket = "object-lambda-e2e-failure";
     let key = "input.txt";
@@ -832,7 +865,7 @@ async fn test_get_object_lambda_rejects_success_response_without_auth_headers() 
     .await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let bucket = "object-lambda-e2e-missing-auth";
     let key = "input.txt";
@@ -879,7 +912,7 @@ async fn test_get_object_lambda_rejects_success_response_with_mismatched_auth_he
     .await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    start_rustfs_server_for_endpoint(&mut env, &webhook_url).await?;
 
     let bucket = "object-lambda-e2e-mismatched-auth";
     let key = "input.txt";

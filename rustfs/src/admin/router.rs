@@ -65,7 +65,7 @@ use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy};
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
@@ -229,7 +229,7 @@ struct ListenNotificationFilter {
     suffix: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ObjectLambdaWebhookConfig {
     endpoint: Url,
     auth_token: String,
@@ -238,6 +238,7 @@ struct ObjectLambdaWebhookConfig {
     client_ca: String,
     skip_tls_verify: bool,
     response_header_timeout: Option<Duration>,
+    outbound_resolver: OutboundDnsResolver,
 }
 
 const LAMBDA_WEBHOOK_SUB_SYS: &str = "lambda_webhook";
@@ -612,7 +613,8 @@ fn resolve_object_lambda_webhook_config_from_server_config(
 
     let parsed_endpoint =
         Url::parse(&endpoint).map_err(|_| s3_error!(InvalidRequest, "object lambda target endpoint is invalid"))?;
-    validate_outbound_url(&parsed_endpoint)
+    let outbound_resolver = outbound_policy()?
+        .resolver_for(&parsed_endpoint)
         .map_err(|err| s3_error!(InvalidRequest, "object lambda target endpoint is not allowed: {}", err))?;
 
     Ok(ObjectLambdaWebhookConfig {
@@ -623,6 +625,7 @@ fn resolve_object_lambda_webhook_config_from_server_config(
         client_ca: kvs.lookup(WEBHOOK_CLIENT_CA).unwrap_or_default(),
         skip_tls_verify: config_enable_is_on(&kvs.lookup(WEBHOOK_SKIP_TLS_VERIFY).unwrap_or_default()),
         response_header_timeout,
+        outbound_resolver,
     })
 }
 
@@ -658,9 +661,18 @@ async fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambd
 }
 
 fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Result<reqwest::Client> {
-    validate_outbound_url(&config.endpoint)
-        .map_err(|err| s3_error!(InvalidRequest, "object lambda target endpoint is not allowed: {}", err))?;
-    let mut builder = reqwest::Client::builder().user_agent(rustfs_targets::get_user_agent(rustfs_targets::ServiceType::Basis));
+    build_object_lambda_http_client_with_resolver(config, config.outbound_resolver.clone())
+}
+
+fn build_object_lambda_http_client_with_resolver(
+    config: &ObjectLambdaWebhookConfig,
+    resolver: impl reqwest::dns::Resolve + 'static,
+) -> S3Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(resolver)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(rustfs_targets::get_user_agent(rustfs_targets::ServiceType::Basis));
 
     if let Some(timeout) = config.response_header_timeout {
         builder = builder.timeout(timeout);
@@ -672,7 +684,7 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
             result = "tls_verification_disabled",
-            endpoint = %config.endpoint,
+            endpoint_origin = %config.endpoint.origin().ascii_serialization(),
             "admin router state"
         );
         builder = builder.danger_accept_invalid_certs(true);
@@ -704,6 +716,17 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
     builder
         .build()
         .map_err(|e| s3_error!(InternalError, "failed to build object lambda http client: {e}"))
+}
+
+async fn send_object_lambda_request(request: reqwest::RequestBuilder) -> S3Result<reqwest::Response> {
+    request
+        .send()
+        .await
+        .map_err(|_| s3_error!(InternalError, "object lambda target request failed"))
+}
+
+fn outbound_policy() -> S3Result<&'static OutboundPolicy> {
+    OutboundPolicy::from_env_cached().map_err(|err| s3_error!(InvalidRequest, "invalid outbound policy: {}", err))
 }
 
 fn extract_request_scheme(headers: &HeaderMap, uri: &Uri) -> String {
@@ -1098,10 +1121,7 @@ async fn invoke_object_lambda_target(
         request_builder = request_builder.header("x-rustfs-object-lambda-version-id", version_id);
     }
 
-    let lambda_response = request_builder
-        .send()
-        .await
-        .map_err(|e| s3_error!(InternalError, "object lambda target request failed: {e}"))?;
+    let lambda_response = send_object_lambda_request(request_builder).await?;
 
     let status = lambda_response.status();
     let lambda_headers = lambda_response.headers().clone();
@@ -2576,7 +2596,70 @@ mod tests {
     use http::Method;
     use http::Uri;
     use s3s::S3Request;
+    use std::net::{IpAddr, SocketAddr};
     use time::macros::datetime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct StaticResolver(IpAddr);
+
+    impl reqwest::dns::Resolve for StaticResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let address = SocketAddr::new(self.0, 0);
+            Box::pin(async move { Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs) })
+        }
+    }
+
+    fn object_lambda_test_config(endpoint: Url) -> ObjectLambdaWebhookConfig {
+        object_lambda_test_config_with_policy(endpoint, &OutboundPolicy::default())
+    }
+
+    fn object_lambda_test_config_with_policy(endpoint: Url, policy: &OutboundPolicy) -> ObjectLambdaWebhookConfig {
+        let outbound_resolver = policy
+            .resolver_for(&endpoint)
+            .expect("test endpoint should satisfy its outbound policy");
+        ObjectLambdaWebhookConfig {
+            endpoint,
+            auth_token: String::new(),
+            client_cert: String::new(),
+            client_key: String::new(),
+            client_ca: String::new(),
+            skip_tls_verify: false,
+            response_header_timeout: Some(Duration::from_secs(2)),
+            outbound_resolver,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log lock").clone()).expect("captured logs must be UTF-8")
+        }
+    }
 
     #[test]
     fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
@@ -3776,6 +3859,214 @@ mod tests {
         let err = validate_object_lambda_response_auth_headers(&mismatched, "route-123", "token-456")
             .expect_err("mismatched auth headers should fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn object_lambda_client_ignores_proxies_and_does_not_follow_redirects() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_OBJECT_LAMBDA_PROXY_CHILD";
+        const TARGET_URL_ENV: &str = "RUSTFS_TEST_OBJECT_LAMBDA_TARGET_URL";
+        const TARGET_ADDR_ENV: &str = "RUSTFS_TEST_OBJECT_LAMBDA_TARGET_ADDR";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let endpoint = Url::parse(&std::env::var(TARGET_URL_ENV).expect("child target URL")).expect("target URL");
+            let address = std::env::var(TARGET_ADDR_ENV)
+                .expect("child target address")
+                .parse::<SocketAddr>()
+                .expect("target address");
+            let config = object_lambda_test_config(endpoint);
+            let client = build_object_lambda_http_client_with_resolver(&config, StaticResolver(address.ip()))
+                .expect("object lambda client should build");
+            tokio::runtime::Runtime::new().expect("child runtime").block_on(async {
+                let response = client
+                    .get(config.endpoint)
+                    .send()
+                    .await
+                    .expect("object lambda request should bypass environment proxy");
+                assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+            });
+            return;
+        }
+
+        use std::io::{Read, Write};
+        use std::net::TcpListener as StdTcpListener;
+
+        let target_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind object lambda target");
+        let target_address = target_listener.local_addr().expect("object lambda target address");
+        let redirect_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind redirect destination");
+        let redirect_address = redirect_listener.local_addr().expect("redirect destination address");
+        drop(redirect_listener);
+        let target = std::thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("accept object lambda request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).expect("read object lambda request");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /transform HTTP/1.1"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/metadata\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        redirect_address.port()
+                    )
+                    .as_bytes(),
+                )
+                .expect("write object lambda redirect");
+        });
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve refused proxy address");
+        let proxy_address = proxy_listener.local_addr().expect("proxy address");
+        drop(proxy_listener);
+        let target_url = format!("http://object-lambda.test:{}/transform", target_address.port());
+        let proxy_url = format!("http://{proxy_address}");
+        let output = std::process::Command::new(std::env::current_exe().expect("resolve current test executable"))
+            .arg("object_lambda_client_ignores_proxies_and_does_not_follow_redirects")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(TARGET_URL_ENV, target_url)
+            .env(TARGET_ADDR_ENV, target_address.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("NO_PROXY", "")
+            .output()
+            .expect("run isolated object lambda proxy test child");
+
+        assert!(
+            output.status.success(),
+            "proxy test child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        target.join().expect("object lambda target should finish");
+    }
+
+    #[tokio::test]
+    async fn object_lambda_client_uses_configured_outbound_policy_resolver() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind object lambda policy target");
+        let address = listener.local_addr().expect("object lambda policy target address");
+        let endpoint = Url::parse(&format!("http://{address}/transform")).expect("object lambda endpoint");
+        let policy = OutboundPolicy::from_allowed_origins(&endpoint.origin().ascii_serialization())
+            .expect("loopback test origin should be explicitly allowed");
+        let config = object_lambda_test_config_with_policy(endpoint.clone(), &policy);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept object lambda policy request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).await.expect("read object lambda policy request");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /transform HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write object lambda policy response");
+        });
+
+        let response = build_object_lambda_http_client(&config)
+            .expect("object lambda policy client should build")
+            .get(endpoint)
+            .send()
+            .await
+            .expect("configured policy resolver should reach the allowed origin");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        server.await.expect("object lambda policy target should finish");
+    }
+
+    #[tokio::test]
+    async fn object_lambda_client_preserves_hostname_for_tls_sni() {
+        use rustls::{
+            ServerConfig, ServerConnection, StreamOwned,
+            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Once};
+
+        static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
+        INSTALL_CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["object-lambda.test".to_string()]).expect("cert should generate");
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let ca_path = temp_dir.path().join("object-lambda-ca.pem");
+        std::fs::write(&ca_path, cert.pem()).expect("write object lambda CA");
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+                )
+                .expect("server certificate should be valid"),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind object lambda TLS server");
+        let address = listener.local_addr().expect("object lambda TLS address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept object lambda TLS request");
+            let connection = ServerConnection::new(server_config).expect("server TLS connection");
+            let mut stream = StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read object lambda TLS request");
+            assert_eq!(stream.conn.server_name(), Some("object-lambda.test"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write object lambda TLS response");
+        });
+        let endpoint =
+            Url::parse(&format!("https://object-lambda.test:{}/transform", address.port())).expect("object lambda TLS endpoint");
+        let mut config = object_lambda_test_config(endpoint.clone());
+        config.client_ca = ca_path.to_string_lossy().into_owned();
+
+        let response = build_object_lambda_http_client_with_resolver(&config, StaticResolver(address.ip()))
+            .expect("object lambda TLS client should build")
+            .get(endpoint)
+            .send()
+            .await
+            .expect("TLS request should keep the configured hostname for SNI");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        server.join().expect("object lambda TLS server should finish");
+    }
+
+    #[test]
+    fn object_lambda_tls_warning_redacts_endpoint_details() {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(captured.clone())
+            .finish();
+        let mut config = object_lambda_test_config(
+            Url::parse("https://object-lambda.test/private?token=secret").expect("object lambda endpoint"),
+        );
+        config.skip_tls_verify = true;
+
+        tracing::subscriber::with_default(subscriber, || {
+            build_object_lambda_http_client_with_resolver(&config, StaticResolver(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+                .expect("object lambda client should build");
+        });
+
+        let logs = captured.contents();
+        assert!(logs.contains("https://object-lambda.test"));
+        for secret in ["/private", "token=secret"] {
+            assert!(!logs.contains(secret), "TLS warning leaked {secret}: {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn object_lambda_request_error_does_not_expose_endpoint_details() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("reserve refused endpoint");
+        let address = listener.local_addr().expect("refused endpoint address");
+        drop(listener);
+        let request = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build")
+            .get(format!("http://{address}/private?token=secret"));
+
+        let error = send_object_lambda_request(request)
+            .await
+            .expect_err("refused object lambda request should fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("object lambda target request failed"));
+        assert!(!rendered.contains("/private"));
+        assert!(!rendered.contains("token=secret"));
     }
 
     #[test]
