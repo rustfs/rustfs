@@ -51,16 +51,15 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
-use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::{OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 use tracing::{debug, error, info, instrument, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
 const SERVER_CONFIG_OBJECT: &str = "config/config.json";
-const CONFIG_TRANSACTION_LOCK_SUFFIX: &str = ".transaction.lock";
 
 // Server-config lock order: SERVER_CONFIG_LOCK -> distributed namespace lock
 // for SERVER_CONFIG_OBJECT. Readers and writers must never reverse this order.
-static SERVER_CONFIG_LOCK: LazyLock<AsyncRwLock<()>> = LazyLock::new(|| AsyncRwLock::new(()));
+static SERVER_CONFIG_LOCK: LazyLock<Arc<AsyncRwLock<()>>> = LazyLock::new(|| Arc::new(AsyncRwLock::new(())));
 
 fn config_task_join_error(operation: &'static str, error: tokio::task::JoinError) -> Error {
     let outcome = if error.is_cancelled() { "cancelled" } else { "panicked" };
@@ -616,10 +615,6 @@ fn get_config_file() -> String {
 
 pub fn server_config_path() -> String {
     SERVER_CONFIG_OBJECT.to_string()
-}
-
-fn server_config_transaction_lock_path() -> String {
-    format!("{}{CONFIG_TRANSACTION_LOCK_SUFFIX}", server_config_path())
 }
 
 fn storage_class_kvs_mut(cfg: &mut Config) -> &mut KVS {
@@ -2041,6 +2036,7 @@ pub struct ServerConfigSnapshot {
     raw: Option<Vec<u8>>,
     seed: Option<Vec<u8>>,
     etag: Option<String>,
+    _local_guard: OwnedRwLockWriteGuard<()>,
     _guard: rustfs_lock::NamespaceLockGuard,
 }
 
@@ -2057,12 +2053,10 @@ impl ServerConfigSnapshot {
     }
 }
 
-/// Read a server config transaction snapshot while holding a dedicated
-/// transaction lock. The config object's normal namespace lock remains
-/// available to fence reads and the conditional write at commit time.
-/// The transaction guard remains live until the snapshot is dropped,
-/// serializing persistence and history ordering across admin nodes. Runtime
-/// state is reloaded from the durable object after this guard is released.
+/// Read a server config transaction snapshot while holding the same local and
+/// distributed write locks used by every other server-config writer. Internal
+/// reads and the later conditional write use no-lock object I/O; the guards
+/// remain live until the snapshot is dropped.
 pub async fn read_server_config_snapshot<S>(api: Arc<S>) -> Result<ServerConfigSnapshot>
 where
     S: ObjectIO<
@@ -2076,13 +2070,13 @@ where
         > + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
     let config_file = server_config_path();
-    // Lock order: config transaction lock -> config object lock -> history
-    // object lock. Other config object users never acquire the transaction
-    // lock, so they cannot create the reverse order.
-    let transaction_lock = server_config_transaction_lock_path();
-    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &transaction_lock).await?;
+    let local_guard = SERVER_CONFIG_LOCK.clone().write_owned().await;
+    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &config_file).await?;
     let guard = lock.get_write_lock(get_lock_acquire_timeout()).await?;
-    let read_options = ObjectOptions::default();
+    let read_options = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
     match read_config_with_metadata_inner(api, &config_file, &read_options, true).await {
         Ok((raw, object_info)) => {
             let (config, seed) = decode_persisted_server_config_with_seed(&raw)?;
@@ -2091,6 +2085,7 @@ where
                 raw: Some(raw),
                 seed: Some(seed),
                 etag: object_info.etag,
+                _local_guard: local_guard,
                 _guard: guard,
             })
         }
@@ -2099,6 +2094,7 @@ where
             raw: None,
             seed: None,
             etag: None,
+            _local_guard: local_guard,
             _guard: guard,
         }),
         Err(err) => handle_config_read_error(err, &config_file),
@@ -2162,6 +2158,7 @@ where
         data,
         &ObjectOptions {
             max_parity: true,
+            no_lock: true,
             http_preconditions: Some(http_preconditions),
             ..Default::default()
         },
@@ -2302,11 +2299,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, config_task_join_error, configs_semantically_equal,
-        decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config, lookup_configs, read_config,
-        read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot,
-        save_server_config, save_server_config_snapshot, server_config_path, server_config_transaction_lock_path,
-        storage_class_kvs_mut,
+        SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, config_task_join_error,
+        configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
+        lookup_configs, read_config, read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate,
+        read_server_config_snapshot, save_server_config, save_server_config_snapshot, server_config_path, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::endpoint::Endpoint;
@@ -4287,12 +4283,11 @@ mod tests {
             .expect("scanner-only config change should be persisted");
 
         assert_eq!(store.write_calls.load(Ordering::SeqCst), 1);
-        assert!(!store.last_put_no_lock.load(Ordering::SeqCst));
+        assert!(store.last_put_no_lock.load(Ordering::SeqCst));
         assert_eq!(
             store.lock_resources.lock().expect("lock resources mutex poisoned").as_slice(),
-            &[server_config_transaction_lock_path()]
+            &[server_config_path()]
         );
-        assert_ne!(server_config_transaction_lock_path(), server_config_path());
         let decoded = read_config_without_migrate(store)
             .await
             .expect("persisted scanner config should reload");
@@ -4361,7 +4356,7 @@ mod tests {
         let lock = rustfs_lock::NamespaceLock::new("server-config-lease-loss".to_string(), client.clone());
         let guard = lock
             .lock_guard(
-                rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, server_config_transaction_lock_path()),
+                rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, server_config_path()),
                 "server-config-lease-loss",
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_millis(120),
@@ -4370,11 +4365,13 @@ mod tests {
             .expect("distributed config lock acquisition should not error")
             .expect("distributed config lock should be acquired");
         let baseline = encode_server_config_blob(&Config::new(), None).expect("baseline config should encode");
+        let local_guard = SERVER_CONFIG_LOCK.clone().write_owned().await;
         let snapshot = ServerConfigSnapshot {
             config: Config::new(),
             raw: Some(baseline.clone()),
             seed: None,
             etag: Some("config-0".to_string()),
+            _local_guard: local_guard,
             _guard: guard,
         };
         let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline), None));

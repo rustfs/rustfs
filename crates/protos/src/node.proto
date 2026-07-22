@@ -756,6 +756,7 @@ message SignalServiceRequest {
 message SignalServiceResponse {
   bool success = 1;
   optional string error_info = 2;
+  uint32 protocol_version = 3;
 }
 
 message ScannerActivityRequest {

@@ -265,6 +265,8 @@ pub(crate) mod scan {
     pub(crate) use super::storage_contracts::{
         BucketOperations, BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
     };
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::{MakeBucketOptions, ObjectIO};
 }
 
 pub(crate) mod scanner_io {

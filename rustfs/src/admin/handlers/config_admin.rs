@@ -1587,9 +1587,26 @@ fn publish_notify_config_intent(
         .then(|| rustfs_notify::ensure_live_events().publish_config(config.clone()))
 }
 
-async fn preflight_notify_config_intent(sub_system: Option<&str>) -> S3Result<()> {
-    if sub_system.is_none() || sub_system.is_some_and(|sub_system| NOTIFY_SUB_SYSTEMS.contains(&sub_system)) {
-        preflight_dynamic_config_reload(sub_system.unwrap_or(NOTIFY_WEBHOOK_SUB_SYS)).await?;
+fn config_preflight_subsystems(sub_system: Option<&str>) -> Vec<&str> {
+    if let Some(sub_system) = sub_system {
+        return is_dynamic_config_subsystem(sub_system)
+            .then_some(sub_system)
+            .into_iter()
+            .collect();
+    }
+
+    let mut sub_systems = vec![NOTIFY_WEBHOOK_SUB_SYS];
+    for sub_system in FULL_CONFIG_WORKER_SUBSYSTEMS {
+        if !NOTIFY_SUB_SYSTEMS.contains(&sub_system) {
+            sub_systems.push(sub_system);
+        }
+    }
+    sub_systems
+}
+
+async fn preflight_config_intent(sub_system: Option<&str>) -> S3Result<()> {
+    for sub_system in config_preflight_subsystems(sub_system) {
+        preflight_dynamic_config_reload(sub_system).await?;
     }
     Ok(())
 }
@@ -1729,9 +1746,9 @@ async fn commit_server_config_transaction(
     }
 
     if let Some(history_data) = history_data.as_deref() {
-        // The dedicated transaction guard remains held while recording the
-        // unique history object, preserving durable commit order without
-        // recursively acquiring the config object's namespace lock.
+        // Lock order remains local server config -> config object -> unique
+        // history object. The config write uses no-lock I/O under the held
+        // config guard, so recording history cannot reacquire it recursively.
         record_server_config_history_after_commit(history_data).await;
         if snapshot.is_lock_lost() {
             return reject_lost_config_transaction(snapshot, "while recording history").await;
@@ -1803,7 +1820,7 @@ impl Operation for SetConfigKVHandler {
 
         let sub_system = config_update_sub_system(&directives)?.map(str::to_owned);
         let config_applied = supervise_admin_mutation("config mutation", async move {
-            preflight_notify_config_intent(sub_system.as_deref()).await?;
+            preflight_config_intent(sub_system.as_deref()).await?;
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = snapshot.config.clone();
             apply_set_directives(&mut config, &directives)?;
@@ -1831,7 +1848,7 @@ impl Operation for DelConfigKVHandler {
 
         let sub_system = config_update_sub_system(&directives)?.map(str::to_owned);
         let config_applied = supervise_admin_mutation("config mutation", async move {
-            preflight_notify_config_intent(sub_system.as_deref()).await?;
+            preflight_config_intent(sub_system.as_deref()).await?;
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = snapshot.config.clone();
             apply_delete_directives(&mut config, &directives);
@@ -1918,7 +1935,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         let history = read_server_config_history(&restore_id).await?;
 
         supervise_admin_mutation("config mutation", async move {
-            preflight_notify_config_intent(None).await?;
+            preflight_config_intent(None).await?;
             let snapshot = load_server_config_snapshot_from_store().await?;
             let config = restore_server_config_from_history(snapshot.config.clone(), &history)?;
             let prepared = prepare_server_config(&config, None).await?;
@@ -1965,7 +1982,7 @@ impl Operation for SetConfigHandler {
         validate_config_directives(&directives)?;
 
         supervise_admin_mutation("config mutation", async move {
-            preflight_notify_config_intent(None).await?;
+            preflight_config_intent(None).await?;
             let snapshot = load_server_config_snapshot_from_store().await?;
             let mut config = ServerConfig::new();
             apply_set_directives(&mut config, &directives)?;
@@ -1982,6 +1999,21 @@ impl Operation for SetConfigHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_preflight_covers_each_runtime_worker_family() {
+        assert_eq!(config_preflight_subsystems(Some(SCANNER_SUB_SYS)), [SCANNER_SUB_SYS]);
+        assert_eq!(config_preflight_subsystems(Some(HEAL_SUB_SYS)), [HEAL_SUB_SYS]);
+        assert!(config_preflight_subsystems(Some("identity_openid")).is_empty());
+        assert_eq!(
+            config_preflight_subsystems(None),
+            [
+                NOTIFY_WEBHOOK_SUB_SYS,
+                rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS,
+                SCANNER_SUB_SYS
+            ]
+        );
+    }
 
     #[test]
     fn tokenize_config_line_handles_quotes_and_escapes() {

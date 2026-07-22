@@ -32,6 +32,20 @@ use std::{
 /// save forever and freeze admin usage stats; callers must bypass the skip instead.
 pub const USAGE_LAST_UPDATE_FUTURE_TOLERANCE: Duration = Duration::from_secs(5 * 60);
 
+/// Authoritative cluster-wide usage snapshot written by coordinated scanners.
+///
+/// This object name is intentionally distinct from the legacy unfenced
+/// snapshot. Older binaries can continue writing the legacy object during a
+/// rolling upgrade without overwriting a snapshot produced by the current
+/// scanner protocol.
+pub const DATA_USAGE_OBJECT_NAME: &str = ".usage.v2.json";
+
+/// Usage snapshot written by scanner implementations predating distributed
+/// leadership fencing. It is read only when neither authoritative snapshot
+/// copy exists.
+// RUSTFS_COMPAT_TODO(scanner-usage-v2): keep .usage.json readable and removable during rolling upgrades from pre-v2 scanners. Remove after supported direct-upgrade sources all write .usage.v2.json.
+pub const LEGACY_DATA_USAGE_OBJECT_NAME: &str = ".usage.json";
+
 /// Returns true when `existing_last_update` is ahead of `now` by more than
 /// [`USAGE_LAST_UPDATE_FUTURE_TOLERANCE`], i.e. the persisted timestamp cannot be
 /// trusted for staleness comparisons and a fresh snapshot save must be allowed.

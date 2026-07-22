@@ -230,6 +230,10 @@ impl ECStore {
         };
 
         if confirmed_missing && !is_meta_bucketname(bucket) {
+            // Fence every scanner cycle that could have observed the namespace
+            // before physical creation. Creation may become visible even when a
+            // later metadata write or namespace-lock check fails.
+            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
             self.cleanup_bucket_usage_best_effort(bucket, ns_guard.as_ref()).await;
         }
 
@@ -537,7 +541,7 @@ mod tests {
         disk::endpoint::Endpoint,
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
-    use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+    use rustfs_data_usage::{BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageInfo};
     use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
     use std::path::{Path, PathBuf};
@@ -1185,7 +1189,7 @@ mod tests {
             .await
             .expect("bucket should be created before corrupting usage");
 
-        let usage_path = format!("{BUCKET_META_PREFIX}/.usage.json");
+        let usage_path = format!("{BUCKET_META_PREFIX}/{DATA_USAGE_OBJECT_NAME}");
         crate::config::com::save_config(ecstore.clone(), &usage_path, b"{".to_vec())
             .await
             .expect("corrupt usage fixture should be stored");

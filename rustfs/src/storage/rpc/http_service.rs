@@ -787,6 +787,47 @@ async fn handle_ns_scanner(req: Request<Incoming>) -> Response<Body> {
         );
         return response_with_status(StatusCode::CONFLICT, "namespace scanner cycle does not match persisted state");
     }
+    // Acquire the per-disk permit before reading the request body. This bounds
+    // slow or duplicated authenticated uploads to one request per physical disk;
+    // dropping the request on timeout releases the permit without consuming its
+    // replay sequence.
+    let admission = match rustfs_scanner::admit_remote_scanner_request(disk.as_ref()) {
+        Ok(admission) => admission,
+        Err(rustfs_scanner::ScannerError::RemoteDiskBusy) => {
+            warn!(
+                event = EVENT_RPC_REQUEST_REJECTED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
+                operation = INTERNODE_OPERATION_NS_SCANNER,
+                result = "rejected",
+                status_code = StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                rpc_path = NS_SCANNER_PATH,
+                method = %Method::POST,
+                reason = "disk_scan_already_active",
+                disk = %query.disk,
+                "internode rpc request rejected"
+            );
+            return response_with_status(StatusCode::TOO_MANY_REQUESTS, "namespace scanner disk is already active");
+        }
+        Err(err) => {
+            let (status, reason, message) = remote_scanner_claim_rejection(&err);
+            warn!(
+                event = EVENT_RPC_REQUEST_REJECTED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
+                operation = INTERNODE_OPERATION_NS_SCANNER,
+                result = "rejected",
+                status_code = status.as_u16(),
+                rpc_path = NS_SCANNER_PATH,
+                method = %Method::POST,
+                reason,
+                disk = %query.disk,
+                error = %err,
+                "internode rpc request rejected"
+            );
+            return response_with_status(status, message);
+        }
+    };
     let body = match tokio::time::timeout(
         NS_SCANNER_REQUEST_BODY_TIMEOUT,
         Limited::new(req.into_body(), rustfs_scanner::NS_SCANNER_MAX_REQUEST_BODY_SIZE).collect(),
@@ -886,43 +927,6 @@ async fn handle_ns_scanner(req: Request<Incoming>) -> Response<Body> {
         );
         return response_with_status(StatusCode::FORBIDDEN, "namespace scanner request envelope mismatch");
     }
-    let admission = match rustfs_scanner::admit_remote_scanner_request(disk.as_ref()) {
-        Ok(admission) => admission,
-        Err(rustfs_scanner::ScannerError::RemoteDiskBusy) => {
-            warn!(
-                event = EVENT_RPC_REQUEST_REJECTED,
-                component = LOG_COMPONENT_INTERNODE_RPC,
-                subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
-                operation = INTERNODE_OPERATION_NS_SCANNER,
-                result = "rejected",
-                status_code = StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                rpc_path = NS_SCANNER_PATH,
-                method = %Method::POST,
-                reason = "disk_scan_already_active",
-                disk = %query.disk,
-                "internode rpc request rejected"
-            );
-            return response_with_status(StatusCode::TOO_MANY_REQUESTS, "namespace scanner disk is already active");
-        }
-        Err(err) => {
-            let (status, reason, message) = remote_scanner_claim_rejection(&err);
-            warn!(
-                event = EVENT_RPC_REQUEST_REJECTED,
-                component = LOG_COMPONENT_INTERNODE_RPC,
-                subsystem = LOG_SUBSYSTEM_NAMESPACE_SCANNER,
-                operation = INTERNODE_OPERATION_NS_SCANNER,
-                result = "rejected",
-                status_code = status.as_u16(),
-                rpc_path = NS_SCANNER_PATH,
-                method = %Method::POST,
-                reason,
-                disk = %query.disk,
-                error = %err,
-                "internode rpc request rejected"
-            );
-            return response_with_status(status, message);
-        }
-    };
     if let Err(err) = rustfs_scanner::claim_remote_scanner_request(
         disk.as_ref(),
         query.ns_scanner_session_id,

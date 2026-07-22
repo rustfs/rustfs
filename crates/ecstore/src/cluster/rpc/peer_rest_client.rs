@@ -27,6 +27,7 @@ use crate::{
 };
 use bytes::Bytes;
 use rmp_serde::{Deserializer, Serializer};
+use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_madmin::{
     ServerProperties,
     health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices},
@@ -75,6 +76,16 @@ const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
+
+fn validate_signal_service_protocol(sig: u64, sub_sys: &str, protocol_version: u32) -> Result<()> {
+    if sig == SERVICE_SIGNAL_RELOAD_DYNAMIC
+        && matches!(sub_sys, SCANNER_SUB_SYS | HEAL_SUB_SYS)
+        && protocol_version < rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION
+    {
+        return Err(Error::other(format!("peer does not support dynamic {sub_sys} config convergence")));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannerPeerActivity {
@@ -1306,6 +1317,7 @@ impl PeerRestClient {
                     }
                     return Err(Error::other(""));
                 }
+                validate_signal_service_protocol(sig, sub_sys, response.protocol_version)?;
                 Ok(())
             }
             .await,
@@ -1322,12 +1334,11 @@ impl PeerRestClient {
                     .await?
                     .max_decoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE)
                     .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
-                let response = client
-                    .scanner_activity(Request::new(ScannerActivityRequest {
-                        challenge: challenge.as_bytes().to_vec().into(),
-                    }))
-                    .await?
-                    .into_inner();
+                let mut request = Request::new(ScannerActivityRequest {
+                    challenge: challenge.as_bytes().to_vec().into(),
+                });
+                set_tonic_canonical_body_digest(&mut request, challenge.as_bytes())?;
+                let response = client.scanner_activity(request).await?.into_inner();
                 decode_scanner_activity(response, challenge.as_bytes())
             }
             .await,
@@ -1520,6 +1531,7 @@ impl PeerRestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::com::STORAGE_CLASS_SUB_SYS;
     use serde_json::Value;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
@@ -1733,6 +1745,26 @@ mod tests {
                 .to_string()
                 .contains("response proof")
         );
+    }
+
+    #[test]
+    fn dynamic_scanner_config_requires_versioned_peer_acknowledgement() {
+        for sub_system in [SCANNER_SUB_SYS, HEAL_SUB_SYS] {
+            let err = validate_signal_service_protocol(SERVICE_SIGNAL_RELOAD_DYNAMIC, sub_system, 0)
+                .expect_err("an unversioned peer must not claim scanner config convergence");
+            assert!(err.to_string().contains("does not support dynamic"));
+            validate_signal_service_protocol(
+                SERVICE_SIGNAL_RELOAD_DYNAMIC,
+                sub_system,
+                rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION,
+            )
+            .expect("a current peer should support dynamic scanner config");
+        }
+
+        validate_signal_service_protocol(SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS, 0)
+            .expect("unrelated dynamic config keeps its existing compatibility contract");
+        validate_signal_service_protocol(SERVICE_SIGNAL_REFRESH_CONFIG, SCANNER_SUB_SYS, 0)
+            .expect("full refresh compatibility is guarded by its scanner preflight");
     }
 
     #[test]

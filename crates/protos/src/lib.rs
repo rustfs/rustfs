@@ -165,6 +165,7 @@ pub fn internode_rpc_max_message_size() -> usize {
 
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;

@@ -23,8 +23,8 @@ use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_S
 use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path,
-    find_local_disk_by_ref, reload_transition_tier_config,
+    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+    StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref, reload_transition_tier_config,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
 use crate::storage::storage_api::{sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest};
@@ -77,6 +77,14 @@ const TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE: i32 = 0;
 const TIER_MUTATION_PEER_STATE_PREPARED_WIRE: i32 = 1;
 const TIER_MUTATION_PEER_STATE_COMMITTED_WIRE: i32 = 2;
 const TIER_MUTATION_PEER_STATE_ABORTED_WIRE: i32 = 3;
+
+fn signal_service_response(success: bool, error_info: Option<String>) -> Response<SignalServiceResponse> {
+    Response::new(SignalServiceResponse {
+        success,
+        error_info,
+        protocol_version: rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION,
+    })
+}
 
 fn supports_dynamic_config_rpc(sub_system: &str) -> bool {
     NOTIFY_SUB_SYSTEMS.contains(&sub_system)
@@ -195,7 +203,7 @@ fn legacy_scanner_activity_response(namespace_generation: u64) -> ScannerActivit
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
         namespace_generation,
         maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
-        protocol_version: rustfs_storage_api::SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+        protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
         topology_digest: Bytes::new(),
         data_movement_active: false,
         response_proof: Bytes::new(),
@@ -1553,62 +1561,41 @@ impl Node for NodeService {
             Some(value) => match value.parse::<bool>() {
                 Ok(value) => value,
                 Err(_) => {
-                    return Ok(Response::new(SignalServiceResponse {
-                        success: false,
-                        error_info: Some(format!("invalid dry-run value: {value}")),
-                    }));
+                    return Ok(signal_service_response(false, Some(format!("invalid dry-run value: {value}"))));
                 }
             },
         };
 
         match signal {
             Some(SERVICE_SIGNAL_REFRESH_CONFIG) => match reload_runtime_config_snapshot().await {
-                Ok(()) => Ok(Response::new(SignalServiceResponse {
-                    success: true,
-                    error_info: None,
-                })),
-                Err(_) => Ok(Response::new(SignalServiceResponse {
-                    success: false,
-                    error_info: Some("runtime config snapshot reload failed".to_string()),
-                })),
+                Ok(()) => Ok(signal_service_response(true, None)),
+                Err(_) => Ok(signal_service_response(false, Some("runtime config snapshot reload failed".to_string()))),
             },
             Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => {
                 let supported = sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM || supports_dynamic_config_rpc(sub_system);
                 if !supported {
-                    return Ok(Response::new(SignalServiceResponse {
-                        success: false,
-                        error_info: Some(format!("unsupported dynamic config subsystem: {sub_system}")),
-                    }));
+                    return Ok(signal_service_response(
+                        false,
+                        Some(format!("unsupported dynamic config subsystem: {sub_system}")),
+                    ));
                 }
                 if dry_run {
-                    return Ok(Response::new(SignalServiceResponse {
-                        success: true,
-                        error_info: None,
-                    }));
+                    return Ok(signal_service_response(true, None));
                 }
                 match reload_dynamic_config_runtime_state(sub_system).await {
-                    Ok(()) => Ok(Response::new(SignalServiceResponse {
-                        success: true,
-                        error_info: None,
-                    })),
-                    Err(_) => Ok(Response::new(SignalServiceResponse {
-                        success: false,
-                        error_info: Some(format!("dynamic config reload failed for {sub_system}")),
-                    })),
+                    Ok(()) => Ok(signal_service_response(true, None)),
+                    Err(_) => Ok(signal_service_response(
+                        false,
+                        Some(format!("dynamic config reload failed for {sub_system}")),
+                    )),
                 }
             }
-            Some(other) => Ok(Response::new(SignalServiceResponse {
-                success: false,
-                error_info: Some(format!("unsupported service signal: {other}")),
-            })),
-            None if raw_signal.is_some() => Ok(Response::new(SignalServiceResponse {
-                success: false,
-                error_info: Some(format!("invalid service signal value: {}", raw_signal.unwrap_or_default())),
-            })),
-            None => Ok(Response::new(SignalServiceResponse {
-                success: false,
-                error_info: Some("missing service signal".to_string()),
-            })),
+            Some(other) => Ok(signal_service_response(false, Some(format!("unsupported service signal: {other}")))),
+            None if raw_signal.is_some() => Ok(signal_service_response(
+                false,
+                Some(format!("invalid service signal value: {}", raw_signal.unwrap_or_default())),
+            )),
+            None => Ok(signal_service_response(false, Some("missing service signal".to_string()))),
         }
     }
 
@@ -1616,16 +1603,20 @@ impl Node for NodeService {
         &self,
         request: Request<ScannerActivityRequest>,
     ) -> Result<Response<ScannerActivityResponse>, Status> {
+        if !request.get_ref().challenge.is_empty() {
+            verify_tonic_canonical_body_digest(&request, request.get_ref().challenge.as_ref())
+                .map_err(|err| Status::permission_denied(format!("scanner activity authentication failed: {err}")))?;
+        }
         let store = self
             .resolve_object_store()
             .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
-        let request = request.into_inner();
-        if request.challenge.is_empty() {
+        if request.get_ref().challenge.is_empty() {
             // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers send an empty activity request. Remove after every supported peer implements authenticated scanner activity protocol v4.
             return Ok(Response::new(legacy_scanner_activity_response(
                 store.scanner_namespace_mutation_generation(),
             )));
         }
+        let request = request.into_inner();
         let challenge: [u8; 16] = request
             .challenge
             .as_ref()
@@ -1898,12 +1889,12 @@ impl Node for NodeService {
 mod tests {
     use super::{
         CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService,
-        PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-        STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
-        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, legacy_scanner_activity_response,
-        make_heal_control_server, make_heal_control_server_with_cache, make_server,
-        make_tier_mutation_control_server_for_context, remove_heal_control_replay, scanner_activity_response,
-        stop_rebalance_response,
+        PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS, admit_heal_control_replay,
+        background_rebalance_start_error_message, execute_heal_control_envelope_with_manager,
+        initialize_heal_topology_fingerprint, legacy_scanner_activity_response, make_heal_control_server,
+        make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server_for_context,
+        remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
@@ -4252,17 +4243,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scanner_activity_requires_storage_layer() {
+    async fn test_scanner_activity_requires_body_bound_auth_before_storage_lookup() {
         let service = create_test_node_service();
 
-        let err = service
+        let unsigned = service
             .scanner_activity(Request::new(ScannerActivityRequest {
                 challenge: vec![7; 16].into(),
             }))
             .await
-            .expect_err("activity queries must fail closed before storage is initialized");
+            .expect_err("unsigned activity queries must fail before storage lookup");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
 
-        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let mut tampered = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+        });
+        set_tonic_canonical_body_digest(&mut tampered, &[8; 16]).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut tampered);
+        let tampered = service
+            .scanner_activity(tampered)
+            .await
+            .expect_err("tampered activity challenge must fail before storage lookup");
+        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
+
+        let mut signed = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+        });
+        set_tonic_canonical_body_digest(&mut signed, &[7; 16]).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut signed);
+        let unavailable = service
+            .scanner_activity(signed)
+            .await
+            .expect_err("authenticated activity queries still require initialized storage");
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
     }
 
     #[test]
@@ -4282,7 +4294,7 @@ mod tests {
         let response = legacy_scanner_activity_response(17);
 
         assert_eq!(response.namespace_generation, 17);
-        assert_eq!(response.protocol_version, rustfs_storage_api::SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION);
+        assert_eq!(response.protocol_version, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION);
         assert!(response.topology_digest.is_empty());
         assert!(!response.data_movement_active);
         assert!(response.response_proof.is_empty());
@@ -4345,6 +4357,7 @@ mod tests {
 
         assert!(response.success, "new nodes must advertise notify lifecycle reload support");
         assert!(response.error_info.is_none());
+        assert_eq!(response.protocol_version, rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION);
     }
 
     #[tokio::test]

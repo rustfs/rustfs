@@ -3494,13 +3494,13 @@ mod tests {
     use super::*;
     use crate::scanner_budget::ScannerCycleBudgetConfig;
     use crate::scanner_folder::ScannerItem;
+    use crate::storage_api::scan::{BucketOperations as _, MakeBucketOptions, ObjectIO as _};
     use crate::{
         DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
         ScannerPutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
         init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
     };
     use rustfs_filemeta::FileInfo;
-    use rustfs_storage_api::{BucketOperations as _, MakeBucketOptions, ObjectIO as _};
     use serial_test::serial;
     use temp_env::with_var;
     use time::OffsetDateTime;

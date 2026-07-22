@@ -654,7 +654,9 @@ pub async fn signal_config_snapshot_reload_checked() -> S3Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::runtime_sources::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
+    use crate::admin::runtime_sources::{
+        IamInterface, KmsInterface, NotificationSystemInterface, ServerConfigInterface, StorageClassInterface,
+    };
     use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use crate::admin::storage_api::config::{
         read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_server_config,
@@ -662,7 +664,6 @@ mod tests {
     };
     use crate::admin::storage_api::error::StorageError;
     use crate::admin::storage_api::runtime_sources::NotificationSys;
-    use crate::app::context::NotificationSystemInterface;
     use crate::server::{
         ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot, is_event_notifier_reconciled,
         refresh_persisted_module_switches_from, save_persisted_module_switches_to,

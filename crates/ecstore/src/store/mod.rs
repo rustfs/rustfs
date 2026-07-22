@@ -445,11 +445,7 @@ impl BucketOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        let result = self.handle_make_bucket(bucket, opts).await;
-        if result.is_ok() {
-            list_objects::observe_scanner_namespace_mutations(bucket, 1);
-        }
-        result
+        self.handle_make_bucket(bucket, opts).await
     }
 
     #[instrument(skip(self))]

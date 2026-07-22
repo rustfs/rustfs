@@ -27,7 +27,8 @@ use rustfs_common::heal_channel::HealScanMode;
 #[cfg(test)]
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
-    BucketTargetUsageInfo, BucketUsageInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, hash_path,
+    BucketTargetUsageInfo, BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageEntry, DataUsageHash, DataUsageHashMap,
+    DataUsageInfo, LEGACY_DATA_USAGE_OBJECT_NAME, hash_path,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -43,8 +44,6 @@ use crate::{
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
-
-const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
@@ -171,7 +170,10 @@ pub static DATA_USAGE_BUCKET: LazyLock<String> =
     LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{BUCKET_META_PREFIX}"));
 
 pub static DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
-    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJ_NAME}"));
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJECT_NAME}"));
+
+pub static LEGACY_DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{LEGACY_DATA_USAGE_OBJECT_NAME}"));
 
 pub static DATA_USAGE_BLOOM_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_BLOOM_NAME}"));
@@ -277,15 +279,16 @@ pub struct SizeSummary {
 impl SizeSummary {
     pub fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
         if oi.delete_marker {
-            self.delete_markers += 1;
+            self.delete_markers = self.delete_markers.saturating_add(1);
             return;
         }
 
         if oi.version_id.is_some_and(|v| !v.is_nil()) && size == actual_size {
-            self.versions += 1;
+            self.versions = self.versions.saturating_add(1);
         }
 
-        self.total_size += if size > 0 { size as usize } else { 0 };
+        let size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+        self.total_size = self.total_size.saturating_add(size);
 
         if oi.transitioned_object.free_version {
             return;
@@ -1541,27 +1544,27 @@ impl SizeSummary {
 
     /// Add another SizeSummary to this one
     pub fn add(&mut self, other: &SizeSummary) {
-        self.total_size += other.total_size;
-        self.versions += other.versions;
-        self.delete_markers += other.delete_markers;
-        self.replicated_size += other.replicated_size;
-        self.replicated_count += other.replicated_count;
-        self.pending_size += other.pending_size;
-        self.failed_size += other.failed_size;
-        self.replica_size += other.replica_size;
-        self.replica_count += other.replica_count;
-        self.pending_count += other.pending_count;
-        self.failed_count += other.failed_count;
+        self.total_size = self.total_size.saturating_add(other.total_size);
+        self.versions = self.versions.saturating_add(other.versions);
+        self.delete_markers = self.delete_markers.saturating_add(other.delete_markers);
+        self.replicated_size = self.replicated_size.saturating_add(other.replicated_size);
+        self.replicated_count = self.replicated_count.saturating_add(other.replicated_count);
+        self.pending_size = self.pending_size.saturating_add(other.pending_size);
+        self.failed_size = self.failed_size.saturating_add(other.failed_size);
+        self.replica_size = self.replica_size.saturating_add(other.replica_size);
+        self.replica_count = self.replica_count.saturating_add(other.replica_count);
+        self.pending_count = self.pending_count.saturating_add(other.pending_count);
+        self.failed_count = self.failed_count.saturating_add(other.failed_count);
 
         // Merge replication target stats
         for (target, stats) in &other.repl_target_stats {
             let entry = self.repl_target_stats.entry(target.clone()).or_default();
-            entry.replicated_size += stats.replicated_size;
-            entry.replicated_count += stats.replicated_count;
-            entry.pending_size += stats.pending_size;
-            entry.failed_size += stats.failed_size;
-            entry.pending_count += stats.pending_count;
-            entry.failed_count += stats.failed_count;
+            entry.replicated_size = entry.replicated_size.saturating_add(stats.replicated_size);
+            entry.replicated_count = entry.replicated_count.saturating_add(stats.replicated_count);
+            entry.pending_size = entry.pending_size.saturating_add(stats.pending_size);
+            entry.failed_size = entry.failed_size.saturating_add(stats.failed_size);
+            entry.pending_count = entry.pending_count.saturating_add(stats.pending_count);
+            entry.failed_count = entry.failed_count.saturating_add(stats.failed_count);
         }
     }
 }
@@ -2097,6 +2100,87 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn size_summary_add_saturates_all_usage_counters() {
+        let target = "arn:minio:replication::target".to_string();
+        let mut summary = SizeSummary {
+            total_size: usize::MAX,
+            versions: usize::MAX,
+            delete_markers: usize::MAX,
+            replicated_size: i64::MAX,
+            replicated_count: usize::MAX,
+            pending_size: i64::MAX,
+            failed_size: i64::MAX,
+            replica_size: i64::MAX,
+            replica_count: usize::MAX,
+            pending_count: usize::MAX,
+            failed_count: usize::MAX,
+            ..Default::default()
+        };
+        summary.repl_target_stats.insert(
+            target.clone(),
+            ReplTargetSizeSummary {
+                replicated_size: i64::MAX,
+                replicated_count: usize::MAX,
+                pending_size: i64::MAX,
+                failed_size: i64::MAX,
+                pending_count: usize::MAX,
+                failed_count: usize::MAX,
+            },
+        );
+
+        let mut increment = SizeSummary {
+            total_size: 1,
+            versions: 1,
+            delete_markers: 1,
+            replicated_size: 1,
+            replicated_count: 1,
+            pending_size: 1,
+            failed_size: 1,
+            replica_size: 1,
+            replica_count: 1,
+            pending_count: 1,
+            failed_count: 1,
+            ..Default::default()
+        };
+        increment.repl_target_stats.insert(
+            target.clone(),
+            ReplTargetSizeSummary {
+                replicated_size: 1,
+                replicated_count: 1,
+                pending_size: 1,
+                failed_size: 1,
+                pending_count: 1,
+                failed_count: 1,
+            },
+        );
+
+        summary.add(&increment);
+
+        assert_eq!(summary.total_size, usize::MAX);
+        assert_eq!(summary.versions, usize::MAX);
+        assert_eq!(summary.delete_markers, usize::MAX);
+        assert_eq!(summary.replicated_size, i64::MAX);
+        assert_eq!(summary.replicated_count, usize::MAX);
+        assert_eq!(summary.pending_size, i64::MAX);
+        assert_eq!(summary.failed_size, i64::MAX);
+        assert_eq!(summary.replica_size, i64::MAX);
+        assert_eq!(summary.replica_count, usize::MAX);
+        assert_eq!(summary.pending_count, usize::MAX);
+        assert_eq!(summary.failed_count, usize::MAX);
+
+        let target_summary = summary
+            .repl_target_stats
+            .get(&target)
+            .expect("replication target summary should remain present");
+        assert_eq!(target_summary.replicated_size, i64::MAX);
+        assert_eq!(target_summary.replicated_count, usize::MAX);
+        assert_eq!(target_summary.pending_size, i64::MAX);
+        assert_eq!(target_summary.failed_size, i64::MAX);
+        assert_eq!(target_summary.pending_count, usize::MAX);
+        assert_eq!(target_summary.failed_count, usize::MAX);
     }
 
     #[test]

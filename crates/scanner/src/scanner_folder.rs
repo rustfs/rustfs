@@ -413,24 +413,36 @@ fn non_negative_i64_to_u64(value: i64) -> u64 {
 }
 
 fn apply_scanner_size_summary(into: &mut DataUsageEntry, summary: &SizeSummary) {
-    into.size += summary.total_size;
-    into.versions += summary.versions;
-    into.delete_markers += summary.delete_markers;
-    into.obj_sizes.add(summary.total_size as u64);
-    into.obj_versions.add(summary.versions as u64);
+    into.size = into.size.saturating_add(summary.total_size);
+    into.versions = into.versions.saturating_add(summary.versions);
+    into.delete_markers = into.delete_markers.saturating_add(summary.delete_markers);
+    into.obj_sizes.add(u64::try_from(summary.total_size).unwrap_or(u64::MAX));
+    into.obj_versions.add(u64::try_from(summary.versions).unwrap_or(u64::MAX));
 
     let replication_stats = into.replication_stats.get_or_insert_with(Default::default);
-    replication_stats.replica_size += non_negative_i64_to_u64(summary.replica_size);
-    replication_stats.replica_count += summary.replica_count as u64;
+    replication_stats.replica_size = replication_stats
+        .replica_size
+        .saturating_add(non_negative_i64_to_u64(summary.replica_size));
+    replication_stats.replica_count = replication_stats
+        .replica_count
+        .saturating_add(u64::try_from(summary.replica_count).unwrap_or(u64::MAX));
 
     for (arn, st) in &summary.repl_target_stats {
         let tgt_stat = replication_stats.targets.entry(arn.clone()).or_default();
-        tgt_stat.pending_size += non_negative_i64_to_u64(st.pending_size);
-        tgt_stat.failed_size += non_negative_i64_to_u64(st.failed_size);
-        tgt_stat.replicated_size += non_negative_i64_to_u64(st.replicated_size);
-        tgt_stat.replicated_count += st.replicated_count as u64;
-        tgt_stat.failed_count += st.failed_count as u64;
-        tgt_stat.pending_count += st.pending_count as u64;
+        tgt_stat.pending_size = tgt_stat.pending_size.saturating_add(non_negative_i64_to_u64(st.pending_size));
+        tgt_stat.failed_size = tgt_stat.failed_size.saturating_add(non_negative_i64_to_u64(st.failed_size));
+        tgt_stat.replicated_size = tgt_stat
+            .replicated_size
+            .saturating_add(non_negative_i64_to_u64(st.replicated_size));
+        tgt_stat.replicated_count = tgt_stat
+            .replicated_count
+            .saturating_add(u64::try_from(st.replicated_count).unwrap_or(u64::MAX));
+        tgt_stat.failed_count = tgt_stat
+            .failed_count
+            .saturating_add(u64::try_from(st.failed_count).unwrap_or(u64::MAX));
+        tgt_stat.pending_count = tgt_stat
+            .pending_count
+            .saturating_add(u64::try_from(st.pending_count).unwrap_or(u64::MAX));
     }
 }
 
@@ -1038,22 +1050,23 @@ impl ScannerItem {
             if let Some(repl_target_size_summary) = size_summary.repl_target_stats.get_mut(arn.as_str()) {
                 match target_status {
                     ReplicationStatusType::Pending => {
-                        repl_target_size_summary.pending_size += roi.size;
-                        repl_target_size_summary.pending_count += 1;
-                        size_summary.pending_size += roi.size;
-                        size_summary.pending_count += 1;
+                        repl_target_size_summary.pending_size = repl_target_size_summary.pending_size.saturating_add(roi.size);
+                        repl_target_size_summary.pending_count = repl_target_size_summary.pending_count.saturating_add(1);
+                        size_summary.pending_size = size_summary.pending_size.saturating_add(roi.size);
+                        size_summary.pending_count = size_summary.pending_count.saturating_add(1);
                     }
                     ReplicationStatusType::Failed => {
-                        repl_target_size_summary.failed_size += roi.size;
-                        repl_target_size_summary.failed_count += 1;
-                        size_summary.failed_size += roi.size;
-                        size_summary.failed_count += 1;
+                        repl_target_size_summary.failed_size = repl_target_size_summary.failed_size.saturating_add(roi.size);
+                        repl_target_size_summary.failed_count = repl_target_size_summary.failed_count.saturating_add(1);
+                        size_summary.failed_size = size_summary.failed_size.saturating_add(roi.size);
+                        size_summary.failed_count = size_summary.failed_count.saturating_add(1);
                     }
                     ReplicationStatusType::Completed | ReplicationStatusType::CompletedLegacy => {
-                        repl_target_size_summary.replicated_size += roi.size;
-                        repl_target_size_summary.replicated_count += 1;
-                        size_summary.replicated_size += roi.size;
-                        size_summary.replicated_count += 1;
+                        repl_target_size_summary.replicated_size =
+                            repl_target_size_summary.replicated_size.saturating_add(roi.size);
+                        repl_target_size_summary.replicated_count = repl_target_size_summary.replicated_count.saturating_add(1);
+                        size_summary.replicated_size = size_summary.replicated_size.saturating_add(roi.size);
+                        size_summary.replicated_count = size_summary.replicated_count.saturating_add(1);
                     }
                     _ => {}
                 }
@@ -1061,8 +1074,8 @@ impl ScannerItem {
         }
 
         if oi.replication_status == ReplicationStatusType::Replica {
-            size_summary.replica_size += roi.size;
-            size_summary.replica_count += 1;
+            size_summary.replica_size = size_summary.replica_size.saturating_add(roi.size);
+            size_summary.replica_count = size_summary.replica_count.saturating_add(1);
         }
     }
 
@@ -2901,6 +2914,76 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use temp_env::{with_var, with_var_unset};
     use uuid::Uuid;
+
+    #[test]
+    fn scanner_size_summary_application_saturates_usage_counters() {
+        let target = "arn:minio:replication::target".to_string();
+        let mut entry = DataUsageEntry {
+            size: usize::MAX,
+            versions: usize::MAX,
+            delete_markers: usize::MAX,
+            replication_stats: Some(Default::default()),
+            ..Default::default()
+        };
+        let replication_stats = entry
+            .replication_stats
+            .as_mut()
+            .expect("replication statistics should be initialized");
+        replication_stats.replica_size = u64::MAX;
+        replication_stats.replica_count = u64::MAX;
+        let target_stats = replication_stats.targets.entry(target.clone()).or_default();
+        target_stats.pending_size = u64::MAX;
+        target_stats.failed_size = u64::MAX;
+        target_stats.replicated_size = u64::MAX;
+        target_stats.replicated_count = u64::MAX;
+        target_stats.failed_count = u64::MAX;
+        target_stats.pending_count = u64::MAX;
+
+        let mut summary = SizeSummary {
+            total_size: 1,
+            versions: 1,
+            delete_markers: 1,
+            replica_size: 1,
+            replica_count: 1,
+            ..Default::default()
+        };
+        summary.repl_target_stats.insert(
+            target.clone(),
+            ReplTargetSizeSummary {
+                replicated_size: 1,
+                replicated_count: 1,
+                pending_size: 1,
+                failed_size: 1,
+                pending_count: 1,
+                failed_count: 1,
+            },
+        );
+
+        apply_scanner_size_summary(&mut entry, &summary);
+
+        assert_eq!(entry.size, usize::MAX);
+        assert_eq!(entry.versions, usize::MAX);
+        assert_eq!(entry.delete_markers, usize::MAX);
+        assert_eq!(entry.obj_sizes.to_map()["LESS_THAN_1024_B"], 1);
+        assert_eq!(entry.obj_versions.to_map()["SINGLE_VERSION"], 1);
+
+        let replication_stats = entry
+            .replication_stats
+            .as_ref()
+            .expect("replication statistics should remain present");
+        assert_eq!(replication_stats.replica_size, u64::MAX);
+        assert_eq!(replication_stats.replica_count, u64::MAX);
+        let target_stats = replication_stats
+            .targets
+            .get(&target)
+            .expect("replication target statistics should remain present");
+        assert_eq!(target_stats.pending_size, u64::MAX);
+        assert_eq!(target_stats.failed_size, u64::MAX);
+        assert_eq!(target_stats.replicated_size, u64::MAX);
+        assert_eq!(target_stats.replicated_count, u64::MAX);
+        assert_eq!(target_stats.failed_count, u64::MAX);
+        assert_eq!(target_stats.pending_count, u64::MAX);
+    }
 
     async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-test-{}", Uuid::new_v4()));
