@@ -224,14 +224,11 @@ impl PeerRestClient {
             return (Vec::new(), Vec::new());
         }
 
-        let eps = eps.clone();
-        let hosts = eps.peer_host_ports_sorted();
+        let hosts = eps.peer_grid_hosts_sorted();
         let mut remote = Vec::with_capacity(hosts.len());
         let mut all = vec![None; hosts.len()];
-        for (i, peer_host_port) in hosts.iter().enumerate() {
-            if let Some(peer_host_port) = peer_host_port
-                && let Some(grid_host) = eps.find_grid_host_from_peer_host_port(peer_host_port)
-            {
+        for (i, peer) in hosts.into_iter().enumerate() {
+            if let Some((peer_host_port, grid_host)) = peer {
                 let host = match XHost::try_from(peer_host_port.clone()) {
                     Ok(host) => host,
                     Err(err) => {

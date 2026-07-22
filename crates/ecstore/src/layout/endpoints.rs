@@ -1020,14 +1020,14 @@ impl EndpointServerPools {
 
     #[instrument]
     pub fn hosts_sorted(&self) -> Vec<Option<XHost>> {
-        let peers = self.peer_host_ports_sorted();
+        let peers = self.peer_grid_hosts_sorted();
 
         let mut ret = vec![None; peers.len()];
-        for (i, peer) in peers.iter().enumerate() {
-            let Some(peer) = peer else {
+        for (i, peer) in peers.into_iter().enumerate() {
+            let Some((peer_host_port, _)) = peer else {
                 continue;
             };
-            let host = match XHost::try_from(peer.to_owned()) {
+            let host = match XHost::try_from(peer_host_port) {
                 Ok(res) => res,
                 Err(err) => {
                     warn!("Xhost parse failed {:?}", err);
@@ -1052,6 +1052,35 @@ impl EndpointServerPools {
                 continue;
             }
             ret[i] = Some(peer);
+        }
+
+        ret
+    }
+
+    pub fn peer_grid_hosts_sorted(&self) -> Vec<Option<(String, String)>> {
+        let (mut peers, local) = self.peers();
+        let mut grid_hosts = HashMap::with_capacity(peers.len());
+        let mut ret = vec![None; peers.len()];
+
+        for ep in self.0.iter() {
+            for endpoint in ep.endpoints.0.iter() {
+                if endpoint.get_type() != EndpointType::Url || endpoint.is_local {
+                    continue;
+                }
+                grid_hosts.entry(endpoint.host_port()).or_insert_with(|| endpoint.grid_host());
+            }
+        }
+
+        peers.sort();
+
+        for (i, peer) in peers.into_iter().enumerate() {
+            if local == peer {
+                continue;
+            }
+            let Some(grid_host) = grid_hosts.get(&peer) else {
+                continue;
+            };
+            ret[i] = Some((peer, grid_host.clone()));
         }
 
         ret
@@ -1470,6 +1499,10 @@ mod test {
             Some("http://rustfs-4.storage.swarm.private:9000"),
             "raw host:port should map directly to the configured grid host"
         );
+        let peer_grid_hosts = endpoint_pools.peer_grid_hosts_sorted();
+        let remote = peer_grid_hosts[1].as_ref().expect("remote peer should be resolved");
+        assert_eq!(remote.0, "rustfs-4.storage.swarm.private:9000");
+        assert_eq!(remote.1, "http://rustfs-4.storage.swarm.private:9000");
     }
 
     #[tokio::test]
