@@ -247,8 +247,10 @@ impl DefaultAdminUsecase {
         Self::query_data_usage_info_with_store(store).await
     }
 
-    /// Serve the last persisted scanner snapshot plus the in-memory overlay.
-    /// This request path must never trigger a live full-version listing
+    /// Serve the last persisted scanner snapshot plus an authoritative
+    /// single-process overlay. Distributed nodes must not promote their
+    /// process-local absolute counters to cluster-wide bucket totals.
+    /// This path never triggers a live full-version listing
     /// (rustfs/backlog#1306); freshness is owned by the scanner.
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
         let mut info = Self::map_data_usage_load_result(load_data_usage_from_backend_cached(store.clone()).await)?;

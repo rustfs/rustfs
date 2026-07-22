@@ -671,7 +671,7 @@ mod tests {
     use crate::storage_api::startup::storage::{init_local_disks_with_instance_ctx, new_instance_ctx};
     use rustfs_config::notify::{ENV_NOTIFY_WEBHOOK_ENABLE, ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
-    use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
+    use rustfs_config::{ENV_SCANNER_CYCLE, HEAL_SUB_SYS, SCANNER_CYCLE, SCANNER_SUB_SYS};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_kms::KmsServiceManager;
@@ -820,6 +820,16 @@ mod tests {
         config
             .0
             .insert(STORAGE_CLASS_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
+        config
+    }
+
+    fn scanner_server_config(cycle: &str) -> ServerConfig {
+        let mut config = ServerConfig::new();
+        let mut kvs = KVS::new();
+        kvs.insert(SCANNER_CYCLE.to_string(), cycle.to_string());
+        config
+            .0
+            .insert(SCANNER_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
         config
     }
 
@@ -1166,6 +1176,47 @@ mod tests {
                 );
             },
         )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(scanner_env)]
+    async fn peer_scanner_reload_publishes_server_snapshot_used_by_cycle_refresh() {
+        temp_env::async_with_vars([(ENV_SCANNER_CYCLE, None::<&str>)], async {
+            let fixture = runtime_config_reload_fixture().await;
+            let candidate = scanner_server_config("61");
+            save_admin_server_config(fixture.context.object_store(), &candidate)
+                .await
+                .expect("persist scanner config");
+
+            reload_dynamic_config_runtime_state_for_context(Some(&fixture.context), SCANNER_SUB_SYS)
+                .await
+                .expect("scanner peer reload should apply persisted config");
+
+            assert_eq!(fixture.server_set_calls.load(Ordering::SeqCst), 1);
+            let snapshot = fixture
+                .server_snapshot
+                .lock()
+                .expect("server config result lock")
+                .clone()
+                .expect("scanner peer reload should publish a server config snapshot");
+            assert_eq!(
+                snapshot
+                    .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+                    .expect("scanner defaults should be present")
+                    .get(SCANNER_CYCLE),
+                "61",
+                "scanner peer reload must keep the process-wide config source current"
+            );
+            let runtime = rustfs_scanner::scanner_runtime_config_status();
+            assert_eq!(runtime.cycle_interval_seconds.value, 61);
+            assert_eq!(
+                runtime.cycle_interval_seconds.source,
+                rustfs_scanner::runtime_config::ScannerRuntimeConfigSource::Config
+            );
+
+            rustfs_scanner::apply_scanner_runtime_config(&ServerConfig::new()).expect("restore scanner runtime defaults");
+        })
         .await;
     }
 

@@ -588,6 +588,7 @@ pub async fn validate_remote_scanner_request_fence(
         store,
         &REMOTE_SCANNER_VALIDATED_CYCLE,
         &REMOTE_SCANNER_CYCLE_REFRESH,
+        NS_SCANNER_VALIDATED_CYCLE_TTL,
     )
     .await
 }
@@ -598,6 +599,7 @@ async fn validate_remote_scanner_request_fence_cached(
     store: Arc<impl ScannerObjectIO>,
     cache: &Mutex<Option<RemoteScannerValidatedCycle>>,
     refresh: &AsyncMutex<()>,
+    cache_ttl: Duration,
 ) -> Result<(), ScannerError> {
     if cached_remote_scanner_fence_matches(cache, requested_cycle, requested_leader_epoch, Instant::now())? {
         return Ok(());
@@ -611,7 +613,7 @@ async fn validate_remote_scanner_request_fence_cached(
     let (persisted_cycle, persisted_leader_epoch) =
         validate_remote_scanner_request_fence_with_store(requested_cycle, requested_leader_epoch, store).await?;
     let valid_until = Instant::now()
-        .checked_add(NS_SCANNER_VALIDATED_CYCLE_TTL)
+        .checked_add(cache_ttl)
         .ok_or_else(|| ScannerError::Other("remote namespace scanner cycle cache expiry overflow".to_string()))?;
     *cache
         .lock()
@@ -663,6 +665,27 @@ async fn watch_remote_scanner_request_fence(
     store: Arc<impl ScannerObjectIO>,
     poll_interval: Duration,
 ) -> Result<(), ScannerError> {
+    watch_remote_scanner_request_fence_with_cache(
+        requested_cycle,
+        requested_leader_epoch,
+        store,
+        poll_interval,
+        &REMOTE_SCANNER_VALIDATED_CYCLE,
+        &REMOTE_SCANNER_CYCLE_REFRESH,
+        NS_SCANNER_VALIDATED_CYCLE_TTL,
+    )
+    .await
+}
+
+async fn watch_remote_scanner_request_fence_with_cache(
+    requested_cycle: u64,
+    requested_leader_epoch: u64,
+    store: Arc<impl ScannerObjectIO>,
+    poll_interval: Duration,
+    cache: &Mutex<Option<RemoteScannerValidatedCycle>>,
+    refresh: &AsyncMutex<()>,
+    cache_ttl: Duration,
+) -> Result<(), ScannerError> {
     if poll_interval.is_zero() {
         return Err(ScannerError::Other(
             "remote namespace scanner fence poll interval must be positive".to_string(),
@@ -675,7 +698,15 @@ async fn watch_remote_scanner_request_fence(
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         poll.tick().await;
-        validate_remote_scanner_request_fence_with_store(requested_cycle, requested_leader_epoch, store.clone()).await?;
+        validate_remote_scanner_request_fence_cached(
+            requested_cycle,
+            requested_leader_epoch,
+            store.clone(),
+            cache,
+            refresh,
+            cache_ttl,
+        )
+        .await?;
     }
 }
 
@@ -2025,7 +2056,25 @@ mod tests {
         let store = Arc::new(MutableCycleStateStore {
             state: RwLock::new(crate::scanner::encode_scanner_cycle_fence_for_test(7, 9)),
         });
-        let watcher = tokio::spawn(watch_remote_scanner_request_fence(7, 9, store.clone(), Duration::from_millis(5)));
+        let cache = Arc::new(Mutex::new(None));
+        let refresh = Arc::new(AsyncMutex::new(()));
+        let watcher = tokio::spawn({
+            let cache = cache.clone();
+            let refresh = refresh.clone();
+            let store = store.clone();
+            async move {
+                watch_remote_scanner_request_fence_with_cache(
+                    7,
+                    9,
+                    store,
+                    Duration::from_millis(5),
+                    cache.as_ref(),
+                    refresh.as_ref(),
+                    Duration::from_millis(5),
+                )
+                .await
+            }
+        });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         *store.state.write().expect("cycle state test lock should remain available") =
@@ -2056,6 +2105,7 @@ mod tests {
                 store.clone(),
                 &cache,
                 &refresh,
+                NS_SCANNER_VALIDATED_CYCLE_TTL,
             )
         }))
         .await;

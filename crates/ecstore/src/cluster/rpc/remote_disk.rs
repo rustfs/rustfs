@@ -99,6 +99,17 @@ const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
 
+fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
+    volume_infos
+        .into_iter()
+        .enumerate()
+        .map(|(index, json)| {
+            serde_json::from_str::<VolumeInfo>(&json)
+                .map_err(|err| Error::other(format!("decode list volumes entry {index} failed: {err}")))
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchMetadataRpcMode {
     Off,
@@ -1403,11 +1414,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let infos = response
-                    .volume_infos
-                    .into_iter()
-                    .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
-                    .collect();
+                let infos = decode_volume_infos(response.volume_infos)?;
 
                 Ok(infos)
             },
@@ -2789,6 +2796,19 @@ mod tests {
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[test]
+    fn list_volumes_decode_rejects_a_malformed_entry() {
+        let valid = serde_json::to_string(&VolumeInfo {
+            name: "bucket".to_string(),
+            created: None,
+        })
+        .expect("volume info should serialize");
+        let err = decode_volume_infos(vec![valid, "{".to_string()])
+            .expect_err("a malformed volume entry must fail the complete response");
+
+        assert!(err.to_string().contains("entry 1"));
+    }
 
     #[test]
     fn decoded_remote_metadata_rejects_default_like_delete_marker() {

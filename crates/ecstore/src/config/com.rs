@@ -2074,6 +2074,9 @@ where
         > + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
 {
     let config_file = server_config_path();
+    // Lock order: config transaction lock -> config object lock -> history
+    // object lock. Other config object users never acquire the transaction
+    // lock, so they cannot create the reverse order.
     let transaction_lock = server_config_transaction_lock_path();
     let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &transaction_lock).await?;
     let guard = lock.get_write_lock(get_lock_acquire_timeout()).await?;
@@ -4133,9 +4136,11 @@ mod tests {
         heal_replacement: Option<Vec<u8>>,
         heal_calls: AtomicUsize,
         write_calls: AtomicUsize,
+        last_put_no_lock: AtomicBool,
         revision: AtomicUsize,
         drive_counts: Vec<usize>,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+        lock_resources: Mutex<Vec<String>>,
     }
 
     impl RecoveryMockStore {
@@ -4145,9 +4150,11 @@ mod tests {
                 heal_replacement,
                 heal_calls: AtomicUsize::new(0),
                 write_calls: AtomicUsize::new(0),
+                last_put_no_lock: AtomicBool::new(false),
                 revision: AtomicUsize::new(1),
                 drive_counts: vec![2],
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
+                lock_resources: Mutex::new(Vec::new()),
             }
         }
 
@@ -4233,6 +4240,7 @@ mod tests {
             }
             let mut body = Vec::new();
             data.stream.read_to_end(&mut body).await?;
+            self.last_put_no_lock.store(opts.no_lock, Ordering::SeqCst);
             self.write_calls.fetch_add(1, Ordering::SeqCst);
             *self.state.lock().expect("state lock poisoned") = RecoveryReadState::Blob(body.clone());
             let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
@@ -4251,6 +4259,10 @@ mod tests {
         type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
 
         async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<Self::NamespaceLock> {
+            self.lock_resources
+                .lock()
+                .expect("lock resources mutex poisoned")
+                .push(object.to_string());
             Ok(rustfs_lock::NamespaceLockWrapper::new(
                 rustfs_lock::NamespaceLock::with_local_manager(
                     "server-config-recovery-mock".to_string(),
@@ -4273,6 +4285,12 @@ mod tests {
             .expect("scanner-only config change should be persisted");
 
         assert_eq!(store.write_calls.load(Ordering::SeqCst), 1);
+        assert!(!store.last_put_no_lock.load(Ordering::SeqCst));
+        assert_eq!(
+            store.lock_resources.lock().expect("lock resources mutex poisoned").as_slice(),
+            &[server_config_transaction_lock_path()]
+        );
+        assert_ne!(server_config_transaction_lock_path(), server_config_path());
         let decoded = read_config_without_migrate(store)
             .await
             .expect("persisted scanner config should reload");
@@ -4341,7 +4359,7 @@ mod tests {
         let lock = rustfs_lock::NamespaceLock::new("server-config-lease-loss".to_string(), client.clone());
         let guard = lock
             .lock_guard(
-                rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, "config/config.json"),
+                rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, server_config_transaction_lock_path()),
                 "server-config-lease-loss",
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_millis(120),

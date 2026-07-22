@@ -128,10 +128,9 @@ fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
         .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
 }
 
-#[derive(Clone)]
 pub struct ScannerBucketScanPlan {
     buckets: Vec<BucketInfo>,
-    all_buckets: Vec<BucketInfo>,
+    all_buckets: Arc<Vec<BucketInfo>>,
     digest: DataUsageScanPlanDigest,
     leader_epoch: u64,
     dirty_usage_buckets: Arc<DirtyUsageBuckets>,
@@ -933,13 +932,12 @@ fn completed_data_usage_info(
     bucket_plan_complete: bool,
     budget_elapsed: bool,
     cancelled: bool,
-    dirty_usage_current: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     if !bucket_plan_complete {
         return None;
     }
     let completed_set_count = results.iter().filter(|result| result.info.last_update.is_some()).count();
-    if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) || !dirty_usage_current {
+    if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
         return None;
     }
     if !scanner_results_form_complete_snapshot(results, expected_sources) {
@@ -1066,18 +1064,9 @@ mod publish_gate_tests {
         all_buckets: &[String],
         budget_elapsed: bool,
         cancelled: bool,
-        dirty_usage_current: bool,
     ) -> Option<(DataUsageInfo, SystemTime)> {
         let expected_sources = results.iter().filter_map(|result| result.info.source).collect::<HashSet<_>>();
-        completed_data_usage_info(
-            results,
-            &expected_sources,
-            all_buckets,
-            true,
-            budget_elapsed,
-            cancelled,
-            dirty_usage_current,
-        )
+        completed_data_usage_info(results, &expected_sources, all_buckets, true, budget_elapsed, cancelled)
     }
 
     #[test]
@@ -1089,29 +1078,43 @@ mod publish_gate_tests {
         second_set.replace("bucket-a", DATA_USAGE_ROOT, DataUsageEntry::default());
 
         assert!(
-            completed_data_usage_info_for_test(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false, true)
+            completed_data_usage_info_for_test(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false)
                 .is_none()
         );
         assert!(
-            completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, true, false, true)
-                .is_none()
+            completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, true, false).is_none()
         );
         assert!(
-            completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, false, true, true)
-                .is_none()
-        );
-        assert!(
-            completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, false, false, false)
-                .is_none()
+            completed_data_usage_info_for_test(&[first_set.clone(), second_set.clone()], &all_buckets, false, true).is_none()
         );
 
         let (data_usage_info, last_update) =
-            completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false, true)
+            completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
                 .expect("all completed sets should produce a publishable data usage snapshot");
         assert_eq!(last_update, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
         assert_eq!(data_usage_info.scanner_cycle, Some(0));
         assert_eq!(data_usage_info.objects_total_count, 3);
         assert_eq!(data_usage_info.buckets_usage.len(), 2);
+    }
+
+    #[test]
+    fn complete_usage_candidate_with_changed_generation_is_superseded() {
+        let all_buckets = vec!["bucket".to_string()];
+        let completed_set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+        let completed_usage = completed_data_usage_info_for_test(&[completed_set], &all_buckets, false, false);
+
+        assert!(completed_usage.is_some());
+        assert_eq!(
+            classify_nsscanner_cycle(
+                completed_usage.is_some(),
+                false,
+                false,
+                ScannerBucketScanStatus::Complete,
+                DirtyUsageSnapshotStatus::Changed,
+                ScannerCycleActivityStatus::Unchanged,
+            ),
+            ScannerCycleStatus::Superseded
+        );
     }
 
     #[test]
@@ -1131,7 +1134,7 @@ mod publish_gate_tests {
         );
 
         let (data_usage_info, last_update) =
-            completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false, true)
+            completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
                 .expect("unique completed set snapshots should be aggregated");
         let bucket = data_usage_info.buckets_usage.get("bucket").expect("merged bucket usage");
 
@@ -1171,7 +1174,7 @@ mod publish_gate_tests {
         first_set.replace("bucket/prefix", "bucket", nested);
         let second_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
 
-        let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false, true)
+        let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
             .expect("nested bucket entries should be flattened before aggregation");
         let bucket = data_usage_info.buckets_usage.get("bucket").expect("merged bucket usage");
 
@@ -1206,7 +1209,7 @@ mod publish_gate_tests {
             .expect("nested entry")
             .add_child(&crate::hash_path("bucket"));
 
-        assert!(completed_data_usage_info_for_test(&[cache], &all_buckets, false, false, true).is_none());
+        assert!(completed_data_usage_info_for_test(&[cache], &all_buckets, false, false).is_none());
     }
 
     #[test]
@@ -1216,13 +1219,11 @@ mod publish_gate_tests {
         let first_set = completed_root_cache("bucket", 2, 10, source);
         let duplicate_set = completed_root_cache("bucket", 3, 20, source);
 
-        assert!(
-            completed_data_usage_info_for_test(&[first_set.clone(), duplicate_set], &all_buckets, false, false, true).is_none()
-        );
+        assert!(completed_data_usage_info_for_test(&[first_set.clone(), duplicate_set], &all_buckets, false, false).is_none());
 
         let mut incomplete_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
         incomplete_set.info.snapshot_complete = false;
-        assert!(completed_data_usage_info_for_test(&[first_set, incomplete_set], &all_buckets, false, false, true).is_none());
+        assert!(completed_data_usage_info_for_test(&[first_set, incomplete_set], &all_buckets, false, false).is_none());
     }
 
     #[test]
@@ -1233,7 +1234,7 @@ mod publish_gate_tests {
         let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0), DataUsageCacheSource::new(1, 0)]);
 
         assert!(
-            completed_data_usage_info(&[first_set, unexpected_set], &expected_sources, &all_buckets, true, false, false, true,)
+            completed_data_usage_info(&[first_set, unexpected_set], &expected_sources, &all_buckets, true, false, false)
                 .is_none()
         );
     }
@@ -1244,7 +1245,7 @@ mod publish_gate_tests {
         let set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
         let expected_sources = HashSet::from([DataUsageCacheSource::new(0, 0)]);
 
-        assert!(completed_data_usage_info(&[set], &expected_sources, &all_buckets, false, false, false, true).is_none());
+        assert!(completed_data_usage_info(&[set], &expected_sources, &all_buckets, false, false, false).is_none());
     }
 
     #[test]
@@ -1254,9 +1255,7 @@ mod publish_gate_tests {
         complete_set.replace("bucket-b", DATA_USAGE_ROOT, DataUsageEntry::default());
         let missing_bucket_set = completed_root_cache("bucket-a", 3, 20, DataUsageCacheSource::new(1, 0));
 
-        assert!(
-            completed_data_usage_info_for_test(&[complete_set, missing_bucket_set], &all_buckets, false, false, true).is_none()
-        );
+        assert!(completed_data_usage_info_for_test(&[complete_set, missing_bucket_set], &all_buckets, false, false).is_none());
     }
 
     #[test]
@@ -1266,7 +1265,7 @@ mod publish_gate_tests {
         let mut second_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
         second_set.info.scan_plan_digest = Some(DataUsageScanPlanDigest([8; 32]));
 
-        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false, true).is_none());
+        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
     }
 
     #[test]
@@ -1277,7 +1276,7 @@ mod publish_gate_tests {
         first_set.info.next_cycle = 12;
         second_set.info.next_cycle = 13;
 
-        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false, true).is_none());
+        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
     }
 
     #[test]
@@ -1288,7 +1287,7 @@ mod publish_gate_tests {
         first_set.info.leader_epoch = 11;
         second_set.info.leader_epoch = 12;
 
-        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false, true).is_none());
+        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
     }
 
     #[test]
@@ -1297,7 +1296,7 @@ mod publish_gate_tests {
         let first_set = completed_root_cache("bucket", usize::MAX, 10, DataUsageCacheSource::new(0, 0));
         let second_set = completed_root_cache("bucket", 1, 20, DataUsageCacheSource::new(1, 0));
 
-        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false, true).is_none());
+        assert!(completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false).is_none());
     }
 
     #[test]
@@ -1894,7 +1893,7 @@ impl ScannerIOCycle for ECStore {
         let dirty_generation_before_bucket_list = dirty_usage_generation();
         let bucket_listing = self.list_bucket_for_scanner(&BucketOptions::default()).await?;
         let mut bucket_plan_complete = bucket_listing.topology_complete;
-        let all_buckets = bucket_listing.buckets;
+        let all_buckets = Arc::new(bucket_listing.buckets);
         let expected_sources = Arc::new(
             self.pools
                 .iter()
@@ -1997,7 +1996,7 @@ impl ScannerIOCycle for ECStore {
                 // Clone the Arc to move it into the spawned task
                 let set_clone: Arc<SetDisks> = Arc::clone(set);
                 let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
-                let set_buckets = buckets_by_source.get(&source).cloned().unwrap_or_default();
+                let set_buckets = buckets_by_source.remove(&source).unwrap_or_default();
                 let pool_label = set.pool_index.to_string();
                 let set_label = set.set_index.to_string();
 
@@ -2024,7 +2023,7 @@ impl ScannerIOCycle for ECStore {
 
                 let scan_plan = ScannerBucketScanPlan {
                     buckets: set_buckets,
-                    all_buckets: all_buckets.clone(),
+                    all_buckets: Arc::clone(&all_buckets),
                     digest: scan_plan_digest,
                     leader_epoch,
                     dirty_usage_buckets: dirty_usage_snapshot.buckets.clone(),
@@ -2147,11 +2146,10 @@ impl ScannerIOCycle for ECStore {
             bucket_plan_complete,
             budget_elapsed,
             ctx.is_cancelled(),
-            dirty_usage_current,
         );
-        let completed_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
+        let structurally_complete_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
         let cycle_status = classify_nsscanner_cycle(
-            completed_snapshot,
+            structurally_complete_snapshot,
             budget_elapsed,
             ctx.is_cancelled(),
             bucket_scan_status,
@@ -2165,7 +2163,7 @@ impl ScannerIOCycle for ECStore {
         }
         let dirty_usage_clear = should_clear_dirty_usage_snapshot(
             result.is_ok(),
-            completed_snapshot,
+            structurally_complete_snapshot,
             budget_elapsed,
             activity_status == ScannerCycleActivityStatus::Unchanged && dirty_usage_current,
             &dirty_usage_snapshot.buckets,
@@ -2221,7 +2219,7 @@ impl ScannerIOCache for SetDisks {
                 cache: HashMap::new(),
             };
             cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
-            for bucket in &all_buckets {
+            for bucket in all_buckets.iter() {
                 cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
             }
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
@@ -2439,7 +2437,7 @@ impl ScannerIOCache for SetDisks {
             cache: HashMap::new(),
         };
         cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
-        for bucket in &all_buckets {
+        for bucket in all_buckets.iter() {
             cache.replace(&bucket.name, DATA_USAGE_ROOT, DataUsageEntry::default());
         }
 

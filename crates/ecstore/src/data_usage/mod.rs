@@ -1189,8 +1189,23 @@ pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
     record_bucket_object_delete_memory(bucket, size_decrement, size_decrement > 0).await;
 }
 
-/// Get bucket usage from in-memory cache
+/// Get bucket usage from the authoritative cache for this topology.
+async fn get_persisted_bucket_usage(bucket: &str) -> Option<u64> {
+    let store = runtime_sources::object_store_handle()?;
+    let data_usage_info = load_data_usage_from_backend_cached(store).await.ok()?;
+    data_usage_info.buckets_usage.get(bucket).map(|usage| usage.size)
+}
+
 pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
+    // A process-local mutation cache is authoritative only when every request
+    // is handled by this process. In a distributed deployment it contains an
+    // absolute count derived from one node's requests, so applying it as the
+    // cluster total can replace a complete snapshot with roughly one node's
+    // share of the bucket.
+    if runtime_sources::setup_is_dist_erasure().await {
+        return get_persisted_bucket_usage(bucket).await;
+    }
+
     update_usage_cache_if_needed().await;
 
     let cache = memory_cache().read().await;
@@ -1301,7 +1316,11 @@ pub async fn replace_bucket_usage_memory_from_info(data_usage_info: &DataUsageIn
     *cache = next_cache;
 }
 
-pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageInfo) {
+async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mut DataUsageInfo, authoritative: bool) {
+    if !authoritative {
+        return;
+    }
+
     let cache = memory_cache().read().await;
     if cache.is_empty() {
         return;
@@ -1324,6 +1343,11 @@ pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageIn
         data_usage_info.buckets_count = data_usage_info.buckets_usage.len() as u64;
         data_usage_info.calculate_totals();
     }
+}
+
+pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageInfo) {
+    let authoritative = !runtime_sources::setup_is_dist_erasure().await;
+    apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info, authoritative).await;
 }
 
 /// Sync memory cache with backend data (called by scanner)
@@ -2358,6 +2382,36 @@ mod tests {
                 .get("bucket-a")
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((0, 0))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn distributed_usage_does_not_apply_a_process_local_absolute_count() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 100, 1_000, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory("bucket-a", 42, true).await;
+
+        let mut distributed_response = persisted.clone();
+        apply_bucket_usage_memory_overlay_if_authoritative(&mut distributed_response, false).await;
+        assert_eq!(
+            distributed_response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((100, 1_000))
+        );
+
+        let mut single_process_response = persisted;
+        apply_bucket_usage_memory_overlay_if_authoritative(&mut single_process_response, true).await;
+        assert_eq!(
+            single_process_response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((99, 958))
         );
     }
 
