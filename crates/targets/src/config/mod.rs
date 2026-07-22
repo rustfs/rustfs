@@ -24,8 +24,9 @@ pub use instance::{
     try_normalize_target_plugin_instances, try_normalize_target_plugin_instances_from_env,
 };
 pub use loader::{
-    collect_env_target_instance_ids, collect_env_target_instance_ids_from_env, collect_target_configs,
-    collect_target_configs_from_env, try_collect_target_configs, try_collect_target_configs_from_env,
+    collect_env_target_instance_ids, collect_env_target_instance_ids_from_env, collect_target_config_results,
+    collect_target_config_results_from_env, collect_target_configs, collect_target_configs_from_env, try_collect_target_configs,
+    try_collect_target_configs_from_env,
 };
 pub use target_args::{
     build_amqp_args, build_kafka_args, build_mqtt_args, build_mysql_args, build_nats_args, build_postgres_args,
