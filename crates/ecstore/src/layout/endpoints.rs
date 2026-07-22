@@ -1058,9 +1058,21 @@ impl EndpointServerPools {
     }
 
     pub fn peer_grid_hosts_sorted(&self) -> Vec<Option<(String, String)>> {
+        self.peer_grid_host_slots_sorted()
+            .into_iter()
+            .map(|(peer, grid_host, is_local)| {
+                if is_local {
+                    None
+                } else {
+                    grid_host.map(|grid_host| (peer, grid_host))
+                }
+            })
+            .collect()
+    }
+
+    pub fn peer_grid_host_slots_sorted(&self) -> Vec<(String, Option<String>, bool)> {
         let (mut peers, local) = self.peers();
         let mut grid_hosts = HashMap::with_capacity(peers.len());
-        let mut ret = vec![None; peers.len()];
 
         for ep in self.0.iter() {
             for endpoint in ep.endpoints.0.iter() {
@@ -1073,17 +1085,14 @@ impl EndpointServerPools {
 
         peers.sort();
 
-        for (i, peer) in peers.into_iter().enumerate() {
-            if local == peer {
-                continue;
-            }
-            let Some(grid_host) = grid_hosts.get(&peer) else {
-                continue;
-            };
-            ret[i] = Some((peer, grid_host.clone()));
-        }
-
-        ret
+        peers
+            .into_iter()
+            .map(|peer| {
+                let is_local = local == peer;
+                let grid_host = if is_local { None } else { grid_hosts.get(&peer).cloned() };
+                (peer, grid_host, is_local)
+            })
+            .collect()
     }
 
     pub fn peers(&self) -> (Vec<String>, String) {
