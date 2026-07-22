@@ -1336,6 +1336,7 @@ impl PeerRestClient {
                     .max_encoding_message_size(SCANNER_ACTIVITY_MAX_MESSAGE_SIZE);
                 let mut request = Request::new(ScannerActivityRequest {
                     challenge: challenge.as_bytes().to_vec().into(),
+                    protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
                 });
                 set_tonic_canonical_body_digest(&mut request, challenge.as_bytes())?;
                 let response = client.scanner_activity(request).await?.into_inner();

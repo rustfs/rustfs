@@ -761,6 +761,7 @@ message SignalServiceResponse {
 
 message ScannerActivityRequest {
   bytes challenge = 1;
+  uint32 protocol_version = 2;
 }
 
 message ScannerActivityResponse {

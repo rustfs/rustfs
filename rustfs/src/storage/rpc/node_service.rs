@@ -1603,15 +1603,25 @@ impl Node for NodeService {
         &self,
         request: Request<ScannerActivityRequest>,
     ) -> Result<Response<ScannerActivityResponse>, Status> {
-        if !request.get_ref().challenge.is_empty() {
-            verify_tonic_canonical_body_digest(&request, request.get_ref().challenge.as_ref())
-                .map_err(|err| Status::permission_denied(format!("scanner activity authentication failed: {err}")))?;
+        match request.get_ref().protocol_version {
+            // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): the immediately preceding peer protocol sends a non-empty challenge without a body digest. Remove after every supported peer sends scanner activity protocol v4.
+            SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {}
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+                verify_tonic_canonical_body_digest(&request, request.get_ref().challenge.as_ref())
+                    .map_err(|err| Status::permission_denied(format!("scanner activity authentication failed: {err}")))?;
+            }
+            version => {
+                return Err(Status::failed_precondition(format!(
+                    "unsupported scanner activity request protocol {version}"
+                )));
+            }
         }
         let store = self
             .resolve_object_store()
             .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
         if request.get_ref().challenge.is_empty() {
-            // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers send an empty activity request. Remove after every supported peer implements authenticated scanner activity protocol v4.
+            // Older peers send an empty protocol-0 request and cannot establish
+            // the topology fence required for distributed usage publication.
             return Ok(Response::new(legacy_scanner_activity_response(
                 store.scanner_namespace_mutation_generation(),
             )));
@@ -4246,9 +4256,28 @@ mod tests {
     async fn test_scanner_activity_requires_body_bound_auth_before_storage_lookup() {
         let service = create_test_node_service();
 
+        let legacy = service
+            .scanner_activity(Request::new(ScannerActivityRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+            }))
+            .await
+            .expect_err("a rolling-upgrade request should pass authentication before storage lookup");
+        assert_eq!(legacy.code(), tonic::Code::Unavailable);
+
+        let unsupported = service
+            .scanner_activity(Request::new(ScannerActivityRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION + 1,
+            }))
+            .await
+            .expect_err("an unknown request protocol must fail before storage lookup");
+        assert_eq!(unsupported.code(), tonic::Code::FailedPrecondition);
+
         let unsigned = service
             .scanner_activity(Request::new(ScannerActivityRequest {
                 challenge: vec![7; 16].into(),
+                protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
             }))
             .await
             .expect_err("unsigned activity queries must fail before storage lookup");
@@ -4256,6 +4285,7 @@ mod tests {
 
         let mut tampered = Request::new(ScannerActivityRequest {
             challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
         });
         set_tonic_canonical_body_digest(&mut tampered, &[8; 16]).expect("digest metadata should encode");
         mark_v2_authenticated(&mut tampered);
@@ -4267,6 +4297,7 @@ mod tests {
 
         let mut signed = Request::new(ScannerActivityRequest {
             challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
         });
         set_tonic_canonical_body_digest(&mut signed, &[7; 16]).expect("digest metadata should encode");
         mark_v2_authenticated(&mut signed);

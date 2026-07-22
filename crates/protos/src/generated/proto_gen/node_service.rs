@@ -1083,6 +1083,8 @@ pub struct SignalServiceResponse {
 pub struct ScannerActivityRequest {
     #[prost(bytes = "bytes", tag = "1")]
     pub challenge: ::prost::bytes::Bytes,
+    #[prost(uint32, tag = "2")]
+    pub protocol_version: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerActivityResponse {
