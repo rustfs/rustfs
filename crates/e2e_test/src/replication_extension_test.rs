@@ -4048,17 +4048,23 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
 
 #[tokio::test]
 #[serial]
-async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_site_replication_resync_lifecycle_survives_real_server_restart() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
+    let resync_process_env = [
+        ("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true"),
+        // Verbose server logging can block startup when this focused test is run
+        // through a captured test process rather than nextest.
+        ("RUST_LOG", "error"),
+    ];
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env
-        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
-        .await?;
+    source_env.capture_log_path = Some(format!("{}/server.log", source_env.temp_dir));
+    source_env.start_rustfs_server_with_env(vec![], &resync_process_env).await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.capture_log_path = Some(format!("{}/server.log", target_env.temp_dir));
     target_env
-        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .start_rustfs_server_without_cleanup_with_env(&resync_process_env)
         .await?;
 
     let source_bucket = "site-repl-resync-src";
@@ -4106,12 +4112,12 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
     wait_for_bucket_on_target(&source_client, source_bucket).await?;
     let target_arn = wait_for_remote_target_arn(&source_env, source_bucket).await?;
 
-    for idx in 0..32 {
+    for idx in 0..96 {
         source_client
             .put_object()
             .bucket(source_bucket)
             .key(format!("resync-object-{idx:02}"))
-            .body(ByteStream::from(vec![b'x'; 256 * 1024]))
+            .body(ByteStream::from(vec![b'x'; 512 * 1024]))
             .send()
             .await?;
     }
@@ -4119,18 +4125,31 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
     let started = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
     assert_eq!(started.status, "success", "unexpected start result: {:?}", started);
     assert!(
-        started
-            .buckets
-            .iter()
-            .any(|bucket| bucket.bucket == source_bucket && matches!(bucket.status.as_str(), "started" | "success")),
+        started.buckets.iter().any(|bucket| {
+            bucket.bucket == source_bucket && matches!(bucket.status.as_str(), "started" | "running" | "completed" | "success")
+        }),
         "source bucket start status missing: {:?}",
         started
     );
     assert!(!started.resync_id.is_empty(), "start response omitted the resync id: {:?}", started);
     let started_reset_id = started.resync_id.clone();
 
+    assert!(
+        matches!(started.state.as_str(), "pending" | "running"),
+        "the fixture must keep the first generation active long enough to test duplicate start: {:?}",
+        started
+    );
+    let duplicate_err = site_replication_resync_op(&source_env, "start", &remote_peer)
+        .await
+        .expect_err("duplicate start must be rejected while a generation is active");
+    assert!(
+        duplicate_err.to_string().contains("already active"),
+        "unexpected duplicate start error: {duplicate_err}"
+    );
+
     let canceled = site_replication_resync_op(&source_env, "cancel", &remote_peer).await?;
     assert_eq!(canceled.status, "success", "unexpected cancel result: {:?}", canceled);
+    assert_eq!(canceled.state, "canceled");
     assert!(
         canceled
             .buckets
@@ -4139,34 +4158,56 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         "source bucket cancel status missing: {:?}",
         canceled
     );
+    let canceled_again = site_replication_resync_op(&source_env, "cancel", &remote_peer).await?;
+    assert_eq!(canceled_again.resync_id, canceled.resync_id, "repeated cancel must be idempotent");
+    assert_eq!(canceled_again.state, "canceled");
 
     let canceled_target =
         wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |target| target.status == "Canceled").await?;
-    assert_eq!(canceled_target.status, "Canceled");
     assert_eq!(canceled_target.reset_id, started_reset_id);
 
     let restarted = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
     assert_eq!(restarted.status, "success", "unexpected restart result: {:?}", restarted);
+    assert_ne!(restarted.resync_id, started_reset_id);
     assert!(
+        matches!(restarted.state.as_str(), "pending" | "running"),
+        "the second generation must be active before the process restart: {:?}",
         restarted
-            .buckets
-            .iter()
-            .any(|bucket| bucket.bucket == source_bucket && matches!(bucket.status.as_str(), "started" | "success")),
-        "source bucket restart status missing: {:?}",
-        restarted
+    );
+    let restarted_reset_id = restarted.resync_id.clone();
+
+    source_env.restart_server_preserving_data(vec![], &resync_process_env).await?;
+    wait_for_site_replication_enabled(&source_env, 2).await?;
+
+    let after_restart = site_replication_resync_op(&source_env, "status", &remote_peer).await?;
+    assert_eq!(
+        after_restart.resync_id, restarted_reset_id,
+        "server restart changed the durable resync id"
+    );
+    assert_eq!(after_restart.generation, restarted.generation);
+    assert_eq!(after_restart.created_at, restarted.created_at);
+    assert!(
+        matches!(after_restart.state.as_str(), "pending" | "running" | "completed" | "failed"),
+        "unexpected recovered lifecycle state: {:?}",
+        after_restart
+    );
+    assert!(
+        after_restart.buckets.iter().any(|bucket| bucket.bucket == source_bucket),
+        "durable status lost the source bucket after restart: {:?}",
+        after_restart
     );
     let restart_snapshot = get_replication_reset_status(&source_env, source_bucket, &target_arn).await?;
     let restarted_target = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |target| {
-        !target.reset_id.is_empty() && target.reset_id != started_reset_id
+        target.reset_id == restarted_reset_id
     })
     .await
     .map_err(|err| {
         format!(
             "restart ids: start={} restart={} snapshot={:?}; {err}",
-            started_reset_id, restarted.resync_id, restart_snapshot.targets
+            started_reset_id, restarted_reset_id, restart_snapshot.targets
         )
     })?;
-    assert_ne!(restarted_target.reset_id, started_reset_id);
+    assert_eq!(restarted_target.reset_id, restarted_reset_id);
 
     Ok(())
 }

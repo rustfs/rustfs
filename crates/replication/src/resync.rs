@@ -154,7 +154,7 @@ impl TargetReplicationResyncStatus {
     }
 
     fn marshal_wire_msg(&self, wr: &mut Vec<u8>) -> Result<()> {
-        rmp::encode::write_map_len(wr, 11)?;
+        rmp::encode::write_map_len(wr, 12)?;
         rmp::encode::write_str(wr, "st")?;
         write_msgp_time(wr, wire_time_or_default(self.start_time))?;
         rmp::encode::write_str(wr, "lst")?;
@@ -177,6 +177,8 @@ impl TargetReplicationResyncStatus {
         rmp::encode::write_str(wr, &self.bucket)?;
         rmp::encode::write_str(wr, "obj")?;
         rmp::encode::write_str(wr, &self.object)?;
+        rmp::encode::write_str(wr, "err")?;
+        rmp::encode::write_str(wr, self.error.as_deref().unwrap_or_default())?;
         Ok(())
     }
 
@@ -202,6 +204,10 @@ impl TargetReplicationResyncStatus {
                 "rrc" => out.replicated_count = rmp::decode::read_int(rd)?,
                 "bkt" => out.bucket = read_msgp_str(rd)?,
                 "obj" => out.object = read_msgp_str(rd)?,
+                "err" => {
+                    let error = read_msgp_str(rd)?;
+                    out.error = (!error.is_empty()).then_some(error);
+                }
                 _ => skip_msgp_value(rd)?,
             }
         }
@@ -623,6 +629,7 @@ mod tests {
                 bucket: "bucket-a".to_string(),
                 object: "object-a".to_string(),
                 replicated_count: 7,
+                error: Some("durable failure".to_string()),
                 ..Default::default()
             },
         );
@@ -634,6 +641,7 @@ mod tests {
         assert_eq!(got.targets_map["arn:replication:a"].resync_id, "rid-1");
         assert_eq!(got.targets_map["arn:replication:a"].resync_status, ResyncStatusType::ResyncStarted);
         assert_eq!(got.targets_map["arn:replication:a"].replicated_count, 7);
+        assert_eq!(got.targets_map["arn:replication:a"].error.as_deref(), Some("durable failure"));
     }
 
     #[test]
