@@ -95,16 +95,18 @@ pub fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
 pub struct NotificationSys {
     pub peer_clients: Vec<Option<PeerRestClient>>,
     pub all_peer_clients: Vec<Option<PeerRestClient>>,
+    peer_topology_hosts: Vec<String>,
     peer_admin_caches: Vec<Mutex<PeerAdminCache>>,
 }
 
 impl NotificationSys {
     pub async fn new(eps: EndpointServerPools) -> Self {
-        let (peer_clients, all_peer_clients) = PeerRestClient::new_clients(eps).await;
+        let (peer_clients, all_peer_clients, peer_topology_hosts) = PeerRestClient::new_clients_with_topology(eps).await;
         let peer_admin_caches = (0..peer_clients.len()).map(|_| Mutex::new(PeerAdminCache::new())).collect();
         Self {
             peer_clients,
             all_peer_clients,
+            peer_topology_hosts,
             peer_admin_caches,
         }
     }
@@ -379,22 +381,19 @@ impl NotificationSys {
         let peer_timeout = Duration::from_secs(5);
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
-            let endpoints = endpoints.clone();
-            let cache = self.peer_admin_caches.get(idx);
+            let host = self
+                .peer_topology_hosts
+                .get(idx)
+                .cloned()
+                .or_else(|| client.as_ref().map(|client| client.host.to_string()))
+                .unwrap_or_default();
             futures.push(async move {
-                // `peer_clients` comes from `new_clients`, which only ever pushes
-                // `Some(client)` (local hosts are excluded, not slotted as
-                // `None`), so this branch is unreachable in practice. Kept as a
-                // defensive fallback: report an explicit `unknown` state rather
-                // than a blank `default()` entry, so it can never contribute a
-                // hollow row to `servers[]` (rustfs/backlog#1049 P3).
                 let Some(client) = client else {
-                    return ServerProperties {
-                        state: ItemState::Unknown.to_string().to_owned(),
-                        ..Default::default()
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::NoClient),
                     };
                 };
-                let host = client.host.to_string();
 
                 // First attempt. A single evicted or half-open internode channel
                 // is enough to fail one probe and, before retrying, would drop
@@ -403,8 +402,7 @@ impl NotificationSys {
                 // before falling back (rustfs/backlog#1049, P1-B).
                 match timeout(peer_timeout, client.server_info()).await {
                     Ok(Ok(info)) => {
-                        update_server_info_cache(cache, &host, &info);
-                        return info;
+                        return PeerServerInfoProbe { host, result: Ok(info) };
                     }
                     Ok(Err(err)) => debug!("peer {host} server_info failed (attempt 1/2): {err}"),
                     Err(_) => debug!("peer {host} server_info timed out (attempt 1/2) after {peer_timeout:?}"),
@@ -420,26 +418,29 @@ impl NotificationSys {
 
                 // Second and final attempt on the fresh channel.
                 match timeout(peer_timeout, client.server_info()).await {
-                    Ok(Ok(info)) => {
-                        update_server_info_cache(cache, &host, &info);
-                        info
-                    }
+                    Ok(Ok(info)) => PeerServerInfoProbe { host, result: Ok(info) },
                     Ok(Err(err)) => {
                         warn!("peer {host} server_info failed after retry: {err}");
                         let health = peer_disk_health(&host).await;
-                        handle_server_info_failure(cache, &host, &endpoints, health.as_ref())
+                        PeerServerInfoProbe {
+                            host,
+                            result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                        }
                     }
                     Err(_) => {
                         warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
                         client.evict_connection().await;
                         let health = peer_disk_health(&host).await;
-                        handle_server_info_failure(cache, &host, &endpoints, health.as_ref())
+                        PeerServerInfoProbe {
+                            host,
+                            result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                        }
                     }
                 }
             });
         }
 
-        join_all(futures).await
+        publish_server_info_probe_round(&self.peer_admin_caches, &endpoints, join_all(futures).await)
     }
 
     pub async fn load_user(&self, access_key: &str, temp: bool) -> Vec<NotificationPeerErr> {
@@ -1263,6 +1264,16 @@ struct PeerDiskHealth {
     disks: Vec<rustfs_madmin::Disk>,
 }
 
+struct PeerServerInfoProbe {
+    host: String,
+    result: std::result::Result<ServerProperties, PeerServerInfoProbeFailure>,
+}
+
+enum PeerServerInfoProbeFailure {
+    Rpc { health: Option<PeerDiskHealth> },
+    NoClient,
+}
+
 /// Consult the local disk-health state for `host` without issuing any RPC.
 ///
 /// On the aggregating node a peer's drives are remote-disk handles whose
@@ -1422,6 +1433,30 @@ fn handle_server_info_failure(
     }
 
     unknown_server_properties(host, endpoints)
+}
+
+fn publish_server_info_probe_round(
+    caches: &[Mutex<PeerAdminCache>],
+    endpoints: &EndpointServerPools,
+    probes: Vec<PeerServerInfoProbe>,
+) -> Vec<ServerProperties> {
+    probes
+        .into_iter()
+        .enumerate()
+        .map(|(idx, probe)| {
+            let cache = caches.get(idx);
+            match probe.result {
+                Ok(info) => {
+                    update_server_info_cache(cache, &probe.host, &info);
+                    info
+                }
+                Err(PeerServerInfoProbeFailure::Rpc { health }) => {
+                    handle_server_info_failure(cache, &probe.host, endpoints, health.as_ref())
+                }
+                Err(PeerServerInfoProbeFailure::NoClient) => unknown_server_properties(&probe.host, endpoints),
+            }
+        })
+        .collect()
 }
 
 fn update_server_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &ServerProperties) {
@@ -1634,6 +1669,7 @@ mod tests {
                 "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
                 "http://127.0.0.1:9000".to_string(),
             ))],
+            peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
         };
 
@@ -1677,6 +1713,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
 
@@ -1696,6 +1733,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
 
@@ -1712,6 +1750,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: Vec::new(),
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
         };
 
@@ -1732,6 +1771,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![Some(client)],
             all_peer_clients: vec![None],
+            peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
 
@@ -1741,6 +1781,51 @@ mod tests {
             .expect_err("an incomplete peer topology must disable scanner idle backoff");
 
         assert!(err.to_string().contains("peer topology is incomplete"));
+    }
+
+    #[tokio::test]
+    async fn server_info_no_client_slot_uses_topology_host_without_counting_rpc_failure() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+        };
+
+        let servers = sys.server_info().await;
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].endpoint, "node-a:9000");
+        assert_eq!(servers[0].state, ItemState::Unknown.to_string());
+        let cache = sys.peer_admin_caches[0].lock().expect("cache mutex should not be poisoned");
+        assert_eq!(cache.server_failures, 0, "construction-only missing slots are not failed RPC attempts");
+        assert!(cache.last_server_info.is_none());
+    }
+
+    #[test]
+    fn server_info_failure_cache_stays_aligned_with_topology_slot() {
+        let cache_a = Mutex::new(PeerAdminCache {
+            last_server_info: Some(build_props("cached-a")),
+            last_server_success: Some(SystemTime::now()),
+            server_failures: 1,
+            storage_failures: 0,
+            last_storage_info: None,
+        });
+        let cache_b = Mutex::new(PeerAdminCache {
+            last_server_info: Some(build_props("cached-b")),
+            last_server_success: Some(SystemTime::now()),
+            server_failures: 1,
+            storage_failures: 0,
+            last_storage_info: None,
+        });
+        let caches = [cache_a, cache_b];
+        let endpoints = EndpointServerPools::from(Vec::new());
+
+        let rendered = handle_server_info_failure(Some(&caches[1]), "node-b:9000", &endpoints, None);
+
+        assert_eq!(rendered.endpoint, "cached-b");
+        assert_eq!(caches[0].lock().expect("cache mutex should not be poisoned").server_failures, 1);
+        assert_eq!(caches[1].lock().expect("cache mutex should not be poisoned").server_failures, 2);
     }
 
     #[tokio::test]
@@ -1762,6 +1847,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
 
@@ -1781,6 +1867,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
 
@@ -1796,6 +1883,7 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
         };
         let mutation_id = Uuid::from_u128(1);
@@ -1994,6 +2082,60 @@ mod tests {
             .checked_sub(SERVER_INFO_CACHE_MAX_AGE + Duration::from_secs(1))
             .expect("test clock underflow");
         assert!(!cached_snapshot_is_fresh(Some(stale)), "an old success is stale");
+    }
+
+    #[test]
+    fn server_info_probe_round_commits_failures_only_when_published() {
+        let caches = vec![Mutex::new(PeerAdminCache::new())];
+        let endpoints = EndpointServerPools::default();
+        let probes = vec![PeerServerInfoProbe {
+            host: "peer-1".to_string(),
+            result: Err(PeerServerInfoProbeFailure::Rpc { health: None }),
+        }];
+
+        assert_eq!(
+            caches[0]
+                .lock()
+                .expect("peer cache should lock before publish")
+                .server_failures,
+            0
+        );
+
+        let replies = publish_server_info_probe_round(&caches, &endpoints, probes);
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].endpoint, "peer-1");
+        assert_eq!(replies[0].state, ItemState::Unknown.to_string());
+        assert_eq!(
+            caches[0]
+                .lock()
+                .expect("peer cache should lock after publish")
+                .server_failures,
+            1
+        );
+    }
+
+    #[test]
+    fn server_info_probe_round_does_not_count_no_client_slots_as_rpc_failures() {
+        let caches = vec![Mutex::new(PeerAdminCache::new())];
+        let endpoints = EndpointServerPools::default();
+        let probes = vec![PeerServerInfoProbe {
+            host: "node-a:9000".to_string(),
+            result: Err(PeerServerInfoProbeFailure::NoClient),
+        }];
+
+        let replies = publish_server_info_probe_round(&caches, &endpoints, probes);
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].endpoint, "node-a:9000");
+        assert_eq!(replies[0].state, ItemState::Unknown.to_string());
+        assert_eq!(
+            caches[0]
+                .lock()
+                .expect("peer cache should lock after no-client publish")
+                .server_failures,
+            0
+        );
     }
 
     #[test]
