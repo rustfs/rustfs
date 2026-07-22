@@ -26,6 +26,7 @@ use crate::bucket::lifecycle::tier_sweeper::delete_object_from_remote_tier_idemp
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
 use crate::object_api::ObjectOptions;
+use crate::services::tier::{tier::TierConfigMgr, warm_backend::TransitionCandidateProbe};
 use crate::storage_api_contracts::{list::ListOperations as _, object::ObjectOperations as _};
 use crate::store::ECStore;
 
@@ -673,10 +674,67 @@ pub async fn process_transition_transaction_record(
             delete_transition_transaction_record(api, transaction.transaction_id).await?;
             Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
         }
-        TransitionTransactionState::UploadStarted | TransitionTransactionState::UploadOutcomeUnknown => {
+        TransitionTransactionState::UploadOutcomeUnknown => recover_unknown_upload_outcome(api, transaction).await,
+        TransitionTransactionState::UploadStarted => Ok(TransitionTransactionRecoveryOutcome::Retained),
+    }
+}
+
+async fn recover_unknown_upload_outcome(
+    api: Arc<ECStore>,
+    transaction: &TransitionTransaction,
+) -> EcstoreResult<TransitionTransactionRecoveryOutcome> {
+    let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(
+        &api.tier_config_mgr(),
+        &transaction.tier_name,
+        transaction.backend_fingerprint,
+    )
+    .await
+    .map_err(Error::other)?;
+
+    match lease
+        .probe_transition_candidate(&transaction.remote_object)
+        .await
+        .map_err(Error::other)?
+    {
+        TransitionCandidateProbe::Missing => {
+            delete_transition_transaction_record(api, transaction.transaction_id).await?;
+            Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
+        }
+        TransitionCandidateProbe::UnversionedPresent => {
+            cleanup_recovered_unknown_upload_candidate(api, transaction, TransitionRemoteVersion::unversioned()).await
+        }
+        TransitionCandidateProbe::VersionedPresent(version_id) => {
+            cleanup_recovered_unknown_upload_candidate(api, transaction, TransitionRemoteVersion::versioned(version_id)).await
+        }
+        TransitionCandidateProbe::Ambiguous | TransitionCandidateProbe::Unsupported => {
             Ok(TransitionTransactionRecoveryOutcome::Retained)
         }
     }
+}
+
+async fn cleanup_recovered_unknown_upload_candidate(
+    api: Arc<ECStore>,
+    transaction: &TransitionTransaction,
+    remote_version: TransitionRemoteVersion,
+) -> EcstoreResult<TransitionTransactionRecoveryOutcome> {
+    let mut cleanup = transaction.clone();
+    cleanup
+        .mark_cleanup_pending(
+            transaction.fence(),
+            TransitionCleanupProof {
+                transaction_id: transaction.transaction_id,
+                write_id: transaction.write_id,
+                remote_object: transaction.remote_object.clone(),
+                remote_version,
+                backend_fingerprint: transaction.backend_fingerprint,
+                decision: TransitionCleanupDecision::RemoteVersionRecoveredAfterCancellation,
+            },
+        )
+        .map_err(transition_transaction_store_error)?;
+    save_transition_transaction_record(api.clone(), &cleanup).await?;
+    delete_transition_remote_candidate(api.clone(), &cleanup).await?;
+    delete_transition_transaction_record(api, cleanup.transaction_id).await?;
+    Ok(TransitionTransactionRecoveryOutcome::RemoteCandidateDeleted)
 }
 
 fn transition_source_is_missing(err: &Error) -> bool {
