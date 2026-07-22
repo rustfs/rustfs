@@ -5913,7 +5913,6 @@ mod transition_upload_integrity_tests {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        backend.set_reject_non_empty_remote_versions(true);
 
         for position in [
             ShardCorruptionPosition::First,
@@ -6085,7 +6084,7 @@ mod transition_upload_integrity_tests {
         let remote_version = Uuid::new_v4().to_string();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         backend.set_put_remote_version(Some(remote_version.clone())).await;
-        backend.set_reject_non_empty_remote_versions(true);
+        backend.reject_next_non_empty_remote_version_validation();
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
@@ -6113,7 +6112,7 @@ mod transition_upload_integrity_tests {
         let remote_version = Uuid::nil().to_string();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         backend.set_put_remote_version(Some(remote_version.clone())).await;
-        backend.set_reject_non_empty_remote_versions(true);
+        backend.reject_next_non_empty_remote_version_validation();
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))

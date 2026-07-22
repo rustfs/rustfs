@@ -339,6 +339,8 @@ async fn delete_object_from_remote_tier_raw_with_lease(
     lease: &TierOperationLease,
     version_id_exact: bool,
 ) -> Result<(), std::io::Error> {
+    lease.validate_remote_version_id(rv_id)?;
+
     if remote_delete_breaker_is_open(Instant::now()).await {
         metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
         return Err(std::io::Error::other(ERR_REMOTE_DELETE_BREAKER_OPEN));
@@ -620,6 +622,46 @@ mod test {
         assert_eq!(outcome, RemoteTierDeleteOutcome::Deleted);
         assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.remove_count().await, 1);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_delete_rejects_nonempty_remote_version_before_backend_io() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        let backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let identity = lease.backend_identity();
+        drop(lease);
+        backend.set_reject_non_empty_remote_versions(true);
+
+        let err = delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "remote-version",
+            "WARM",
+            identity,
+            &manager,
+            true,
+        )
+        .await
+        .expect_err("a provider that rejects a versioned delete must fail before remote IO");
+
+        assert!(err.to_string().contains("requires an unversioned remote object"));
+        assert_eq!(backend.remove_count().await, 0);
+
+        delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "",
+            "WARM",
+            identity,
+            &manager,
+            false,
+        )
+        .await
+        .expect("unversioned remote delete should continue without a version ID");
+
+        assert_eq!(backend.remove_versions().await, vec![("remote/object".to_string(), String::new())]);
     }
 
     #[test]

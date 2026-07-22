@@ -2809,6 +2809,8 @@ pub(crate) async fn get_transitioned_object_reader_with_tier_manager(
         Err(err) => return Err(std::io::Error::other(err)),
     };
 
+    tgt_client.validate_remote_version_id(&oi.transitioned_object.version_id)?;
+
     let ret = new_getobjectreader(rs, oi, opts, h);
     if let Err(err) = ret {
         return Err(error_resp_to_object_err(err, vec![bucket, object]));
@@ -4044,6 +4046,56 @@ mod tests {
             0,
             "tier generation lease should release after EOF"
         );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn transitioned_get_rejects_nonempty_remote_version_before_backend_io() {
+        let manager = TierConfigMgr::new();
+        let tier = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&manager, &tier).await;
+        let remote_object = format!("remote/{}", Uuid::new_v4());
+        let body = Bytes::from_static(b"transitioned object body");
+        let remote_version = backend
+            .put(
+                &remote_object,
+                ReaderImpl::Body(body.clone()),
+                i64::try_from(body.len()).expect("body length should fit"),
+            )
+            .await
+            .expect("mock remote object should be stored");
+        backend.set_reject_non_empty_remote_versions(true);
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: i64::try_from(body.len()).expect("body length should fit"),
+            transitioned_object: TransitionedObject {
+                name: remote_object,
+                version_id: remote_version,
+                status: crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string(),
+                tier,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = match get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+        )
+        .await
+        {
+            Ok(_) => panic!("a provider that rejects versioned GET must fail before remote IO"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("requires an unversioned remote object"));
+        assert_eq!(backend.get_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]

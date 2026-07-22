@@ -166,6 +166,7 @@ struct MockWarmBackendInner {
     response_loss_after_put: AtomicBool,
     transition_candidate_probe_override: Mutex<Option<TransitionCandidateProbe>>,
     reject_non_empty_remote_versions: AtomicBool,
+    reject_non_empty_remote_version_validations: AtomicUsize,
     fail_remove: AtomicBool,
     exact_remove_count: AtomicUsize,
     op_log: Mutex<Vec<MockWarmOp>>,
@@ -398,6 +399,14 @@ impl MockWarmBackend {
         self.inner.reject_non_empty_remote_versions.store(reject, Ordering::Release);
     }
 
+    /// Reject the next non-empty remote version validation without changing
+    /// subsequent exact-version backend cleanup behavior.
+    pub fn reject_next_non_empty_remote_version_validation(&self) {
+        self.inner
+            .reject_non_empty_remote_version_validations
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Enable or disable a persistent remove failure for durability tests.
     pub fn set_remove_failure(&self, fail: bool) {
         self.inner.fail_remove.store(fail, Ordering::Release);
@@ -610,7 +619,15 @@ impl MockWarmBackend {
 #[async_trait]
 impl WarmBackend for MockWarmBackend {
     fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
-        if self.inner.reject_non_empty_remote_versions.load(Ordering::Acquire) && !remote_version_id.is_empty() {
+        if remote_version_id.is_empty() {
+            return Ok(());
+        }
+        let reject_once = self
+            .inner
+            .reject_non_empty_remote_version_validations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
+            .is_ok();
+        if reject_once || self.inner.reject_non_empty_remote_versions.load(Ordering::Acquire) {
             return Err(std::io::Error::other("mock warm backend requires an unversioned remote object"));
         }
         Ok(())

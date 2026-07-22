@@ -833,7 +833,7 @@ mod serial_tests {
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&tier_name).await;
         backend.set_put_remote_version(Some(Uuid::new_v4().to_string())).await;
-        backend.set_reject_non_empty_remote_versions(true);
+        backend.reject_next_non_empty_remote_version_validation();
         backend.set_remove_failure(true);
         let cleanup_store_barrier = TransitionCleanupStoreBarrier::install();
 
@@ -943,7 +943,7 @@ mod serial_tests {
             let backend = register_mock_tier(&tier_name).await;
             let remote_version = Uuid::new_v4().to_string();
             backend.set_put_remote_version(Some(remote_version.clone())).await;
-            backend.set_reject_non_empty_remote_versions(true);
+            backend.reject_next_non_empty_remote_version_validation();
             backend.set_remove_failure(matches!(case, CleanupCase::FullyFailed));
             let put_barrier = backend.arm_put_barrier().await;
             let remove_barrier = if matches!(case, CleanupCase::RetryPersisted) {

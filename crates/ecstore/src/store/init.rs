@@ -1850,7 +1850,7 @@ mod tests {
         let tier_name = "CROSSCTXA";
         let backend = register_mock_tier(&ctx_a.tier_config_mgr(), tier_name).await;
         backend.set_put_remote_version(Some(uuid::Uuid::new_v4().to_string())).await;
-        backend.set_reject_non_empty_remote_versions(true);
+        backend.reject_next_non_empty_remote_version_validation();
         let remove_barrier = backend.arm_failing_remove_barrier().await;
 
         let bucket = "transition-cleanup-context-a";
