@@ -28,7 +28,7 @@ use rustfs_targets::{
     check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
     config::{
         TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, build_amqp_args, build_kafka_args, build_mysql_args,
-        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, normalize_target_plugin_instances,
+        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, try_normalize_target_plugin_instances,
         validate_redis_config,
     },
     manifest::builtin_target_manifest,
@@ -252,11 +252,11 @@ pub(crate) fn endpoint_source(
     config: &Config,
     target_type: &str,
     target_name: &str,
-) -> TargetEndpointSource {
-    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
+) -> S3Result<TargetEndpointSource> {
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
     let service = target_service_name(specs, target_type).unwrap_or_default();
     let key = normalized_endpoint_key(target_name, service);
-    classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &key)
+    Ok(classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &key))
 }
 
 pub(crate) fn target_mutation_block_reason(
@@ -266,8 +266,8 @@ pub(crate) fn target_mutation_block_reason(
     target_type: &str,
     target_name: &str,
     target_label: &str,
-) -> Option<String> {
-    match endpoint_source(specs, route_prefix, config, target_type, target_name) {
+) -> S3Result<Option<String>> {
+    Ok(match endpoint_source(specs, route_prefix, config, target_type, target_name)? {
         TargetEndpointSource::Env => Some(format!(
             "{} '{}' is managed by environment variables and cannot be modified from the console",
             target_label, target_name
@@ -277,7 +277,7 @@ pub(crate) fn target_mutation_block_reason(
             target_label, target_name
         )),
         TargetEndpointSource::Config | TargetEndpointSource::Runtime => None,
-    }
+    })
 }
 
 pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, enabled: bool, action: &str) -> Option<String> {
@@ -326,13 +326,13 @@ pub(crate) fn merge_target_endpoints<V>(
     route_prefix: &str,
     config: &Config,
     runtime_statuses: HashMap<EndpointKey, V>,
-) -> Vec<MergedTargetEndpoint>
+) -> S3Result<Vec<MergedTargetEndpoint>>
 where
     V: Into<RuntimeHealthStatus>,
 {
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
-    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, RuntimeHealthStatus)> = HashMap::new();
 
     for ((account_id, service), status) in runtime_statuses {
@@ -392,7 +392,7 @@ where
     }
 
     endpoints.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
-    endpoints
+    Ok(endpoints)
 }
 
 pub(crate) fn canonical_target_instance_id(plugin_id: &str, domain: TargetDomain, instance_id: &str) -> String {
@@ -404,7 +404,7 @@ pub(crate) fn collect_target_instances<V>(
     route_prefix: &str,
     config: &Config,
     runtime_statuses: HashMap<EndpointKey, V>,
-) -> Vec<TargetInstanceReadModel>
+) -> S3Result<Vec<TargetInstanceReadModel>>
 where
     V: Into<RuntimeHealthStatus>,
 {
@@ -412,7 +412,7 @@ where
     let mut seen = HashSet::new();
     let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, RuntimeHealthStatus)> = HashMap::new();
     let domain = inferred_target_domain(route_prefix);
-    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
 
     for ((account_id, service), status) in runtime_statuses {
         let normalized = normalized_endpoint_key(&account_id, &service);
@@ -477,7 +477,7 @@ where
     }
 
     instances.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
-    instances
+    Ok(instances)
 }
 
 pub(crate) fn find_target_instance<V>(
@@ -486,13 +486,13 @@ pub(crate) fn find_target_instance<V>(
     config: &Config,
     runtime_statuses: HashMap<EndpointKey, V>,
     canonical_id: &str,
-) -> Option<TargetInstanceReadModel>
+) -> S3Result<Option<TargetInstanceReadModel>>
 where
     V: Into<RuntimeHealthStatus>,
 {
-    collect_target_instances(specs, route_prefix, config, runtime_statuses)
+    Ok(collect_target_instances(specs, route_prefix, config, runtime_statuses)?
         .into_iter()
-        .find(|instance| instance.canonical_id == canonical_id)
+        .find(|instance| instance.canonical_id == canonical_id))
 }
 
 pub(crate) fn allowed_target_keys(specs: &[AdminTargetSpec], target_type: &str) -> HashSet<&'static str> {
@@ -600,11 +600,11 @@ fn normalized_target_instances(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-) -> Vec<TargetPluginInstanceRecord> {
-    specs
-        .iter()
-        .flat_map(|spec| {
-            normalize_target_plugin_instances(
+) -> S3Result<Vec<TargetPluginInstanceRecord>> {
+    let mut instances = Vec::new();
+    for spec in specs {
+        instances.extend(
+            try_normalize_target_plugin_instances(
                 config,
                 &TargetPluginInstanceCompatDescriptor {
                     domain: inferred_target_domain(route_prefix),
@@ -615,8 +615,10 @@ fn normalized_target_instances(
                     valid_fields: spec.valid_keys,
                 },
             )
-        })
-        .collect()
+            .map_err(|err| s3_error!(InvalidRequest, "invalid {} target environment: {}", spec.service, err))?,
+        );
+    }
+    Ok(instances)
 }
 
 fn inferred_target_domain(route_prefix: &str) -> TargetDomain {
@@ -638,8 +640,8 @@ fn target_spec_by_service<'a>(specs: &'a [AdminTargetSpec], service: &str) -> Op
     specs.iter().find(|spec| spec.service == service)
 }
 
-fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> TargetEndpointSnapshot {
-    let normalized_instances = normalized_target_instances(specs, route_prefix, config);
+fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> S3Result<TargetEndpointSnapshot> {
+    let normalized_instances = normalized_target_instances(specs, route_prefix, config)?;
     let mut configured_keys = Vec::new();
     let mut config_targets = HbHashSet::new();
     let mut env_targets = HbHashSet::new();
@@ -659,12 +661,12 @@ fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, conf
         }
     }
 
-    TargetEndpointSnapshot {
+    Ok(TargetEndpointSnapshot {
         normalized_instances,
         configured_keys,
         config_targets,
         env_targets,
-    }
+    })
 }
 
 async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>

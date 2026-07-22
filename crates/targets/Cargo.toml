@@ -18,6 +18,7 @@ rustfs-tls-runtime = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-utils = { workspace = true, features = ["egress"] }
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 async-nats = { workspace = true }
 deadpool-postgres = { workspace = true }
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
@@ -26,6 +27,7 @@ lapin = { workspace = true, default-features = false, features = ["tokio", "rust
 libc = { workspace = true }
 pulsar = { workspace = true, default-features = false, features = ["tokio-rustls-runtime", "telemetry"] }
 regex = { workspace = true }
+rayon = { workspace = true }
 reqwest = { workspace = true }
 rumqttc = { workspace = true, features = ["websocket"] }
 redis = { workspace = true, features = ["connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
@@ -38,6 +40,7 @@ sha2 = { workspace = true }
 snap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
+tokio-util = { workspace = true }
 tokio-postgres = { workspace = true, default-features = false, features = ["runtime", "with-serde_json-1"] }
 tokio-postgres-rustls = { workspace = true }
 tracing = { workspace = true }

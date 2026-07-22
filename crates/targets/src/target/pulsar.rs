@@ -24,8 +24,9 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store, redacted_secret, sanitize_queue_dir_component,
+        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store, redacted_secret, sanitize_queue_dir_component,
+        with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
@@ -39,10 +40,14 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
+
+const PULSAR_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const PULSAR_FAILED_DELIVERY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct PulsarArgs {
@@ -276,6 +281,23 @@ where
         self.tls_state.lock().reset();
     }
 
+    async fn clear_failed_delivery_state(&self) {
+        match tokio::time::timeout(PULSAR_FAILED_DELIVERY_CLEANUP_TIMEOUT, self.producer.lock()).await {
+            Ok(mut producer) => {
+                producer.take();
+            }
+            Err(_) => {
+                warn!(
+                    target_id = %self.id,
+                    reason = "producer_cleanup_lock_timeout",
+                    "Timed out clearing the Pulsar producer after a failed delivery"
+                );
+            }
+        }
+        self.clear_cached_client();
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
     async fn get_or_connect_client(&self) -> Result<Pulsar<TokioExecutor>, TargetError> {
         // When a TLS reload adapter is attached, it drives client rebuilds
         // in the background. The inline per-send fingerprint check is skipped.
@@ -334,20 +356,30 @@ where
     }
 
     async fn send_body(&self, body: Vec<u8>) -> Result<(), TargetError> {
-        self.init_producer().await?;
-        let mut guard = self.producer.lock().await;
-        let producer = guard
-            .as_mut()
-            .ok_or_else(|| TargetError::Configuration("Pulsar producer not initialized".to_string()))?;
-        let receipt = producer
-            .send_non_blocking(body)
-            .await
-            .map_err(|e| TargetError::Request(format!("Failed to send Pulsar message: {e}")))?;
-        receipt
-            .await
-            .map_err(|e| TargetError::Request(format!("Failed to receive Pulsar receipt: {e}")))?;
-        self.delivery_counters.record_success();
-        Ok(())
+        let result = with_delivery_deadline(PULSAR_DELIVERY_TIMEOUT, "Pulsar delivery", async {
+            self.init_producer().await?;
+            let mut guard = self.producer.lock().await;
+            let producer = guard
+                .as_mut()
+                .ok_or_else(|| TargetError::Configuration("Pulsar producer not initialized".to_string()))?;
+            let receipt = producer
+                .send_non_blocking(body)
+                .await
+                .map_err(|e| TargetError::Request(format!("Failed to send Pulsar message: {e}")))?;
+            receipt
+                .await
+                .map_err(|e| TargetError::Request(format!("Failed to receive Pulsar receipt: {e}")))?;
+            self.delivery_counters.record_success();
+            Ok(())
+        })
+        .await;
+
+        if let Err(err) = &result
+            && is_connectivity_error(err)
+        {
+            self.clear_failed_delivery_state().await;
+        }
+        result
     }
 }
 
@@ -523,6 +555,22 @@ mod tests {
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_delivery_cleanup_is_bounded_when_the_producer_lock_is_busy() {
+        let target = Arc::new(PulsarTarget::<String>::new("pulsar:test".to_string(), base_args()).expect("target should build"));
+        target.connected.store(true, Ordering::SeqCst);
+        let producer_guard = target.producer.lock().await;
+        let cleanup = {
+            let target = Arc::clone(&target);
+            tokio::spawn(async move { target.clear_failed_delivery_state().await })
+        };
+
+        cleanup.await.expect("cleanup task should not panic");
+
+        assert!(!target.connected.load(Ordering::SeqCst));
+        drop(producer_guard);
     }
 
     #[test]

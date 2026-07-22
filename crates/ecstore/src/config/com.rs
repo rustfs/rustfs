@@ -17,12 +17,15 @@ use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::runtime::sources as runtime_sources;
+use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{
     admin::StorageAdminApi,
     heal::HealOperations,
+    namespace::NamespaceLocking,
     object::{DeletedObject, EcstoreObjectIO, ObjectIO, ObjectOperations, ObjectToDelete},
     range::HTTPRangeSpec,
 };
+use crate::store::ECStore;
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_config::audit::{
@@ -45,10 +48,94 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
+use tokio::sync::RwLock as AsyncRwLock;
 use tracing::{debug, error, info, instrument, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
-const CONFIG_FILE: &str = "config.json";
+const SERVER_CONFIG_OBJECT: &str = "config/config.json";
+
+// Server-config lock order: SERVER_CONFIG_LOCK -> distributed namespace lock
+// for SERVER_CONFIG_OBJECT. Readers and writers must never reverse this order.
+static SERVER_CONFIG_LOCK: LazyLock<AsyncRwLock<()>> = LazyLock::new(|| AsyncRwLock::new(()));
+
+fn config_task_join_error(operation: &'static str, error: tokio::task::JoinError) -> Error {
+    let outcome = if error.is_cancelled() { "cancelled" } else { "panicked" };
+    Error::other(format!("{operation} task {outcome}"))
+}
+
+/// Runs one complete server-config transaction while holding both the local
+/// process guard and the distributed namespace write lock for `config.json`.
+/// The operation must use the corresponding no-lock read/save functions.
+pub async fn with_server_config_write_lock<F, Fut, T>(store: Arc<ECStore>, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        // Lock order: SERVER_CONFIG_LOCK -> namespace write lock.
+        let _local_guard = SERVER_CONFIG_LOCK.write().await;
+        let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, SERVER_CONFIG_OBJECT).await?;
+        let _write_guard = namespace_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        Ok(operation().await)
+    })
+    .await
+    .map_err(|error| config_task_join_error("server config write", error))?
+}
+
+/// Reads and synchronously publishes one server-config snapshot while holding
+/// a shared namespace lock. Concurrent peer reloads may proceed together, but
+/// no writer can interleave between the snapshot read and generation accept.
+pub async fn with_server_config_read_lock<F, Fut, T>(store: Arc<ECStore>, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        // Lock order: SERVER_CONFIG_LOCK -> namespace read lock.
+        let _local_guard = SERVER_CONFIG_LOCK.read().await;
+        let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, SERVER_CONFIG_OBJECT).await?;
+        let _read_guard = namespace_lock.get_read_lock(get_lock_acquire_timeout()).await?;
+        Ok(operation().await)
+    })
+    .await
+    .map_err(|error| config_task_join_error("server config read", error))?
+}
+
+/// Runs a cancellation-safe transaction under the distributed write lock for
+/// one metadata config object. The operation must use no-lock object I/O.
+pub async fn with_config_object_write_lock<F, Fut, T>(store: Arc<ECStore>, object: String, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+        let _write_guard = namespace_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        Ok(operation().await)
+    })
+    .await
+    .map_err(|error| config_task_join_error("config object write", error))?
+}
+
+/// Runs one read-and-publish transaction under the distributed read lock for
+/// a metadata config object. The operation must use no-lock object I/O.
+pub async fn with_config_object_read_lock<F, Fut, T>(store: Arc<ECStore>, object: String, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+        let _read_guard = namespace_lock.get_read_lock(get_lock_acquire_timeout()).await?;
+        Ok(operation().await)
+    })
+    .await
+    .map_err(|error| config_task_join_error("config object read", error))?
+}
 
 /// Environment variable gating the startup fallback to the default server
 /// config when the persisted `config.json` object is corrupt beyond repair
@@ -393,6 +480,31 @@ where
     .await
 }
 
+pub async fn save_config_no_lock<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_config_with_opts(
+        api,
+        file,
+        data,
+        &ObjectOptions {
+            max_parity: true,
+            no_lock: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 #[instrument(skip(api))]
 pub async fn delete_config<S>(api: Arc<S>, file: &str) -> Result<()>
 where
@@ -462,8 +574,17 @@ where
     Ok(cfg)
 }
 
+async fn new_and_save_server_config_no_lock<S>(api: Arc<S>) -> Result<Config>
+where
+    S: EcstoreObjectIO + StorageAdminApi,
+{
+    let cfg = new_server_config();
+    save_server_config_no_lock(api, &cfg).await?;
+    Ok(cfg)
+}
+
 fn get_config_file() -> String {
-    format!("{CONFIG_PREFIX}{SLASH_SEPARATOR}{CONFIG_FILE}")
+    SERVER_CONFIG_OBJECT.to_string()
 }
 
 fn storage_class_kvs_mut(cfg: &mut Config) -> &mut KVS {
@@ -1267,13 +1388,17 @@ where
 }
 
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
-async fn handle_missing_config<S>(api: Arc<S>, context: &str) -> Result<Config>
+async fn handle_missing_config<S>(api: Arc<S>, context: &str, namespace_lock_held: bool) -> Result<Config>
 where
     S: EcstoreObjectIO + StorageAdminApi,
 {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
     let cfg = if runtime_sources::first_cluster_node_is_local().await {
-        new_and_save_server_config(api.clone()).await?
+        if namespace_lock_held {
+            new_and_save_server_config_no_lock(api.clone()).await?
+        } else {
+            new_and_save_server_config(api.clone()).await?
+        }
     } else {
         new_server_config()
     };
@@ -1299,17 +1424,57 @@ where
             PutObjectReader = PutObjReader,
         > + StorageAdminApi,
 {
+    read_config_without_migrate_inner(api, false).await
+}
+
+/// Reads the server config while an upper layer holds the namespace write lock
+/// for [`SERVER_CONFIG_OBJECT`]. Missing-config initialization uses the matching
+/// no-lock save path and therefore cannot recursively acquire the same lock.
+pub async fn read_config_without_migrate_no_lock<S>(api: Arc<S>) -> Result<Config>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + StorageAdminApi,
+{
+    read_config_without_migrate_inner(api, true).await
+}
+
+/// Reads an already-initialized server config while a caller owns a namespace
+/// read lock. This never initializes or migrates a missing object.
+pub async fn read_existing_server_config_no_lock(api: Arc<ECStore>) -> Result<Config> {
+    let data = read_config_no_lock(api, SERVER_CONFIG_OBJECT).await?;
+    Ok(decode_persisted_server_config(&data)?.merge())
+}
+
+async fn read_config_without_migrate_inner<S>(api: Arc<S>, namespace_lock_held: bool) -> Result<Config>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + StorageAdminApi,
+{
     let config_file = get_config_file();
 
     // Try to read the configuration file
     match read_config_no_lock(api.clone(), &config_file).await {
-        Ok(data) => read_server_config(api, &data).await,
-        Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration").await,
+        Ok(data) => read_server_config(api, &data, namespace_lock_held).await,
+        Err(Error::ConfigNotFound) => handle_missing_config(api, "Read the main configuration", namespace_lock_held).await,
         Err(err) => handle_config_read_error(err, &config_file),
     }
 }
 
-async fn read_server_config<S>(api: Arc<S>, data: &[u8]) -> Result<Config>
+async fn read_server_config<S>(api: Arc<S>, data: &[u8], namespace_lock_held: bool) -> Result<Config>
 where
     S: EcstoreObjectIO + StorageAdminApi,
 {
@@ -1324,7 +1489,9 @@ where
                 let cfg = decode_persisted_server_config(&cfg_data)?;
                 return Ok(cfg.merge());
             }
-            Err(Error::ConfigNotFound) => return handle_missing_config(api, "Read alternate configuration").await,
+            Err(Error::ConfigNotFound) => {
+                return handle_missing_config(api, "Read alternate configuration", namespace_lock_held).await;
+            }
             Err(err) => return handle_config_read_error(err, &config_file),
         }
     }
@@ -1545,8 +1712,44 @@ where
             PutObjectReader = PutObjReader,
         >,
 {
+    save_server_config_inner(api, cfg, false).await
+}
+
+/// Saves the server config while an upper layer holds the namespace write
+/// lock for [`SERVER_CONFIG_OBJECT`].
+pub async fn save_server_config_no_lock<S>(api: Arc<S>, cfg: &Config) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    save_server_config_inner(api, cfg, true).await
+}
+
+async fn save_server_config_inner<S>(api: Arc<S>, cfg: &Config, no_lock: bool) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let config_file = get_config_file();
-    let existing = match read_config(api.clone(), &config_file).await {
+    let existing = match if no_lock {
+        read_config_no_lock(api.clone(), &config_file).await
+    } else {
+        read_config(api.clone(), &config_file).await
+    } {
         Ok(v) => Some(v),
         Err(Error::ConfigNotFound) => None,
         Err(err) => {
@@ -1570,7 +1773,21 @@ where
         return Ok(());
     }
 
-    save_config(api, &config_file, data).await
+    if no_lock {
+        save_config_with_opts(
+            api,
+            &config_file,
+            data,
+            &ObjectOptions {
+                max_parity: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+    } else {
+        save_config(api, &config_file, data).await
+    }
 }
 
 pub async fn lookup_configs<S>(cfg: &mut Config, api: Arc<S>) -> Result<()>
@@ -1630,9 +1847,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_dynamic_config_for_sub_sys_with, configs_semantically_equal, decode_server_config_blob, encode_server_config_blob,
-        is_standard_object_server_config, lookup_configs, read_config, read_config_preserve_empty, read_config_with_metadata,
-        storage_class_kvs_mut,
+        apply_dynamic_config_for_sub_sys_with, config_task_join_error, configs_semantically_equal, decode_server_config_blob,
+        encode_server_config_blob, is_standard_object_server_config, lookup_configs, read_config, read_config_preserve_empty,
+        read_config_with_metadata, storage_class_kvs_mut,
     };
     use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
@@ -1652,6 +1869,17 @@ mod tests {
     use rustfs_config::{
         DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE,
     };
+
+    #[tokio::test]
+    async fn config_task_join_error_does_not_expose_panic_payload() {
+        let join_error = tokio::spawn(async { panic!("do-not-expose-payload") })
+            .await
+            .expect_err("test task should panic");
+
+        let rendered = config_task_join_error("server config write", join_error).to_string();
+        assert!(rendered.contains("panicked"));
+        assert!(!rendered.contains("do-not-expose-payload"));
+    }
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};

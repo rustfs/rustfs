@@ -47,16 +47,13 @@ pub(super) fn split_env_field_and_instance(rest: &str, valid_fields: &HashSet<St
         .max_by_key(|(field, _)| field.len())
 }
 
-pub(super) fn is_target_enabled(config: &KVS) -> bool {
-    config
-        .lookup(ENABLE_KEY)
-        .map(|v| {
-            EnableState::from_str(v.as_str())
-                .ok()
-                .map(|s| s.is_enabled())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+pub(super) fn is_target_enabled(config: &KVS) -> Result<bool, TargetError> {
+    let Some(value) = config.lookup(ENABLE_KEY) else {
+        return Ok(false);
+    };
+    EnableState::from_str(value.as_str())
+        .map(EnableState::is_enabled)
+        .map_err(|_| TargetError::Configuration(format!("Invalid {ENABLE_KEY} value '{value}'")))
 }
 
 pub(super) fn parse_target_bool(value: Option<&str>) -> Option<bool> {

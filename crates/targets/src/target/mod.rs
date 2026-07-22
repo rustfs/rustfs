@@ -19,12 +19,14 @@ use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_types::EventName;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::fmt::Formatter;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread_local;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 pub mod amqp;
@@ -245,7 +247,12 @@ where
         }
     }
 
-    /// Saves an event (either sends it immediately or stores it for later)
+    /// Saves an event (either sends it immediately or stores it for later).
+    ///
+    /// A target whose [`Self::store`] returns `Some` must only persist the event
+    /// here; network delivery belongs to its replay worker. Runtime lifecycle
+    /// handoff drains these durable enqueues while allowing a direct network
+    /// send to finish against a detached target.
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError>;
 
     /// Sends an event from the store using the queued raw body and metadata.
@@ -739,6 +746,24 @@ pub(crate) fn open_target_queue_store(
     Ok(store.map(|store| Box::new(store) as BoxedQueuedStore))
 }
 
+thread_local! {
+    static DEFER_QUEUE_STORE_OPEN: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn with_deferred_queue_store_open<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEFER_QUEUE_STORE_OPEN.with(|deferred| deferred.set(self.0));
+        }
+    }
+
+    let previous = DEFER_QUEUE_STORE_OPEN.with(|deferred| deferred.replace(true));
+    let _reset = Reset(previous);
+    operation()
+}
+
 /// Opens the queue store and returns the concrete QueueStore, so a target that needs its typed
 /// failed-store capability holds it directly rather than through the type-erased Store handle.
 pub(crate) fn open_target_queue_store_typed(
@@ -759,9 +784,11 @@ pub(crate) fn open_target_queue_store_typed(
         TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
     };
     let store = QueueStore::<QueuedPayload>::new(queue_dir, queue_limit, extension);
-    store
-        .open()
-        .map_err(|err| TargetError::Storage(format!("{open_context}: {err}")))?;
+    if !DEFER_QUEUE_STORE_OPEN.with(Cell::get) {
+        store
+            .open()
+            .map_err(|err| TargetError::Storage(format!("{open_context}: {err}")))?;
+    }
 
     Ok(Some(store))
 }
@@ -781,6 +808,26 @@ pub(crate) fn persist_queued_payload_to_store(
 
 pub(crate) fn is_connectivity_error(err: &TargetError) -> bool {
     matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
+}
+
+/// Applies an absolute deadline to one protocol delivery attempt.
+///
+/// Target clients expose different timeout controls, and several of them only
+/// place a timeout value in the wire request without bounding the local socket
+/// future. Keeping the outer deadline here gives every caller the same typed,
+/// retryable timeout without changing the target-specific error mapping.
+pub(crate) async fn with_delivery_deadline<T, F>(
+    deadline: Duration,
+    operation: &'static str,
+    delivery: F,
+) -> Result<T, TargetError>
+where
+    F: Future<Output = Result<T, TargetError>>,
+{
+    match tokio::time::timeout(deadline, delivery).await {
+        Ok(result) => result,
+        Err(_) => Err(TargetError::Timeout(format!("{operation} timed out after {deadline:?}"))),
+    }
 }
 
 pub(crate) async fn invalidate_cache_on_connectivity_error<F, Fut>(err: &TargetError, invalidate: F)
@@ -1272,6 +1319,29 @@ mod tests {
     }
 
     #[test]
+    fn deferred_queue_store_creation_does_not_touch_the_filesystem() {
+        let base = std::env::temp_dir().join(format!("rustfs-target-store-deferred-{}", Uuid::new_v4()));
+        fs::write(&base, b"not-a-directory").expect("failed to create file base");
+        let target_id = TargetID::new("target-a".to_string(), ChannelTargetType::Kafka.as_str().to_string());
+
+        let store = with_deferred_queue_store_open(|| {
+            open_target_queue_store(
+                base.to_str().unwrap(),
+                100,
+                TargetType::NotifyEvent,
+                ChannelTargetType::Kafka.as_str(),
+                &target_id,
+                "deferred open",
+            )
+        })
+        .expect("deferred construction must not open the queue directory")
+        .expect("non-empty queue directory should create a dormant store");
+
+        assert!(store.open().is_err(), "the invalid path must fail when handoff explicitly opens it");
+        let _ = fs::remove_file(base);
+    }
+
+    #[test]
     fn persist_queued_payload_to_store_writes_encoded_payload() {
         let store = MockQueuedStore::new(false);
         let meta = QueuedPayloadMeta::new(
@@ -1314,6 +1384,19 @@ mod tests {
         assert!(is_connectivity_error(&TargetError::Network("network".to_string())));
         assert!(!is_connectivity_error(&TargetError::Storage("storage".to_string())));
         assert!(!is_connectivity_error(&TargetError::Serialization("serialization".to_string())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_deadline_cuts_off_a_stalled_protocol_operation() {
+        let error = with_delivery_deadline(
+            Duration::from_secs(30),
+            "test delivery",
+            std::future::pending::<Result<(), TargetError>>(),
+        )
+        .await
+        .expect_err("a stalled delivery must hit its hard deadline");
+
+        assert!(matches!(error, TargetError::Timeout(message) if message == "test delivery timed out after 30s"));
     }
 
     #[tokio::test]

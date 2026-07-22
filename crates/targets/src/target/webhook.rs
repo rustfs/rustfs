@@ -1164,7 +1164,7 @@ mod tests {
             .expect("https webhook probe should trust configured ca");
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        assert_eq!(resp.text_with_charset("utf-8").await.expect("read response body"), "");
+        assert!(resp.bytes().await.expect("read response body").is_empty());
         handle.join().expect("tls server thread");
     }
 }

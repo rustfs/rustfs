@@ -607,7 +607,7 @@ fn plugin_instance_mutation_block_reason(
     target_type: &str,
     target_name: &str,
     target_label: &str,
-) -> Option<String> {
+) -> S3Result<Option<String>> {
     shared_target_mutation_block_reason(context.specs, context.route_prefix, config, target_type, target_name, target_label)
 }
 
@@ -671,7 +671,7 @@ async fn collect_domain_instances(context: PluginInstanceDomainContext) -> S3Res
     let config = plugin_instance_config_snapshot(context).await?;
     let module_disabled_reason = module_disabled_block_reason(context.domain, "listing plugin instances");
     let mut entries = Vec::new();
-    for instance in collect_target_instances(context.specs, context.route_prefix, &config, runtime_statuses) {
+    for instance in collect_target_instances(context.specs, context.route_prefix, &config, runtime_statuses)? {
         entries.push(plugin_instance_list_entry(instance, module_disabled_reason.clone()));
     }
     Ok(entries)
@@ -692,13 +692,7 @@ async fn find_plugin_instance(instance_id: &str) -> S3Result<Option<TargetInstan
     let context = plugin_instance_domain_context(parse_plugin_instance_id(instance_id)?.1);
     let runtime_statuses = plugin_instance_runtime_statuses(context).await?;
     let config = plugin_instance_config_snapshot(context).await?;
-    Ok(find_target_instance(
-        context.specs,
-        context.route_prefix,
-        &config,
-        runtime_statuses,
-        instance_id,
-    ))
+    find_target_instance(context.specs, context.route_prefix, &config, runtime_statuses, instance_id)
 }
 
 async fn set_plugin_instance_config(
@@ -804,7 +798,7 @@ impl Operation for PutPluginInstanceHandler {
             resolved.target_spec.subsystem,
             &resolved.target_name,
             "plugin instance",
-        ) {
+        )? {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
@@ -856,7 +850,7 @@ impl Operation for DeletePluginInstanceHandler {
             resolved.target_spec.subsystem,
             &resolved.target_name,
             "plugin instance",
-        ) {
+        )? {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
@@ -968,12 +962,9 @@ mod tests {
             )]),
         )]));
 
-        let instances = collect_target_instances(
-            super::notification_target_specs(),
-            NOTIFY_ROUTE_PREFIX,
-            &config,
-            HashMap::<(String, String), String>::new(),
-        );
+        let instances =
+            collect_target_instances(super::notification_target_specs(), NOTIFY_ROUTE_PREFIX, &config, HashMap::new())
+                .expect("collect target instances");
         let primary = instances
             .into_iter()
             .find(|instance| instance.account_id == "primary" && instance.service == "webhook")
@@ -995,8 +986,9 @@ mod tests {
                     super::notification_target_specs(),
                     NOTIFY_ROUTE_PREFIX,
                     &Config(HashMap::new()),
-                    HashMap::<(String, String), String>::new(),
-                );
+                    HashMap::new(),
+                )
+                .expect("collect target instances");
                 let env_only = instances
                     .into_iter()
                     .find(|instance| instance.account_id == "env-only")
@@ -1016,7 +1008,8 @@ mod tests {
             NOTIFY_ROUTE_PREFIX,
             &Config(HashMap::new()),
             runtime_statuses,
-        );
+        )
+        .expect("collect target instances");
 
         let runtime_only = instances
             .into_iter()

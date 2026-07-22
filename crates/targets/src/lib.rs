@@ -43,6 +43,7 @@ pub use config::{
     LegacyTargetInstanceDescriptor, TargetInstanceSourceClass, TargetInstanceSourceHints, TargetPluginInstance,
     TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, normalize_legacy_target_instances,
     normalize_legacy_target_instances_from_env, normalize_target_plugin_instances, normalize_target_plugin_instances_from_env,
+    try_normalize_target_plugin_instances, try_normalize_target_plugin_instances_from_env,
 };
 pub use control_plane::{
     TargetPluginEnableState, TargetPluginExternalAction, TargetPluginExternalActionDecision, TargetPluginExternalActionError,
@@ -65,9 +66,9 @@ pub use plugin::{
     TargetPluginRegistry, TargetRequestValidator, boxed_target,
 };
 pub use runtime::{
-    ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot, RuntimeTargetHealthReason,
-    RuntimeTargetHealthSnapshot, RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget, TargetRuntimeManager,
-    activate_targets_with_replay,
+    OpenedActivation, PreparedActivation, ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot,
+    RuntimeTargetHealthReason, RuntimeTargetHealthSnapshot, RuntimeTargetHealthState, RuntimeTargetSnapshot, SharedTarget,
+    TargetRuntimeManager, activate_targets_with_replay,
     adapter::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter},
     health_snapshots_for_targets, init_target_and_optionally_start_replay,
     ops_diagnostics::{

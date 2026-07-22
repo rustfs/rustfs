@@ -28,11 +28,21 @@ use crate::target::QueuedPayload;
 use crate::target::TargetDeliverySnapshot;
 use crate::target::{TargetHealth, TargetHealthReason, TargetHealthState};
 use crate::{StoreError, TargetError};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
 use std::{future::Future, pin::Pin, time::Duration};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+fn join_failure_reason(error: &tokio::task::JoinError) -> &'static str {
+    if error.is_cancelled() {
+        "join_cancelled"
+    } else {
+        "join_panicked"
+    }
+}
 
 /// Maximum number of replay attempts before a stored entry is exhausted. Each attempt runs one full
 /// send (one ack wait at the configured timeout for a JetStream entry), then a backoff sleep before
@@ -69,13 +79,24 @@ pub(crate) fn inter_attempt_backoff_sum(attempts: usize) -> Duration {
 pub type SharedTarget<E> = Arc<dyn Target<E> + Send + Sync>;
 type ReplayHook<E> = Arc<dyn Fn(ReplayEvent<E>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// Upper bound on how long [`ReplayWorkerManager::stop_all`] waits for a single
-/// replay worker to observe its cancel signal and exit before it is forcibly
-/// aborted. Workers observe cancellation promptly (including during retry
-/// backoff), so this only guards against a wedged task.
-const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_COLLECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_PROBE_CONCURRENCY: usize = 10;
+
+pub(crate) enum PrepareTargetResult<E>
+where
+    E: PluginEvent,
+{
+    Ready(SharedTarget<E>),
+    Degraded {
+        error: TargetError,
+        target: SharedTarget<E>,
+    },
+    Failed {
+        error: TargetError,
+        target: Box<dyn Target<E> + Send + Sync>,
+    },
+    Cancelled(Box<dyn Target<E> + Send + Sync>),
+}
 
 /// Tracks a running replay worker: its cancel channel and, when the worker was
 /// spawned in-process, the [`JoinHandle`] used to await its exit on shutdown.
@@ -116,7 +137,7 @@ impl ReplayWorkerManager {
     }
 
     /// Registers a cancel channel together with the worker's join handle so
-    /// `stop_all` can await the worker's exit (bounded by [`STOP_JOIN_TIMEOUT`]).
+    /// `stop_all` can await the worker's exit.
     pub fn insert_with_handle(&mut self, target_id: String, cancel_tx: mpsc::Sender<()>, join: JoinHandle<()>) {
         self.cancellers.insert(
             target_id,
@@ -143,37 +164,36 @@ impl ReplayWorkerManager {
     }
 
     /// Stops every replay worker: it first signals cancellation to all of them,
-    /// then awaits each worker's exit (bounded by [`STOP_JOIN_TIMEOUT`], after
-    /// which the task is aborted). Signalling before joining lets all workers
-    /// wind down concurrently, and joining guarantees no worker keeps draining
-    /// the shared store after this returns — preventing duplicate delivery and
-    /// orphaned tasks across reloads and shutdown.
+    /// then strictly awaits each worker's exit. A worker already awaiting a
+    /// delivery acknowledgement is allowed to finish; aborting it at an
+    /// arbitrary deadline could leave an acknowledged queue entry undeleted and
+    /// make the replacement worker deliver it again. Signalling before joining
+    /// lets all workers wind down concurrently. Legacy joinless registrations
+    /// can only be signalled.
     pub async fn stop_all(&mut self, log_prefix: &str) {
-        let mut handles: Vec<(String, ReplayWorkerHandle)> = self.cancellers.drain().collect();
+        let handles: Vec<(String, ReplayWorkerHandle)> = self.cancellers.drain().collect();
+        let mut joins = std::collections::VecDeque::new();
 
         // Phase 1: signal cancellation to all workers.
-        for (target_id, handle) in &handles {
+        for (target_id, handle) in handles {
             tracing::info!(target_id = %target_id, "{log_prefix}");
-            let _ = handle.cancel_tx.send(()).await;
+            let _ = handle.cancel_tx.try_send(());
+            if let Some(join) = handle.join {
+                joins.push_back((target_id, join));
+            } else {
+                tracing::warn!(
+                    target_id = %target_id,
+                    "Replay worker has no join handle; cancellation was signalled but exit cannot be verified"
+                );
+            }
         }
 
-        // Phase 2: await each worker's exit, forcibly aborting any that overrun.
-        for (target_id, handle) in handles.drain(..) {
-            let Some(mut join) = handle.join else {
-                continue;
-            };
-            match tokio::time::timeout(STOP_JOIN_TIMEOUT, &mut join).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(target_id = %target_id, error = %err, "Replay worker terminated abnormally");
-                }
-                Err(_) => {
-                    join.abort();
-                    tracing::warn!(
-                        target_id = %target_id,
-                        "Timed out awaiting replay worker exit; task aborted"
-                    );
-                }
+        // Phase 2: strict join. Delivery operations own their own protocol
+        // deadlines; lifecycle must not invent a shorter deadline that turns an
+        // acknowledgement race into duplicate delivery.
+        while let Some((target_id, join)) = joins.pop_front() {
+            if let Err(err) = join.await {
+                tracing::warn!(target_id = %target_id, reason = join_failure_reason(&err), "Replay worker terminated abnormally");
             }
         }
     }
@@ -185,6 +205,55 @@ where
 {
     pub replay_workers: ReplayWorkerManager,
     pub targets: Vec<SharedTarget<E>>,
+}
+
+/// Targets whose persistent queue stores are open and are ready to start
+/// replay. This distinct stage prevents activation from skipping store open.
+pub struct OpenedActivation<E>
+where
+    E: PluginEvent,
+{
+    pub(crate) targets: Vec<SharedTarget<E>>,
+}
+
+struct TargetActivationFailure {
+    detail: String,
+}
+
+/// Targets that have completed initialization but have not started replay
+/// workers yet. Keeping preparation dormant lets lifecycle orchestration stop
+/// the previous workers before the replacement workers are spawned.
+pub struct PreparedActivation<E>
+where
+    E: PluginEvent,
+{
+    failures: Vec<TargetActivationFailure>,
+    rejected_targets: Vec<SharedTarget<E>>,
+    pub(crate) targets: Vec<SharedTarget<E>>,
+}
+
+impl<E> PreparedActivation<E>
+where
+    E: PluginEvent,
+{
+    pub fn failure_summary(&self) -> Option<String> {
+        if self.failures.is_empty() {
+            return None;
+        }
+
+        Some(
+            self.failures
+                .iter()
+                .map(|failure| failure.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    pub fn extend_creation_failures(&mut self, failures: impl IntoIterator<Item = String>) {
+        self.failures
+            .extend(failures.into_iter().map(|detail| TargetActivationFailure { detail }));
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -339,17 +408,19 @@ where
     /// Surfacing them lets a caller fail an explicit shutdown while still tearing down the rest of the
     /// runtime.
     pub async fn clear_and_close(&mut self) -> Vec<(String, TargetError)> {
-        let target_ids: Vec<String> = self.targets.keys().cloned().collect();
+        let targets = std::mem::take(&mut self.targets);
+        let mut closes = FuturesUnordered::new();
+        for (target_id, target) in targets {
+            closes.push(async move { (target_id, target.close().await) });
+        }
+
         let mut errors = Vec::new();
-        for target_id in target_ids {
-            if let Some(target) = self.targets.remove(&target_id)
-                && let Err(err) = target.close().await
-            {
+        while let Some((target_id, result)) = closes.next().await {
+            if let Err(err) = result {
                 tracing::error!(target_id = %target_id, error = %err, "Failed to close target during shutdown");
                 errors.push((target_id, err));
             }
         }
-        self.targets.clear();
         errors
     }
 
@@ -468,21 +539,16 @@ where
         SharedTarget<E>,
     ) -> (mpsc::Sender<()>, JoinHandle<()>),
 {
-    let target_id = target.id().to_string();
-    let has_store = target.store().is_some();
-
-    if let Err(err) = target.init().await {
-        tracing::error!(target_id = %target_id, error = %err, "Failed to initialize target");
-        if !has_store {
+    let shared = match prepare_target(target, None).await {
+        PrepareTargetResult::Ready(target) => target,
+        PrepareTargetResult::Degraded { target, .. } => target,
+        PrepareTargetResult::Failed { target, .. } => {
+            let _ = target.close().await;
             return None;
         }
-        tracing::warn!(
-            target_id = %target_id,
-            "Proceeding with store-backed target despite init failure"
-        );
-    }
-
-    let shared: SharedTarget<E> = Arc::from(target);
+        PrepareTargetResult::Cancelled(_) => unreachable!("preparation without a cancellation token cannot be cancelled"),
+    };
+    let target_id = shared.id().to_string();
     if !shared.is_enabled() {
         on_replay_start(&target_id, false);
         return Some((shared, None));
@@ -493,6 +559,45 @@ where
         .map(|store| start_replay(store.boxed_clone(), Arc::clone(&shared)));
     on_replay_start(&target_id, cancel.is_some());
     Some((shared, cancel))
+}
+
+pub(crate) async fn prepare_target<E>(
+    target: Box<dyn Target<E> + Send + Sync>,
+    cancellation: Option<&CancellationToken>,
+) -> PrepareTargetResult<E>
+where
+    E: PluginEvent,
+{
+    let target_id = target.id().to_string();
+    let has_store = target.store().is_some();
+
+    let init_result = match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return PrepareTargetResult::Cancelled(target),
+                result = target.init() => result,
+            }
+        }
+        None => target.init().await,
+    };
+
+    if let Err(err) = init_result {
+        tracing::error!(target_id = %target_id, reason = "initialization_failed", "Failed to initialize target");
+        if !has_store {
+            return PrepareTargetResult::Failed { error: err, target };
+        }
+        tracing::warn!(
+            target_id = %target_id,
+            "Proceeding with store-backed target despite init failure"
+        );
+        return PrepareTargetResult::Degraded {
+            error: err,
+            target: Arc::from(target),
+        };
+    }
+
+    PrepareTargetResult::Ready(Arc::from(target))
 }
 
 type ActivatedTarget<E> = (SharedTarget<E>, Option<(mpsc::Sender<()>, JoinHandle<()>)>);
@@ -612,7 +717,11 @@ async fn stream_replay_worker<E>(
                 }
                 Ok(Ok(_)) => {}
                 Err(join_err) => {
-                    tracing::warn!(target_id = %target.id(), error = %join_err, "The failed-events maintenance task failed to join");
+                    tracing::warn!(
+                        target_id = %target.id(),
+                        reason = join_failure_reason(&join_err),
+                        "The failed-events maintenance task failed to join"
+                    );
                 }
             }
             last_prune = tokio::time::Instant::now();
@@ -863,8 +972,9 @@ mod tests {
     use crate::{SharedTarget, Target, TargetError};
     use async_trait::async_trait;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::{Notify, Semaphore};
 
     #[tokio::test(start_paused = true)]
     async fn seed_interval_start_backdates_by_one_interval() {
@@ -929,18 +1039,24 @@ mod tests {
     #[derive(Clone)]
     struct TestTarget {
         id: TargetID,
+        block_on_close: Arc<AtomicBool>,
+        close_gate: Arc<Semaphore>,
         close_calls: Arc<AtomicUsize>,
         enabled: bool,
         health_delay: Duration,
+        close_started: Arc<Notify>,
     }
 
     impl TestTarget {
         fn new(id: &str, name: &str) -> Self {
             Self {
                 id: TargetID::new(id.to_string(), name.to_string()),
+                block_on_close: Arc::new(AtomicBool::new(false)),
+                close_gate: Arc::new(Semaphore::new(0)),
                 close_calls: Arc::new(AtomicUsize::new(0)),
                 enabled: true,
                 health_delay: Duration::ZERO,
+                close_started: Arc::new(Notify::new()),
             }
         }
 
@@ -983,6 +1099,10 @@ mod tests {
 
         async fn close(&self) -> Result<(), TargetError> {
             self.close_calls.fetch_add(1, Ordering::SeqCst);
+            self.close_started.notify_one();
+            if self.block_on_close.load(Ordering::SeqCst) {
+                let _permit = self.close_gate.acquire().await.expect("close gate should remain open");
+            }
             Ok(())
         }
 
@@ -1012,6 +1132,45 @@ mod tests {
         assert!(removed.is_some());
         assert_eq!(manager.len(), 0);
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_manager_starts_all_target_closes_before_waiting_for_completion() {
+        let mut manager = TargetRuntimeManager::<String>::new();
+        let first = TestTarget::new("first", "webhook");
+        let second = TestTarget::new("second", "webhook");
+        let first_observer = first.clone();
+        let second_observer = second.clone();
+        manager.add_boxed(Box::new(first));
+        manager.add_boxed(Box::new(second));
+
+        let first_close_key = manager
+            .keys()
+            .into_iter()
+            .next()
+            .expect("two targets should have a first close key");
+        let (blocked, unblocked) = if first_close_key == first_observer.id.to_string() {
+            (first_observer, second_observer)
+        } else {
+            (second_observer, first_observer)
+        };
+        blocked.block_on_close.store(true, Ordering::SeqCst);
+
+        let close_task = tokio::spawn(async move { manager.clear_and_close().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), blocked.close_started.notified())
+            .await
+            .expect("the first target close should start");
+        tokio::time::timeout(std::time::Duration::from_secs(1), unblocked.close_started.notified())
+            .await
+            .expect("a blocked first close must not prevent the second close from starting");
+        assert!(!close_task.is_finished(), "clear_and_close must still await the blocked target");
+
+        blocked.close_gate.add_permits(1);
+        let errors = close_task.await.expect("clear_and_close task should join");
+        assert!(errors.is_empty());
+        assert_eq!(blocked.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(unblocked.close_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1142,6 +1301,51 @@ mod tests {
 
         assert!(manager.is_empty());
         assert!(exited.load(Ordering::SeqCst), "stop_all must await the worker to completion");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_all_does_not_abort_delivery_awaiting_acknowledgement() {
+        use super::ReplayWorkerManager;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let mut manager = ReplayWorkerManager::new();
+        let acknowledgement = Arc::new(Notify::new());
+        let worker_started = Arc::new(Notify::new());
+        let exited = Arc::new(AtomicBool::new(false));
+        let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let worker_acknowledgement = acknowledgement.clone();
+        let worker_started_signal = worker_started.clone();
+        let worker_exited = exited.clone();
+        let join = tokio::spawn(async move {
+            worker_started_signal.notify_one();
+            let _ = cancel_rx.recv().await;
+            // Model a protocol operation that has accepted the request but has
+            // not returned its acknowledgement yet. Lifecycle must not abort
+            // this future or the same durable entry can be sent twice.
+            worker_acknowledgement.notified().await;
+            worker_exited.store(true, Ordering::SeqCst);
+        });
+        manager.insert_with_handle("primary:webhook".to_string(), cancel_tx, join);
+        worker_started.notified().await;
+
+        let mut stop = Box::pin(manager.stop_all("stopping ack-pending test worker"));
+        tokio::select! {
+            biased;
+            _ = &mut stop => panic!("stop_all returned before the pending acknowledgement"),
+            _ = std::future::ready(()) => {}
+        }
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::select! {
+            biased;
+            _ = &mut stop => panic!("stop_all aborted an acknowledgement-pending delivery"),
+            _ = std::future::ready(()) => {}
+        }
+
+        acknowledgement.notify_one();
+        stop.await;
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(manager.is_empty());
     }
 
     mod classifier {

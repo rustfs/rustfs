@@ -223,7 +223,7 @@ async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminActio
     validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
 }
 
-fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
+fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> S3Result<Option<String>> {
     shared_target_mutation_block_reason(
         audit_target_specs(),
         AUDIT_ROUTE_PREFIX,
@@ -250,21 +250,23 @@ async fn audit_target_operation_block_reason(action: &str) -> Option<String> {
     target_module_disabled_reason("audit", rustfs_config::ENV_AUDIT_ENABLE, is_audit_module_enabled(), action)
 }
 
-fn merge_audit_endpoints<V>(config: &Config, runtime_statuses: HashMap<EndpointKey, V>) -> Vec<AuditEndpoint>
+fn merge_audit_endpoints<V>(config: &Config, runtime_statuses: HashMap<EndpointKey, V>) -> S3Result<Vec<AuditEndpoint>>
 where
     V: Into<RuntimeHealthStatus>,
 {
-    shared_merge_target_endpoints(audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)
-        .into_iter()
-        .map(|endpoint| AuditEndpoint {
-            account_id: endpoint.account_id,
-            service: endpoint.service,
-            status: endpoint.status,
-            health_state: endpoint.health_state,
-            health_reason: endpoint.health_reason,
-            source: endpoint.source,
-        })
-        .collect()
+    Ok(
+        shared_merge_target_endpoints(audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)?
+            .into_iter()
+            .map(|endpoint| AuditEndpoint {
+                account_id: endpoint.account_id,
+                service: endpoint.service,
+                status: endpoint.status,
+                health_state: endpoint.health_state,
+                health_reason: endpoint.health_reason,
+                source: endpoint.source,
+            })
+            .collect(),
+    )
 }
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
@@ -286,7 +288,7 @@ impl Operation for AuditTargetConfig {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let config_snapshot = load_server_config_from_store().await?;
-        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
+        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
             log_audit_target_operation_blocked!("set_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
@@ -312,12 +314,14 @@ impl Operation for AuditTargetConfig {
         )
         .await?;
 
-        update_audit_config_and_reload(audit_target_specs(), |config| {
+        let mutation_target_type = target_type.to_lowercase();
+        let mutation_target_name = target_name.to_lowercase();
+        update_audit_config_and_reload(audit_target_specs(), move |config| {
             config
                 .0
-                .entry(target_type.to_lowercase())
+                .entry(mutation_target_type.clone())
                 .or_default()
-                .insert(target_name.to_lowercase(), kvs.clone());
+                .insert(mutation_target_name.clone(), kvs.clone());
             true
         })
         .await
@@ -351,7 +355,7 @@ impl Operation for ListAuditTargets {
         }
 
         let config = load_server_config_from_store().await?;
-        let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses);
+        let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses)?;
         let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints }).map_err(|e| {
             log_audit_target_request_failed!("list_audit_targets", "serialize_audit_targets_failed", None, None, e);
             s3_error!(InternalError, "failed to serialize audit targets: {}", e)
@@ -376,19 +380,21 @@ impl Operation for RemoveAuditTarget {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let config_snapshot = load_server_config_from_store().await?;
-        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
+        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
             log_audit_target_operation_blocked!("remove_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        update_audit_config_and_reload(audit_target_specs(), |config| {
+        let mutation_target_type = target_type.to_lowercase();
+        let mutation_target_name = target_name.to_lowercase();
+        update_audit_config_and_reload(audit_target_specs(), move |config| {
             let mut changed = false;
-            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
-                if targets.remove(&target_name.to_lowercase()).is_some() {
+            if let Some(targets) = config.0.get_mut(&mutation_target_type) {
+                if targets.remove(&mutation_target_name).is_some() {
                     changed = true;
                 }
                 if targets.is_empty() {
-                    config.0.remove(&target_type.to_lowercase());
+                    config.0.remove(&mutation_target_type);
                 }
             }
             changed
@@ -476,7 +482,7 @@ mod tests {
                     (("mixed-target".to_string(), "webhook".to_string()), "online".to_string()),
                     (("env-only".to_string(), "webhook".to_string()), "online".to_string()),
                 ]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
                 let mixed = merged
                     .iter()
@@ -519,7 +525,7 @@ mod tests {
                     (("mixed-kafka".to_string(), "kafka".to_string()), "online".to_string()),
                     (("env-kafka".to_string(), "kafka".to_string()), "online".to_string()),
                 ]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
                 let mixed = merged
                     .iter()
@@ -556,7 +562,7 @@ mod tests {
                     (("mixed-amqp".to_string(), "amqp".to_string()), "online".to_string()),
                     (("env-amqp".to_string(), "amqp".to_string()), "online".to_string()),
                 ]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
                 let mixed = merged
                     .iter()
@@ -583,7 +589,8 @@ mod tests {
             ],
             || {
                 let config = Config(HashMap::new());
-                let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary");
+                let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary")
+                    .expect("audit target mutation block reason");
                 assert!(reason.is_some());
                 assert!(reason.unwrap().contains("managed by environment variables"));
             },
@@ -620,7 +627,8 @@ mod tests {
                 AUDIT_WEBHOOK_SUB_SYS.to_string(),
                 HashMap::from([("primary".to_string(), enabled_kvs("on"))]),
             )]));
-            let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary");
+            let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary")
+                .expect("audit target mutation block reason");
             assert!(reason.is_some());
             assert!(reason.unwrap().contains("both persisted config and environment variables"));
         });
@@ -640,7 +648,7 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MIXED-DISABLED", Some("https://example.com/hook")),
             ],
             || {
-                let merged = merge_audit_endpoints(&config, HashMap::<EndpointKey, String>::new());
+                let merged = merge_audit_endpoints(&config, HashMap::new()).expect("merge audit endpoints");
                 let mixed = merged
                     .iter()
                     .find(|entry| entry.account_id == "mixed-disabled")
@@ -662,7 +670,7 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
             ],
             || {
-                let merged = merge_audit_endpoints(&config, HashMap::<EndpointKey, String>::new());
+                let merged = merge_audit_endpoints(&config, HashMap::new()).expect("merge audit endpoints");
                 let env_only = merged
                     .iter()
                     .find(|entry| entry.account_id == "env-only")
@@ -775,7 +783,7 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), "online".to_string())]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
                 let mixed = merged
                     .iter()
                     .find(|entry| entry.account_id == "PrimaryCase" && entry.service == "webhook")
@@ -794,7 +802,11 @@ mod tests {
         )]));
 
         with_audit_webhook_target_env_cleared("primarycase", || {
-            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
+            assert!(
+                audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase")
+                    .expect("audit target mutation block reason")
+                    .is_none()
+            );
         });
     }
 
@@ -802,7 +814,11 @@ mod tests {
     fn audit_target_mutation_block_reason_allows_runtime_only_target() {
         with_audit_webhook_target_env_cleared("primary", || {
             let config = Config(HashMap::new());
-            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary").is_none());
+            assert!(
+                audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary")
+                    .expect("audit target mutation block reason")
+                    .is_none()
+            );
         });
     }
 

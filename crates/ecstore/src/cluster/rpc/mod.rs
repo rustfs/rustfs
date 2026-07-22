@@ -37,8 +37,8 @@ pub use http_auth::{
 pub(crate) use internode_data_transport::TcpHttpInternodeDataTransport;
 pub use internode_data_transport::build_internode_data_transport_from_env;
 pub use peer_rest_client::{
-    PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
-    ScannerPeerActivity,
+    PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity,
 };
 pub(crate) use peer_s3_client::heal_bucket_local_on_disks;
 pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys};
