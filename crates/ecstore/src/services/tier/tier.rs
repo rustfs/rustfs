@@ -2515,6 +2515,11 @@ impl TierConfigMgr {
                 let _config_lock = config_lock;
                 let _update = update;
                 let mutation_kind = mutation.intent_kind();
+                if version.is_none() && !candidate.tiers.is_empty() && mutation_kind != TierMutationIntentKind::Add {
+                    return Err(TierConfigUpdateError::Load(io::Error::other(
+                        "tier configuration mutation requires an existing config ETag",
+                    )));
+                }
                 let explicit_tier_name = mutation.explicit_tier_name().map(str::to_string);
                 let current_for_targets = TierConfigMgr {
                     driver_cache: HashMap::new(),
@@ -6061,6 +6066,7 @@ mod tests {
     #[derive(Debug)]
     struct CasConfigStore {
         state: tokio::sync::Mutex<Option<(Vec<u8>, String)>>,
+        legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
         next_etag: AtomicUsize,
         fail_put: AtomicBool,
         truncate_reference_page_without_marker: AtomicBool,
@@ -6073,6 +6079,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 state: tokio::sync::Mutex::new(None),
+                legacy_state: tokio::sync::Mutex::new(None),
                 next_etag: AtomicUsize::new(0),
                 fail_put: AtomicBool::new(false),
                 truncate_reference_page_without_marker: AtomicBool::new(false),
@@ -6114,8 +6121,19 @@ mod tests {
             _headers: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader> {
-            let state = self.state.lock().await;
-            let (data, etag) = state.as_ref().ok_or(Error::ConfigNotFound)?;
+            let current_config_path = tier_config_path(TIER_CONFIG_FILE);
+            let legacy_config_path = tier_config_path(TIER_CONFIG_LEGACY_FILE);
+            let (data, etag) = if object == current_config_path {
+                let state = self.state.lock().await;
+                let (data, etag) = state.as_ref().ok_or(Error::ConfigNotFound)?;
+                (data.clone(), etag.clone())
+            } else if object == legacy_config_path {
+                let state = self.legacy_state.lock().await;
+                let data = state.as_ref().ok_or(Error::ConfigNotFound)?;
+                (data.clone(), "legacy-config-etag".to_string())
+            } else {
+                return Err(Error::ConfigNotFound);
+            };
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(data.clone())),
                 object_info: ObjectInfo {
@@ -6123,7 +6141,7 @@ mod tests {
                     name: object.to_string(),
                     size: data.len() as i64,
                     actual_size: data.len() as i64,
-                    etag: Some(etag.clone()),
+                    etag: Some(etag),
                     ..Default::default()
                 },
                 buffered_body: None,
@@ -6607,13 +6625,20 @@ mod tests {
         let mut candidate = empty_mgr();
         candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
         candidate.tiers.insert("COLD-B".to_string(), build_rustfs_tier("COLD-B"));
+        candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("stale-manager fixture should persist");
+        let (candidate, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("stale-manager fixture should reload with an ETag");
         let update = TierConfigMgr::admin_update_lock(&manager).await;
 
         TierConfigMgr::update_candidate_owned(
             &manager,
             store.clone(),
             candidate,
-            None,
+            version,
             TierCandidateMutation::Remove("COLD-A".to_string(), true),
             update,
             None,
@@ -6628,6 +6653,60 @@ mod tests {
             .0;
         assert!(!reloaded.tiers.contains_key("COLD-A"));
         assert!(reloaded.tiers.contains_key("COLD-B"));
+    }
+
+    #[tokio::test]
+    async fn legacy_config_without_etag_blocks_non_add_mutations_before_save() {
+        for (case, mutation) in [
+            (
+                "edit",
+                TierCandidateMutation::Edit(
+                    "COLD-A".to_string(),
+                    TierCreds {
+                        access_key: "rotated-access".to_string(),
+                        secret_key: "rotated-secret".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ("remove", TierCandidateMutation::Remove("COLD-A".to_string(), true)),
+            ("clear", TierCandidateMutation::Clear(true)),
+        ] {
+            let manager = TierConfigMgr::new();
+            let store = Arc::new(CasConfigStore::default());
+            let mut legacy = empty_mgr();
+            legacy.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+            let legacy_data = legacy.marshal().expect("legacy tier config should encode");
+            *store.legacy_state.lock().await = Some(legacy_data.to_vec());
+
+            let (loaded, version) = load_tier_config_for_update(store.clone())
+                .await
+                .expect("legacy tier config should load for update");
+            assert!(loaded.tiers.contains_key("COLD-A"), "{case} fixture should load legacy config");
+            assert_eq!(version, None, "{case} fixture must represent a legacy config without current ETag");
+
+            let err = TierConfigMgr::update_candidate_with_config_lock(&manager, store.clone(), mutation)
+                .await
+                .expect_err("non-add legacy config mutations must fail closed before save");
+
+            match err {
+                TierConfigUpdateError::Load(err) => {
+                    assert!(
+                        err.to_string().contains("requires an existing config ETag"),
+                        "{case} returned unexpected load error: {err}"
+                    );
+                }
+                other => panic!("{case} should fail before mutation/save, got {other:?}"),
+            }
+            assert!(
+                store.state.lock().await.is_none(),
+                "{case} must not create the durable binary tier config after a failed legacy mutation"
+            );
+            assert!(
+                manager.read().await.tiers.is_empty(),
+                "{case} must not publish a failed legacy mutation into the live manager"
+            );
+        }
     }
 
     #[test]
@@ -6683,9 +6762,16 @@ mod tests {
             install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
         }
         let store = Arc::new(CasConfigStore::default());
-        store.fail_put.store(true, Ordering::SeqCst);
         let mut candidate = empty_mgr();
         candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("save-failure fixture should persist");
+        let (_, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("save-failure fixture should reload with an ETag");
+        store.fail_put.store(true, Ordering::SeqCst);
         candidate
             .driver_cache
             .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("candidate")));
@@ -6695,7 +6781,7 @@ mod tests {
             &manager,
             store.clone(),
             candidate,
-            None,
+            version.clone(),
             TierCandidateMutation::Remove("COLD-A".to_string(), true),
             update,
             None,
@@ -6725,7 +6811,7 @@ mod tests {
             &manager,
             store,
             retry,
-            None,
+            version,
             TierCandidateMutation::Remove("COLD-A".to_string(), true),
             update,
             None,
@@ -6749,6 +6835,13 @@ mod tests {
         let mut candidate = empty_mgr();
         candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
         candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("cancelled update fixture should persist");
+        let (_, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("cancelled update fixture should reload with an ETag");
+        candidate
             .driver_cache
             .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("candidate")));
         let update = TierConfigMgr::admin_update_lock(&manager).await;
@@ -6759,7 +6852,7 @@ mod tests {
                 &update_manager,
                 update_store,
                 candidate,
-                None,
+                version,
                 TierCandidateMutation::Remove("COLD-A".to_string(), true),
                 update,
                 None,
@@ -6900,6 +6993,13 @@ mod tests {
         let mut candidate = empty_mgr();
         candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
         candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("panic fixture should persist");
+        let (_, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("panic fixture should reload with an ETag");
+        candidate
             .driver_cache
             .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::panicking_in_use("panic")));
         let update = TierConfigMgr::admin_update_lock(&manager).await;
@@ -6908,7 +7008,7 @@ mod tests {
             &manager,
             store,
             candidate,
-            None,
+            version,
             TierCandidateMutation::Remove("COLD-A".to_string(), false),
             update,
             None,
