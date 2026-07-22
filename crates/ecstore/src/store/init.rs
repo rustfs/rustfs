@@ -2647,7 +2647,11 @@ mod tests {
 
             assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
             assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
-            assert_eq!(backend.object_count().await, 0, "case {case}: recovered unknown upload candidate must be absent");
+            assert_eq!(
+                backend.object_count().await,
+                0,
+                "case {case}: recovered unknown upload candidate must be absent"
+            );
             let removed = remote_version
                 .map(|version| vec![(transaction.remote_object.clone(), version)])
                 .unwrap_or_default();
@@ -2656,7 +2660,10 @@ mod tests {
                 removed,
                 "case {case}: recovery must delete only provider-recovered candidates"
             );
-            assert_eq!(backend.exact_remove_count(), usize::from(removed.first().is_some_and(|(_, version)| !version.is_empty())));
+            assert_eq!(
+                backend.exact_remove_count(),
+                usize::from(removed.first().is_some_and(|(_, version)| !version.is_empty()))
+            );
         }
     }
 }
