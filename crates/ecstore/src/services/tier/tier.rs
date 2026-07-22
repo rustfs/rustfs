@@ -47,7 +47,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::client::admin_handler_utils::AdminError;
+use crate::client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
 use crate::error::{Error, Result, StorageError};
 use crate::services::tier::{
     tier_admin::TierCreds,
@@ -230,6 +230,7 @@ struct PreparedTierDriver {
     tier_name: String,
     config_fingerprint: TierDriverFingerprint,
     backend_identity: TierDestinationId,
+    exact_get_delete: bool,
     driver: SharedWarmBackend,
 }
 
@@ -1051,6 +1052,10 @@ fn normalized_tier_prefix<'a>(tier_type: &TierType, prefix: &'a str) -> &'a str 
     }
 }
 
+fn tier_exact_get_delete(config: &TierConfig) -> bool {
+    ProviderVersionCapabilities::for_tier_type(&config.tier_type.as_lowercase()).exact_get_delete
+}
+
 struct TierDriverGeneration {
     tier_name: Arc<str>,
     generation: DriverRevision,
@@ -1058,6 +1063,7 @@ struct TierDriverGeneration {
     config_fingerprint: TierDriverFingerprint,
     // Durable cleanup identity: routing fields only, with all credentials excluded.
     backend_identity: TierDestinationId,
+    exact_get_delete: bool,
     driver: SharedWarmBackend,
     accepting: AtomicBool,
     active_leases: AtomicUsize,
@@ -1177,6 +1183,17 @@ impl TierOperationLease {
 
     pub(crate) fn backend_identity(&self) -> TierDestinationId {
         self.inner.backend_identity
+    }
+
+    pub(crate) fn validate_remote_version_id(&self, remote_version_id: &str) -> io::Result<()> {
+        self.inner.driver.validate_remote_version_id(remote_version_id)?;
+        if !remote_version_id.is_empty() && !self.inner.exact_get_delete {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote tier does not support exact versioned GET and DELETE",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn is_current_generation(&self) -> bool {
@@ -2525,10 +2542,12 @@ impl TierConfigMgr {
                         admin_err.message = err.to_string();
                         admin_err
                     })?;
+                    let exact_get_delete = tier_exact_get_delete(config);
                     Some(PreparedTierDriver {
                         tier_name: tier_name.to_string(),
                         config_fingerprint,
                         backend_identity,
+                        exact_get_delete,
                         driver: Arc::from(driver),
                     })
                 }
@@ -2557,6 +2576,7 @@ impl TierConfigMgr {
                 generation,
                 config_fingerprint: prepared.config_fingerprint,
                 backend_identity: prepared.backend_identity,
+                exact_get_delete: prepared.exact_get_delete,
                 driver: prepared.driver.clone(),
                 accepting: AtomicBool::new(true),
                 active_leases: AtomicUsize::new(0),
@@ -3027,28 +3047,18 @@ impl TierConfigMgr {
             self.driver_cache.insert(tier_name.to_string(), driver);
             return Ok(());
         };
-        let config_fingerprint = self
-            .tiers
-            .get(tier_name)
-            .ok_or_else(|| ERR_TIER_NOT_FOUND.clone())
-            .and_then(|config| {
-                tier_config_fingerprint(tier_name, config).map_err(|err| {
-                    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
-                    admin_err.message = err.to_string();
-                    admin_err
-                })
-            })?;
-        let backend_identity = self
-            .tiers
-            .get(tier_name)
-            .ok_or_else(|| ERR_TIER_NOT_FOUND.clone())
-            .and_then(|config| {
-                tier_backend_identity(config).map_err(|err| {
-                    let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
-                    admin_err.message = err.to_string();
-                    admin_err
-                })
-            })?;
+        let config = self.tiers.get(tier_name).ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?;
+        let config_fingerprint = tier_config_fingerprint(tier_name, config).map_err(|err| {
+            let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+            admin_err.message = err.to_string();
+            admin_err
+        })?;
+        let backend_identity = tier_backend_identity(config).map_err(|err| {
+            let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+            admin_err.message = err.to_string();
+            admin_err
+        })?;
+        let exact_get_delete = tier_exact_get_delete(config);
         let mut runtime_guard = lock_unpoisoned(&runtime);
         let generation = runtime_guard.next_generation.checked_add(1).ok_or_else(|| {
             let mut err = ERR_TIER_INVALID_CONFIG.clone();
@@ -3061,6 +3071,7 @@ impl TierConfigMgr {
             generation,
             config_fingerprint,
             backend_identity,
+            exact_get_delete,
             driver: driver.clone(),
             accepting: AtomicBool::new(true),
             active_leases: AtomicUsize::new(0),
@@ -6632,6 +6643,44 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn operation_lease_rejects_nonempty_versions_without_exact_get_delete() {
+        let manager = TierConfigMgr::new();
+        let azure_tier = build_azure_tier("account-a");
+        let azure_tier_name = azure_tier.name.clone();
+        let exact_tier = build_rustfs_tier("COLD-EXACT");
+        let exact_tier_name = exact_tier.name.clone();
+        {
+            let mut guard = manager.write().await;
+            guard.tiers.insert(azure_tier_name.clone(), azure_tier);
+            guard
+                .replace_driver(&azure_tier_name, Box::new(LeaseTestBackend::ready("azure")))
+                .expect("test Azure tier driver should install");
+            guard.tiers.insert(exact_tier_name.clone(), exact_tier);
+            guard
+                .replace_driver(&exact_tier_name, Box::new(LeaseTestBackend::ready("exact")))
+                .expect("test exact tier driver should install");
+        }
+
+        let lease = TierConfigMgr::acquire_operation_lease(&manager, &azure_tier_name)
+            .await
+            .expect("tier operation lease should resolve");
+        let err = lease
+            .validate_remote_version_id("provider-version")
+            .expect_err("a provider without exact GET and DELETE must not commit a versioned transition");
+
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        lease
+            .validate_remote_version_id("")
+            .expect("unversioned remote state remains supported");
+
+        TierConfigMgr::acquire_operation_lease(&manager, &exact_tier_name)
+            .await
+            .expect("exact tier operation lease should resolve")
+            .validate_remote_version_id("provider-version")
+            .expect("providers declaring exact GET and DELETE must retain versioned transition support");
     }
 
     #[test]
