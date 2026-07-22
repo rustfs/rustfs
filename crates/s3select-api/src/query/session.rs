@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::query::Context;
-use crate::{QueryError, QueryResult, object_store::EcObjectStore};
+use crate::{QueryError, QueryResult, SelectStore, object_store::EcObjectStore};
 use datafusion::{
     arrow::{
         array::{Int32Array, StringArray},
@@ -26,7 +26,10 @@ use datafusion::{
     prelude::SessionContext,
 };
 use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::error;
+
+pub type QueryExecutionGuard = Arc<OwnedSemaphorePermit>;
 
 #[derive(Clone)]
 pub struct SessionCtx {
@@ -81,7 +84,34 @@ impl SessionCtxFactory {
     }
 
     pub async fn create_session_ctx(&self, context: &Context) -> QueryResult<SessionCtx> {
-        let df_session_ctx = self.build_df_session_context(context).await?;
+        self.create_session_ctx_inner(context, None, None).await
+    }
+
+    pub async fn create_session_ctx_with_guard(
+        &self,
+        context: &Context,
+        query_guard: QueryExecutionGuard,
+    ) -> QueryResult<SessionCtx> {
+        self.create_session_ctx_inner(context, Some(query_guard), None).await
+    }
+
+    #[cfg(test)]
+    async fn create_session_ctx_with_guard_and_store(
+        &self,
+        context: &Context,
+        query_guard: QueryExecutionGuard,
+        store: Arc<SelectStore>,
+    ) -> QueryResult<SessionCtx> {
+        self.create_session_ctx_inner(context, Some(query_guard), Some(store)).await
+    }
+
+    async fn create_session_ctx_inner(
+        &self,
+        context: &Context,
+        query_guard: Option<QueryExecutionGuard>,
+        store: Option<Arc<SelectStore>>,
+    ) -> QueryResult<SessionCtx> {
+        let df_session_ctx = self.build_df_session_context(context, query_guard, store).await?;
 
         Ok(SessionCtx {
             _desc: Arc::new(SessionCtxDesc {}),
@@ -89,7 +119,12 @@ impl SessionCtxFactory {
         })
     }
 
-    async fn build_df_session_context(&self, context: &Context) -> QueryResult<SessionContext> {
+    async fn build_df_session_context(
+        &self,
+        context: &Context,
+        query_guard: Option<QueryExecutionGuard>,
+        store: Option<Arc<SelectStore>>,
+    ) -> QueryResult<SessionContext> {
         let path = format!("s3://{}", context.input.bucket);
         let store_url = url::Url::parse(&path).unwrap();
         let rt = RuntimeEnvBuilder::new()
@@ -146,8 +181,11 @@ impl SessionCtxFactory {
 
             df_session_state.with_object_store(&store_url, store).build()
         } else {
-            let store: EcObjectStore = EcObjectStore::new(context.input.clone(), memory_pool)
-                .map_err(|_| QueryError::NotImplemented { err: String::new() })?;
+            let store: EcObjectStore = match query_guard {
+                Some(query_guard) => EcObjectStore::new_with_query_guard(context.input.clone(), memory_pool, query_guard, store),
+                None => EcObjectStore::new(context.input.clone(), memory_pool),
+            }
+            .map_err(|_| QueryError::NotImplemented { err: String::new() })?;
             df_session_state.with_object_store(&store_url, Arc::new(store)).build()
         };
 
@@ -283,6 +321,32 @@ mod tests {
             session.inner().runtime_env().memory_pool.memory_limit(),
             MemoryLimit::Finite(1024)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn session_factory_propagates_query_guard_to_ec_store() {
+        let temp_root = tempfile::tempdir().expect("create session test temp root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_root.path())
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("query permit should be available");
+        let query_guard = Arc::new(permit);
+        let session = SessionCtxFactory::new(false)
+            .create_session_ctx_with_guard_and_store(&test_context(), Arc::clone(&query_guard), Arc::clone(&env.ecstore))
+            .await
+            .expect("production session should be created with the query guard");
+
+        assert!(Arc::strong_count(&query_guard) > 1);
+        drop(session);
+        assert_eq!(Arc::strong_count(&query_guard), 1);
     }
 
     #[test]

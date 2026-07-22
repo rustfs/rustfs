@@ -50,13 +50,13 @@ use rustfs_s3select_api::{
         function::FuncMetaManagerRef,
         logical_planner::{LogicalPlanner, Plan},
         parser::Parser,
-        session::{SessionCtx, SessionCtxFactory},
+        session::{QueryExecutionGuard, SessionCtx, SessionCtxFactory},
     },
 };
 use s3s::dto::{FileHeaderInfo, SelectObjectContentInput};
 use std::sync::LazyLock;
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::Semaphore,
     time::{Instant, Sleep, sleep_until, timeout_at},
 };
 
@@ -94,9 +94,12 @@ impl QueryDispatcher for SimpleQueryDispatcher {
             .clone()
             .try_acquire_owned()
             .map_err(|_| QueryError::QueryConcurrencyLimit)?;
+        let query_guard = Arc::new(permit);
         let deadline = Instant::now() + self.query_timeout;
         let output = timeout_at(deadline, async {
-            let query_state_machine = self.build_query_state_machine(query.clone()).await?;
+            let query_state_machine = self
+                .build_query_state_machine_with_guard(query.clone(), Arc::clone(&query_guard))
+                .await?;
             let logical_plan = self.build_logical_plan(query_state_machine.clone()).await?;
             let Some(logical_plan) = logical_plan else {
                 return Ok(Output::Nil(()));
@@ -111,7 +114,7 @@ impl QueryDispatcher for SimpleQueryDispatcher {
         match output {
             Output::StreamData(stream) => Ok(Output::StreamData(Box::pin(TrackedRecordBatchStream::new(
                 stream,
-                permit,
+                query_guard,
                 deadline,
                 self.query_timeout.as_secs(),
             )))),
@@ -158,13 +161,23 @@ impl QueryDispatcher for SimpleQueryDispatcher {
 
     async fn build_query_state_machine(&self, query: Query) -> QueryResult<Arc<QueryStateMachine>> {
         let session = self.session_factory.create_session_ctx(query.context()).await?;
-
-        let query_state_machine = Arc::new(QueryStateMachine::begin(query, session));
-        Ok(query_state_machine)
+        Ok(Arc::new(QueryStateMachine::begin(query, session)))
     }
 }
 
 impl SimpleQueryDispatcher {
+    async fn build_query_state_machine_with_guard(
+        &self,
+        query: Query,
+        query_guard: QueryExecutionGuard,
+    ) -> QueryResult<Arc<QueryStateMachine>> {
+        let session = self
+            .session_factory
+            .create_session_ctx_with_guard(query.context(), query_guard)
+            .await?;
+        Ok(Arc::new(QueryStateMachine::begin(query, session)))
+    }
+
     async fn statement_to_logical_plan<S: ContextProviderExtension + Send + Sync>(
         &self,
         stmt: ExtStatement,
@@ -317,6 +330,7 @@ pub struct TrackedRecordBatchStream {
     state: Arc<TrackedRecordBatchState>,
     schema: SchemaRef,
     deadline: Pin<Box<Sleep>>,
+    deadline_at: Instant,
     deadline_task: tokio::task::JoinHandle<()>,
     timeout_seconds: u64,
     done: bool,
@@ -324,13 +338,13 @@ pub struct TrackedRecordBatchStream {
 
 struct TrackedRecordBatchState {
     inner: Mutex<Option<SendableRecordBatchStream>>,
-    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    query_guard: Mutex<Option<QueryExecutionGuard>>,
     timed_out: AtomicBool,
 }
 
 impl TrackedRecordBatchState {
     fn finish(&self) {
-        self.permit.lock().take();
+        self.query_guard.lock().take();
         self.inner.lock().take();
     }
 
@@ -341,11 +355,11 @@ impl TrackedRecordBatchState {
 }
 
 impl TrackedRecordBatchStream {
-    fn new(inner: SendableRecordBatchStream, permit: OwnedSemaphorePermit, deadline: Instant, timeout_seconds: u64) -> Self {
+    fn new(inner: SendableRecordBatchStream, query_guard: QueryExecutionGuard, deadline: Instant, timeout_seconds: u64) -> Self {
         let schema = inner.schema();
         let state = Arc::new(TrackedRecordBatchState {
             inner: Mutex::new(Some(inner)),
-            permit: Mutex::new(Some(permit)),
+            query_guard: Mutex::new(Some(query_guard)),
             timed_out: AtomicBool::new(false),
         });
         let deadline_state = Arc::clone(&state);
@@ -357,6 +371,7 @@ impl TrackedRecordBatchStream {
             state,
             schema,
             deadline: Box::pin(sleep_until(deadline)),
+            deadline_at: deadline,
             deadline_task,
             timeout_seconds,
             done: false,
@@ -388,19 +403,24 @@ impl Stream for TrackedRecordBatchStream {
             self.done = true;
             self.state.expire();
             self.deadline_task.abort();
-            return Poll::Ready(Some(Err(datafusion::common::DataFusionError::External(Box::new(
-                QueryError::QueryTimeout {
-                    seconds: self.timeout_seconds,
-                },
-            )))));
+            return Poll::Ready(Some(Err(query_timeout_error(self.timeout_seconds))));
         }
-        let poll = {
+        let deadline_at = self.deadline_at;
+        let (poll, timed_out) = {
             let mut inner = self.state.inner.lock();
-            match inner.as_mut() {
+            let poll = match inner.as_mut() {
                 Some(inner) => inner.as_mut().poll_next(cx),
                 None => Poll::Ready(None),
-            }
+            };
+            let timed_out = self.state.timed_out.load(Ordering::Acquire) || Instant::now() >= deadline_at;
+            (poll, timed_out)
         };
+        if timed_out {
+            self.done = true;
+            self.state.expire();
+            self.deadline_task.abort();
+            return Poll::Ready(Some(Err(query_timeout_error(self.timeout_seconds))));
+        }
         if matches!(poll, Poll::Ready(None)) {
             self.done = true;
             self.state.finish();
@@ -408,6 +428,12 @@ impl Stream for TrackedRecordBatchStream {
         }
         poll
     }
+}
+
+fn query_timeout_error(timeout_seconds: u64) -> datafusion::common::DataFusionError {
+    datafusion::common::DataFusionError::External(Box::new(QueryError::QueryTimeout {
+        seconds: timeout_seconds,
+    }))
 }
 
 #[derive(Default, Clone)]
@@ -686,7 +712,7 @@ mod tests {
                 Poll::Pending::<Option<Result<RecordBatch, DataFusionError>>>
             }),
         ));
-        let mut output = Box::pin(TrackedRecordBatchStream::new(inner, permit, Instant::now(), 300));
+        let mut output = Box::pin(TrackedRecordBatchStream::new(inner, Arc::new(permit), Instant::now(), 300));
 
         let err = output
             .next()
@@ -721,7 +747,7 @@ mod tests {
                 Poll::Pending::<Option<Result<RecordBatch, DataFusionError>>>
             }),
         ));
-        let _output = TrackedRecordBatchStream::new(inner, permit, Instant::now(), 300);
+        let _output = TrackedRecordBatchStream::new(inner, Arc::new(permit), Instant::now(), 300);
 
         let recovered_permit = tokio::time::timeout(Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
             .await
@@ -746,12 +772,55 @@ mod tests {
         ));
         let mut output = Box::pin(TrackedRecordBatchStream::new(
             inner,
-            permit,
+            Arc::new(permit),
             Instant::now() + Duration::from_secs(300),
             300,
         ));
 
         assert!(output.next().await.is_none());
         assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_timeout_during_inner_poll_returns_error() {
+        let admission = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&admission)
+            .acquire_owned()
+            .await
+            .expect("admission permit should be available");
+        let inner = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            stream::pending::<Result<RecordBatch, DataFusionError>>(),
+        ));
+        let mut output = Box::pin(TrackedRecordBatchStream::new(
+            inner,
+            Arc::new(permit),
+            Instant::now() + Duration::from_secs(300),
+            300,
+        ));
+        let deadline_state = Arc::clone(&output.state);
+        let poll_state = Arc::clone(&deadline_state);
+        *deadline_state.inner.lock() = Some(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            stream::poll_fn(move |_| {
+                poll_state.timed_out.store(true, Ordering::Release);
+                Poll::Ready(None::<Result<RecordBatch, DataFusionError>>)
+            }),
+        )));
+
+        let err = output
+            .next()
+            .await
+            .expect("timeout error")
+            .expect_err("timeout racing with inner poll must fail");
+        let DataFusionError::External(source) = err else {
+            panic!("expected external query error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<QueryError>(),
+            Some(QueryError::QueryTimeout { seconds: 300 })
+        ));
+        assert_eq!(admission.available_permits(), 1);
+        assert!(output.next().await.is_none());
     }
 }

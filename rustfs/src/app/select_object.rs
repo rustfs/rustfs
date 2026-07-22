@@ -78,9 +78,13 @@ pub async fn execute_select_object_content(
         .into_record_batch_stream()
         .map_err(map_query_error_to_s3)?;
 
-    let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(8);
+    let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(9);
+    let terminal_permit = tx
+        .clone()
+        .try_reserve_owned()
+        .map_err(|_| s3_error!(InternalError, "can't reserve Select terminal event capacity"))?;
     spawn_traced(async move {
-        send_select_events_until_deadline(output, tx, validation, query_deadline, query_timeout.as_secs()).await;
+        send_select_events_until_deadline(output, tx, terminal_permit, validation, query_deadline, query_timeout.as_secs()).await;
     });
 
     Ok(S3Response::new(SelectObjectContentOutput {
@@ -91,6 +95,7 @@ pub async fn execute_select_object_content(
 async fn send_select_events_until_deadline(
     output: SendableRecordBatchStream,
     tx: mpsc::Sender<S3Result<SelectObjectContentEvent>>,
+    terminal_permit: mpsc::OwnedPermit<S3Result<SelectObjectContentEvent>>,
     validation: SelectValidation,
     deadline: Instant,
     timeout_seconds: u64,
@@ -99,7 +104,7 @@ async fn send_select_events_until_deadline(
         .await
         .is_err()
     {
-        let _ = tx.try_send(Err(map_query_error_to_s3(QueryError::QueryTimeout {
+        terminal_permit.send(Err(map_query_error_to_s3(QueryError::QueryTimeout {
             seconds: timeout_seconds,
         })));
     }
@@ -532,6 +537,12 @@ fn map_query_error_to_s3(err: QueryError) -> S3Error {
         QueryError::Datafusion { source } if is_resource_exhausted(source.as_ref()) => {
             S3Error::with_message(S3ErrorCode::Busy, message)
         }
+        QueryError::Datafusion { source } if is_unexpected_eof(source.as_ref()) => {
+            S3Error::with_message(S3ErrorCode::InternalError, message)
+        }
+        QueryError::Datafusion { source } if is_invalid_object_size(source.as_ref()) => {
+            S3Error::with_message(S3ErrorCode::InternalError, message)
+        }
         QueryError::Datafusion { .. } if looks_like_invalid_scan_range(&message) => {
             S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
         }
@@ -570,6 +581,16 @@ fn is_query_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<QueryError>()
         .is_some_and(|err| matches!(err, QueryError::QueryTimeout { .. }))
         || err.source().is_some_and(is_query_timeout)
+}
+
+fn is_unexpected_eof(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::UnexpectedEof)
+        || err.source().is_some_and(is_unexpected_eof)
+}
+
+fn is_invalid_object_size(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<std::num::TryFromIntError>().is_some() || err.source().is_some_and(is_invalid_object_size)
 }
 
 fn looks_like_object_not_found(message: &str) -> bool {
@@ -681,21 +702,39 @@ mod tests {
                 source: Box::new(DataFusionError::ResourcesExhausted("memory limit".to_string())),
             }))),
         });
+        let truncated = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated object stream")),
+            }))),
+        });
+        let invalid_object_size = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(u64::try_from(-1_i64).expect_err("negative size must fail conversion")),
+            }))),
+        });
 
         assert_eq!(unsupported.code(), &S3ErrorCode::UnsupportedSqlStructure);
         assert_eq!(saturated.code(), &S3ErrorCode::SlowDown);
         assert_eq!(timed_out.code(), &S3ErrorCode::Busy);
         assert_eq!(stream_timed_out.code(), &S3ErrorCode::Busy);
         assert_eq!(exhausted.code(), &S3ErrorCode::Busy);
+        assert_eq!(truncated.code(), &S3ErrorCode::InternalError);
+        assert_eq!(invalid_object_size.code(), &S3ErrorCode::InternalError);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn producer_deadline_cancels_backpressured_send() {
         let output = Box::pin(RecordBatchStreamAdapter::new(
             Arc::new(Schema::empty()),
             futures::stream::pending::<Result<RecordBatch, DataFusionError>>(),
         ));
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(2);
+        let terminal_permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("test channel should reserve terminal capacity");
         tx.send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
             .await
             .expect("test channel should accept the prefilled event");
@@ -704,14 +743,27 @@ mod tests {
             progress_enabled: false,
         };
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            send_select_events_until_deadline(output, tx, validation, Instant::now(), 300),
-        )
-        .await
-        .expect("expired producer should not remain blocked on send");
+        let producer = tokio::spawn(send_select_events_until_deadline(
+            output,
+            tx,
+            terminal_permit,
+            validation,
+            Instant::now() + std::time::Duration::from_secs(1),
+            300,
+        ));
 
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        producer.await.expect("producer should finish without draining the channel");
         assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let timeout_error = rx
+            .recv()
+            .await
+            .expect("producer should send a terminal timeout error")
+            .expect_err("terminal event should be an error");
+        assert_eq!(timeout_error.code(), &S3ErrorCode::Busy);
         assert!(rx.recv().await.is_none());
     }
 
