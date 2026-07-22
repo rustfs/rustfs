@@ -658,17 +658,24 @@ pub async fn process_transition_transaction_record(
             }
             Err(err) => Err(err),
         },
-        TransitionTransactionState::LocalCommitStarted if local_commit_matches_transaction(api.clone(), transaction).await? => {
-            delete_transition_transaction_record(api, transaction.transaction_id).await?;
-            Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
+        TransitionTransactionState::LocalCommitStarted => {
+            match local_commit_matches_transaction(api.clone(), transaction).await {
+                Ok(true) => {
+                    delete_transition_transaction_record(api, transaction.transaction_id).await?;
+                    Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
+                }
+                Ok(false) => Ok(TransitionTransactionRecoveryOutcome::Retained),
+                Err(err) if transition_source_is_missing(&err) => Ok(TransitionTransactionRecoveryOutcome::Retained),
+                Err(err) => Err(err),
+            }
         }
         TransitionTransactionState::AbortedNoRemote | TransitionTransactionState::Committed => {
             delete_transition_transaction_record(api, transaction.transaction_id).await?;
             Ok(TransitionTransactionRecoveryOutcome::RecordDeleted)
         }
-        TransitionTransactionState::UploadStarted
-        | TransitionTransactionState::UploadOutcomeUnknown
-        | TransitionTransactionState::LocalCommitStarted => Ok(TransitionTransactionRecoveryOutcome::Retained),
+        TransitionTransactionState::UploadStarted | TransitionTransactionState::UploadOutcomeUnknown => {
+            Ok(TransitionTransactionRecoveryOutcome::Retained)
+        }
     }
 }
 
