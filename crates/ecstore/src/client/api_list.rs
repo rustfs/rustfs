@@ -24,7 +24,7 @@ use crate::client::{
         ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult, ListObjectPartsResult, ListVersionsResult, ObjectPart,
     },
     credentials,
-    transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
+    transition_api::{ReaderImpl, RequestMetadata, TransitionClient, collect_response_body},
 };
 use crate::storage_api_contracts::bucket::BucketInfo;
 use http::{HeaderMap, StatusCode};
@@ -88,7 +88,7 @@ impl TransitionClient {
             url_values.insert("max-keys".to_string(), max_keys.to_string());
         }
 
-        let mut resp = self
+        let resp = self
             .execute_method(
                 http::Method::GET,
                 &mut RequestMetadata {
@@ -164,7 +164,7 @@ impl TransitionClient {
         Ok(list_bucket_result)
     }
 
-    pub fn list_object_versions_query(
+    pub async fn list_object_versions_query(
         &self,
         bucket_name: &str,
         opts: &ListObjectsOptions,
@@ -172,93 +172,88 @@ impl TransitionClient {
         version_id_marker: &str,
         delimiter: &str,
     ) -> Result<ListVersionsResult, std::io::Error> {
-        /*if err := s3utils.CheckValidBucketName(bucketName); err != nil {
-          return ListVersionsResult{}, err
+        let mut url_values = HashMap::new();
+        url_values.insert("versions".to_string(), "".to_string());
+        url_values.insert("prefix".to_string(), opts.prefix.clone());
+        url_values.insert("delimiter".to_string(), delimiter.to_string());
+        url_values.insert("encoding-type".to_string(), "url".to_string());
+
+        if !key_marker.is_empty() {
+            url_values.insert("key-marker".to_string(), key_marker.to_string());
         }
-        if err := s3utils.CheckValidObjectNamePrefix(opts.Prefix); err != nil {
-          return ListVersionsResult{}, err
-        }
-        urlValues := make(url.Values)
-
-        urlValues.Set("versions", "")
-
-        urlValues.Set("prefix", opts.Prefix)
-
-        urlValues.Set("delimiter", delimiter)
-
-        if keyMarker != "" {
-          urlValues.Set("key-marker", keyMarker)
-        }
-
         if opts.max_keys > 0 {
-          urlValues.Set("max-keys", fmt.Sprintf("%d", opts.max_keys))
+            url_values.insert("max-keys".to_string(), opts.max_keys.to_string());
+        }
+        if !version_id_marker.is_empty() {
+            url_values.insert("version-id-marker".to_string(), version_id_marker.to_string());
+        }
+        if opts.with_metadata {
+            url_values.insert("metadata".to_string(), "true".to_string());
         }
 
-        if versionIDMarker != "" {
-          urlValues.Set("version-id-marker", versionIDMarker)
+        let mut resp = self
+            .execute_method(
+                http::Method::GET,
+                &mut RequestMetadata {
+                    bucket_name: bucket_name.to_string(),
+                    object_name: "".to_string(),
+                    query_values: url_values,
+                    content_sha256_hex: EMPTY_STRING_SHA256_HASH.to_string(),
+                    custom_header: opts.headers.clone(),
+                    content_body: ReaderImpl::Body(Bytes::new()),
+                    content_length: 0,
+                    content_md5_base64: "".to_string(),
+                    stream_sha256: false,
+                    trailer: HeaderMap::new(),
+                    pre_sign_url: Default::default(),
+                    add_crc: Default::default(),
+                    extra_pre_sign_header: Default::default(),
+                    bucket_location: Default::default(),
+                    expires: Default::default(),
+                },
+            )
+            .await?;
+
+        let resp_status = resp.status();
+        let headers = resp.headers().clone();
+        let body = collect_response_body(resp.into_body(), MAX_S3_CLIENT_RESPONSE_SIZE).await?;
+        if resp_status != StatusCode::OK {
+            return Err(std::io::Error::other(http_resp_to_error_response(
+                resp_status,
+                &headers,
+                body,
+                bucket_name,
+                "",
+            )));
         }
 
-        if opts.WithMetadata {
-          urlValues.Set("metadata", "true")
+        let mut versions = quick_xml::de::from_reader::<_, ListVersionsResult>(body.as_slice())
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        for version in &mut versions.versions {
+            version.key = decode_s3_name(&version.key, &versions.encoding_type)?;
+        }
+        for marker in &mut versions.delete_markers {
+            marker.key = decode_s3_name(&marker.key, &versions.encoding_type)?;
+        }
+        for prefix in &mut versions.common_prefixes {
+            prefix.prefix = decode_s3_name(&prefix.prefix, &versions.encoding_type)?;
+        }
+        if !versions.next_key_marker.is_empty() {
+            versions.next_key_marker = decode_s3_name(&versions.next_key_marker, &versions.encoding_type)?;
         }
 
-        urlValues.Set("encoding-type", "url")
-
-        let resp = self.executeMethod(http::Method::GET, &mut RequestMetadata{
-            bucketName:       bucketName,
-            queryValues:      urlValues,
-            contentSHA256Hex: emptySHA256Hex,
-            customHeader:     opts.headers,
-        }).await?;
-        defer closeResponse(resp)
-        if err != nil {
-          return ListVersionsResult{}, err
-        }
-        if resp != nil {
-          if resp.StatusCode != http.StatusOK {
-            return ListVersionsResult{}, httpRespToErrorResponse(resp, bucketName, "")
-          }
-        }
-
-        listObjectVersionsOutput := ListVersionsResult{}
-        err = xml_decoder(resp.Body, &listObjectVersionsOutput)
-        if err != nil {
-          return ListVersionsResult{}, err
-        }
-
-        for i, obj := range listObjectVersionsOutput.Versions {
-          listObjectVersionsOutput.Versions[i].Key, err = decode_s3_name(obj.Key, listObjectVersionsOutput.EncodingType)
-          if err != nil {
-            return listObjectVersionsOutput, err
-          }
-        }
-
-        for i, obj := range listObjectVersionsOutput.CommonPrefixes {
-          listObjectVersionsOutput.CommonPrefixes[i].Prefix, err = decode_s3_name(obj.Prefix, listObjectVersionsOutput.EncodingType)
-          if err != nil {
-            return listObjectVersionsOutput, err
-          }
-        }
-
-        if listObjectVersionsOutput.NextKeyMarker != "" {
-          listObjectVersionsOutput.NextKeyMarker, err = decode_s3_name(listObjectVersionsOutput.NextKeyMarker, listObjectVersionsOutput.EncodingType)
-          if err != nil {
-            return listObjectVersionsOutput, err
-          }
-        }
-
-        Ok(listObjectVersionsOutput)*/
-        Err(std::io::Error::new(
-            ErrorKind::Unsupported,
-            credentials::ErrorResponse {
+        if versions.is_truncated && versions.next_key_marker.is_empty() {
+            return Err(std::io::Error::other(credentials::ErrorResponse {
                 sts_error: credentials::STSError {
                     r#type: "".to_string(),
                     code: "NotImplemented".to_string(),
-                    message: format!("list_object_versions_query is not implemented for bucket {bucket_name}"),
+                    message: "Truncated ListObjectVersions response should have next key marker set".to_string(),
                 },
                 request_id: "".to_string(),
-            },
-        ))
+            }));
+        }
+
+        Ok(versions)
     }
 
     pub fn list_objects_query(
@@ -364,6 +359,7 @@ impl TransitionClient {
     }
 }
 
+#[derive(Default)]
 #[allow(dead_code)]
 pub struct ListObjectsOptions {
     reverse_versions: bool,
@@ -429,5 +425,53 @@ fn decode_s3_name(name: &str, encoding_type: &str) -> Result<String, std::io::Er
         _ => {
             return Ok(name.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_versions_xml_preserves_versions_and_delete_markers() {
+        let xml = br#"
+            <ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                <Name>tier-bucket</Name>
+                <Prefix>archive/object</Prefix>
+                <KeyMarker></KeyMarker>
+                <VersionIdMarker></VersionIdMarker>
+                <MaxKeys>2</MaxKeys>
+                <IsTruncated>true</IsTruncated>
+                <NextKeyMarker>archive/object</NextKeyMarker>
+                <NextVersionIdMarker>version-a</NextVersionIdMarker>
+                <Version>
+                    <Key>archive/object</Key>
+                    <VersionId>version-a</VersionId>
+                    <IsLatest>true</IsLatest>
+                    <LastModified>2026-07-22T00:00:00Z</LastModified>
+                    <ETag>&quot;etag-a&quot;</ETag>
+                    <Size>5</Size>
+                    <StorageClass>STANDARD</StorageClass>
+                </Version>
+                <DeleteMarker>
+                    <Key>archive/object</Key>
+                    <VersionId>marker-a</VersionId>
+                    <IsLatest>false</IsLatest>
+                    <LastModified>2026-07-22T00:00:01Z</LastModified>
+                </DeleteMarker>
+            </ListVersionsResult>
+        "#;
+
+        let parsed =
+            quick_xml::de::from_reader::<_, ListVersionsResult>(xml.as_slice()).expect("ListObjectVersions XML should parse");
+
+        assert!(parsed.is_truncated);
+        assert_eq!(parsed.next_key_marker, "archive/object");
+        assert_eq!(parsed.next_version_id_marker, "version-a");
+        assert_eq!(parsed.versions.len(), 1);
+        assert_eq!(parsed.versions[0].key, "archive/object");
+        assert_eq!(parsed.versions[0].version_id, "version-a");
+        assert_eq!(parsed.delete_markers.len(), 1);
+        assert_eq!(parsed.delete_markers[0].version_id, "marker-a");
     }
 }

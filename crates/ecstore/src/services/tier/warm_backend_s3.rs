@@ -24,8 +24,10 @@ use url::Url;
 
 use crate::client::{
     api_get_options::GetObjectOptions,
+    api_list::ListObjectsOptions,
     api_put_object::PutObjectOptions,
     api_remove::{RemoveObjectOptions, RemoveObjectResult},
+    api_s3_datatypes::ListVersionsResult,
     credentials::{Credentials, SignatureType, Static, Value},
     transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
@@ -34,11 +36,12 @@ use crate::error::ErrorResponse;
 use crate::error::error_resp_to_object_err;
 use crate::services::tier::{
     tier_config::TierS3,
-    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
 };
 use http::HeaderMap;
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::path::SLASH_SEPARATOR;
+use s3s::dto::BucketVersioningStatus;
 
 pub struct WarmBackendS3 {
     pub client: Arc<TransitionClient>,
@@ -46,6 +49,27 @@ pub struct WarmBackendS3 {
     pub bucket: String,
     pub prefix: String,
     pub storage_class: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteBucketVersioning {
+    Disabled,
+    Suspended,
+    Enabled,
+}
+
+fn remote_bucket_versioning_from_status(status: Option<&str>) -> Result<RemoteBucketVersioning, std::io::Error> {
+    Ok(match status {
+        Some(BucketVersioningStatus::ENABLED) => RemoteBucketVersioning::Enabled,
+        Some(BucketVersioningStatus::SUSPENDED) => RemoteBucketVersioning::Suspended,
+        Some(status) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("remote tier bucket returned unsupported versioning status {status}"),
+            ));
+        }
+        None => RemoteBucketVersioning::Disabled,
+    })
 }
 
 impl WarmBackendS3 {
@@ -159,11 +183,57 @@ impl WarmBackendS3 {
         let (_, headers, reader) = self.core.get_object(&self.bucket, &self.get_dest(object), &gopts).await?;
         Ok((headers, reader))
     }
+
+    async fn remote_bucket_versioning(&self) -> Result<RemoteBucketVersioning, std::io::Error> {
+        let config = self.client.get_bucket_versioning(&self.bucket).await?;
+        remote_bucket_versioning_from_status(config.status.as_ref().map(|status| status.as_str()))
+    }
+
+    async fn list_transition_candidate_versions(&self, object: &str) -> Result<ListVersionsResult, std::io::Error> {
+        let mut opts = ListObjectsOptions::default();
+        opts.set("prefix", &self.get_dest(object));
+        opts.set("max-keys", "2");
+        self.client.list_object_versions_query(&self.bucket, &opts, "", "", "").await
+    }
+}
+
+fn classify_transition_candidate_versions(
+    remote_object: &str,
+    bucket_versioning: RemoteBucketVersioning,
+    versions: &ListVersionsResult,
+) -> TransitionCandidateProbe {
+    if versions.is_truncated {
+        return TransitionCandidateProbe::Ambiguous;
+    }
+
+    if versions.delete_markers.iter().any(|marker| marker.key == remote_object) {
+        return TransitionCandidateProbe::Ambiguous;
+    }
+
+    let mut exact_versions = versions.versions.iter().filter(|version| version.key == remote_object);
+    let Some(version) = exact_versions.next() else {
+        return TransitionCandidateProbe::Missing;
+    };
+    if exact_versions.next().is_some() {
+        return TransitionCandidateProbe::Ambiguous;
+    }
+
+    match bucket_versioning {
+        RemoteBucketVersioning::Disabled => TransitionCandidateProbe::UnversionedPresent,
+        RemoteBucketVersioning::Suspended if version.version_id == "null" => {
+            TransitionCandidateProbe::VersionedPresent(version.version_id.clone())
+        }
+        RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled if !version.version_id.is_empty() => {
+            TransitionCandidateProbe::VersionedPresent(version.version_id.clone())
+        }
+        RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled => TransitionCandidateProbe::Ambiguous,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::api_s3_datatypes::{ListVersionsResult, Version};
 
     #[tokio::test]
     async fn new_rejects_loopback_endpoint_before_network_setup() {
@@ -180,6 +250,116 @@ mod tests {
             Ok(_) => panic!("loopback endpoint should be rejected"),
             Err(err) => assert!(err.to_string().contains("not allowed")),
         }
+    }
+
+    fn list_versions(versions: &[(&str, &str)], delete_markers: &[(&str, &str)], is_truncated: bool) -> ListVersionsResult {
+        ListVersionsResult {
+            versions: versions
+                .iter()
+                .map(|(key, version_id)| Version {
+                    key: (*key).to_string(),
+                    version_id: (*version_id).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            delete_markers: delete_markers
+                .iter()
+                .map(|(key, version_id)| Version {
+                    key: (*key).to_string(),
+                    version_id: (*version_id).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            is_truncated,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transition_candidate_probe_classifier_is_fail_closed() {
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Disabled,
+                &list_versions(&[], &[], false),
+            ),
+            TransitionCandidateProbe::Missing
+        );
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Disabled,
+                &list_versions(&[("archive/object", "")], &[], false),
+            ),
+            TransitionCandidateProbe::UnversionedPresent
+        );
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Enabled,
+                &list_versions(&[("archive/object", "version-a")], &[], false),
+            ),
+            TransitionCandidateProbe::VersionedPresent("version-a".to_string())
+        );
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Suspended,
+                &list_versions(&[("archive/object", "null")], &[], false),
+            ),
+            TransitionCandidateProbe::VersionedPresent("null".to_string())
+        );
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Enabled,
+                &list_versions(&[("archive/object", "")], &[], false),
+            ),
+            TransitionCandidateProbe::Ambiguous
+        );
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Enabled,
+                &list_versions(&[("archive/object", "version-a"), ("archive/object", "version-b")], &[], false),
+            ),
+            TransitionCandidateProbe::Ambiguous
+        );
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Enabled,
+                &list_versions(&[("archive/object", "version-a")], &[("archive/object", "marker-a")], false),
+            ),
+            TransitionCandidateProbe::Ambiguous
+        );
+        assert_eq!(
+            classify_transition_candidate_versions(
+                "archive/object",
+                RemoteBucketVersioning::Enabled,
+                &list_versions(&[("archive/object", "version-a")], &[], true),
+            ),
+            TransitionCandidateProbe::Ambiguous
+        );
+    }
+
+    #[test]
+    fn remote_bucket_versioning_status_parser_fails_closed() {
+        assert_eq!(
+            remote_bucket_versioning_from_status(None).expect("absent status means disabled"),
+            RemoteBucketVersioning::Disabled
+        );
+        assert_eq!(
+            remote_bucket_versioning_from_status(Some(BucketVersioningStatus::ENABLED)).expect("enabled status should parse"),
+            RemoteBucketVersioning::Enabled
+        );
+        assert_eq!(
+            remote_bucket_versioning_from_status(Some(BucketVersioningStatus::SUSPENDED)).expect("suspended status should parse"),
+            RemoteBucketVersioning::Suspended
+        );
+        let err = remote_bucket_versioning_from_status(Some("UnexpectedStatus"))
+            .expect_err("unknown versioning status must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
 
@@ -213,6 +393,16 @@ impl WarmBackend for WarmBackendS3 {
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         self.remove_with_result(object, rv).await.map(|_| ())
+    }
+
+    async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        let bucket_versioning = self.remote_bucket_versioning().await?;
+        let versions = self.list_transition_candidate_versions(object).await?;
+        Ok(classify_transition_candidate_versions(
+            &self.get_dest(object),
+            bucket_versioning,
+            &versions,
+        ))
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
