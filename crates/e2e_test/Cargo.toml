@@ -33,6 +33,7 @@ rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-ecstore.workspace = true
 rustfs-data-usage.workspace = true
 rustfs-rio.workspace = true
+rustfs-utils = { workspace = true, features = ["egress"] }
 flatbuffers.workspace = true
 futures.workspace = true
 rustfs-lock.workspace = true
