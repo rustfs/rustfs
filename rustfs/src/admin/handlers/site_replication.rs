@@ -187,7 +187,11 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
         "s3:PutObjectTagging",
         "s3:PutObjectVersionTagging",
         "s3:DeleteObjectTagging",
-        "s3:DeleteObjectVersionTagging"
+        "s3:DeleteObjectVersionTagging",
+        "s3:GetObjectRetention",
+        "s3:PutObjectRetention",
+        "s3:GetObjectLegalHold",
+        "s3:PutObjectLegalHold"
       ],
       "Resource": ["arn:aws:s3:::*/*"]
     }
@@ -8858,6 +8862,57 @@ mod tests {
             ..operation_args
         };
         assert!(!policy.is_allowed(&put_policy_args).await);
+    }
+
+    // The replication service account must be able to carry object-lock metadata to the peer.
+    // Without these actions the peer answers AccessDenied for any replicated object that has
+    // retention or a legal hold, so a WORM-protected object never reaches the replica at all,
+    // and a retention change made after upload never propagates.
+    #[tokio::test]
+    async fn test_site_replicator_policy_allows_object_lock_replication() {
+        let policy = site_replicator_service_account_policy().expect("site replicator policy should parse");
+        let groups: Option<Vec<String>> = None;
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+
+        let base_args = rustfs_policy::policy::Args {
+            account: SITE_REPLICATOR_SERVICE_ACCOUNT,
+            groups: &groups,
+            action: Action::S3Action(S3Action::PutObjectRetentionAction),
+            conditions: &conditions,
+            is_owner: false,
+            claims: &claims,
+            deny_only: false,
+            bucket: "photos",
+            object: "image.jpg",
+        };
+
+        for action in [
+            S3Action::PutObjectRetentionAction,
+            S3Action::GetObjectRetentionAction,
+            S3Action::PutObjectLegalHoldAction,
+            S3Action::GetObjectLegalHoldAction,
+        ] {
+            let args = rustfs_policy::policy::Args {
+                action: Action::S3Action(action),
+                ..base_args
+            };
+            assert!(
+                policy.is_allowed(&args).await,
+                "site replicator must be allowed to replicate object-lock metadata: {action:?}"
+            );
+        }
+
+        // Governance bypass stays denied: replication must not be able to erase a retained
+        // version on the peer.
+        let bypass_args = rustfs_policy::policy::Args {
+            action: Action::S3Action(S3Action::BypassGovernanceRetentionAction),
+            ..base_args
+        };
+        assert!(
+            !policy.is_allowed(&bypass_args).await,
+            "site replicator must not be granted governance bypass"
+        );
     }
 
     #[test]
