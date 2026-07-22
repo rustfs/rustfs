@@ -31,6 +31,7 @@ use crate::storage_api_contracts::{
 pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-intent-v1";
 pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
 pub(crate) const TIER_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/records";
+pub(crate) const TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/coordinators";
 pub(crate) type TierMutationDigest = [u8; 32];
 
 pub(crate) type Result<T> = std::result::Result<T, TierMutationIntentError>;
@@ -295,21 +296,23 @@ impl TierMutationIntent {
 }
 
 pub(crate) fn tier_mutation_intent_record_object_name(mutation_id: Uuid) -> Result<String> {
+    tier_mutation_intent_record_object_name_with_prefix(TIER_MUTATION_INTENT_RECORD_PREFIX, mutation_id)
+}
+
+fn tier_mutation_intent_record_object_name_with_prefix(prefix: &str, mutation_id: Uuid) -> Result<String> {
     if mutation_id.is_nil() {
         return Err(TierMutationIntentError::Corrupt("mutation_id is nil"));
     }
     let mutation_key = mutation_id.simple().to_string();
-    Ok(format!(
-        "{}/{}/{}/{}.json",
-        TIER_MUTATION_INTENT_RECORD_PREFIX,
-        &mutation_key[..2],
-        &mutation_key[2..4],
-        mutation_key
-    ))
+    Ok(format!("{}/{}/{}/{}.json", prefix, &mutation_key[..2], &mutation_key[2..4], mutation_key))
 }
 
 pub(crate) fn tier_mutation_intent_id_from_record_object_name(object: &str) -> Result<Uuid> {
-    let prefix = format!("{TIER_MUTATION_INTENT_RECORD_PREFIX}/");
+    tier_mutation_intent_id_from_record_object_name_with_prefix(TIER_MUTATION_INTENT_RECORD_PREFIX, object)
+}
+
+fn tier_mutation_intent_id_from_record_object_name_with_prefix(prefix: &str, object: &str) -> Result<Uuid> {
+    let prefix = format!("{prefix}/");
     let suffix = object
         .strip_prefix(&prefix)
         .ok_or(TierMutationIntentError::Corrupt("intent record path has wrong prefix"))?;
@@ -346,16 +349,39 @@ pub(crate) async fn save_tier_mutation_intent_record<S>(api: Arc<S>, intent: &Ti
 where
     S: EcstoreObjectIO,
 {
-    let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
+    let object = tier_mutation_intent_record_object_name_with_prefix(TIER_MUTATION_INTENT_RECORD_PREFIX, intent.mutation_id)
+        .map_err(tier_mutation_intent_store_error)?;
     let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
     com::save_config(api, &object, data).await
+}
+
+pub(crate) async fn save_tier_coordinator_mutation_intent_record_if_absent<S>(
+    api: Arc<S>,
+    intent: &TierMutationIntent,
+) -> EcstoreResult<()>
+where
+    S: EcstoreObjectIO,
+{
+    save_tier_mutation_intent_record_if_absent_with_prefix(api, TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, intent).await
 }
 
 pub(crate) async fn save_tier_mutation_intent_record_if_absent<S>(api: Arc<S>, intent: &TierMutationIntent) -> EcstoreResult<()>
 where
     S: EcstoreObjectIO,
 {
-    let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
+    save_tier_mutation_intent_record_if_absent_with_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, intent).await
+}
+
+async fn save_tier_mutation_intent_record_if_absent_with_prefix<S>(
+    api: Arc<S>,
+    prefix: &str,
+    intent: &TierMutationIntent,
+) -> EcstoreResult<()>
+where
+    S: EcstoreObjectIO,
+{
+    let object = tier_mutation_intent_record_object_name_with_prefix(prefix, intent.mutation_id)
+        .map_err(tier_mutation_intent_store_error)?;
     let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
     com::save_config_with_opts(
         api,
@@ -388,7 +414,19 @@ pub(crate) async fn load_tier_mutation_intent_record_with_etag<S>(
 where
     S: EcstoreObjectIO,
 {
-    let object = tier_mutation_intent_record_object_name(mutation_id).map_err(tier_mutation_intent_store_error)?;
+    load_tier_mutation_intent_record_with_etag_at_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, mutation_id).await
+}
+
+async fn load_tier_mutation_intent_record_with_etag_at_prefix<S>(
+    api: Arc<S>,
+    prefix: &str,
+    mutation_id: Uuid,
+) -> EcstoreResult<(TierMutationIntent, String)>
+where
+    S: EcstoreObjectIO,
+{
+    let object =
+        tier_mutation_intent_record_object_name_with_prefix(prefix, mutation_id).map_err(tier_mutation_intent_store_error)?;
     let (data, object_info) = com::read_config_with_metadata(api, &object, &ObjectOptions::default()).await?;
     let etag = object_info
         .etag
@@ -409,7 +447,23 @@ where
     if current_etag.trim().is_empty() {
         return Err(Error::other("tier mutation intent current ETag is empty"));
     }
-    let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
+    save_tier_mutation_intent_record_if_current_with_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, intent, current_etag).await
+}
+
+async fn save_tier_mutation_intent_record_if_current_with_prefix<S>(
+    api: Arc<S>,
+    prefix: &str,
+    intent: &TierMutationIntent,
+    current_etag: &str,
+) -> EcstoreResult<()>
+where
+    S: EcstoreObjectIO,
+{
+    if current_etag.trim().is_empty() {
+        return Err(Error::other("tier mutation intent current ETag is empty"));
+    }
+    let object = tier_mutation_intent_record_object_name_with_prefix(prefix, intent.mutation_id)
+        .map_err(tier_mutation_intent_store_error)?;
     let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
     com::save_config_with_opts(
         api,
@@ -431,7 +485,22 @@ pub(crate) async fn delete_tier_mutation_intent_record<S>(api: Arc<S>, mutation_
 where
     S: EcstoreObjectOperations,
 {
-    let object = tier_mutation_intent_record_object_name(mutation_id).map_err(tier_mutation_intent_store_error)?;
+    delete_tier_mutation_intent_record_with_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, mutation_id).await
+}
+
+pub(crate) async fn delete_tier_coordinator_mutation_intent_record<S>(api: Arc<S>, mutation_id: Uuid) -> EcstoreResult<()>
+where
+    S: EcstoreObjectOperations,
+{
+    delete_tier_mutation_intent_record_with_prefix(api, TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, mutation_id).await
+}
+
+async fn delete_tier_mutation_intent_record_with_prefix<S>(api: Arc<S>, prefix: &str, mutation_id: Uuid) -> EcstoreResult<()>
+where
+    S: EcstoreObjectOperations,
+{
+    let object =
+        tier_mutation_intent_record_object_name_with_prefix(prefix, mutation_id).map_err(tier_mutation_intent_store_error)?;
     match com::delete_config(api, &object).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
         Err(err) => Err(err),
@@ -447,18 +516,81 @@ pub(crate) async fn advance_tier_mutation_intent_record_idempotent<S>(
 where
     S: EcstoreObjectIO,
 {
-    let (mut intent, current_etag) = load_tier_mutation_intent_record_with_etag(api.clone(), mutation_id).await?;
+    advance_tier_mutation_intent_record_idempotent_at_prefix(
+        api,
+        TIER_MUTATION_INTENT_RECORD_PREFIX,
+        mutation_id,
+        next,
+        committed_config_etag,
+    )
+    .await
+}
+
+pub(crate) async fn advance_tier_coordinator_mutation_intent_record_idempotent<S>(
+    api: Arc<S>,
+    mutation_id: Uuid,
+    next: TierMutationIntentState,
+    committed_config_etag: Option<String>,
+) -> EcstoreResult<(TierMutationIntent, bool)>
+where
+    S: EcstoreObjectIO,
+{
+    advance_tier_mutation_intent_record_idempotent_at_prefix(
+        api,
+        TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX,
+        mutation_id,
+        next,
+        committed_config_etag,
+    )
+    .await
+}
+
+async fn advance_tier_mutation_intent_record_idempotent_at_prefix<S>(
+    api: Arc<S>,
+    prefix: &str,
+    mutation_id: Uuid,
+    next: TierMutationIntentState,
+    committed_config_etag: Option<String>,
+) -> EcstoreResult<(TierMutationIntent, bool)>
+where
+    S: EcstoreObjectIO,
+{
+    let (mut intent, current_etag) =
+        load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await?;
     let advanced = intent
         .advance_idempotent(next, committed_config_etag)
         .map_err(tier_mutation_intent_store_error)?;
     if advanced {
-        save_tier_mutation_intent_record_if_current(api, &intent, &current_etag).await?;
+        save_tier_mutation_intent_record_if_current_with_prefix(api, prefix, &intent, &current_etag).await?;
     }
     Ok((intent, advanced))
 }
 
 pub(crate) async fn list_tier_mutation_intent_records<S>(
     api: Arc<S>,
+    limit: usize,
+    marker: Option<String>,
+) -> EcstoreResult<TierMutationIntentRecordScan>
+where
+    S: EcstoreObjectIO + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
+{
+    list_tier_mutation_intent_records_at_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, limit, marker).await
+}
+
+pub(crate) async fn list_tier_coordinator_mutation_intent_records<S>(
+    api: Arc<S>,
+    limit: usize,
+    marker: Option<String>,
+) -> EcstoreResult<TierMutationIntentRecordScan>
+where
+    S: EcstoreObjectIO + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
+{
+    list_tier_mutation_intent_records_at_prefix(api, TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, limit, marker).await
+}
+
+async fn list_tier_mutation_intent_records_at_prefix<S>(
+    api: Arc<S>,
+    prefix: &str,
     limit: usize,
     marker: Option<String>,
 ) -> EcstoreResult<TierMutationIntentRecordScan>
@@ -473,7 +605,7 @@ where
         .clone()
         .list_objects_v2(
             RUSTFS_META_BUCKET,
-            TIER_MUTATION_INTENT_RECORD_PREFIX,
+            prefix,
             marker,
             None,
             i32::try_from(limit).map_or(i32::MAX, |value| value),
@@ -492,15 +624,15 @@ where
 
     for object in list.objects {
         scan.scanned += 1;
-        let mutation_id = match tier_mutation_intent_id_from_record_object_name(&object.name) {
+        let mutation_id = match tier_mutation_intent_id_from_record_object_name_with_prefix(prefix, &object.name) {
             Ok(mutation_id) => mutation_id,
             Err(_) => {
                 scan.failed += 1;
                 continue;
             }
         };
-        match load_tier_mutation_intent_record(api.clone(), mutation_id).await {
-            Ok(intent) => scan.intents.push(intent),
+        match load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await {
+            Ok((intent, _)) => scan.intents.push(intent),
             Err(Error::ConfigNotFound) => {}
             Err(_) => scan.failed += 1,
         }
