@@ -2493,4 +2493,91 @@ mod tests {
         );
         assert_eq!(backend.remove_count().await, 0);
     }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_retains_unproven_remote_candidates() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-unproven", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXUNPROVEN";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let new_transaction = || {
+            TransitionTransaction::new(TransitionTransactionInit {
+                deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+                transaction_id: uuid::Uuid::new_v4(),
+                owner_epoch: uuid::Uuid::new_v4(),
+                write_id: uuid::Uuid::new_v4(),
+                source: TransitionSourceIdentity {
+                    bucket: "absent-source-bucket".to_string(),
+                    object: "source-object".to_string(),
+                    version_id: None,
+                    data_dir: uuid::Uuid::new_v4(),
+                    mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                    size: 42,
+                    etag: "source-etag".to_string(),
+                    version_mode: TransitionSourceVersionMode::Unversioned,
+                },
+                tier_name: tier_name.to_string(),
+                backend_fingerprint: backend_identity,
+                not_after_unix_nanos: 1_780_000_000_000_000_000,
+            })
+            .expect("transaction should build")
+        };
+
+        let upload_started = new_transaction();
+        let mut upload_outcome_unknown = new_transaction();
+        upload_outcome_unknown
+            .advance(upload_outcome_unknown.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+            .expect("transaction should enter unknown upload outcome state");
+        let mut local_commit_started = new_transaction();
+        local_commit_started
+            .advance(
+                local_commit_started.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        local_commit_started
+            .advance(local_commit_started.fence(), TransitionTransactionState::LocalCommitStarted, None)
+            .expect("transaction should enter local commit state");
+
+        backend.set_put_remote_version(Some(remote_version)).await;
+        for transaction in [&upload_started, &upload_outcome_unknown, &local_commit_started] {
+            let candidate = bytes::Bytes::from_static(b"unproven transition remote candidate");
+            backend
+                .put(
+                    &transaction.remote_object,
+                    ReaderImpl::Body(candidate.clone()),
+                    i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+                )
+                .await
+                .expect("mock backend should accept candidate");
+            save_transition_transaction_record(store.clone(), transaction)
+                .await
+                .expect("transaction record should persist");
+        }
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (3, 0, 3, 0));
+        assert_eq!(
+            transition_transaction_record_count(store.clone()).await,
+            3,
+            "an unknown upload outcome or unproven local commit must remain for authoritative reconcile"
+        );
+        assert_eq!(backend.object_count().await, 3, "recovery must not delete an unproven remote candidate");
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(backend.exact_remove_count(), 0);
+    }
 }
