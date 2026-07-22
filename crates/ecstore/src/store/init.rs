@@ -546,7 +546,7 @@ mod tests {
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
             test_util::{MockWarmBackend, TransitionCleanupStoreBarrier, register_mock_tier},
-            tier::TierConfigMgr,
+            tier::{TIER_CONFIG_FILE, TierConfigMgr},
             tier_mutation_intent::{
                 TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
                 TierMutationIntentTarget, advance_tier_mutation_intent_record_idempotent, delete_tier_mutation_intent_record,
@@ -1588,6 +1588,47 @@ mod tests {
             .expect("committed peer intent should remain durable");
         assert_eq!(loaded.state, TierMutationIntentState::Committed);
         assert_eq!(loaded.committed_config_etag.as_deref(), Some("new-etag"));
+
+        store
+            .tier_config_mgr()
+            .read()
+            .await
+            .save_tiering_config(store.clone())
+            .await
+            .expect("tier config should persist for cleaned intent commit proof");
+        let tier_config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("tier config object info should load");
+        let tier_config_etag = tier_config_info.etag.expect("tier config should carry an ETag");
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("committed peer intent cleanup should persist");
+        let cleaned_commit_retry = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            tier_config_etag.as_bytes(),
+        )
+        .await
+        .expect("commit retry after durable cleanup should be idempotently terminal");
+        assert!(!cleaned_commit_retry.applied);
+        assert_eq!(cleaned_commit_retry.state, TierMutationPeerState::Committed);
+        let mismatched_cleaned_commit = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"not-the-current-etag",
+        )
+        .await
+        .expect_err("missing intent without a matching committed config ETag must fail closed");
+        assert!(matches!(mismatched_cleaned_commit, TierMutationPeerError::Store(Error::ConfigNotFound)));
 
         let abort_id = uuid::Uuid::new_v4();
         let abort_intent = tier_mutation_peer_test_intent(abort_id, "COLD-B", [4; 32]);

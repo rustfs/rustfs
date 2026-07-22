@@ -21,10 +21,12 @@ use uuid::Uuid;
 use crate::config::com;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
-use crate::object_api::ObjectOptions;
+use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::services::tier::tier::TierDestinationId;
-use crate::storage_api_contracts::{list::ListOperations as _, object::HTTPPreconditions};
-use crate::store::ECStore;
+use crate::storage_api_contracts::{
+    list::{ListOperations, StorageListObjectsV2Info},
+    object::{EcstoreObjectIO, EcstoreObjectOperations, HTTPPreconditions},
+};
 
 pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-intent-v1";
 pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
@@ -340,16 +342,19 @@ pub(crate) fn tier_mutation_intent_id_from_record_object_name(object: &str) -> R
     Uuid::parse_str(mutation_key).map_err(|_| TierMutationIntentError::Corrupt("intent record path has invalid uuid"))
 }
 
-pub(crate) async fn save_tier_mutation_intent_record(api: Arc<ECStore>, intent: &TierMutationIntent) -> EcstoreResult<()> {
+pub(crate) async fn save_tier_mutation_intent_record<S>(api: Arc<S>, intent: &TierMutationIntent) -> EcstoreResult<()>
+where
+    S: EcstoreObjectIO,
+{
     let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
     let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
     com::save_config(api, &object, data).await
 }
 
-pub(crate) async fn save_tier_mutation_intent_record_if_absent(
-    api: Arc<ECStore>,
-    intent: &TierMutationIntent,
-) -> EcstoreResult<()> {
+pub(crate) async fn save_tier_mutation_intent_record_if_absent<S>(api: Arc<S>, intent: &TierMutationIntent) -> EcstoreResult<()>
+where
+    S: EcstoreObjectIO,
+{
     let object = tier_mutation_intent_record_object_name(intent.mutation_id).map_err(tier_mutation_intent_store_error)?;
     let data = intent.encode().map_err(tier_mutation_intent_store_error)?;
     com::save_config_with_opts(
@@ -368,15 +373,21 @@ pub(crate) async fn save_tier_mutation_intent_record_if_absent(
     .await
 }
 
-pub(crate) async fn load_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<TierMutationIntent> {
+pub(crate) async fn load_tier_mutation_intent_record<S>(api: Arc<S>, mutation_id: Uuid) -> EcstoreResult<TierMutationIntent>
+where
+    S: EcstoreObjectIO,
+{
     let (intent, _) = load_tier_mutation_intent_record_with_etag(api, mutation_id).await?;
     Ok(intent)
 }
 
-pub(crate) async fn load_tier_mutation_intent_record_with_etag(
-    api: Arc<ECStore>,
+pub(crate) async fn load_tier_mutation_intent_record_with_etag<S>(
+    api: Arc<S>,
     mutation_id: Uuid,
-) -> EcstoreResult<(TierMutationIntent, String)> {
+) -> EcstoreResult<(TierMutationIntent, String)>
+where
+    S: EcstoreObjectIO,
+{
     let object = tier_mutation_intent_record_object_name(mutation_id).map_err(tier_mutation_intent_store_error)?;
     let (data, object_info) = com::read_config_with_metadata(api, &object, &ObjectOptions::default()).await?;
     let etag = object_info
@@ -387,11 +398,14 @@ pub(crate) async fn load_tier_mutation_intent_record_with_etag(
     Ok((intent, etag))
 }
 
-pub(crate) async fn save_tier_mutation_intent_record_if_current(
-    api: Arc<ECStore>,
+pub(crate) async fn save_tier_mutation_intent_record_if_current<S>(
+    api: Arc<S>,
     intent: &TierMutationIntent,
     current_etag: &str,
-) -> EcstoreResult<()> {
+) -> EcstoreResult<()>
+where
+    S: EcstoreObjectIO,
+{
     if current_etag.trim().is_empty() {
         return Err(Error::other("tier mutation intent current ETag is empty"));
     }
@@ -413,7 +427,10 @@ pub(crate) async fn save_tier_mutation_intent_record_if_current(
     .await
 }
 
-pub(crate) async fn delete_tier_mutation_intent_record(api: Arc<ECStore>, mutation_id: Uuid) -> EcstoreResult<()> {
+pub(crate) async fn delete_tier_mutation_intent_record<S>(api: Arc<S>, mutation_id: Uuid) -> EcstoreResult<()>
+where
+    S: EcstoreObjectOperations,
+{
     let object = tier_mutation_intent_record_object_name(mutation_id).map_err(tier_mutation_intent_store_error)?;
     match com::delete_config(api, &object).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
@@ -421,12 +438,15 @@ pub(crate) async fn delete_tier_mutation_intent_record(api: Arc<ECStore>, mutati
     }
 }
 
-pub(crate) async fn advance_tier_mutation_intent_record_idempotent(
-    api: Arc<ECStore>,
+pub(crate) async fn advance_tier_mutation_intent_record_idempotent<S>(
+    api: Arc<S>,
     mutation_id: Uuid,
     next: TierMutationIntentState,
     committed_config_etag: Option<String>,
-) -> EcstoreResult<(TierMutationIntent, bool)> {
+) -> EcstoreResult<(TierMutationIntent, bool)>
+where
+    S: EcstoreObjectIO,
+{
     let (mut intent, current_etag) = load_tier_mutation_intent_record_with_etag(api.clone(), mutation_id).await?;
     let advanced = intent
         .advance_idempotent(next, committed_config_etag)
@@ -437,11 +457,14 @@ pub(crate) async fn advance_tier_mutation_intent_record_idempotent(
     Ok((intent, advanced))
 }
 
-pub(crate) async fn list_tier_mutation_intent_records(
-    api: Arc<ECStore>,
+pub(crate) async fn list_tier_mutation_intent_records<S>(
+    api: Arc<S>,
     limit: usize,
     marker: Option<String>,
-) -> EcstoreResult<TierMutationIntentRecordScan> {
+) -> EcstoreResult<TierMutationIntentRecordScan>
+where
+    S: EcstoreObjectIO + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
+{
     if limit == 0 {
         return Err(Error::other("tier mutation intent scan limit must be greater than zero"));
     }
