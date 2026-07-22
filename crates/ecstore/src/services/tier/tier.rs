@@ -5811,8 +5811,8 @@ mod tests {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let handle = TierConfigMgr::new();
 
-            let err = TIER_MUTATION_TEST_COMMIT_PEERS
-                .scope(vec![FakeTierMutationCommitPeer::boxed("peer-a", calls.clone(), Err(peer_error))], async {
+            let err = TIER_MUTATION_TEST_PEERS
+                .scope(vec![FakeTierMutationPeer::boxed("peer-a", calls.clone(), Err(peer_error))], async {
                     TierConfigMgr::reload_handle_with(&handle, store.clone()).await
                 })
                 .await
