@@ -1041,7 +1041,7 @@ impl NotificationSys {
         Ok(generations)
     }
 
-    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<()> {
+    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<bool> {
         let mut by_host = HashMap::with_capacity(acknowledgements.len());
         for (host, instance_id, generation) in acknowledgements {
             if by_host.insert(host.clone(), (instance_id, generation)).is_some() {
@@ -1072,12 +1072,7 @@ impl NotificationSys {
                 (host, result)
             });
         }
-        for (host, result) in join_all(futures).await {
-            if let Err(err) = result {
-                failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: {err}"));
-            }
-        }
-        aggregate_notification_failures("acknowledge_scanner_dirty_usage", failures)
+        aggregate_scanner_dirty_usage_acknowledgement_results(join_all(futures).await, failures)
     }
 
     pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {
@@ -1630,6 +1625,23 @@ fn aggregate_notification_failures(operation: &str, failures: Vec<String>) -> Re
     )))
 }
 
+fn aggregate_scanner_dirty_usage_acknowledgement_results(
+    results: Vec<(String, Result<ScannerPeerActivity>)>,
+    mut failures: Vec<String>,
+) -> Result<bool> {
+    let mut dirty_usage_pending = false;
+    for (host, result) in results {
+        match result {
+            Ok(activity) => {
+                dirty_usage_pending |= activity.dirty_usage_pending != Some(false);
+            }
+            Err(err) => failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: {err}")),
+        }
+    }
+    aggregate_notification_failures("acknowledge_scanner_dirty_usage", failures)?;
+    Ok(dirty_usage_pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1907,6 +1919,42 @@ mod tests {
                 .to_string()
                 .contains("duplicate scanner dirty usage acknowledgement target")
         );
+    }
+
+    #[test]
+    fn scanner_dirty_usage_acknowledgement_preserves_newer_pending_work() {
+        let activity = |dirty_usage_pending| ScannerPeerActivity {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 1,
+            maintenance_generation: 1,
+            protocol_version: crate::storage_api_contracts::internode::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: Some([0; 32]),
+            data_movement_active: Some(false),
+            dirty_usage_generation: Some(2),
+            dirty_usage_pending,
+        };
+
+        let pending = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![
+                ("peer-1".to_string(), Ok(activity(Some(false)))),
+                ("peer-2".to_string(), Ok(activity(Some(true)))),
+            ],
+            Vec::new(),
+        )
+        .expect("successful acknowledgements should return their pending state");
+        assert!(pending, "new dirty usage reported by an acknowledged peer must remain pending");
+
+        let cleared = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![("peer-1".to_string(), Ok(activity(Some(false))))],
+            Vec::new(),
+        )
+        .expect("a cleared acknowledgement should succeed");
+        assert!(!cleared, "an explicitly cleared peer must not remain pending");
+
+        let unknown =
+            aggregate_scanner_dirty_usage_acknowledgement_results(vec![("peer-1".to_string(), Ok(activity(None)))], Vec::new())
+                .expect("an acknowledgement without a pending field should remain retryable");
+        assert!(unknown, "a peer that cannot prove its dirty state is clear must remain pending");
     }
 
     #[tokio::test]

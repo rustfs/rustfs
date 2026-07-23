@@ -2734,7 +2734,7 @@ async fn run_data_scanner_cycle(
             .map(|acknowledgement| (acknowledgement.host, acknowledgement.instance_id, acknowledgement.generation))
             .collect();
         match notification_system.acknowledge_scanner_dirty_usage(acknowledgements).await {
-            Ok(()) => false,
+            Ok(dirty_usage_pending) => dirty_usage_pending,
             Err(err) => {
                 warn!(
                     target: "rustfs::scanner",
