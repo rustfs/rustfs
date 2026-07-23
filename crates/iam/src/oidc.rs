@@ -172,19 +172,29 @@ pub fn oidc_plugin_authn_metrics_snapshot() -> OidcPluginAuthnMetricsSnapshot {
     OIDC_PLUGIN_AUTHN_METRICS.snapshot()
 }
 
+/// Header names whose values may carry OIDC secrets (client credentials, cookies,
+/// bearer tokens). Their values are never emitted to logs, only their byte length.
+const SENSITIVE_HEADER_NAMES: [&str; 4] = ["authorization", "proxy-authorization", "cookie", "set-cookie"];
+
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADER_NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 fn format_http_headers(headers: &http::HeaderMap) -> String {
     headers
         .iter()
         .map(|(name, value)| {
-            let value = value.to_str().unwrap_or("<non-utf8>");
-            format!("{}={}", name.as_str(), value)
+            if is_sensitive_header(name.as_str()) {
+                format!("{}=<redacted len={}>", name.as_str(), value.as_bytes().len())
+            } else {
+                let value = value.to_str().unwrap_or("<non-utf8>");
+                format!("{}={}", name.as_str(), value)
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-fn format_http_body(body: &[u8]) -> String {
-    String::from_utf8_lossy(body).into_owned()
 }
 
 #[derive(Debug, Default)]
@@ -326,7 +336,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let uri = parts.uri.to_string();
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let request_headers = format_http_headers(&parts.headers);
-                let request_body = format_http_body(&body);
                 debug!(
                     event = EVENT_OIDC_HTTP,
                     component = LOG_COMPONENT_IAM,
@@ -336,7 +345,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                     uri = %uri,
                     request_headers = %request_headers,
                     request_body_len = body.len(),
-                    request_body = %request_body,
                     "oidc outbound http"
                 );
             }
@@ -387,7 +395,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             })?;
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let response_headers = format_http_headers(&headers);
-                let response_body = format_http_body(&body_bytes);
                 debug!(
                     event = EVENT_OIDC_HTTP,
                     component = LOG_COMPONENT_IAM,
@@ -400,7 +407,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                     elapsed_ms,
                     response_headers = %response_headers,
                     response_body_len = body_bytes.len(),
-                    response_body = %response_body,
                     "oidc outbound http"
                 );
             }
@@ -814,7 +820,6 @@ impl OidcSys {
                 }
                 RequestTokenError::Parse(parse_err, body) => {
                     let shape = inspect_token_response_body(body);
-                    let response_body = format_http_body(body);
                     error!(
                         event = EVENT_OIDC_DIAGNOSTICS,
                         component = LOG_COMPONENT_IAM,
@@ -837,12 +842,11 @@ impl OidcSys {
                         response_has_error = shape.has_error,
                         response_has_error_description = shape.has_error_description,
                         response_looks_like_html = shape.looks_like_html,
-                        response_body = %response_body,
                         error = %e,
                         "oidc token exchange failed"
                     );
                     format!(
-                        "token exchange failed: {e}: stage=token_response_parse_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, parse_error_path={}, response_body_len={}, response_json_keys={}, response_has_id_token={}, response_has_error={}, response_looks_like_html={}, response_body={}",
+                        "token exchange failed: {e}: stage=token_response_parse_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, parse_error_path={}, response_body_len={}, response_json_keys={}, response_has_id_token={}, response_has_error={}, response_looks_like_html={}",
                         session.provider_id,
                         config.config_url,
                         issuer,
@@ -854,8 +858,7 @@ impl OidcSys {
                         shape.json_keys,
                         shape.has_id_token,
                         shape.has_error,
-                        shape.looks_like_html,
-                        response_body
+                        shape.looks_like_html
                     )
                 }
                 RequestTokenError::Other(message) => {
@@ -1847,6 +1850,39 @@ mod tests {
         assert_eq!(extract_string_claim(&claims, "email"), "user@example.com");
         assert_eq!(extract_string_claim(&claims, "sub"), "12345");
         assert_eq!(extract_string_claim(&claims, "missing"), "");
+    }
+
+    #[test]
+    fn format_http_headers_redacts_sensitive_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Basic Y2xpZW50OnNlY3JldA==".parse().unwrap());
+        headers.insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(http::header::COOKIE, "session=super-secret".parse().unwrap());
+
+        let rendered = format_http_headers(&headers);
+
+        // Sensitive header values never appear; only their length is emitted.
+        assert!(!rendered.contains("Y2xpZW50OnNlY3JldA=="), "authorization value leaked: {rendered}");
+        assert!(!rendered.contains("super-secret"), "cookie value leaked: {rendered}");
+        assert!(
+            rendered.contains("authorization=<redacted len="),
+            "expected redacted authorization: {rendered}"
+        );
+        assert!(rendered.contains("cookie=<redacted len="), "expected redacted cookie: {rendered}");
+        // Non-sensitive header values are preserved for diagnostics.
+        assert!(
+            rendered.contains("content-type=application/json"),
+            "content-type should be visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_header_is_case_insensitive() {
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("PROXY-AUTHORIZATION"));
+        assert!(is_sensitive_header("Set-Cookie"));
+        assert!(!is_sensitive_header("content-type"));
+        assert!(!is_sensitive_header("x-request-id"));
     }
 
     #[test]
