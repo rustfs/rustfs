@@ -202,7 +202,7 @@ pbkdf2 = "0.13.0"
 rsa = { version = "=0.10.0-rc.18" }
 rustls = { default-features = false, version = "0.23.42" }
 rustls-native-certs = "0.8"
-rustls-pki-types = "1.15.0"
+rustls-pki-types = "1.15.1"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 subtle = "2.6"
@@ -231,7 +231,7 @@ aws-sdk-s3 = { default-features = false, version = "1.139.0" }
 aws-smithy-http-client = { default-features = false, version = "1.2.0" }
 aws-smithy-runtime-api = { version = "1.13.0" }
 aws-smithy-types = { version = "1.6.1" }
-base64 = "0.22.1"
+base64 = "0.23.0"
 base64-simd = "0.8.0"
 brotli = "8.0.4"
 clap = { version = "4.6.4" }
