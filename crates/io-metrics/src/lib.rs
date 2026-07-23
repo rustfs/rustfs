@@ -887,8 +887,8 @@ pub fn record_get_encrypted_range_read_amplification(path: &'static str, amplifi
     if !get_stage_metrics_enabled() {
         return;
     }
-    counter!("rustfs_get_encrypted_range_read_path_total", "path" => path).increment(1);
-    histogram!("rustfs_get_encrypted_range_read_amplification", "path" => path).record(amplification);
+    counter!("rustfs_io_get_encrypted_range_read_path_total", "path" => path).increment(1);
+    histogram!("rustfs_io_get_encrypted_range_read_amplification", "path" => path).record(amplification);
 }
 
 /// Record the final codec-streaming rollout decision for a GET request.
