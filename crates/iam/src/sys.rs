@@ -56,6 +56,8 @@ pub const STATUS_DISABLED: &str = "disabled";
 pub const POLICYNAME: &str = "policy";
 pub const SESSION_POLICY_NAME: &str = "sessionPolicy";
 pub const SESSION_POLICY_NAME_EXTRACTED: &str = "sessionPolicy-extracted";
+const FEDERATED_POLICY_SNAPSHOT_CLAIM: &str = "x-rustfs-internal-federated-policy";
+const FEDERATED_POLICY_BOUNDARY_CLAIM: &str = "x-rustfs-internal-federated-boundary";
 pub(crate) const SITE_REPLICATOR_CLAIM: &str = "site-replicator";
 
 static POLICY_PLUGIN_CLIENT: OnceLock<Arc<RwLock<Option<rustfs_policy::policy::opa::AuthZPlugin>>>> = OnceLock::new();
@@ -100,6 +102,7 @@ enum PreparedIamMode {
         bypass_parent_policy: bool,
         parent_user: String,
         combined_policy: Policy,
+        federated_boundary: Option<Policy>,
         mode: PreparedServicePolicyMode,
         session_policy: PreparedSessionPolicy,
     },
@@ -130,11 +133,16 @@ impl PreparedIamAuth {
             }
             PreparedIamMode::ServiceAccount {
                 combined_policy,
+                federated_boundary,
                 mode,
                 session_policy,
                 ..
             } => {
                 policy_needs_existing_object_tag_for_args(combined_policy, args).await
+                    || match federated_boundary {
+                        Some(policy) => policy_needs_existing_object_tag_for_args(policy, args).await,
+                        None => false,
+                    }
                     || matches!(mode, PreparedServicePolicyMode::SessionBound)
                         && prepared_session_policy_needs_existing_object_tag_for_args(session_policy, args).await
             }
@@ -870,15 +878,7 @@ impl<T: Store> IamSys<T> {
     /// - No characters outside the allowed set (helps mitigate path traversal
     ///   and injection when names are used in storage keys or log output).
     fn is_safe_claim_policy_name(policy: &str) -> bool {
-        let mut has_alnum = false;
-        for c in policy.bytes() {
-            if c.is_ascii_alphanumeric() {
-                has_alnum = true;
-            } else if !matches!(c, b'_' | b'-' | b':' | b'.') {
-                return false;
-            }
-        }
-        has_alnum
+        is_safe_claim_policy_name(policy)
     }
 
     // JWT policy claims carry canned policy names only; policy documents are resolved by IAM store.
@@ -905,6 +905,41 @@ impl<T: Store> IamSys<T> {
             })
             .map(ToOwned::to_owned)
             .collect()
+    }
+
+    pub async fn federated_service_account_claims(
+        &self,
+        claims: &HashMap<String, Value>,
+    ) -> Result<Option<HashMap<String, Value>>> {
+        if !is_rustfs_oidc_claims(claims) {
+            return Ok(None);
+        }
+
+        let policy_names = Self::safe_claim_policy_names(claims, "");
+        if policy_names.is_empty() {
+            return Err(IamError::InvalidArgument);
+        }
+        let (resolved, _) = self.store.merge_policies(&policy_names.join(",")).await;
+        let resolved_names = MappedPolicy::new(&resolved).to_slice();
+        if policy_names.iter().any(|policy_name| !resolved_names.contains(policy_name)) {
+            return Err(IamError::InvalidArgument);
+        }
+
+        let boundary = if let Some(encoded) = claims.get(SESSION_POLICY_NAME).and_then(Value::as_str) {
+            decode_session_policy(encoded)?;
+            Some(encoded.to_string())
+        } else {
+            None
+        };
+
+        let mut snapshot = HashMap::from([
+            (FEDERATED_POLICY_SNAPSHOT_CLAIM.to_string(), Value::Bool(true)),
+            (POLICYNAME.to_string(), Value::String(resolved)),
+        ]);
+        if let Some(boundary) = boundary {
+            snapshot.insert(FEDERATED_POLICY_BOUNDARY_CLAIM.to_string(), Value::String(boundary));
+        }
+        Ok(Some(snapshot))
     }
 
     /// Compatibility wrapper for service-account authorization entry points.
@@ -987,13 +1022,22 @@ impl<T: Store> IamSys<T> {
                 bypass_parent_policy,
                 parent_user,
                 combined_policy,
+                federated_boundary,
                 mode,
                 session_policy,
             } => {
                 let mut parent_args = args.clone();
                 parent_args.account = parent_user;
+                let boundary_allowed = if let Some(policy) = federated_boundary {
+                    let mut boundary_args = args.clone();
+                    boundary_args.is_owner = false;
+                    policy.is_allowed(&boundary_args).await
+                } else {
+                    true
+                };
 
-                let parent_allowed = *bypass_parent_policy || *is_owner || combined_policy.is_allowed(&parent_args).await;
+                let parent_allowed =
+                    (*bypass_parent_policy || *is_owner || combined_policy.is_allowed(&parent_args).await) && boundary_allowed;
                 match mode {
                     PreparedServicePolicyMode::Inherited => parent_allowed,
                     PreparedServicePolicyMode::SessionBound => {
@@ -1031,7 +1075,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub(crate) async fn prepare_sts_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
-        let is_owner = crate::is_root_access_key(parent_user);
+        let is_owner = !is_rustfs_oidc_claims(args.claims) && crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
         let (effective_groups, groups_source, policies) = if is_owner {
@@ -1174,6 +1218,26 @@ impl<T: Store> IamSys<T> {
         };
 
         let session_policy = prepare_session_policy(args, true);
+        let has_federated_snapshot = args.claims.contains_key(FEDERATED_POLICY_SNAPSHOT_CLAIM);
+        let federated_boundary = if has_federated_snapshot {
+            if !has_valid_federated_policy_snapshot(args.claims) {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::Deny,
+                };
+            }
+            match federated_policy_boundary(args.claims) {
+                Ok(boundary) => boundary,
+                Err(_) => {
+                    return PreparedIamAuth {
+                        needs_existing_object_tag: false,
+                        mode: PreparedIamMode::Deny,
+                    };
+                }
+            }
+        } else {
+            None
+        };
         let bypass_parent_policy = args.account == SITE_REPLICATOR_SERVICE_ACCOUNT
             && args
                 .claims
@@ -1183,11 +1247,13 @@ impl<T: Store> IamSys<T> {
             && matches!(mode, PreparedServicePolicyMode::SessionBound)
             && matches!(session_policy, PreparedSessionPolicy::Policy(_));
 
-        let is_owner = crate::is_root_access_key(parent_user);
+        let is_owner = !has_federated_snapshot && crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
         let svc_policies = if is_owner || bypass_parent_policy {
             Vec::new()
+        } else if has_federated_snapshot {
+            Self::safe_claim_policy_names(args.claims, parent_user)
         } else if role_arn.is_some() {
             let Ok(arn) = ARN::parse(role_arn.unwrap_or_default()) else {
                 tracing::warn!(
@@ -1222,7 +1288,8 @@ impl<T: Store> IamSys<T> {
             Policy::default()
         } else {
             let (a, c) = self.store.merge_policies(&svc_policies.join(",")).await;
-            if a.is_empty() {
+            let resolved = MappedPolicy::new(&a).to_slice();
+            if a.is_empty() || has_federated_snapshot && svc_policies.iter().any(|policy_name| !resolved.contains(policy_name)) {
                 return PreparedIamAuth {
                     needs_existing_object_tag: false,
                     mode: PreparedIamMode::Deny,
@@ -1231,6 +1298,10 @@ impl<T: Store> IamSys<T> {
             c
         };
         let needs_existing_object_tag = policy_needs_existing_object_tag_for_args(&combined_policy, args).await
+            || match &federated_boundary {
+                Some(policy) => policy_needs_existing_object_tag_for_args(policy, args).await,
+                None => false,
+            }
             || matches!(mode, PreparedServicePolicyMode::SessionBound)
                 && prepared_session_policy_needs_existing_object_tag_for_args(&session_policy, args).await;
 
@@ -1241,6 +1312,7 @@ impl<T: Store> IamSys<T> {
                 bypass_parent_policy,
                 parent_user: parent_user.to_string(),
                 combined_policy,
+                federated_boundary,
                 mode,
                 session_policy,
             },
@@ -1286,6 +1358,78 @@ fn prepare_session_policy(args: &Args<'_>, empty_is_none: bool) -> PreparedSessi
     }
 
     PreparedSessionPolicy::Policy(sub_policy)
+}
+
+fn decode_session_policy(encoded: &str) -> Result<Policy> {
+    let bytes = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(encoded.as_bytes())?;
+    if bytes.len() > MAX_SVCSESSION_POLICY_SIZE {
+        return Err(IamError::PolicyTooLarge);
+    }
+    let policy = Policy::parse_config(&bytes)?;
+    policy.validate()?;
+    if policy.version.is_empty() {
+        return Err(IamError::InvalidArgument);
+    }
+    Ok(policy)
+}
+
+fn is_safe_claim_policy_name(policy: &str) -> bool {
+    let mut has_alnum = false;
+    for c in policy.bytes() {
+        if c.is_ascii_alphanumeric() {
+            has_alnum = true;
+        } else if !matches!(c, b'_' | b'-' | b':' | b'.') {
+            return false;
+        }
+    }
+    has_alnum
+}
+
+pub fn is_rustfs_oidc_claims(claims: &HashMap<String, Value>) -> bool {
+    claims.get("iss").and_then(Value::as_str) == Some("rustfs-oidc")
+        && claims
+            .get("oidc_provider")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| !provider.is_empty())
+        && claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .is_some_and(|subject| !subject.is_empty())
+}
+
+fn has_federated_policy_snapshot(claims: &HashMap<String, Value>) -> bool {
+    claims
+        .get(FEDERATED_POLICY_SNAPSHOT_CLAIM)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub fn remove_federated_policy_snapshot(claims: &mut HashMap<String, Value>) -> bool {
+    let removed = claims.remove(FEDERATED_POLICY_SNAPSHOT_CLAIM).is_some();
+    claims.remove(FEDERATED_POLICY_BOUNDARY_CLAIM);
+    removed
+}
+
+fn has_valid_federated_policy_snapshot(claims: &HashMap<String, Value>) -> bool {
+    has_federated_policy_snapshot(claims)
+        && is_rustfs_oidc_claims(claims)
+        && claims.get(POLICYNAME).and_then(Value::as_str).is_some_and(|policies| {
+            policies
+                .split(',')
+                .map(str::trim)
+                .all(|policy| !policy.is_empty() && is_safe_claim_policy_name(policy))
+        })
+}
+
+fn federated_policy_boundary(claims: &HashMap<String, Value>) -> Result<Option<Policy>> {
+    let Some(boundary) = claims.get(FEDERATED_POLICY_BOUNDARY_CLAIM) else {
+        return Ok(None);
+    };
+    boundary
+        .as_str()
+        .ok_or(IamError::InvalidArgument)
+        .and_then(decode_session_policy)
+        .map(Some)
 }
 
 fn extract_session_policy_text(claims: &HashMap<String, Value>) -> Option<String> {
@@ -2384,6 +2528,70 @@ mod tests {
             iam_sys.eval_prepared(&prepared, &args).await,
             "STS temp credentials should resolve custom canned policy names carried in JWT policy claims"
         );
+    }
+
+    #[tokio::test]
+    async fn oidc_service_account_uses_persisted_policy_boundary() {
+        ensure_test_global_credentials();
+        let iam_sys = IamSys::new(IamCache::new(StsTestMockStore::new(true)).await.unwrap());
+        let parent_user = "oidc-user";
+        let mut oidc_claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+        ]);
+        oidc_claims.insert(
+            SESSION_POLICY_NAME.to_string(),
+            Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes())),
+        );
+
+        let snapshot = iam_sys
+            .federated_service_account_claims(&oidc_claims)
+            .await
+            .expect("verified OIDC claims should produce a policy snapshot")
+            .expect("OIDC claims should be recognized");
+        oidc_claims.remove(SESSION_POLICY_NAME);
+        oidc_claims.extend(snapshot);
+
+        let (credential, _) = iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: "OIDCSERVICEACCOUNT01".to_string(),
+                    secret_key: "oidcServiceAccountSecret123".to_string(),
+                    claims: Some(oidc_claims),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("OIDC service account should be created");
+        let claims = iam_sys
+            .get_claims_for_svc_acc(&credential.access_key)
+            .await
+            .expect("stored service-account claims should decode");
+        let groups = None;
+        let conditions = HashMap::new();
+
+        for (action, allowed) in [(S3Action::GetObjectAction, true), (S3Action::PutObjectAction, false)] {
+            let args = Args {
+                account: &credential.access_key,
+                groups: &groups,
+                action: Action::S3Action(action),
+                bucket: CUSTOM_STS_CLAIM_BUCKET,
+                conditions: &conditions,
+                is_owner: false,
+                object: "allowed/object.txt",
+                claims: &claims,
+                deny_only: false,
+            };
+            assert_eq!(
+                iam_sys.is_allowed(&args).await,
+                allowed,
+                "service-account permissions must be the OIDC policy intersected with its session boundary"
+            );
+        }
     }
 
     #[tokio::test]

@@ -30,7 +30,7 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials as StoredCredentials;
 use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
-use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
+use rustfs_iam::sys::{NewServiceAccountOpts, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, UpdateServiceAccountOpts};
 use rustfs_madmin::{
     ACCESS_KEY_LIST_ALL, ACCESS_KEY_LIST_STS_ONLY, ACCESS_KEY_LIST_SVCACC_ONLY, ACCESS_KEY_LIST_USERS_ONLY, AddServiceAccountReq,
     AddServiceAccountResp, Credentials, InfoServiceAccountResp, ListAccessKeysResp, ListServiceAccountsResp,
@@ -89,13 +89,29 @@ fn delete_service_account_success_status(path: &str) -> StatusCode {
 fn merge_derived_service_account_claims(
     target_claims: &mut HashMap<String, serde_json::Value>,
     source_claims: &HashMap<String, serde_json::Value>,
-) {
+    federated_snapshot: Option<HashMap<String, serde_json::Value>>,
+    has_child_session_policy: bool,
+) -> bool {
     for (key, value) in source_claims {
         if key == "exp" {
             continue;
         }
         target_claims.insert(key.clone(), value.clone());
     }
+    let inherited_snapshot = rustfs_iam::sys::remove_federated_policy_snapshot(target_claims);
+    let Some(snapshot) = federated_snapshot else {
+        return !inherited_snapshot;
+    };
+    target_claims.remove(SESSION_POLICY_NAME);
+    target_claims.remove(SESSION_POLICY_NAME_EXTRACTED);
+    target_claims.extend(snapshot);
+    if !has_child_session_policy {
+        target_claims.insert(
+            SESSION_POLICY_NAME.to_string(),
+            serde_json::Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(b"{}")),
+        );
+    }
+    true
 }
 
 fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
@@ -358,6 +374,14 @@ impl Operation for AddServiceAccount {
         }
 
         let is_svc_acc = target_user == req_user || target_user == req_parent_user;
+        let federated_snapshot = if is_svc_acc && !cred.is_service_account() {
+            iam_store
+                .federated_service_account_claims(cred.claims_or_empty())
+                .await
+                .map_err(|_| s3_error!(AccessDenied, "access denied"))?
+        } else {
+            None
+        };
 
         // GHSA-5354: confine a non-owner caller to its own scope so it cannot mint
         // a root-parented (owner) service account. Evaluated on the original
@@ -390,12 +414,15 @@ impl Operation for AddServiceAccount {
 
             target_groups = req_groups;
 
-            if let Some(claims) = cred.claims {
-                if opts.claims.is_none() {
-                    opts.claims = Some(HashMap::new());
-                }
-
-                merge_derived_service_account_claims(opts.claims.as_mut().unwrap(), &claims);
+            if let Some(claims) = cred.claims
+                && !merge_derived_service_account_claims(
+                    opts.claims.get_or_insert_default(),
+                    &claims,
+                    federated_snapshot,
+                    opts.session_policy.is_some(),
+                )
+            {
+                return Err(s3_error!(AccessDenied, "access denied"));
             }
         }
 
@@ -1775,19 +1802,50 @@ mod tests {
     }
 
     #[test]
-    fn merge_derived_service_account_claims_skips_only_expiration() {
+    fn merge_derived_service_account_claims_strips_non_inheritable_claims() {
         let mut merged = HashMap::new();
         let source = HashMap::from([
             ("exp".to_string(), json!(123456)),
             ("parent".to_string(), json!("owner-user")),
             ("custom".to_string(), json!("value")),
+            ("x-rustfs-internal-federated-policy".to_string(), json!(true)),
+            ("x-rustfs-internal-federated-boundary".to_string(), json!("boundary")),
         ]);
 
-        merge_derived_service_account_claims(&mut merged, &source);
+        assert!(!merge_derived_service_account_claims(&mut merged, &source, None, false));
 
         assert!(!merged.contains_key("exp"));
+        assert!(!merged.contains_key("x-rustfs-internal-federated-policy"));
+        assert!(!merged.contains_key("x-rustfs-internal-federated-boundary"));
         assert_eq!(merged.get("parent"), Some(&json!("owner-user")));
         assert_eq!(merged.get("custom"), Some(&json!("value")));
+    }
+
+    #[test]
+    fn merge_federated_snapshot_keeps_legacy_root_guard() {
+        let mut merged = HashMap::new();
+        let source = HashMap::from([
+            (SESSION_POLICY_NAME.to_string(), json!("parent-session")),
+            (SESSION_POLICY_NAME_EXTRACTED.to_string(), json!("parent-session-json")),
+        ]);
+        let snapshot = HashMap::from([("snapshot".to_string(), json!(true))]);
+
+        assert!(merge_derived_service_account_claims(&mut merged, &source, Some(snapshot), false));
+        assert_eq!(
+            merged.get(SESSION_POLICY_NAME),
+            Some(&json!(base64_simd::URL_SAFE_NO_PAD.encode_to_string(b"{}")))
+        );
+        assert!(!merged.contains_key(SESSION_POLICY_NAME_EXTRACTED));
+        assert_eq!(merged.get("snapshot"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn merge_federated_snapshot_does_not_replace_child_session_policy() {
+        let mut merged = HashMap::new();
+        let source = HashMap::from([(SESSION_POLICY_NAME.to_string(), json!("parent-session"))]);
+
+        assert!(merge_derived_service_account_claims(&mut merged, &source, Some(HashMap::new()), true,));
+        assert!(!merged.contains_key(SESSION_POLICY_NAME));
     }
 
     #[test]
