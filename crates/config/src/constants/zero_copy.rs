@@ -56,3 +56,33 @@ pub const DEFAULT_OBJECT_MMAP_READ_ENABLE: bool = true;
 ///
 /// Prefer [`DEFAULT_OBJECT_MMAP_READ_ENABLE`].
 pub const DEFAULT_OBJECT_ZERO_COPY_ENABLE: bool = DEFAULT_OBJECT_MMAP_READ_ENABLE;
+
+/// Environment variable capping the byte length a single mmap-copy read may
+/// materialize in memory.
+///
+/// The mmap-copy read path returns the whole requested range as one owned
+/// allocation before the first byte is served. GET/heal shard reads request
+/// the entire part span in one call, so for a large single-part object
+/// (e.g. a multi-gigabyte non-multipart upload) an uncapped mmap-copy read
+/// allocates the whole shard in memory — stalling first-byte latency past the
+/// disk-read timeout and OOM-killing memory-limited deployments
+/// (<https://github.com/rustfs/rustfs/issues/5123>). Reads longer than this
+/// cap fall back to the bounded streaming reader instead.
+///
+/// - Purpose: Bound per-shard-read memory for mmap-based reads
+/// - Acceptable values: byte count as an unsigned integer; `0` disables
+///   mmap-copy for all non-empty reads (every read streams)
+/// - Example: `export RUSTFS_OBJECT_MMAP_READ_MAX_LENGTH=8388608`
+pub const ENV_OBJECT_MMAP_READ_MAX_LENGTH: &str = "RUSTFS_OBJECT_MMAP_READ_MAX_LENGTH";
+
+/// Default mmap-copy read length cap: 32 MiB per shard read.
+///
+/// Large enough that typical multipart part shards (parts up to a few hundred
+/// megabytes across the erasure set) keep the mmap fast path, small enough
+/// that whole-part reads of huge single-part objects stream instead of
+/// materializing gigabytes per shard.
+///
+/// The cap bounds memory per shard reader, so a single part read can still
+/// materialize up to `data_shards x cap` bytes; raising the cap raises that
+/// per-request bound proportionally.
+pub const DEFAULT_OBJECT_MMAP_READ_MAX_LENGTH: usize = 32 * 1024 * 1024;

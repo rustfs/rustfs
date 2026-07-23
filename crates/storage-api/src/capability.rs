@@ -22,6 +22,7 @@ pub enum CapabilityState {
     Supported,
     Unsupported,
     Disabled,
+    #[serde(other)]
     #[default]
     Unknown,
 }
@@ -132,5 +133,13 @@ mod tests {
         assert_eq!(decoded.1.state, CapabilityState::Unsupported);
         assert_eq!(decoded.1.reason.as_deref(), Some("target does not expose profiler"));
         assert!(!decoded.1.state.is_supported());
+    }
+
+    #[test]
+    fn future_capability_state_deserializes_as_unknown() {
+        let status: CapabilityStatus = serde_json::from_str(r#"{"state":"future_state"}"#)
+            .expect("future capability states should preserve conservative compatibility");
+
+        assert_eq!(status.state, CapabilityState::Unknown);
     }
 }
