@@ -214,7 +214,7 @@ rustfs --help
 2. **创建存储桶**: 使用控制台为您​​的对象创建一个新的存储桶 (Bucket)。
 3. **上传对象**: 您可以直接通过控制台上传文件，或使用 S3 兼容的 API/客户端与您的 RustFS 实例进行交互。
 
-**注意**: 如果您希望通过 `https` 访问 RustFS 实例，请参考 [TLS 配置文档](https://docs.rustfs.com/integration/tls-configured.html)。
+**注意**: 如果您希望通过 `https` 访问 RustFS 实例，请参考 [TLS 配置文档](http://web.archive.org/web/20260622225320/https://docs.rustfs.com/integration/tls-configured.html)。
 
 ## 文档
 
