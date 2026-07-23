@@ -360,7 +360,11 @@ impl Operation for AddServiceAccount {
         let is_svc_acc = target_user == req_user || target_user == req_parent_user;
 
         // GHSA-5354: confine a non-owner caller to its own scope so it cannot mint
-        // a root-parented (owner) service account. See the helper's doc comment.
+        // a root-parented (owner) service account. Evaluated on the original
+        // `target_user` the caller submitted, before the derived-credential rewrite
+        // to `req_parent_user` below, so the guard is bound to the parent actually
+        // requested. Its allow set is exactly `owner || is_svc_acc`. See the helper's
+        // doc comment.
         if !add_service_account_parent_within_scope(&target_user, &req_user, &req_parent_user, owner) {
             return Err(s3_error!(AccessDenied, "service account parent is outside requester scope"));
         }
@@ -1468,6 +1472,47 @@ mod tests {
             add_service_account_parent_within_scope("bob", root, root, true),
             "owner may create a service account for another user"
         );
+    }
+
+    #[test]
+    fn ghsa_5354_scope_guard_matches_owner_or_self_scope_for_derived_credentials() {
+        // The handler evaluates `add_service_account_parent_within_scope` on the
+        // original `target_user`, before the `target_user = req_parent_user` rewrite
+        // taken inside the `is_svc_acc` branch. The guard's allow set must therefore
+        // stay exactly `owner || is_svc_acc`, where
+        // `is_svc_acc == (target_user == req_user || target_user == req_parent_user)`.
+        //
+        // The named-boundary test above only exercises the self-scoped case with
+        // `req_user == req_parent_user`. A *derived* credential has `req_user`
+        // (its own key) distinct from `req_parent_user` (its parent), which is the
+        // realistic attacker shape: a service account holding
+        // CreateServiceAccountAdminAction. Pin the equivalence across that shape so a
+        // later change to either the guard or the rewrite cannot silently let a
+        // derived non-owner credential escape its own parent's scope.
+        let root = rustfs_credentials::DEFAULT_ACCESS_KEY;
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // Derived non-owner (own key != parent) aiming at root -> deny.
+            (root, "attacker-sa", "alice", false),
+            // Derived non-owner aiming at an unrelated user -> deny.
+            ("bob", "attacker-sa", "alice", false),
+            // Derived non-owner aiming at its own parent -> allow.
+            ("alice", "attacker-sa", "alice", false),
+            // Derived non-owner aiming at its own key -> allow.
+            ("attacker-sa", "attacker-sa", "alice", false),
+            // Top-level non-owner aiming at itself -> allow.
+            ("alice", "alice", "alice", false),
+            // Owner is unrestricted, including root and a derived shape.
+            (root, "attacker-sa", "alice", true),
+            ("bob", root, root, true),
+        ];
+        for &(target_user, req_user, req_parent_user, owner) in cases {
+            let is_svc_acc = target_user == req_user || target_user == req_parent_user;
+            assert_eq!(
+                add_service_account_parent_within_scope(target_user, req_user, req_parent_user, owner),
+                owner || is_svc_acc,
+                "scope guard must equal `owner || is_svc_acc` for (target={target_user}, req_user={req_user}, req_parent={req_parent_user}, owner={owner})"
+            );
+        }
     }
 
     #[test]
