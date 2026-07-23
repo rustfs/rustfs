@@ -445,7 +445,7 @@ impl BucketOperations for ECStore {
 
     #[instrument(skip(self))]
     async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
-        self.handle_make_bucket(bucket, opts).await
+        Box::pin(self.handle_make_bucket(bucket, opts)).await
     }
 
     #[instrument(skip(self))]
@@ -458,11 +458,7 @@ impl BucketOperations for ECStore {
     }
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
-        let result = self.handle_delete_bucket(bucket, opts).await;
-        if result.is_ok() {
-            list_objects::observe_scanner_namespace_mutations(bucket, 1);
-        }
-        result
+        Box::pin(self.handle_delete_bucket(bucket, opts)).await
     }
 }
 
@@ -872,9 +868,9 @@ mod tests {
 
     // Build a minimal ECStore carrying an explicit instance context. Empty
     // pools/disks are sufficient: the Phase 5 accessors read only `self.ctx`.
-    fn build_store_with_ctx(ctx: Arc<InstanceContext>) -> ECStore {
+    fn build_store_with_ctx(ctx: Arc<InstanceContext>) -> Arc<ECStore> {
         let endpoint_pools = EndpointServerPools::default();
-        ECStore {
+        Arc::new(ECStore {
             id: uuid::Uuid::new_v4(),
             disk_map: std::collections::HashMap::new(),
             pools: Vec::new(),
@@ -885,7 +881,7 @@ mod tests {
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
             ctx,
-        }
+        })
     }
 
     // The object graph is the isolation carrier: two ECStore instances holding

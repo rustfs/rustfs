@@ -62,7 +62,7 @@ use rustfs_config::oidc::{
 };
 use rustfs_config::server_config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS};
 use rustfs_config::{
-    COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
+    BASE_DSN_STRING, COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
     ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
     ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
     ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY, ENV_SCANNER_IDLE_MODE,
@@ -1103,6 +1103,7 @@ fn is_sensitive_key_name(key: &str) -> bool {
         || normalized.ends_with("_tls_client_key")
         || normalized == "private_key"
         || normalized.ends_with("_private_key")
+        || normalized == BASE_DSN_STRING
 }
 
 fn apply_set_directives(config: &mut ServerConfig, directives: &[ConfigDirective]) -> S3Result<()> {
@@ -2135,6 +2136,17 @@ mod tests {
         )
         .expect("utf8");
         assert!(!rendered_after_delete.contains("client_secret="));
+    }
+
+    #[test]
+    fn config_rendering_redacts_database_dsn() {
+        let entry = KV {
+            key: BASE_DSN_STRING.to_string(),
+            value: "postgres://user:password@db.example/database".to_string(),
+            hidden_if_empty: true,
+        };
+
+        assert_eq!(render_entry_value(&entry, true), REDACTED_VALUE);
     }
 
     #[test]

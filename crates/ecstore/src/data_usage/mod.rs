@@ -318,12 +318,15 @@ fn remove_bucket_usage_from_info(data_usage_info: &mut DataUsageInfo, bucket: &s
     true
 }
 
-async fn clear_bucket_usage_memory(bucket: &str) {
+async fn clear_bucket_usage_memory(bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<(), Error> {
     if bucket.is_empty() {
-        return;
+        return Ok(());
     }
 
-    memory_cache().write().await.remove(bucket);
+    let mut cache = memory_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "data usage memory cleanup")?;
+    cache.remove(bucket);
+    Ok(())
 }
 
 pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
@@ -331,17 +334,43 @@ pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str)
 }
 
 pub(crate) async fn remove_bucket_usage_for_namespace_change(store: &ECStore, bucket: &str) -> Result<(), Error> {
-    live_bucket_usage_cache().invalidate(bucket).await;
-    clear_bucket_usage_memory(bucket).await;
-    *data_usage_snapshot_cache().write().await = None;
-
-    remove_bucket_usage_from_backend_with_store(store, bucket).await
+    prepare_bucket_usage_for_namespace_change(bucket, None).await?;
+    remove_bucket_usage_from_backend_with_guard(store, bucket, None).await
 }
 
-async fn load_data_usage_for_bucket_removal(
-    store: &impl EcstoreObjectIO,
-    object: &str,
-) -> Result<Option<(DataUsageInfo, String)>, Error> {
+pub(crate) async fn prepare_bucket_usage_for_namespace_change(
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error> {
+    ensure_bucket_namespace_guard(guard, bucket, "data usage cache cleanup")?;
+    live_bucket_usage_cache().invalidate(bucket).await;
+    clear_bucket_usage_memory(bucket, guard).await?;
+
+    let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cache cleanup")?;
+    *snapshot_cache = None;
+    Ok(())
+}
+
+pub(crate) async fn remove_bucket_usage_from_backend_with_guard<S>(
+    store: &S,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    let result = remove_bucket_usage_from_backend_with_store_and_guard(store, bucket, guard).await;
+    let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cache invalidation")?;
+    *snapshot_cache = None;
+    result
+}
+
+async fn load_data_usage_for_bucket_removal<S>(store: &S, object: &str) -> Result<Option<(DataUsageInfo, String)>, Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
     let mut reader = match store
         .get_object_reader(RUSTFS_META_BUCKET, object, None, http::HeaderMap::new(), &ObjectOptions::default())
         .await
@@ -373,7 +402,34 @@ fn advance_data_usage_last_update(data_usage_info: &mut DataUsageInfo) {
     });
 }
 
-async fn remove_bucket_usage_from_backend_with_store(store: &impl EcstoreObjectIO, bucket: &str) -> Result<(), Error> {
+#[cfg(test)]
+async fn remove_bucket_usage_from_backend_with_store<S>(store: &S, bucket: &str) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    remove_bucket_usage_from_backend_with_store_and_guard(store, bucket, None).await
+}
+
+fn ensure_bucket_namespace_guard(
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    bucket: &str,
+    operation: &'static str,
+) -> Result<(), Error> {
+    if guard.is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost) {
+        return Err(Error::other(format!("bucket namespace lock was lost before {operation}: {bucket}")));
+    }
+    Ok(())
+}
+
+async fn remove_bucket_usage_from_backend_with_store_and_guard<S>(
+    store: &S,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    ensure_bucket_namespace_guard(guard, bucket, "data usage primary cleanup")?;
     let primary_seed = load_data_usage_seed_for_missing_primary(store).await?;
     remove_bucket_usage_from_object_with_retries(
         store,
@@ -381,9 +437,11 @@ async fn remove_bucket_usage_from_backend_with_store(store: &impl EcstoreObjectI
         bucket,
         DATA_USAGE_REMOVE_CAS_RETRIES,
         Some(&primary_seed),
+        guard,
     )
     .await?;
 
+    ensure_bucket_namespace_guard(guard, bucket, "data usage backup cleanup")?;
     let backup_seed = load_data_usage_for_bucket_removal(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await?
         .map_or(primary_seed, |(data_usage_info, _)| data_usage_info);
@@ -393,6 +451,7 @@ async fn remove_bucket_usage_from_backend_with_store(store: &impl EcstoreObjectI
         bucket,
         DATA_USAGE_REMOVE_CAS_RETRIES,
         Some(&backup_seed),
+        guard,
     )
     .await?;
 
@@ -400,12 +459,15 @@ async fn remove_bucket_usage_from_backend_with_store(store: &impl EcstoreObjectI
         LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
         LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
     ] {
-        remove_bucket_usage_from_object_with_retries(store, object, bucket, DATA_USAGE_REMOVE_CAS_RETRIES, None).await?;
+        remove_bucket_usage_from_object_with_retries(store, object, bucket, DATA_USAGE_REMOVE_CAS_RETRIES, None, guard).await?;
     }
     Ok(())
 }
 
-async fn load_data_usage_seed_for_missing_primary(store: &impl EcstoreObjectIO) -> Result<DataUsageInfo, Error> {
+async fn load_data_usage_seed_for_missing_primary<S>(store: &S) -> Result<DataUsageInfo, Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
     for object in [
         DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
         LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -418,14 +480,19 @@ async fn load_data_usage_seed_for_missing_primary(store: &impl EcstoreObjectIO) 
     Ok(DataUsageInfo::default())
 }
 
-async fn remove_bucket_usage_from_object_with_retries(
-    store: &impl EcstoreObjectIO,
+async fn remove_bucket_usage_from_object_with_retries<S>(
+    store: &S,
     object: &str,
     bucket: &str,
     cas_retries: usize,
     missing_seed: Option<&DataUsageInfo>,
-) -> Result<(), Error> {
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
     for attempt in 0..=cas_retries {
+        ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cleanup")?;
         let (mut data_usage_info, revision) = match load_data_usage_for_bucket_removal(store, object).await? {
             Some((data_usage_info, revision)) => (data_usage_info, Some(revision)),
             None => match missing_seed {
@@ -449,6 +516,7 @@ async fn remove_bucket_usage_from_object_with_retries(
                 ..Default::default()
             },
         };
+        ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot commit")?;
         let save_result = store
             .put_object(
                 RUSTFS_META_BUCKET,
@@ -472,6 +540,7 @@ async fn remove_bucket_usage_from_object_with_retries(
                     if attempt < cas_retries
                         && (err == Error::PreconditionFailed || revision.as_ref() != Some(&observed_revision))
                     {
+                        ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot retry")?;
                         continue;
                     }
                 } else if attempt < cas_retries && err == Error::PreconditionFailed {
@@ -1765,8 +1834,10 @@ pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
 mod tests {
     use super::*;
     use rustfs_data_usage::BucketUsageInfo;
+    use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
     use std::io::Cursor;
+    use std::sync::Arc;
     use tokio::{io::AsyncReadExt, sync::Mutex};
 
     #[derive(Debug, Default)]
@@ -1776,7 +1847,14 @@ mod tests {
         legacy_object: Option<(Vec<u8>, u64)>,
         legacy_backup_object: Option<(Vec<u8>, u64)>,
         interleaving_snapshot: Option<Vec<u8>>,
+        interleaving_backup_snapshot: Option<Vec<u8>>,
+        interleaving_legacy_snapshot: Option<Vec<u8>>,
+        interleaving_legacy_backup_snapshot: Option<Vec<u8>>,
         error_after_commit_put: Option<usize>,
+        advance_time_on_put: Option<Duration>,
+        advance_time_after_get: Option<(UsageObjectSlot, Duration)>,
+        advance_time_before_put: Option<(usize, Duration)>,
+        advance_time_after_put: Option<(usize, Duration)>,
         put_count: usize,
     }
 
@@ -1814,15 +1892,32 @@ mod tests {
             if bucket != RUSTFS_META_BUCKET {
                 return Err(Error::FileNotFound);
             }
-            let state = self.state.lock().await;
-            let stored = match object {
-                object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => &state.object,
-                object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => &state.backup_object,
-                object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => &state.legacy_object,
-                object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => &state.legacy_backup_object,
+            let slot = match object {
+                object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Primary,
+                object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::Backup,
+                object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::LegacyPrimary,
+                object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::LegacyBackup,
                 _ => return Err(Error::FileNotFound),
             };
+            let mut state = self.state.lock().await;
+            let stored = match slot {
+                UsageObjectSlot::Primary => &state.object,
+                UsageObjectSlot::Backup => &state.backup_object,
+                UsageObjectSlot::LegacyPrimary => &state.legacy_object,
+                UsageObjectSlot::LegacyBackup => &state.legacy_backup_object,
+            };
             let (data, revision) = stored.clone().ok_or(Error::FileNotFound)?;
+            let advance = match state.advance_time_after_get {
+                Some((expected_slot, duration)) if expected_slot == slot => {
+                    state.advance_time_after_get = None;
+                    Some(duration)
+                }
+                _ => None,
+            };
+            drop(state);
+            if let Some(duration) = advance {
+                tokio::time::advance(duration).await;
+            }
             Ok(crate::object_api::GetObjectReader {
                 stream: Box::new(Cursor::new(data)),
                 object_info: ObjectInfo {
@@ -1857,11 +1952,42 @@ mod tests {
             let mut state = self.state.lock().await;
             state.put_count += 1;
             let put_count = state.put_count;
+            if let Some(duration) = state.advance_time_on_put.take() {
+                drop(state);
+                tokio::time::advance(duration).await;
+                state = self.state.lock().await;
+            }
+            if let Some((expected_put, duration)) = state.advance_time_before_put
+                && expected_put == put_count
+            {
+                state.advance_time_before_put = None;
+                drop(state);
+                tokio::time::advance(duration).await;
+                state = self.state.lock().await;
+            }
             if slot == UsageObjectSlot::Primary
                 && let Some(interleaving) = state.interleaving_snapshot.take()
             {
                 let revision = state.object.as_ref().map_or(1, |(_, revision)| revision + 1);
                 state.object = Some((interleaving, revision));
+            }
+            if slot == UsageObjectSlot::Backup
+                && let Some(interleaving) = state.interleaving_backup_snapshot.take()
+            {
+                let revision = state.backup_object.as_ref().map_or(1, |(_, revision)| revision + 1);
+                state.backup_object = Some((interleaving, revision));
+            }
+            if slot == UsageObjectSlot::LegacyPrimary
+                && let Some(interleaving) = state.interleaving_legacy_snapshot.take()
+            {
+                let revision = state.legacy_object.as_ref().map_or(1, |(_, revision)| revision + 1);
+                state.legacy_object = Some((interleaving, revision));
+            }
+            if slot == UsageObjectSlot::LegacyBackup
+                && let Some(interleaving) = state.interleaving_legacy_backup_snapshot.take()
+            {
+                let revision = state.legacy_backup_object.as_ref().map_or(1, |(_, revision)| revision + 1);
+                state.legacy_backup_object = Some((interleaving, revision));
             }
             let current_revision = match slot {
                 UsageObjectSlot::Primary => state.object.as_ref(),
@@ -1901,6 +2027,13 @@ mod tests {
             }
             if state.error_after_commit_put == Some(put_count) {
                 return Err(Error::other("injected post-commit failure"));
+            }
+            if let Some((expected_put, duration)) = state.advance_time_after_put
+                && expected_put == put_count
+            {
+                state.advance_time_after_put = None;
+                drop(state);
+                tokio::time::advance(duration).await;
             }
             Ok(ObjectInfo {
                 etag: Some(format!("usage-{revision}")),
@@ -2639,6 +2772,431 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_retry_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-cleanup-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let now = SystemTime::now();
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        let scanner_winner = data_usage_info_for_test("bucket-a", 4, 168, now);
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((serde_json::to_vec(&initial).expect("initial usage snapshot should encode"), 1)),
+                interleaving_snapshot: Some(serde_json::to_vec(&scanner_winner).expect("scanner winner should encode")),
+                advance_time_on_put: Some(ttl + Duration::from_millis(1)),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop the cleanup CAS retry");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 1, "the stale cleanup must not issue a second CAS write");
+        let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("scanner winner should remain").0)
+            .expect("scanner winner should decode");
+        assert_eq!(saved.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_before_put_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-pre-put-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        let encoded = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded, 1)),
+                advance_time_after_get: Some((UsageObjectSlot::Primary, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss after the snapshot read must fence the write");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 0, "a cleanup that lost its lease must not start a snapshot write");
+        let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("usage snapshot should remain").0)
+            .expect("usage snapshot should decode");
+        assert!(saved.buckets_usage.contains_key("bucket-a"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_before_backup_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-backup-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let snapshot = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        let encoded = serde_json::to_vec(&snapshot).expect("usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded.clone(), 1)),
+                backup_object: Some((encoded, 1)),
+                advance_time_after_put: Some((1, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop cleanup before the backup write");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 1, "the cleanup must not write the backup after lock loss");
+        let backup = serde_json::from_slice::<DataUsageInfo>(
+            &state.backup_object.as_ref().expect("new-generation backup should remain").0,
+        )
+        .expect("backup should decode");
+        assert_eq!(backup.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_backup_retry_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-backup-retry-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let now = SystemTime::now();
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        let scanner_winner = data_usage_info_for_test("bucket-a", 4, 168, now);
+        let encoded = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded.clone(), 1)),
+                backup_object: Some((encoded, 1)),
+                interleaving_backup_snapshot: Some(serde_json::to_vec(&scanner_winner).expect("scanner winner should encode")),
+                advance_time_before_put: Some((2, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop the backup CAS retry");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 2, "the stale cleanup must not issue a second backup CAS write");
+        let backup = serde_json::from_slice::<DataUsageInfo>(
+            &state.backup_object.as_ref().expect("scanner winner backup should remain").0,
+        )
+        .expect("backup should decode");
+        assert_eq!(backup.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(4));
+    }
+
+    async fn assert_legacy_cleanup_stops_retry_after_lock_loss(backup: bool) {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new(
+            format!("usage-legacy-{}-retry-lock-loss-test", if backup { "backup" } else { "primary" }),
+            Arc::new(LocalClient::new()),
+        );
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let now = SystemTime::now();
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        let scanner_winner = data_usage_info_for_test("bucket-a", 4, 168, now);
+        let encoded = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
+        let winner = serde_json::to_vec(&scanner_winner).expect("scanner winner should encode");
+        let conflict_put = if backup { 4 } else { 3 };
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded.clone(), 1)),
+                backup_object: Some((encoded.clone(), 1)),
+                legacy_object: Some((encoded.clone(), 1)),
+                legacy_backup_object: Some((encoded, 1)),
+                interleaving_legacy_snapshot: (!backup).then_some(winner.clone()),
+                interleaving_legacy_backup_snapshot: backup.then_some(winner),
+                advance_time_before_put: Some((conflict_put, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop the legacy snapshot CAS retry");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(
+            state.put_count, conflict_put,
+            "the stale cleanup must not retry the conflicted legacy snapshot"
+        );
+        let saved = if backup {
+            &state
+                .legacy_backup_object
+                .as_ref()
+                .expect("scanner winner legacy backup should remain")
+                .0
+        } else {
+            &state
+                .legacy_object
+                .as_ref()
+                .expect("scanner winner legacy primary should remain")
+                .0
+        };
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("scanner winner should decode");
+        assert_eq!(saved.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_legacy_retries_after_namespace_lock_loss() {
+        assert_legacy_cleanup_stops_retry_after_lock_loss(false).await;
+        assert_legacy_cleanup_stops_retry_after_lock_loss(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn prepare_bucket_usage_preserves_successor_memory_after_lock_loss() {
+        const BUCKET: &str = "successor-bucket";
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-memory-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new(BUCKET, ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("namespace lock acquisition should not fail")
+                .expect("namespace lock should be acquired"),
+        );
+
+        let mut cache = memory_cache().write().await;
+        cache.insert(
+            BUCKET.to_string(),
+            cached_bucket_usage_now(BucketUsageInfo {
+                objects_count: 7,
+                versions_count: 7,
+                size: 294,
+                ..Default::default()
+            }),
+        );
+        let guard_for_prepare = guard.clone();
+        let prepare =
+            tokio::spawn(
+                async move { prepare_bucket_usage_for_namespace_change(BUCKET, Some(guard_for_prepare.as_ref())).await },
+            );
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        drop(cache);
+        let err = prepare
+            .await
+            .expect("prepare task should join")
+            .expect_err("lock loss while waiting for the cache must stop cleanup");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let mut cache = memory_cache().write().await;
+        assert_eq!(
+            cache.get(BUCKET).map(|entry| entry.usage.objects_count),
+            Some(7),
+            "fresh successor memory usage must not be erased after namespace lock loss"
+        );
+        cache.remove(BUCKET);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn prepare_bucket_usage_preserves_successor_snapshot_cache_after_lock_loss() {
+        const BUCKET: &str = "successor-snapshot-bucket";
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-snapshot-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new(BUCKET, ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("namespace lock acquisition should not fail")
+                .expect("namespace lock should be acquired"),
+        );
+        let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
+        let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+        *snapshot_cache = Some(CachedDataUsageSnapshot {
+            info: Some(successor),
+            loaded_at: tokio::time::Instant::now(),
+        });
+        memory_cache()
+            .write()
+            .await
+            .insert(BUCKET.to_string(), cached_bucket_usage_now(BucketUsageInfo::default()));
+
+        let guard_for_prepare = guard.clone();
+        let prepare =
+            tokio::spawn(
+                async move { prepare_bucket_usage_for_namespace_change(BUCKET, Some(guard_for_prepare.as_ref())).await },
+            );
+        loop {
+            if !memory_cache().read().await.contains_key(BUCKET) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        drop(snapshot_cache);
+        let err = prepare
+            .await
+            .expect("prepare task should join")
+            .expect_err("lock loss while waiting for the snapshot cache must stop cleanup");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let snapshot_cache = data_usage_snapshot_cache().read().await;
+        assert_eq!(
+            snapshot_cache
+                .as_ref()
+                .and_then(|cached| cached.info.as_ref())
+                .and_then(|info| info.buckets_usage.get(BUCKET))
+                .map(|usage| usage.objects_count),
+            Some(7),
+            "fresh successor snapshot cache must not be erased after namespace lock loss"
+        );
+        drop(snapshot_cache);
+        *data_usage_snapshot_cache().write().await = None;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_preserves_successor_snapshot_cache_after_lock_loss() {
+        const BUCKET: &str = "successor-final-snapshot-bucket";
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-final-snapshot-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new(BUCKET, ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("namespace lock acquisition should not fail")
+                .expect("namespace lock should be acquired"),
+        );
+        let store = Arc::new(UsageCasStore::default());
+        let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
+        let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+        *snapshot_cache = Some(CachedDataUsageSnapshot {
+            info: Some(successor),
+            loaded_at: tokio::time::Instant::now(),
+        });
+
+        let store_for_cleanup = store.clone();
+        let guard_for_cleanup = guard.clone();
+        let cleanup = tokio::spawn(async move {
+            remove_bucket_usage_from_backend_with_guard(store_for_cleanup.as_ref(), BUCKET, Some(guard_for_cleanup.as_ref()))
+                .await
+        });
+        loop {
+            if store.state.lock().await.put_count >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        drop(snapshot_cache);
+        let err = cleanup
+            .await
+            .expect("cleanup task should join")
+            .expect_err("lock loss while waiting for final cache invalidation must stop cleanup");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let snapshot_cache = data_usage_snapshot_cache().read().await;
+        assert_eq!(
+            snapshot_cache
+                .as_ref()
+                .and_then(|cached| cached.info.as_ref())
+                .and_then(|info| info.buckets_usage.get(BUCKET))
+                .map(|usage| usage.objects_count),
+            Some(7),
+            "fresh successor snapshot cache must not be erased by final invalidation after lock loss"
+        );
+        drop(snapshot_cache);
+        *data_usage_snapshot_cache().write().await = None;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn remove_bucket_usage_invalidates_snapshot_cache_after_backend_error() {
+        const BUCKET: &str = "backend-error-cache-bucket";
+        let store = UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((b"{".to_vec(), 1)),
+                ..Default::default()
+            }),
+        };
+        let stale = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
+        *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
+            info: Some(stale),
+            loaded_at: tokio::time::Instant::now(),
+        });
+
+        remove_bucket_usage_from_backend_with_guard(&store, BUCKET, None)
+            .await
+            .expect_err("the malformed backend snapshot should be reported");
+
+        assert!(
+            data_usage_snapshot_cache().read().await.is_none(),
+            "a failed cleanup must still invalidate cached predecessor usage"
+        );
+    }
+
     #[tokio::test]
     async fn remove_bucket_usage_writes_fences_when_bucket_is_already_absent() {
         let last_update = SystemTime::now() - Duration::from_secs(10);
@@ -2836,9 +3394,16 @@ mod tests {
             }),
         });
 
-        remove_bucket_usage_from_object_with_retries(store.as_ref(), DATA_USAGE_OBJ_NAME_PATH.as_str(), "bucket-a", 0, None)
-            .await
-            .expect("final-attempt read-back should confirm the ambiguous committed removal");
+        remove_bucket_usage_from_object_with_retries(
+            store.as_ref(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            "bucket-a",
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect("final-attempt read-back should confirm the ambiguous committed removal");
 
         let state = store.state.lock().await;
         let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("usage snapshot should remain").0)
@@ -2902,7 +3467,9 @@ mod tests {
         let persisted = data_usage_info_for_test("bucket-a", 1, 42, SystemTime::now() - Duration::from_secs(10));
         replace_bucket_usage_memory_from_info(&persisted).await;
         record_bucket_object_delete_memory("bucket-a", 42, true).await;
-        clear_bucket_usage_memory("bucket-a").await;
+        clear_bucket_usage_memory("bucket-a", None)
+            .await
+            .expect("bucket usage memory cleanup should succeed");
 
         let mut response = DataUsageInfo {
             last_update: Some(SystemTime::now()),

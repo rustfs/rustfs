@@ -1887,6 +1887,7 @@ mod tests {
             peer_clients: Vec::new(),
             all_peer_clients: Vec::new(),
             peer_admin_caches: Vec::new(),
+            peer_topology_hosts: Vec::new(),
         };
         let missing = sys
             .acknowledge_scanner_dirty_usage(vec![("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7)])
