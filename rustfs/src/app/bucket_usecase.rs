@@ -2734,11 +2734,15 @@ mod tests {
             .expect("test admission should remain open");
         let started = Arc::new(AtomicBool::new(false));
         let started_for_task = started.clone();
-        let result = await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async move {
-            started_for_task.store(true, Ordering::SeqCst);
-            Ok(())
-        })
-        .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async move {
+                started_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await
+        .expect("saturated admission must fail within the bounded timeout");
         drop(held);
 
         assert!(
@@ -2783,12 +2787,15 @@ mod tests {
 
         let ninth_started = Arc::new(AtomicBool::new(false));
         let ninth_started_for_task = ninth_started.clone();
-        let ninth_result =
+        let ninth_result = tokio::time::timeout(
+            Duration::from_secs(1),
             await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission.clone(), async move {
                 ninth_started_for_task.store(true, Ordering::SeqCst);
                 Ok(())
-            })
-            .await;
+            }),
+        )
+        .await
+        .expect("an excess bucket transaction must fail within the bounded timeout");
         assert!(
             !ninth_started.load(Ordering::SeqCst),
             "the ninth bucket transaction must not start when admission is saturated"
@@ -2849,6 +2856,25 @@ mod tests {
         let rest = &source[start + start_marker.len()..];
         let end = rest.find("\n    pub async fn ").unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    #[test]
+    fn bucket_create_and_delete_use_admitted_fresh_tasks() {
+        let source = include_str!("bucket_usecase.rs");
+        for (method, operation, inner_method) in [
+            ("execute_create_bucket", "bucket creation", "execute_create_bucket_inner"),
+            ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner"),
+        ] {
+            let body = usecase_method_source(source, method);
+            assert!(
+                body.contains(&format!("await_bucket_usecase_on_fresh_task(\"{operation}\"")),
+                "{method} must use bounded detached-task admission"
+            );
+            assert!(
+                body.contains(&format!("{inner_method}(req).await")),
+                "{method} must run its mutation inside the admitted task"
+            );
+        }
     }
 
     #[test]

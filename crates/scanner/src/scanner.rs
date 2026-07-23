@@ -281,6 +281,30 @@ pub(crate) fn scanner_cycle_outcome_with_pending_maintenance(
     }
 }
 
+async fn remote_dirty_usage_acknowledgement_pending<F, E>(cycle: u64, acknowledgement_count: usize, acknowledgement: F) -> bool
+where
+    F: Future<Output = Result<bool, E>>,
+    E: std::fmt::Display,
+{
+    match acknowledgement.await {
+        Ok(dirty_usage_pending) => dirty_usage_pending,
+        Err(err) => {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                cycle,
+                acknowledgement_count,
+                error = %err,
+                state = "remote_dirty_usage_acknowledgement_pending",
+                "Scanner cycle left remote dirty usage acknowledgements pending"
+            );
+            true
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ScannerCleanIdleBackoff {
     interval_multiplier: u32,
@@ -2733,23 +2757,12 @@ async fn run_data_scanner_cycle(
             .into_iter()
             .map(|acknowledgement| (acknowledgement.host, acknowledgement.instance_id, acknowledgement.generation))
             .collect();
-        match notification_system.acknowledge_scanner_dirty_usage(acknowledgements).await {
-            Ok(dirty_usage_pending) => dirty_usage_pending,
-            Err(err) => {
-                warn!(
-                    target: "rustfs::scanner",
-                    event = EVENT_SCANNER_PERSIST_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    cycle = cycle_info.current,
-                    acknowledgement_count,
-                    error = %err,
-                    state = "remote_dirty_usage_acknowledgement_pending",
-                    "Scanner cycle left remote dirty usage acknowledgements pending"
-                );
-                true
-            }
-        }
+        remote_dirty_usage_acknowledgement_pending(
+            cycle_info.current,
+            acknowledgement_count,
+            notification_system.acknowledge_scanner_dirty_usage(acknowledgements),
+        )
+        .await
     } else {
         warn!(
             target: "rustfs::scanner",
@@ -5795,6 +5808,34 @@ mod tests {
         assert_eq!(outcome, ScannerCycleOutcome::Completed);
         assert_eq!(acknowledgements, vec![remote_acknowledgement]);
         assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    }
+
+    #[tokio::test]
+    async fn scanner_cycle_keeps_remote_pending_acknowledgement() {
+        let pending =
+            remote_dirty_usage_acknowledgement_pending(7, 1, std::future::ready(Ok::<bool, std::io::Error>(true))).await;
+        assert_eq!(
+            scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, pending),
+            ScannerCycleOutcome::CompletedWithPendingMaintenance
+        );
+
+        let cleared =
+            remote_dirty_usage_acknowledgement_pending(7, 1, std::future::ready(Ok::<bool, std::io::Error>(false))).await;
+        assert_eq!(
+            scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, cleared),
+            ScannerCycleOutcome::Completed
+        );
+
+        let failed = remote_dirty_usage_acknowledgement_pending(
+            7,
+            1,
+            std::future::ready(Err::<bool, _>(std::io::Error::other("injected acknowledgement failure"))),
+        )
+        .await;
+        assert_eq!(
+            scanner_cycle_outcome_with_pending_maintenance(ScannerCycleOutcome::Completed, failed),
+            ScannerCycleOutcome::CompletedWithPendingMaintenance
+        );
     }
 
     #[test]

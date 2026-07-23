@@ -1955,6 +1955,14 @@ mod tests {
             aggregate_scanner_dirty_usage_acknowledgement_results(vec![("peer-1".to_string(), Ok(activity(None)))], Vec::new())
                 .expect("an acknowledgement without a pending field should remain retryable");
         assert!(unknown, "a peer that cannot prove its dirty state is clear must remain pending");
+
+        let err = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![("peer-1".to_string(), Err(Error::other("injected acknowledgement failure")))],
+            Vec::new(),
+        )
+        .expect_err("a reachable peer acknowledgement failure must be reported");
+        assert!(err.to_string().contains("peer-1"));
+        assert!(err.to_string().contains("injected acknowledgement failure"));
     }
 
     #[tokio::test]
