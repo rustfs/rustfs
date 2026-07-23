@@ -18,7 +18,9 @@ use crate::cluster::rpc::client::{
 };
 use crate::cluster::rpc::{set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof};
 use crate::error::{Error, Result};
-use crate::storage_api_contracts::internode::{SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION};
+use crate::storage_api_contracts::internode::{
+    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
+};
 use crate::{
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     layout::endpoints::EndpointServerPools,
@@ -95,6 +97,8 @@ pub struct ScannerPeerActivity {
     pub protocol_version: u32,
     pub topology_digest: Option<[u8; 32]>,
     pub data_movement_active: Option<bool>,
+    pub dirty_usage_generation: Option<u64>,
+    pub dirty_usage_pending: Option<bool>,
 }
 
 fn decode_scanner_activity_with_verifier(
@@ -111,26 +115,58 @@ fn decode_scanner_activity_with_verifier(
     {
         return Err(Error::other("peer returned an invalid scanner activity instance ID"));
     }
-    let topology_digest = match response.protocol_version {
-        // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers omit the activity challenge response fields. Remove after every supported peer implements authenticated scanner activity protocol v4.
+    let (topology_digest, data_movement_active, dirty_usage_generation, dirty_usage_pending) = match response.protocol_version {
+        // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): legacy response fields are unauthenticated. Remove after protocol v0 peers are unsupported.
         SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION
-            if response.topology_digest.is_empty() && response.response_proof.is_empty() && !response.data_movement_active =>
+            if response.topology_digest.is_empty()
+                && response.response_proof.is_empty()
+                && !response.data_movement_active
+                && response.dirty_usage_generation == 0
+                && !response.dirty_usage_pending =>
         {
-            None
+            (None, None, None, None)
         }
         SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
             return Err(Error::other("legacy scanner activity peer returned unexpected extended fields"));
         }
+        SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
+            if response.dirty_usage_generation != 0 || response.dirty_usage_pending {
+                return Err(Error::other("scanner activity protocol v4 peer returned unauthenticated v5 fields"));
+            }
+            let canonical = rustfs_protos::canonical_scanner_activity_v4_response_body(challenge, &response)
+                .map_err(|_| Error::other("peer scanner activity response is too large to authenticate"))?;
+            verify_proof(&canonical, &response.response_proof)?;
+            (
+                Some(
+                    response
+                        .topology_digest
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| Error::other("peer returned an invalid scanner topology digest"))?,
+                ),
+                Some(response.data_movement_active),
+                None,
+                None,
+            )
+        }
         SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            if response.dirty_usage_pending && response.dirty_usage_generation == 0 {
+                return Err(Error::other("scanner activity peer returned pending dirty usage without a generation"));
+            }
             let canonical = rustfs_protos::canonical_scanner_activity_response_body(challenge, &response)
                 .map_err(|_| Error::other("peer scanner activity response is too large to authenticate"))?;
             verify_proof(&canonical, &response.response_proof)?;
-            Some(
-                response
-                    .topology_digest
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| Error::other("peer returned an invalid scanner topology digest"))?,
+            (
+                Some(
+                    response
+                        .topology_digest
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| Error::other("peer returned an invalid scanner topology digest"))?,
+                ),
+                Some(response.data_movement_active),
+                Some(response.dirty_usage_generation),
+                Some(response.dirty_usage_pending),
             )
         }
         version => {
@@ -143,8 +179,9 @@ fn decode_scanner_activity_with_verifier(
         maintenance_generation: response.maintenance_generation,
         protocol_version: response.protocol_version,
         topology_digest,
-        data_movement_active: (response.protocol_version == SCANNER_ACTIVITY_PROTOCOL_VERSION)
-            .then_some(response.data_movement_active),
+        data_movement_active,
+        dirty_usage_generation,
+        dirty_usage_pending,
     })
 }
 
@@ -1325,7 +1362,11 @@ impl PeerRestClient {
         .await
     }
 
-    pub async fn scanner_activity(&self) -> Result<ScannerPeerActivity> {
+    async fn scanner_activity_request(
+        &self,
+        acknowledge_instance_id: String,
+        acknowledge_dirty_usage_generation: u64,
+    ) -> Result<ScannerPeerActivity> {
         self.finalize_result(
             async {
                 let challenge = Uuid::new_v4();
@@ -1337,14 +1378,26 @@ impl PeerRestClient {
                 let mut request = Request::new(ScannerActivityRequest {
                     challenge: challenge.as_bytes().to_vec().into(),
                     protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+                    acknowledge_instance_id,
+                    acknowledge_dirty_usage_generation,
                 });
-                set_tonic_canonical_body_digest(&mut request, challenge.as_bytes())?;
+                let canonical = rustfs_protos::canonical_scanner_activity_request_body(request.get_ref())
+                    .map_err(|_| Error::other("scanner activity request is too large to authenticate"))?;
+                set_tonic_canonical_body_digest(&mut request, &canonical)?;
                 let response = client.scanner_activity(request).await?.into_inner();
                 decode_scanner_activity(response, challenge.as_bytes())
             }
             .await,
         )
         .await
+    }
+
+    pub async fn scanner_activity(&self) -> Result<ScannerPeerActivity> {
+        self.scanner_activity_request(String::new(), 0).await
+    }
+
+    pub async fn acknowledge_scanner_dirty_usage(&self, instance_id: String, generation: u64) -> Result<ScannerPeerActivity> {
+        self.scanner_activity_request(instance_id, generation).await
     }
 
     pub async fn get_metacache_listing(&self) -> Result<()> {
@@ -1615,6 +1668,8 @@ mod tests {
             topology_digest: Vec::new().into(),
             data_movement_active: false,
             response_proof: Vec::new().into(),
+            dirty_usage_generation: 0,
+            dirty_usage_pending: false,
         })
         .expect("legacy peers should retain their activity generations during a rolling upgrade");
         assert_eq!(
@@ -1626,6 +1681,34 @@ mod tests {
                 protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
                 topology_digest: None,
                 data_movement_active: None,
+                dirty_usage_generation: None,
+                dirty_usage_pending: None,
+            }
+        );
+
+        let previous = decode_test_scanner_activity(ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: true,
+            response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 0,
+            dirty_usage_pending: false,
+        })
+        .expect("protocol v4 peers should remain observable during a rolling upgrade");
+        assert_eq!(
+            previous,
+            ScannerPeerActivity {
+                instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+                namespace_generation: 7,
+                maintenance_generation: 3,
+                protocol_version: SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+                topology_digest: Some([7; 32]),
+                data_movement_active: Some(true),
+                dirty_usage_generation: None,
+                dirty_usage_pending: None,
             }
         );
 
@@ -1637,6 +1720,8 @@ mod tests {
             topology_digest: vec![7; 31].into(),
             data_movement_active: false,
             response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
         };
         assert!(
             decode_test_scanner_activity(malformed_topology)
@@ -1653,6 +1738,8 @@ mod tests {
             topology_digest: vec![7; 32].into(),
             data_movement_active: false,
             response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
         };
         assert!(
             decode_test_scanner_activity(missing_instance)
@@ -1669,6 +1756,8 @@ mod tests {
             topology_digest: vec![7; 32].into(),
             data_movement_active: false,
             response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
         };
         assert!(
             decode_test_scanner_activity(malformed_instance)
@@ -1685,6 +1774,8 @@ mod tests {
             topology_digest: vec![7; 32].into(),
             data_movement_active: true,
             response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
         })
         .expect("complete activity responses should be accepted");
         assert_eq!(
@@ -1696,7 +1787,45 @@ mod tests {
                 protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
                 topology_digest: Some([7; 32]),
                 data_movement_active: Some(true),
+                dirty_usage_generation: Some(11),
+                dirty_usage_pending: Some(true),
             }
+        );
+
+        let pending_without_generation = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 0,
+            dirty_usage_pending: true,
+        };
+        assert!(
+            decode_test_scanner_activity(pending_without_generation)
+                .expect_err("pending dirty usage must carry a nonzero generation")
+                .to_string()
+                .contains("without a generation")
+        );
+
+        let previous_with_dirty_usage = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+            topology_digest: vec![7; 32].into(),
+            data_movement_active: false,
+            response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+        };
+        assert!(
+            decode_test_scanner_activity(previous_with_dirty_usage)
+                .expect_err("protocol v4 responses must not claim unauthenticated dirty usage fields")
+                .to_string()
+                .contains("unauthenticated v5 fields")
         );
 
         let legacy_with_topology = ScannerActivityResponse {
@@ -1707,6 +1836,8 @@ mod tests {
             topology_digest: vec![7; 32].into(),
             data_movement_active: false,
             response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 0,
+            dirty_usage_pending: false,
         };
         assert!(
             decode_test_scanner_activity(legacy_with_topology)
@@ -1723,6 +1854,8 @@ mod tests {
             topology_digest: vec![7; 32].into(),
             data_movement_active: false,
             response_proof: b"proof".to_vec().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
         };
         assert!(
             decode_test_scanner_activity(unsupported_protocol)
@@ -1739,6 +1872,8 @@ mod tests {
             topology_digest: vec![7; 32].into(),
             data_movement_active: false,
             response_proof: Vec::new().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
         };
         assert!(
             decode_test_scanner_activity(missing_proof)

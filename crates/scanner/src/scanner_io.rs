@@ -189,6 +189,20 @@ static SCANNER_ACTIVITY_EPOCH: LazyLock<String> = LazyLock::new(|| format!("{:03
 static SCANNER_MAINTENANCE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SCANNER_MAINTENANCE_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScannerDirtyUsageState {
+    pub generation: u64,
+    pub pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ScannerDirtyUsageAckError {
+    #[error("scanner process instance changed before dirty usage acknowledgement")]
+    ProcessChanged,
+    #[error("scanner dirty usage generation cannot be acknowledged")]
+    InvalidGeneration,
+}
+
 fn dirty_usage_buckets() -> MutexGuard<'static, DirtyUsageBuckets> {
     DIRTY_USAGE_BUCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -238,6 +252,42 @@ pub(crate) async fn scanner_maintenance_changed() {
 
 pub fn scanner_activity_epoch() -> &'static str {
     SCANNER_ACTIVITY_EPOCH.as_str()
+}
+
+pub fn scanner_dirty_usage_state() -> ScannerDirtyUsageState {
+    let dirty_buckets = dirty_usage_buckets();
+    ScannerDirtyUsageState {
+        generation: DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
+        pending: !dirty_buckets.is_empty(),
+    }
+}
+
+pub fn acknowledge_dirty_usage_generation(
+    instance_id: &str,
+    generation: u64,
+) -> std::result::Result<(), ScannerDirtyUsageAckError> {
+    if instance_id != scanner_activity_epoch() {
+        return Err(ScannerDirtyUsageAckError::ProcessChanged);
+    }
+
+    let (cleared_buckets, pending_buckets) = {
+        let mut dirty_buckets = dirty_usage_buckets();
+        let current_generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
+        if generation == 0 || generation == u64::MAX || current_generation == u64::MAX || generation > current_generation {
+            return Err(ScannerDirtyUsageAckError::InvalidGeneration);
+        }
+
+        let before = dirty_buckets.len();
+        dirty_buckets.retain(|_, dirty_generation| *dirty_generation > generation);
+        let cleared_buckets = before.saturating_sub(dirty_buckets.len());
+        if cleared_buckets > 0 {
+            advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+        }
+        (cleared_buckets, dirty_buckets.len())
+    };
+    global_metrics()
+        .record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared_buckets), usize_to_u64_saturated(pending_buckets));
+    Ok(())
 }
 
 pub(crate) fn dirty_usage_generation() -> u64 {
@@ -1774,6 +1824,7 @@ pub(crate) enum ScannerCycleStatus {
 pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
+    remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
     required_cycle_floor: Option<u64>,
@@ -1784,6 +1835,7 @@ impl ScannerCycleResult {
         Self {
             status,
             dirty_usage_clear,
+            remote_dirty_usage_acknowledgements: Vec::new(),
             failed_dirty_usage: false,
             pending_maintenance_work: false,
             required_cycle_floor: None,
@@ -1805,14 +1857,24 @@ impl ScannerCycleResult {
         self
     }
 
-    pub(crate) fn acknowledge_durable_usage(self) {
+    pub(crate) fn with_remote_dirty_usage_acknowledgements(
+        mut self,
+        acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    ) -> Self {
+        self.remote_dirty_usage_acknowledgements = acknowledgements;
+        self
+    }
+
+    pub(crate) fn acknowledge_durable_usage(self) -> Vec<crate::scanner::ScannerDirtyUsageAcknowledgement> {
         if let Some(snapshot) = self.dirty_usage_clear {
             clear_dirty_usage_buckets(&snapshot);
         }
+        self.remote_dirty_usage_acknowledgements
     }
 
     pub(crate) fn has_dirty_usage_to_acknowledge(&self) -> bool {
         self.dirty_usage_clear.as_ref().is_some_and(|snapshot| !snapshot.is_empty())
+            || !self.remote_dirty_usage_acknowledgements.is_empty()
     }
 
     pub(crate) fn has_failed_dirty_usage(&self) -> bool {
@@ -1942,7 +2004,11 @@ impl ScannerIOCycle for ECStore {
             };
             send_data_usage_update(&updates, empty_usage).await?;
             let dirty_usage_clear = Some(dirty_usage_snapshot.buckets.as_ref().clone());
-            return Ok(ScannerCycleResult::new(status, dirty_usage_clear));
+            return Ok(
+                ScannerCycleResult::new(status, dirty_usage_clear).with_remote_dirty_usage_acknowledgements(
+                    crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before),
+                ),
+            );
         }
 
         let total_results = expected_sources.len();
@@ -2170,7 +2236,13 @@ impl ScannerIOCycle for ECStore {
             &failed_buckets,
         );
         result?;
+        let remote_dirty_usage_acknowledgements = if cycle_status == ScannerCycleStatus::Complete {
+            crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before)
+        } else {
+            Vec::new()
+        };
         Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
+            .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_failed_dirty_usage(!failed_buckets.is_empty())
             .with_pending_maintenance_work(pending_maintenance_work)
             .with_required_cycle_floor(required_cycle_floor))
@@ -3718,6 +3790,62 @@ mod tests {
 
     #[test]
     #[serial]
+    fn dirty_usage_generation_acknowledgement_preserves_newer_mutations() {
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_bucket("photos");
+        let acknowledged_generation = scanner_dirty_usage_state().generation;
+        record_dirty_usage_bucket("videos");
+
+        acknowledge_dirty_usage_generation(scanner_activity_epoch(), acknowledged_generation)
+            .expect("a matching process and prior generation should be acknowledged");
+        acknowledge_dirty_usage_generation(scanner_activity_epoch(), acknowledged_generation)
+            .expect("replaying an acknowledged generation should be idempotent");
+
+        let pending = dirty_usage_buckets_for_tests();
+        assert!(!pending.contains_key("photos"));
+        assert!(pending.contains_key("videos"));
+        assert!(scanner_dirty_usage_state().pending);
+        drop(pending);
+
+        let remaining_generation = scanner_dirty_usage_state().generation;
+        acknowledge_dirty_usage_generation(scanner_activity_epoch(), remaining_generation)
+            .expect("the remaining generation should be acknowledged");
+        assert!(!scanner_dirty_usage_state().pending);
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn dirty_usage_generation_acknowledgement_rejects_stale_process_and_future_generation() {
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_bucket("photos");
+        let generation = scanner_dirty_usage_state().generation;
+
+        assert_eq!(
+            acknowledge_dirty_usage_generation("stale-process", generation),
+            Err(ScannerDirtyUsageAckError::ProcessChanged)
+        );
+        assert_eq!(
+            acknowledge_dirty_usage_generation(scanner_activity_epoch(), 0),
+            Err(ScannerDirtyUsageAckError::InvalidGeneration)
+        );
+        assert_eq!(
+            acknowledge_dirty_usage_generation(scanner_activity_epoch(), u64::MAX),
+            Err(ScannerDirtyUsageAckError::InvalidGeneration)
+        );
+        assert_eq!(
+            acknowledge_dirty_usage_generation(
+                scanner_activity_epoch(),
+                generation.checked_add(1).expect("test generation should not be exhausted")
+            ),
+            Err(ScannerDirtyUsageAckError::InvalidGeneration)
+        );
+        assert!(dirty_usage_buckets_for_tests().contains_key("photos"));
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
     fn dirty_usage_snapshot_detects_uncovered_generation() {
         clear_dirty_usage_buckets_for_tests();
         record_dirty_usage_bucket("photos");
@@ -3756,8 +3884,9 @@ mod tests {
         assert!(dirty_usage_buckets().contains_key("temporarily-omitted"));
         assert_eq!(dirty_usage_snapshot_status(&snapshot), DirtyUsageSnapshotStatus::Current);
 
-        ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()))
+        let acknowledgements = ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()))
             .acknowledge_durable_usage();
+        assert!(acknowledgements.is_empty());
         assert!(!dirty_usage_buckets().contains_key("temporarily-omitted"));
         clear_dirty_usage_buckets_for_tests();
     }
@@ -3862,7 +3991,8 @@ mod tests {
         assert!(dirty_usage_buckets().contains_key("photos"));
 
         let confirmed = ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(snapshot.buckets.as_ref().clone()));
-        confirmed.acknowledge_durable_usage();
+        let acknowledgements = confirmed.acknowledge_durable_usage();
+        assert!(acknowledgements.is_empty());
         assert!(!dirty_usage_buckets().contains_key("photos"));
         clear_dirty_usage_buckets_for_tests();
     }

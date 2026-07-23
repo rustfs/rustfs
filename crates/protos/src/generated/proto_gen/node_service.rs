@@ -1085,6 +1085,10 @@ pub struct ScannerActivityRequest {
     pub challenge: ::prost::bytes::Bytes,
     #[prost(uint32, tag = "2")]
     pub protocol_version: u32,
+    #[prost(string, tag = "3")]
+    pub acknowledge_instance_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub acknowledge_dirty_usage_generation: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScannerActivityResponse {
@@ -1102,6 +1106,10 @@ pub struct ScannerActivityResponse {
     pub data_movement_active: bool,
     #[prost(bytes = "bytes", tag = "7")]
     pub response_proof: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "8")]
+    pub dirty_usage_generation: u64,
+    #[prost(bool, tag = "9")]
+    pub dirty_usage_pending: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackgroundHealStatusRequest {}

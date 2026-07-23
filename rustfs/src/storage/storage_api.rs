@@ -226,7 +226,9 @@ pub(crate) mod rpc_consumer {
     }
 
     pub(crate) mod node_service {
-        pub(crate) use super::super::storage_contracts::SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION;
+        pub(crate) use super::super::storage_contracts::{
+            SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+        };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore,
             ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,

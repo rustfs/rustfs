@@ -30,7 +30,7 @@ use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, Scanne
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::{
     ScannerCycleStatus, ScannerIOCycle, dirty_usage_bucket_notified, dirty_usage_buckets_pending, dirty_usage_generation,
-    scanner_maintenance_changed, scanner_maintenance_generation,
+    scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
@@ -57,7 +57,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::storage_api::scan::{
     BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
-    SCANNER_ACTIVITY_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
@@ -413,9 +413,18 @@ pub(crate) struct ScannerNodeActivity {
     protocol_version: u32,
     topology_digest: [u8; 32],
     data_movement_active: bool,
+    dirty_usage_generation: u64,
+    dirty_usage_pending: bool,
 }
 
 pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScannerDirtyUsageAcknowledgement {
+    pub(crate) host: String,
+    pub(crate) instance_id: String,
+    pub(crate) generation: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerActivityObservation {
@@ -761,12 +770,26 @@ pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapsho
         hasher.update(activity.protocol_version.to_be_bytes());
         hasher.update(activity.topology_digest);
         hasher.update([u8::from(activity.data_movement_active)]);
+        hasher.update(activity.dirty_usage_generation.to_be_bytes());
+        hasher.update([u8::from(activity.dirty_usage_pending)]);
     }
     hasher.finalize().into()
 }
 
 pub(crate) fn scanner_activity_allows_usage_publication(snapshot: &ScannerActivitySnapshot) -> bool {
     snapshot.values().all(|activity| !activity.data_movement_active)
+}
+
+pub(crate) fn scanner_dirty_usage_acknowledgements(snapshot: &ScannerActivitySnapshot) -> Vec<ScannerDirtyUsageAcknowledgement> {
+    snapshot
+        .iter()
+        .filter(|(host, activity)| host.as_str() != LOCAL_SCANNER_ACTIVITY_NODE && activity.dirty_usage_pending)
+        .map(|(host, activity)| ScannerDirtyUsageAcknowledgement {
+            host: host.clone(),
+            instance_id: activity.instance_id.clone(),
+            generation: activity.dirty_usage_generation,
+        })
+        .collect()
 }
 
 pub fn scanner_topology_digest(storeapi: &ECStore) -> [u8; 32] {
@@ -817,7 +840,8 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
     let data_movement_active = storeapi.scanner_data_movement_active().await;
     let namespace_generation = storeapi.scanner_namespace_mutation_generation();
     let maintenance_generation = scanner_maintenance_generation();
-    if namespace_generation == u64::MAX || maintenance_generation == u64::MAX {
+    let dirty_usage = scanner_dirty_usage_state();
+    if namespace_generation == u64::MAX || maintenance_generation == u64::MAX || dirty_usage.generation == u64::MAX {
         return Err("local scanner activity generation is exhausted".to_string());
     }
     let local_instance_id = crate::scanner_io::scanner_activity_epoch().to_string();
@@ -831,6 +855,8 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
             protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
             topology_digest,
             data_movement_active,
+            dirty_usage_generation: dirty_usage.generation,
+            dirty_usage_pending: dirty_usage.pending,
         },
     )]);
     if !distributed {
@@ -848,25 +874,41 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
         if activity.namespace_generation == u64::MAX || activity.maintenance_generation == u64::MAX {
             return Err(format!("scanner activity peer {host} exhausted its activity generation"));
         }
-        let (peer_topology_digest, peer_data_movement_active) = match activity.protocol_version {
-            SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
-                return Err(format!("scanner activity peer {host} cannot verify data movement publication fencing"));
-            }
-            SCANNER_ACTIVITY_PROTOCOL_VERSION => (
-                activity
-                    .topology_digest
-                    .ok_or_else(|| format!("scanner activity peer {host} omitted its storage topology"))?,
-                activity
-                    .data_movement_active
-                    .ok_or_else(|| format!("scanner activity peer {host} omitted its data movement state"))?,
-            ),
-            version => {
-                return Err(format!(
-                    "scanner activity peer {host} uses protocol {version}, expected {}",
-                    SCANNER_ACTIVITY_PROTOCOL_VERSION
-                ));
-            }
-        };
+        let (peer_topology_digest, peer_data_movement_active, peer_dirty_usage_generation, peer_dirty_usage_pending) =
+            match activity.protocol_version {
+                SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
+                    return Err(format!("scanner activity peer {host} cannot verify data movement publication fencing"));
+                }
+                SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
+                    return Err(format!(
+                        "scanner activity peer {host} cannot acknowledge distributed dirty usage with protocol {}",
+                        SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION
+                    ));
+                }
+                SCANNER_ACTIVITY_PROTOCOL_VERSION => (
+                    activity
+                        .topology_digest
+                        .ok_or_else(|| format!("scanner activity peer {host} omitted its storage topology"))?,
+                    activity
+                        .data_movement_active
+                        .ok_or_else(|| format!("scanner activity peer {host} omitted its data movement state"))?,
+                    activity
+                        .dirty_usage_generation
+                        .ok_or_else(|| format!("scanner activity peer {host} omitted its dirty usage generation"))?,
+                    activity
+                        .dirty_usage_pending
+                        .ok_or_else(|| format!("scanner activity peer {host} omitted its dirty usage state"))?,
+                ),
+                version => {
+                    return Err(format!(
+                        "scanner activity peer {host} uses protocol {version}, expected {}",
+                        SCANNER_ACTIVITY_PROTOCOL_VERSION
+                    ));
+                }
+            };
+        if peer_dirty_usage_generation == u64::MAX {
+            return Err(format!("scanner activity peer {host} exhausted its dirty usage generation"));
+        }
         if peer_topology_digest != topology_digest {
             return Err(format!("scanner activity peer {host} has a different storage topology"));
         }
@@ -881,6 +923,8 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
                     protocol_version: activity.protocol_version,
                     topology_digest: peer_topology_digest,
                     data_movement_active: peer_data_movement_active,
+                    dirty_usage_generation: peer_dirty_usage_generation,
+                    dirty_usage_pending: peer_dirty_usage_pending,
                 },
             )
             .is_some()
@@ -2679,9 +2723,46 @@ async fn run_data_scanner_cycle(
         };
     }
 
-    let (completion_outcome, scanner_pending_maintenance_work) =
+    let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_persist_outcome);
-    let pending_maintenance_work = scanner_pending_maintenance_work || unresolved_heal_work;
+    let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
+        false
+    } else if let Some(notification_system) = storeapi.notification_system() {
+        let acknowledgement_count = remote_dirty_usage_acknowledgements.len();
+        let acknowledgements = remote_dirty_usage_acknowledgements
+            .into_iter()
+            .map(|acknowledgement| (acknowledgement.host, acknowledgement.instance_id, acknowledgement.generation))
+            .collect();
+        match notification_system.acknowledge_scanner_dirty_usage(acknowledgements).await {
+            Ok(()) => false,
+            Err(err) => {
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    cycle = cycle_info.current,
+                    acknowledgement_count,
+                    error = %err,
+                    state = "remote_dirty_usage_acknowledgement_pending",
+                    "Scanner cycle left remote dirty usage acknowledgements pending"
+                );
+                true
+            }
+        }
+    } else {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            cycle = cycle_info.current,
+            state = "remote_dirty_usage_acknowledgement_unavailable",
+            "Scanner cycle cannot acknowledge remote dirty usage without a notification system"
+        );
+        true
+    };
+    let pending_maintenance_work = scanner_pending_maintenance_work || unresolved_heal_work || remote_dirty_usage_pending;
     match completion_outcome {
         ScannerCycleOutcome::Failed => {
             error!(
@@ -3395,7 +3476,7 @@ fn scanner_cycle_completion_outcome(
 fn finalize_scanner_cycle_result(
     scan_cycle_result: crate::scanner_io::ScannerCycleResult,
     usage_persist_outcome: DataUsagePersistOutcome,
-) -> (ScannerCycleOutcome, bool) {
+) -> (ScannerCycleOutcome, bool, Vec<ScannerDirtyUsageAcknowledgement>) {
     let completion_outcome = scanner_cycle_completion_outcome(
         scan_cycle_result.status,
         usage_persist_outcome,
@@ -3403,13 +3484,15 @@ fn finalize_scanner_cycle_result(
         scan_cycle_result.has_failed_dirty_usage(),
     );
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work();
-    if matches!(
+    let remote_dirty_usage_acknowledgements = if matches!(
         usage_persist_outcome,
         DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable
     ) {
-        scan_cycle_result.acknowledge_durable_usage();
-    }
-    (completion_outcome, pending_maintenance_work)
+        scan_cycle_result.acknowledge_durable_usage()
+    } else {
+        Vec::new()
+    };
+    (completion_outcome, pending_maintenance_work, remote_dirty_usage_acknowledgements)
 }
 
 /// Decide whether an incoming usage snapshot must be skipped as stale, given the local
@@ -5694,14 +5777,23 @@ mod tests {
         crate::scanner_io::record_dirty_usage_bucket("photos");
         let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
-        let unsaved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot.clone()));
-        let (outcome, _) = finalize_scanner_cycle_result(unsaved, DataUsagePersistOutcome::NoUpdate);
+        let remote_acknowledgement = ScannerDirtyUsageAcknowledgement {
+            host: "node-2".to_string(),
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            generation: 11,
+        };
+        let unsaved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot.clone()))
+            .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement.clone()]);
+        let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(unsaved, DataUsagePersistOutcome::NoUpdate);
         assert_eq!(outcome, ScannerCycleOutcome::Failed);
+        assert!(acknowledgements.is_empty());
         assert!(crate::scanner_io::dirty_usage_buckets_pending());
 
-        let saved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
-        let (outcome, _) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved);
+        let saved = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot))
+            .with_remote_dirty_usage_acknowledgements(vec![remote_acknowledgement.clone()]);
+        let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(saved, DataUsagePersistOutcome::Saved);
         assert_eq!(outcome, ScannerCycleOutcome::Completed);
+        assert_eq!(acknowledgements, vec![remote_acknowledgement]);
         assert!(!crate::scanner_io::dirty_usage_buckets_pending());
     }
 
@@ -5713,9 +5805,10 @@ mod tests {
         let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
         let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
-        let (outcome, _) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::AlreadyDurable);
+        let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::AlreadyDurable);
 
         assert_eq!(outcome, ScannerCycleOutcome::Completed);
+        assert!(acknowledgements.is_empty());
         assert!(!crate::scanner_io::dirty_usage_buckets_pending());
     }
 
@@ -5727,9 +5820,10 @@ mod tests {
         let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
         let durable = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Complete, Some(dirty_snapshot));
-        let (outcome, _) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::PriorCycleDurable);
+        let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(durable, DataUsagePersistOutcome::PriorCycleDurable);
 
         assert_eq!(outcome, ScannerCycleOutcome::Completed);
+        assert!(acknowledgements.is_empty());
         assert!(crate::scanner_io::dirty_usage_buckets_pending());
         crate::scanner_io::clear_dirty_usage_bucket("photos");
     }
@@ -5742,9 +5836,10 @@ mod tests {
         let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
 
         let superseded = crate::scanner_io::ScannerCycleResult::new(ScannerCycleStatus::Superseded, Some(dirty_snapshot));
-        let (outcome, _) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::NoUpdate);
+        let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(superseded, DataUsagePersistOutcome::NoUpdate);
 
         assert_eq!(outcome, ScannerCycleOutcome::Superseded);
+        assert!(acknowledgements.is_empty());
         assert!(crate::scanner_io::dirty_usage_buckets_pending());
         crate::scanner_io::clear_dirty_usage_bucket("photos");
     }
@@ -6614,6 +6709,8 @@ mod tests {
             protocol_version: SCANNER_ACTIVITY_PROTOCOL_VERSION,
             topology_digest: [3; 32],
             data_movement_active: false,
+            dirty_usage_generation: 5,
+            dirty_usage_pending: false,
         }
     }
 
@@ -6649,6 +6746,53 @@ mod tests {
         assert!(scanner_activity_allows_usage_publication(&idle));
         assert!(!scanner_activity_allows_usage_publication(&moving));
         assert_ne!(scanner_activity_snapshot_digest(&idle), scanner_activity_snapshot_digest(&moving));
+    }
+
+    #[test]
+    fn scanner_activity_snapshot_digest_fences_dirty_usage_state() {
+        let clean = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+        let pending = BTreeMap::from([(
+            "node-2".to_string(),
+            ScannerNodeActivity {
+                dirty_usage_generation: 6,
+                dirty_usage_pending: true,
+                ..scanner_node_activity("epoch-a", 7, 3)
+            },
+        )]);
+
+        assert_ne!(scanner_activity_snapshot_digest(&clean), scanner_activity_snapshot_digest(&pending));
+    }
+
+    #[test]
+    fn scanner_dirty_usage_acknowledgements_exclude_local_and_clean_nodes() {
+        let snapshot = BTreeMap::from([
+            (
+                LOCAL_SCANNER_ACTIVITY_NODE.to_string(),
+                ScannerNodeActivity {
+                    dirty_usage_generation: 7,
+                    dirty_usage_pending: true,
+                    ..scanner_node_activity("epoch-local", 7, 3)
+                },
+            ),
+            ("node-2".to_string(), scanner_node_activity("epoch-clean", 7, 3)),
+            (
+                "node-3".to_string(),
+                ScannerNodeActivity {
+                    dirty_usage_generation: 11,
+                    dirty_usage_pending: true,
+                    ..scanner_node_activity("epoch-dirty", 7, 3)
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            scanner_dirty_usage_acknowledgements(&snapshot),
+            vec![ScannerDirtyUsageAcknowledgement {
+                host: "node-3".to_string(),
+                instance_id: "epoch-dirty".to_string(),
+                generation: 11,
+            }]
+        );
     }
 
     #[test]

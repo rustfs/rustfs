@@ -28,7 +28,8 @@ pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence
 pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
 pub const SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION: u32 = 0;
-pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 4;
+pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 4;
+pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]

@@ -762,6 +762,8 @@ message SignalServiceResponse {
 message ScannerActivityRequest {
   bytes challenge = 1;
   uint32 protocol_version = 2;
+  string acknowledge_instance_id = 3;
+  uint64 acknowledge_dirty_usage_generation = 4;
 }
 
 message ScannerActivityResponse {
@@ -772,6 +774,8 @@ message ScannerActivityResponse {
   bytes topology_digest = 5;
   bool data_movement_active = 6;
   bytes response_proof = 7;
+  uint64 dirty_usage_generation = 8;
+  bool dirty_usage_pending = 9;
 }
 
 message BackgroundHealStatusRequest {}
