@@ -17,6 +17,7 @@ for later deletion.
 - `#4648` walk-dir stream completion capability: old clients can append fallback output to an already-used metacache writer after a terminal body error, so servers emit terminal walk errors only to clients that sign the `walk_dir_stream_completion=error-v1` query capability and its request-body digest. Remove the legacy clean-EOF path after the minimum supported RustFS peer version always advertises this capability.
 - `heal-rpc-auth-v2` internode gRPC authentication: servers temporarily accept legacy prefix signatures so old peers remain available during rolling upgrades. Remove the legacy fallback after the minimum supported RustFS peer version sends v2 authentication on every internode gRPC request.
 - `heal-status-rpc-v1` node heal status capability: new peers treat an unimplemented BackgroundHealStatus RPC as an explicitly incomplete rolling-upgrade response. Remove the fallback after the minimum supported RustFS peer version implements BackgroundHealStatus.
+- `backlog-1316` legacy encrypted multipart range seek: the feature remains opt-in until every server that can initiate, write, or complete multipart uploads supports the candidate-to-final marker protocol and uploadId commit lock, and pre-upgrade multipart uploads have drained. Remove the RUSTFS_ENCRYPTED_RANGE_SEEK switch after the minimum supported release does so; keep the quorum marker and malformed-layout full-read guards permanently.
 
 ## Review Checklist
 

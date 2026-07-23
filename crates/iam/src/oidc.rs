@@ -21,9 +21,9 @@
 use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreJsonWebKeySet};
 use openidconnect::{
-    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, LogoutRequest, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, RequestTokenError,
-    Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, JsonWebKeySetUrl,
+    LogoutRequest, Nonce, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl,
+    RequestTokenError, Scope,
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
@@ -1683,7 +1683,8 @@ impl OidcSys {
             ));
         }
 
-        let jwks = CoreJsonWebKeySet::fetch_async(provider_metadata.jwks_uri(), http_client)
+        let jwks_url = jwks_url_from_config_url(&config.config_url, &issuer_url, provider_metadata.jwks_uri())?;
+        let jwks = CoreJsonWebKeySet::fetch_async(&jwks_url, http_client)
             .await
             .map_err(|err| format!("failed to fetch JWKS: {err}"))?;
 
@@ -1831,6 +1832,33 @@ fn discovery_url_from_config_url(config_url: &str) -> Result<Url, String> {
     };
     url.set_path(&discovery_path);
     Ok(url)
+}
+
+fn jwks_url_from_config_url(
+    config_url: &str,
+    issuer_url: &IssuerUrl,
+    jwks_url: &JsonWebKeySetUrl,
+) -> Result<JsonWebKeySetUrl, String> {
+    let issuer = issuer_url.url();
+    let jwks = jwks_url.url();
+    if issuer.origin() != jwks.origin() {
+        return Ok(jwks_url.clone());
+    }
+
+    let issuer_path = issuer.path().trim_end_matches('/');
+    let Some(suffix) = jwks.path().strip_prefix(issuer_path) else {
+        return Ok(jwks_url.clone());
+    };
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return Ok(jwks_url.clone());
+    }
+
+    let mut internal_url =
+        Url::parse(&normalize_config_url(config_url)?).map_err(|err| format!("invalid config_url issuer base: {err}"))?;
+    let internal_path = internal_url.path().trim_end_matches('/');
+    internal_url.set_path(&format!("{internal_path}{suffix}"));
+    internal_url.set_query(jwks.query());
+    Ok(JsonWebKeySetUrl::from_url(internal_url))
 }
 
 fn issuer_candidates(base: &str) -> Vec<String> {
@@ -2229,7 +2257,7 @@ mod tests {
         max_requests: usize,
     ) -> Option<(String, std::thread::JoinHandle<()>)>
     where
-        F: Fn(&str) -> String + Send + 'static,
+        F: Fn(&str) -> (String, String, String) + Send + 'static,
     {
         use std::io::Read;
         use std::io::Write;
@@ -2249,12 +2277,12 @@ mod tests {
             Err(err) => panic!("test listener should bind: {err}"),
         };
         let base = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
-        let discovery_issuer = build_discovery_issuer(&base);
+        let (discovery_issuer, discovery_jwks_uri, expected_jwks_path) = build_discovery_issuer(&base);
         let discovery_body = serde_json::json!({
             "issuer": discovery_issuer,
             "authorization_endpoint": format!("{base}/authorize"),
             "token_endpoint": format!("{base}/token"),
-            "jwks_uri": format!("{base}/jwks"),
+            "jwks_uri": discovery_jwks_uri,
             "response_types_supported": ["code"],
             "response_modes_supported": ["query"],
             "subject_types_supported": ["public"],
@@ -2325,7 +2353,7 @@ mod tests {
 
                 let (status, body) = if path.contains("/.well-known/openid-configuration") {
                     (200, discovery_body.as_str())
-                } else if path.contains("/jwks") {
+                } else if path == expected_jwks_path {
                     (200, jwks_body)
                 } else {
                     (404, r#"{"error":"not found"}"#)
@@ -2373,7 +2401,10 @@ mod tests {
     async fn test_validate_oidc_provider_config_retries_with_issuer_candidates() {
         // Discovery document must advertise the canonical issuer path. The first candidate has no
         // trailing slash; openidconnect rejects issuer mismatch, then the second variant succeeds.
-        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/rustfs/"), 8) else {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |base| (format!("{base}/application/o/rustfs/"), format!("{base}/jwks"), "/jwks".to_string()),
+            8,
+        ) else {
             return;
         };
         let config_url = format!("{base}/application/o/rustfs");
@@ -2387,27 +2418,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_oidc_provider_config_accepts_separate_issuer() {
-        let Some((base, handle)) = start_mock_oidc_discovery_server(|_| "https://public.example.com/realms/app".to_string(), 2)
-        else {
+    async fn test_validate_oidc_provider_config_fetches_issuer_relative_jwks_from_config_url() {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |_| {
+                (
+                    "http://127.0.0.1:1/public/realms/app".to_string(),
+                    "http://127.0.0.1:1/public/realms/app/jwks?version=1".to_string(),
+                    "/internal/realms/app/jwks?version=1".to_string(),
+                )
+            },
+            2,
+        ) else {
             return;
         };
         let mut config =
             build_mocked_oidc_provider_config("default", &format!("{base}/internal/realms/app/.well-known/openid-configuration"));
-        config.issuer = Some("https://public.example.com/realms/app".to_string());
+        config.issuer = Some("http://127.0.0.1:1/public/realms/app".to_string());
 
         let validation_result = validate_mocked_oidc_provider_config(&config)
             .await
             .expect("OIDC provider validation should succeed");
 
-        assert_eq!(validation_result.issuer, "https://public.example.com/realms/app");
+        assert_eq!(validation_result.issuer, "http://127.0.0.1:1/public/realms/app");
         assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn test_jwks_url_from_config_url_preserves_unrelated_urls() {
+        let issuer = IssuerUrl::new("https://public.example.com/realms/app".to_string()).expect("issuer URL should parse");
+        for raw_jwks_url in [
+            "https://keys.example.com/jwks",
+            "http://public.example.com/realms/app/jwks",
+            "https://public.example.com:8443/realms/app/jwks",
+            "https://public.example.com/keys/jwks",
+            "https://public.example.com/realms/application/jwks",
+        ] {
+            let jwks_url = JsonWebKeySetUrl::new(raw_jwks_url.to_string()).expect("JWKS URL should parse");
+
+            let resolved = jwks_url_from_config_url(
+                "http://keycloak.internal/realms/app/.well-known/openid-configuration",
+                &issuer,
+                &jwks_url,
+            )
+            .expect("JWKS URL should resolve");
+
+            assert_eq!(resolved.as_str(), raw_jwks_url);
+        }
+
+        let issuer_root_jwks = JsonWebKeySetUrl::new(issuer.as_str().to_string()).expect("JWKS URL should parse");
+        let resolved = jwks_url_from_config_url(
+            "http://keycloak.internal/realms/app/.well-known/openid-configuration",
+            &issuer,
+            &issuer_root_jwks,
+        )
+        .expect("issuer-root JWKS URL should resolve");
+        assert_eq!(resolved.as_str(), "http://keycloak.internal/realms/app");
+
+        let issuer_with_slash =
+            IssuerUrl::new("https://public.example.com/realms/app/".to_string()).expect("issuer URL should parse");
+        let jwks_url =
+            JsonWebKeySetUrl::new("https://public.example.com/realms/app/jwks".to_string()).expect("JWKS URL should parse");
+        let resolved = jwks_url_from_config_url(
+            "http://keycloak.internal/realms/app/.well-known/openid-configuration",
+            &issuer_with_slash,
+            &jwks_url,
+        )
+        .expect("issuer-relative JWKS URL should resolve");
+        assert_eq!(resolved.as_str(), "http://keycloak.internal/realms/app/jwks");
     }
 
     #[tokio::test]
     async fn test_validate_oidc_provider_config_rejects_separate_issuer_mismatch() {
-        let Some((base, handle)) = start_mock_oidc_discovery_server(|_| "https://public.example.com/realms/other".to_string(), 1)
-        else {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |base| {
+                (
+                    "https://public.example.com/realms/other".to_string(),
+                    format!("{base}/jwks"),
+                    "/jwks".to_string(),
+                )
+            },
+            1,
+        ) else {
             return;
         };
         let mut config =
@@ -2425,7 +2516,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_oidc_provider_config_returns_detailed_errors() {
-        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8) else {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |base| (format!("{base}/application/o/other"), format!("{base}/jwks"), "/jwks".to_string()),
+            8,
+        ) else {
             return;
         };
         let config_url = format!("{base}/application/o/rustfs");
