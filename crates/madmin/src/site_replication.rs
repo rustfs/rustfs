@@ -1156,10 +1156,50 @@ pub struct SRStateEditReq {
 pub struct ResyncBucketStatus {
     #[serde(default)]
     pub bucket: String,
+    #[serde(rename = "targetArn", default, skip_serializing_if = "String::is_empty")]
+    pub target_arn: String,
     #[serde(default)]
     pub status: String,
     #[serde(rename = "errorDetail", skip_serializing_if = "String::is_empty", default)]
     pub err_detail: String,
+    #[serde(
+        rename = "createdAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub created_at: Option<OffsetDateTime>,
+    #[serde(
+        rename = "startedAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(
+        rename = "updatedAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub updated_at: Option<OffsetDateTime>,
+    #[serde(
+        rename = "completedAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generation: u64,
+    #[serde(rename = "replicatedObjects", default, skip_serializing_if = "is_zero_u64")]
+    pub replicated_objects: u64,
+    #[serde(rename = "replicatedBytes", default, skip_serializing_if = "is_zero_u64")]
+    pub replicated_bytes: u64,
+    #[serde(rename = "failedObjects", default, skip_serializing_if = "is_zero_u64")]
+    pub failed_objects: u64,
+    #[serde(rename = "failedBytes", default, skip_serializing_if = "is_zero_u64")]
+    pub failed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1170,10 +1210,74 @@ pub struct SRResyncOpStatus {
     pub resync_id: String,
     #[serde(default)]
     pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buckets: Vec<ResyncBucketStatus>,
     #[serde(rename = "errorDetail", skip_serializing_if = "String::is_empty", default)]
     pub err_detail: String,
+    #[serde(
+        rename = "createdAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub created_at: Option<OffsetDateTime>,
+    #[serde(
+        rename = "startedAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(
+        rename = "updatedAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub updated_at: Option<OffsetDateTime>,
+    #[serde(
+        rename = "completedAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generation: u64,
+    #[serde(rename = "totalBuckets", default, skip_serializing_if = "is_zero_u64")]
+    pub total_buckets: u64,
+    #[serde(rename = "pendingBuckets", default, skip_serializing_if = "is_zero_u64")]
+    pub pending_buckets: u64,
+    #[serde(rename = "runningBuckets", default, skip_serializing_if = "is_zero_u64")]
+    pub running_buckets: u64,
+    #[serde(rename = "completedBuckets", default, skip_serializing_if = "is_zero_u64")]
+    pub completed_buckets: u64,
+    #[serde(rename = "failedBuckets", default, skip_serializing_if = "is_zero_u64")]
+    pub failed_buckets: u64,
+    #[serde(rename = "canceledBuckets", default, skip_serializing_if = "is_zero_u64")]
+    pub canceled_buckets: u64,
+    #[serde(rename = "replicatedObjects", default, skip_serializing_if = "is_zero_u64")]
+    pub replicated_objects: u64,
+    #[serde(rename = "replicatedBytes", default, skip_serializing_if = "is_zero_u64")]
+    pub replicated_bytes: u64,
+    #[serde(rename = "failedObjects", default, skip_serializing_if = "is_zero_u64")]
+    pub failed_objects: u64,
+    #[serde(rename = "failedBytes", default, skip_serializing_if = "is_zero_u64")]
+    pub failed_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    #[serde(rename = "nextContinuationToken", default, skip_serializing_if = "String::is_empty")]
+    pub next_continuation_token: String,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1202,7 +1306,7 @@ pub struct SiteNetPerfResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerInfo, PeerSite};
+    use super::{PeerInfo, PeerSite, SRResyncOpStatus};
     use serde_json::{Value, json};
 
     const TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----";
@@ -1301,5 +1405,95 @@ mod tests {
         assert!(!peer_debug.contains("BEGIN CERTIFICATE"));
         assert!(peer_debug.contains("skip_tls_verify: false"));
         assert!(peer_debug.contains("has_custom_ca: true"));
+    }
+
+    #[test]
+    fn resync_status_legacy_json_defaults_new_lifecycle_fields() {
+        let legacy_json = json!({
+            "op": "start",
+            "id": "resync-1",
+            "status": "success",
+            "buckets": [{
+                "bucket": "photos",
+                "status": "success"
+            }]
+        });
+
+        let status: SRResyncOpStatus =
+            serde_json::from_value(legacy_json.clone()).expect("legacy resync status should deserialize");
+
+        assert_eq!(status.generation, 0);
+        assert!(status.state.is_empty());
+        assert!(status.created_at.is_none());
+        assert_eq!(status.total_buckets, 0);
+        assert_eq!(status.replicated_objects, 0);
+        assert!(!status.truncated);
+        assert!(status.next_continuation_token.is_empty());
+        assert!(status.buckets[0].created_at.is_none());
+        assert!(status.buckets[0].target_arn.is_empty());
+        assert_eq!(status.buckets[0].generation, 0);
+        assert_eq!(status.buckets[0].replicated_bytes, 0);
+        assert_eq!(serde_json::to_value(status).expect("legacy resync status should serialize"), legacy_json);
+    }
+
+    #[test]
+    fn resync_status_lifecycle_fields_round_trip_with_exact_json_names() {
+        let status_json = json!({
+            "op": "status",
+            "id": "resync-2",
+            "status": "success",
+            "state": "running",
+            "createdAt": "2026-07-22T01:00:00Z",
+            "startedAt": "2026-07-22T01:00:01Z",
+            "updatedAt": "2026-07-22T01:01:00Z",
+            "completedAt": "2026-07-22T01:02:00Z",
+            "generation": 7,
+            "totalBuckets": 6,
+            "pendingBuckets": 1,
+            "runningBuckets": 1,
+            "completedBuckets": 1,
+            "failedBuckets": 1,
+            "canceledBuckets": 2,
+            "replicatedObjects": 12,
+            "replicatedBytes": 4096,
+            "failedObjects": 3,
+            "failedBytes": 512,
+            "truncated": true,
+            "nextContinuationToken": "bucket-page-2",
+            "buckets": [{
+                "bucket": "photos",
+                "targetArn": "arn:rustfs:replication::peer-a:photos",
+                "status": "failed",
+                "errorDetail": "target unavailable",
+                "createdAt": "2026-07-22T01:00:00Z",
+                "startedAt": "2026-07-22T01:00:01Z",
+                "updatedAt": "2026-07-22T01:01:00Z",
+                "completedAt": "2026-07-22T01:02:00Z",
+                "generation": 7,
+                "replicatedObjects": 12,
+                "replicatedBytes": 4096,
+                "failedObjects": 3,
+                "failedBytes": 512
+            }]
+        });
+
+        let status: SRResyncOpStatus =
+            serde_json::from_value(status_json.clone()).expect("expanded resync status should deserialize");
+
+        assert_eq!(status.generation, 7);
+        assert_eq!(status.state, "running");
+        assert_eq!(status.total_buckets, 6);
+        assert_eq!(status.completed_buckets, 1);
+        assert_eq!(status.replicated_bytes, 4096);
+        assert!(status.truncated);
+        assert_eq!(status.next_continuation_token, "bucket-page-2");
+        assert_eq!(status.buckets[0].generation, 7);
+        assert_eq!(status.buckets[0].target_arn, "arn:rustfs:replication::peer-a:photos");
+        assert_eq!(status.buckets[0].failed_objects, 3);
+        assert!(status.buckets[0].completed_at.is_some());
+        assert_eq!(
+            serde_json::to_value(status).expect("expanded resync status should serialize"),
+            status_json
+        );
     }
 }

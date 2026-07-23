@@ -323,9 +323,7 @@ pub(crate) mod replication {
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
     pub(crate) type ReplicationStatusType = super::ecstore_bucket::replication::ReplicationStatusType;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
-    #[cfg(test)]
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;
-    #[cfg(test)]
     pub(crate) type TargetReplicationResyncStatus = super::ecstore_bucket::replication::TargetReplicationResyncStatus;
 
     pub(crate) fn resync_opts(
