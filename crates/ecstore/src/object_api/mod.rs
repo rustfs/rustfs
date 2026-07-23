@@ -51,6 +51,37 @@ use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
+pub(crate) const ENCRYPTED_PART_LAYOUT_CANDIDATE_SUFFIX: &str = "encrypted-part-layout-quorum-candidate-v1";
+pub(crate) const ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX: &str = "encrypted-part-layout-quorum-v1";
+pub(crate) const ENV_RUSTFS_ENCRYPTED_RANGE_SEEK: &str = "RUSTFS_ENCRYPTED_RANGE_SEEK";
+pub(crate) const DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK: bool = false;
+
+pub(crate) fn has_encrypted_part_layout_marker(metadata: &HashMap<String, String>, suffix: &str, expected: &str) -> bool {
+    let mut value = None;
+    for (key, candidate) in metadata {
+        if !rustfs_utils::http::has_internal_suffix(key, suffix) {
+            continue;
+        }
+        if candidate.is_empty() || value.is_some_and(|current| current != candidate) {
+            return false;
+        }
+        value = Some(candidate);
+    }
+    value.is_some_and(|value| value == expected)
+}
+
+pub(crate) fn legacy_encrypted_range_seek_enabled() -> bool {
+    // RUSTFS_COMPAT_TODO(backlog-1316): mixed-version MPUs need opt-in. Remove after all servers use candidate markers and uploadId locks.
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK)
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK))
+    }
+}
 
 mod body_cache_hook;
 mod hook_slot;

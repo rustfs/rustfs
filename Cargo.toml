@@ -278,7 +278,7 @@ pretty_assertions = "1.4.1"
 rand = { version = "0.10.2" }
 ratelimit = "0.10.1"
 rayon = "1.12.0"
-reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "8.0.0" }
+reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "8.0.1" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.33.3" }
@@ -333,7 +333,7 @@ libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "10.0.1" }
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.62.3" }
+russh = { version = "0.62.4" }
 russh-sftp = "2.3.0"
 
 # WebDAV

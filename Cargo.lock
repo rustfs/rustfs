@@ -8652,9 +8652,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.62.3"
+version = "0.62.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "059dd24c0fe20721639f7acad7b82cd51ec3dd3254ed8cf7a0b7df6c20eaff1c"
+checksum = "b8b67b5a0d8068c89dcbe9d95df986af7a851d1f3c604525274c37468e60464f"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -9194,9 +9194,9 @@ dependencies = [
 
 [[package]]
 name = "rustfs-erasure-codec"
-version = "8.0.0"
+version = "8.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8c8af301cb0273d7fb3a1670d74aa9eff015b448f427359658a9ca0f2184b06"
+checksum = "a39413e8f0ca32be9bc2ca9d29f8d17a2ddf952748284cf0fd148ab11180cf6c"
 dependencies = [
  "cc",
  "cfg_aliases",
