@@ -123,7 +123,7 @@ use std::{
     io::Write,
     sync::{Arc, LazyLock},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, TryAcquireError};
 use tracing::{Instrument as _, debug, error, info, instrument, warn};
 
 const LOG_COMPONENT_APP: &str = "app";
@@ -1108,10 +1108,12 @@ where
     T: Send + 'static,
     F: Future<Output = S3Result<T>> + Send + 'static,
 {
-    let permit = admission
-        .acquire_owned()
-        .await
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} admission closed: {err}")))?;
+    let permit = admission.try_acquire_owned().map_err(|err| match err {
+        TryAcquireError::NoPermits => {
+            S3Error::with_message(S3ErrorCode::SlowDown, format!("{operation} concurrency limit reached; retry later"))
+        }
+        TryAcquireError::Closed => S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} admission closed")),
+    })?;
     tokio::spawn(
         async move {
             let _permit = permit;
@@ -2723,7 +2725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_bucket_usecase_waiter_does_not_start_work() {
+    async fn saturated_bucket_usecase_admission_does_not_start_work() {
         let admission = Arc::new(Semaphore::new(1));
         let held = admission
             .clone()
@@ -2732,45 +2734,43 @@ mod tests {
             .expect("test admission should remain open");
         let started = Arc::new(AtomicBool::new(false));
         let started_for_task = started.clone();
-        let parent = tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
-            "test bucket operation",
-            admission,
-            async move {
-                started_for_task.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-        ));
-        tokio::task::yield_now().await;
-
-        parent.abort();
-        let _ = parent.await;
+        let result = await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async move {
+            started_for_task.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
         drop(held);
-        tokio::task::yield_now().await;
 
         assert!(
             !started.load(Ordering::SeqCst),
-            "cancelling before admission must not leave a detached bucket operation"
+            "saturated admission must not start a detached bucket operation"
         );
+        assert_eq!(result.expect_err("saturated admission must fail fast").code(), &S3ErrorCode::SlowDown);
     }
 
     #[tokio::test]
-    #[serial_test::serial]
-    async fn bucket_usecase_global_admission_limits_detached_tasks() {
+    async fn bucket_usecase_admission_rejects_excess_detached_tasks() {
+        let admission = Arc::new(Semaphore::new(BUCKET_OPERATION_CONCURRENCY));
         let release = Arc::new(Semaphore::new(0));
         let started = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::with_capacity(BUCKET_OPERATION_CONCURRENCY + 1);
+        let mut tasks = Vec::with_capacity(BUCKET_OPERATION_CONCURRENCY);
 
         for _ in 0..BUCKET_OPERATION_CONCURRENCY {
+            let admission_for_task = admission.clone();
             let release_for_task = release.clone();
             let started_for_task = started.clone();
-            tasks.push(tokio::spawn(await_bucket_usecase_on_fresh_task("test bucket operation", async move {
-                started_for_task.fetch_add(1, Ordering::SeqCst);
-                let _release = release_for_task
-                    .acquire()
-                    .await
-                    .expect("test release gate should remain open");
-                Ok(())
-            })));
+            tasks.push(tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+                "test bucket operation",
+                admission_for_task,
+                async move {
+                    started_for_task.fetch_add(1, Ordering::SeqCst);
+                    let _release = release_for_task
+                        .acquire()
+                        .await
+                        .expect("test release gate should remain open");
+                    Ok(())
+                },
+            )));
         }
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2783,29 +2783,31 @@ mod tests {
 
         let ninth_started = Arc::new(AtomicBool::new(false));
         let ninth_started_for_task = ninth_started.clone();
-        let release_for_ninth = release.clone();
-        tasks.push(tokio::spawn(await_bucket_usecase_on_fresh_task("test bucket operation", async move {
-            ninth_started_for_task.store(true, Ordering::SeqCst);
-            let _release = release_for_ninth
-                .acquire()
-                .await
-                .expect("test release gate should remain open");
-            Ok(())
-        })));
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
+        let ninth_result =
+            await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission.clone(), async move {
+                ninth_started_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
         assert!(
             !ninth_started.load(Ordering::SeqCst),
-            "the ninth bucket transaction must wait for global admission"
+            "the ninth bucket transaction must not start when admission is saturated"
+        );
+        assert_eq!(
+            ninth_result.expect_err("the ninth bucket transaction must fail fast").code(),
+            &S3ErrorCode::SlowDown
         );
 
-        release.add_permits(BUCKET_OPERATION_CONCURRENCY + 1);
+        release.add_permits(BUCKET_OPERATION_CONCURRENCY);
         for task in tasks {
             task.await
                 .expect("bucket transaction parent should join")
                 .expect("bucket transaction should succeed");
         }
+
+        await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async { Ok(()) })
+            .await
+            .expect("admission must recover after active transactions finish");
     }
 
     #[tokio::test]
