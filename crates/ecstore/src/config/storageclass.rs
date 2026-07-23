@@ -513,6 +513,50 @@ mod tests {
     }
 
     #[test]
+    fn should_inline_preserves_exact_default_shard_boundaries() {
+        let config = Config::default();
+
+        for (case, shard_size, versioned, expected) in [
+            ("unversioned below", 128 * 1024 - 1, false, true),
+            ("unversioned exact", 128 * 1024, false, true),
+            ("unversioned above", 128 * 1024 + 1, false, false),
+            ("versioned below", 16 * 1024 - 1, true, true),
+            ("versioned exact", 16 * 1024, true, true),
+            ("versioned above", 16 * 1024 + 1, true, false),
+            ("negative", -1, false, false),
+        ] {
+            assert_eq!(
+                config.should_inline(shard_size, versioned),
+                expected,
+                "{case}: shard_size={shard_size}, versioned={versioned}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_inline_preserves_exact_default_ec_2_2_object_boundaries() {
+        let config = Config::default();
+        let erasure = crate::erasure::coding::Erasure::new(2, 2, 1024 * 1024);
+
+        for (case, object_size, versioned, expected_shard_size, expected) in [
+            ("unversioned below", 256 * 1024 - 1, false, 128 * 1024, true),
+            ("unversioned exact", 256 * 1024, false, 128 * 1024, true),
+            ("unversioned above", 256 * 1024 + 1, false, 128 * 1024 + 1, false),
+            ("versioned below", 32 * 1024 - 1, true, 16 * 1024, true),
+            ("versioned exact", 32 * 1024, true, 16 * 1024, true),
+            ("versioned above", 32 * 1024 + 1, true, 16 * 1024 + 1, false),
+        ] {
+            let shard_size = erasure.shard_file_size(object_size);
+            assert_eq!(shard_size, expected_shard_size, "{case}: object_size={object_size}");
+            assert_eq!(
+                config.should_inline(shard_size, versioned),
+                expected,
+                "{case}: object_size={object_size}, shard_size={shard_size}, versioned={versioned}"
+            );
+        }
+    }
+
+    #[test]
     fn automatic_parity_is_resolved_per_pool() {
         let cfg = lookup_config_for_pools_with_env(&KVS::new(), &[4, 2], no_env_overrides())
             .expect("automatic storage class should support heterogeneous pools");
