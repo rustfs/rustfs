@@ -593,8 +593,6 @@ impl Operation for OidcCallbackHandler {
                         result = "code_exchange_failed",
                         requested_provider_id = %provider_id,
                         redirect_uri = %redirect_uri,
-                        code = %code,
-                        state = %state,
                         code_len = code.len(),
                         state_len = state.len(),
                         error = %message,
