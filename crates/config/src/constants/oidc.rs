@@ -14,6 +14,7 @@
 
 // OIDC configuration field keys (used in KVS)
 pub const OIDC_CONFIG_URL: &str = "config_url";
+pub const OIDC_ISSUER: &str = "issuer";
 pub const OIDC_CLIENT_ID: &str = "client_id";
 pub const OIDC_CLIENT_SECRET: &str = "client_secret";
 pub const OIDC_SCOPES: &str = "scopes";
@@ -33,6 +34,7 @@ pub const OIDC_HIDE_FROM_UI: &str = "hide_from_ui";
 // Environment variable names for OIDC
 pub const ENV_IDENTITY_OPENID_ENABLE: &str = "RUSTFS_IDENTITY_OPENID_ENABLE";
 pub const ENV_IDENTITY_OPENID_CONFIG_URL: &str = "RUSTFS_IDENTITY_OPENID_CONFIG_URL";
+pub const ENV_IDENTITY_OPENID_ISSUER: &str = "RUSTFS_IDENTITY_OPENID_ISSUER";
 pub const ENV_IDENTITY_OPENID_CLIENT_ID: &str = "RUSTFS_IDENTITY_OPENID_CLIENT_ID";
 pub const ENV_IDENTITY_OPENID_CLIENT_SECRET: &str = "RUSTFS_IDENTITY_OPENID_CLIENT_SECRET";
 pub const ENV_IDENTITY_OPENID_SCOPES: &str = "RUSTFS_IDENTITY_OPENID_SCOPES";
@@ -50,9 +52,10 @@ pub const ENV_IDENTITY_OPENID_USERNAME_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_USE
 pub const ENV_IDENTITY_OPENID_HIDE_FROM_UI: &str = "RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI";
 
 /// List of all environment variable keys for an OIDC provider.
-pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 17] = &[
+pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 18] = &[
     ENV_IDENTITY_OPENID_ENABLE,
     ENV_IDENTITY_OPENID_CONFIG_URL,
+    ENV_IDENTITY_OPENID_ISSUER,
     ENV_IDENTITY_OPENID_CLIENT_ID,
     ENV_IDENTITY_OPENID_CLIENT_SECRET,
     ENV_IDENTITY_OPENID_SCOPES,
@@ -74,6 +77,7 @@ pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 17] = &[
 pub const IDENTITY_OPENID_KEYS: &[&str] = &[
     crate::ENABLE_KEY,
     OIDC_CONFIG_URL,
+    OIDC_ISSUER,
     OIDC_CLIENT_ID,
     OIDC_CLIENT_SECRET,
     OIDC_SCOPES,
