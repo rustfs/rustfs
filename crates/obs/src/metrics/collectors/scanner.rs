@@ -753,7 +753,7 @@ mod tests {
         let stats = ScannerStats::default();
         let metrics = collect_scanner_metrics(&stats);
 
-        assert_eq!(metrics.len(), 68);
+        assert_eq!(metrics.len(), 69);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             if metric.name == SCANNER_PARTIAL_CYCLES_BY_REASON_MD.get_full_metric_name() {
