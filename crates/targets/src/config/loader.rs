@@ -84,7 +84,23 @@ fn redact_target_field_value(field_name: &str, value: &str) -> String {
         return crate::target::mysql::redact_mysql_dsn(value);
     }
     if is_sensitive_target_field(field_name) {
-        return "***redacted***".to_string();
+        return crate::target::REDACTED_SECRET.to_string();
+    }
+    if field_name.eq_ignore_ascii_case(rustfs_config::WEBHOOK_ENDPOINT)
+        || field_name.eq_ignore_ascii_case(rustfs_config::AMQP_URL)
+    {
+        return url::Url::parse(value)
+            .ok()
+            .and_then(|endpoint| {
+                let host = match endpoint.host()? {
+                    url::Host::Domain(host) => host.to_string(),
+                    url::Host::Ipv4(host) => host.to_string(),
+                    url::Host::Ipv6(host) => format!("[{host}]"),
+                };
+                let port = endpoint.port().map(|port| format!(":{port}")).unwrap_or_default();
+                Some(format!("{}://{host}{port}", endpoint.scheme()))
+            })
+            .unwrap_or_else(|| crate::target::REDACTED_SECRET.to_string());
     }
     value.to_string()
 }
@@ -633,6 +649,24 @@ mod tests {
     }
 
     #[test]
+    fn redact_target_field_value_strips_endpoint_path_and_query() {
+        assert_eq!(
+            redact_target_field_value("endpoint", "https://example.com/private/hook?token=secret"),
+            "https://example.com"
+        );
+        assert_eq!(redact_target_field_value("endpoint", "not a URL with secret"), "***redacted***");
+    }
+
+    #[test]
+    fn redact_target_field_value_strips_url_credentials() {
+        assert_eq!(
+            redact_target_field_value("url", "amqps://user:secret@broker.example/vhost"),
+            "amqps://broker.example"
+        );
+        assert_eq!(redact_target_field_value("url", "not a URL with secret"), "***redacted***");
+    }
+
+    #[test]
     fn redact_dsn_string_partial_redaction() {
         let dsn = "rustfs:secret123@tcp(mysql.example.com:3306)/rustfs_events";
         let redacted = redact_target_field_value(rustfs_config::MYSQL_DSN_STRING, dsn);
@@ -671,7 +705,7 @@ mod tests {
         assert_eq!(
             redacted,
             vec![
-                ("endpoint".to_string(), "https://example.com/hook".to_string()),
+                ("endpoint".to_string(), "https://example.com".to_string()),
                 ("password".to_string(), "***redacted***".to_string()),
                 ("client_key".to_string(), "***redacted***".to_string()),
                 ("auth_token".to_string(), "***redacted***".to_string()),

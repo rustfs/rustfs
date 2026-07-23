@@ -1020,18 +1020,14 @@ impl EndpointServerPools {
 
     #[instrument]
     pub fn hosts_sorted(&self) -> Vec<Option<XHost>> {
-        let (mut peers, local) = self.peers();
+        let peers = self.peer_grid_hosts_sorted();
 
         let mut ret = vec![None; peers.len()];
-
-        peers.sort();
-
-        for (i, peer) in peers.iter().enumerate() {
-            if &local == peer {
+        for (i, peer) in peers.into_iter().enumerate() {
+            let Some((peer_host_port, _)) = peer else {
                 continue;
-            }
-
-            let host = match XHost::try_from(peer.clone()) {
+            };
+            let host = match XHost::try_from(peer_host_port) {
                 Ok(res) => res,
                 Err(err) => {
                     warn!("Xhost parse failed {:?}", err);
@@ -1044,6 +1040,61 @@ impl EndpointServerPools {
 
         ret
     }
+
+    pub fn peer_host_ports_sorted(&self) -> Vec<Option<String>> {
+        let (mut peers, local) = self.peers();
+        let mut ret = vec![None; peers.len()];
+
+        peers.sort();
+
+        for (i, peer) in peers.into_iter().enumerate() {
+            if local == peer {
+                continue;
+            }
+            ret[i] = Some(peer);
+        }
+
+        ret
+    }
+
+    pub fn peer_grid_hosts_sorted(&self) -> Vec<Option<(String, String)>> {
+        self.peer_grid_host_slots_sorted()
+            .into_iter()
+            .map(|(peer, grid_host, is_local)| {
+                if is_local {
+                    None
+                } else {
+                    grid_host.map(|grid_host| (peer, grid_host))
+                }
+            })
+            .collect()
+    }
+
+    pub fn peer_grid_host_slots_sorted(&self) -> Vec<(String, Option<String>, bool)> {
+        let (mut peers, local) = self.peers();
+        let mut grid_hosts = HashMap::with_capacity(peers.len());
+
+        for ep in self.0.iter() {
+            for endpoint in ep.endpoints.0.iter() {
+                if endpoint.get_type() != EndpointType::Url || endpoint.is_local {
+                    continue;
+                }
+                grid_hosts.entry(endpoint.host_port()).or_insert_with(|| endpoint.grid_host());
+            }
+        }
+
+        peers.sort();
+
+        peers
+            .into_iter()
+            .map(|peer| {
+                let is_local = local == peer;
+                let grid_host = if is_local { None } else { grid_hosts.get(&peer).cloned() };
+                (peer, grid_host, is_local)
+            })
+            .collect()
+    }
+
     pub fn peers(&self) -> (Vec<String>, String) {
         let mut local = None;
         let mut set = HashSet::new();
@@ -1083,6 +1134,25 @@ impl EndpointServerPools {
                     return Some(endpoint.grid_host());
                 }
             }
+        }
+
+        None
+    }
+
+    pub fn find_grid_host_from_peer_host_port(&self, peer_host_port: &str) -> Option<String> {
+        for ep in self.0.iter() {
+            for endpoint in ep.endpoints.0.iter() {
+                if endpoint.is_local {
+                    continue;
+                }
+                if endpoint.host_port() == peer_host_port {
+                    return Some(endpoint.grid_host());
+                }
+            }
+        }
+
+        if let Ok(host) = XHost::try_from(peer_host_port.to_owned()) {
+            return self.find_grid_hosts_from_peer(&host);
         }
 
         None
@@ -1405,6 +1475,43 @@ mod test {
         assert!(eps[0].is_local);
         assert!(eps[1].is_local, "same host:port must inherit the local verdict");
         assert!(!eps[2].is_local, "a genuinely remote host must stay remote");
+    }
+
+    #[test]
+    fn peer_host_ports_sorted_preserves_raw_remote_hosts() {
+        let mut local =
+            Endpoint::try_from("http://rustfs-1.storage.swarm.private:9000/data").expect("local endpoint should parse");
+        local.is_local = true;
+        let mut remote =
+            Endpoint::try_from("http://rustfs-4.storage.swarm.private:9000/data").expect("remote endpoint should parse");
+        remote.is_local = false;
+        let endpoint_pools = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(vec![local, remote]),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+
+        let peers = endpoint_pools.peer_host_ports_sorted();
+
+        assert_eq!(
+            peers,
+            vec![None, Some("rustfs-4.storage.swarm.private:9000".to_string())],
+            "membership enumeration must keep raw topology host:port instead of requiring DNS resolution"
+        );
+        assert_eq!(
+            endpoint_pools
+                .find_grid_host_from_peer_host_port("rustfs-4.storage.swarm.private:9000")
+                .as_deref(),
+            Some("http://rustfs-4.storage.swarm.private:9000"),
+            "raw host:port should map directly to the configured grid host"
+        );
+        let peer_grid_hosts = endpoint_pools.peer_grid_hosts_sorted();
+        let remote = peer_grid_hosts[1].as_ref().expect("remote peer should be resolved");
+        assert_eq!(remote.0, "rustfs-4.storage.swarm.private:9000");
+        assert_eq!(remote.1, "http://rustfs-4.storage.swarm.private:9000");
     }
 
     #[tokio::test]

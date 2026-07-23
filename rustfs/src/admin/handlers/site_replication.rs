@@ -114,6 +114,8 @@ const SITE_REPL_REMOVE_SUCCESS: &str = "Requested site(s) were removed from clus
 const SITE_REPL_RESYNC_START: &str = "start";
 const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_RESYNC_STATUS: &str = "status";
+const SITE_REPL_RESYNC_DEFAULT_PAGE_SIZE: usize = 100;
+const SITE_REPL_RESYNC_MAX_PAGE_SIZE: usize = 1000;
 const SITE_REPL_MIN_NETPERF_DURATION: Duration = Duration::from_secs(1);
 const SITE_REPL_MAX_NETPERF_DURATION: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -187,7 +189,11 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
         "s3:PutObjectTagging",
         "s3:PutObjectVersionTagging",
         "s3:DeleteObjectTagging",
-        "s3:DeleteObjectVersionTagging"
+        "s3:DeleteObjectVersionTagging",
+        "s3:GetObjectRetention",
+        "s3:PutObjectRetention",
+        "s3:GetObjectLegalHold",
+        "s3:PutObjectLegalHold"
       ],
       "Resource": ["arn:aws:s3:::*/*"]
     }
@@ -4890,32 +4896,160 @@ fn removed_deployment_ids_for_pending_remove(pending: &PendingRemove, local_peer
         .collect()
 }
 
-fn resync_status_for_state(
-    state: &mut SiteReplicationState,
-    op_type: &str,
-    peer: &PeerInfo,
-    bucket_names: Vec<String>,
-) -> SRResyncOpStatus {
-    let status = SRResyncOpStatus {
-        op_type: op_type.to_string(),
-        resync_id: Uuid::new_v4().to_string(),
-        status: "success".to_string(),
-        buckets: bucket_names
-            .into_iter()
-            .map(|bucket| ResyncBucketStatus {
-                bucket,
-                status: if op_type == SITE_REPL_RESYNC_CANCEL {
-                    "canceled".to_string()
-                } else {
-                    "started".to_string()
-                },
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
+#[derive(Debug, Serialize, Deserialize)]
+struct SiteResyncContinuationToken {
+    id: String,
+    generation: u64,
+    offset: usize,
+}
+
+fn site_resync_is_active(status: &SRResyncOpStatus) -> bool {
+    matches!(status.state.as_str(), "pending" | "running" | "canceling")
+}
+
+fn site_resync_cancel_is_idempotent(status: &SRResyncOpStatus) -> bool {
+    status.state == "canceled"
+}
+
+fn site_resync_nonnegative(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or_default()
+}
+
+fn site_resync_bucket_state(status: replication::ResyncStatusType) -> &'static str {
+    match status {
+        replication::ResyncStatusType::ResyncPending => "pending",
+        replication::ResyncStatusType::ResyncStarted => "running",
+        replication::ResyncStatusType::ResyncCompleted => "completed",
+        replication::ResyncStatusType::ResyncCanceled => "canceled",
+        replication::ResyncStatusType::ResyncFailed | replication::ResyncStatusType::NoResync => "failed",
+    }
+}
+
+fn site_bucket_resync_is_active(status: replication::ResyncStatusType) -> bool {
+    matches!(
+        status,
+        replication::ResyncStatusType::ResyncPending | replication::ResyncStatusType::ResyncStarted
+    )
+}
+
+fn apply_site_resync_target_status(bucket: &mut ResyncBucketStatus, target: &replication::TargetReplicationResyncStatus) {
+    bucket.status = site_resync_bucket_state(target.resync_status).to_string();
+    bucket.started_at = target.start_time;
+    bucket.updated_at = target.last_update;
+    bucket.replicated_objects = site_resync_nonnegative(target.replicated_count);
+    bucket.replicated_bytes = site_resync_nonnegative(target.replicated_size);
+    bucket.failed_objects = site_resync_nonnegative(target.failed_count);
+    bucket.failed_bytes = site_resync_nonnegative(target.failed_size);
+    bucket.err_detail = target.error.as_deref().map(summarize_peer_error_detail).unwrap_or_default();
+    if matches!(bucket.status.as_str(), "completed" | "canceled" | "failed") {
+        bucket.completed_at = bucket.updated_at;
+    }
+}
+
+fn summarize_site_resync_status(status: &mut SRResyncOpStatus, now: OffsetDateTime) {
+    status.total_buckets = status.buckets.len() as u64;
+    status.pending_buckets = 0;
+    status.running_buckets = 0;
+    status.completed_buckets = 0;
+    status.failed_buckets = 0;
+    status.canceled_buckets = 0;
+    status.replicated_objects = 0;
+    status.replicated_bytes = 0;
+    status.failed_objects = 0;
+    status.failed_bytes = 0;
+
+    for bucket in &status.buckets {
+        match bucket.status.as_str() {
+            "pending" => status.pending_buckets += 1,
+            "running" | "started" => status.running_buckets += 1,
+            "completed" | "success" => status.completed_buckets += 1,
+            "canceled" => status.canceled_buckets += 1,
+            _ => status.failed_buckets += 1,
+        }
+        status.replicated_objects = status.replicated_objects.saturating_add(bucket.replicated_objects);
+        status.replicated_bytes = status.replicated_bytes.saturating_add(bucket.replicated_bytes);
+        status.failed_objects = status.failed_objects.saturating_add(bucket.failed_objects);
+        status.failed_bytes = status.failed_bytes.saturating_add(bucket.failed_bytes);
+    }
+
+    status.updated_at = Some(now);
+    status.status = if status.failed_buckets > 0 { "failed" } else { "success" }.to_string();
+    let has_active_buckets = status.pending_buckets > 0
+        || status.running_buckets > 0
+        || status.buckets.iter().any(|bucket| bucket.status == "conflict");
+    status.state = if has_active_buckets {
+        if status.op_type == SITE_REPL_RESYNC_CANCEL {
+            "canceling"
+        } else if status.running_buckets > 0 {
+            "running"
+        } else {
+            "pending"
+        }
+    } else if status.failed_buckets > 0 {
+        "failed"
+    } else if status.op_type == SITE_REPL_RESYNC_CANCEL || status.canceled_buckets == status.total_buckets {
+        "canceled"
+    } else {
+        "completed"
+    }
+    .to_string();
+    if matches!(status.state.as_str(), "completed" | "canceled" | "failed") && status.completed_at.is_none() {
+        status.completed_at = Some(now);
+    }
+    status.err_detail = if status.failed_buckets > 0 {
+        format!("{} of {} buckets failed", status.failed_buckets, status.total_buckets)
+    } else {
+        String::new()
     };
-    state.resync_status.insert(peer.deployment_id.clone(), status.clone());
-    status
+}
+
+fn site_resync_page(status: &SRResyncOpStatus, limit: usize, offset: usize) -> S3Result<SRResyncOpStatus> {
+    if offset > status.buckets.len() {
+        return Err(s3_error!(InvalidRequest, "invalid resync continuation token"));
+    }
+    let mut response = status.clone();
+    let end = offset.saturating_add(limit).min(status.buckets.len());
+    response.buckets = status.buckets[offset..end].to_vec();
+    response.truncated = end < status.buckets.len();
+    response.next_continuation_token = if response.truncated {
+        let token = SiteResyncContinuationToken {
+            id: status.resync_id.clone(),
+            generation: status.generation,
+            offset: end,
+        };
+        let encoded = serde_json::to_vec(&token)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("encode resync cursor failed: {err}")))?;
+        URL_SAFE_NO_PAD.encode(encoded)
+    } else {
+        String::new()
+    };
+    Ok(response)
+}
+
+fn parse_site_resync_page(query: &HashMap<String, String>, status: &SRResyncOpStatus) -> S3Result<(usize, usize)> {
+    let limit = query
+        .get("limit")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| s3_error!(InvalidRequest, "invalid resync page limit"))?
+        .unwrap_or(SITE_REPL_RESYNC_DEFAULT_PAGE_SIZE);
+    if limit == 0 || limit > SITE_REPL_RESYNC_MAX_PAGE_SIZE {
+        return Err(s3_error!(InvalidRequest, "invalid resync page limit"));
+    }
+    let offset = if let Some(value) = query.get("continuationToken") {
+        let decoded = URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| s3_error!(InvalidRequest, "invalid resync continuation token"))?;
+        let token: SiteResyncContinuationToken =
+            serde_json::from_slice(&decoded).map_err(|_| s3_error!(InvalidRequest, "invalid resync continuation token"))?;
+        if token.id != status.resync_id || token.generation != status.generation {
+            return Err(s3_error!(InvalidRequest, "stale resync continuation token"));
+        }
+        token.offset
+    } else {
+        0
+    };
+    Ok((limit, offset))
 }
 
 fn bucket_target_endpoint(target: &BucketTarget) -> String {
@@ -4924,8 +5058,10 @@ fn bucket_target_endpoint(target: &BucketTarget) -> String {
 }
 
 fn bucket_target_matches_peer(target: &BucketTarget, peer: &PeerInfo) -> bool {
-    (!target.deployment_id.is_empty() && target.deployment_id == peer.deployment_id)
-        || bucket_target_endpoint(target) == canonical_endpoint(&peer.endpoint)
+    if !target.deployment_id.is_empty() {
+        return target.deployment_id == peer.deployment_id;
+    }
+    bucket_target_endpoint(target) == canonical_endpoint(&peer.endpoint)
 }
 
 fn site_replication_target_arns_by_peer(config: Option<&s3s::dto::ReplicationConfiguration>) -> HashMap<String, String> {
@@ -5576,7 +5712,12 @@ async fn backfill_existing_buckets_after_add(
             if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
                 continue;
             }
-            let result = start_site_bucket_resync(name, peer, &resync_id).await;
+            let manifest = site_bucket_resync_manifest_entry(name, peer, OffsetDateTime::now_utc()).await;
+            let result = if manifest.target_arn.is_empty() {
+                manifest
+            } else {
+                start_site_bucket_resync(name, &manifest.target_arn, &resync_id).await
+            };
             if result.status == "failed" {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
@@ -5657,10 +5798,60 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
     Ok(())
 }
 
-async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str) -> ResyncBucketStatus {
+async fn site_bucket_resync_manifest_entry(bucket: &str, peer: &PeerInfo, now: OffsetDateTime) -> ResyncBucketStatus {
+    let mut entry = ResyncBucketStatus {
+        bucket: bucket.to_string(),
+        status: "pending".to_string(),
+        created_at: Some(now),
+        updated_at: Some(now),
+        ..Default::default()
+    };
+    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let (config, _) = match metadata_sys::get_replication_config(bucket).await {
+        Ok(config) => config,
+        Err(err) => {
+            entry.status = "failed".to_string();
+            entry.err_detail = summarize_peer_error_detail(&err.to_string());
+            return entry;
+        }
+    };
+    let targets = match metadata_sys::list_bucket_targets(bucket).await {
+        Ok(targets) => targets,
+        Err(err) => {
+            entry.status = "failed".to_string();
+            entry.err_detail = summarize_peer_error_detail(&err.to_string());
+            return entry;
+        }
+    };
+    let mut matching = targets
+        .targets
+        .iter()
+        .filter(|target| target.target_type == BucketTargetType::ReplicationService && bucket_target_matches_peer(target, peer));
+    let Some(target) = matching.next() else {
+        entry.status = "failed".to_string();
+        entry.err_detail = "no valid remote target found for peer".to_string();
+        return entry;
+    };
+    if matching.next().is_some() {
+        entry.status = "failed".to_string();
+        entry.err_detail = "multiple remote targets matched peer".to_string();
+        return entry;
+    }
+    let (has_arn, existing_object_enabled) = config.has_existing_object_replication(&target.arn);
+    if !has_arn || !existing_object_enabled {
+        entry.status = "failed".to_string();
+        entry.err_detail = "existing object replication is not enabled for the peer target".to_string();
+        return entry;
+    }
+    entry.target_arn = target.arn.clone();
+    entry
+}
+
+async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &str) -> ResyncBucketStatus {
     let mut bucket_status = ResyncBucketStatus {
         bucket: bucket.to_string(),
-        status: "started".to_string(),
+        target_arn: target_arn.to_string(),
+        status: "running".to_string(),
         ..Default::default()
     };
     let targets_guard = lock_bucket_targets_metadata(bucket).await;
@@ -5683,15 +5874,40 @@ async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str
         }
     };
 
+    let Some(pool) = current_replication_pool_handle() else {
+        bucket_status.status = "failed".to_string();
+        bucket_status.err_detail = "replication pool is not initialized".to_string();
+        return bucket_status;
+    };
+
+    let Some(target_index) = targets
+        .targets
+        .iter()
+        .position(|target| target.target_type == BucketTargetType::ReplicationService && target.arn == target_arn)
+    else {
+        bucket_status.status = "failed".to_string();
+        bucket_status.err_detail = "recorded remote target no longer exists".to_string();
+        return bucket_status;
+    };
+
+    let existing_reset_id = targets.targets[target_index].reset_id.clone();
+    if !existing_reset_id.is_empty() && existing_reset_id != resync_id {
+        let existing_is_active = pool
+            .get_bucket_resync_status(bucket)
+            .await
+            .ok()
+            .and_then(|status| status.targets_map.get(target_arn).cloned())
+            .is_none_or(|target| target.resync_id != existing_reset_id || site_bucket_resync_is_active(target.resync_status));
+        if existing_is_active {
+            bucket_status.status = "conflict".to_string();
+            bucket_status.err_detail = "target belongs to a different active resync operation".to_string();
+            return bucket_status;
+        }
+    }
+
     let reset_before = Some(OffsetDateTime::now_utc());
     let target_arn = {
-        let Some(target) = targets.targets.iter_mut().find(|target| {
-            target.target_type == BucketTargetType::ReplicationService && bucket_target_matches_peer(target, peer)
-        }) else {
-            bucket_status.status = "failed".to_string();
-            bucket_status.err_detail = format!("no valid remote target found for peer {}", peer.deployment_id);
-            return bucket_status;
-        };
+        let target = &mut targets.targets[target_index];
 
         let (has_arn, existing_object_enabled) = config.has_existing_object_replication(&target.arn);
         if !has_arn || !existing_object_enabled {
@@ -5722,12 +5938,6 @@ async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
     drop(targets_guard);
 
-    let Some(pool) = current_replication_pool_handle() else {
-        bucket_status.status = "failed".to_string();
-        bucket_status.err_detail = "replication pool is not initialized".to_string();
-        return bucket_status;
-    };
-
     if let Err(err) = pool
         .start_bucket_resync(replication::resync_opts(bucket, target_arn, resync_id, reset_before))
         .await
@@ -5739,9 +5949,10 @@ async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str
     bucket_status
 }
 
-async fn cancel_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str) -> ResyncBucketStatus {
+async fn cancel_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &str) -> ResyncBucketStatus {
     let mut bucket_status = ResyncBucketStatus {
         bucket: bucket.to_string(),
+        target_arn: target_arn.to_string(),
         status: "canceled".to_string(),
         ..Default::default()
     };
@@ -5757,18 +5968,32 @@ async fn cancel_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &st
     };
 
     let Some(target) = targets.targets.iter_mut().find(|target| {
-        target.target_type == BucketTargetType::ReplicationService
-            && bucket_target_matches_peer(target, peer)
-            && target.reset_id == resync_id
+        target.target_type == BucketTargetType::ReplicationService && target.arn == target_arn && target.reset_id == resync_id
     }) else {
         bucket_status.status = "failed".to_string();
-        bucket_status.err_detail = format!("no in-progress resync target found for peer {}", peer.deployment_id);
+        bucket_status.err_detail = "recorded resync target is not in progress".to_string();
         return bucket_status;
     };
 
+    let target_arn = target.arn.clone();
+
+    let Some(pool) = current_replication_pool_handle() else {
+        bucket_status.status = "failed".to_string();
+        bucket_status.err_detail = "replication pool is not initialized".to_string();
+        return bucket_status;
+    };
+
+    if let Err(err) = pool
+        .cancel_bucket_resync(replication::resync_opts(bucket, target_arn, resync_id, None))
+        .await
+    {
+        bucket_status.status = "failed".to_string();
+        bucket_status.err_detail = err.to_string();
+        return bucket_status;
+    }
+
     target.reset_id.clear();
     target.reset_before_date = None;
-    let target_arn = target.arn.clone();
 
     let json_targets = match serde_json::to_vec(&targets) {
         Ok(json_targets) => json_targets,
@@ -5787,21 +6012,89 @@ async fn cancel_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &st
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
     drop(targets_guard);
 
-    let Some(pool) = current_replication_pool_handle() else {
-        bucket_status.status = "failed".to_string();
-        bucket_status.err_detail = "replication pool is not initialized".to_string();
-        return bucket_status;
-    };
-
-    if let Err(err) = pool
-        .cancel_bucket_resync(replication::resync_opts(bucket, target_arn, resync_id, None))
-        .await
-    {
-        bucket_status.status = "failed".to_string();
-        bucket_status.err_detail = err.to_string();
-    }
-
     bucket_status
+}
+
+async fn refresh_site_resync_status(mut status: SRResyncOpStatus, peer: &PeerInfo) -> SRResyncOpStatus {
+    for bucket in &mut status.buckets {
+        if bucket.target_arn.is_empty() && matches!(bucket.status.as_str(), "pending" | "running" | "started") {
+            let resolved = site_bucket_resync_manifest_entry(&bucket.bucket, peer, OffsetDateTime::now_utc()).await;
+            if resolved.target_arn.is_empty() {
+                bucket.status = "failed".to_string();
+                bucket.err_detail = resolved.err_detail;
+            } else {
+                bucket.target_arn = resolved.target_arn;
+                bucket.status = "pending".to_string();
+            }
+        }
+    }
+    if let Some(pool) = current_replication_pool_handle() {
+        for bucket in &mut status.buckets {
+            if bucket.target_arn.is_empty() || bucket.status == "failed" {
+                continue;
+            }
+            match pool.get_bucket_resync_status(&bucket.bucket).await {
+                Ok(live) => match live.targets_map.get(&bucket.target_arn) {
+                    Some(target) if target.resync_id == status.resync_id => {
+                        apply_site_resync_target_status(bucket, target);
+                    }
+                    Some(target) if !target.resync_id.is_empty() && site_bucket_resync_is_active(target.resync_status) => {
+                        bucket.status = "conflict".to_string();
+                        bucket.err_detail = "recorded target belongs to a different resync operation".to_string();
+                        bucket.updated_at = Some(OffsetDateTime::now_utc());
+                    }
+                    Some(target) if !target.resync_id.is_empty() => {
+                        bucket.status = "failed".to_string();
+                        bucket.err_detail = "recorded resync operation was superseded by a terminal bucket resync".to_string();
+                        bucket.updated_at = Some(OffsetDateTime::now_utc());
+                        bucket.completed_at = bucket.updated_at;
+                    }
+                    _ if matches!(bucket.status.as_str(), "pending" | "running" | "started") => {
+                        let previous = bucket.clone();
+                        let mut recovered =
+                            start_site_bucket_resync(&previous.bucket, &previous.target_arn, &status.resync_id).await;
+                        recovered.created_at = previous.created_at;
+                        recovered.started_at = previous.started_at.or(Some(OffsetDateTime::now_utc()));
+                        recovered.updated_at = Some(OffsetDateTime::now_utc());
+                        recovered.generation = status.generation;
+                        recovered.err_detail = summarize_peer_error_detail(&recovered.err_detail);
+                        *bucket = recovered;
+                    }
+                    _ => {}
+                },
+                Err(err) => {
+                    bucket.err_detail = summarize_peer_error_detail(&err.to_string());
+                    bucket.updated_at = Some(OffsetDateTime::now_utc());
+                }
+            }
+        }
+    }
+    summarize_site_resync_status(&mut status, OffsetDateTime::now_utc());
+    status
+}
+
+async fn persist_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    if state
+        .resync_status
+        .get(peer_id)
+        .is_some_and(|current| current.resync_id != status.resync_id || current.generation != status.generation)
+    {
+        return Err(s3_error!(InvalidRequest, "site replication resync state changed"));
+    }
+    state.resync_status.insert(peer_id.to_string(), status.clone());
+    save_site_replication_state(&state).await
+}
+
+async fn persist_new_site_resync_status(peer_id: &str, status: &SRResyncOpStatus) -> S3Result<()> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    if state.resync_status.get(peer_id).is_some_and(site_resync_is_active) {
+        return Err(s3_error!(InvalidRequest, "site replication resync is already active"));
+    }
+    state.resync_status.insert(peer_id.to_string(), status.clone());
+    save_site_replication_state(&state).await
 }
 
 fn apply_state_edit_req(mut state: SiteReplicationState, body: SRStateEditReq) -> SiteReplicationState {
@@ -7261,89 +7554,162 @@ pub struct SiteReplicationResyncOpHandler {}
 impl Operation for SiteReplicationResyncOpHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationResyncAction).await?;
-        let operation = query_pairs(&req.uri).get("operation").cloned().unwrap_or_default();
-        // Resolve before the request body is consumed below; the `else` stays
-        // at its original position so error precedence is unchanged.
+        let query = query_pairs(&req.uri);
+        let operation = query.get("operation").cloned().unwrap_or_default();
         let resolved_store = object_store_from_req(&req);
-        let peer: PeerInfo = read_site_replication_json(req, "", false).await?;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
-        let mut state = load_site_replication_state().await?;
-        let local_peer = current_local_runtime_peer(&state);
-        let peer = normalize_peer_info(peer);
-        if peer.deployment_id == local_peer.deployment_id {
-            return Err(s3_error!(InvalidRequest, "invalid peer specified - cannot resync to self"));
-        }
-        if !state.peers.contains_key(&peer.deployment_id) {
-            return Err(s3_error!(InvalidRequest, "site replication peer not found"));
-        }
-        let Some(store) = resolved_store else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        let requested_peer: PeerInfo = read_site_replication_json(req, "", false).await?;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let (peer, existing_status) = {
+            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let state = load_site_replication_state().await?;
+            let local_peer = current_local_runtime_peer(&state);
+            let requested_peer = normalize_peer_info(requested_peer);
+            if requested_peer.deployment_id == local_peer.deployment_id {
+                return Err(s3_error!(InvalidRequest, "invalid peer specified - cannot resync to self"));
+            }
+            let peer = state
+                .peers
+                .get(&requested_peer.deployment_id)
+                .cloned()
+                .ok_or_else(|| s3_error!(InvalidRequest, "site replication peer not found"))?;
+            (peer, state.resync_status.get(&requested_peer.deployment_id).cloned())
         };
-        let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
-        let bucket_names: Vec<String> = buckets.into_iter().map(|bucket| bucket.name).collect();
 
-        let status = match operation.as_str() {
+        let mut status = match operation.as_str() {
             SITE_REPL_RESYNC_START => {
-                let mut status = resync_status_for_state(&mut state, &operation, &peer, vec![]);
-                let mut bucket_statuses = Vec::new();
+                if let Some(existing) = existing_status.as_ref() {
+                    let existing = refresh_site_resync_status(existing.clone(), &peer).await;
+                    persist_site_resync_status(&peer.deployment_id, &existing).await?;
+                    if site_resync_is_active(&existing) {
+                        return Err(s3_error!(InvalidRequest, "site replication resync is already active"));
+                    }
+                }
+                let Some(store) = resolved_store else {
+                    return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+                };
+                let mut bucket_names: Vec<String> = store
+                    .list_bucket(&BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .map(|bucket| bucket.name)
+                    .collect();
+                bucket_names.sort();
+                let now = OffsetDateTime::now_utc();
+                let mut bucket_statuses = Vec::with_capacity(bucket_names.len());
                 for bucket in bucket_names {
-                    bucket_statuses.push(start_site_bucket_resync(&bucket, &peer, &status.resync_id).await);
+                    bucket_statuses.push(site_bucket_resync_manifest_entry(&bucket, &peer, now).await);
                 }
-                let failures = bucket_statuses.iter().filter(|bucket| bucket.status == "failed").count();
-                if failures == bucket_statuses.len() && !bucket_statuses.is_empty() {
-                    status.status = "failed".to_string();
-                    status.err_detail = "all buckets resync failed".to_string();
-                } else if failures > 0 {
-                    status.err_detail = "partial failure in starting site resync".to_string();
+                let mut status = SRResyncOpStatus {
+                    op_type: SITE_REPL_RESYNC_START.to_string(),
+                    resync_id: Uuid::new_v4().to_string(),
+                    status: "success".to_string(),
+                    state: "pending".to_string(),
+                    buckets: bucket_statuses,
+                    created_at: Some(now),
+                    started_at: Some(now),
+                    updated_at: Some(now),
+                    generation: existing_status
+                        .as_ref()
+                        .map_or(1, |existing| existing.generation.saturating_add(1).max(1)),
+                    ..Default::default()
+                };
+                summarize_site_resync_status(&mut status, now);
+                persist_new_site_resync_status(&peer.deployment_id, &status).await?;
+                for index in 0..status.buckets.len() {
+                    if status.buckets[index].target_arn.is_empty() || status.buckets[index].status == "failed" {
+                        continue;
+                    }
+                    let previous = status.buckets[index].clone();
+                    let mut result = start_site_bucket_resync(&previous.bucket, &previous.target_arn, &status.resync_id).await;
+                    result.created_at = previous.created_at;
+                    result.started_at = Some(OffsetDateTime::now_utc());
+                    result.updated_at = result.started_at;
+                    result.generation = status.generation;
+                    result.err_detail = summarize_peer_error_detail(&result.err_detail);
+                    status.buckets[index] = result;
+                    summarize_site_resync_status(&mut status, OffsetDateTime::now_utc());
+                    persist_site_resync_status(&peer.deployment_id, &status).await?;
                 }
-                status.buckets = bucket_statuses;
-                state.resync_status.insert(peer.deployment_id.clone(), status.clone());
+                status = refresh_site_resync_status(status, &peer).await;
+                persist_site_resync_status(&peer.deployment_id, &status).await?;
                 status
             }
             SITE_REPL_RESYNC_CANCEL => {
-                let Some(existing_status) = state.resync_status.get(&peer.deployment_id).cloned() else {
+                let Some(existing_status) = existing_status else {
                     return Err(s3_error!(InvalidRequest, "no resync in progress"));
                 };
                 if existing_status.resync_id.is_empty() {
                     return Err(s3_error!(InvalidRequest, "no resync in progress"));
                 }
-                let mut status = SRResyncOpStatus {
-                    op_type: operation.clone(),
-                    resync_id: existing_status.resync_id.clone(),
-                    status: "success".to_string(),
-                    ..Default::default()
-                };
-                let mut bucket_statuses = Vec::new();
-                for bucket in bucket_names {
-                    bucket_statuses.push(cancel_site_bucket_resync(&bucket, &peer, &existing_status.resync_id).await);
+                let mut status = refresh_site_resync_status(existing_status, &peer).await;
+                if status.buckets.iter().any(|bucket| bucket.status == "conflict") {
+                    return Err(s3_error!(
+                        InvalidRequest,
+                        "site replication resync target belongs to a different active operation"
+                    ));
                 }
-                let failures = bucket_statuses.iter().filter(|bucket| bucket.status == "failed").count();
-                if failures == bucket_statuses.len() && !bucket_statuses.is_empty() {
-                    status.status = "failed".to_string();
-                    status.err_detail = "all buckets resync cancel failed".to_string();
-                } else if failures > 0 {
-                    status.err_detail = "partial failure in canceling site resync".to_string();
+                if site_resync_cancel_is_idempotent(&status) {
+                    status.op_type = SITE_REPL_RESYNC_CANCEL.to_string();
+                    for bucket in &status.buckets {
+                        if !bucket.target_arn.is_empty() {
+                            let _ = cancel_site_bucket_resync(&bucket.bucket, &bucket.target_arn, &status.resync_id).await;
+                        }
+                    }
+                    status
+                } else {
+                    if !site_resync_is_active(&status) {
+                        return Err(s3_error!(InvalidRequest, "no active resync to cancel"));
+                    }
+                    status.op_type = SITE_REPL_RESYNC_CANCEL.to_string();
+                    status.state = "canceling".to_string();
+                    status.updated_at = Some(OffsetDateTime::now_utc());
+                    persist_site_resync_status(&peer.deployment_id, &status).await?;
+                    for index in 0..status.buckets.len() {
+                        if status.buckets[index].target_arn.is_empty()
+                            || matches!(status.buckets[index].status.as_str(), "failed" | "canceled")
+                        {
+                            continue;
+                        }
+                        let previous = status.buckets[index].clone();
+                        let mut result =
+                            cancel_site_bucket_resync(&previous.bucket, &previous.target_arn, &status.resync_id).await;
+                        result.created_at = previous.created_at;
+                        result.started_at = previous.started_at;
+                        result.updated_at = Some(OffsetDateTime::now_utc());
+                        result.completed_at = result.updated_at;
+                        result.generation = status.generation;
+                        result.err_detail = summarize_peer_error_detail(&result.err_detail);
+                        status.buckets[index] = result;
+                        summarize_site_resync_status(&mut status, OffsetDateTime::now_utc());
+                        persist_site_resync_status(&peer.deployment_id, &status).await?;
+                    }
+                    status = refresh_site_resync_status(status, &peer).await;
+                    persist_site_resync_status(&peer.deployment_id, &status).await?;
+                    status
                 }
-                status.buckets = bucket_statuses;
-                state.resync_status.insert(peer.deployment_id.clone(), status.clone());
-                status
             }
             SITE_REPL_RESYNC_STATUS => {
-                let status = state
-                    .resync_status
-                    .get(&peer.deployment_id)
-                    .cloned()
-                    .unwrap_or_else(|| SRResyncOpStatus {
-                        op_type: SITE_REPL_RESYNC_STATUS.to_string(),
-                        status: "not-found".to_string(),
-                        ..Default::default()
-                    });
-                return json_response(&status);
+                let status = existing_status.unwrap_or_else(|| SRResyncOpStatus {
+                    op_type: SITE_REPL_RESYNC_STATUS.to_string(),
+                    status: "not-found".to_string(),
+                    ..Default::default()
+                });
+                if status.resync_id.is_empty() {
+                    status
+                } else {
+                    let status = refresh_site_resync_status(status, &peer).await;
+                    persist_site_resync_status(&peer.deployment_id, &status).await?;
+                    status
+                }
             }
             _ => return Err(s3_error!(InvalidRequest, "unsupported resync operation")),
         };
-        save_site_replication_state(&state).await?;
-        json_response(&status)
+        status
+            .buckets
+            .sort_by(|left, right| left.bucket.cmp(&right.bucket).then(left.target_arn.cmp(&right.target_arn)));
+        let (limit, offset) = parse_site_resync_page(&query, &status)?;
+        json_response(&site_resync_page(&status, limit, offset)?)
     }
 }
 
@@ -8858,6 +9224,57 @@ mod tests {
             ..operation_args
         };
         assert!(!policy.is_allowed(&put_policy_args).await);
+    }
+
+    // The replication service account must be able to carry object-lock metadata to the peer.
+    // Without these actions the peer answers AccessDenied for any replicated object that has
+    // retention or a legal hold, so a WORM-protected object never reaches the replica at all,
+    // and a retention change made after upload never propagates.
+    #[tokio::test]
+    async fn test_site_replicator_policy_allows_object_lock_replication() {
+        let policy = site_replicator_service_account_policy().expect("site replicator policy should parse");
+        let groups: Option<Vec<String>> = None;
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+
+        let base_args = rustfs_policy::policy::Args {
+            account: SITE_REPLICATOR_SERVICE_ACCOUNT,
+            groups: &groups,
+            action: Action::S3Action(S3Action::PutObjectRetentionAction),
+            conditions: &conditions,
+            is_owner: false,
+            claims: &claims,
+            deny_only: false,
+            bucket: "photos",
+            object: "image.jpg",
+        };
+
+        for action in [
+            S3Action::PutObjectRetentionAction,
+            S3Action::GetObjectRetentionAction,
+            S3Action::PutObjectLegalHoldAction,
+            S3Action::GetObjectLegalHoldAction,
+        ] {
+            let args = rustfs_policy::policy::Args {
+                action: Action::S3Action(action),
+                ..base_args
+            };
+            assert!(
+                policy.is_allowed(&args).await,
+                "site replicator must be allowed to replicate object-lock metadata: {action:?}"
+            );
+        }
+
+        // Governance bypass stays denied: replication must not be able to erase a retained
+        // version on the peer.
+        let bypass_args = rustfs_policy::policy::Args {
+            action: Action::S3Action(S3Action::BypassGovernanceRetentionAction),
+            ..base_args
+        };
+        assert!(
+            !policy.is_allowed(&bypass_args).await,
+            "site replicator must not be granted governance bypass"
+        );
     }
 
     #[test]
@@ -11484,5 +11901,89 @@ mod tests {
         let rule_ids: Vec<&str> = existing_rules.iter().filter_map(|r| r.id.as_deref()).collect();
         assert!(rule_ids.contains(&"site-repl-dep-b"));
         assert!(rule_ids.contains(&"site-repl-dep-c"));
+    }
+
+    #[test]
+    fn site_resync_summary_reports_partial_failure_and_clamps_counters() {
+        let now = OffsetDateTime::now_utc();
+        let mut running = ResyncBucketStatus {
+            bucket: "b".to_string(),
+            target_arn: "arn-b".to_string(),
+            ..Default::default()
+        };
+        apply_site_resync_target_status(
+            &mut running,
+            &replication::TargetReplicationResyncStatus {
+                resync_status: replication::ResyncStatusType::ResyncStarted,
+                resync_id: "run-1".to_string(),
+                replicated_count: 4,
+                replicated_size: 16,
+                failed_count: -1,
+                failed_size: -2,
+                ..Default::default()
+            },
+        );
+        let failed = ResyncBucketStatus {
+            bucket: "a".to_string(),
+            target_arn: "arn-a".to_string(),
+            status: "conflict".to_string(),
+            err_detail: "durable failure".to_string(),
+            ..Default::default()
+        };
+        let mut status = SRResyncOpStatus {
+            op_type: SITE_REPL_RESYNC_START.to_string(),
+            resync_id: "run-1".to_string(),
+            buckets: vec![running, failed],
+            ..Default::default()
+        };
+
+        summarize_site_resync_status(&mut status, now);
+
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.state, "running");
+        assert_eq!(status.running_buckets, 1);
+        assert_eq!(status.failed_buckets, 1);
+        assert_eq!(status.replicated_objects, 4);
+        assert_eq!(status.replicated_bytes, 16);
+        assert_eq!(status.failed_objects, 0);
+        assert_eq!(status.failed_bytes, 0);
+        assert_eq!(status.completed_at, None);
+        assert!(site_resync_is_active(&status));
+        assert!(site_resync_cancel_is_idempotent(&SRResyncOpStatus {
+            state: "canceled".to_string(),
+            ..Default::default()
+        }));
+        assert!(site_bucket_resync_is_active(replication::ResyncStatusType::ResyncPending));
+        assert!(site_bucket_resync_is_active(replication::ResyncStatusType::ResyncStarted));
+        assert!(!site_bucket_resync_is_active(replication::ResyncStatusType::ResyncCompleted));
+    }
+
+    #[test]
+    fn site_resync_pagination_is_sorted_and_rejects_stale_cursor() {
+        let status = SRResyncOpStatus {
+            resync_id: "run-1".to_string(),
+            generation: 3,
+            buckets: ["a", "b", "c"]
+                .into_iter()
+                .map(|bucket| ResyncBucketStatus {
+                    bucket: bucket.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let first = site_resync_page(&status, 2, 0).expect("first page should be valid");
+        assert!(first.truncated);
+        assert_eq!(first.buckets.iter().map(|bucket| bucket.bucket.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+
+        let query = HashMap::from([
+            ("limit".to_string(), "2".to_string()),
+            ("continuationToken".to_string(), first.next_continuation_token),
+        ]);
+        let (_, offset) = parse_site_resync_page(&query, &status).expect("cursor should match operation");
+        assert_eq!(offset, 2);
+        let mut newer = status;
+        newer.generation += 1;
+        assert!(parse_site_resync_page(&query, &newer).is_err());
     }
 }

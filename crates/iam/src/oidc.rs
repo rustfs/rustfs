@@ -19,7 +19,7 @@
 //! and ID token verification.
 
 use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
+use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreJsonWebKeySet};
 use openidconnect::{
     AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, LogoutRequest, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, RequestTokenError,
@@ -172,19 +172,29 @@ pub fn oidc_plugin_authn_metrics_snapshot() -> OidcPluginAuthnMetricsSnapshot {
     OIDC_PLUGIN_AUTHN_METRICS.snapshot()
 }
 
+/// Header names whose values may carry OIDC secrets (client credentials, cookies,
+/// bearer tokens). Their values are never emitted to logs, only their byte length.
+const SENSITIVE_HEADER_NAMES: [&str; 4] = ["authorization", "proxy-authorization", "cookie", "set-cookie"];
+
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADER_NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 fn format_http_headers(headers: &http::HeaderMap) -> String {
     headers
         .iter()
         .map(|(name, value)| {
-            let value = value.to_str().unwrap_or("<non-utf8>");
-            format!("{}={}", name.as_str(), value)
+            if is_sensitive_header(name.as_str()) {
+                format!("{}=<redacted len={}>", name.as_str(), value.as_bytes().len())
+            } else {
+                let value = value.to_str().unwrap_or("<non-utf8>");
+                format!("{}={}", name.as_str(), value)
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-fn format_http_body(body: &[u8]) -> String {
-    String::from_utf8_lossy(body).into_owned()
 }
 
 #[derive(Debug, Default)]
@@ -326,7 +336,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let uri = parts.uri.to_string();
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let request_headers = format_http_headers(&parts.headers);
-                let request_body = format_http_body(&body);
                 debug!(
                     event = EVENT_OIDC_HTTP,
                     component = LOG_COMPONENT_IAM,
@@ -336,7 +345,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                     uri = %uri,
                     request_headers = %request_headers,
                     request_body_len = body.len(),
-                    request_body = %request_body,
                     "oidc outbound http"
                 );
             }
@@ -387,7 +395,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             })?;
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let response_headers = format_http_headers(&headers);
-                let response_body = format_http_body(&body_bytes);
                 debug!(
                     event = EVENT_OIDC_HTTP,
                     component = LOG_COMPONENT_IAM,
@@ -400,7 +407,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                     elapsed_ms,
                     response_headers = %response_headers,
                     response_body_len = body_bytes.len(),
-                    response_body = %response_body,
                     "oidc outbound http"
                 );
             }
@@ -430,6 +436,7 @@ pub struct OidcProviderConfig {
     pub id: String,
     pub enabled: bool,
     pub config_url: String,
+    pub issuer: Option<String>,
     pub client_id: String,
     pub client_secret: Option<String>,
     pub scopes: Vec<String>,
@@ -453,6 +460,7 @@ impl fmt::Debug for OidcProviderConfig {
             .field("id", &self.id)
             .field("enabled", &self.enabled)
             .field("config_url", &self.config_url)
+            .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("client_secret", &redacted_optional_secret(self.client_secret.as_deref()))
             .field("scopes", &self.scopes)
@@ -814,7 +822,6 @@ impl OidcSys {
                 }
                 RequestTokenError::Parse(parse_err, body) => {
                     let shape = inspect_token_response_body(body);
-                    let response_body = format_http_body(body);
                     error!(
                         event = EVENT_OIDC_DIAGNOSTICS,
                         component = LOG_COMPONENT_IAM,
@@ -837,12 +844,11 @@ impl OidcSys {
                         response_has_error = shape.has_error,
                         response_has_error_description = shape.has_error_description,
                         response_looks_like_html = shape.looks_like_html,
-                        response_body = %response_body,
                         error = %e,
                         "oidc token exchange failed"
                     );
                     format!(
-                        "token exchange failed: {e}: stage=token_response_parse_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, parse_error_path={}, response_body_len={}, response_json_keys={}, response_has_id_token={}, response_has_error={}, response_looks_like_html={}, response_body={}",
+                        "token exchange failed: {e}: stage=token_response_parse_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, parse_error_path={}, response_body_len={}, response_json_keys={}, response_has_id_token={}, response_has_error={}, response_looks_like_html={}",
                         session.provider_id,
                         config.config_url,
                         issuer,
@@ -854,8 +860,7 @@ impl OidcSys {
                         shape.json_keys,
                         shape.has_id_token,
                         shape.has_error,
-                        shape.looks_like_html,
-                        response_body
+                        shape.looks_like_html
                     )
                 }
                 RequestTokenError::Other(message) => {
@@ -1406,6 +1411,7 @@ impl OidcSys {
 
         let enable_val = get_env(ENV_IDENTITY_OPENID_ENABLE);
         let config_url = get_env(ENV_IDENTITY_OPENID_CONFIG_URL);
+        let issuer = get_env(ENV_IDENTITY_OPENID_ISSUER);
 
         // Skip if no config URL
         if config_url.is_empty() {
@@ -1482,6 +1488,7 @@ impl OidcSys {
             id: id.to_string(),
             enabled,
             config_url,
+            issuer: if issuer.is_empty() { None } else { Some(issuer) },
             client_id: get_env(ENV_IDENTITY_OPENID_CLIENT_ID),
             client_secret,
             scopes,
@@ -1550,6 +1557,7 @@ impl OidcSys {
             id: id.to_string(),
             enabled,
             config_url,
+            issuer: kvs.lookup(OIDC_ISSUER).filter(|v| !v.is_empty()),
             client_id: kvs.get(OIDC_CLIENT_ID),
             client_secret,
             scopes,
@@ -1571,6 +1579,10 @@ impl OidcSys {
     /// Perform OIDC discovery for a provider.
     /// `discover_async` fetches the discovery document and JWKS in one step.
     async fn discover_provider(config: &OidcProviderConfig, http_client: &ReqwestHttpClient) -> Result<ProviderState, String> {
+        if let Some(issuer) = config.issuer.as_deref().filter(|issuer| !issuer.trim().is_empty()) {
+            return Self::discover_provider_from_config_url(config, issuer, http_client).await;
+        }
+
         // The openidconnect crate expects the issuer URL (base), not the
         // .well-known/openid-configuration URL.
         let base_issuer = normalize_config_url(&config.config_url)?;
@@ -1637,6 +1649,48 @@ impl OidcSys {
             candidates,
             last_errors.join("; ")
         ))
+    }
+
+    async fn discover_provider_from_config_url(
+        config: &OidcProviderConfig,
+        issuer: &str,
+        http_client: &ReqwestHttpClient,
+    ) -> Result<ProviderState, String> {
+        let issuer_url = IssuerUrl::new(issuer.trim().to_string()).map_err(|e| format!("invalid issuer URL: {e}"))?;
+        let discovery_url = discovery_url_from_config_url(&config.config_url)?;
+        let request = http::Request::builder()
+            .uri(discovery_url.to_string())
+            .method(http::Method::GET)
+            .header(http::header::ACCEPT, "application/json")
+            .body(Vec::new())
+            .map_err(|err| format!("failed to prepare discovery request: {err}"))?;
+
+        let response = http_client
+            .call(request)
+            .await
+            .map_err(|err| format!("discovery request failed: {err}"))?;
+        if response.status() != http::StatusCode::OK {
+            return Err(format!("discovery failed: HTTP status code {} at {}", response.status(), discovery_url));
+        }
+
+        let provider_metadata = serde_json::from_slice::<ProviderMetadataWithLogout>(response.body())
+            .map_err(|err| format!("failed to parse discovery response: {err}"))?;
+        if provider_metadata.issuer() != &issuer_url {
+            return Err(format!(
+                "unexpected issuer URI `{}` (expected `{}`)",
+                provider_metadata.issuer().as_str(),
+                issuer_url.as_str()
+            ));
+        }
+
+        let jwks = CoreJsonWebKeySet::fetch_async(provider_metadata.jwks_uri(), http_client)
+            .await
+            .map_err(|err| format!("failed to fetch JWKS: {err}"))?;
+
+        Ok(ProviderState {
+            metadata: provider_metadata.set_jwks(jwks),
+            discovered_at: Instant::now(),
+        })
     }
 }
 
@@ -1751,6 +1805,34 @@ fn normalize_config_url(config_url: &str) -> Result<String, String> {
     Ok(issuer)
 }
 
+fn discovery_url_from_config_url(config_url: &str) -> Result<Url, String> {
+    let mut url = Url::parse(config_url.trim()).map_err(|e| format!("invalid config_url: {e}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(format!("invalid config_url scheme: {}", url.scheme()));
+    }
+    if url.host_str().is_none() {
+        return Err("config_url missing host".to_string());
+    }
+
+    let path = url.path().to_string();
+    let without_trailing_slash = path.strip_suffix('/').unwrap_or(&path);
+    if without_trailing_slash.ends_with("/.well-known/openid-configuration") {
+        url.set_path(without_trailing_slash);
+        return Ok(url);
+    }
+    if without_trailing_slash.contains("/.well-known/") {
+        return Err("config_url uses an unsupported .well-known discovery URL".into());
+    }
+
+    let discovery_path = if without_trailing_slash.is_empty() || without_trailing_slash == "/" {
+        "/.well-known/openid-configuration".to_string()
+    } else {
+        format!("{without_trailing_slash}/.well-known/openid-configuration")
+    };
+    url.set_path(&discovery_path);
+    Ok(url)
+}
+
 fn issuer_candidates(base: &str) -> Vec<String> {
     let original = base.trim();
     let mut variants = Vec::with_capacity(2);
@@ -1847,6 +1929,39 @@ mod tests {
         assert_eq!(extract_string_claim(&claims, "email"), "user@example.com");
         assert_eq!(extract_string_claim(&claims, "sub"), "12345");
         assert_eq!(extract_string_claim(&claims, "missing"), "");
+    }
+
+    #[test]
+    fn format_http_headers_redacts_sensitive_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Basic Y2xpZW50OnNlY3JldA==".parse().unwrap());
+        headers.insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(http::header::COOKIE, "session=super-secret".parse().unwrap());
+
+        let rendered = format_http_headers(&headers);
+
+        // Sensitive header values never appear; only their length is emitted.
+        assert!(!rendered.contains("Y2xpZW50OnNlY3JldA=="), "authorization value leaked: {rendered}");
+        assert!(!rendered.contains("super-secret"), "cookie value leaked: {rendered}");
+        assert!(
+            rendered.contains("authorization=<redacted len="),
+            "expected redacted authorization: {rendered}"
+        );
+        assert!(rendered.contains("cookie=<redacted len="), "expected redacted cookie: {rendered}");
+        // Non-sensitive header values are preserved for diagnostics.
+        assert!(
+            rendered.contains("content-type=application/json"),
+            "content-type should be visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_header_is_case_insensitive() {
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("PROXY-AUTHORIZATION"));
+        assert!(is_sensitive_header("Set-Cookie"));
+        assert!(!is_sensitive_header("content-type"));
+        assert!(!is_sensitive_header("x-request-id"));
     }
 
     #[test]
@@ -2047,6 +2162,23 @@ mod tests {
     }
 
     #[test]
+    fn test_discovery_url_from_config_url() {
+        assert_eq!(
+            discovery_url_from_config_url("https://idp.example.com/.well-known/openid-configuration")
+                .expect("config URL should parse")
+                .as_str(),
+            "https://idp.example.com/.well-known/openid-configuration"
+        );
+        assert_eq!(
+            discovery_url_from_config_url("https://idp.example.com/realms/app")
+                .expect("issuer URL should derive discovery URL")
+                .as_str(),
+            "https://idp.example.com/realms/app/.well-known/openid-configuration"
+        );
+        assert!(discovery_url_from_config_url("https://idp.example.com/.well-known/not-openid").is_err());
+    }
+
+    #[test]
     fn test_issuer_candidates() {
         assert_eq!(
             issuer_candidates("https://idp.example.com/realm"),
@@ -2073,6 +2205,7 @@ mod tests {
             id: id.to_string(),
             enabled: true,
             config_url: config_url.to_string(),
+            issuer: None,
             client_id: "rustfs-oidc-test".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
@@ -2254,6 +2387,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validate_oidc_provider_config_accepts_separate_issuer() {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(|_| "https://public.example.com/realms/app".to_string(), 2)
+        else {
+            return;
+        };
+        let mut config =
+            build_mocked_oidc_provider_config("default", &format!("{base}/internal/realms/app/.well-known/openid-configuration"));
+        config.issuer = Some("https://public.example.com/realms/app".to_string());
+
+        let validation_result = validate_mocked_oidc_provider_config(&config)
+            .await
+            .expect("OIDC provider validation should succeed");
+
+        assert_eq!(validation_result.issuer, "https://public.example.com/realms/app");
+        assert!(handle.join().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_provider_config_rejects_separate_issuer_mismatch() {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(|_| "https://public.example.com/realms/other".to_string(), 1)
+        else {
+            return;
+        };
+        let mut config =
+            build_mocked_oidc_provider_config("default", &format!("{base}/internal/realms/app/.well-known/openid-configuration"));
+        config.issuer = Some("https://public.example.com/realms/app".to_string());
+
+        let err = validate_mocked_oidc_provider_config(&config)
+            .await
+            .expect_err("OIDC provider validation should fail");
+
+        assert!(err.contains("unexpected issuer URI"));
+        assert!(err.contains("https://public.example.com/realms/app"));
+        assert!(handle.join().is_ok());
+    }
+
+    #[tokio::test]
     async fn test_validate_oidc_provider_config_returns_detailed_errors() {
         let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8) else {
             return;
@@ -2364,6 +2534,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_single_provider_reads_issuer() {
+        temp_env::with_vars(
+            [
+                (
+                    ENV_IDENTITY_OPENID_CONFIG_URL,
+                    Some("http://keycloak.ns.svc.cluster.local:8080/realms/app/.well-known/openid-configuration"),
+                ),
+                (ENV_IDENTITY_OPENID_ISSUER, Some("https://app.local/realms/app")),
+                (ENV_IDENTITY_OPENID_CLIENT_ID, Some("console")),
+            ],
+            || {
+                let config = OidcSys::parse_single_provider("", "default").expect("provider config should parse");
+
+                assert_eq!(config.issuer.as_deref(), Some("https://app.local/realms/app"));
+            },
+        );
+    }
+
+    #[test]
     fn test_parse_persisted_provider_config() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
@@ -2389,6 +2578,7 @@ mod tests {
         );
         kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
         kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        kvs.insert(OIDC_ISSUER.to_string(), "https://issuer.example".to_string());
         kvs.insert(OIDC_ROLES_CLAIM.to_string(), "app_roles".to_string());
 
         cfg.0
@@ -2400,6 +2590,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "default");
         assert_eq!(parsed[0].client_id, "console");
+        assert_eq!(parsed[0].issuer.as_deref(), Some("https://issuer.example"));
         assert!(parsed[0].enabled);
         assert_eq!(parsed[0].roles_claim, "app_roles");
     }
@@ -2492,6 +2683,7 @@ mod tests {
             id: id.to_string(),
             enabled: true,
             config_url: format!("https://example.com/{id}/.well-known/openid-configuration"),
+            issuer: None,
             client_id: "client-id".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
@@ -2794,6 +2986,7 @@ mod tests {
             id: "test".to_string(),
             enabled: true,
             config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+            issuer: None,
             client_id: "my-client".to_string(),
             client_secret: Some("secret".to_string()),
             scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],

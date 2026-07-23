@@ -312,31 +312,62 @@ impl PeerRestClient {
             recovery_running: Arc::new(AtomicBool::new(false)),
         }
     }
-    pub async fn new_clients(eps: EndpointServerPools) -> (Vec<Option<Self>>, Vec<Option<Self>>) {
-        if !runtime_sources::setup_is_dist_erasure().await {
-            return (Vec::new(), Vec::new());
-        }
 
-        let eps = eps.clone();
-        let hosts = eps.hosts_sorted();
-        let mut remote = Vec::with_capacity(hosts.len());
-        let mut all = vec![None; hosts.len()];
-        for (i, hs_host) in hosts.iter().enumerate() {
-            if let Some(host) = hs_host
-                && let Some(grid_host) = eps.find_grid_hosts_from_peer(host)
-            {
-                let client = PeerRestClient::new(host.clone(), grid_host);
+    fn build_clients_from_slots(
+        slots: Vec<(String, Option<String>, bool)>,
+    ) -> (Vec<Option<Self>>, Vec<Option<Self>>, Vec<String>) {
+        let mut remote = Vec::with_capacity(slots.len().saturating_sub(1));
+        let mut all = vec![None; slots.len()];
+        let mut remote_topology_hosts = Vec::with_capacity(slots.len().saturating_sub(1));
 
-                all[i] = Some(client.clone());
-                remote.push(Some(client));
+        for (idx, (peer_host_port, grid_host, is_local)) in slots.into_iter().enumerate() {
+            if is_local {
+                continue;
             }
+
+            let client = match grid_host {
+                Some(grid_host) => match XHost::try_from(peer_host_port.clone()) {
+                    Ok(host) => Some(PeerRestClient::new(host, grid_host)),
+                    Err(err) => {
+                        warn!(peer = %peer_host_port, "Xhost parse failed while constructing peer client: {err:?}");
+                        None
+                    }
+                },
+                None => {
+                    warn!(peer = %peer_host_port, "grid host is missing while constructing peer client");
+                    None
+                }
+            };
+
+            all[idx] = client.clone();
+            remote.push(client);
+            remote_topology_hosts.push(peer_host_port);
         }
+
+        (remote, all, remote_topology_hosts)
+    }
+
+    pub async fn new_clients(eps: EndpointServerPools) -> (Vec<Option<Self>>, Vec<Option<Self>>) {
+        let (remote, all, _) = Self::new_clients_with_topology(eps).await;
+        (remote, all)
+    }
+
+    pub async fn new_clients_with_topology(eps: EndpointServerPools) -> (Vec<Option<Self>>, Vec<Option<Self>>, Vec<String>) {
+        if !runtime_sources::setup_is_dist_erasure().await {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let (remote, all, remote_topology_hosts) = Self::build_clients_from_slots(eps.peer_grid_host_slots_sorted());
 
         if all.len() != remote.len() + 1 {
-            warn!("Expected number of all hosts ({}) to be remote +1 ({})", all.len(), remote.len());
+            warn!(
+                all_hosts = all.len(),
+                remote_slots = remote.len(),
+                "Expected number of all hosts to be remote slots + local node"
+            );
         }
 
-        (remote, all)
+        (remote, all, remote_topology_hosts)
     }
 
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
@@ -1656,6 +1687,36 @@ mod tests {
                 .then_some(())
                 .ok_or_else(|| Error::other("peer returned an invalid scanner activity response proof"))
         })
+    }
+
+    #[test]
+    fn build_clients_from_slots_preserves_missing_remote_topology_slots() {
+        let slots = vec![
+            ("127.0.0.1:9000".to_string(), None, true),
+            ("127.0.0.1:9001".to_string(), Some("http://127.0.0.1:9001".to_string()), false),
+            ("127.0.0.1:notaport".to_string(), Some("http://127.0.0.1:notaport".to_string()), false),
+            ("127.0.0.1:9003".to_string(), None, false),
+        ];
+
+        let (remote, all, remote_topology_hosts) = PeerRestClient::build_clients_from_slots(slots);
+
+        assert_eq!(remote.len(), 3, "local node is excluded but remote slots are not compacted away");
+        assert_eq!(all.len(), 4, "all slots preserve the sorted cluster topology shape");
+        assert_eq!(
+            remote_topology_hosts,
+            vec![
+                "127.0.0.1:9001".to_string(),
+                "127.0.0.1:notaport".to_string(),
+                "127.0.0.1:9003".to_string()
+            ]
+        );
+        assert!(remote[0].is_some(), "valid remote peer should get a client");
+        assert!(remote[1].is_none(), "unparseable remote peer should remain observable as a missing slot");
+        assert!(remote[2].is_none(), "missing grid host should remain observable as a missing slot");
+        assert!(all[0].is_none(), "local node is represented by the local server_info row");
+        assert!(all[1].is_some());
+        assert!(all[2].is_none());
+        assert!(all[3].is_none());
     }
 
     #[test]
