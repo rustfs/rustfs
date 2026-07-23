@@ -111,6 +111,24 @@ pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY: bool = false;
 // Compile-time invariant: dual-write by default so the base build is byte-for-byte legacy behavior.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
 
+/// Require target-bound v2 signatures on every internode gRPC request, rejecting the legacy
+/// constant-target fallback instead of accepting it (<https://github.com/rustfs/backlog/issues/1327>).
+///
+/// Defaults to `false` (fail-open): a request without any v2 auth headers keeps authenticating
+/// through the legacy signature, so legacy-only peers survive rolling upgrades with byte-for-byte
+/// the pre-gate acceptance behavior. This is a rollout lever, not a wire-format change: it may only
+/// be enabled **after** the v1-fallback counter
+/// (`rustfs_system_network_internode_signature_v1_fallback_total`) has read zero across a release
+/// window fleet-wide, confirming every peer already sends v2 authentication on every internode gRPC
+/// request. Single-env rollback. Requests that do carry v2 headers are unaffected by this switch:
+/// they are always verified as v2 with no downgrade, strict or not.
+pub const ENV_INTERNODE_RPC_SIGNATURE_STRICT: &str = "RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT";
+pub const DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT: bool = false;
+
+// Compile-time invariant: fail-open by default so legacy-only peers keep authenticating during
+// rolling upgrades until the fleet-wide v1-fallback counter reads zero.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT);
+
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
 /// P3 observability).
 ///
@@ -275,6 +293,12 @@ mod tests {
     fn internode_msgpack_only_env_name_is_stable() {
         // The dual-write-by-default invariant is asserted at compile time next to the definition.
         assert_eq!(ENV_INTERNODE_RPC_MSGPACK_ONLY, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY");
+    }
+
+    #[test]
+    fn internode_signature_strict_env_name_is_stable() {
+        // The fail-open default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_SIGNATURE_STRICT, "RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT");
     }
 
     #[test]

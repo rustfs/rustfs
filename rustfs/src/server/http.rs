@@ -2368,6 +2368,48 @@ mod tests {
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
+    /// Rolling-upgrade compatibility anchor for <https://github.com/rustfs/backlog/issues/1327>:
+    /// a legacy-only peer (constant-target signature, no v2 headers) must keep authenticating
+    /// through the real production path (`check_auth` + `RpcRequestTarget` extension), and every
+    /// such acceptance must increment the v1-fallback convergence counter exactly once. That
+    /// counter reading zero fleet-wide is the precondition for ever enabling
+    /// `RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_accepts_legacy_only_peer_and_counts_v1_fallback() {
+        use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name("127.0.0.1:9000").await;
+
+        // Exactly what an old peer sends on the gRPC plane: the legacy constant-target signature
+        // and timestamp headers, nothing else.
+        let legacy_headers = storage::gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy headers should build");
+        let mut request = Request::new(());
+        request.metadata_mut().as_mut().extend(legacy_headers);
+        request.extensions_mut().insert(RpcRequestTarget {
+            uri: "http://127.0.0.1:9000/node_service.NodeService/Ping"
+                .parse()
+                .expect("test RPC URI should parse"),
+            method: Method::POST,
+        });
+
+        let before = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        assert!(
+            check_auth(request).is_ok(),
+            "a legacy-only peer must keep authenticating during rolling upgrades"
+        );
+        let after = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        assert_eq!(
+            after,
+            before + 1,
+            "an accepted legacy-only request must increment signature_v1_fallback_total exactly once"
+        );
+
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn peer_rest_heal_control_uses_production_auth_and_keeps_validation_errors_online() {
