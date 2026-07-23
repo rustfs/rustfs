@@ -9201,8 +9201,7 @@ dependencies = [
 [[package]]
 name = "rustfs-erasure-codec"
 version = "8.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a39413e8f0ca32be9bc2ca9d29f8d17a2ddf952748284cf0fd148ab11180cf6c"
+source = "git+https://github.com/houseme/reed-solomon-erasure?rev=f3bcf37f2c3bb67f4c552b63442409afe93d7216#f3bcf37f2c3bb67f4c552b63442409afe93d7216"
 dependencies = [
  "cc",
  "cfg_aliases",
