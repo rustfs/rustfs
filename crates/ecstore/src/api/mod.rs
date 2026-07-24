@@ -43,10 +43,12 @@ pub mod bucket {
 
         pub mod bucket_lifecycle_ops {
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
-                ExpiryState, LifecycleOps, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
-                apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
-                enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, post_restore_opts, run_stale_multipart_upload_cleanup_once, validate_transition_tier,
+                ExpiryState, LifecycleOps, ManualTransitionRunOptions, ManualTransitionRunReport, RestoreRequestOps,
+                TransitionState, TransitionedObject, apply_expiry_rule, apply_transition_rule,
+                enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
+                enqueue_transition_for_existing_objects_scoped, enqueue_transition_immediate, expire_transitioned_object,
+                get_global_expiry_state, get_global_transition_state, init_background_expiry, post_restore_opts,
+                run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }
 

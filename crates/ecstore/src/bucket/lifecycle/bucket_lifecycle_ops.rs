@@ -991,6 +991,21 @@ enum ImmediateEnqueueFailure {
     QueueSendTimedOut { timeout_ms: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitionEnqueueOutcome {
+    Queued,
+    AlreadyInFlight,
+    QueueFull,
+    QueueClosed,
+    QueueSendTimedOut,
+}
+
+impl TransitionEnqueueOutcome {
+    fn is_handled(self) -> bool {
+        matches!(self, Self::Queued | Self::AlreadyInFlight)
+    }
+}
+
 impl TransitionState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<Self> {
@@ -1213,12 +1228,17 @@ impl TransitionState {
         }
     }
 
-    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
+    async fn queue_transition_task_outcome(
+        self: &Arc<Self>,
+        oi: &ObjectInfo,
+        event: &lifecycle::Event,
+        src: &LcEventSrc,
+    ) -> TransitionEnqueueOutcome {
         if is_immediate_transition_source(src) && should_force_immediate_transition_enqueue_timeout() {
             self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::ForcedTimeout);
             record_scanner_transition_enqueue_result(src, 1, false);
             self.record_scanner_transition_state();
-            return false;
+            return TransitionEnqueueOutcome::QueueSendTimedOut;
         }
 
         // Deduplicate concurrent enqueues of the same object version. The claim is
@@ -1227,7 +1247,7 @@ impl TransitionState {
         // counters (the first enqueue already counted this object).
         if !self.reserve_transition(oi) {
             self.record_scanner_transition_state();
-            return true;
+            return TransitionEnqueueOutcome::AlreadyInFlight;
         }
 
         let task = TransitionTask {
@@ -1237,6 +1257,7 @@ impl TransitionState {
         };
         let mut queued = false;
         if is_immediate_transition_source(src) {
+            let mut failure = None;
             match self.transition_tx.try_send(Some(task)) {
                 Ok(()) => queued = true,
                 Err(async_channel::TrySendError::Full(task)) => {
@@ -1252,6 +1273,7 @@ impl TransitionState {
                                     timeout_ms: Some(send_timeout.as_millis() as u64),
                                 },
                             );
+                            failure = Some(TransitionEnqueueOutcome::QueueClosed);
                         }
                         Err(_) => {
                             self.handle_immediate_enqueue_failure(
@@ -1261,11 +1283,13 @@ impl TransitionState {
                                     timeout_ms: send_timeout.as_millis() as u64,
                                 },
                             );
+                            failure = Some(TransitionEnqueueOutcome::QueueSendTimedOut);
                         }
                     }
                 }
                 Err(async_channel::TrySendError::Closed(_task)) => {
                     self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::QueueClosed { timeout_ms: None });
+                    failure = Some(TransitionEnqueueOutcome::QueueClosed);
                 }
             }
             if !queued {
@@ -1273,13 +1297,19 @@ impl TransitionState {
             }
             record_scanner_transition_enqueue_result(src, 1, queued);
             self.record_scanner_transition_state();
-            return queued;
+            return if queued {
+                TransitionEnqueueOutcome::Queued
+            } else {
+                failure.unwrap_or(TransitionEnqueueOutcome::QueueFull)
+            };
         }
 
+        let mut failure = None;
         match self.transition_tx.try_send(Some(task)) {
             Ok(()) => queued = true,
             Err(async_channel::TrySendError::Full(_)) => {
                 Self::inc_counter(&self.queue_full_tasks);
+                failure = Some(TransitionEnqueueOutcome::QueueFull);
                 debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
@@ -1298,6 +1328,7 @@ impl TransitionState {
                     state = "queue_closed",
                     "transition enqueue failed because the queue is closed"
                 );
+                failure = Some(TransitionEnqueueOutcome::QueueClosed);
             }
         }
         if !queued {
@@ -1305,7 +1336,15 @@ impl TransitionState {
         }
         record_scanner_transition_enqueue_result(src, 1, queued);
         self.record_scanner_transition_state();
-        queued
+        if queued {
+            TransitionEnqueueOutcome::Queued
+        } else {
+            failure.unwrap_or(TransitionEnqueueOutcome::QueueFull)
+        }
+    }
+
+    pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
+        self.queue_transition_task_outcome(oi, event, src).await.is_handled()
     }
 
     pub async fn init(api: Arc<ECStore>) {
@@ -2402,10 +2441,72 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ManualTransitionRunOptions {
+    pub prefix: String,
+    pub tier: Option<String>,
+    pub dry_run: bool,
+    pub max_objects: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ManualTransitionRunReport {
+    pub bucket: String,
+    pub prefix: String,
+    pub tier: Option<String>,
+    pub dry_run: bool,
+    pub lifecycle_config_found: bool,
+    pub scanned: u64,
+    pub eligible: u64,
+    pub enqueued: u64,
+    pub dry_run_eligible: u64,
+    pub skipped_not_transition: u64,
+    pub skipped_tier: u64,
+    pub skipped_delete_marker: u64,
+    pub skipped_directory: u64,
+    pub skipped_replication: u64,
+    pub skipped_already_in_flight: u64,
+    pub skipped_queue_full: u64,
+    pub skipped_queue_closed: u64,
+    pub skipped_queue_timeout: u64,
+    pub truncated_by_limit: bool,
+    pub next_marker: Option<String>,
+    pub next_version_idmarker: Option<String>,
+}
+
+impl ManualTransitionRunReport {
+    fn new(bucket: &str, options: &ManualTransitionRunOptions) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            prefix: options.prefix.clone(),
+            tier: options.tier.clone(),
+            dry_run: options.dry_run,
+            ..Default::default()
+        }
+    }
+
+    pub fn has_partial_enqueue(&self) -> bool {
+        self.skipped_queue_full > 0 || self.skipped_queue_closed > 0 || self.skipped_queue_timeout > 0
+    }
+}
+
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    let _ = enqueue_transition_for_existing_objects_scoped(api, bucket, ManualTransitionRunOptions::default()).await?;
+    Ok(())
+}
+
+pub async fn enqueue_transition_for_existing_objects_scoped(
+    api: Arc<ECStore>,
+    bucket: &str,
+    options: ManualTransitionRunOptions,
+) -> Result<ManualTransitionRunReport, Error> {
+    const LIST_PAGE_SIZE: i32 = 1000;
+
+    let mut report = ManualTransitionRunReport::new(bucket, &options);
     let Some(lc) = runtime_sources::bucket_lifecycle_config(bucket).await else {
-        return Ok(());
+        return Ok(report);
     };
+    report.lifecycle_config_found = true;
     let mut marker = None;
     let mut version_marker = None;
     let src = LcEventSrc::Scanner;
@@ -2413,15 +2514,22 @@ pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: 
     loop {
         let page = api
             .clone()
-            .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
+            .list_object_versions(bucket, &options.prefix, marker.clone(), version_marker.clone(), None, LIST_PAGE_SIZE)
             .await?;
 
         for object in &page.objects {
-            enqueue_transition_with_lifecycle(object, &lc, &src).await;
+            report.scanned = report.scanned.saturating_add(1);
+            enqueue_transition_with_lifecycle_report(object, &lc, &src, &options, &mut report).await;
+            if options.max_objects.is_some_and(|max_objects| report.scanned >= max_objects) {
+                report.truncated_by_limit = true;
+                report.next_marker = Some(object.name.clone());
+                report.next_version_idmarker = object.version_id.map(|version| version.to_string());
+                return Ok(report);
+            }
         }
 
         if !page.is_truncated {
-            return Ok(());
+            return Ok(report);
         }
 
         marker = page.next_marker;
@@ -2615,23 +2723,70 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
     }
 }
 
-async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycleConfiguration, src: &LcEventSrc) -> bool {
+async fn enqueue_transition_with_lifecycle_report(
+    oi: &ObjectInfo,
+    lc: &BucketLifecycleConfiguration,
+    src: &LcEventSrc,
+    options: &ManualTransitionRunOptions,
+    report: &mut ManualTransitionRunReport,
+) -> bool {
     let event = lc.eval(&oi.to_lifecycle_opts()).await;
     match event.action {
         IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
             if oi.delete_marker || oi.is_dir {
+                if oi.delete_marker {
+                    report.skipped_delete_marker = report.skipped_delete_marker.saturating_add(1);
+                } else {
+                    report.skipped_directory = report.skipped_directory.saturating_add(1);
+                }
                 return false;
             }
             if lifecycle_action_blocked_by_replication(event.action, oi) {
+                report.skipped_replication = report.skipped_replication.saturating_add(1);
                 return false;
             }
-            return runtime_sources::transition_state_handle()
-                .queue_transition_task(oi, &event, src)
+            if options
+                .tier
+                .as_deref()
+                .is_some_and(|tier| !event.storage_class.eq_ignore_ascii_case(tier))
+            {
+                report.skipped_tier = report.skipped_tier.saturating_add(1);
+                return false;
+            }
+            report.eligible = report.eligible.saturating_add(1);
+            if options.dry_run {
+                report.dry_run_eligible = report.dry_run_eligible.saturating_add(1);
+                return true;
+            }
+            let outcome = runtime_sources::transition_state_handle()
+                .queue_transition_task_outcome(oi, &event, src)
                 .await;
+            match outcome {
+                TransitionEnqueueOutcome::Queued => report.enqueued = report.enqueued.saturating_add(1),
+                TransitionEnqueueOutcome::AlreadyInFlight => {
+                    report.skipped_already_in_flight = report.skipped_already_in_flight.saturating_add(1);
+                }
+                TransitionEnqueueOutcome::QueueFull => {
+                    report.skipped_queue_full = report.skipped_queue_full.saturating_add(1);
+                }
+                TransitionEnqueueOutcome::QueueClosed => {
+                    report.skipped_queue_closed = report.skipped_queue_closed.saturating_add(1);
+                }
+                TransitionEnqueueOutcome::QueueSendTimedOut => {
+                    report.skipped_queue_timeout = report.skipped_queue_timeout.saturating_add(1);
+                }
+            }
+            return outcome.is_handled();
         }
-        _ => (),
+        _ => report.skipped_not_transition = report.skipped_not_transition.saturating_add(1),
     }
     false
+}
+
+async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycleConfiguration, src: &LcEventSrc) -> bool {
+    let options = ManualTransitionRunOptions::default();
+    let mut report = ManualTransitionRunReport::new(&oi.bucket, &options);
+    enqueue_transition_with_lifecycle_report(oi, lc, src, &options, &mut report).await
 }
 
 /// Build the delete options for a lifecycle expiry event on a transitioned
@@ -3459,10 +3614,11 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, FreeVersionTask, StaleMultipartUploadCandidate,
-        TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TierFreeVersionRecoverySchedule,
-        TransitionState, TransitionedObject, VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks,
-        cleanup_stale_multipart_uploads_once_at, enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle,
+        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, FreeVersionTask, ManualTransitionRunOptions, ManualTransitionRunReport,
+        StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
+        TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
+        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report,
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
@@ -5596,6 +5752,32 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn queue_transition_task_outcome_reports_duplicate_separately() {
+        let state = TransitionState::new_with_capacity(4);
+        let object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        let first = state
+            .queue_transition_task_outcome(&object, &event, &LcEventSrc::Scanner)
+            .await;
+        let second = state
+            .queue_transition_task_outcome(&object, &event, &LcEventSrc::Scanner)
+            .await;
+
+        assert_eq!(first, TransitionEnqueueOutcome::Queued);
+        assert_eq!(second, TransitionEnqueueOutcome::AlreadyInFlight);
+        assert_eq!(state.transition_rx.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn queue_transition_task_dedupes_immediate_and_scanner_sources_for_same_version() {
         let state = TransitionState::new_with_capacity(4);
         let version_id = Uuid::new_v4();
@@ -6029,6 +6211,62 @@ mod tests {
         let queued = enqueue_transition_with_lifecycle(&object, &lc, &LcEventSrc::Scanner).await;
 
         assert!(!queued);
+    }
+
+    #[tokio::test]
+    async fn manual_transition_dry_run_counts_due_object_without_enqueue() {
+        let lc = latest_transition_lifecycle();
+        let object = current_object(ReplicationStatusType::Completed);
+        let options = ManualTransitionRunOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
+
+        let handled = enqueue_transition_with_lifecycle_report(&object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+
+        assert!(handled);
+        assert_eq!(report.eligible, 1);
+        assert_eq!(report.dry_run_eligible, 1);
+        assert_eq!(report.enqueued, 0);
+    }
+
+    #[tokio::test]
+    async fn manual_transition_respects_not_yet_due_lifecycle_rule() {
+        let lc = latest_transition_lifecycle();
+        let object = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..current_object(ReplicationStatusType::Completed)
+        };
+        let options = ManualTransitionRunOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
+
+        let handled = enqueue_transition_with_lifecycle_report(&object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+
+        assert!(!handled);
+        assert_eq!(report.eligible, 0);
+        assert_eq!(report.skipped_not_transition, 1);
+    }
+
+    #[tokio::test]
+    async fn manual_transition_tier_filter_skips_non_matching_transition() {
+        let lc = latest_transition_lifecycle();
+        let object = current_object(ReplicationStatusType::Completed);
+        let options = ManualTransitionRunOptions {
+            tier: Some("COLD".to_string()),
+            dry_run: true,
+            ..Default::default()
+        };
+        let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
+
+        let handled = enqueue_transition_with_lifecycle_report(&object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+
+        assert!(!handled);
+        assert_eq!(report.eligible, 0);
+        assert_eq!(report.skipped_tier, 1);
     }
 
     #[tokio::test]
