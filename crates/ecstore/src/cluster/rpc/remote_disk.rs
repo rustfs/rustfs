@@ -3075,6 +3075,41 @@ mod tests {
     }
 
     #[test]
+    fn compat_json_restores_json_when_either_msgpack_only_gate_is_removed() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(json.is_empty(), "both gates should enter msgpack-only send mode");
+            },
+        );
+
+        for vars in [
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("false")),
+            ],
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("false")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+        ] {
+            with_internode_msgpack_env(vars, || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(!json.is_empty(), "removing either gate should restore old-peer JSON compatibility");
+                assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+            });
+        }
+    }
+
+    #[test]
     fn read_multiple_response_decode_reports_corrupt_msgpack_item() {
         let endpoint = sample_remote_endpoint();
         let response = ReadMultipleResponse {
