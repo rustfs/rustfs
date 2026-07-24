@@ -51,6 +51,9 @@ struct ManualTransitionRunQuery {
     #[serde(rename = "versionMarker")]
     version_marker: Option<String>,
     tier: Option<String>,
+    #[serde(rename = "async")]
+    async_mode: Option<bool>,
+    mode: Option<String>,
     #[serde(rename = "dryRun")]
     dry_run: Option<bool>,
     #[serde(rename = "maxObjects")]
@@ -92,6 +95,23 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
         .ok_or_else(|| s3_error!(InvalidRequest, "bucket is required"))?;
     if is_reserved_or_invalid_bucket(bucket, false) {
         return Err(s3_error!(InvalidBucketName, "invalid bucket name"));
+    }
+
+    let mode = query.mode.as_deref().map(str::trim).filter(|mode| !mode.is_empty());
+    if matches!(
+        (query.async_mode, mode),
+        (Some(true), Some("enqueue_only")) | (Some(false), Some("async"))
+    ) {
+        return Err(s3_error!(InvalidArgument, "conflicting manual transition mode"));
+    }
+    if mode.is_some_and(|mode| mode != "enqueue_only" && mode != "async") {
+        return Err(s3_error!(InvalidArgument, "unsupported manual transition mode"));
+    }
+    if query.async_mode == Some(true) || mode == Some("async") {
+        return Err(S3Error::with_message(
+            S3ErrorCode::NotImplemented,
+            "durable manual transition jobs are not implemented; omit async/mode for enqueue_only",
+        ));
     }
 
     let max_objects = query.max_objects.unwrap_or(DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS);
@@ -327,6 +347,49 @@ mod tests {
             parse_manual_transition_query(Some("bucket=data&maxDurationSeconds=30")).expect("valid query should parse");
 
         assert_eq!(options.max_duration, Some(std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn manual_transition_query_accepts_explicit_enqueue_only_mode() {
+        let (_bucket, options) = parse_manual_transition_query(Some("bucket=data&mode=enqueue_only&async=false"))
+            .expect("explicit enqueue_only mode should remain compatible");
+
+        assert!(!options.dry_run);
+        assert_eq!(options.max_objects, Some(DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS));
+    }
+
+    #[test]
+    fn manual_transition_query_rejects_unimplemented_durable_mode() {
+        let err = parse_manual_transition_query(Some("bucket=data&async=true"))
+            .expect_err("async durable jobs must not be silently accepted");
+
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+
+        let err = parse_manual_transition_query(Some("bucket=data&mode=async"))
+            .expect_err("mode=async must not fall back to enqueue_only");
+
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[test]
+    fn manual_transition_query_rejects_conflicting_mode_flags() {
+        let err = parse_manual_transition_query(Some("bucket=data&async=true&mode=enqueue_only"))
+            .expect_err("conflicting async and enqueue_only flags must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+
+        let err = parse_manual_transition_query(Some("bucket=data&async=false&mode=async"))
+            .expect_err("conflicting async=false and mode=async flags must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn manual_transition_query_rejects_unknown_mode() {
+        let err = parse_manual_transition_query(Some("bucket=data&mode=background"))
+            .expect_err("unknown mode must not be silently accepted");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
     #[test]
