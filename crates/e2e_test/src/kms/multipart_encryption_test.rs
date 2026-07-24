@@ -566,14 +566,19 @@ async fn test_multipart_encryption_type(
         .set_parts(Some(completed_parts))
         .build();
 
-    let _complete_output = s3_client
+    let mut complete_request = s3_client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(object_key)
         .upload_id(upload_id)
-        .multipart_upload(completed_multipart_upload)
-        .send()
-        .await?;
+        .multipart_upload(completed_multipart_upload);
+    if matches!(encryption_type, EncryptionType::SSEC) {
+        complete_request = complete_request
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(sse_c_key.as_ref().unwrap())
+            .sse_customer_key_md5(sse_c_md5.as_ref().unwrap());
+    }
+    let _complete_output = complete_request.send().await?;
 
     // Download and verify
     let mut get_request = s3_client.get_object().bucket(bucket).key(object_key);
