@@ -44,7 +44,7 @@ on:
       push_images:
         description: "Push images to registries"
         required: false
-        default: true
+        default: 
         type: boolean
       version:
         description: "Version to build (latest for stable release, or specific version like v1.0.0, v1.0.0-alpha1)"
@@ -458,7 +458,7 @@ jobs:
           image-ref: ${{ env.REGISTRY_GHCR }}:${{ needs.build-check.outputs.version }}${{ matrix.suffix }}
           format: sarif
           output: trivy-${{ matrix.variant }}.sarif
-          ignore-unfixed: true
+          ignore-unfixed: 
           vuln-type: os,library
           severity: CRITICAL,HIGH
           exit-code: "0"
