@@ -97,7 +97,7 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::{LazyLock, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -117,8 +117,6 @@ const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_RESYNC_STATUS: &str = "status";
 const SITE_REPL_RESYNC_DEFAULT_PAGE_SIZE: usize = 100;
 const SITE_REPL_RESYNC_MAX_PAGE_SIZE: usize = 1000;
-const SITE_REPL_MIN_NETPERF_DURATION: Duration = Duration::from_secs(1);
-const SITE_REPL_MAX_NETPERF_DURATION: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
@@ -765,14 +763,6 @@ fn json_response<T: Serialize>(value: &T) -> S3Result<S3Response<(StatusCode, Bo
 fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> S3Response<(StatusCode, Body)> {
     let data = encode_go_gob_site_netperf_node_result(value);
     S3Response::new((StatusCode::OK, Body::from(data)))
-}
-
-fn site_repl_netperf_duration(uri: &Uri) -> Duration {
-    query_pairs(uri)
-        .get("duration")
-        .and_then(|value| rustfs_madmin::utils::parse_duration(value).ok())
-        .unwrap_or(SITE_REPL_MIN_NETPERF_DURATION)
-        .clamp(SITE_REPL_MIN_NETPERF_DURATION, SITE_REPL_MAX_NETPERF_DURATION)
 }
 
 fn encode_go_gob_site_netperf_node_result(value: &SiteNetPerfNodeResult) -> Vec<u8> {
@@ -6985,26 +6975,24 @@ impl Operation for SiteReplicationDevNullHandler {
 
 pub struct SiteReplicationNetPerfHandler {}
 
+fn unsupported_site_netperf_result(endpoint: String) -> SiteNetPerfNodeResult {
+    SiteNetPerfNodeResult {
+        endpoint,
+        tx: 0,
+        tx_total_duration_ns: 0,
+        rx: 0,
+        rx_total_duration_ns: 0,
+        total_conn: 0,
+        error: "site-replication netperf is unsupported because RustFS does not perform peer traffic".to_string(),
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for SiteReplicationNetPerfHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        let duration = site_repl_netperf_duration(&req.uri);
-
         let endpoint = request_endpoint(&req.uri, &req.headers);
-        let started_at = Instant::now();
-        let body = read_plain_admin_body(req.input).await?;
-        let elapsed = started_at.elapsed().max(duration);
-
-        Ok(go_gob_site_netperf_response(&SiteNetPerfNodeResult {
-            endpoint,
-            tx: body.len() as u64,
-            tx_total_duration_ns: elapsed.as_nanos() as i64,
-            rx: body.len() as u64,
-            rx_total_duration_ns: elapsed.as_nanos() as i64,
-            total_conn: 1,
-            error: String::new(),
-        }))
+        Ok(go_gob_site_netperf_response(&unsupported_site_netperf_result(endpoint)))
     }
 }
 
@@ -11823,16 +11811,14 @@ mod tests {
     }
 
     #[test]
-    fn test_site_repl_netperf_duration_is_bounded() {
-        let default_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf");
-        let too_short_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf?duration=0s");
-        let too_long_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf?duration=60s");
-        let valid_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf?duration=5s");
+    fn test_site_repl_netperf_reports_unsupported_without_measurements() {
+        let result = unsupported_site_netperf_result("https://peer.example.com".to_string());
 
-        assert_eq!(site_repl_netperf_duration(&default_uri), SITE_REPL_MIN_NETPERF_DURATION);
-        assert_eq!(site_repl_netperf_duration(&too_short_uri), SITE_REPL_MIN_NETPERF_DURATION);
-        assert_eq!(site_repl_netperf_duration(&too_long_uri), SITE_REPL_MAX_NETPERF_DURATION);
-        assert_eq!(site_repl_netperf_duration(&valid_uri), Duration::from_secs(5));
+        assert_eq!(result.endpoint, "https://peer.example.com");
+        assert_eq!(result.tx, 0);
+        assert_eq!(result.rx, 0);
+        assert_eq!(result.total_conn, 0);
+        assert!(result.error.contains("unsupported"));
     }
 
     #[test]
@@ -11858,6 +11844,33 @@ mod tests {
             0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x70, 0x65, 0x65, 0x72, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e,
             0x63, 0x6f, 0x6d, 0x01, 0x7b, 0x01, 0xfe, 0x03, 0x90, 0x01, 0xfe, 0x03, 0x15, 0x01, 0xfe, 0x02, 0x82, 0x01, 0x03,
             0x00,
+        ];
+
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_gob_site_netperf_unsupported_error_matches_go_encoding() {
+        let data =
+            encode_go_gob_site_netperf_node_result(&unsupported_site_netperf_result("https://peer.example.com".to_string()));
+
+        // Generated independently with Go's encoding/gob Encoder from the
+        // MinIO-compatible SiteNetPerfNodeResult shape. This specifically
+        // covers the field delta from Endpoint to Error when all counters are zero.
+        let expected: &[u8] = &[
+            0x7d, 0x7f, 0x03, 0x01, 0x01, 0x15, 0x53, 0x69, 0x74, 0x65, 0x4e, 0x65, 0x74, 0x50, 0x65, 0x72, 0x66, 0x4e, 0x6f,
+            0x64, 0x65, 0x52, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x01, 0xff, 0x80, 0x00, 0x01, 0x07, 0x01, 0x08, 0x45, 0x6e, 0x64,
+            0x70, 0x6f, 0x69, 0x6e, 0x74, 0x01, 0x0c, 0x00, 0x01, 0x02, 0x54, 0x58, 0x01, 0x06, 0x00, 0x01, 0x0f, 0x54, 0x58,
+            0x54, 0x6f, 0x74, 0x61, 0x6c, 0x44, 0x75, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x01, 0x04, 0x00, 0x01, 0x02, 0x52,
+            0x58, 0x01, 0x06, 0x00, 0x01, 0x0f, 0x52, 0x58, 0x54, 0x6f, 0x74, 0x61, 0x6c, 0x44, 0x75, 0x72, 0x61, 0x74, 0x69,
+            0x6f, 0x6e, 0x01, 0x04, 0x00, 0x01, 0x09, 0x54, 0x6f, 0x74, 0x61, 0x6c, 0x43, 0x6f, 0x6e, 0x6e, 0x01, 0x06, 0x00,
+            0x01, 0x05, 0x45, 0x72, 0x72, 0x6f, 0x72, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x73, 0xff, 0x80, 0x01, 0x18, 0x68, 0x74,
+            0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x70, 0x65, 0x65, 0x72, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e,
+            0x63, 0x6f, 0x6d, 0x06, 0x54, 0x73, 0x69, 0x74, 0x65, 0x2d, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69,
+            0x6f, 0x6e, 0x20, 0x6e, 0x65, 0x74, 0x70, 0x65, 0x72, 0x66, 0x20, 0x69, 0x73, 0x20, 0x75, 0x6e, 0x73, 0x75, 0x70,
+            0x70, 0x6f, 0x72, 0x74, 0x65, 0x64, 0x20, 0x62, 0x65, 0x63, 0x61, 0x75, 0x73, 0x65, 0x20, 0x52, 0x75, 0x73, 0x74,
+            0x46, 0x53, 0x20, 0x64, 0x6f, 0x65, 0x73, 0x20, 0x6e, 0x6f, 0x74, 0x20, 0x70, 0x65, 0x72, 0x66, 0x6f, 0x72, 0x6d,
+            0x20, 0x70, 0x65, 0x65, 0x72, 0x20, 0x74, 0x72, 0x61, 0x66, 0x66, 0x69, 0x63, 0x00,
         ];
 
         assert_eq!(data, expected);
