@@ -554,11 +554,11 @@ impl DefaultMultipartUsecase {
         // checksum: stored (decrypted) values take precedence over the request input;
         // additional algorithms (XXHash3/64/128, SHA-512, MD5), which have no typed
         // CompleteMultipartUploadOutput field, are echoed as raw response headers (#1261).
-        let (checksums, _is_multipart) = obj_info
+        let (checksums, is_multipart) = obj_info
             .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
             .map_err(ApiError::from)?;
 
-        let classified = crate::app::object_usecase::classify_response_checksums(checksums);
+        let classified = crate::app::object_usecase::classify_response_checksums(checksums, is_multipart);
         let checksum_crc32 = classified.crc32.or(input.checksum_crc32);
         let checksum_crc32c = classified.crc32c.or(input.checksum_crc32c);
         let checksum_sha1 = classified.sha1.or(input.checksum_sha1);
@@ -1352,6 +1352,7 @@ impl DefaultMultipartUsecase {
             checksum_crc64nvme: checksum_value(rustfs_rio::ChecksumType::CRC64_NVME),
             e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
+            ..Default::default()
         };
 
         let output = UploadPartCopyOutput {
