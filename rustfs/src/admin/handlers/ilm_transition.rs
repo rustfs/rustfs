@@ -38,6 +38,9 @@ const MAX_MANUAL_TRANSITION_OBJECTS: u64 = 100_000;
 struct ManualTransitionRunQuery {
     bucket: Option<String>,
     prefix: Option<String>,
+    marker: Option<String>,
+    #[serde(rename = "versionMarker")]
+    version_marker: Option<String>,
     tier: Option<String>,
     #[serde(rename = "dryRun")]
     dry_run: Option<bool>,
@@ -90,6 +93,8 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
         bucket.to_string(),
         ManualTransitionRunOptions {
             prefix: query.prefix.unwrap_or_default(),
+            marker: query.marker.filter(|marker| !marker.is_empty()),
+            version_marker: query.version_marker.filter(|version_marker| !version_marker.is_empty()),
             tier: query.tier.map(|tier| tier.trim().to_string()).filter(|tier| !tier.is_empty()),
             dry_run: query.dry_run.unwrap_or(false),
             max_objects: Some(max_objects),
@@ -172,10 +177,13 @@ mod tests {
     #[test]
     fn manual_transition_query_defaults_to_bounded_run() {
         let (bucket, options) =
-            parse_manual_transition_query(Some("bucket=data&prefix=logs/&tier=warm")).expect("valid query should parse");
+            parse_manual_transition_query(Some("bucket=data&prefix=logs/&marker=logs/a&versionMarker=v1&tier=warm"))
+                .expect("valid query should parse");
 
         assert_eq!(bucket, "data");
         assert_eq!(options.prefix, "logs/");
+        assert_eq!(options.marker.as_deref(), Some("logs/a"));
+        assert_eq!(options.version_marker.as_deref(), Some("v1"));
         assert_eq!(options.tier.as_deref(), Some("warm"));
         assert!(!options.dry_run);
         assert_eq!(options.max_objects, Some(DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS));

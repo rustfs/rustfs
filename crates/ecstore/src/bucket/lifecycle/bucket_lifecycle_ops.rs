@@ -2444,6 +2444,8 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ManualTransitionRunOptions {
     pub prefix: String,
+    pub marker: Option<String>,
+    pub version_marker: Option<String>,
     pub tier: Option<String>,
     pub dry_run: bool,
     pub max_objects: Option<u64>,
@@ -2507,8 +2509,8 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
         return Ok(report);
     };
     report.lifecycle_config_found = true;
-    let mut marker = None;
-    let mut version_marker = None;
+    let mut marker = options.marker.clone();
+    let mut version_marker = options.version_marker.clone();
     let src = LcEventSrc::Scanner;
 
     loop {
@@ -2517,13 +2519,15 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
             .list_object_versions(bucket, &options.prefix, marker.clone(), version_marker.clone(), None, LIST_PAGE_SIZE)
             .await?;
 
-        for object in &page.objects {
+        for (index, object) in page.objects.iter().enumerate() {
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(object, &lc, &src, &options, &mut report).await;
             if options.max_objects.is_some_and(|max_objects| report.scanned >= max_objects) {
-                report.truncated_by_limit = true;
-                report.next_marker = Some(object.name.clone());
-                report.next_version_idmarker = object.version_id.map(|version| version.to_string());
+                if manual_transition_has_more_after_limit(index, page.objects.len(), page.is_truncated) {
+                    report.truncated_by_limit = true;
+                    report.next_marker = Some(object.name.clone());
+                    report.next_version_idmarker = object.version_id.map(|version| version.to_string());
+                }
                 return Ok(report);
             }
         }
@@ -2721,6 +2725,10 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
         marker = page.next_marker;
         version_marker = page.next_version_idmarker;
     }
+}
+
+fn manual_transition_has_more_after_limit(page_index: usize, page_len: usize, page_is_truncated: bool) -> bool {
+    page_index.saturating_add(1) < page_len || page_is_truncated
 }
 
 async fn enqueue_transition_with_lifecycle_report(
@@ -3622,12 +3630,12 @@ mod tests {
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
-        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
-        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
-        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
-        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
-        wait_for_tier_free_version_recovery,
+        manual_transition_has_more_after_limit, mark_delete_opts_skip_decommissioned_on_remote_success,
+        merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_queue_capacity,
+        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
+        run_tier_free_version_recovery_loop, select_restore_s3_location, set_recovered_free_version_enqueue_observer,
+        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
+        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -6267,6 +6275,13 @@ mod tests {
         assert!(!handled);
         assert_eq!(report.eligible, 0);
         assert_eq!(report.skipped_tier, 1);
+    }
+
+    #[test]
+    fn manual_transition_limit_boundary_only_truncates_when_more_objects_exist() {
+        assert!(!manual_transition_has_more_after_limit(9, 10, false));
+        assert!(manual_transition_has_more_after_limit(9, 11, false));
+        assert!(manual_transition_has_more_after_limit(9, 10, true));
     }
 
     #[tokio::test]
