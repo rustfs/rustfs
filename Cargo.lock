@@ -8928,6 +8928,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-storage-api",
  "rustfs-targets",
+ "rustfs-test-utils",
  "rustfs-tls-runtime",
  "rustfs-trusted-proxies",
  "rustfs-utils",

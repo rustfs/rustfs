@@ -18,9 +18,9 @@ use crate::admin::{
     runtime_sources::{current_action_credentials, current_ready_iam_handle, current_token_signing_key},
 };
 use rustfs_iam::{
-    federation::{FederatedSessionBinding, FederatedSessionBindingError, FederatedSessionTransaction},
-    store::object::ObjectStore,
-    sys::IamSys,
+    federation::{FederatedSessionBinding, FederatedSessionBindingError, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM},
+    store::{MappedPolicy, object::ObjectStore},
+    sys::{IamSys, is_safe_claim_policy_name},
 };
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
 use rustfs_policy::auth::get_new_credentials_with_metadata;
@@ -31,6 +31,17 @@ use time::{Duration, OffsetDateTime};
 use tracing::{debug, warn};
 
 pub(crate) struct DefaultFederatedSessionBinding;
+
+// Legacy receivers reject an empty parsed mapping; current receivers ignore it when the virtual-parent marker is present.
+const OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY: &str = " ";
+
+fn all_oidc_policies_resolved(selected_policy_names: &[String], resolved_policy_mapping: &str) -> bool {
+    let resolved_policy_names = MappedPolicy::new(resolved_policy_mapping).to_slice();
+    !selected_policy_names.is_empty()
+        && selected_policy_names
+            .iter()
+            .all(|policy_name| is_safe_claim_policy_name(policy_name) && resolved_policy_names.contains(policy_name))
+}
 
 fn build_oidc_token_claims(transaction: &FederatedSessionTransaction) -> HashMap<String, Value> {
     let authorization = &transaction.authorization;
@@ -168,22 +179,23 @@ fn parent_user_is_reserved(parent_user: &str, root_access_key: Option<&str>) -> 
 
 fn issue_credentials(
     transaction: &FederatedSessionTransaction,
+    selected_policy_names: &[String],
     secret: Option<&str>,
 ) -> Result<rustfs_credentials::Credentials, FederatedSessionBindingError> {
     let authorization = &transaction.authorization;
     let claims = &authorization.claims;
+    let parent_user = authorization.oidc_virtual_parent().ok_or_else(|| {
+        FederatedSessionBindingError::InvalidRequest("verified OIDC identity is missing issuer or subject".to_string())
+    })?;
     let mut token_claims = build_oidc_token_claims(transaction);
     let duration = i64::try_from(transaction.duration_seconds)
         .map_err(|_| FederatedSessionBindingError::InvalidRequest("invalid duration".to_string()))?;
     let exp = OffsetDateTime::now_utc().saturating_add(Duration::seconds(duration));
     token_claims.insert("exp".to_string(), Value::Number(serde_json::Number::from(exp.unix_timestamp())));
 
-    let parent_user = claims.session_identity();
     // Fail closed if the derived federated parent collides with the root access key. At IAM
-    // request time `parent_user == root access key` is treated as owner (see auth.rs and
-    // rustfs_iam owner resolution), so issuing such a credential would silently grant a
-    // federated identity full owner access purely because its display name matched root.
-    // Deny before any credential generation, `set_temp_user`, or site replication.
+    // request time `parent_user == root access key` is treated as owner, so issuing such a
+    // credential would silently grant a federated identity full owner access.
     let root_access_key = current_action_credentials().map(|cred| cred.access_key);
     if parent_user_is_reserved(&parent_user, root_access_key.as_deref()) {
         return Err(FederatedSessionBindingError::InvalidRequest(
@@ -205,9 +217,12 @@ fn issue_credentials(
         "OIDC STS credential claims prepared"
     );
     token_claims.insert("parent".to_string(), Value::String(parent_user.clone()));
+    token_claims.insert(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.clone()));
 
-    if !authorization.policies.is_empty() {
-        token_claims.insert("policy".to_string(), Value::String(authorization.policies.join(",")));
+    if !selected_policy_names.is_empty() {
+        token_claims.insert("policy".to_string(), Value::String(selected_policy_names.join(",")));
+    } else {
+        token_claims.remove("policy");
     }
     if let Some(policy) = transaction.session_policy.as_deref() {
         populate_session_policy(&mut token_claims, policy).map_err(binding_error_from_s3)?;
@@ -221,11 +236,7 @@ fn issue_credentials(
     Ok(credentials)
 }
 
-fn site_replication_item(
-    credentials: &rustfs_credentials::Credentials,
-    transaction: &FederatedSessionTransaction,
-    updated_at: OffsetDateTime,
-) -> SRIAMItem {
+fn site_replication_item(credentials: &rustfs_credentials::Credentials, updated_at: OffsetDateTime) -> SRIAMItem {
     SRIAMItem {
         r#type: "sts-credential".to_string(),
         sts_credential: Some(SRSTSCredential {
@@ -233,7 +244,7 @@ fn site_replication_item(
             secret_key: credentials.secret_key.clone(),
             session_token: credentials.session_token.clone(),
             parent_user: credentials.parent_user.clone(),
-            parent_policy_mapping: transaction.authorization.policies.join(","),
+            parent_policy_mapping: OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY.to_string(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         }),
         updated_at: Some(updated_at),
@@ -249,17 +260,35 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         transaction: &FederatedSessionTransaction,
     ) -> Result<rustfs_credentials::Credentials, FederatedSessionBindingError> {
         let authorization = &transaction.authorization;
-        let secret = current_token_signing_key();
-        let credentials = issue_credentials(transaction, secret.as_deref())?;
-
         let iam_store =
             current_ready_iam_handle().map_err(|_| FederatedSessionBindingError::Internal("IAM not initialized".to_string()))?;
+        let parent_user = authorization.oidc_virtual_parent().ok_or_else(|| {
+            FederatedSessionBindingError::InvalidRequest("verified OIDC identity is missing issuer or subject".to_string())
+        })?;
+        let selected_policy_names = match iam_store
+            .policy_db_get(&parent_user, &Some(authorization.groups.clone()))
+            .await
+            .map_err(|_| FederatedSessionBindingError::Internal("failed to resolve OIDC policy mapping".to_string()))?
+        {
+            mapped_policy_names if !mapped_policy_names.is_empty() => mapped_policy_names,
+            _ => authorization.policies.clone(),
+        };
+        let selected_policy_mapping = selected_policy_names.join(",");
+        let resolved_policy_mapping = iam_store.current_policies(&selected_policy_mapping).await;
+        if !all_oidc_policies_resolved(&selected_policy_names, &resolved_policy_mapping) {
+            return Err(FederatedSessionBindingError::InvalidRequest(
+                "OIDC policy mapping did not resolve to current policies".to_string(),
+            ));
+        }
+
+        let secret = current_token_signing_key();
+        let credentials = issue_credentials(transaction, &selected_policy_names, secret.as_deref())?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_oidc_policy_diagnostics(
                 &iam_store,
                 &authorization.provider_id,
                 &credentials.parent_user,
-                &authorization.policies,
+                &selected_policy_names,
                 &authorization.groups,
             )
             .await;
@@ -270,7 +299,7 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
             .await
             .map_err(|_| FederatedSessionBindingError::Internal("failed to store temp user".to_string()))?;
 
-        if let Err(err) = site_replication_iam_change_hook(site_replication_item(&credentials, transaction, updated_at)).await {
+        if let Err(err) = site_replication_iam_change_hook(site_replication_item(&credentials, updated_at)).await {
             warn!("site replication OIDC STS hook failed, err: {err}");
         }
 
@@ -292,7 +321,7 @@ mod tests {
                     email: "user@example.com".to_string(),
                     username: "user".to_string(),
                     groups: vec!["source-group".to_string()],
-                    raw: HashMap::new(),
+                    raw: HashMap::from([("iss".to_string(), serde_json::json!("https://idp.example.test"))]),
                 },
                 policies: vec!["readwrite".to_string()],
                 groups: vec!["devs".to_string()],
@@ -322,23 +351,32 @@ mod tests {
     fn issued_credentials_and_replication_item_preserve_existing_shape() {
         let transaction = transaction();
         let secret = "federated-session-test-signing-secret";
+        let selected_policy_names = vec!["readonly".to_string()];
 
-        let credentials = issue_credentials(&transaction, Some(secret)).expect("credential issuance should succeed");
-        assert_eq!(credentials.parent_user, "user");
+        let credentials =
+            issue_credentials(&transaction, &selected_policy_names, Some(secret)).expect("credential issuance should succeed");
+        assert_eq!(credentials.parent_user, "openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I");
         assert_eq!(credentials.groups, Some(vec!["devs".to_string()]));
 
         let claims = rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, secret)
             .expect("issued session token should verify");
         assert_eq!(claims.get("iss"), Some(&serde_json::json!("rustfs-oidc")));
         assert_eq!(claims.get("oidc_provider"), Some(&serde_json::json!("default")));
-        assert_eq!(claims.get("parent"), Some(&serde_json::json!("user")));
-        assert_eq!(claims.get("policy"), Some(&serde_json::json!("readwrite")));
+        assert_eq!(
+            claims.get("parent"),
+            Some(&serde_json::json!("openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I"))
+        );
+        assert_eq!(
+            claims.get(OIDC_VIRTUAL_PARENT_CLAIM),
+            Some(&serde_json::json!("openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I"))
+        );
+        assert_eq!(claims.get("policy"), Some(&serde_json::json!("readonly")));
         assert_eq!(claims.get("groups"), Some(&serde_json::json!(["devs"])));
         assert_eq!(claims.get("roles"), Some(&serde_json::json!(["admin", "reader"])));
         assert!(!claims.contains_key("oidc_issuer"));
 
         let updated_at = OffsetDateTime::UNIX_EPOCH;
-        let item = site_replication_item(&credentials, &transaction, updated_at);
+        let item = site_replication_item(&credentials, updated_at);
         assert_eq!(item.r#type, "sts-credential");
         assert_eq!(item.updated_at, Some(updated_at));
         assert_eq!(item.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
@@ -346,8 +384,10 @@ mod tests {
         assert_eq!(replicated.access_key, credentials.access_key);
         assert_eq!(replicated.secret_key, credentials.secret_key);
         assert_eq!(replicated.session_token, credentials.session_token);
-        assert_eq!(replicated.parent_user, "user");
-        assert_eq!(replicated.parent_policy_mapping, "readwrite");
+        assert_eq!(replicated.parent_user, "openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I");
+        assert_eq!(replicated.parent_policy_mapping, OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY);
+        assert!(replicated.parent_policy_mapping.trim().is_empty());
+        assert!(MappedPolicy::new(&replicated.parent_policy_mapping).to_slice().is_empty());
         assert_eq!(replicated.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
     }
 
@@ -356,7 +396,8 @@ mod tests {
         let mut transaction = transaction();
         transaction.session_policy = Some("not-json".to_string());
 
-        let error = issue_credentials(&transaction, None).expect_err("invalid policy should fail first");
+        let error = issue_credentials(&transaction, &transaction.authorization.policies, None)
+            .expect_err("invalid policy should fail first");
         assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
     }
 
@@ -377,9 +418,29 @@ mod tests {
         // Reuse the collision decision the issuance path applies: a federated identity whose
         // derived parent_user equals the root access key must be denied at issuance.
         let transaction = transaction();
-        let parent_user = transaction.authorization.claims.session_identity();
-        assert_eq!(parent_user, "user");
-        assert!(parent_user_is_reserved(&parent_user, Some("user")));
+        let parent_user = transaction
+            .authorization
+            .oidc_virtual_parent()
+            .expect("fixture must contain issuer and subject");
+        assert!(parent_user_is_reserved(&parent_user, Some(&parent_user)));
         assert!(!parent_user_is_reserved(&parent_user, Some("root")));
+    }
+
+    #[test]
+    fn missing_oidc_issuer_fails_closed_before_credential_issuance() {
+        let mut transaction = transaction();
+        transaction.authorization.claims.raw.clear();
+
+        let error = issue_credentials(&transaction, &transaction.authorization.policies, Some("signing-secret"))
+            .expect_err("credential issuance should reject a missing issuer");
+        assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn oidc_replication_requires_all_selected_policies() {
+        assert!(all_oidc_policies_resolved(&["readonly".to_string()], "readonly"));
+        assert!(!all_oidc_policies_resolved(&["readonly".to_string(), "missing".to_string()], "readonly"));
+        assert!(!all_oidc_policies_resolved(&[], ""));
+        assert!(!all_oidc_policies_resolved(&["team+readonly".to_string()], "team+readonly"));
     }
 }

@@ -126,18 +126,6 @@ pub(crate) async fn notify_iam_load_service_account(access_key: &str) -> Vec<Iam
     }
 }
 
-pub(crate) async fn notify_iam_delete_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
-    match runtime_sources::notification_sys() {
-        Some(notification_sys) => notification_sys
-            .delete_service_account(access_key)
-            .await
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-        None => Vec::new(),
-    }
-}
-
 pub(crate) async fn notify_iam_load_group(group: &str) -> Vec<IamNotificationPeerErr> {
     match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys.load_group(group).await.into_iter().map(Into::into).collect(),

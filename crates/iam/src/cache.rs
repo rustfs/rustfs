@@ -25,6 +25,7 @@ use rustfs_policy::{
     policy::{Args, PolicyDoc},
 };
 use time::OffsetDateTime;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 use crate::store::{GroupInfo, MappedPolicy};
@@ -63,6 +64,7 @@ impl Default for CacheState {
 pub struct Cache {
     state: ArcSwap<CacheState>,
     write_lock: Mutex<()>,
+    service_account_mutation_lock: AsyncMutex<()>,
 }
 
 impl Default for Cache {
@@ -70,6 +72,7 @@ impl Default for Cache {
         Self {
             state: ArcSwap::new(Arc::new(CacheState::default())),
             write_lock: Mutex::new(()),
+            service_account_mutation_lock: AsyncMutex::new(()),
         }
     }
 }
@@ -77,6 +80,10 @@ impl Default for Cache {
 pub(crate) type CacheSnapshot = Guard<Arc<CacheState>>;
 
 impl Cache {
+    pub(crate) fn service_account_mutation_lock(&self) -> &AsyncMutex<()> {
+        &self.service_account_mutation_lock
+    }
+
     pub(crate) fn snapshot(&self) -> CacheSnapshot {
         self.state.load()
     }
