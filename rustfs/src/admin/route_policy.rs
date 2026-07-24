@@ -53,6 +53,7 @@ const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const HEALTH_INFO: AdminActionRef = AdminActionRef::new("HealthInfoAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
+const INSPECT_DATA: AdminActionRef = AdminActionRef::new("InspectDataAction");
 const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
 const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
 const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
@@ -657,6 +658,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HEALTH_INFO,
         RouteRiskLevel::High,
     ),
+    admin(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA, RouteRiskLevel::High),
     // MinIO-compatible profiling / trace endpoints.
     admin(HttpMethod::Post, "/rustfs/admin/v3/profiling/start", PROFILING, RouteRiskLevel::High),
     admin(
@@ -1826,6 +1828,11 @@ mod tests {
     #[test]
     fn route_policy_maps_metrics_to_explicit_admin_action() {
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS);
+    }
+
+    #[test]
+    fn route_policy_requires_dedicated_inspect_action_for_encrypted_archive() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA);
     }
 
     #[test]

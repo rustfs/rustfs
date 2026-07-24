@@ -637,6 +637,7 @@ pub struct RuntimeCapabilitiesSummary {
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
     pub diagnostic_probes: DiagnosticProbeCapabilities,
+    pub inspect_archive: super::inspect_archive::InspectArchiveCapability,
     pub storage_classes: StorageClassCapabilities,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<CapabilityStatus>,
@@ -767,6 +768,7 @@ pub(crate) async fn build_runtime_capabilities_response()
     let observability = observability_provider.observability_snapshot().await?;
     let workload_admission = workload_admission_registry_snapshot();
     let cluster_snapshot_discovery = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
+    let local_drive_count = crate::storage::all_local_disk().await.len();
 
     let (topology, topology_status) = if let Some(endpoint_pools) = current_endpoints_handle() {
         let topology_provider = EndpointTopologySnapshotProvider::new(endpoint_pools);
@@ -785,6 +787,7 @@ pub(crate) async fn build_runtime_capabilities_response()
     Ok(RuntimeCapabilitiesResponse {
         summary,
         diagnostic_probes: DiagnosticProbeCapabilities::current(),
+        inspect_archive: super::inspect_archive::InspectArchiveCapability::current(local_drive_count),
         storage_classes: StorageClassCapabilities::current(),
         cluster_snapshot_path: usecase.cluster_snapshot_route().to_string(),
         cluster_snapshot_summary: cluster_snapshot_discovery.summary,
