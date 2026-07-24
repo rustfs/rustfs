@@ -1729,11 +1729,7 @@ async fn apply_managed_decryption_material(
         // When a test-injected provider is registered via set_sse_dek_provider_for_test,
         // use it instead of creating a fresh KmsSseDekProvider which cannot resolve
         // a KMS service without an AppContext.
-        if let Some(cached) = GLOBAL_SSE_DEK_PROVIDER
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned())
-        {
+        if let Some(cached) = GLOBAL_SSE_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
             cached
         } else {
             Arc::new(KmsSseDekProvider::new().await?)
@@ -4121,6 +4117,7 @@ mod tests {
         .await;
 
         manager.stop().await.expect("stop test KMS service");
+        reset_sse_dek_provider();
 
         let kms_envelope = br#"{
             "key_id": "test-key-id",
