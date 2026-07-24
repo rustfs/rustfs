@@ -2472,7 +2472,9 @@ pub struct ManualTransitionRunReport {
     pub skipped_queue_closed: u64,
     pub skipped_queue_timeout: u64,
     pub truncated_by_limit: bool,
+    #[serde(skip_serializing)]
     pub next_marker: Option<String>,
+    #[serde(skip_serializing)]
     pub next_version_idmarker: Option<String>,
 }
 
@@ -2511,6 +2513,8 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
     report.lifecycle_config_found = true;
     let mut marker = options.marker.clone();
     let mut version_marker = options.version_marker.clone();
+    let mut previous_marker = marker.clone();
+    let mut previous_version_marker = version_marker.clone();
     let src = LcEventSrc::Scanner;
 
     loop {
@@ -2522,14 +2526,21 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
         for (index, object) in page.objects.iter().enumerate() {
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(object, &lc, &src, &options, &mut report).await;
+            if report.has_partial_enqueue() {
+                report.next_marker.clone_from(&previous_marker);
+                report.next_version_idmarker.clone_from(&previous_version_marker);
+                return Ok(report);
+            }
             if options.max_objects.is_some_and(|max_objects| report.scanned >= max_objects) {
                 if manual_transition_has_more_after_limit(index, page.objects.len(), page.is_truncated) {
                     report.truncated_by_limit = true;
                     report.next_marker = Some(object.name.clone());
-                    report.next_version_idmarker = object.version_id.map(|version| version.to_string());
+                    report.next_version_idmarker = Some(manual_transition_version_marker(object));
                 }
                 return Ok(report);
             }
+            previous_marker = Some(object.name.clone());
+            previous_version_marker = Some(manual_transition_version_marker(object));
         }
 
         if !page.is_truncated {
@@ -2538,6 +2549,8 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
 
         marker = page.next_marker;
         version_marker = page.next_version_idmarker;
+        previous_marker = marker.clone();
+        previous_version_marker = version_marker.clone();
     }
 }
 
@@ -2731,6 +2744,12 @@ fn manual_transition_has_more_after_limit(page_index: usize, page_len: usize, pa
     page_index.saturating_add(1) < page_len || page_is_truncated
 }
 
+fn manual_transition_version_marker(oi: &ObjectInfo) -> String {
+    oi.version_id
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
 async fn enqueue_transition_with_lifecycle_report(
     oi: &ObjectInfo,
     lc: &BucketLifecycleConfiguration,
@@ -2793,7 +2812,7 @@ async fn enqueue_transition_with_lifecycle_report(
 
 async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycleConfiguration, src: &LcEventSrc) -> bool {
     let options = ManualTransitionRunOptions::default();
-    let mut report = ManualTransitionRunReport::new(&oi.bucket, &options);
+    let mut report = ManualTransitionRunReport::default();
     enqueue_transition_with_lifecycle_report(oi, lc, src, &options, &mut report).await
 }
 
@@ -3630,12 +3649,13 @@ mod tests {
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
-        manual_transition_has_more_after_limit, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_queue_capacity,
-        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
-        run_tier_free_version_recovery_loop, select_restore_s3_location, set_recovered_free_version_enqueue_observer,
-        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
-        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
+        manual_transition_has_more_after_limit, manual_transition_version_marker,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
+        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
+        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
+        wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -5786,6 +5806,37 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn queue_transition_task_outcome_reports_queue_full_separately() {
+        let state = TransitionState::new_with_capacity(1);
+        let first_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "first".to_string(),
+            ..Default::default()
+        };
+        let second_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "second".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        let first = state
+            .queue_transition_task_outcome(&first_object, &event, &LcEventSrc::Scanner)
+            .await;
+        let second = state
+            .queue_transition_task_outcome(&second_object, &event, &LcEventSrc::Scanner)
+            .await;
+
+        assert_eq!(first, TransitionEnqueueOutcome::Queued);
+        assert_eq!(second, TransitionEnqueueOutcome::QueueFull);
+        assert_eq!(state.transition_rx.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn queue_transition_task_dedupes_immediate_and_scanner_sources_for_same_version() {
         let state = TransitionState::new_with_capacity(4);
         let version_id = Uuid::new_v4();
@@ -6275,6 +6326,22 @@ mod tests {
         assert!(!handled);
         assert_eq!(report.eligible, 0);
         assert_eq!(report.skipped_tier, 1);
+    }
+
+    #[test]
+    fn manual_transition_version_marker_preserves_null_version_cursor() {
+        let null_version = ObjectInfo {
+            version_id: None,
+            ..Default::default()
+        };
+        let version_id = Uuid::new_v4();
+        let versioned = ObjectInfo {
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+
+        assert_eq!(manual_transition_version_marker(&null_version), "null");
+        assert_eq!(manual_transition_version_marker(&versioned), version_id.to_string());
     }
 
     #[test]

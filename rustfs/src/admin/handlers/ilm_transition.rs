@@ -212,4 +212,45 @@ mod tests {
 
         assert_eq!(response_state(&report), "partial");
     }
+
+    #[test]
+    fn manual_transition_response_omits_raw_resume_markers() {
+        let report = ManualTransitionRunReport {
+            truncated_by_limit: true,
+            next_marker: Some("private/object".to_string()),
+            next_version_idmarker: Some("null".to_string()),
+            ..Default::default()
+        };
+        let response = ManualTransitionRunResponse {
+            state: response_state(&report),
+            mode: "enqueue_only",
+            job_id: None,
+            status_endpoint: None,
+            report,
+        };
+
+        let value = serde_json::to_value(response).expect("response should serialize");
+        assert!(value.pointer("/report/next_marker").is_none());
+        assert!(value.pointer("/report/next_version_idmarker").is_none());
+    }
+
+    #[test]
+    fn manual_transition_handler_requires_set_tier_action() {
+        let src = include_str!("ilm_transition.rs");
+        let auth_block = extract_block_between_markers(src, "async fn authorize_manual_transition_request", "fn response_state");
+
+        assert!(auth_block.contains("AdminAction::SetTierAction"));
+        assert!(!auth_block.contains("AdminAction::ServerInfoAdminAction"));
+    }
+
+    fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = src
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("expected start marker `{start_marker}`"));
+        let after_start = &src[start..];
+        let end = after_start
+            .find(end_marker)
+            .unwrap_or_else(|| panic!("expected end marker `{end_marker}` after `{start_marker}`"));
+        &after_start[..end]
+    }
 }
