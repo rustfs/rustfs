@@ -1255,16 +1255,14 @@ impl TransitionState {
             src: src.clone(),
             event: event.clone(),
         };
-        let mut queued = false;
         if is_immediate_transition_source(src) {
-            let mut failure = None;
-            match self.transition_tx.try_send(Some(task)) {
-                Ok(()) => queued = true,
+            let outcome = match self.transition_tx.try_send(Some(task)) {
+                Ok(()) => TransitionEnqueueOutcome::Queued,
                 Err(async_channel::TrySendError::Full(task)) => {
                     Self::inc_counter(&self.queue_full_tasks);
                     let send_timeout = self.transition_queue_send_timeout;
                     match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
-                        Ok(Ok(())) => queued = true,
+                        Ok(Ok(())) => TransitionEnqueueOutcome::Queued,
                         Ok(Err(_)) => {
                             self.handle_immediate_enqueue_failure(
                                 oi,
@@ -1273,7 +1271,7 @@ impl TransitionState {
                                     timeout_ms: Some(send_timeout.as_millis() as u64),
                                 },
                             );
-                            failure = Some(TransitionEnqueueOutcome::QueueClosed);
+                            TransitionEnqueueOutcome::QueueClosed
                         }
                         Err(_) => {
                             self.handle_immediate_enqueue_failure(
@@ -1283,39 +1281,35 @@ impl TransitionState {
                                     timeout_ms: send_timeout.as_millis() as u64,
                                 },
                             );
-                            failure = Some(TransitionEnqueueOutcome::QueueSendTimedOut);
+                            TransitionEnqueueOutcome::QueueSendTimedOut
                         }
                     }
                 }
                 Err(async_channel::TrySendError::Closed(_task)) => {
                     self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::QueueClosed { timeout_ms: None });
-                    failure = Some(TransitionEnqueueOutcome::QueueClosed);
+                    TransitionEnqueueOutcome::QueueClosed
                 }
-            }
+            };
+            let queued = outcome == TransitionEnqueueOutcome::Queued;
             if !queued {
                 self.release_transition(oi);
             }
             record_scanner_transition_enqueue_result(src, 1, queued);
             self.record_scanner_transition_state();
-            return if queued {
-                TransitionEnqueueOutcome::Queued
-            } else {
-                failure.unwrap_or(TransitionEnqueueOutcome::QueueFull)
-            };
+            return outcome;
         }
 
-        let mut failure = None;
-        match self.transition_tx.try_send(Some(task)) {
-            Ok(()) => queued = true,
+        let outcome = match self.transition_tx.try_send(Some(task)) {
+            Ok(()) => TransitionEnqueueOutcome::Queued,
             Err(async_channel::TrySendError::Full(_)) => {
                 Self::inc_counter(&self.queue_full_tasks);
-                failure = Some(TransitionEnqueueOutcome::QueueFull);
                 debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
                     source = ?src,
                     "transition queue is full; deferring to scanner/backfill"
                 );
+                TransitionEnqueueOutcome::QueueFull
             }
             Err(async_channel::TrySendError::Closed(_)) => {
                 debug!(
@@ -1328,19 +1322,16 @@ impl TransitionState {
                     state = "queue_closed",
                     "transition enqueue failed because the queue is closed"
                 );
-                failure = Some(TransitionEnqueueOutcome::QueueClosed);
+                TransitionEnqueueOutcome::QueueClosed
             }
-        }
+        };
+        let queued = outcome == TransitionEnqueueOutcome::Queued;
         if !queued {
             self.release_transition(oi);
         }
         record_scanner_transition_enqueue_result(src, 1, queued);
         self.record_scanner_transition_state();
-        if queued {
-            TransitionEnqueueOutcome::Queued
-        } else {
-            failure.unwrap_or(TransitionEnqueueOutcome::QueueFull)
-        }
+        outcome
     }
 
     pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
@@ -2811,9 +2802,21 @@ async fn enqueue_transition_with_lifecycle_report(
 }
 
 async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycleConfiguration, src: &LcEventSrc) -> bool {
-    let options = ManualTransitionRunOptions::default();
-    let mut report = ManualTransitionRunReport::default();
-    enqueue_transition_with_lifecycle_report(oi, lc, src, &options, &mut report).await
+    let event = lc.eval(&oi.to_lifecycle_opts()).await;
+    match event.action {
+        IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
+            if oi.delete_marker || oi.is_dir {
+                return false;
+            }
+            if lifecycle_action_blocked_by_replication(event.action, oi) {
+                return false;
+            }
+            runtime_sources::transition_state_handle()
+                .queue_transition_task(oi, &event, src)
+                .await
+        }
+        _ => false,
+    }
 }
 
 /// Build the delete options for a lifecycle expiry event on a transitioned
