@@ -1194,6 +1194,36 @@ mod tests {
     }
 
     #[test]
+    fn request_compat_send_site_manifest_pins_exact_json_policies() {
+        let mut policies = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| (send_site.field.message, send_site.field.json_field, send_site.policy))
+            .collect::<Vec<_>>();
+        policies.sort_by_key(|(message, json_field, _)| (*message, *json_field));
+
+        assert_eq!(
+            policies,
+            [
+                (
+                    "BatchReadVersionRequest",
+                    "batch_read_version_req",
+                    RequestJsonPolicy::MsgpackOnlyEligible
+                ),
+                ("DeleteVersionRequest", "file_info", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero),
+                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("ReadMultipleRequest", "read_multiple_req", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("ReadVersionRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("RenameDataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("UpdateMetadataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("UpdateMetadataRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("WriteMetadataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+            ]
+        );
+    }
+
+    #[test]
     fn response_compat_send_site_manifest_covers_node_proto_bin_fields() {
         let mut manifest_fields = RESPONSE_COMPAT_SEND_SITES
             .iter()
@@ -1290,6 +1320,31 @@ mod tests {
                 assert!(!internode_rpc_msgpack_only(), "reset must reload current env values");
             },
         );
+
+        reset_internode_rpc_msgpack_only_cache();
+    }
+
+    #[test]
+    fn internode_rpc_msgpack_only_requires_request_and_fleet_confirmation() {
+        for (requested, fleet_confirmed, expected) in [
+            (None, None, false),
+            (Some("true"), None, false),
+            (None, Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("true"), true),
+        ] {
+            reset_internode_rpc_msgpack_only_cache();
+            temp_env::with_vars(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, requested),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, fleet_confirmed),
+                ],
+                || {
+                    assert_eq!(internode_rpc_msgpack_only(), expected);
+                },
+            );
+        }
 
         reset_internode_rpc_msgpack_only_cache();
     }
