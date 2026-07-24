@@ -478,15 +478,14 @@ impl ObjectInfo {
             v
         };
 
-        // Extract storage class from metadata, default to STANDARD if not found
-        let storage_class = if !fi.transition_tier.is_empty() {
-            Some(fi.transition_tier.clone())
-        } else {
-            fi.metadata
-                .get(AMZ_STORAGE_CLASS)
-                .cloned()
-                .or_else(|| Some(storageclass::STANDARD.to_string()))
-        };
+        let storage_class = Some(
+            storageclass::effective_class(
+                fi.metadata.get(AMZ_STORAGE_CLASS).map(String::as_str),
+                (fi.transition_status == rustfs_filemeta::TRANSITION_COMPLETE && !fi.transition_tier.is_empty())
+                    .then_some(fi.transition_tier.as_str()),
+            )
+            .to_string(),
+        );
 
         let mut restore_ongoing = false;
         let mut restore_expires = None;
@@ -1143,6 +1142,58 @@ mod tests {
         let info = ObjectInfo::from_file_info(&fi, "bucket", "object", true);
 
         assert_eq!(info.replication_decision, "arn=true;false;arn:replication::1:dest;rule-id");
+    }
+
+    #[test]
+    fn from_file_info_reports_effective_storage_class_for_legacy_metadata() {
+        for legacy_label in [
+            storageclass::STANDARD_IA,
+            storageclass::ONEZONE_IA,
+            storageclass::INTELLIGENT_TIERING,
+            storageclass::GLACIER,
+        ] {
+            let fi = FileInfo {
+                metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
+                ..Default::default()
+            };
+
+            let info = ObjectInfo::from_file_info(&fi, "bucket", "legacy-object", true);
+
+            assert_eq!(
+                info.storage_class.as_deref(),
+                Some(storageclass::STANDARD),
+                "{legacy_label} was only a label and must report the effective STANDARD layout"
+            );
+        }
+    }
+
+    #[test]
+    fn from_file_info_preserves_transitioned_tier_storage_class() {
+        let fi = FileInfo {
+            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            transition_tier: "WARM-TIER".to_string(),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "transitioned-object", true);
+
+        assert_eq!(info.storage_class.as_deref(), Some("WARM-TIER"));
+        assert_eq!(info.transitioned_object.tier, "WARM-TIER");
+    }
+
+    #[test]
+    fn from_file_info_ignores_a_tier_name_without_a_completed_transition() {
+        let fi = FileInfo {
+            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            transition_tier: "WARM-TIER".to_string(),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "incomplete-transition", true);
+
+        assert_eq!(info.storage_class.as_deref(), Some(storageclass::STANDARD));
+        assert_eq!(info.transitioned_object.tier, "WARM-TIER");
     }
 
     #[test]

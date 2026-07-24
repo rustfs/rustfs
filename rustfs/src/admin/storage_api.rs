@@ -375,9 +375,11 @@ pub(crate) mod versioning_sys {
 }
 
 pub(crate) mod storageclass {
+    pub(crate) const CAPABILITY_CONTRACT_VERSION: u32 = super::ecstore_config::storageclass::CAPABILITY_CONTRACT_VERSION;
     #[cfg(test)]
     pub(crate) const CLASS_STANDARD: &str = super::ecstore_config::storageclass::CLASS_STANDARD;
     pub(crate) const INLINE_BLOCK_ENV: &str = super::ecstore_config::storageclass::INLINE_BLOCK_ENV;
+    pub(crate) const LEGACY_LABEL_BEHAVIOR: &str = super::ecstore_config::storageclass::LEGACY_LABEL_BEHAVIOR;
     pub(crate) const OPTIMIZE_ENV: &str = super::ecstore_config::storageclass::OPTIMIZE_ENV;
     #[cfg(test)]
     pub(crate) const RRS: &str = super::ecstore_config::storageclass::RRS;
@@ -385,6 +387,8 @@ pub(crate) mod storageclass {
     #[cfg(test)]
     pub(crate) const STANDARD: &str = super::ecstore_config::storageclass::STANDARD;
     pub(crate) const STANDARD_ENV: &str = super::ecstore_config::storageclass::STANDARD_ENV;
+    pub(crate) const SUPPORTED_WRITE_CLASSES: [&str; 2] = super::ecstore_config::storageclass::SUPPORTED_WRITE_CLASSES;
+    pub(crate) const UNSUPPORTED_WRITE_ERROR: &str = super::ecstore_config::storageclass::UNSUPPORTED_WRITE_ERROR;
 
     pub(crate) type Config = super::ecstore_config::storageclass::Config;
 
