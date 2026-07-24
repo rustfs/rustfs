@@ -106,18 +106,18 @@ fallback counter has read zero across a window with the new decoders fully deplo
 
 ## Stage 1 — Stop writing JSON (env-gated, after Stage 0 reads zero)
 
-The send-side lever is **implemented** and gated by the default-off env flag
-`RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`. When enabled, the convergence-ready fields above send
-only `_bin` and leave the JSON string empty; the `_bin` payload is always sent and decoders
-keep the JSON read fallback unchanged. The delete fields are excluded (dual-write) per the
-section above.
+The send-side lever is **implemented** and requires two default-off env flags:
+
+- `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true`
+- `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true`
+
+The first flag only requests msgpack-only. The second flag is the explicit proof gate that the fleet has passed the release-window fallback, capability, and rollback checks. If only `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` is set, RustFS keeps dual-writing JSON compatibility fields so old JSON-only peers remain compatible. When both flags are enabled, the convergence-ready fields above send only `_bin` and leave the JSON string empty; the `_bin` payload is always sent and decoders keep the JSON read fallback unchanged. The delete fields are excluded (dual-write) per the section above.
 
 Only enable it **after** Stage 0 has read zero for a full window across the fleet:
 
 1. Ship with the flag **off** (no behavior change).
-2. Enable it on one node (`RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true`, restart) and watch the
-   fallback counter for a soak period. If it stays zero, enable fleet-wide.
-3. **Rollback:** set `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false` (or unset) and restart. No
+2. Enable it on one node with both `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true`, then restart and watch the fallback counter for a soak period. If it stays zero, enable fleet-wide.
+3. **Rollback:** set either `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false` or `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false` (or unset either flag) and restart. No
    wire-format was broken in this stage, so rollback is immediate and safe.
 
 ## Stage 2 — Remove the proto JSON fields (next release, N+1)
@@ -135,7 +135,7 @@ still zero.
 | Stage | Wire-format broken? | Rollback |
 |---|---|---|
 | 0 Observe | no | n/a (metric only) |
-| 1 msgpack-only send | no | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false` + restart |
+| 1 msgpack-only send | no | unset either msgpack-only env flag + restart |
 | 2 remove fields | yes | redeploy prior release; field numbers stay `reserved` |
 
 ## Related

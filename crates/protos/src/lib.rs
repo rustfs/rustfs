@@ -636,12 +636,18 @@ mod tier_mutation_rpc_tests {
 
 /// Whether internode metadata RPCs should send only the msgpack `_bin` payloads and leave the JSON
 /// compatibility strings empty (grpc-optimization P2-1). Shared by the client (`remote_disk`) and
-/// server (`node_service`) send paths. Defaults to `false` (dual-write); see
-/// [`rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY`] and the convergence runbook before enabling.
+/// server (`node_service`) send paths.
+///
+/// The legacy flag alone is deliberately insufficient: emptying JSON breaks old peers that only
+/// decode the compatibility field. Operators must also set the fleet-confirmed guard after the
+/// convergence runbook proves every peer supports `_bin` and rollback.
 pub fn internode_rpc_msgpack_only() -> bool {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
         rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
+    ) && rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
     )
 }
 
