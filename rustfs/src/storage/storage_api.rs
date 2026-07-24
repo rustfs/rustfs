@@ -669,8 +669,16 @@ impl StorageReplicationPoolHandle {
         self.inner.clone().cancel_bucket_resync(opts).await
     }
 
-    pub(crate) async fn start_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<()> {
-        self.inner.clone().start_bucket_resync(opts).await
+    pub(crate) async fn admit_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<bool> {
+        self.inner.clone().admit_bucket_resync(opts).await
+    }
+
+    pub(crate) async fn activate_bucket_resync(
+        &self,
+        opts: ecstore_bucket::replication::ResyncOpts,
+        recovering: bool,
+    ) -> Result<()> {
+        self.inner.clone().activate_bucket_resync(opts, recovering).await
     }
 
     pub(crate) async fn init_resync(self: Arc<Self>, ctx: CancellationToken, buckets: Vec<String>) -> Result<()> {
@@ -775,6 +783,60 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
 
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
     ecstore_bucket::replication::init_background_replication(store).await;
+}
+
+fn apply_active_resync_intents(
+    targets: &mut ecstore_bucket::target::BucketTargets,
+    status: &ecstore_bucket::replication::BucketReplicationResyncStatus,
+) -> Result<bool> {
+    let mut changed = false;
+    for (arn, intent) in &status.targets_map {
+        if !matches!(
+            intent.resync_status,
+            ecstore_bucket::replication::ResyncStatusType::ResyncPending
+                | ecstore_bucket::replication::ResyncStatusType::ResyncStarted
+        ) {
+            continue;
+        }
+        let target = targets
+            .targets
+            .iter_mut()
+            .find(|target| target.arn == *arn)
+            .ok_or_else(|| Error::other(format!("accepted replication resync target {arn} is not configured")))?;
+        if target.reset_id != intent.resync_id || target.reset_before_date != intent.resync_before_date {
+            target.reset_id = intent.resync_id.clone();
+            target.reset_before_date = intent.resync_before_date;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+pub(crate) async fn reconcile_bucket_resync_target_intents(buckets: &[String]) -> Result<()> {
+    let Some(pool) = ecstore_bucket::replication::get_global_replication_pool() else {
+        return Err(Error::other("replication pool is not initialized"));
+    };
+
+    for bucket in buckets {
+        let _transaction_guard = ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await?;
+        let status = pool.get_bucket_resync_status(bucket).await?;
+        if status.targets_map.is_empty() {
+            continue;
+        }
+        let metadata = ecstore_bucket::metadata_sys::get_config_from_disk(bucket).await?;
+        let mut targets = if metadata.bucket_targets_config_json.is_empty() {
+            ecstore_bucket::target::BucketTargets::default()
+        } else {
+            serde_json::from_slice(&metadata.bucket_targets_config_json).map_err(Error::other)?
+        };
+        if !apply_active_resync_intents(&mut targets, &status)? {
+            continue;
+        }
+        let encoded = serde_json::to_vec(&targets).map_err(Error::other)?;
+        ecstore_bucket::metadata_sys::update_bucket_targets_under_transaction_lock(bucket, encoded).await?;
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn all_local_disk() -> Vec<DiskStore> {
@@ -1340,6 +1402,14 @@ pub(crate) async fn update_bucket_metadata_config(
     Ok(updated_at)
 }
 
+pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    ecstore_bucket::metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await
+}
+
+pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<time::OffsetDateTime> {
+    ecstore_bucket::metadata_sys::update_bucket_targets_under_transaction_lock(bucket, data).await
+}
+
 fn record_scanner_maintenance_config_change(bucket: &str, config_file: &str) {
     if scanner_maintenance_config_file(config_file) {
         rustfs_scanner::record_scanner_maintenance_change(bucket);
@@ -1593,7 +1663,8 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 #[cfg(test)]
 mod tests {
     use super::{
-        bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata, scanner_maintenance_config_file,
+        apply_active_resync_intents, bucket_targets_metadata_lock_shard, ecstore_bucket, lock_bucket_targets_metadata,
+        scanner_maintenance_config_file,
     };
     use std::time::Duration;
 
@@ -1629,5 +1700,37 @@ mod tests {
         assert!(scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_LIFECYCLE_CONFIG));
         assert!(scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_REPLICATION_CONFIG));
         assert!(!scanner_maintenance_config_file(ecstore_bucket::metadata::BUCKET_POLICY_CONFIG));
+    }
+
+    #[test]
+    fn restart_reconcile_repairs_accepted_id_without_losing_other_target() {
+        let mut targets = ecstore_bucket::target::BucketTargets {
+            targets: vec![
+                ecstore_bucket::target::BucketTarget {
+                    arn: "arn:accepted".to_string(),
+                    reset_id: "orphan-id".to_string(),
+                    ..Default::default()
+                },
+                ecstore_bucket::target::BucketTarget {
+                    arn: "arn:other".to_string(),
+                    reset_id: "concurrent-id".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut status = ecstore_bucket::replication::BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:accepted".to_string(),
+            ecstore_bucket::replication::TargetReplicationResyncStatus {
+                resync_id: "durable-id".to_string(),
+                resync_before_date: Some(time::OffsetDateTime::UNIX_EPOCH),
+                resync_status: ecstore_bucket::replication::ResyncStatusType::ResyncPending,
+                ..Default::default()
+            },
+        );
+
+        assert!(apply_active_resync_intents(&mut targets, &status).expect("accepted intent should reconcile"));
+        assert_eq!(targets.targets[0].reset_id, "durable-id");
+        assert_eq!(targets.targets[1].reset_id, "concurrent-id");
     }
 }

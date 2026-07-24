@@ -70,7 +70,7 @@ pub use replication_object_decision_boundary::{
 };
 pub use replication_pool::{
     DurableMrfBacklog, DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
-    init_background_replication, read_durable_mrf_backlog,
+    init_background_replication, read_durable_mrf_backlog, resync_start_conflict_id,
 };
 pub use replication_queue_boundary::{
     DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,

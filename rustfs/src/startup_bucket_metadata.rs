@@ -15,7 +15,8 @@
 use crate::startup_runtime_sources;
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::bucket_metadata::{
-    ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
+    ECStore, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata,
+    try_migrate_iam_config,
 };
 use std::{
     io::{Error, Result},
@@ -37,6 +38,7 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>) -
     try_migrate_bucket_metadata(store.clone()).await;
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
     try_migrate_iam_config(store).await;
+    reconcile_bucket_resync_target_intents(&buckets).await?;
 
     Ok(buckets)
 }
@@ -54,12 +56,13 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 
     try_migrate_bucket_metadata(store.clone()).await;
 
+    try_migrate_iam_config(store.clone()).await;
+    init_bucket_metadata_sys(store, buckets.clone()).await;
+    reconcile_bucket_resync_target_intents(&buckets).await?;
+
     if let Some(pool) = startup_runtime_sources::replication_pool_handle() {
         pool.init_resync(ctx, buckets.clone()).await?;
     }
-
-    try_migrate_iam_config(store.clone()).await;
-    init_bucket_metadata_sys(store, buckets.clone()).await;
 
     Ok(buckets)
 }
