@@ -80,6 +80,36 @@ const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_
 const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT: u64 = 2;
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: u64 = 100;
+enum ReadAllError {
+    Open(std::io::Error),
+    Disk(DiskError),
+}
+
+struct ListingMetadataRead {
+    bytes: Vec<u8>,
+    file_meta: Option<FileMeta>,
+    data_dirs: HashSet<String>,
+    has_namespace_child_candidate: bool,
+}
+
+fn read_all_data_std(path: &Path) -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
+    let mut file = std::fs::File::open(path).map_err(ReadAllError::Open)?;
+    let metadata = file.metadata().map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+
+    if metadata.is_dir() {
+        return Err(ReadAllError::Disk(DiskError::FileNotFound));
+    }
+
+    let size = usize::try_from(metadata.len()).map_err(|err| ReadAllError::Disk(DiskError::other(err)))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|err| ReadAllError::Disk(Error::other(err)))?;
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+
+    let modtime = metadata.modified().ok().map(OffsetDateTime::from);
+    Ok((bytes, modtime))
+}
 
 fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
     let used_data_dirs: HashSet<Uuid> = meta.get_data_dirs().unwrap_or_default().into_iter().flatten().collect();
@@ -4651,6 +4681,80 @@ impl LocalDisk {
         Ok(data)
     }
 
+    async fn read_listing_metadata(&self, volume: &str, object_name: &str) -> Result<ListingMetadataRead> {
+        let object_dir = self.get_object_path(volume, object_name)?;
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+        let volume_dir = self.get_bucket_path(volume)?;
+        let result = tokio::task::spawn_blocking(move || {
+            let (bytes, _) = read_all_data_std(&metadata_path)?;
+            let file_meta = FileMeta::load(&bytes).ok();
+            let data_dirs: HashSet<String> = file_meta
+                .as_ref()
+                .and_then(|meta| meta.get_data_dirs().ok())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|data_dir| data_dir.to_string())
+                .collect();
+            let probe = match os::read_dir_probe(&object_dir, data_dirs.len().saturating_add(2)) {
+                Ok(probe) => probe,
+                Err(err) if err.kind() == ErrorKind::NotFound => os::ReadDirProbe {
+                    entries: Vec::new(),
+                    complete: true,
+                },
+                Err(err) => return Err(ReadAllError::Disk(to_file_error(err).into())),
+            };
+            let found_child = probe.entries.into_iter().any(|entry| {
+                entry
+                    .strip_suffix(SLASH_SEPARATOR)
+                    .is_some_and(|child| !child.is_empty() && !data_dirs.contains(child))
+            });
+            let has_namespace_child_candidate = found_child || !probe.complete;
+
+            Ok(ListingMetadataRead {
+                bytes,
+                file_meta,
+                data_dirs,
+                has_namespace_child_candidate,
+            })
+        })
+        .await
+        .map_err(DiskError::from)?;
+
+        self.resolve_read_all_result(volume, &volume_dir, result).await
+    }
+
+    async fn resolve_read_all_result<T>(
+        &self,
+        volume: &str,
+        volume_dir: &Path,
+        result: core::result::Result<T, ReadAllError>,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(ReadAllError::Disk(err)) => Err(err),
+            Err(ReadAllError::Open(err)) => {
+                if err.kind() == ErrorKind::NotFound
+                    && !skip_access_checks(volume)
+                    && let Err(access_err) = access(volume_dir).await
+                    && access_err.kind() == ErrorKind::NotFound
+                {
+                    warn!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        reason = "read_all_data_with_dmtime_volume_not_found",
+                        error = ?access_err,
+                        "Disk local read fallback failed"
+                    );
+                    return Err(DiskError::VolumeNotFound);
+                }
+
+                Err(to_file_error(err).into())
+            }
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all_data_with_dmtime(
         &self,
@@ -4671,66 +4775,12 @@ impl LocalDisk {
         // succeeds the fd is valid, so fstat/read never return ENOENT. Hence
         // gating the volume fallback on the open error alone is equivalent to
         // the original code, where the fallback lived solely in the open match arm.
-        enum ReadAllError {
-            /// Raw, unmapped open() error; the async side decides the fallback.
-            Open(std::io::Error),
-            /// Already-mapped post-open error.
-            Disk(DiskError),
-        }
-
         let path = file_path.as_ref().to_path_buf();
-        let res =
-            tokio::task::spawn_blocking(move || -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
-                // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
-                let mut f = std::fs::File::open(&path).map_err(ReadAllError::Open)?;
-
-                let meta = f.metadata().map_err(|e| ReadAllError::Disk(to_file_error(e).into()))?;
-
-                if meta.is_dir() {
-                    return Err(ReadAllError::Disk(DiskError::FileNotFound));
-                }
-
-                let size = meta.len() as usize;
-                let mut bytes = Vec::new();
-                bytes
-                    .try_reserve_exact(size)
-                    .map_err(|e| ReadAllError::Disk(Error::other(e)))?;
-
-                std::io::Read::read_to_end(&mut f, &mut bytes).map_err(|e| ReadAllError::Disk(to_file_error(e).into()))?;
-
-                let modtime = match meta.modified() {
-                    Ok(md) => Some(OffsetDateTime::from(md)),
-                    Err(_) => None,
-                };
-
-                Ok((bytes, modtime))
-            })
+        let res = tokio::task::spawn_blocking(move || read_all_data_std(&path))
             .await
             .map_err(DiskError::from)?;
 
-        let (bytes, modtime) = match res {
-            Ok(v) => v,
-            Err(ReadAllError::Disk(e)) => return Err(e),
-            Err(ReadAllError::Open(e)) => {
-                if e.kind() == ErrorKind::NotFound
-                    && !skip_access_checks(volume)
-                    && let Err(er) = access(volume_dir.as_ref()).await
-                    && er.kind() == ErrorKind::NotFound
-                {
-                    warn!(
-                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        reason = "read_all_data_with_dmtime_volume_not_found",
-                        error = ?er,
-                        "Disk local read fallback failed"
-                    );
-                    return Err(DiskError::VolumeNotFound);
-                }
-
-                return Err(to_file_error(e).into());
-            }
-        };
+        let (bytes, modtime) = self.resolve_read_all_result(volume, volume_dir.as_ref(), res).await?;
 
         Ok((bytes, modtime))
     }
@@ -5307,16 +5357,19 @@ impl LocalDisk {
             }
         }
 
-        let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>)> = Vec::with_capacity(5);
+        let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>, bool)> = Vec::with_capacity(5);
         // Explicit directory markers and real directories can resolve to the same logical path.
-        let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>)>,
+        let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>, bool)>,
                             dir_name: String,
                             skip_object: bool,
-                            dir_to_skip: Option<HashSet<String>>| {
-            if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip)) = dir_stack.last_mut()
+                            dir_to_skip: Option<HashSet<String>>,
+                            scan_required: bool| {
+            if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip, existing_scan_required)) =
+                dir_stack.last_mut()
                 && *last_dir_name == dir_name
             {
                 *existing_skip_object |= skip_object;
+                *existing_scan_required |= scan_required;
                 if let Some(existing_dir_to_skip) = existing_dir_to_skip {
                     if let Some(new_dir_to_skip) = &dir_to_skip {
                         existing_dir_to_skip.extend(new_dir_to_skip.iter().cloned());
@@ -5325,7 +5378,7 @@ impl LocalDisk {
                     *existing_dir_to_skip = dir_to_skip;
                 }
             } else {
-                dir_stack.push((dir_name, skip_object, dir_to_skip));
+                dir_stack.push((dir_name, skip_object, dir_to_skip, scan_required));
             }
         };
         prefix = "".to_owned();
@@ -5341,10 +5394,10 @@ impl LocalDisk {
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-            while let Some((last_name, _, _)) = dir_stack.last()
+            while let Some((last_name, _, _, _)) = dir_stack.last()
                 && *last_name < name
             {
-                let (pop, skip_object, dir_to_skip) = dir_stack.pop().expect("operation should succeed");
+                let (pop, skip_object, dir_to_skip, scan_required) = dir_stack.pop().expect("operation should succeed");
                 write_metacache_obj(
                     out,
                     &MetaCacheEntry {
@@ -5356,6 +5409,7 @@ impl LocalDisk {
 
                 let scan_path = pop.clone();
                 if opts.recursive
+                    && scan_required
                     && let Err(er) =
                         Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
                 {
@@ -5389,9 +5443,25 @@ impl LocalDisk {
             }
 
             let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
+            let metadata_read = if opts.recursive && !is_dir_obj {
+                with_walk_stall_timeout(stall, self.read_listing_metadata(&opts.bucket, &meta.name))
+                    .await
+                    .map(|read| {
+                        (
+                            Bytes::from(read.bytes),
+                            read.file_meta,
+                            Some(read.data_dirs),
+                            read.has_namespace_child_candidate,
+                        )
+                    })
+            } else {
+                with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str()))
+                    .await
+                    .map(|metadata| (metadata, None, None, true))
+            };
 
-            match with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str())).await {
-                Ok(res) => {
+            match metadata_read {
+                Ok((res, prefetched_file_meta, prefetched_data_dirs, has_namespace_child_candidate)) => {
                     if is_dir_obj {
                         meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
                         meta.name.push_str(SLASH_SEPARATOR);
@@ -5401,24 +5471,29 @@ impl LocalDisk {
 
                     write_metacache_obj(out, &meta).await?;
 
-                    let file_meta = if opts.limit > 0 || opts.recursive || !is_dir_obj {
-                        FileMeta::load(&res).ok()
-                    } else {
-                        None
+                    let file_meta = match prefetched_file_meta {
+                        Some(file_meta) => Some(file_meta),
+                        None if opts.limit > 0 || opts.recursive || !is_dir_obj => FileMeta::load(&res).ok(),
+                        None => None,
                     };
 
                     if opts.limit <= 0 || file_meta.as_ref().is_none_or(file_meta_counts_toward_limit) {
                         *objs_returned += 1;
                     }
 
-                    let mut dir_to_skip = HashSet::new();
-                    if let Some(file_meta) = file_meta.as_ref()
-                        && let Ok(data_dirs) = file_meta.get_data_dirs()
-                    {
-                        for data_dir in data_dirs.iter().flatten() {
-                            dir_to_skip.insert(data_dir.to_string());
+                    let dir_to_skip = if let Some(data_dirs) = prefetched_data_dirs {
+                        data_dirs
+                    } else {
+                        let mut data_dirs_to_skip = HashSet::new();
+                        if let Some(file_meta) = file_meta.as_ref()
+                            && let Ok(data_dirs) = file_meta.get_data_dirs()
+                        {
+                            for data_dir in data_dirs.iter().flatten() {
+                                data_dirs_to_skip.insert(data_dir.to_string());
+                            }
                         }
-                    }
+                        data_dirs_to_skip
+                    };
 
                     if opts.recursive {
                         let mut dir_name = meta.name.clone();
@@ -5430,6 +5505,7 @@ impl LocalDisk {
                             dir_name,
                             true,
                             if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
+                            has_namespace_child_candidate,
                         );
                     } else if !is_dir_obj
                         && self
@@ -5444,7 +5520,7 @@ impl LocalDisk {
                         // separate real directory entry handled above.
                         let mut dir_name = meta.name.clone();
                         dir_name.push_str(SLASH_SEPARATOR);
-                        schedule_dir(&mut dir_stack, dir_name, true, None);
+                        schedule_dir(&mut dir_stack, dir_name, true, None, true);
                     }
                 }
                 Err(err) => {
@@ -5462,7 +5538,7 @@ impl LocalDisk {
                                     .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted, stall)
                                     .await?
                             {
-                                schedule_dir(&mut dir_stack, meta.name, false, None);
+                                schedule_dir(&mut dir_stack, meta.name, false, None, true);
                             }
                         }
 
@@ -5483,7 +5559,7 @@ impl LocalDisk {
             };
         }
 
-        while let Some((dir, skip_object, dir_to_skip)) = dir_stack.pop() {
+        while let Some((dir, skip_object, dir_to_skip, scan_required)) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
@@ -5499,6 +5575,7 @@ impl LocalDisk {
 
             let scan_path = dir.clone();
             if opts.recursive
+                && scan_required
                 && let Err(er) =
                     Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
@@ -11917,6 +11994,52 @@ mod test {
     }
 
     #[tokio::test]
+    async fn listing_metadata_probe_distinguishes_data_dirs_from_namespace_children() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let bucket = "test-bucket";
+        let object_dir = dir.path().join(bucket).join("object");
+        let data_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("parse data dir");
+        let version_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("parse version id");
+        let mut file_meta = FileMeta::default();
+        let mut file_info = FileInfo::new("object", 1, 1);
+        file_info.data_dir = Some(data_dir);
+        file_info.version_id = Some(version_id);
+        file_info.mod_time = Some(OffsetDateTime::now_utc());
+        file_meta.add_version(file_info).expect("add object version");
+
+        fs::create_dir_all(object_dir.join(data_dir.to_string()))
+            .await
+            .expect("create version data dir");
+        fs::write(
+            object_dir.join(STORAGE_FORMAT_FILE),
+            file_meta.marshal_msg().expect("encode object metadata"),
+        )
+        .await
+        .expect("write object metadata");
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+
+        let leaf = disk
+            .read_listing_metadata(bucket, "object")
+            .await
+            .expect("read leaf metadata");
+        assert!(!leaf.has_namespace_child_candidate);
+        assert!(leaf.data_dirs.contains(&data_dir.to_string()));
+
+        fs::create_dir(object_dir.join("child"))
+            .await
+            .expect("create namespace child");
+        let parent = disk
+            .read_listing_metadata(bucket, "object")
+            .await
+            .expect("read parent metadata");
+        assert!(parent.has_namespace_child_candidate);
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_includes_nested_object_dirs() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
@@ -11969,6 +12092,16 @@ mod test {
 
         let mut reader = MetacacheReader::new(reader);
         let entries = reader.read_all().await.expect("operation should succeed");
+        assert!(
+            entries.iter().any(|entry| entry.name == "asdf/" && entry.metadata.is_empty()),
+            "leaf object traversal markers must remain in the metacache stream"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == "foo/bar/" && entry.metadata.is_empty()),
+            "objects with namespace children must still emit a traversal prefix"
+        );
         let names: Vec<String> = entries
             .into_iter()
             .filter(|entry| !entry.metadata.is_empty())
@@ -12062,6 +12195,69 @@ mod test {
                 &[("outcome", "ok"), ("count_mode", "whole")]
             ),
             vec![12.0]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scan_dir_leaf_object_avoids_recursive_scan() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should be created");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                use tempfile::tempdir;
+
+                let dir = tempdir().expect("tempdir should be created");
+                let bucket = "test-bucket";
+                let object_dir = dir.path().join(bucket).join("object");
+                fs::create_dir_all(&object_dir)
+                    .await
+                    .expect("object directory should be created");
+                fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                    .await
+                    .expect("object metadata should be written");
+
+                let endpoint =
+                    Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+                let mut sink = tokio::io::sink();
+                let mut out = MetacacheWriter::new(&mut sink);
+                let opts = WalkDirOptions {
+                    bucket: bucket.to_owned(),
+                    recursive: true,
+                    ..Default::default()
+                };
+                let mut objects_returned = 0;
+
+                disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objects_returned, false, None)
+                    .await
+                    .expect("scan_dir should succeed");
+                out.close().await.expect("metacache writer should close");
+
+                assert_eq!(objects_returned, 1);
+            });
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(
+            recorder.counter_value(
+                "rustfs_s3_list_objects_local_read_dir_total",
+                &[("outcome", "ok"), ("count_mode", "whole"), ("is_root", "true")]
+            ),
+            1
+        );
+        assert_eq!(
+            recorder.counter_value(
+                "rustfs_s3_list_objects_local_read_dir_total",
+                &[("outcome", "ok"), ("count_mode", "whole"), ("is_root", "false")]
+            ),
+            0
         );
     }
 
