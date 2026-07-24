@@ -15,7 +15,10 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_replication_stats_handle, current_runtime_port, object_store_from_req};
+use crate::admin::runtime_sources::{
+    AppContext, app_context_from_req, current_notification_system_for_context, current_replication_stats_handle_for_context,
+    current_runtime_port, object_store_from_req,
+};
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
@@ -25,6 +28,7 @@ use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTar
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
+use crate::admin::storage_api::runtime::PeerRestClient;
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -39,7 +43,8 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 use tracing::{debug, error, info, warn};
@@ -283,6 +288,39 @@ fn is_local_host(_host: String) -> bool {
     false
 }
 
+pub(crate) async fn cluster_replication_stats(bucket: &str, context: Option<Arc<AppContext>>) -> BucketStats {
+    let Some(stats) = current_replication_stats_handle_for_context(context.clone()) else {
+        return BucketStats::default();
+    };
+
+    let local = stats.get_latest_replication_stats(bucket).await;
+    let Some(notification_system) = current_notification_system_for_context(context.as_deref()) else {
+        return local;
+    };
+
+    let (peers, expected_node_count) = unique_replication_peers(&notification_system.peer_clients);
+    let peer_results = futures_util::future::join_all(peers.into_iter().map(|peer| peer.get_bucket_stats(bucket))).await;
+    let mut snapshots = Vec::with_capacity(peer_results.len().saturating_add(1));
+    snapshots.push(local);
+    snapshots.extend(peer_results.into_iter().filter_map(Result::ok));
+
+    stats
+        .aggregate_bucket_replication_stats(bucket, snapshots, expected_node_count)
+        .await
+}
+
+fn unique_replication_peers(peer_clients: &[Option<PeerRestClient>]) -> (Vec<&PeerRestClient>, u32) {
+    let mut seen_grid_hosts = HashSet::new();
+    let peers: Vec<_> = peer_clients
+        .iter()
+        .filter_map(|peer| peer.as_ref())
+        .filter(|peer| seen_grid_hosts.insert(peer.grid_host.clone()))
+        .collect();
+    let unavailable_slots = peer_clients.iter().filter(|peer| peer.is_none()).count();
+    let expected_node_count = u32::try_from(peers.len().saturating_add(unavailable_slots).saturating_add(1)).unwrap_or(u32::MAX);
+    (peers, expected_node_count)
+}
+
 //awscurl --service s3 --region us-east-1 --access_key rustfsadmin --secret_key rustfsadmin "http://:9000/rustfs/admin/v3/replicationmetrics?bucket=1"
 pub struct GetReplicationMetricsHandler {}
 
@@ -322,13 +360,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(ApiError::from(err).into());
         }
 
-        // TODO cluster cache
-        // In actual implementation, statistics would be obtained from cluster
-        // This is simplified to get from local cache
-        let bucket_stats = match current_replication_stats_handle() {
-            Some(s) => s.get_latest_replication_stats(bucket).await,
-            None => BucketStats::default(),
-        };
+        let bucket_stats = cluster_replication_stats(bucket, app_context_from_req(&req)).await;
 
         let data = serde_json::to_vec(&bucket_stats.replication_stats)
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
@@ -779,9 +811,8 @@ impl Operation for ReplicationDiffHandler {
     }
 }
 
-/// Failed-replication backlog for one remote target (ARN), summarised from the
-/// replication stats. RustFS tracks failed replications as aggregate counters,
-/// not an enumerable per-object MRF queue, so this reports the aggregate.
+/// Failed-replication totals for one remote target (ARN), summarised from the
+/// runtime replication statistics.
 #[derive(Debug, Serialize)]
 struct MrfTargetBacklog {
     #[serde(rename = "ARN")]
@@ -790,14 +821,14 @@ struct MrfTargetBacklog {
     failed_count: i64,
     #[serde(rename = "FailedSize")]
     failed_size: i64,
+    #[serde(rename = "ObservationScope")]
+    observation_scope: &'static str,
 }
 
 /// Response body for `GET /v3/replication/mrf`.
 ///
-/// MinIO streams individual MRF (most-recently-failed) entries. RustFS persists
-/// MRF entries to disk but does not expose a runtime query over that queue, so
-/// this endpoint reports the aggregate failed-replication backlog and the
-/// in-queue counters instead. See the handler docs and the PR limitations note.
+/// Runtime failed/queued totals and the durable MRF recovery backlog are kept
+/// separate because persisted MRF entries do not contain a target ARN.
 #[derive(Debug, Serialize)]
 struct MrfResponse {
     #[serde(rename = "Bucket")]
@@ -814,18 +845,89 @@ struct MrfResponse {
     queued_size: i64,
     #[serde(rename = "PerObjectEntriesAvailable")]
     per_object_entries_available: bool,
+    #[serde(rename = "RuntimeStatsAvailable")]
+    runtime_stats_available: bool,
+    #[serde(rename = "ClusterComplete")]
+    cluster_complete: bool,
+    #[serde(rename = "ObservedNodeCount")]
+    observed_node_count: u32,
+    #[serde(rename = "ExpectedNodeCount")]
+    expected_node_count: u32,
+    #[serde(rename = "DurableBacklogAvailable")]
+    durable_backlog_available: bool,
+    #[serde(rename = "DurableCount")]
+    durable_count: i64,
+    #[serde(rename = "DurableSize")]
+    durable_size: i64,
+    #[serde(rename = "PerTargetDurableEntriesAvailable")]
+    per_target_durable_entries_available: bool,
+}
+
+fn build_mrf_response(
+    bucket: String,
+    bucket_stats: &BucketStats,
+    durable: crate::admin::storage_api::replication::DurableMrfBacklog,
+) -> MrfResponse {
+    let observation_scope = if bucket_stats.replication_stats.cluster_complete {
+        "cluster_aggregated"
+    } else {
+        "partial_cluster"
+    };
+    let mut targets: Vec<MrfTargetBacklog> = Vec::with_capacity(bucket_stats.replication_stats.stats.len());
+    let mut total_failed_count: i64 = 0;
+    let mut total_failed_size: i64 = 0;
+    for (arn, stat) in &bucket_stats.replication_stats.stats {
+        total_failed_count = total_failed_count.saturating_add(stat.failed.count);
+        total_failed_size = total_failed_size.saturating_add(stat.failed.size);
+        targets.push(MrfTargetBacklog {
+            arn: arn.clone(),
+            failed_count: stat.failed.count,
+            failed_size: stat.failed.size,
+            observation_scope,
+        });
+    }
+    targets.sort_by(|a, b| a.arn.cmp(&b.arn));
+
+    let queued = &bucket_stats.replication_stats.q_stat.curr;
+    let (durable_count, durable_size) = if durable.available {
+        durable
+            .entries
+            .iter()
+            .filter(|entry| entry.bucket == bucket)
+            .fold((0i64, 0i64), |(count, size), entry| {
+                (count.saturating_add(1), size.saturating_add(entry.size))
+            })
+    } else {
+        (0, 0)
+    };
+
+    MrfResponse {
+        bucket,
+        targets,
+        total_failed_count,
+        total_failed_size,
+        queued_count: queued.count,
+        queued_size: queued.bytes,
+        per_object_entries_available: false,
+        runtime_stats_available: bucket_stats.replication_stats.provider_available,
+        cluster_complete: bucket_stats.replication_stats.cluster_complete,
+        observed_node_count: bucket_stats.replication_stats.observed_node_count,
+        expected_node_count: bucket_stats.replication_stats.expected_node_count,
+        durable_backlog_available: durable.available,
+        durable_count,
+        durable_size,
+        per_target_durable_entries_available: false,
+    }
 }
 
 /// `GET /v3/replication/mrf`
 ///
 /// Reports the failed-replication backlog (MinIO's MRF concept) for a bucket.
 ///
-/// Compatibility note: MinIO returns a stream of individual MRF entries drained
-/// from its in-memory MRF queue. RustFS records failed replications as aggregate
-/// counters in the replication stats and persists MRF entries to disk without a
-/// runtime query API, so this handler returns the aggregate failed and queued
-/// counts per target instead of per-object rows. `PerObjectEntriesAvailable` is
-/// always `false` to make that limitation explicit to clients.
+/// Compatibility note: MinIO returns a stream of individual MRF entries. RustFS
+/// deliberately returns aggregate runtime and durable counters instead.
+/// `PerObjectEntriesAvailable` and `PerTargetDurableEntriesAvailable` remain
+/// false until an enumerable API and target-bearing durable format exist.
 pub struct ReplicationMrfHandler {}
 
 #[async_trait::async_trait]
@@ -857,35 +959,9 @@ impl Operation for ReplicationMrfHandler {
             return Err(ApiError::from(err).into());
         }
 
-        let bucket_stats = match current_replication_stats_handle() {
-            Some(s) => s.get_latest_replication_stats(&bucket).await,
-            None => BucketStats::default(),
-        };
-
-        let mut targets: Vec<MrfTargetBacklog> = Vec::new();
-        let mut total_failed_count: i64 = 0;
-        let mut total_failed_size: i64 = 0;
-        for (arn, stat) in &bucket_stats.replication_stats.stats {
-            total_failed_count += stat.failed.count;
-            total_failed_size += stat.failed.size;
-            targets.push(MrfTargetBacklog {
-                arn: arn.clone(),
-                failed_count: stat.failed.count,
-                failed_size: stat.failed.size,
-            });
-        }
-        targets.sort_by(|a, b| a.arn.cmp(&b.arn));
-
-        let queued = &bucket_stats.replication_stats.q_stat.curr;
-        let response = MrfResponse {
-            bucket,
-            targets,
-            total_failed_count,
-            total_failed_size,
-            queued_count: queued.count,
-            queued_size: queued.bytes,
-            per_object_entries_available: false,
-        };
+        let durable = crate::admin::storage_api::replication::read_durable_mrf_backlog(store).await;
+        let bucket_stats = cluster_replication_stats(&bucket, app_context_from_req(&req)).await;
+        let response = build_mrf_response(bucket, &bucket_stats, durable);
 
         let data = serde_json::to_vec(&response)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
@@ -897,8 +973,12 @@ impl Operation for ReplicationMrfHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteTargetRequest, extract_query_params, validate_remote_target_tls_settings};
+    use super::{
+        RemoteTargetRequest, build_mrf_response, extract_query_params, unique_replication_peers,
+        validate_remote_target_tls_settings,
+    };
     use crate::admin::storage_api::bucket::target::BucketTarget;
+    use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
     use http::Uri;
 
     fn valid_remote_target_request() -> serde_json::Value {
@@ -912,6 +992,115 @@ mod tests {
             "secure": true,
             "type": "replication"
         })
+    }
+
+    #[test]
+    fn cluster_peer_plan_deduplicates_nodes_and_counts_unavailable_slots() {
+        let peer = crate::admin::storage_api::runtime::PeerRestClient::new(
+            rustfs_utils::XHost::try_from("127.0.0.1:9000".to_string()).expect("peer host should parse"),
+            "node-a.example.com:9001".to_string(),
+        );
+        let slots = vec![Some(peer.clone()), Some(peer), None];
+
+        let (peers, expected_node_count) = unique_replication_peers(&slots);
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].grid_host, "node-a.example.com:9001");
+        assert_eq!(expected_node_count, 3);
+    }
+
+    #[test]
+    fn mrf_response_keeps_runtime_and_durable_truth_separate() {
+        let mut stats = BucketStats::default();
+        stats.replication_stats.provider_available = true;
+        stats.replication_stats.cluster_complete = false;
+        stats.replication_stats.observed_node_count = 2;
+        stats.replication_stats.expected_node_count = 3;
+        let target = stats.replication_stats.stats.entry("arn-a".to_string()).or_default();
+        target.failed.count = 3;
+        target.failed.size = 900;
+        stats
+            .replication_stats
+            .q_stat
+            .curr
+            .now_count
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .replication_stats
+            .q_stat
+            .curr
+            .now_bytes
+            .store(1200, std::sync::atomic::Ordering::Relaxed);
+        stats.replication_stats.q_stat = stats.replication_stats.q_stat.snapshot();
+        let durable = DurableMrfBacklog {
+            available: true,
+            entries: vec![
+                MrfReplicateEntry {
+                    bucket: "bucket-a".to_string(),
+                    object: "object-a".to_string(),
+                    version_id: None,
+                    retry_count: 0,
+                    size: 250,
+                    op: MrfOpKind::Object,
+                    delete_marker_version_id: None,
+                    delete_marker: false,
+                    delete_marker_mtime: None,
+                },
+                MrfReplicateEntry {
+                    bucket: "other-bucket".to_string(),
+                    object: "object-b".to_string(),
+                    version_id: None,
+                    retry_count: 0,
+                    size: 999,
+                    op: MrfOpKind::Object,
+                    delete_marker_version_id: None,
+                    delete_marker: false,
+                    delete_marker_mtime: None,
+                },
+            ],
+        };
+
+        let response = build_mrf_response("bucket-a".to_string(), &stats, durable);
+        let json = serde_json::to_value(response).expect("MRF response should serialize");
+
+        assert_eq!(json["TotalFailedCount"], 3);
+        assert_eq!(json["TotalFailedSize"], 900);
+        assert_eq!(json["QueuedCount"], 4);
+        assert_eq!(json["QueuedSize"], 1200);
+        assert_eq!(json["DurableCount"], 1);
+        assert_eq!(json["DurableSize"], 250);
+        assert_eq!(json["RuntimeStatsAvailable"], true);
+        assert_eq!(json["ClusterComplete"], false);
+        assert_eq!(json["Targets"][0]["ObservationScope"], "partial_cluster");
+        assert_eq!(json["PerObjectEntriesAvailable"], false);
+        assert_eq!(json["PerTargetDurableEntriesAvailable"], false);
+    }
+
+    #[test]
+    fn mrf_response_distinguishes_unavailable_sources_from_valid_zero() {
+        let unavailable = build_mrf_response("bucket-a".to_string(), &BucketStats::default(), DurableMrfBacklog::default());
+        let unavailable_json = serde_json::to_value(unavailable).expect("unavailable response should serialize");
+        assert_eq!(unavailable_json["RuntimeStatsAvailable"], false);
+        assert_eq!(unavailable_json["DurableBacklogAvailable"], false);
+
+        let mut valid_empty_stats = BucketStats::default();
+        valid_empty_stats.replication_stats.provider_available = true;
+        valid_empty_stats.replication_stats.cluster_complete = true;
+        valid_empty_stats.replication_stats.observed_node_count = 1;
+        valid_empty_stats.replication_stats.expected_node_count = 1;
+        let valid_empty = build_mrf_response(
+            "bucket-a".to_string(),
+            &valid_empty_stats,
+            DurableMrfBacklog {
+                available: true,
+                entries: Vec::new(),
+            },
+        );
+        let valid_empty_json = serde_json::to_value(valid_empty).expect("valid empty response should serialize");
+        assert_eq!(valid_empty_json["RuntimeStatsAvailable"], true);
+        assert_eq!(valid_empty_json["DurableBacklogAvailable"], true);
+        assert_eq!(valid_empty_json["TotalFailedCount"], 0);
+        assert_eq!(valid_empty_json["DurableCount"], 0);
     }
 
     #[test]

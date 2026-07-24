@@ -28,8 +28,8 @@ use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::runtime_sources::{
-    ServerContextSlot, current_boot_time, current_bucket_monitor_handle, current_deployment_id, current_notification_system,
-    current_object_store_handle, current_region, current_replication_pool_handle, current_replication_stats_handle,
+    ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
+    current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
     current_server_config, default_object_usecase,
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
@@ -1441,11 +1441,12 @@ async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     }
 }
 
-async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtRoute) -> S3Result<S3Response<Body>> {
-    let bucket_stats = match current_replication_stats_handle() {
-        Some(stats) => stats.get_latest_replication_stats(bucket).await,
-        None => BucketStats::default(),
-    };
+async fn build_replication_metrics_response(
+    bucket: &str,
+    route: ReplicationExtRoute,
+    context: Option<Arc<crate::admin::runtime_sources::AppContext>>,
+) -> S3Result<S3Response<Body>> {
+    let bucket_stats = crate::admin::handlers::replication::cluster_replication_stats(bucket, context).await;
     let bucket_stats = apply_replication_metrics_bandwidth_report(bucket_stats, collect_replication_metrics_bandwidth(bucket));
     let bucket_stats = apply_replication_metrics_runtime_fields(bucket_stats, route, replication_metrics_uptime_seconds());
 
@@ -1487,10 +1488,12 @@ fn apply_replication_metrics_bandwidth_report(
     mut bucket_stats: BucketStats,
     bandwidth_report: HashMap<String, BandwidthDetails>,
 ) -> BucketStats {
+    if bucket_stats.replication_stats.expected_node_count > 1 {
+        return bucket_stats;
+    }
     for (arn, details) in bandwidth_report {
         let stat = bucket_stats.replication_stats.stats.entry(arn).or_default();
-        stat.bandwidth_limit_bytes_per_sec = details.limit_bytes_per_sec;
-        stat.current_bandwidth_bytes_per_sec = details.current_bandwidth_bytes_per_sec;
+        stat.set_node_local_bandwidth(details.limit_bytes_per_sec, details.current_bandwidth_bytes_per_sec);
     }
 
     bucket_stats
@@ -2212,7 +2215,7 @@ async fn handle_replication_extension_request(
     match ext_req.route {
         ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
             ensure_replication_config_exists(&ext_req.bucket).await?;
-            build_replication_metrics_response(&ext_req.bucket, ext_req.route).await
+            build_replication_metrics_response(&ext_req.bucket, ext_req.route, app_context_from_req(req)).await
         }
         ReplicationExtRoute::Check => {
             let (versioning, _) = metadata_sys::get_versioning_config(&ext_req.bucket)
@@ -3260,6 +3263,10 @@ mod tests {
         assert_eq!(stat.replicated_count, 3);
         assert_eq!(stat.bandwidth_limit_bytes_per_sec, 2048);
         assert_eq!(stat.current_bandwidth_bytes_per_sec, 1536.5);
+        assert_eq!(
+            serde_json::to_value(stat).expect("target stats should serialize")["bandwidth_scope"],
+            "node_local"
+        );
     }
 
     #[test]
@@ -3281,6 +3288,34 @@ mod tests {
 
         assert_eq!(stat.bandwidth_limit_bytes_per_sec, 4096);
         assert_eq!(stat.current_bandwidth_bytes_per_sec, 1024.25);
+    }
+
+    #[test]
+    fn apply_replication_metrics_bandwidth_report_does_not_replace_cluster_values() {
+        let mut stats = BucketStats::default();
+        stats.replication_stats.expected_node_count = 2;
+        let target = stats
+            .replication_stats
+            .stats
+            .entry("arn:replication:a".to_string())
+            .or_default();
+        target.bandwidth_limit_bytes_per_sec = 8192;
+        target.current_bandwidth_bytes_per_sec = 3000.0;
+
+        let updated = apply_replication_metrics_bandwidth_report(
+            stats,
+            HashMap::from([(
+                "arn:replication:a".to_string(),
+                BandwidthDetails {
+                    limit_bytes_per_sec: 2048,
+                    current_bandwidth_bytes_per_sec: 1000.0,
+                },
+            )]),
+        );
+        let target = &updated.replication_stats.stats["arn:replication:a"];
+
+        assert_eq!(target.bandwidth_limit_bytes_per_sec, 8192);
+        assert_eq!(target.current_bandwidth_bytes_per_sec, 3000.0);
     }
 
     #[test]
