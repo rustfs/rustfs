@@ -107,7 +107,6 @@ use uuid::Uuid;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_SITE_REPLICATION: &str = "site_replication";
 const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
-const SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM: &str = "x-rustfs-internal-site-replication-version";
 const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
 const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
@@ -6276,22 +6275,17 @@ fn group_info_requires_upsert(update: &rustfs_madmin::GroupAddRemove) -> bool {
 }
 
 pub(crate) fn encode_service_account_replication_policy(
-    claims: &mut HashMap<String, Value>,
+    claims: &HashMap<String, Value>,
     session_policy: Option<&str>,
-) -> S3Result<SRSessionPolicy> {
+) -> S3Result<(SRSessionPolicy, Option<rustfs_madmin::SRSvcAccReplicationEnvelope>)> {
     if !claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) {
         return session_policy
             .map(SRSessionPolicy::from_json)
             .transpose()
             .map(|policy| policy.unwrap_or_default())
+            .map(|policy| (policy, None))
             .map_err(|err| s3_error!(InvalidArgument, "marshal policy failed: {:?}", err));
     }
-
-    claims.remove(SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM);
-    claims.insert(
-        SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM.to_string(),
-        Value::Number(SERVICE_ACCOUNT_ENVELOPE_VERSION.into()),
-    );
 
     let policy = match session_policy {
         Some(policy) => serde_json::from_str::<Policy>(policy)
@@ -6305,8 +6299,14 @@ pub(crate) fn encode_service_account_replication_policy(
     }
     let policy = serde_json::to_string(&policy)
         .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
-    SRSessionPolicy::from_json(&policy)
-        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))
+    let policy = SRSessionPolicy::from_json(&policy)
+        .map_err(|err| s3_error!(InternalError, "marshal service account replication policy failed: {:?}", err))?;
+    Ok((
+        policy,
+        Some(rustfs_madmin::SRSvcAccReplicationEnvelope {
+            version: SERVICE_ACCOUNT_ENVELOPE_VERSION,
+        }),
+    ))
 }
 
 #[derive(Debug)]
@@ -6330,7 +6330,8 @@ impl ReplicatedServiceAccountPolicy {
 }
 
 fn decode_service_account_replication_policy(
-    create: &mut SRSvcAccCreate,
+    create: &SRSvcAccCreate,
+    envelope: Option<&rustfs_madmin::SRSvcAccReplicationEnvelope>,
     incoming_updated_at: Option<OffsetDateTime>,
     local_updated_at: Option<OffsetDateTime>,
 ) -> S3Result<Option<ReplicatedServiceAccountPolicy>> {
@@ -6338,13 +6339,13 @@ fn decode_service_account_replication_policy(
         return Ok(None);
     }
 
-    let Some(version) = create.claims.remove(SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM) else {
+    let Some(envelope) = envelope else {
         return Ok(Some(ReplicatedServiceAccountPolicy {
             policy: create.session_policy.as_str().and_then(|raw| serde_json::from_str(raw).ok()),
             is_envelope: false,
         }));
     };
-    if version.as_u64() != Some(SERVICE_ACCOUNT_ENVELOPE_VERSION) || !create.claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) {
+    if envelope.version != SERVICE_ACCOUNT_ENVELOPE_VERSION || !create.claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) {
         return Err(s3_error!(InvalidRequest, "invalid service account replication envelope"));
     }
 
@@ -6489,7 +6490,8 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             let Some(change) = item.svc_acc_change else {
                 return Err(s3_error!(InvalidRequest, "serviceAccountChange is required"));
             };
-            if let Some(mut create) = change.create {
+            let envelope = change.oidc_service_account_envelope;
+            if let Some(create) = change.create {
                 let local_updated_at = iam_sys
                     .get_user(&create.access_key)
                     .await
@@ -6503,8 +6505,12 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                         is_envelope: false,
                     }
                 } else {
-                    let Some(replicated_policy) =
-                        decode_service_account_replication_policy(&mut create, incoming_updated_at, local_updated_at)?
+                    let Some(replicated_policy) = decode_service_account_replication_policy(
+                        &create,
+                        envelope.as_ref(),
+                        incoming_updated_at,
+                        local_updated_at,
+                    )?
                     else {
                         return Ok(());
                     };
@@ -8068,10 +8074,11 @@ mod tests {
     fn oidc_service_account_envelope_round_trips_actual_policy() {
         let actual_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket/*"]}]}"#;
         let updated_at = OffsetDateTime::UNIX_EPOCH;
-        let mut claims =
+        let claims =
             HashMap::from([(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("openid=verified-parent".to_string()))]);
-        let wire_policy = encode_service_account_replication_policy(&mut claims, Some(actual_policy)).expect("encode envelope");
-        let mut create = SRSvcAccCreate {
+        let (wire_policy, envelope) =
+            encode_service_account_replication_policy(&claims, Some(actual_policy)).expect("encode envelope");
+        let create = SRSvcAccCreate {
             parent: "openid=verified-parent".to_string(),
             access_key: "OIDCREPLICATEDSERVICE".to_string(),
             secret_key: "oidcReplicatedSecret123".to_string(),
@@ -8095,15 +8102,10 @@ mod tests {
             serde_json::to_value(old_receiver_policy).expect("serialize old receiver policy"),
             serde_json::from_str::<Value>(actual_policy).expect("parse expected policy")
         );
-        assert_eq!(
-            create
-                .claims
-                .get(SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM)
-                .and_then(Value::as_u64),
-            Some(SERVICE_ACCOUNT_ENVELOPE_VERSION)
-        );
+        assert_eq!(envelope.as_ref().map(|envelope| envelope.version), Some(SERVICE_ACCOUNT_ENVELOPE_VERSION));
+        assert_eq!(create.claims.len(), 1);
 
-        let decoded = decode_service_account_replication_policy(&mut create, Some(updated_at), None)
+        let decoded = decode_service_account_replication_policy(&create, envelope.as_ref(), Some(updated_at), None)
             .expect("decode envelope")
             .expect("current envelope");
         assert!(decoded.is_envelope);
@@ -8113,16 +8115,16 @@ mod tests {
             serde_json::to_value(restored).expect("serialize restored policy"),
             serde_json::from_str::<Value>(actual_policy).expect("parse expected policy")
         );
-        assert!(!create.claims.contains_key(SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM));
     }
 
     #[test]
     fn oidc_service_account_envelope_clears_policy_on_existing_account() {
         let updated_at = OffsetDateTime::UNIX_EPOCH;
-        let mut claims =
+        let claims =
             HashMap::from([(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("openid=verified-parent".to_string()))]);
-        let wire_policy = encode_service_account_replication_policy(&mut claims, None).expect("encode inherited envelope");
-        let mut create = SRSvcAccCreate {
+        let (wire_policy, envelope) =
+            encode_service_account_replication_policy(&claims, None).expect("encode inherited envelope");
+        let create = SRSvcAccCreate {
             parent: "openid=verified-parent".to_string(),
             access_key: "OIDCREPLICATEDSERVICE".to_string(),
             secret_key: "oidcReplicatedSecret123".to_string(),
@@ -8145,7 +8147,7 @@ mod tests {
         assert!(old_receiver_policy.version.is_empty());
         assert!(old_receiver_policy.statements.is_empty());
 
-        let decoded = decode_service_account_replication_policy(&mut create, Some(updated_at), None)
+        let decoded = decode_service_account_replication_policy(&create, envelope.as_ref(), Some(updated_at), None)
             .expect("decode inherited envelope")
             .expect("current envelope");
 
@@ -8162,10 +8164,11 @@ mod tests {
     #[test]
     fn oidc_service_account_envelope_replays_normalized_empty_policy() {
         let actual_policy = r#"{"ID":"deny-boundary","Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#;
-        let mut claims =
+        let claims =
             HashMap::from([(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("openid=verified-parent".to_string()))]);
-        let wire_policy = encode_service_account_replication_policy(&mut claims, Some(actual_policy)).expect("encode envelope");
-        let mut create = SRSvcAccCreate {
+        let (wire_policy, envelope) =
+            encode_service_account_replication_policy(&claims, Some(actual_policy)).expect("encode envelope");
+        let create = SRSvcAccCreate {
             parent: "openid=verified-parent".to_string(),
             access_key: "OIDCREPLICATEDSERVICE".to_string(),
             secret_key: "oidcReplicatedSecret123".to_string(),
@@ -8179,9 +8182,10 @@ mod tests {
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         };
 
-        let decoded = decode_service_account_replication_policy(&mut create, Some(OffsetDateTime::UNIX_EPOCH), None)
-            .expect("decode normalized empty policy")
-            .expect("current envelope");
+        let decoded =
+            decode_service_account_replication_policy(&create, envelope.as_ref(), Some(OffsetDateTime::UNIX_EPOCH), None)
+                .expect("decode normalized empty policy")
+                .expect("current envelope");
         let restored = decoded.policy.as_ref().expect("normalized policy must remain explicit");
         assert_eq!(
             serde_json::to_value(restored).expect("serialize restored policy"),
@@ -8192,18 +8196,12 @@ mod tests {
 
     #[test]
     fn oidc_service_account_envelope_rejects_missing_policy() {
-        let mut create = SRSvcAccCreate {
+        let create = SRSvcAccCreate {
             parent: "openid=verified-parent".to_string(),
             access_key: "OIDCREPLICATEDSERVICE".to_string(),
             secret_key: "oidcReplicatedSecret123".to_string(),
             groups: Vec::new(),
-            claims: HashMap::from([
-                (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("openid=verified-parent".to_string())),
-                (
-                    SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM.to_string(),
-                    Value::Number(SERVICE_ACCOUNT_ENVELOPE_VERSION.into()),
-                ),
-            ]),
+            claims: HashMap::from([(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("openid=verified-parent".to_string()))]),
             session_policy: SRSessionPolicy::default(),
             status: String::new(),
             name: String::new(),
@@ -8212,7 +8210,10 @@ mod tests {
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         };
 
-        let err = decode_service_account_replication_policy(&mut create, Some(OffsetDateTime::UNIX_EPOCH), None)
+        let envelope = rustfs_madmin::SRSvcAccReplicationEnvelope {
+            version: SERVICE_ACCOUNT_ENVELOPE_VERSION,
+        };
+        let err = decode_service_account_replication_policy(&create, Some(&envelope), Some(OffsetDateTime::UNIX_EPOCH), None)
             .expect_err("policy-less envelope must fail closed");
 
         assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
@@ -8220,15 +8221,12 @@ mod tests {
 
     #[test]
     fn stale_oidc_service_account_envelope_is_ignored_before_decoding() {
-        let mut create = SRSvcAccCreate {
+        let create = SRSvcAccCreate {
             parent: "openid=verified-parent".to_string(),
             access_key: "OIDCREPLICATEDSERVICE".to_string(),
             secret_key: "oidcReplicatedSecret123".to_string(),
             groups: Vec::new(),
-            claims: HashMap::from([(
-                SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM.to_string(),
-                Value::Number((SERVICE_ACCOUNT_ENVELOPE_VERSION + 1).into()),
-            )]),
+            claims: HashMap::new(),
             session_policy: SRSessionPolicy::default(),
             status: String::new(),
             name: String::new(),
@@ -8237,15 +8235,91 @@ mod tests {
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         };
 
+        let envelope = rustfs_madmin::SRSvcAccReplicationEnvelope {
+            version: SERVICE_ACCOUNT_ENVELOPE_VERSION + 1,
+        };
         let decoded = decode_service_account_replication_policy(
-            &mut create,
+            &create,
+            Some(&envelope),
             Some(OffsetDateTime::UNIX_EPOCH),
             Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
         )
         .expect("stale envelope must be ignored before validation");
 
         assert!(decoded.is_none());
-        assert!(create.claims.contains_key(SERVICE_ACCOUNT_ENVELOPE_VERSION_CLAIM));
+    }
+
+    #[test]
+    fn oidc_service_account_envelope_does_not_survive_a_legacy_hop() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct LegacyServiceAccountChange {
+            #[serde(rename = "crSvcAccCreate", skip_serializing_if = "Option::is_none")]
+            create: Option<SRSvcAccCreate>,
+            #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+            api_version: Option<String>,
+        }
+
+        let claims =
+            HashMap::from([(OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String("openid=verified-parent".to_string()))]);
+        let (session_policy, envelope) =
+            encode_service_account_replication_policy(&claims, None).expect("encode envelope for legacy hop");
+        let change = rustfs_madmin::SRSvcAccChange {
+            create: Some(SRSvcAccCreate {
+                parent: "openid=verified-parent".to_string(),
+                access_key: "OIDCREPLICATEDSERVICE".to_string(),
+                secret_key: "oidcReplicatedSecret123".to_string(),
+                groups: Vec::new(),
+                claims,
+                session_policy,
+                status: String::new(),
+                name: String::new(),
+                description: String::new(),
+                expiration: None,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            oidc_service_account_envelope: envelope,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        };
+
+        let legacy: LegacyServiceAccountChange =
+            serde_json::from_value(serde_json::to_value(change).expect("serialize new replication payload"))
+                .expect("legacy node must ignore the unknown envelope field");
+        let legacy_claims = legacy
+            .create
+            .as_ref()
+            .expect("legacy payload has a create operation")
+            .claims
+            .clone();
+        assert_eq!(legacy_claims.len(), 1);
+
+        let reemitted: rustfs_madmin::SRSvcAccChange = serde_json::from_value(
+            serde_json::to_value(LegacyServiceAccountChange {
+                create: Some(SRSvcAccCreate {
+                    parent: "openid=verified-parent".to_string(),
+                    access_key: "OIDCLEGACYCHILD001".to_string(),
+                    secret_key: "oidcLegacyChildSecret123".to_string(),
+                    groups: Vec::new(),
+                    claims: legacy_claims,
+                    session_policy: SRSessionPolicy::default(),
+                    status: String::new(),
+                    name: String::new(),
+                    description: String::new(),
+                    expiration: None,
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            })
+            .expect("serialize legacy child replication payload"),
+        )
+        .expect("new node accepts legacy child replication payload");
+
+        assert!(reemitted.oidc_service_account_envelope.is_none());
+        let create = reemitted.create.expect("reemitted payload has a create operation");
+        let decoded = decode_service_account_replication_policy(&create, None, Some(OffsetDateTime::UNIX_EPOCH), None)
+            .expect("legacy payload must not be parsed as an envelope")
+            .expect("legacy payload should be accepted");
+        assert!(!decoded.is_envelope);
     }
 
     fn valid_test_ca_pem(name: &str) -> String {

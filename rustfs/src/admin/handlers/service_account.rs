@@ -438,7 +438,7 @@ impl Operation for AddServiceAccount {
                 .await
                 .map(|(credentials, updated_at)| (credentials, updated_at, replication_claims))
         };
-        let (new_cred, updated_at, mut replication_claims) = create_result.map_err(|e| {
+        let (new_cred, updated_at, replication_claims) = create_result.map_err(|e| {
             debug!(
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
@@ -456,8 +456,8 @@ impl Operation for AddServiceAccount {
                 err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
             }
         })?;
-        let replication_session_policy =
-            encode_service_account_replication_policy(&mut replication_claims, replication_policy.as_deref())?;
+        let (replication_session_policy, oidc_service_account_envelope) =
+            encode_service_account_replication_policy(&replication_claims, replication_policy.as_deref())?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "service-account".to_string(),
@@ -475,6 +475,7 @@ impl Operation for AddServiceAccount {
                     expiration: replication_expiration,
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 }),
+                oidc_service_account_envelope,
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
             }),
