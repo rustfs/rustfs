@@ -19,12 +19,34 @@ use rustfs_obs::dial9::Dial9SessionGuard;
 
 #[inline]
 fn compute_default_thread_stack_size() -> usize {
-    // Baseline: Release 1 MiB，Debug 2 MiB；macOS at least 2 MiB
-    // macOS is more conservative: many system libraries and backtracking are more "stack-eating"
-    if cfg!(debug_assertions) || cfg!(target_os = "macos") {
+    if cfg!(debug_assertions) {
+        // Debug builds keep larger async futures and tracing state on the stack;
+        // scanner e2e paths need more headroom than the release runtime.
+        8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+    } else if cfg!(target_os = "macos") {
+        // macOS is more conservative: many system libraries and backtracking are more "stack-eating"
         2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
     } else {
         rustfs_config::DEFAULT_THREAD_STACK_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_thread_stack_size_matches_build_profile() {
+        let default_stack = rustfs_config::DEFAULT_THREAD_STACK_SIZE;
+        let expected = if cfg!(debug_assertions) {
+            8 * default_stack
+        } else if cfg!(target_os = "macos") {
+            2 * default_stack
+        } else {
+            default_stack
+        };
+
+        assert_eq!(compute_default_thread_stack_size(), expected);
     }
 }
 
