@@ -657,14 +657,19 @@ pub async fn test_multipart_upload_with_config(
         .build();
 
     info!("🔗 Completing multipart upload");
-    let complete_output = s3_client
+    let mut complete_request = s3_client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(&config.object_key)
         .upload_id(upload_id)
-        .multipart_upload(completed_multipart_upload)
-        .send()
-        .await?;
+        .multipart_upload(completed_multipart_upload);
+    if let EncryptionType::SSEC { .. } = &config.encryption_type {
+        complete_request = complete_request
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(sse_c_key_b64.as_ref().unwrap())
+            .sse_customer_key_md5(sse_c_key_md5.as_ref().unwrap());
+    }
+    let complete_output = complete_request.send().await?;
 
     debug!("Multipart upload finalized with ETag {:?}", complete_output.e_tag());
 

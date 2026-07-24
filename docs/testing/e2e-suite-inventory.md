@@ -72,9 +72,10 @@
 | protocols | 16 |  |
 | quota_test | 14 |  |
 | reliability_disk_fault_test | 3 |  |
-| reliant | 10 | 4 ✅ |
+| reliant | 10 | 5 ✅ |
 | replication_extension_test | 47 | 20 ✅ +27 🌙 |
 | security_boundary_test | 4 |  |
+| ssec_copy_test | 2 | ✅ |
 | server_startup_failfast_test | 1 |  |
 | snowball_auto_extract_test | 6 |  |
 | special_chars_test | 14 | ✅ |
@@ -86,4 +87,4 @@
 
 `notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
 
-**Total listed: 483 tests across 66 modules · PR smoke subset: 126 tests / 31 modules** (29 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-24.
+**Total listed: 485 tests across 67 modules · PR smoke subset: 129 tests / 32 modules** (30 full modules + 5 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-24.

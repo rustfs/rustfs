@@ -5831,6 +5831,17 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(InvalidStorageClass));
         }
+        let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
+        validate_sse_headers_for_write(
+            requested_sse.as_ref(),
+            requested_kms_key_id.as_ref(),
+            ssekms_context.as_ref(),
+            sse_customer_algorithm.as_ref(),
+            sse_customer_key.as_ref(),
+            sse_customer_key_md5.as_ref(),
+            true,
+        )?;
+        let has_explicit_ssec = sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some();
 
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
@@ -5957,6 +5968,9 @@ impl DefaultObjectUsecase {
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
+            if has_explicit_ssec {
+                return None;
+            }
             bucket_sse_config.as_ref().and_then(|(config, _)| {
                 config.rules.first().and_then(|rule| {
                     rule.apply_server_side_encryption_by_default
@@ -5970,6 +5984,9 @@ impl DefaultObjectUsecase {
             })
         });
         let mut effective_kms_key_id = requested_kms_key_id.or_else(|| {
+            if has_explicit_ssec {
+                return None;
+            }
             bucket_sse_config.as_ref().and_then(|(config, _)| {
                 config.rules.first().and_then(|rule| {
                     rule.apply_server_side_encryption_by_default
@@ -6145,7 +6162,7 @@ impl DefaultObjectUsecase {
             key: &key,
             server_side_encryption: effective_sse.clone(),
             ssekms_key_id: effective_kms_key_id.clone(),
-            ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
+            ssekms_context,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
