@@ -22,8 +22,9 @@ use crate::server::rate_limit::{
     apply_throttle_headers, client_ip,
 };
 use crate::server::{
-    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX,
-    RequestContextLayer, VERSION, build_health_response_parts, collect_probe_readiness,
+    APPLE_TOUCH_ICON_PATH, APPLE_TOUCH_ICON_PRECOMPOSED_PATH, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH,
+    HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX, RequestContextLayer, VERSION, build_health_response_parts,
+    collect_probe_readiness,
 };
 use crate::version::build;
 use axum::{
@@ -470,7 +471,8 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 /// # Returns:
 /// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
-    path == FAVICON_PATH || has_path_prefix(path, CONSOLE_PREFIX)
+    matches!(path, FAVICON_PATH | APPLE_TOUCH_ICON_PATH | APPLE_TOUCH_ICON_PRECOMPOSED_PATH)
+        || has_path_prefix(path, CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
@@ -874,6 +876,8 @@ mod tests {
     #[test]
     fn external_admin_paths_are_not_console_paths() {
         assert!(is_console_path("/rustfs/console/"));
+        assert!(is_console_path("/apple-touch-icon.png"));
+        assert!(is_console_path("/apple-touch-icon-precomposed.png"));
         assert!(!is_console_path("/minio/admin/v3/info"));
         assert!(!is_console_path("/rustfs/admin/v3/info"));
     }
