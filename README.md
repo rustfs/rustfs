@@ -262,7 +262,7 @@ rustfs --help
 2. **Create a Bucket**: Use the console to create a new bucket for your objects.
 3. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs/clients to interact with your RustFS instance.
 
-**NOTE**: To access the RustFS instance via `https`, please refer to the [TLS Configuration Docs](https://docs.rustfs.com/integration/tls-configured.html).
+**NOTE**: To access the RustFS instance via `https`, please refer to the [TLS Configuration Docs](http://web.archive.org/web/20260622225320/https://docs.rustfs.com/integration/tls-configured.html).
 
 ### OIDC Roles Claim (Microsoft Entra ID)
 
