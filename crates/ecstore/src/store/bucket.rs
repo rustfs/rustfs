@@ -326,6 +326,13 @@ impl ECStore {
         )
         .await?;
 
+        if confirmed_missing && !is_meta_bucketname(bucket) {
+            // A scanner may have sampled the first fence before the bucket
+            // became visible. Fence again after metadata initialization so
+            // that snapshot cannot publish as complete.
+            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+        }
+
         Ok(())
     }
 
@@ -545,6 +552,9 @@ impl ECStore {
                 "physical bucket deletion succeeded but metadata cleanup remains pending"
             );
         }
+        // A scanner may have sampled the first fence before the physical
+        // namespace disappeared. The completion fence invalidates that scan.
+        crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
         Ok(())
     }
 }
@@ -839,8 +849,8 @@ mod tests {
             .expect("bucket should be created");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_make.saturating_add(1),
-            "successful bucket creation should advance scanner namespace activity"
+            generation_before_make.saturating_add(2),
+            "successful bucket creation should fence scanner namespace activity before and after creation"
         );
 
         let generation_before_put = ecstore.scanner_namespace_mutation_generation();
@@ -1057,8 +1067,8 @@ mod tests {
             .expect("MarkDelete should remove an empty bucket");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_delete.saturating_add(1),
-            "successful bucket deletion should advance scanner namespace activity"
+            generation_before_delete.saturating_add(2),
+            "successful bucket deletion should fence scanner namespace activity before and after deletion"
         );
 
         assert!(
@@ -1179,8 +1189,8 @@ mod tests {
             .expect("Purge should force-delete bucket data");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
-            generation_before_delete.saturating_add(1),
-            "successful bucket purge should advance scanner namespace activity"
+            generation_before_delete.saturating_add(2),
+            "successful bucket purge should fence scanner namespace activity before and after deletion"
         );
 
         assert!(!any_disk_path_exists(&disk_paths, &bucket).await, "Purge should remove the bucket volume");
@@ -1271,6 +1281,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        snapshot.usage_snapshot_complete = true;
         snapshot.bucket_sizes.insert(bucket.clone(), 42);
         snapshot.calculate_totals();
         crate::data_usage::store_data_usage_in_backend(snapshot, ecstore.clone())
@@ -1324,6 +1335,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        snapshot.usage_snapshot_complete = true;
         snapshot.bucket_sizes.insert(bucket.clone(), 42);
         snapshot.calculate_totals();
         crate::data_usage::store_data_usage_in_backend(snapshot, ecstore.clone())
@@ -1373,6 +1385,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        snapshot.usage_snapshot_complete = true;
         snapshot.bucket_sizes.insert(bucket.clone(), 42);
         snapshot.calculate_totals();
         crate::data_usage::store_data_usage_in_backend(snapshot, ecstore.clone())

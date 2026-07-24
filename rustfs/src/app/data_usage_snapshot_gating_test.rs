@@ -25,22 +25,35 @@
 //! while the response carries the seeded numbers.
 
 use super::gating_test_env::shared_gating_ecstore;
-use super::storage_api::test::StoragePutObjReader as PutObjReader;
-use super::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
+use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use super::storage_api::test::contract::object::ObjectIO as _;
 use super::storage_api::test::data_usage::{
     compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached, record_bucket_object_write_memory,
     store_data_usage_in_backend,
 };
+use super::storage_api::test::{ECStore, StoragePutObjReader as PutObjReader};
 use crate::app::admin_usecase::DefaultAdminUsecase;
 use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
 use serial_test::serial;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const SEEDED_BUCKET_SIZE: u64 = 123_456;
 const SEEDED_BUCKET_OBJECTS: u64 = 42;
+
+async fn next_snapshot_time(ecstore: Arc<ECStore>) -> SystemTime {
+    let now = SystemTime::now();
+    let latest = load_data_usage_from_backend_cached(ecstore)
+        .await
+        .ok()
+        .and_then(|info| info.last_update)
+        .unwrap_or(now);
+    latest.max(now) + Duration::from_nanos(1)
+}
 
 fn seeded_data_usage_info(bucket: &str, last_update: SystemTime) -> DataUsageInfo {
     let usage = BucketUsageInfo {
@@ -58,6 +71,7 @@ fn seeded_data_usage_info(bucket: &str, last_update: SystemTime) -> DataUsageInf
         ..Default::default()
     };
     info.buckets_usage = HashMap::from([(bucket.to_string(), usage)]);
+    info.usage_snapshot_complete = true;
     info.bucket_sizes = HashMap::from([(bucket.to_string(), SEEDED_BUCKET_SIZE)]);
     info
 }
@@ -78,8 +92,16 @@ fn sized_data_usage_info(bucket: &str, size: u64, last_update: SystemTime) -> Da
         ..Default::default()
     };
     info.buckets_usage = HashMap::from([(bucket.to_string(), usage)]);
+    info.usage_snapshot_complete = true;
     info.bucket_sizes = HashMap::from([(bucket.to_string(), size)]);
     info
+}
+
+async fn persist_scanner_snapshot(ecstore: Arc<ECStore>, info: DataUsageInfo) {
+    let (sender, receiver) = mpsc::channel(1);
+    sender.send(info).await.expect("enqueue scanner snapshot");
+    drop(sender);
+    rustfs_scanner::scanner::store_data_usage_in_backend(CancellationToken::new(), ecstore, receiver).await;
 }
 
 #[tokio::test]
@@ -121,10 +143,34 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
         .make_bucket(&seeded_bucket, &MakeBucketOptions::default())
         .await
         .expect("create seeded bucket");
-    let seeded_at = SystemTime::now();
-    store_data_usage_in_backend(seeded_data_usage_info(&seeded_bucket, seeded_at), ecstore.clone())
+    ecstore
+        .make_bucket(&overlay_bucket, &MakeBucketOptions::default())
         .await
-        .expect("persist seeded data usage snapshot");
+        .expect("create overlay bucket");
+    let seeded_at = next_snapshot_time(ecstore.clone()).await;
+    let mut seeded_info = seeded_data_usage_info(&seeded_bucket, seeded_at);
+    for bucket in ecstore
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .expect("list the complete live bucket namespace")
+        .into_iter()
+        .filter(|bucket| !bucket.name.starts_with('.'))
+    {
+        seeded_info.buckets_usage.entry(bucket.name.clone()).or_default();
+        seeded_info.bucket_sizes.entry(bucket.name).or_default();
+    }
+    seeded_info.bucket_sizes.insert(live_bucket.clone(), control_usage.size);
+    seeded_info.buckets_usage.insert(live_bucket.clone(), control_usage);
+    seeded_info
+        .buckets_usage
+        .insert(overlay_bucket.clone(), BucketUsageInfo::default());
+    seeded_info.bucket_sizes.insert(overlay_bucket.clone(), 0);
+    seeded_info.buckets_count = u64::try_from(seeded_info.buckets_usage.len()).expect("test bucket count should fit into u64");
+    seeded_info.calculate_totals();
+    persist_scanner_snapshot(ecstore.clone(), seeded_info).await;
 
     record_bucket_object_write_memory(&overlay_bucket, None, 512).await;
 
@@ -182,6 +228,138 @@ async fn data_usage_endpoint_serves_snapshot_without_live_listing() {
     assert_eq!(overlay_usage.size, 512);
 }
 
+#[tokio::test]
+#[serial]
+async fn data_usage_endpoint_treats_legacy_partial_stats_as_unknown_until_covered() {
+    let ecstore = shared_gating_ecstore().await;
+    let agent_bucket = format!("usage-legacy-agent-{}", Uuid::new_v4());
+    let small_bucket = format!("usage-legacy-small-{}", Uuid::new_v4());
+    ecstore
+        .make_bucket(&agent_bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create legacy partial snapshot bucket");
+    ecstore
+        .make_bucket(&small_bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create legacy zero snapshot bucket");
+    let mut reader = PutObjReader::from_vec(b"object exists".to_vec());
+    ecstore
+        .put_object(&agent_bucket, "object.bin", &mut reader, &Default::default())
+        .await
+        .expect("put object before persisting legacy partial snapshot");
+    let mut small_reader = PutObjReader::from_vec(vec![b'x'; 57_344]);
+    ecstore
+        .put_object(&small_bucket, "small.bin", &mut small_reader, &Default::default())
+        .await
+        .expect("put object before persisting legacy zero snapshot");
+
+    let persisted_at = next_snapshot_time(ecstore.clone()).await;
+    let mut legacy = DataUsageInfo {
+        last_update: Some(persisted_at),
+        buckets_count: 2,
+        ..Default::default()
+    };
+    legacy.buckets_usage.insert(
+        agent_bucket.clone(),
+        BucketUsageInfo {
+            size: 196_870_144,
+            objects_count: 1_502,
+            versions_count: 1_502,
+            ..Default::default()
+        },
+    );
+    legacy.buckets_usage.insert(small_bucket.clone(), BucketUsageInfo::default());
+    legacy.bucket_sizes.insert(agent_bucket.clone(), 196_870_144);
+    legacy.bucket_sizes.insert(small_bucket.clone(), 0);
+    store_data_usage_in_backend(legacy, ecstore.clone())
+        .await
+        .expect("persist legacy partial snapshot");
+
+    let before_endpoint = live_bucket_usage_computations();
+    let unknown = DefaultAdminUsecase::query_data_usage_info_with_store(ecstore.clone())
+        .await
+        .expect_err("an uncovered snapshot must be reported as temporarily unavailable");
+
+    assert_eq!(unknown.code, s3s::S3ErrorCode::ServiceUnavailable);
+    assert_eq!(
+        live_bucket_usage_computations(),
+        before_endpoint,
+        "uncovered snapshot handling must not restore request-time object listings"
+    );
+
+    let completed_at = persisted_at + Duration::from_nanos(1);
+    let mut completed = DataUsageInfo {
+        last_update: Some(completed_at),
+        usage_snapshot_complete: true,
+        ..Default::default()
+    };
+    for bucket in ecstore
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .expect("list the complete live bucket namespace")
+        .into_iter()
+        .filter(|bucket| !bucket.name.starts_with('.'))
+    {
+        completed
+            .buckets_usage
+            .insert(bucket.name.clone(), BucketUsageInfo::default());
+        completed.bucket_sizes.insert(bucket.name, 0);
+    }
+    completed.buckets_usage.insert(
+        agent_bucket.clone(),
+        BucketUsageInfo {
+            size: 222_822_400,
+            objects_count: 1_700,
+            versions_count: 1_700,
+            ..Default::default()
+        },
+    );
+    completed.bucket_sizes.insert(agent_bucket.clone(), 222_822_400);
+    completed.buckets_usage.insert(
+        small_bucket.clone(),
+        BucketUsageInfo {
+            size: 57_344,
+            objects_count: 1,
+            versions_count: 1,
+            ..Default::default()
+        },
+    );
+    completed.bucket_sizes.insert(small_bucket.clone(), 57_344);
+    completed.buckets_count = u64::try_from(completed.buckets_usage.len()).expect("test bucket count should fit into u64");
+    completed.calculate_totals();
+    store_data_usage_in_backend(completed, ecstore.clone())
+        .await
+        .expect("persist complete covered snapshot");
+
+    let covered = DefaultAdminUsecase::query_data_usage_info_with_store(ecstore)
+        .await
+        .expect("query covered data usage info");
+    assert_eq!(covered.last_update, Some(completed_at));
+    assert!(covered.usage_snapshot_complete);
+    assert_eq!(
+        covered
+            .buckets_usage
+            .get(&agent_bucket)
+            .map(|usage| (usage.objects_count, usage.size)),
+        Some((1_700, 222_822_400))
+    );
+    assert_eq!(
+        covered
+            .buckets_usage
+            .get(&small_bucket)
+            .map(|usage| (usage.objects_count, usage.size)),
+        Some((1, 57_344))
+    );
+    assert_eq!(
+        live_bucket_usage_computations(),
+        before_endpoint,
+        "covered snapshot publication must not trigger request-time object listings"
+    );
+}
+
 /// Revert detector for the snapshot-cache invalidation in
 /// `save_data_usage_in_backend` (rustfs/backlog#1306): a fresh scanner save must
 /// be visible to the very next cached read, not deferred until the 30s TTL
@@ -194,11 +372,11 @@ async fn save_data_usage_invalidates_snapshot_cache() {
     let ecstore = shared_gating_ecstore().await;
     let bucket = format!("usage-invalidate-{}", Uuid::new_v4());
 
-    // Future-date both snapshots beyond the stale-guard's 5min tolerance so the
-    // persists win deterministically over whatever snapshot a sibling serial
-    // test may have left behind, regardless of test execution order.
-    let warm_at = SystemTime::now() + Duration::from_secs(600);
-    let changed_at = warm_at + Duration::from_secs(1);
+    // Advance beyond the latest persisted timestamp by the smallest possible
+    // increment so this save wins the monotonicity guard without masking a
+    // subsequent in-memory mutation as older than the snapshot.
+    let warm_at = next_snapshot_time(ecstore.clone()).await;
+    let changed_at = warm_at + Duration::from_nanos(1);
 
     const WARM_SIZE: u64 = 111_000;
     const CHANGED_SIZE: u64 = 222_000;
@@ -234,6 +412,38 @@ async fn save_data_usage_invalidates_snapshot_cache() {
         Some(changed_at),
         "cached read after save must report the new snapshot timestamp"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_save_invalidates_snapshot_cache() {
+    let ecstore = shared_gating_ecstore().await;
+    let bucket = format!("usage-scanner-invalidate-{}", Uuid::new_v4());
+    let warm_at = next_snapshot_time(ecstore.clone()).await;
+    let changed_at = warm_at + Duration::from_nanos(1);
+
+    const WARM_SIZE: u64 = 333_000;
+    const CHANGED_SIZE: u64 = 444_000;
+
+    store_data_usage_in_backend(sized_data_usage_info(&bucket, WARM_SIZE, warm_at), ecstore.clone())
+        .await
+        .expect("persist initial snapshot");
+    let warmed = load_data_usage_from_backend_cached(ecstore.clone())
+        .await
+        .expect("warm cached snapshot");
+    assert_eq!(warmed.buckets_usage.get(&bucket).map(|usage| usage.size), Some(WARM_SIZE));
+
+    persist_scanner_snapshot(ecstore.clone(), sized_data_usage_info(&bucket, CHANGED_SIZE, changed_at)).await;
+
+    let reloaded = load_data_usage_from_backend_cached(ecstore)
+        .await
+        .expect("reload cached snapshot after scanner save");
+    assert_eq!(
+        reloaded.buckets_usage.get(&bucket).map(|usage| usage.size),
+        Some(CHANGED_SIZE),
+        "scanner persistence must invalidate the process-local snapshot cache"
+    );
+    assert_eq!(reloaded.last_update, Some(changed_at));
 }
 
 /// Wire pin for the no-snapshot response shape (rustfs/backlog#1306): a

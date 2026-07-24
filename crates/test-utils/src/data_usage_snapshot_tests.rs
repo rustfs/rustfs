@@ -34,6 +34,7 @@ fn snapshot(bucket: &str, last_update: SystemTime) -> DataUsageInfo {
             ..Default::default()
         },
     );
+    info.usage_snapshot_complete = true;
     info.bucket_sizes.insert(bucket.to_string(), 42);
     info.buckets_count = 1;
     info.calculate_totals();

@@ -61,8 +61,9 @@ use crate::storage_api::scan::{
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
-    save_config_shared_with_preconditions, save_config_with_preconditions, scanner_is_erasure_sd,
+    get_lifecycle_config, get_replication_config, invalidate_data_usage_snapshot_cache, read_config,
+    replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions, save_config_with_preconditions,
+    scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -985,7 +986,7 @@ fn initial_scanner_delay_for_startup(
 }
 
 fn data_usage_info_is_cold(info: &DataUsageInfo) -> bool {
-    info.last_update.is_none() || (info.buckets_usage.is_empty() && info.bucket_sizes.is_empty())
+    !info.is_complete_bucket_usage_snapshot()
 }
 
 async fn read_data_usage_config_for_startup(storeapi: &Arc<impl ScannerObjectIO>) -> Result<Option<Vec<u8>>, EcstoreError> {
@@ -1004,10 +1005,12 @@ async fn read_data_usage_config_for_startup(storeapi: &Arc<impl ScannerObjectIO>
         }
     }
 
-    match read_pair(storeapi, DATA_USAGE_OBJ_NAME_PATH.as_str()).await? {
-        Some(data) => Ok(Some(data)),
-        None => read_pair(storeapi, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()).await,
+    for path in [DATA_USAGE_OBJ_NAME_PATH.as_str(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()] {
+        if let Some(data) = read_pair(storeapi, path).await? {
+            return Ok(Some(data));
+        }
     }
+    Ok(None)
 }
 
 fn data_usage_backup_due(data_usage_info: &DataUsageInfo) -> bool {
@@ -3611,6 +3614,21 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
             data_usage_info.scanner_epoch = Some(leader_epoch);
         }
 
+        if !data_usage_info.is_complete_bucket_usage_snapshot() {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "reject_incomplete_snapshot",
+                "Scanner refused to persist an incomplete data usage snapshot"
+            );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
+            outcome = DataUsagePersistOutcome::Failed;
+            continue;
+        }
+
         let data = match serde_json::to_vec(&data_usage_info) {
             Ok(data) => data,
             Err(e) => {
@@ -3767,16 +3785,19 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
 
         match save_outcome {
             DataUsagePersistOutcome::Current => {
+                invalidate_data_usage_snapshot_cache().await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::SkippedStale);
                 outcome = DataUsagePersistOutcome::Current;
                 continue;
             }
             DataUsagePersistOutcome::AlreadyDurable => {
+                invalidate_data_usage_snapshot_cache().await;
                 replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 outcome = DataUsagePersistOutcome::AlreadyDurable;
             }
             DataUsagePersistOutcome::PriorCycleDurable => {
+                invalidate_data_usage_snapshot_cache().await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 outcome = DataUsagePersistOutcome::PriorCycleDurable;
             }
@@ -3786,6 +3807,7 @@ async fn store_data_usage_in_backend_with_outcome_for_epoch_and_baseline(
                 continue;
             }
             DataUsagePersistOutcome::Saved => {
+                invalidate_data_usage_snapshot_cache().await;
                 replace_bucket_usage_memory_from_info(&data_usage_info).await;
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 outcome = DataUsagePersistOutcome::Saved;
@@ -4485,8 +4507,25 @@ mod tests {
         assert_eq!(epoch, 11);
     }
 
+    #[test]
+    fn scanner_startup_treats_incomplete_usage_snapshot_as_cold() {
+        let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::now()), 1);
+        legacy.usage_snapshot_complete = false;
+
+        assert!(data_usage_info_is_cold(&legacy));
+        assert!(!data_usage_info_is_cold(&complete_usage_with_bucket_count(
+            Some(std::time::SystemTime::now()),
+            1,
+        )));
+        assert!(!data_usage_info_is_cold(&DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        }));
+    }
+
     #[tokio::test]
-    async fn scanner_startup_migrates_legacy_usage_only_until_v2_exists() {
+    async fn scanner_startup_prefers_v2_over_legacy_usage() {
         let store = Arc::new(MemoryConfigStore::default());
         let legacy = DataUsageInfo {
             scanner_epoch: Some(19),
@@ -4517,9 +4556,10 @@ mod tests {
         );
 
         let authoritative = DataUsageInfo {
-            scanner_epoch: Some(7),
-            scanner_cycle: Some(11),
+            scanner_epoch: Some(23),
+            scanner_cycle: Some(51),
             last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
             ..Default::default()
         };
         let authoritative_data = serde_json::to_vec(&authoritative).expect("v2 usage snapshot should encode");
@@ -4539,8 +4579,8 @@ mod tests {
                 .await
                 .expect("v2 usage floor should be authoritative"),
             PersistedUsageFloor {
-                next_cycle: 12,
-                leader_epoch: 7,
+                next_cycle: 52,
+                leader_epoch: 23,
             }
         );
 
@@ -4594,7 +4634,7 @@ mod tests {
                     scanner_epoch: Some(1),
                     scanner_cycle: Some(cycle),
                     last_update: Some(std::time::SystemTime::now()),
-                    ..Default::default()
+                    ..complete_usage_with_bucket_count(None, 0)
                 })
                 .await
                 .expect("usage update should queue");
@@ -4959,16 +4999,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel(2);
         let ctx = CancellationToken::new();
 
-        let newer = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let older = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
-            buckets_count: 1,
-            ..Default::default()
-        };
+        let newer = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 2);
+        let older = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)), 1);
 
         sender.send(newer).await.expect("newer usage snapshot should enqueue");
         sender.send(older).await.expect("older usage snapshot should enqueue");
@@ -4993,16 +5025,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let ctx = CancellationToken::new();
         let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
-        let newer = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let stale = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
-            buckets_count: 1,
-            ..Default::default()
-        };
+        let newer = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 2);
+        let stale = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)), 1);
         store
             .interleaving_puts
             .lock()
@@ -5045,6 +5069,7 @@ mod tests {
         initial.bucket_sizes.insert("bucket-a".to_string(), 84);
         initial.buckets_count = 1;
         initial.calculate_totals();
+        mark_usage_snapshot_complete(&mut initial);
         let initial_data = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
         store.objects.lock().await.insert(key.clone(), initial_data.clone());
         store.revisions.lock().await.insert(key.clone(), 1);
@@ -5054,6 +5079,7 @@ mod tests {
         deleted.bucket_sizes.clear();
         deleted.buckets_count = 0;
         deleted.calculate_totals();
+        mark_usage_snapshot_complete(&mut deleted);
         store
             .interleaving_puts
             .lock()
@@ -5102,7 +5128,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(1),
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 0)
         };
         store.objects.lock().await.insert(
             backup_key.clone(),
@@ -5129,6 +5155,7 @@ mod tests {
             incoming.bucket_sizes.insert("bucket-a".to_string(), 84);
             incoming.buckets_count = 1;
             incoming.calculate_totals();
+            mark_usage_snapshot_complete(&mut incoming);
             sender.send(incoming).await.expect("usage snapshot should enqueue");
         }
         drop(sender);
@@ -5162,7 +5189,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(10),
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 0)
         };
         let encoded = serde_json::to_vec(&durable).expect("usage snapshot should encode");
         store.objects.lock().await.insert(main_key.clone(), encoded.clone());
@@ -5205,6 +5232,7 @@ mod tests {
         incoming.bucket_sizes.insert("bucket-a".to_string(), 84);
         incoming.buckets_count = 1;
         incoming.calculate_totals();
+        mark_usage_snapshot_complete(&mut incoming);
 
         let mut deleted = incoming.clone();
         deleted.last_update = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(31));
@@ -5212,6 +5240,7 @@ mod tests {
         deleted.bucket_sizes.clear();
         deleted.buckets_count = 0;
         deleted.calculate_totals();
+        mark_usage_snapshot_complete(&mut deleted);
         store.replace_after_successful_puts.lock().await.insert(
             main_key.clone(),
             (1, serde_json::to_vec(&deleted).expect("deleted primary snapshot should encode")),
@@ -5251,21 +5280,9 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let ctx = CancellationToken::new();
         let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
-        let initial = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
-            buckets_count: 1,
-            ..Default::default()
-        };
-        let stale_winner = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let current = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
-            buckets_count: 3,
-            ..Default::default()
-        };
+        let initial = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)), 3);
+        let stale_winner = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 3);
+        let current = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)), 3);
         store
             .objects
             .lock()
@@ -5298,21 +5315,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_data_usage_in_backend_rejects_untimestamped_stale_snapshot() {
+    async fn test_store_data_usage_in_backend_rejects_untimestamped_complete_snapshot() {
         let store = Arc::new(MemoryConfigStore::default());
         let (sender, receiver) = mpsc::channel(2);
         let ctx = CancellationToken::new();
 
-        let timestamped = DataUsageInfo {
-            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
-            buckets_count: 2,
-            ..Default::default()
-        };
-        let untimestamped = DataUsageInfo {
-            last_update: None,
-            buckets_count: 1,
-            ..Default::default()
-        };
+        let timestamped = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 2);
+        let untimestamped = complete_usage_with_bucket_count(None, 1);
 
         sender
             .send(timestamped)
@@ -5334,7 +5343,7 @@ mod tests {
 
         assert_eq!(saved.buckets_count, 2);
         assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
-        assert_eq!(outcome, DataUsagePersistOutcome::Current);
+        assert_eq!(outcome, DataUsagePersistOutcome::Failed);
     }
 
     #[tokio::test]
@@ -5346,8 +5355,7 @@ mod tests {
         let snapshot = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5377,8 +5385,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5392,8 +5399,7 @@ mod tests {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
                 scanner_epoch: Some(8),
                 scanner_cycle: Some(12),
-                buckets_count: 3,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 3)
             })
             .await
             .expect("changed retry snapshot should enqueue");
@@ -5426,8 +5432,7 @@ mod tests {
         let existing = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(200)),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5440,8 +5445,7 @@ mod tests {
         let older = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
             scanner_cycle: Some(11),
-            buckets_count: 1,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 1)
         };
         older_sender.send(older).await.expect("older-cycle snapshot should enqueue");
         drop(older_sender);
@@ -5454,8 +5458,7 @@ mod tests {
         let newer = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
             scanner_cycle: Some(13),
-            buckets_count: 3,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 3)
         };
         newer_sender
             .send(newer.clone())
@@ -5490,8 +5493,7 @@ mod tests {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(200)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5506,8 +5508,7 @@ mod tests {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
                 scanner_epoch: Some(7),
                 scanner_cycle: Some(99),
-                buckets_count: 1,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 1)
             })
             .await
             .expect("old-epoch snapshot should enqueue");
@@ -5523,8 +5524,7 @@ mod tests {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
                 scanner_epoch: None,
                 scanner_cycle: Some(1),
-                buckets_count: 3,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 3)
             })
             .await
             .expect("replacement-epoch snapshot should enqueue");
@@ -5554,8 +5554,7 @@ mod tests {
         let existing = DataUsageInfo {
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100)),
             scanner_cycle: Some(12),
-            buckets_count: 2,
-            ..Default::default()
+            ..complete_usage_with_bucket_count(None, 2)
         };
         store
             .objects
@@ -5569,8 +5568,7 @@ mod tests {
             .send(DataUsageInfo {
                 last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
                 scanner_cycle: Some(12),
-                buckets_count: 3,
-                ..Default::default()
+                ..complete_usage_with_bucket_count(None, 3)
             })
             .await
             .expect("conflicting same-cycle snapshot should enqueue");
@@ -5595,11 +5593,59 @@ mod tests {
         );
     }
 
-    fn usage_with_last_update(last_update: Option<std::time::SystemTime>) -> DataUsageInfo {
-        DataUsageInfo {
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_rejects_incomplete_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let complete_update = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+
+        sender
+            .send(complete_usage_with_bucket_count(Some(complete_update), 1))
+            .await
+            .expect("complete usage snapshot should enqueue");
+        sender
+            .send(DataUsageInfo {
+                last_update: Some(complete_update + Duration::from_secs(1)),
+                buckets_count: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("incomplete usage snapshot should enqueue");
+        drop(sender);
+
+        let outcome = store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()))
+            .expect("complete data usage snapshot should remain saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+        assert_eq!(saved.last_update, Some(complete_update));
+        assert!(saved.is_complete_bucket_usage_snapshot());
+        assert_eq!(outcome, DataUsagePersistOutcome::Failed);
+    }
+
+    fn mark_usage_snapshot_complete(info: &mut DataUsageInfo) {
+        info.usage_snapshot_complete = true;
+    }
+
+    fn complete_usage_with_bucket_count(last_update: Option<std::time::SystemTime>, buckets_count: u64) -> DataUsageInfo {
+        let mut info = DataUsageInfo {
             last_update,
+            buckets_count,
+            usage_snapshot_complete: true,
             ..Default::default()
+        };
+        for index in 0..buckets_count {
+            let bucket = format!("bucket-{index}");
+            info.buckets_usage.insert(bucket.clone(), Default::default());
+            info.bucket_sizes.insert(bucket, 0);
         }
+        info
+    }
+
+    fn usage_with_last_update(last_update: Option<std::time::SystemTime>) -> DataUsageInfo {
+        complete_usage_with_bucket_count(last_update, 0)
     }
 
     #[test]
@@ -5681,11 +5727,10 @@ mod tests {
 
         for idx in 1_u64..=11 {
             sender
-                .send(DataUsageInfo {
-                    last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(idx)),
-                    buckets_count: idx,
-                    ..Default::default()
-                })
+                .send(complete_usage_with_bucket_count(
+                    Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(idx)),
+                    idx,
+                ))
                 .await
                 .expect("usage snapshot should enqueue");
         }

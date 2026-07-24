@@ -41,7 +41,11 @@ use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource_and_system,
     snapshot_process_resource_and_system_with,
 };
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::SystemTime,
+};
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
@@ -52,8 +56,10 @@ const EVENT_METRICS_COLLECTOR_STATE: &str = "metrics_collector_state";
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
 type ObsBackendInfo = <ObsStore as StorageAdminApi>::BackendInfo;
 
+#[derive(Default)]
 struct ObsDataUsageInfo {
     last_update: Option<SystemTime>,
+    usage_snapshot_complete: bool,
     buckets_count: u64,
     objects_total_count: u64,
     versions_total_count: u64,
@@ -62,6 +68,7 @@ struct ObsDataUsageInfo {
     buckets_usage: HashMap<String, ObsBucketUsageInfo>,
 }
 
+#[derive(Default)]
 struct ObsBucketUsageInfo {
     size: u64,
     objects_count: u64,
@@ -85,9 +92,11 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 
 async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreResult<ObsDataUsageInfo> {
     let data_usage = obs_load_data_usage_from_backend(store).await?;
+    let usage_snapshot_complete = data_usage.is_complete_bucket_usage_snapshot();
 
     Ok(ObsDataUsageInfo {
         last_update: data_usage.last_update,
+        usage_snapshot_complete,
         buckets_count: data_usage.buckets_count,
         objects_total_count: data_usage.objects_total_count,
         versions_total_count: data_usage.versions_total_count,
@@ -111,6 +120,21 @@ async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreRes
             })
             .collect(),
     })
+}
+
+fn bucket_usage_metric_values(data_usage: Option<&ObsDataUsageInfo>, bucket: &str) -> (Option<u64>, Option<u64>) {
+    data_usage
+        .filter(|usage| usage.usage_snapshot_complete)
+        .and_then(|usage| usage.buckets_usage.get(bucket))
+        .map(|usage| (Some(usage.size), Some(usage.objects_count)))
+        .unwrap_or((None, None))
+}
+
+fn data_usage_snapshot_covers_bucket_namespace(data_usage: &ObsDataUsageInfo, buckets: &HashSet<String>) -> bool {
+    data_usage.usage_snapshot_complete
+        && u64::try_from(buckets.len()).ok() == Some(data_usage.buckets_count)
+        && buckets.len() == data_usage.buckets_usage.len()
+        && buckets.iter().all(|bucket| data_usage.buckets_usage.contains_key(bucket))
 }
 
 fn resolve_obs_object_store_handle() -> Option<Arc<ObsStore>> {
@@ -365,25 +389,16 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
         })
         .count() as u64;
 
-    // Get bucket and object counts from data usage info.
-    let (buckets_count, objects_count) = match load_obs_data_usage_from_backend(store.clone()).await {
-        Ok(data_usage) => (data_usage.buckets_count, data_usage.objects_total_count),
-        Err(e) => {
-            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "data_usage_load_failed", error = %e, "metrics collector state changed");
-            // Fall back to bucket list for buckets_count, objects_count stays 0.
-            let buckets = store
-                .list_bucket(&BucketOptions {
-                    cached: true,
-                    ..Default::default()
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "bucket_list_failed", error = %err, "metrics collector state changed");
-                    Vec::new()
-                });
-            (buckets.len() as u64, 0)
+    let data_usage = match load_obs_data_usage_from_backend(store).await {
+        Ok(data_usage) if data_usage.usage_snapshot_complete => Some(data_usage),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "cluster_stats", result = "data_usage_load_failed", error = %error, "metrics collector state changed");
+            None
         }
     };
+    let buckets_count = data_usage.as_ref().map(|usage| usage.buckets_count);
+    let objects_count = data_usage.as_ref().map(|usage| usage.objects_total_count);
 
     let mut online = 0u64;
     let mut offline = 0u64;
@@ -428,10 +443,12 @@ pub async fn collect_cluster_health_stats() -> ClusterHealthStats {
 }
 
 /// Collect bucket statistics from the storage layer.
-pub async fn collect_bucket_stats() -> Vec<BucketStats> {
-    let Some(store) = resolve_obs_object_store_handle() else {
-        return Vec::new();
-    };
+///
+/// `None` means the bucket namespace could not be observed. Callers must keep
+/// their prior metric-series state instead of treating that failure as an
+/// authoritative empty namespace.
+pub async fn collect_bucket_stats() -> Option<Vec<BucketStats>> {
+    let store = resolve_obs_object_store_handle()?;
 
     // Load data usage info from backend to get bucket sizes and object counts
     let data_usage = match load_obs_data_usage_from_backend(store.clone()).await {
@@ -453,7 +470,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
         Ok(buckets) => buckets,
         Err(e) => {
             warn!(event = EVENT_METRICS_COLLECTOR_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_COLLECTOR, collector = "bucket_stats", result = "bucket_list_failed", error = %e, "metrics collector state changed");
-            return Vec::new();
+            return None;
         }
     };
 
@@ -465,11 +482,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
         }
 
         // Get size and objects_count from data usage info
-        let (size_bytes, objects_count) = data_usage
-            .as_ref()
-            .and_then(|du| du.buckets_usage.get(&bucket.name))
-            .map(|bui| (bui.size, bui.objects_count))
-            .unwrap_or((0, 0));
+        let (size_bytes, objects_count) = bucket_usage_metric_values(data_usage.as_ref(), &bucket.name);
 
         // Get quota from bucket metadata
         let quota_bytes = obs_bucket_quota_limit_bytes(&bucket.name).await;
@@ -482,7 +495,7 @@ pub async fn collect_bucket_stats() -> Vec<BucketStats> {
         });
     }
 
-    stats
+    Some(stats)
 }
 
 /// Collect bucket replication bandwidth stats from the global monitor.
@@ -935,6 +948,29 @@ pub async fn collect_iam_stats() -> Option<IamStats> {
 pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
     let store = resolve_obs_object_store_handle()?;
     let data_usage = load_obs_data_usage_from_backend(store.clone()).await.ok()?;
+    let bucket_namespace = store
+        .list_bucket(&BucketOptions {
+            cached: true,
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|bucket| !bucket.name.starts_with('.'))
+        .map(|bucket| bucket.name)
+        .collect::<HashSet<_>>();
+    collect_cluster_usage_metric_stats_from_data_usage(data_usage, &bucket_namespace).await
+}
+
+async fn collect_cluster_usage_metric_stats_from_data_usage(
+    data_usage: ObsDataUsageInfo,
+    bucket_namespace: &HashSet<String>,
+) -> Option<(ClusterUsageStats, Vec<BucketUsageStats>)> {
+    if !data_usage_snapshot_covers_bucket_namespace(&data_usage, bucket_namespace) {
+        return None;
+    }
+
     let mut buckets = Vec::with_capacity(data_usage.buckets_usage.len());
 
     for (bucket_name, usage) in &data_usage.buckets_usage {
@@ -1185,6 +1221,65 @@ mod tests {
         disk.state = DRIVE_STATE_OK.to_string();
         disk.runtime_state = Some(DRIVE_STATE_ONLINE.to_string());
         info
+    }
+
+    #[test]
+    fn bucket_usage_metrics_distinguish_unknown_from_confirmed_zero() {
+        assert_eq!(bucket_usage_metric_values(None, "bucket"), (None, None));
+
+        let mut data_usage = ObsDataUsageInfo {
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        data_usage
+            .buckets_usage
+            .insert("bucket".to_string(), ObsBucketUsageInfo::default());
+
+        assert_eq!(bucket_usage_metric_values(Some(&data_usage), "bucket"), (Some(0), Some(0)));
+        assert_eq!(bucket_usage_metric_values(Some(&data_usage), "missing"), (None, None));
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_skip_incomplete_snapshot() {
+        assert!(
+            collect_cluster_usage_metric_stats_from_data_usage(ObsDataUsageInfo::default(), &HashSet::new())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_publish_complete_empty_snapshot() {
+        let (cluster, buckets) = collect_cluster_usage_metric_stats_from_data_usage(
+            ObsDataUsageInfo {
+                usage_snapshot_complete: true,
+                ..Default::default()
+            },
+            &HashSet::new(),
+        )
+        .await
+        .expect("complete empty usage should remain publishable");
+
+        assert_eq!(cluster.buckets_count, 0);
+        assert_eq!(cluster.objects_count, 0);
+        assert_eq!(cluster.total_bytes, 0);
+        assert!(buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_usage_metrics_skip_snapshot_for_a_different_bucket_namespace() {
+        let data_usage = ObsDataUsageInfo {
+            usage_snapshot_complete: true,
+            buckets_count: 1,
+            buckets_usage: HashMap::from([("stale-bucket".to_string(), ObsBucketUsageInfo::default())]),
+            ..Default::default()
+        };
+
+        assert!(
+            collect_cluster_usage_metric_stats_from_data_usage(data_usage, &HashSet::from(["live-bucket".to_string()]))
+                .await
+                .is_none()
+        );
     }
 
     #[test]
