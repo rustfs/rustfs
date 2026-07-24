@@ -20,6 +20,37 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PartFailureSummary {
+    part_number: usize,
+    failed_shards: usize,
+    bitrot_failure: bool,
+}
+
+fn first_unhealthy_part_summary(
+    data_errs_by_part: &HashMap<usize, Vec<usize>>,
+    parts: &[ObjectPartInfo],
+) -> Option<PartFailureSummary> {
+    data_errs_by_part
+        .iter()
+        .filter_map(|(part_index, part_errs)| {
+            let failed_shards = count_part_not_success(part_errs);
+            if failed_shards == 0 {
+                return None;
+            }
+            Some((
+                *part_index,
+                PartFailureSummary {
+                    part_number: parts.get(*part_index).map(|part| part.number).unwrap_or(part_index + 1),
+                    failed_shards,
+                    bitrot_failure: part_errs.contains(&CHECK_PART_FILE_CORRUPT),
+                },
+            ))
+        })
+        .min_by_key(|(part_index, _)| *part_index)
+        .map(|(_, summary)| summary)
+}
+
 impl SetDisks {
     #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     pub(in crate::set_disk) async fn heal_object(
@@ -278,17 +309,53 @@ impl SetDisks {
                             let total_disks = parts_metadata.len();
                             let healthy_count = total_disks.saturating_sub(disks_to_heal_count);
                             let required_data = total_disks.saturating_sub(latest_meta.erasure.parity_blocks);
+                            let no_parity_failure =
+                                (!latest_meta.deleted && !latest_meta.is_remote() && latest_meta.erasure.parity_blocks == 0)
+                                    .then(|| first_unhealthy_part_summary(&data_errs_by_part, &latest_meta.parts))
+                                    .flatten();
+                            let cannot_heal_err = if no_parity_failure.is_some_and(|failure| failure.bitrot_failure) {
+                                DiskError::FileCorrupt
+                            } else {
+                                DiskError::ErasureReadQuorum
+                            };
 
-                            error!(
-                                bucket,
-                                object,
-                                version_id,
-                                required_data_shards = required_data,
-                                healthy_shards = healthy_count,
-                                missing_or_corrupt_shards = disks_to_heal_count,
-                                parity_shards = latest_meta.erasure.parity_blocks,
-                                "Heal object cannot reconstruct with available shards"
-                            );
+                            if let Some(failure) = no_parity_failure {
+                                result.detail = format!(
+                                    "no-parity object is unrecoverable: part {} has {} missing or corrupt data shard(s), bitrot_failure={}, data_blocks={}, parity_blocks=0",
+                                    failure.part_number,
+                                    failure.failed_shards,
+                                    failure.bitrot_failure,
+                                    latest_meta.erasure.data_blocks
+                                );
+                                error!(
+                                    bucket,
+                                    object,
+                                    version_id,
+                                    data_shards = latest_meta.erasure.data_blocks,
+                                    parity_shards = latest_meta.erasure.parity_blocks,
+                                    required_data_shards = required_data,
+                                    healthy_shards = healthy_count,
+                                    missing_or_corrupt_shards = disks_to_heal_count,
+                                    part_number = failure.part_number,
+                                    bitrot_failure = failure.bitrot_failure,
+                                    "No-parity object failed integrity or availability validation and cannot be reconstructed"
+                                );
+                            } else {
+                                result.detail = format!(
+                                    "object cannot be reconstructed with available shards: required_data_shards={required_data}, healthy_shards={healthy_count}, missing_or_corrupt_shards={disks_to_heal_count}, parity_shards={}",
+                                    latest_meta.erasure.parity_blocks
+                                );
+                                error!(
+                                    bucket,
+                                    object,
+                                    version_id,
+                                    required_data_shards = required_data,
+                                    healthy_shards = healthy_count,
+                                    missing_or_corrupt_shards = disks_to_heal_count,
+                                    parity_shards = latest_meta.erasure.parity_blocks,
+                                    "Heal object cannot reconstruct with available shards"
+                                );
+                            }
 
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
                             // this would end up restoring the correct readable versions.
@@ -324,19 +391,10 @@ impl SetDisks {
                                         object,
                                         version_id,
                                         error = %err,
+                                        returned_error = %cannot_heal_err,
                                         "Heal object dangling cleanup could not prove object deletion"
                                     );
-                                    let quorum_err = DiskError::ErasureReadQuorum;
-                                    let mut t_errs = Vec::with_capacity(errs.len());
-                                    for _ in 0..errs.len() {
-                                        t_errs.push(Some(quorum_err.clone()));
-                                    }
-
-                                    Ok((
-                                        self.default_heal_result(FileInfo::default(), &t_errs, bucket, object, version_id)
-                                            .await,
-                                        Some(quorum_err),
-                                    ))
+                                    Ok((result, Some(cannot_heal_err)))
                                 }
                             };
                         }
@@ -1258,8 +1316,12 @@ mod heal_result_report_tests {
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
     use crate::disk::{DiskOption, DiskStore, new_disk};
-    use rustfs_common::heal_channel::DriveState;
-    use rustfs_filemeta::FileInfo;
+    use crate::object_api::{ObjectOptions, PutObjReader};
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::{config::storageclass, store::init_format::save_format_file};
+    use rustfs_common::heal_channel::{DriveState, HealOpts, HealScanMode};
+    use rustfs_filemeta::{BLOCK_SIZE_V2, FileInfo};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
@@ -1298,6 +1360,50 @@ mod heal_result_report_tests {
             vec![],
         )
         .await
+    }
+
+    async fn formatted_single_disk_no_parity_set() -> (TempDir, Arc<SetDisks>) {
+        let format = FormatV3::new(1, 1);
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let mut disk_format = format.clone();
+        disk_format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&Some(disk.clone()), &Some(disk_format))
+            .await
+            .expect("format should be saved");
+
+        let set = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk)])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            vec![],
+        )
+        .await;
+        set.set_test_storage_class_config(
+            storageclass::lookup_config_for_pools_without_env(&rustfs_config::server_config::KVS::new(), &[1])
+                .expect("test storage class should resolve for one local drive"),
+        );
+        (dir, set)
     }
 
     // Regression for #955: an offline disk must contribute exactly one drive
@@ -1396,5 +1502,62 @@ mod heal_result_report_tests {
         assert_eq!(result.before.drives[1].state, DriveState::Ok.to_string());
         assert_eq!(result.before.drives[2].state, DriveState::Offline.to_string());
         assert_eq!(result.before.drives[3].state, DriveState::Ok.to_string());
+    }
+
+    #[tokio::test]
+    async fn heal_no_parity_bitrot_reports_unrecoverable_integrity_failure() {
+        let (dir, set) = formatted_single_disk_no_parity_set().await;
+        let bucket = "bucket-no-parity-bitrot";
+        let object = "bad-object.bin";
+        let payload = (0..(BLOCK_SIZE_V2 + 17)).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload);
+        set.put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let (fi, _, _) = set
+            .get_object_fileinfo(bucket, object, &opts, true, false)
+            .await
+            .expect("object metadata should resolve");
+        assert_eq!(fi.erasure.parity_blocks, 0);
+        let data_dir = fi.data_dir.expect("non-inline object should have a data directory");
+        let part_path = dir.path().join(bucket).join(object).join(data_dir.to_string()).join("part.1");
+        let mut part = tokio::fs::read(&part_path).await.expect("part should be readable");
+        part[0] ^= 0xff;
+        tokio::fs::write(&part_path, part)
+            .await
+            .expect("part corruption should be written");
+
+        let (result, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("heal should report the unrecoverable object without panicking");
+
+        assert_eq!(err, Some(DiskError::FileCorrupt));
+        assert_eq!(result.bucket, bucket);
+        assert_eq!(result.object, object);
+        assert_eq!(result.data_blocks, 1);
+        assert_eq!(result.parity_blocks, 0);
+        assert_eq!(result.before.drives[0].state, DriveState::Corrupt.to_string());
+        assert!(result.detail.contains("no-parity object is unrecoverable"));
+        assert!(result.detail.contains("part 1"));
+        assert!(result.detail.contains("bitrot_failure=true"));
     }
 }
