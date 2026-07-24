@@ -82,8 +82,8 @@ use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLoo
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
-    validate_archive_content_encoding,
+    filter_object_metadata, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
+    normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -2695,6 +2695,52 @@ where
     Ok(())
 }
 
+fn insert_expires_metadata(metadata: &mut HashMap<String, String>, expires: Option<&Timestamp>) -> S3Result<()> {
+    if let Some(expires) = expires {
+        let mut formatted = Vec::new();
+        expires
+            .format(TimestampFormat::HttpDate, &mut formatted)
+            .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
+        metadata.insert("expires".to_string(), String::from_utf8_lossy(&formatted).into_owned());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_standard_object_metadata(
+    metadata: &mut HashMap<String, String>,
+    cache_control: Option<&str>,
+    content_disposition: Option<&str>,
+    content_encoding: Option<&str>,
+    content_language: Option<&str>,
+    content_type: Option<&str>,
+    expires: Option<&Timestamp>,
+    website_redirect_location: Option<&str>,
+) -> S3Result<()> {
+    if let Some(cache_control) = cache_control {
+        metadata.insert("cache-control".to_string(), cache_control.to_string());
+    }
+    if let Some(content_disposition) = content_disposition {
+        metadata.insert("content-disposition".to_string(), content_disposition.to_string());
+    }
+    if let Some(content_encoding) = content_encoding
+        && let Some(normalized_content_encoding) = normalize_content_encoding_for_storage(content_encoding)
+    {
+        metadata.insert("content-encoding".to_string(), normalized_content_encoding);
+    }
+    if let Some(content_language) = content_language {
+        metadata.insert("content-language".to_string(), content_language.to_string());
+    }
+    if let Some(content_type) = content_type {
+        metadata.insert("content-type".to_string(), content_type.to_string());
+    }
+    insert_expires_metadata(metadata, expires)?;
+    if let Some(website_redirect_location) = website_redirect_location {
+        metadata.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location.to_string());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_put_request_metadata(
     metadata: &mut HashMap<String, String>,
@@ -2710,33 +2756,16 @@ fn apply_put_request_metadata(
     tagging: Option<TaggingHeader>,
     storage_class: Option<StorageClass>,
 ) -> S3Result<()> {
-    if let Some(cache_control) = cache_control {
-        metadata.insert("cache-control".to_string(), cache_control);
-    }
-    if let Some(content_disposition) = content_disposition {
-        metadata.insert("content-disposition".to_string(), content_disposition);
-    }
-    if let Some(content_encoding) = content_encoding
-        && let Some(normalized_content_encoding) = normalize_content_encoding_for_storage(&content_encoding)
-    {
-        metadata.insert("content-encoding".to_string(), normalized_content_encoding);
-    }
-    if let Some(content_language) = content_language {
-        metadata.insert("content-language".to_string(), content_language);
-    }
-    if let Some(content_type) = content_type {
-        metadata.insert("content-type".to_string(), content_type);
-    }
-    if let Some(expires) = expires {
-        let mut formatted = Vec::new();
-        expires
-            .format(TimestampFormat::HttpDate, &mut formatted)
-            .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
-        metadata.insert("expires".to_string(), String::from_utf8_lossy(&formatted).into_owned());
-    }
-    if let Some(website_redirect_location) = website_redirect_location {
-        metadata.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location);
-    }
+    apply_standard_object_metadata(
+        metadata,
+        cache_control.as_deref(),
+        content_disposition.as_deref(),
+        content_encoding.as_deref(),
+        content_language.as_deref(),
+        content_type.as_deref(),
+        expires.as_ref(),
+        website_redirect_location.as_deref(),
+    )?;
     if let Some(tags) = tagging {
         metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
     }
@@ -5740,7 +5769,13 @@ impl DefaultObjectUsecase {
             tagging_directive,
             copy_source_if_match,
             copy_source_if_none_match,
+            cache_control,
+            content_disposition,
+            content_encoding,
+            content_language,
             content_type,
+            expires,
+            website_redirect_location,
             object_lock_legal_hold_status,
             object_lock_mode,
             object_lock_retain_until_date,
@@ -5784,6 +5819,47 @@ impl DefaultObjectUsecase {
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
+        let replaces_metadata = match metadata_directive.as_ref().map(|directive| directive.as_str()) {
+            None | Some(MetadataDirective::COPY) => false,
+            Some(MetadataDirective::REPLACE) => true,
+            Some(_) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "The MetadataDirective header is invalid".to_string(),
+                ));
+            }
+        };
+        let has_replacement_metadata = metadata.is_some()
+            || cache_control.is_some()
+            || content_disposition.is_some()
+            || content_encoding.is_some()
+            || content_language.is_some()
+            || content_type.is_some()
+            || expires.is_some();
+        if has_replacement_metadata && !replaces_metadata {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                "Replacement metadata requires the REPLACE metadata directive".to_string(),
+            ));
+        }
+        let replacement_metadata = if replaces_metadata {
+            validate_archive_content_encoding(&key, content_type.as_deref(), content_encoding.as_deref())?;
+            let mut replacement_metadata = metadata.unwrap_or_default();
+            namespace_reserved_user_metadata(&mut replacement_metadata);
+            apply_standard_object_metadata(
+                &mut replacement_metadata,
+                cache_control.as_deref(),
+                content_disposition.as_deref(),
+                content_encoding.as_deref(),
+                content_language.as_deref(),
+                content_type.as_deref(),
+                expires.as_ref(),
+                website_redirect_location.as_deref(),
+            )?;
+            Some(replacement_metadata)
+        } else {
+            None
+        };
 
         // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place),
         // when an explicit storage class change is requested, or when restoring a specific historical
@@ -5794,7 +5870,7 @@ impl DefaultObjectUsecase {
             tagging_directive.as_ref(),
         )?;
 
-        if metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE)
+        if !replaces_metadata
             && tagging_directive.as_ref().map(TaggingDirective::as_str) != Some(TaggingDirective::REPLACE)
             && storage_class.is_none()
             && version_id.is_none()
@@ -5949,13 +6025,18 @@ impl DefaultObjectUsecase {
         // Extract user_defined from Arc for mutation; it will be re-wrapped after all edits.
         let mut user_defined = (*src_info.user_defined).clone();
         let effective_tags = replacement_tags.unwrap_or_else(|| (*src_info.user_tags).clone());
+        if !replaces_metadata {
+            let source_expires = src_info.expires.map(Timestamp::from);
+            insert_expires_metadata(&mut user_defined, source_expires.as_ref())?;
+        }
 
         strip_managed_encryption_metadata(&mut user_defined);
 
-        if let Some(ref sc) = storage_class {
-            src_info.storage_class = Some(sc.as_str().to_string());
-            user_defined.insert(AMZ_STORAGE_CLASS.to_string(), sc.as_str().to_string());
-        }
+        let destination_storage_class = storage_class
+            .as_ref()
+            .map(StorageClass::as_str)
+            .unwrap_or(storageclass::STANDARD);
+        src_info.storage_class = Some(destination_storage_class.to_string());
 
         let actual_size = src_info.get_actual_size().map_err(ApiError::from)?;
 
@@ -5981,15 +6062,21 @@ impl DefaultObjectUsecase {
         // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
         // System metadata (compression, encryption) is added after this block to ensure
         // it's not cleared by the REPLACE operation.
-        if metadata_directive.as_ref().map(|d| d.as_str()) == Some(MetadataDirective::REPLACE) {
-            user_defined.clear();
-            if let Some(metadata) = metadata {
-                user_defined.extend(metadata);
+        if let Some(replacement_metadata) = replacement_metadata {
+            user_defined = replacement_metadata;
+            src_info.content_type = content_type.clone();
+            src_info.content_encoding = content_encoding.as_deref().and_then(normalize_content_encoding_for_storage);
+            src_info.expires = expires.map(OffsetDateTime::from);
+        } else if metadata_directive.is_some() || website_redirect_location.is_some() {
+            user_defined.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_WEBSITE_REDIRECT_LOCATION));
+            if let Some(website_redirect_location) = website_redirect_location {
+                user_defined.insert(AMZ_WEBSITE_REDIRECT_LOCATION.to_string(), website_redirect_location);
             }
-            if let Some(ct) = content_type {
-                src_info.content_type = Some(ct.clone());
-                user_defined.insert("content-type".to_string(), ct);
-            }
+        }
+
+        user_defined.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_STORAGE_CLASS));
+        if destination_storage_class != storageclass::STANDARD {
+            user_defined.insert(AMZ_STORAGE_CLASS.to_string(), destination_storage_class.to_string());
         }
 
         user_defined.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_OBJECT_TAGGING));
