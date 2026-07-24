@@ -24,6 +24,7 @@ use crate::server::RemoteAddr;
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::access_consumer::contract::bucket::BucketOperations;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use http::HeaderMap;
 use metrics::counter;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
@@ -246,6 +247,57 @@ fn merge_list_bucket_query_conditions(action: Action, query: Option<&str>, condi
     }
 }
 
+fn merge_request_object_tag_conditions(
+    action: Action,
+    headers: &HeaderMap,
+    conditions: &mut HashMap<String, Vec<String>>,
+) -> S3Result<()> {
+    if action != Action::S3Action(S3Action::PutObjectAction) {
+        return Ok(());
+    }
+
+    let Some(tagging) = headers.get("x-amz-tagging").and_then(|value| value.to_str().ok()) else {
+        return Ok(());
+    };
+
+    let mut tag_keys = Vec::new();
+    for tag in crate::storage::s3_api::tagging::parse_object_tag_header(tagging)? {
+        let Some(key) = tag.key else {
+            continue;
+        };
+        let Some(value) = tag.value else {
+            continue;
+        };
+        tag_keys.push(key.clone());
+        conditions.entry(format!("RequestObjectTag/{key}")).or_default().push(value);
+    }
+    conditions.insert("RequestObjectTagKeys".to_string(), tag_keys);
+    Ok(())
+}
+
+fn authorization_conditions<T>(
+    req: &S3Request<T>,
+    cred: &rustfs_credentials::Credentials,
+    version_id: Option<&str>,
+    region: Option<s3s::region::Region>,
+    remote_addr: Option<std::net::SocketAddr>,
+    client_info: Option<&ClientInfo>,
+    action: Action,
+) -> S3Result<HashMap<String, Vec<String>>> {
+    let mut conditions = get_condition_values_with_query_and_client_info(
+        &req.headers,
+        cred,
+        version_id,
+        region,
+        remote_addr,
+        req.uri.query(),
+        client_info,
+    );
+    merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
+    merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
+    Ok(conditions)
+}
+
 fn auth_fs() -> &'static FS {
     static AUTH_FS: OnceLock<FS> = OnceLock::new();
     AUTH_FS.get_or_init(FS::new)
@@ -358,16 +410,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
         let client_info = req.extensions.get::<ClientInfo>();
-        let mut conditions = get_condition_values_with_query_and_client_info(
-            &req.headers,
-            cred,
-            version_id.as_deref(),
-            None,
-            remote_addr,
-            req.uri.query(),
-            client_info,
-        );
-        merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
+        let mut conditions = authorization_conditions(req, cred, version_id.as_deref(), None, remote_addr, client_info, action)?;
 
         let action_args = Args {
             account: &cred.access_key,
@@ -579,16 +622,15 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     } else {
         let default_cred = rustfs_credentials::Credentials::default();
         let client_info = req.extensions.get::<ClientInfo>();
-        let mut conditions = get_condition_values_with_query_and_client_info(
-            &req.headers,
+        let mut conditions = authorization_conditions(
+            req,
             &default_cred,
             version_id.as_deref(),
             req.region.clone(),
             remote_addr,
-            req.uri.query(),
             client_info,
-        );
-        merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
+            action,
+        )?;
 
         let no_groups: Option<Vec<String>> = None;
         let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
@@ -2105,12 +2147,12 @@ mod tests {
         bucket_policy_needs_existing_object_tag_from_hint, classify_bucket_policy_raw_load_error,
         complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
         legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
-        merge_list_bucket_query_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
-        put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested, secondary_tag_hint_action,
-        table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
+        merge_list_bucket_query_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
+        post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested,
+        secondary_tag_hint_action, table_data_plane_admin_action, validate_post_object_success_controls, versioned_read_action,
     };
     use crate::error::ApiError;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use rustfs_policy::policy::action::{Action, S3Action};
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
     use s3s::{S3ErrorCode, S3Request, dto::*};
@@ -2321,6 +2363,33 @@ mod tests {
         );
 
         assert!(conditions.is_empty());
+    }
+
+    #[test]
+    fn test_merge_request_object_tag_conditions_applies_only_to_put_object() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("classification=restricted&label=copy%20test"));
+
+        let mut source_conditions = HashMap::new();
+        merge_request_object_tag_conditions(Action::S3Action(S3Action::GetObjectAction), &headers, &mut source_conditions)
+            .expect("GetObject condition construction should succeed");
+        assert!(
+            source_conditions.is_empty(),
+            "destination request tags must not affect CopyObject source authorization"
+        );
+
+        let mut destination_conditions = HashMap::new();
+        merge_request_object_tag_conditions(Action::S3Action(S3Action::PutObjectAction), &headers, &mut destination_conditions)
+            .expect("PutObject condition construction should succeed");
+        assert_eq!(
+            destination_conditions.get("RequestObjectTag/classification"),
+            Some(&vec!["restricted".to_string()])
+        );
+        assert_eq!(destination_conditions.get("RequestObjectTag/label"), Some(&vec!["copy test".to_string()]));
+        assert_eq!(
+            destination_conditions.get("RequestObjectTagKeys"),
+            Some(&vec!["classification".to_string(), "label".to_string()])
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@
 | content_encoding_test | 3 | ✅ |
 | copy_object_checksum_test | 3 |  |
 | copy_object_metadata_test | 1 | ✅ |
+| copy_object_tagging_test | 2 | ✅ |
 | copy_object_version_restore_test | 2 |  |
 | copy_source_invalid_date_test | 1 | ✅ |
 | create_bucket_region_test | 2 | ✅ |
@@ -83,4 +84,4 @@
 
 `notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
 
-**Total listed: 467 tests across 63 modules · PR smoke subset: 114 tests / 28 modules** (26 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-21.
+**Total listed: 469 tests across 64 modules · PR smoke subset: 116 tests / 29 modules** (27 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-23.
