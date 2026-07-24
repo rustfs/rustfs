@@ -412,6 +412,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/scanner/status", SERVER_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/audit/target/list",
@@ -1789,6 +1790,12 @@ mod tests {
         ] {
             assert_not_action(method, path, SERVER_INFO);
         }
+    }
+
+    #[test]
+    fn route_policy_requires_set_tier_for_manual_transition_run() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SERVER_INFO);
     }
 
     #[test]
