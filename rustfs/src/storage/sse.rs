@@ -1726,7 +1726,18 @@ async fn apply_managed_decryption_material(
     // advertised SSE scheme and current KMS availability are write policy
     // and runtime state, neither of which identifies the historical provider.
     let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(&encrypted_data_key) {
-        Arc::new(KmsSseDekProvider::new().await?)
+        // When a test-injected provider is registered via set_sse_dek_provider_for_test,
+        // use it instead of creating a fresh KmsSseDekProvider which cannot resolve
+        // a KMS service without an AppContext.
+        if let Some(cached) = GLOBAL_SSE_DEK_PROVIDER
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+        {
+            cached
+        } else {
+            Arc::new(KmsSseDekProvider::new().await?)
+        }
     } else {
         get_local_sse_dek_provider().await?
     };
