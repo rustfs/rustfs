@@ -22,7 +22,11 @@ use derive_builder::Builder;
 use rustfs_s3select_api::{
     QueryResult,
     query::{
-        Query, dispatcher::QueryDispatcher, execution::QueryStateMachineRef, logical_planner::Plan, session::SessionCtxFactory,
+        Query,
+        dispatcher::QueryDispatcher,
+        execution::QueryStateMachineRef,
+        logical_planner::Plan,
+        session::{DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES as DEFAULT_MEMORY_LIMIT_BYTES, SessionCtxFactory},
     },
     server::dbms::{DatabaseManagerSystem, QueryHandle},
 };
@@ -41,9 +45,8 @@ const ENV_RUSTFS_S3SELECT_TARGET_PARTITIONS: &str = "RUSTFS_S3SELECT_TARGET_PART
 const ENV_RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES: &str = "RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES";
 const ENV_RUSTFS_S3SELECT_QUERY_TIMEOUT_SECS: &str = "RUSTFS_S3SELECT_QUERY_TIMEOUT_SECS";
 const ENV_RUSTFS_S3SELECT_MAX_CONCURRENT_QUERIES: &str = "RUSTFS_S3SELECT_MAX_CONCURRENT_QUERIES";
-const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
-const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 4;
+pub(crate) const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
+pub(crate) const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 4;
 const MAX_QUERY_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const TEST_MAX_CONCURRENT_QUERIES: usize = 1024;
 
@@ -172,11 +175,7 @@ pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) 
     // init Function Manager, we can define some UDF if need
     let func_manager = SimpleFunctionMetadataManager::default();
     let runtime_config = S3SelectRuntimeConfig::from_env();
-    let session_factory = Arc::new(
-        SessionCtxFactory::new(is_test)
-            .with_target_partitions(runtime_config.target_partitions)
-            .with_memory_limit_bytes(runtime_config.memory_limit_bytes),
-    );
+    let session_factory = Arc::new(SessionCtxFactory::new(is_test).with_target_partitions(runtime_config.target_partitions));
     let parser = Arc::new(DefaultParser::default());
     let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
     let scheduler = Arc::new(LocalScheduler {});
@@ -190,6 +189,7 @@ pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) 
         .with_func_manager(Arc::new(func_manager))
         .with_default_table_provider(default_table_provider)
         .with_session_factory(session_factory)
+        .with_memory_limit_bytes(runtime_config.memory_limit_bytes)
         .with_parser(parser)
         .with_query_execution_factory(query_execution_factory)
         .with_query_admission(query_admission(is_test))
@@ -212,17 +212,14 @@ pub async fn make_rustfsms_with_components(
     default_table_provider: Arc<BaseTableProvider>,
 ) -> QueryResult<impl DatabaseManagerSystem> {
     let runtime_config = S3SelectRuntimeConfig::from_env();
-    let session_factory = Arc::new(
-        SessionCtxFactory::new(is_test)
-            .with_target_partitions(runtime_config.target_partitions)
-            .with_memory_limit_bytes(runtime_config.memory_limit_bytes),
-    );
+    let session_factory = Arc::new(SessionCtxFactory::new(is_test).with_target_partitions(runtime_config.target_partitions));
 
     let query_dispatcher = SimpleQueryDispatcherBuilder::default()
         .with_input(input)
         .with_func_manager(func_manager)
         .with_default_table_provider(default_table_provider)
         .with_session_factory(session_factory)
+        .with_memory_limit_bytes(runtime_config.memory_limit_bytes)
         .with_parser(parser)
         .with_query_execution_factory(query_execution_factory)
         .with_query_admission(query_admission(is_test))

@@ -14,15 +14,17 @@
 
 use crate::{
     SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
-    SelectStore, query::session::QueryExecutionGuard, resolve_select_object_store_handle, select_is_err_bucket_not_found,
-    select_is_err_object_not_found, select_is_err_version_not_found,
+    SelectStore,
+    query::session::{QueryExecutionGuard, QueryExecutionTracker},
+    resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
+    select_is_err_version_not_found,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use datafusion::{
     common::{DataFusionError, runtime::SpawnedTask},
-    execution::memory_pool::{MemoryConsumer, MemoryPool},
+    execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool},
     object_store::{
         Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
         MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
@@ -93,7 +95,7 @@ pub struct EcObjectStore {
     /// this key in the root JSON object before flattening.
     json_sub_path: Option<String>,
     memory_pool: Arc<dyn MemoryPool>,
-    query_guard: Option<QueryExecutionGuard>,
+    query_tracker: Option<QueryExecutionTracker>,
 
     store: Arc<SelectStore>,
 }
@@ -122,23 +124,27 @@ impl SelectScanRange {
 pub struct InvalidScanRange;
 
 impl EcObjectStore {
-    pub fn new(input: Arc<SelectObjectContentInput>, memory_pool: Arc<dyn MemoryPool>) -> S3Result<Self> {
+    pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
+        Self::build(input, Arc::new(UnboundedMemoryPool::default()), None, None)
+    }
+
+    pub(crate) fn new_with_memory_pool(input: Arc<SelectObjectContentInput>, memory_pool: Arc<dyn MemoryPool>) -> S3Result<Self> {
         Self::build(input, memory_pool, None, None)
     }
 
-    pub(crate) fn new_with_query_guard(
+    pub(crate) fn new_with_query_tracker(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
-        query_guard: QueryExecutionGuard,
+        query_tracker: QueryExecutionTracker,
         store: Option<Arc<SelectStore>>,
     ) -> S3Result<Self> {
-        Self::build(input, memory_pool, Some(query_guard), store)
+        Self::build(input, memory_pool, Some(query_tracker), store)
     }
 
     fn build(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
-        query_guard: Option<QueryExecutionGuard>,
+        query_tracker: Option<QueryExecutionTracker>,
         store: Option<Arc<SelectStore>>,
     ) -> S3Result<Self> {
         let Some(store) = store.or_else(resolve_select_object_store_handle) else {
@@ -185,7 +191,7 @@ impl EcObjectStore {
             is_json_document,
             json_sub_path,
             memory_pool,
-            query_guard,
+            query_tracker,
             store,
         })
     }
@@ -534,7 +540,7 @@ impl ObjectStore for EcObjectStore {
                 original_size,
                 self.json_sub_path.clone(),
                 Arc::clone(&self.memory_pool),
-                self.query_guard.clone(),
+                self.query_tracker.clone(),
             );
             GetResultPayload::Stream(stream)
         } else if let Some((_, scan_range)) = scan_context {
@@ -913,14 +919,14 @@ fn json_document_ndjson_stream(
     original_size: u64,
     json_sub_path: Option<String>,
     memory_pool: Arc<dyn MemoryPool>,
-    query_guard: Option<QueryExecutionGuard>,
+    query_tracker: Option<QueryExecutionTracker>,
 ) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
     json_document_ndjson_stream_with_parser(
         stream,
         original_size,
         json_sub_path,
         memory_pool,
-        query_guard,
+        query_tracker,
         |all_bytes, json_sub_path| parse_json_document_to_lines(&all_bytes, json_sub_path.as_deref()),
     )
 }
@@ -930,7 +936,7 @@ fn json_document_ndjson_stream_with_parser<P>(
     original_size: u64,
     json_sub_path: Option<String>,
     memory_pool: Arc<dyn MemoryPool>,
-    query_guard: Option<QueryExecutionGuard>,
+    query_tracker: Option<QueryExecutionTracker>,
     parser: P,
 ) -> futures_core::stream::BoxStream<'static, Result<Bytes>>
 where
@@ -976,7 +982,7 @@ where
         }
 
         // ── 2. Parse phase (blocking thread pool, non-blocking runtime) ──
-        let pending_query_guard = PendingQueryExecutionGuard::new(query_guard);
+        let pending_query_guard = PendingQueryExecutionGuard::new(query_tracker);
         let task_query_guard = pending_query_guard.task_state();
         let (lines, _reservation, _query_guard) = SpawnedTask::spawn_blocking(move || {
             let query_guard = PendingQueryExecutionGuard::start(&task_query_guard)?;
@@ -1006,15 +1012,15 @@ struct PendingQueryExecutionGuard {
 }
 
 enum QueryExecutionGuardState {
-    Pending(Option<QueryExecutionGuard>),
+    Pending(Option<QueryExecutionTracker>),
     Started,
     Cancelled,
 }
 
 impl PendingQueryExecutionGuard {
-    fn new(query_guard: Option<QueryExecutionGuard>) -> Self {
+    fn new(query_tracker: Option<QueryExecutionTracker>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(QueryExecutionGuardState::Pending(query_guard))),
+            state: Arc::new(Mutex::new(QueryExecutionGuardState::Pending(query_tracker))),
         }
     }
 
@@ -1025,7 +1031,10 @@ impl PendingQueryExecutionGuard {
     fn start(state: &Mutex<QueryExecutionGuardState>) -> std::io::Result<Option<QueryExecutionGuard>> {
         let mut state = state.lock();
         match std::mem::replace(&mut *state, QueryExecutionGuardState::Started) {
-            QueryExecutionGuardState::Pending(query_guard) => Ok(query_guard),
+            QueryExecutionGuardState::Pending(None) => Ok(None),
+            QueryExecutionGuardState::Pending(Some(query_tracker)) => query_tracker.query_guard().map(Some).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "JSON DOCUMENT parse was cancelled before it started")
+            }),
             QueryExecutionGuardState::Cancelled => {
                 *state = QueryExecutionGuardState::Cancelled;
                 Err(std::io::Error::new(
@@ -1173,12 +1182,13 @@ fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error 
 #[cfg(test)]
 mod test {
     use super::{
-        JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, SelectScanRange, bytes_stream, convert_field_delimiter_stream,
-        extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
-        json_document_ndjson_stream, json_document_ndjson_stream_with_parser, replace_symbol, scan_range_from_bounds,
-        scan_range_read_start, scan_range_stream, select_read_headers, validate_json_document_size, validated_object_size,
+        EcObjectStore, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, SelectScanRange, bytes_stream,
+        convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson,
+        http_range_spec_from_get_range, json_document_ndjson_stream, json_document_ndjson_stream_with_parser, replace_symbol,
+        scan_range_from_bounds, scan_range_read_start, scan_range_stream, select_read_headers, validate_json_document_size,
+        validated_object_size,
     };
-    use crate::query::session::QueryExecutionGuard;
+    use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
     use bytes::Bytes;
@@ -1200,6 +1210,11 @@ mod test {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn ec_object_store_constructor_remains_source_compatible() {
+        let _constructor: fn(Arc<SelectObjectContentInput>) -> s3s::S3Result<EcObjectStore> = EcObjectStore::new;
+    }
     use tokio::sync::Semaphore;
 
     #[test]
@@ -1455,7 +1470,7 @@ mod test {
             is_json_document: false,
             json_sub_path: None,
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
-            query_guard: None,
+            query_tracker: None,
             store: env.ecstore,
         };
 
@@ -1628,6 +1643,12 @@ mod test {
                 .await
                 .expect("query permit should be available");
             let query_guard: QueryExecutionGuard = Arc::new(permit);
+            let query_tracker = QueryExecutionTracker::new(
+                &QueryExecutionOwner::new(),
+                query_guard,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                30,
+            );
             let input = b"{}".to_vec();
             let memory_pool: Arc<dyn MemoryPool> =
                 Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
@@ -1636,7 +1657,7 @@ mod test {
                 input.len() as u64,
                 None,
                 memory_pool,
-                Some(query_guard),
+                Some(query_tracker),
             );
 
             {
@@ -1659,6 +1680,77 @@ mod test {
     }
 
     #[test]
+    fn test_json_document_expired_queued_parse_does_not_start() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        runtime.block_on(async {
+            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
+            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocking_started_tx.send(());
+                release_blocking_rx.recv().expect("release blocking worker");
+            });
+            blocking_started_rx.await.expect("blocking worker should start");
+
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = Arc::clone(&admission)
+                .acquire_owned()
+                .await
+                .expect("query permit should be available");
+            let owner = QueryExecutionOwner::new();
+            let query_tracker = QueryExecutionTracker::new(
+                &owner,
+                Arc::new(permit),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                30,
+            );
+            let input = b"{}".to_vec();
+            let memory_pool: Arc<dyn MemoryPool> =
+                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+            let parser_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let parser_started_in_task = Arc::clone(&parser_started);
+            let mut output = json_document_ndjson_stream_with_parser(
+                Box::new(std::io::Cursor::new(input.clone())),
+                input.len() as u64,
+                None,
+                memory_pool,
+                Some(query_tracker.clone()),
+                move |_, _| {
+                    parser_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(vec![Bytes::from_static(b"{}\n")])
+                },
+            );
+
+            {
+                let next = output.next();
+                futures::pin_mut!(next);
+                assert!(futures::poll!(next.as_mut()).is_pending());
+            }
+            query_tracker.expire(&owner);
+            assert_eq!(admission.available_permits(), 1);
+            release_blocking_tx.send(()).expect("release blocking worker");
+            blocker.await.expect("blocking worker should finish");
+
+            let err = tokio::time::timeout(std::time::Duration::from_secs(5), output.next())
+                .await
+                .expect("queued parser should resume")
+                .expect("queued parser should return an error")
+                .expect_err("expired queued parser must not run");
+            let object_store::Error::Generic { source, .. } = err else {
+                panic!("expected generic object store error");
+            };
+            let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
+            assert_eq!(source.kind(), std::io::ErrorKind::Interrupted);
+            assert!(!parser_started.load(std::sync::atomic::Ordering::SeqCst));
+        });
+    }
+
+    #[test]
     fn test_json_document_started_parse_retains_query_guard_when_cancelled() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1674,6 +1766,12 @@ mod test {
                 .await
                 .expect("query permit should be available");
             let query_guard: QueryExecutionGuard = Arc::new(permit);
+            let query_tracker = QueryExecutionTracker::new(
+                &QueryExecutionOwner::new(),
+                query_guard,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                30,
+            );
             let input = b"{}".to_vec();
             let memory_pool: Arc<dyn MemoryPool> =
                 Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
@@ -1684,7 +1782,7 @@ mod test {
                 input.len() as u64,
                 None,
                 memory_pool,
-                Some(query_guard),
+                Some(query_tracker),
                 move |_, _| {
                     let _ = parse_started_tx.send(());
                     release_parse_rx.recv().expect("release JSON parser");
