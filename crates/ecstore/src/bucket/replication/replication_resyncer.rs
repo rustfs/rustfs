@@ -37,7 +37,7 @@ use super::replication_queue_boundary::DeletedObjectReplicationInfo;
 use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
-    resync_state_accepts_update, should_count_head_proxy_failure,
+    resync_state_accepts_update, sanitize_resync_error_detail, should_count_head_proxy_failure,
 };
 #[cfg(test)]
 use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX, decode_resync_file};
@@ -116,6 +116,20 @@ const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
+
+fn resync_target_error_detail<E, R>(error: &SdkError<E, R>) -> Option<String>
+where
+    E: ProvideErrorMetadata,
+{
+    sanitize_resync_error_detail(error.code().unwrap_or(match error {
+        SdkError::ConstructionFailure(_) => "failed to construct target request",
+        SdkError::TimeoutError(_) => "target request timed out",
+        SdkError::DispatchFailure(_) => "target dispatch failed",
+        SdkError::ResponseError(_) => "invalid target response",
+        SdkError::ServiceError(_) => "target service error",
+        _ => "target request failed",
+    }))
+}
 
 async fn finish_resync_workers(
     worker_txs: Vec<tokio::sync::mpsc::Sender<ReplicateObjectInfo>>,
@@ -428,6 +442,9 @@ impl ReplicationResyncer {
         state.replicated_size += status.replicated_size;
         state.failed_count += status.failed_count;
         state.failed_size += status.failed_size;
+        if state.error.is_none() && status.failed_count > 0 {
+            state.error = status.error.as_deref().and_then(sanitize_resync_error_detail);
+        }
         state.last_update = Some(now);
         bucket_status.last_update = Some(now);
     }
@@ -885,6 +902,7 @@ impl ReplicationResyncer {
                             "Processed resync object"
                         );
                     }
+                    st.error = err.as_ref().and_then(resync_target_error_detail);
 
                     if cancel_token.is_cancelled() {
                         return;
@@ -3227,6 +3245,7 @@ mod tests {
         assert_eq!(tgt.start_time, Some(start));
         assert_eq!(tgt.last_update, Some(last));
         assert_eq!(tgt.resync_before_date, Some(before));
+        assert_eq!(tgt.error, None);
     }
 
     #[test]
@@ -3679,6 +3698,59 @@ mod tests {
         resyncer.inc_stats(&status, opts.clone()).await;
 
         assert!(resyncer.target_has_resync_failures(&opts).await);
+    }
+
+    #[tokio::test]
+    async fn test_inc_stats_retains_first_sanitized_error_across_success() {
+        let resyncer = ReplicationResyncer::new().await;
+        let opts = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-new".to_string(),
+            resync_before: None,
+        };
+        let failed = TargetReplicationResyncStatus {
+            failed_count: 1,
+            object: "failed-object".to_string(),
+            error: Some("Authorization: Bearer status-secret".to_string()),
+            ..Default::default()
+        };
+        let later_failure = TargetReplicationResyncStatus {
+            failed_count: 1,
+            object: "later-failed-object".to_string(),
+            error: Some("AccessDenied".to_string()),
+            ..Default::default()
+        };
+        let succeeded = TargetReplicationResyncStatus {
+            replicated_count: 1,
+            object: "successful-object".to_string(),
+            ..Default::default()
+        };
+
+        resyncer.inc_stats(&failed, opts.clone()).await;
+        resyncer.inc_stats(&later_failure, opts.clone()).await;
+        resyncer.inc_stats(&succeeded, opts.clone()).await;
+
+        let status_map = resyncer.status_map.read().await;
+        let target = &status_map["bucket"].targets_map["arn:replication::dest"];
+        assert_eq!(target.failed_count, 2);
+        assert_eq!(target.replicated_count, 1);
+        assert_eq!(target.object, "successful-object");
+        assert_eq!(target.error.as_deref(), Some("[redacted sensitive resync error detail]"));
+    }
+
+    #[test]
+    fn test_resync_target_error_detail_uses_safe_service_code_and_fallback() {
+        let metadata = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("AccessDenied")
+            .message("Authorization: Bearer status-secret")
+            .build();
+        let service_error = SdkError::service_error(HeadObjectError::generic(metadata), ());
+        let timeout_error =
+            SdkError::<HeadObjectError, ()>::timeout_error(std::io::Error::new(std::io::ErrorKind::TimedOut, "status-secret"));
+
+        assert_eq!(resync_target_error_detail(&service_error).as_deref(), Some("AccessDenied"));
+        assert_eq!(resync_target_error_detail(&timeout_error).as_deref(), Some("target request timed out"));
     }
 
     #[test]
