@@ -1428,6 +1428,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3657,7 +3663,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-http-client",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "clap",
@@ -8838,7 +8844,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "base64-simd",
  "bytes",
  "chacha20poly1305",
@@ -9090,7 +9096,7 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "base64 0.22.1",
+ "base64 0.23.0",
  "base64-simd",
  "byteorder",
  "bytes",
@@ -9195,9 +9201,9 @@ dependencies = [
 
 [[package]]
 name = "rustfs-erasure-codec"
-version = "8.0.1"
+version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a39413e8f0ca32be9bc2ca9d29f8d17a2ddf952748284cf0fd148ab11180cf6c"
+checksum = "bb8ba5edcc507013a0a7bcf7424be94f0ef070b38eab8bcbc38206a8148bc70a"
 dependencies = [
  "cc",
  "cfg_aliases",
@@ -9250,7 +9256,7 @@ name = "rustfs-heal"
 version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.0",
  "futures",
  "http 1.4.2",
  "metrics",
@@ -9421,7 +9427,7 @@ dependencies = [
  "arc-swap",
  "argon2",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chacha20poly1305",
  "insta",
  "jiff",
@@ -9674,7 +9680,7 @@ dependencies = [
  "async-compression",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "dav-server",
  "futures",
@@ -9771,7 +9777,7 @@ dependencies = [
  "aes-gcm",
  "arc-swap",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "crc-fast",
  "faster-hex",
@@ -10230,9 +10236,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.15.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
+checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
  "web-time",
  "zeroize",
