@@ -12,18 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use derive_builder::Builder;
 use rustfs_s3select_api::{
     QueryResult,
     query::{
-        Query, dispatcher::QueryDispatcher, execution::QueryStateMachineRef, logical_planner::Plan, session::SessionCtxFactory,
+        Query,
+        dispatcher::QueryDispatcher,
+        execution::QueryStateMachineRef,
+        logical_planner::Plan,
+        session::{DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES as DEFAULT_MEMORY_LIMIT_BYTES, SessionCtxFactory},
     },
     server::dbms::{DatabaseManagerSystem, QueryHandle},
 };
 use s3s::dto::SelectObjectContentInput;
+use tokio::sync::Semaphore;
 
 use crate::{
     dispatcher::manager::SimpleQueryDispatcherBuilder,
@@ -34,6 +42,16 @@ use crate::{
 };
 
 const ENV_RUSTFS_S3SELECT_TARGET_PARTITIONS: &str = "RUSTFS_S3SELECT_TARGET_PARTITIONS";
+const ENV_RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES: &str = "RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES";
+const ENV_RUSTFS_S3SELECT_QUERY_TIMEOUT_SECS: &str = "RUSTFS_S3SELECT_QUERY_TIMEOUT_SECS";
+const ENV_RUSTFS_S3SELECT_MAX_CONCURRENT_QUERIES: &str = "RUSTFS_S3SELECT_MAX_CONCURRENT_QUERIES";
+pub(crate) const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
+pub(crate) const DEFAULT_MAX_CONCURRENT_QUERIES: usize = 4;
+const MAX_QUERY_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+const TEST_MAX_CONCURRENT_QUERIES: usize = 1024;
+
+static QUERY_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(S3SelectRuntimeConfig::from_env().max_concurrent_queries)));
 
 #[derive(Builder)]
 pub struct RustFSms<D: QueryDispatcher> {
@@ -79,9 +97,23 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct S3SelectRuntimeConfig {
     target_partitions: usize,
+    memory_limit_bytes: usize,
+    query_timeout: Duration,
+    max_concurrent_queries: usize,
+}
+
+impl Default for S3SelectRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            target_partitions: 0,
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
+            query_timeout: Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
+            max_concurrent_queries: DEFAULT_MAX_CONCURRENT_QUERIES,
+        }
+    }
 }
 
 impl S3SelectRuntimeConfig {
@@ -90,12 +122,53 @@ impl S3SelectRuntimeConfig {
             target_partitions: target_partitions_from_env_value(
                 std::env::var(ENV_RUSTFS_S3SELECT_TARGET_PARTITIONS).ok().as_deref(),
             ),
+            memory_limit_bytes: bounded_usize_from_env_value(
+                std::env::var(ENV_RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES).ok().as_deref(),
+                DEFAULT_MEMORY_LIMIT_BYTES,
+                usize::MAX,
+            ),
+            query_timeout: s3_select_query_timeout(),
+            max_concurrent_queries: bounded_usize_from_env_value(
+                std::env::var(ENV_RUSTFS_S3SELECT_MAX_CONCURRENT_QUERIES).ok().as_deref(),
+                DEFAULT_MAX_CONCURRENT_QUERIES,
+                Semaphore::MAX_PERMITS,
+            ),
         }
     }
 }
 
+pub fn s3_select_query_timeout() -> Duration {
+    Duration::from_secs(bounded_u64_from_env_value(
+        std::env::var(ENV_RUSTFS_S3SELECT_QUERY_TIMEOUT_SECS).ok().as_deref(),
+        DEFAULT_QUERY_TIMEOUT_SECS,
+        MAX_QUERY_TIMEOUT_SECS,
+    ))
+}
+
 fn target_partitions_from_env_value(value: Option<&str>) -> usize {
     value.and_then(|value| value.parse::<usize>().ok()).unwrap_or(0)
+}
+
+fn bounded_usize_from_env_value(value: Option<&str>, default: usize, max: usize) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=max).contains(value))
+        .unwrap_or(default)
+}
+
+fn bounded_u64_from_env_value(value: Option<&str>, default: u64, max: u64) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=max).contains(value))
+        .unwrap_or(default)
+}
+
+fn query_admission(is_test: bool) -> Arc<Semaphore> {
+    if is_test {
+        Arc::new(Semaphore::new(TEST_MAX_CONCURRENT_QUERIES))
+    } else {
+        Arc::clone(&QUERY_ADMISSION)
+    }
 }
 
 pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) -> QueryResult<impl DatabaseManagerSystem> {
@@ -116,8 +189,11 @@ pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) 
         .with_func_manager(Arc::new(func_manager))
         .with_default_table_provider(default_table_provider)
         .with_session_factory(session_factory)
+        .with_memory_limit_bytes(runtime_config.memory_limit_bytes)
         .with_parser(parser)
         .with_query_execution_factory(query_execution_factory)
+        .with_query_admission(query_admission(is_test))
+        .with_query_timeout(runtime_config.query_timeout)
         .build()?;
 
     let mut builder = RustFSmsBuilder::default();
@@ -143,8 +219,11 @@ pub async fn make_rustfsms_with_components(
         .with_func_manager(func_manager)
         .with_default_table_provider(default_table_provider)
         .with_session_factory(session_factory)
+        .with_memory_limit_bytes(runtime_config.memory_limit_bytes)
         .with_parser(parser)
         .with_query_execution_factory(query_execution_factory)
+        .with_query_admission(query_admission(is_test))
+        .with_query_timeout(runtime_config.query_timeout)
         .build()?;
 
     let mut builder = RustFSmsBuilder::default();
@@ -167,7 +246,10 @@ mod tests {
 
     use crate::get_global_db;
 
-    use super::{S3SelectRuntimeConfig, target_partitions_from_env_value};
+    use super::{
+        DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_QUERY_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS,
+        S3SelectRuntimeConfig, bounded_u64_from_env_value, bounded_usize_from_env_value, target_partitions_from_env_value,
+    };
 
     #[test]
     fn parses_target_partitions_from_env_value() {
@@ -179,7 +261,24 @@ mod tests {
 
     #[test]
     fn default_runtime_config_uses_datafusion_default_partitions() {
-        assert_eq!(S3SelectRuntimeConfig::default().target_partitions, 0);
+        let config = S3SelectRuntimeConfig::default();
+
+        assert_eq!(config.target_partitions, 0);
+        assert_eq!(config.memory_limit_bytes, DEFAULT_MEMORY_LIMIT_BYTES);
+        assert_eq!(config.query_timeout.as_secs(), DEFAULT_QUERY_TIMEOUT_SECS);
+        assert_eq!(config.max_concurrent_queries, DEFAULT_MAX_CONCURRENT_QUERIES);
+    }
+
+    #[test]
+    fn resource_limits_reject_invalid_and_out_of_range_values() {
+        assert_eq!(bounded_usize_from_env_value(Some("1024"), 64, 2048), 1024);
+        assert_eq!(bounded_usize_from_env_value(Some("0"), 64, 2048), 64);
+        assert_eq!(bounded_usize_from_env_value(Some("4096"), 64, 2048), 64);
+        assert_eq!(bounded_usize_from_env_value(Some("invalid"), 64, 2048), 64);
+        assert_eq!(bounded_u64_from_env_value(Some("30"), 300, MAX_QUERY_TIMEOUT_SECS), 30);
+        assert_eq!(bounded_u64_from_env_value(Some("0"), 300, MAX_QUERY_TIMEOUT_SECS), 300);
+        assert_eq!(bounded_u64_from_env_value(Some("86401"), 300, MAX_QUERY_TIMEOUT_SECS), 300);
+        assert_eq!(bounded_u64_from_env_value(None, 300, MAX_QUERY_TIMEOUT_SECS), 300);
     }
 
     #[tokio::test]

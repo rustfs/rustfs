@@ -34,7 +34,7 @@ derive_builder = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
-tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 
 [lib]

@@ -19,7 +19,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result as DFResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::var_provider::is_system_variables;
-use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF, planner::ExprPlanner};
 use datafusion::variable::VarType;
 use datafusion::{config::ConfigOptions, sql::planner::ContextProvider};
 use rustfs_s3select_api::query::{function::FuncMetaManagerRef, session::SessionCtx};
@@ -81,6 +81,10 @@ impl ContextProviderExtension for MetadataProvider {
 }
 
 impl ContextProvider for MetadataProvider {
+    fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
+        self.session.inner().expr_planners()
+    }
+
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
         self.func_manager
             .udf(name)
