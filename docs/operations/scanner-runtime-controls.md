@@ -58,8 +58,8 @@ The `/v3/scanner/status` response reports each effective runtime value with a
 | `heal.bitrot_cycle` | `RUSTFS_SCANNER_BITROT_CYCLE_SECS` | seconds | `2592000` | Controls periodic deep bitrot scans. `false`, `off`, `no`, or `disabled` disables periodic deep scans; `0`, `true`, `on`, or `yes` runs deep mode every scanner cycle. |
 | `scanner.idle_mode` | `RUSTFS_SCANNER_IDLE_MODE` | boolean | `true` | Enables scanner sleeps and cooperative throttling. |
 | `scanner.cache_save_timeout` | `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` | seconds | `30` | Timeout for saving scanner cache; runtime enforces a minimum of `1`. |
-| `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `0` | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
-| `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `0` | Caps concurrent disk bucket walks per set. `0` keeps disk-count-derived concurrency. |
+| `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `4` | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
+| `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` | Caps concurrent disk bucket walks per set. `0` keeps disk-count-derived concurrency. |
 | `scanner.yield_every_n_objects` | `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` | objects | `128` | Controls how often object loops yield to the async runtime. `0` disables this extra yield. |
 | `scanner.alert_excess_versions` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS` | versions | `100` | Version count threshold for scanner alerts. |
 | `scanner.alert_excess_version_size` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE` | bytes | `1099511627776` | Retained version byte threshold for scanner alerts. |

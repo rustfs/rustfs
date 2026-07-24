@@ -560,17 +560,22 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
 
-    set.delete_object(
-        bucket,
-        cleanup_key.as_str(),
-        ObjectOptions {
-            delete_prefix: true,
-            delete_prefix_object: true,
-            no_lock: true,
-            ..Default::default()
-        },
-    )
-    .await
+    let result = set
+        .delete_object(
+            bucket,
+            cleanup_key.as_str(),
+            ObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    if result.is_ok() {
+        crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+    }
+    result
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {

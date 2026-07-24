@@ -36,7 +36,23 @@ pub enum ScannerError {
     #[error("Scanner error: {0}")]
     Other(String),
 
+    /// A remote namespace scanner request ID was already accepted.
+    #[error("Remote namespace scanner request replay detected")]
+    RemoteRequestReplay,
+
+    /// The bounded remote namespace scanner replay cache cannot accept more IDs yet.
+    #[error("Remote namespace scanner replay cache capacity exceeded")]
+    RemoteReplayCapacity,
+
+    /// A remote namespace scanner request is already active for the target disk.
+    #[error("Remote namespace scanner disk is already active")]
+    RemoteDiskBusy,
+
     /// Partial data usage cache produced before the scanner stopped.
     #[error("Scanner stopped with partial data usage cache")]
     PartialCache(Box<DataUsageCache>),
+
+    /// Partial cache retained because the bucket or scan root disappeared.
+    #[error("Scanner namespace path disappeared during the scan")]
+    NamespaceNotFoundCache(Box<DataUsageCache>),
 }

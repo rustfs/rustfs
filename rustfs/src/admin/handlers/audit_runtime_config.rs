@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::supervise_admin_mutation;
 use crate::admin::handlers::target_descriptor::AdminTargetSpec;
 use crate::admin::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
 use crate::admin::storage_api::config::{
-    read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_server_config_no_lock,
-    with_admin_server_config_write_lock,
+    read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_server_config_snapshot,
 };
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
@@ -96,20 +96,20 @@ where
     let Some(store) = current_object_store_handle_for_context(context) else {
         return Err(s3_error!(InternalError, "server storage not initialized"));
     };
-
     let specs = specs.to_vec();
-    let lock_store = store.clone();
-    with_admin_server_config_write_lock(lock_store, move || async move {
-        let mut config = read_admin_config_without_migrate_no_lock(store.clone())
+    supervise_admin_mutation("audit config update", async move {
+        let snapshot = read_admin_server_config_snapshot(store.clone())
             .await
             .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
+        let mut config = snapshot.config.clone();
 
         if !modifier(&mut config) {
             return Ok(());
         }
 
-        save_admin_server_config_no_lock(store, &config)
+        save_admin_server_config_snapshot(store, &config, &snapshot)
             .await
+            .map(|_| ())
             .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
 
         // Keep persistence and runtime publication in one detached, serialized
@@ -118,8 +118,6 @@ where
         apply_audit_runtime_config(&specs, config).await
     })
     .await
-    .map_err(|err| s3_error!(InternalError, "failed to lock server config update: {}", err))??;
-    Ok(())
 }
 
 pub(crate) async fn update_audit_config_and_reload<F>(specs: &[AdminTargetSpec], modifier: F) -> S3Result<()>

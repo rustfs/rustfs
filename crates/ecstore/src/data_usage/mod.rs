@@ -20,21 +20,21 @@ pub mod local_snapshot;
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},
     list::{ListOperations as _, StorageListObjectVersionsInfo},
-    object::ObjectIO as _,
+    object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _},
 };
 use crate::{
     bucket::{metadata_sys::get_replication_config, versioning::VersioningApi as _, versioning_sys::BucketVersioningSys},
     config::com::{read_config, read_config_preserve_empty},
-    disk::DiskAPI,
+    disk::{DiskAPI, RUSTFS_META_BUCKET},
     error::{Error, classify_system_path_failure_reason},
-    object_api::ObjectInfo,
+    object_api::{ObjectInfo, ObjectOptions, PutObjReader},
     runtime::sources as runtime_sources,
     store::{ECStore, list_objects::list_marker_key},
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
-    BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus,
-    SizeHistogram, SizeSummary, VersionsHistogram,
+    BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DATA_USAGE_OBJECT_NAME, DataUsageCache, DataUsageEntry,
+    DataUsageInfo, DiskUsageStatus, LEGACY_DATA_USAGE_OBJECT_NAME, SizeHistogram, SizeSummary, VersionsHistogram,
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -53,12 +53,12 @@ use tracing::{debug, error, info, instrument};
 
 // Data usage storage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
-const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 const LIVE_BUCKET_USAGE_MAX_ENTRIES: u64 = 1024;
+const DATA_USAGE_REMOVE_CAS_RETRIES: usize = 3;
 
 #[derive(Debug, Clone)]
 struct CachedBucketUsage {
@@ -201,9 +201,15 @@ lazy_static::lazy_static! {
     pub static ref DATA_USAGE_OBJ_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
         SLASH_SEPARATOR,
-        DATA_USAGE_OBJ_NAME
+        DATA_USAGE_OBJECT_NAME
     );
     static ref DATA_USAGE_OBJ_BACKUP_PATH: String = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    static ref LEGACY_DATA_USAGE_OBJ_NAME_PATH: String = format!("{}{}{}",
+        crate::disk::BUCKET_META_PREFIX,
+        SLASH_SEPARATOR,
+        LEGACY_DATA_USAGE_OBJECT_NAME
+    );
+    static ref LEGACY_DATA_USAGE_OBJ_BACKUP_PATH: String = format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str());
     pub static ref DATA_USAGE_BLOOM_NAME_PATH: String = format!("{}{}{}",
         crate::disk::BUCKET_META_PREFIX,
         SLASH_SEPARATOR,
@@ -312,39 +318,240 @@ fn remove_bucket_usage_from_info(data_usage_info: &mut DataUsageInfo, bucket: &s
     true
 }
 
-fn merge_bucket_usage_removal(candidate: DataUsageInfo, existing: Option<DataUsageInfo>, bucket: &str) -> Option<DataUsageInfo> {
-    let mut data_usage_info = match existing {
-        Some(existing) if data_usage_info_updated_at(&existing) >= data_usage_info_updated_at(&candidate) => existing,
-        _ => candidate,
-    };
-
-    if remove_bucket_usage_from_info(&mut data_usage_info, bucket) {
-        Some(data_usage_info)
-    } else {
-        None
-    }
-}
-
-async fn clear_bucket_usage_memory(bucket: &str) {
+async fn clear_bucket_usage_memory(bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<(), Error> {
     if bucket.is_empty() {
-        return;
+        return Ok(());
     }
 
-    memory_cache().write().await.remove(bucket);
+    let mut cache = memory_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "data usage memory cleanup")?;
+    cache.remove(bucket);
+    Ok(())
 }
 
 pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    remove_bucket_usage_for_namespace_change(store.as_ref(), bucket).await
+}
+
+pub(crate) async fn remove_bucket_usage_for_namespace_change(store: &ECStore, bucket: &str) -> Result<(), Error> {
+    prepare_bucket_usage_for_namespace_change(bucket, None).await?;
+    remove_bucket_usage_from_backend_with_guard(store, bucket, None).await
+}
+
+pub(crate) async fn prepare_bucket_usage_for_namespace_change(
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error> {
+    ensure_bucket_namespace_guard(guard, bucket, "data usage cache cleanup")?;
     live_bucket_usage_cache().invalidate(bucket).await;
-    clear_bucket_usage_memory(bucket).await;
+    clear_bucket_usage_memory(bucket, guard).await?;
 
-    let data_usage_info = load_primary_data_usage_from_backend(store.clone()).await?;
-    let existing = load_primary_data_usage_from_backend(store.clone()).await.ok();
+    let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cache cleanup")?;
+    *snapshot_cache = None;
+    Ok(())
+}
 
-    if let Some(data_usage_info) = merge_bucket_usage_removal(data_usage_info, existing, bucket) {
-        save_data_usage_in_backend(data_usage_info, store).await?;
+pub(crate) async fn remove_bucket_usage_from_backend_with_guard<S>(
+    store: &S,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    let result = remove_bucket_usage_from_backend_with_store_and_guard(store, bucket, guard).await;
+    let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+    ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cache invalidation")?;
+    *snapshot_cache = None;
+    result
+}
+
+async fn load_data_usage_for_bucket_removal<S>(store: &S, object: &str) -> Result<Option<(DataUsageInfo, String)>, Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    let mut reader = match store
+        .get_object_reader(RUSTFS_META_BUCKET, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+        .await
+    {
+        Ok(reader) => reader,
+        Err(Error::FileNotFound | Error::ObjectNotFound(_, _) | Error::ConfigNotFound) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let revision = reader
+        .object_info
+        .etag
+        .as_deref()
+        .filter(|etag| !etag.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::other("data usage snapshot has no ETag"))?;
+    let data_usage_info = normalize_loaded_data_usage(parse_usage_snapshot(&reader.read_all().await?)?).await;
+    Ok(Some((data_usage_info, revision)))
+}
+
+fn data_usage_contains_bucket(data_usage_info: &DataUsageInfo, bucket: &str) -> bool {
+    data_usage_info.buckets_usage.contains_key(bucket) || data_usage_info.bucket_sizes.contains_key(bucket)
+}
+
+fn advance_data_usage_last_update(data_usage_info: &mut DataUsageInfo) {
+    let now = SystemTime::now();
+    data_usage_info.last_update = Some(match data_usage_info.last_update {
+        Some(last_update) if last_update >= now => last_update.checked_add(Duration::from_nanos(1)).unwrap_or(now),
+        _ => now,
+    });
+}
+
+#[cfg(test)]
+async fn remove_bucket_usage_from_backend_with_store<S>(store: &S, bucket: &str) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    remove_bucket_usage_from_backend_with_store_and_guard(store, bucket, None).await
+}
+
+fn ensure_bucket_namespace_guard(
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    bucket: &str,
+    operation: &'static str,
+) -> Result<(), Error> {
+    if guard.is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost) {
+        return Err(Error::other(format!("bucket namespace lock was lost before {operation}: {bucket}")));
+    }
+    Ok(())
+}
+
+async fn remove_bucket_usage_from_backend_with_store_and_guard<S>(
+    store: &S,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    ensure_bucket_namespace_guard(guard, bucket, "data usage primary cleanup")?;
+    let primary_seed = load_data_usage_seed_for_missing_primary(store).await?;
+    remove_bucket_usage_from_object_with_retries(
+        store,
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        bucket,
+        DATA_USAGE_REMOVE_CAS_RETRIES,
+        Some(&primary_seed),
+        guard,
+    )
+    .await?;
+
+    ensure_bucket_namespace_guard(guard, bucket, "data usage backup cleanup")?;
+    let backup_seed = load_data_usage_for_bucket_removal(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await?
+        .map_or(primary_seed, |(data_usage_info, _)| data_usage_info);
+    remove_bucket_usage_from_object_with_retries(
+        store,
+        DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+        bucket,
+        DATA_USAGE_REMOVE_CAS_RETRIES,
+        Some(&backup_seed),
+        guard,
+    )
+    .await?;
+
+    for object in [
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+    ] {
+        remove_bucket_usage_from_object_with_retries(store, object, bucket, DATA_USAGE_REMOVE_CAS_RETRIES, None, guard).await?;
+    }
+    Ok(())
+}
+
+async fn load_data_usage_seed_for_missing_primary<S>(store: &S) -> Result<DataUsageInfo, Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    for object in [
+        DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+    ] {
+        if let Some((data_usage_info, _)) = load_data_usage_for_bucket_removal(store, object).await? {
+            return Ok(data_usage_info);
+        }
+    }
+    Ok(DataUsageInfo::default())
+}
+
+async fn remove_bucket_usage_from_object_with_retries<S>(
+    store: &S,
+    object: &str,
+    bucket: &str,
+    cas_retries: usize,
+    missing_seed: Option<&DataUsageInfo>,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(), Error>
+where
+    S: EcstoreObjectIO + ?Sized,
+{
+    for attempt in 0..=cas_retries {
+        ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot cleanup")?;
+        let (mut data_usage_info, revision) = match load_data_usage_for_bucket_removal(store, object).await? {
+            Some((data_usage_info, revision)) => (data_usage_info, Some(revision)),
+            None => match missing_seed {
+                Some(data_usage_info) => (data_usage_info.clone(), None),
+                None => return Ok(()),
+            },
+        };
+        remove_bucket_usage_from_info(&mut data_usage_info, bucket);
+        advance_data_usage_last_update(&mut data_usage_info);
+
+        let data = serde_json::to_vec(&data_usage_info)
+            .map_err(|err| Error::other(format!("Failed to serialize data usage info: {err}")))?;
+        let mut put_data = PutObjReader::from_vec(data);
+        let http_preconditions = match revision.as_ref() {
+            Some(revision) => HTTPPreconditions {
+                if_match: Some(revision.clone()),
+                ..Default::default()
+            },
+            None => HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+        };
+        ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot commit")?;
+        let save_result = store
+            .put_object(
+                RUSTFS_META_BUCKET,
+                object,
+                &mut put_data,
+                &ObjectOptions {
+                    max_parity: true,
+                    http_preconditions: Some(http_preconditions),
+                    ..Default::default()
+                },
+            )
+            .await;
+        match save_result {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                if let Some((observed, observed_revision)) = load_data_usage_for_bucket_removal(store, object).await? {
+                    let revision_advanced = revision.as_ref().is_none_or(|revision| revision != &observed_revision);
+                    if revision_advanced && !data_usage_contains_bucket(&observed, bucket) {
+                        return Ok(());
+                    }
+                    if attempt < cas_retries
+                        && (err == Error::PreconditionFailed || revision.as_ref() != Some(&observed_revision))
+                    {
+                        ensure_bucket_namespace_guard(guard, bucket, "data usage snapshot retry")?;
+                        continue;
+                    }
+                } else if attempt < cas_retries && err == Error::PreconditionFailed {
+                    continue;
+                }
+                return Err(err);
+            }
+        }
     }
 
-    Ok(())
+    Err(Error::other("data usage bucket removal CAS retries exhausted"))
 }
 
 fn record_usage_snapshot_failure(operation: &'static str, object: &str, e: &Error) {
@@ -390,7 +597,7 @@ fn parse_usage_snapshot(buf: &[u8]) -> Result<DataUsageInfo, Error> {
     })
 }
 
-/// Decide which usage snapshot to serve: the primary `.usage.json` or its
+/// Decide which usage snapshot to serve: a primary usage object or its
 /// `.bkp` backup. The backup future is polled only when the primary is unusable,
 /// so the healthy path performs a single read.
 ///
@@ -398,21 +605,23 @@ fn parse_usage_snapshot(buf: &[u8]) -> Result<DataUsageInfo, Error> {
 /// the backup are `ConfigNotFound` — a genuine "no snapshot yet". A real
 /// primary failure with a missing backup propagates as an error instead of
 /// being rendered as confirmed all-zero stats.
-async fn resolve_loaded_snapshot_with_source(
+async fn resolve_loaded_snapshot_pair_with_source(
     primary: Result<Vec<u8>, Error>,
     backup: impl Future<Output = Result<Vec<u8>, Error>>,
+    primary_path: &str,
+    backup_path: &str,
 ) -> Result<(DataUsageInfo, UsageSnapshotSource), Error> {
     let primary_failure = match primary {
         Ok(buf) => match parse_usage_snapshot(&buf) {
             Ok(info) => return Ok((info, UsageSnapshotSource::Primary)),
             Err(e) => {
-                record_usage_snapshot_decode_failure("parse_primary", DATA_USAGE_OBJ_NAME_PATH.as_str(), &e);
+                record_usage_snapshot_decode_failure("parse_primary", primary_path, &e);
                 e
             }
         },
         Err(e) => {
             if e != Error::ConfigNotFound {
-                record_usage_snapshot_failure("read_primary", DATA_USAGE_OBJ_NAME_PATH.as_str(), &e);
+                record_usage_snapshot_failure("read_primary", primary_path, &e);
             }
             e
         }
@@ -421,7 +630,7 @@ async fn resolve_loaded_snapshot_with_source(
         Ok(buf) => match parse_usage_snapshot(&buf) {
             Ok(info) => Ok((info, UsageSnapshotSource::Backup)),
             Err(e) => {
-                record_usage_snapshot_decode_failure("parse_backup", &DATA_USAGE_OBJ_BACKUP_PATH, &e);
+                record_usage_snapshot_decode_failure("parse_backup", backup_path, &e);
                 Err(e)
             }
         },
@@ -430,7 +639,7 @@ async fn resolve_loaded_snapshot_with_source(
         }
         Err(Error::ConfigNotFound) => Err(primary_failure),
         Err(e) => {
-            record_usage_snapshot_failure("read_backup", &DATA_USAGE_OBJ_BACKUP_PATH, &e);
+            record_usage_snapshot_failure("read_backup", backup_path, &e);
             Err(e)
         }
     }
@@ -440,21 +649,60 @@ async fn resolve_loaded_snapshot(
     primary: Result<Vec<u8>, Error>,
     backup: impl Future<Output = Result<Vec<u8>, Error>>,
 ) -> Result<DataUsageInfo, Error> {
-    Ok(resolve_loaded_snapshot_with_source(primary, backup).await?.0)
+    Ok(resolve_loaded_snapshot_pair_with_source(
+        primary,
+        backup,
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+    )
+    .await?
+    .0)
 }
 
-async fn load_data_usage_snapshot(store: Arc<ECStore>) -> Result<(DataUsageInfo, UsageSnapshotSource), Error> {
-    let primary = read_config_preserve_empty(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await;
-    resolve_loaded_snapshot_with_source(
+#[cfg(test)]
+async fn resolve_loaded_snapshot_with_source(
+    primary: Result<Vec<u8>, Error>,
+    backup: impl Future<Output = Result<Vec<u8>, Error>>,
+) -> Result<(DataUsageInfo, UsageSnapshotSource), Error> {
+    resolve_loaded_snapshot_pair_with_source(
         primary,
-        async move { read_config_preserve_empty(store, &DATA_USAGE_OBJ_BACKUP_PATH).await },
+        backup,
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
     )
     .await
 }
 
-async fn load_primary_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    let buf = read_config_preserve_empty(store, &DATA_USAGE_OBJ_NAME_PATH).await?;
-    Ok(normalize_loaded_data_usage(parse_usage_snapshot(&buf)?).await)
+async fn load_data_usage_snapshot_from_store<S: EcstoreObjectIO>(
+    store: Arc<S>,
+) -> Result<(DataUsageInfo, UsageSnapshotSource), Error> {
+    let primary = read_config_preserve_empty(store.clone(), &DATA_USAGE_OBJ_NAME_PATH).await;
+    let authoritative = resolve_loaded_snapshot_pair_with_source(
+        primary,
+        {
+            let store = store.clone();
+            async move { read_config_preserve_empty(store, &DATA_USAGE_OBJ_BACKUP_PATH).await }
+        },
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+    )
+    .await?;
+    if authoritative.1 != UsageSnapshotSource::Missing {
+        return Ok(authoritative);
+    }
+
+    let legacy_primary = read_config_preserve_empty(store.clone(), &LEGACY_DATA_USAGE_OBJ_NAME_PATH).await;
+    resolve_loaded_snapshot_pair_with_source(
+        legacy_primary,
+        async move { read_config_preserve_empty(store, &LEGACY_DATA_USAGE_OBJ_BACKUP_PATH).await },
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+    )
+    .await
+}
+
+async fn load_data_usage_snapshot(store: Arc<ECStore>) -> Result<(DataUsageInfo, UsageSnapshotSource), Error> {
+    load_data_usage_snapshot_from_store(store).await
 }
 
 /// Load data usage info from backend storage
@@ -1103,8 +1351,23 @@ pub async fn decrement_bucket_usage_memory(bucket: &str, size_decrement: u64) {
     record_bucket_object_delete_memory(bucket, size_decrement, size_decrement > 0).await;
 }
 
-/// Get bucket usage from in-memory cache
+/// Get bucket usage from the authoritative cache for this topology.
+async fn get_persisted_bucket_usage(bucket: &str) -> Option<u64> {
+    let store = runtime_sources::object_store_handle()?;
+    let data_usage_info = load_data_usage_from_backend_cached(store).await.ok()?;
+    data_usage_info.buckets_usage.get(bucket).map(|usage| usage.size)
+}
+
 pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
+    // A process-local mutation cache is authoritative only when every request
+    // is handled by this process. In a distributed deployment it contains an
+    // absolute count derived from one node's requests, so applying it as the
+    // cluster total can replace a complete snapshot with roughly one node's
+    // share of the bucket.
+    if runtime_sources::setup_is_dist_erasure().await {
+        return get_persisted_bucket_usage(bucket).await;
+    }
+
     update_usage_cache_if_needed().await;
 
     let cache = memory_cache().read().await;
@@ -1215,7 +1478,11 @@ pub async fn replace_bucket_usage_memory_from_info(data_usage_info: &DataUsageIn
     *cache = next_cache;
 }
 
-pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageInfo) {
+async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mut DataUsageInfo, authoritative: bool) {
+    if !authoritative {
+        return;
+    }
+
     let cache = memory_cache().read().await;
     if cache.is_empty() {
         return;
@@ -1238,6 +1505,11 @@ pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageIn
         data_usage_info.buckets_count = data_usage_info.buckets_usage.len() as u64;
         data_usage_info.calculate_totals();
     }
+}
+
+pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageInfo) {
+    let authoritative = !runtime_sources::setup_is_dist_erasure().await;
+    apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info, authoritative).await;
 }
 
 /// Sync memory cache with backend data (called by scanner)
@@ -1562,7 +1834,213 @@ pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
 mod tests {
     use super::*;
     use rustfs_data_usage::BucketUsageInfo;
+    use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use tokio::{io::AsyncReadExt, sync::Mutex};
+
+    #[derive(Debug, Default)]
+    struct UsageCasState {
+        object: Option<(Vec<u8>, u64)>,
+        backup_object: Option<(Vec<u8>, u64)>,
+        legacy_object: Option<(Vec<u8>, u64)>,
+        legacy_backup_object: Option<(Vec<u8>, u64)>,
+        interleaving_snapshot: Option<Vec<u8>>,
+        interleaving_backup_snapshot: Option<Vec<u8>>,
+        interleaving_legacy_snapshot: Option<Vec<u8>>,
+        interleaving_legacy_backup_snapshot: Option<Vec<u8>>,
+        error_after_commit_put: Option<usize>,
+        advance_time_on_put: Option<Duration>,
+        advance_time_after_get: Option<(UsageObjectSlot, Duration)>,
+        advance_time_before_put: Option<(usize, Duration)>,
+        advance_time_after_put: Option<(usize, Duration)>,
+        put_count: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct UsageCasStore {
+        state: Mutex<UsageCasState>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum UsageObjectSlot {
+        Primary,
+        Backup,
+        LegacyPrimary,
+        LegacyBackup,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for UsageCasStore {
+        type Error = Error;
+        type RangeSpec = crate::storage_api_contracts::range::HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = crate::object_api::GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            _range: Option<Self::RangeSpec>,
+            _h: Self::HeaderMap,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::GetObjectReader, Self::Error> {
+            if bucket != RUSTFS_META_BUCKET {
+                return Err(Error::FileNotFound);
+            }
+            let slot = match object {
+                object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Primary,
+                object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::Backup,
+                object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::LegacyPrimary,
+                object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::LegacyBackup,
+                _ => return Err(Error::FileNotFound),
+            };
+            let mut state = self.state.lock().await;
+            let stored = match slot {
+                UsageObjectSlot::Primary => &state.object,
+                UsageObjectSlot::Backup => &state.backup_object,
+                UsageObjectSlot::LegacyPrimary => &state.legacy_object,
+                UsageObjectSlot::LegacyBackup => &state.legacy_backup_object,
+            };
+            let (data, revision) = stored.clone().ok_or(Error::FileNotFound)?;
+            let advance = match state.advance_time_after_get {
+                Some((expected_slot, duration)) if expected_slot == slot => {
+                    state.advance_time_after_get = None;
+                    Some(duration)
+                }
+                _ => None,
+            };
+            drop(state);
+            if let Some(duration) = advance {
+                tokio::time::advance(duration).await;
+            }
+            Ok(crate::object_api::GetObjectReader {
+                stream: Box::new(Cursor::new(data)),
+                object_info: ObjectInfo {
+                    etag: Some(format!("usage-{revision}")),
+                    ..Default::default()
+                },
+                buffered_body: None,
+                body_source: Default::default(),
+            })
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            data: &mut Self::PutObjectReader,
+            opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            if bucket != RUSTFS_META_BUCKET {
+                return Err(Error::FileNotFound);
+            }
+            let slot = match object {
+                object if object == DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::Primary,
+                object if object == DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::Backup,
+                object if object == LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() => UsageObjectSlot::LegacyPrimary,
+                object if object == LEGACY_DATA_USAGE_OBJ_BACKUP_PATH.as_str() => UsageObjectSlot::LegacyBackup,
+                _ => return Err(Error::FileNotFound),
+            };
+            let mut buf = Vec::new();
+            data.stream.read_to_end(&mut buf).await?;
+
+            let mut state = self.state.lock().await;
+            state.put_count += 1;
+            let put_count = state.put_count;
+            if let Some(duration) = state.advance_time_on_put.take() {
+                drop(state);
+                tokio::time::advance(duration).await;
+                state = self.state.lock().await;
+            }
+            if let Some((expected_put, duration)) = state.advance_time_before_put
+                && expected_put == put_count
+            {
+                state.advance_time_before_put = None;
+                drop(state);
+                tokio::time::advance(duration).await;
+                state = self.state.lock().await;
+            }
+            if slot == UsageObjectSlot::Primary
+                && let Some(interleaving) = state.interleaving_snapshot.take()
+            {
+                let revision = state.object.as_ref().map_or(1, |(_, revision)| revision + 1);
+                state.object = Some((interleaving, revision));
+            }
+            if slot == UsageObjectSlot::Backup
+                && let Some(interleaving) = state.interleaving_backup_snapshot.take()
+            {
+                let revision = state.backup_object.as_ref().map_or(1, |(_, revision)| revision + 1);
+                state.backup_object = Some((interleaving, revision));
+            }
+            if slot == UsageObjectSlot::LegacyPrimary
+                && let Some(interleaving) = state.interleaving_legacy_snapshot.take()
+            {
+                let revision = state.legacy_object.as_ref().map_or(1, |(_, revision)| revision + 1);
+                state.legacy_object = Some((interleaving, revision));
+            }
+            if slot == UsageObjectSlot::LegacyBackup
+                && let Some(interleaving) = state.interleaving_legacy_backup_snapshot.take()
+            {
+                let revision = state.legacy_backup_object.as_ref().map_or(1, |(_, revision)| revision + 1);
+                state.legacy_backup_object = Some((interleaving, revision));
+            }
+            let current_revision = match slot {
+                UsageObjectSlot::Primary => state.object.as_ref(),
+                UsageObjectSlot::Backup => state.backup_object.as_ref(),
+                UsageObjectSlot::LegacyPrimary => state.legacy_object.as_ref(),
+                UsageObjectSlot::LegacyBackup => state.legacy_backup_object.as_ref(),
+            }
+            .map(|(_, revision)| *revision);
+            if let Some(preconditions) = &opts.http_preconditions {
+                if preconditions
+                    .if_none_match
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    && current_revision.is_some()
+                {
+                    return Err(Error::PreconditionFailed);
+                }
+                if let Some(expected) = preconditions
+                    .if_match
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let actual = current_revision.map(|revision| format!("usage-{revision}"));
+                    if actual.as_deref() != Some(expected.trim_matches('"')) {
+                        return Err(Error::PreconditionFailed);
+                    }
+                }
+            }
+
+            let revision = current_revision.unwrap_or_default() + 1;
+            match slot {
+                UsageObjectSlot::Primary => state.object = Some((buf, revision)),
+                UsageObjectSlot::Backup => state.backup_object = Some((buf, revision)),
+                UsageObjectSlot::LegacyPrimary => state.legacy_object = Some((buf, revision)),
+                UsageObjectSlot::LegacyBackup => state.legacy_backup_object = Some((buf, revision)),
+            }
+            if state.error_after_commit_put == Some(put_count) {
+                return Err(Error::other("injected post-commit failure"));
+            }
+            if let Some((expected_put, duration)) = state.advance_time_after_put
+                && expected_put == put_count
+            {
+                state.advance_time_after_put = None;
+                drop(state);
+                tokio::time::advance(duration).await;
+            }
+            Ok(ObjectInfo {
+                etag: Some(format!("usage-{revision}")),
+                ..Default::default()
+            })
+        }
+    }
 
     async fn clear_usage_memory_cache_for_test() {
         memory_cache().write().await.clear();
@@ -1831,6 +2309,33 @@ mod tests {
             .expect("no snapshot yet must resolve to empty stats");
         assert_eq!(info.buckets_count, 0);
         assert!(info.buckets_usage.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authoritative_usage_loader_migrates_only_when_v2_is_absent() {
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                legacy_object: Some((snapshot_bytes("legacy-bucket"), 1)),
+                ..Default::default()
+            }),
+        });
+
+        let (legacy, _) = load_data_usage_snapshot_from_store(store.clone())
+            .await
+            .expect("a legacy snapshot should seed an upgrade when v2 is absent");
+        assert_snapshot_bucket(&legacy, "legacy-bucket");
+
+        store.state.lock().await.object = Some((snapshot_bytes("v2-bucket"), 1));
+        let (authoritative, _) = load_data_usage_snapshot_from_store(store.clone())
+            .await
+            .expect("a v2 snapshot should be authoritative");
+        assert_snapshot_bucket(&authoritative, "v2-bucket");
+
+        store.state.lock().await.object = Some((b"corrupt-v2".to_vec(), 2));
+        let err = load_data_usage_snapshot_from_store(store)
+            .await
+            .expect_err("corrupt v2 state must not fall back to a legacy writer");
+        assert!(err.to_string().contains("deserialize"));
     }
 
     #[tokio::test]
@@ -2151,6 +2656,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn distributed_usage_does_not_apply_a_process_local_absolute_count() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 100, 1_000, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory("bucket-a", 42, true).await;
+
+        let mut distributed_response = persisted.clone();
+        apply_bucket_usage_memory_overlay_if_authoritative(&mut distributed_response, false).await;
+        assert_eq!(
+            distributed_response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((100, 1_000))
+        );
+
+        let mut single_process_response = persisted;
+        apply_bucket_usage_memory_overlay_if_authoritative(&mut single_process_response, true).await;
+        assert_eq!(
+            single_process_response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((99, 958))
+        );
+    }
+
     #[test]
     fn remove_bucket_usage_from_info_drops_bucket_and_recomputes_totals() {
         let last_update = SystemTime::now();
@@ -2184,12 +2719,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn merge_bucket_usage_removal_preserves_current_snapshot() {
+    #[tokio::test]
+    async fn remove_bucket_usage_retries_against_newer_scanner_snapshot() {
         let now = SystemTime::now();
-        let candidate = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
-        let mut existing = data_usage_info_for_test("bucket-a", 4, 168, now);
-        existing.buckets_usage.insert(
+        let mut initial = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        initial.scanner_epoch = Some(8);
+        initial.scanner_cycle = Some(12);
+        let mut scanner_winner = data_usage_info_for_test("bucket-a", 4, 168, now);
+        scanner_winner.scanner_epoch = Some(9);
+        scanner_winner.scanner_cycle = Some(13);
+        scanner_winner.buckets_usage.insert(
             "bucket-c".to_string(),
             BucketUsageInfo {
                 objects_count: 5,
@@ -2198,24 +2737,725 @@ mod tests {
                 ..Default::default()
             },
         );
-        existing.bucket_sizes.insert("bucket-c".to_string(), 210);
-        existing.buckets_count = 2;
-        existing.calculate_totals();
+        scanner_winner.bucket_sizes.insert("bucket-c".to_string(), 210);
+        scanner_winner.buckets_count = 2;
+        scanner_winner.calculate_totals();
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((serde_json::to_vec(&initial).expect("initial usage snapshot should encode"), 1)),
+                interleaving_snapshot: Some(serde_json::to_vec(&scanner_winner).expect("scanner winner snapshot should encode")),
+                ..Default::default()
+            }),
+        });
 
-        let merged = merge_bucket_usage_removal(candidate, Some(existing), "bucket-a")
-            .expect("bucket-a should be removed from the current snapshot");
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should reconcile the scanner CAS winner");
 
-        assert_eq!(merged.last_update, Some(now));
-        assert_eq!(merged.buckets_count, 1);
-        assert_eq!(merged.objects_total_count, 5);
-        assert_eq!(merged.objects_total_size, 210);
-        assert!(!merged.buckets_usage.contains_key("bucket-a"));
+        let state = store.state.lock().await;
+        let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("usage snapshot should remain").0)
+            .expect("saved usage snapshot should decode");
+        assert_eq!(state.put_count, 3);
+        assert!(saved.last_update.is_some_and(|last_update| last_update > now));
+        assert_eq!(saved.scanner_epoch, Some(9));
+        assert_eq!(saved.scanner_cycle, Some(13));
+        assert_eq!(saved.buckets_count, 1);
+        assert_eq!(saved.objects_total_count, 5);
+        assert_eq!(saved.objects_total_size, 210);
+        assert!(!saved.buckets_usage.contains_key("bucket-a"));
         assert_eq!(
-            merged
+            saved
                 .buckets_usage
                 .get("bucket-c")
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((5, 210))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_retry_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-cleanup-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let now = SystemTime::now();
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        let scanner_winner = data_usage_info_for_test("bucket-a", 4, 168, now);
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((serde_json::to_vec(&initial).expect("initial usage snapshot should encode"), 1)),
+                interleaving_snapshot: Some(serde_json::to_vec(&scanner_winner).expect("scanner winner should encode")),
+                advance_time_on_put: Some(ttl + Duration::from_millis(1)),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop the cleanup CAS retry");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 1, "the stale cleanup must not issue a second CAS write");
+        let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("scanner winner should remain").0)
+            .expect("scanner winner should decode");
+        assert_eq!(saved.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_before_put_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-pre-put-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        let encoded = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded, 1)),
+                advance_time_after_get: Some((UsageObjectSlot::Primary, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss after the snapshot read must fence the write");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 0, "a cleanup that lost its lease must not start a snapshot write");
+        let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("usage snapshot should remain").0)
+            .expect("usage snapshot should decode");
+        assert!(saved.buckets_usage.contains_key("bucket-a"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_before_backup_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-backup-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let snapshot = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        let encoded = serde_json::to_vec(&snapshot).expect("usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded.clone(), 1)),
+                backup_object: Some((encoded, 1)),
+                advance_time_after_put: Some((1, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop cleanup before the backup write");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 1, "the cleanup must not write the backup after lock loss");
+        let backup = serde_json::from_slice::<DataUsageInfo>(
+            &state.backup_object.as_ref().expect("new-generation backup should remain").0,
+        )
+        .expect("backup should decode");
+        assert_eq!(backup.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_backup_retry_after_namespace_lock_loss() {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-backup-retry-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let now = SystemTime::now();
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        let scanner_winner = data_usage_info_for_test("bucket-a", 4, 168, now);
+        let encoded = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded.clone(), 1)),
+                backup_object: Some((encoded, 1)),
+                interleaving_backup_snapshot: Some(serde_json::to_vec(&scanner_winner).expect("scanner winner should encode")),
+                advance_time_before_put: Some((2, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop the backup CAS retry");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 2, "the stale cleanup must not issue a second backup CAS write");
+        let backup = serde_json::from_slice::<DataUsageInfo>(
+            &state.backup_object.as_ref().expect("scanner winner backup should remain").0,
+        )
+        .expect("backup should decode");
+        assert_eq!(backup.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(4));
+    }
+
+    async fn assert_legacy_cleanup_stops_retry_after_lock_loss(backup: bool) {
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new(
+            format!("usage-legacy-{}-retry-lock-loss-test", if backup { "backup" } else { "primary" }),
+            Arc::new(LocalClient::new()),
+        );
+        let request = LockRequest::new(ObjectKey::new("bucket-a", ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("namespace lock acquisition should not fail")
+            .expect("namespace lock should be acquired");
+
+        let now = SystemTime::now();
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        let scanner_winner = data_usage_info_for_test("bucket-a", 4, 168, now);
+        let encoded = serde_json::to_vec(&initial).expect("initial usage snapshot should encode");
+        let winner = serde_json::to_vec(&scanner_winner).expect("scanner winner should encode");
+        let conflict_put = if backup { 4 } else { 3 };
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded.clone(), 1)),
+                backup_object: Some((encoded.clone(), 1)),
+                legacy_object: Some((encoded.clone(), 1)),
+                legacy_backup_object: Some((encoded, 1)),
+                interleaving_legacy_snapshot: (!backup).then_some(winner.clone()),
+                interleaving_legacy_backup_snapshot: backup.then_some(winner),
+                advance_time_before_put: Some((conflict_put, ttl + Duration::from_millis(1))),
+                ..Default::default()
+            }),
+        });
+
+        let err = remove_bucket_usage_from_backend_with_store_and_guard(store.as_ref(), "bucket-a", Some(&guard))
+            .await
+            .expect_err("namespace lock loss must stop the legacy snapshot CAS retry");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let state = store.state.lock().await;
+        assert_eq!(
+            state.put_count, conflict_put,
+            "the stale cleanup must not retry the conflicted legacy snapshot"
+        );
+        let saved = if backup {
+            &state
+                .legacy_backup_object
+                .as_ref()
+                .expect("scanner winner legacy backup should remain")
+                .0
+        } else {
+            &state
+                .legacy_object
+                .as_ref()
+                .expect("scanner winner legacy primary should remain")
+                .0
+        };
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("scanner winner should decode");
+        assert_eq!(saved.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_stops_legacy_retries_after_namespace_lock_loss() {
+        assert_legacy_cleanup_stops_retry_after_lock_loss(false).await;
+        assert_legacy_cleanup_stops_retry_after_lock_loss(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn prepare_bucket_usage_preserves_successor_memory_after_lock_loss() {
+        const BUCKET: &str = "successor-bucket";
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-memory-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new(BUCKET, ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("namespace lock acquisition should not fail")
+                .expect("namespace lock should be acquired"),
+        );
+
+        let mut cache = memory_cache().write().await;
+        cache.insert(
+            BUCKET.to_string(),
+            cached_bucket_usage_now(BucketUsageInfo {
+                objects_count: 7,
+                versions_count: 7,
+                size: 294,
+                ..Default::default()
+            }),
+        );
+        let guard_for_prepare = guard.clone();
+        let prepare =
+            tokio::spawn(
+                async move { prepare_bucket_usage_for_namespace_change(BUCKET, Some(guard_for_prepare.as_ref())).await },
+            );
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        drop(cache);
+        let err = prepare
+            .await
+            .expect("prepare task should join")
+            .expect_err("lock loss while waiting for the cache must stop cleanup");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let mut cache = memory_cache().write().await;
+        assert_eq!(
+            cache.get(BUCKET).map(|entry| entry.usage.objects_count),
+            Some(7),
+            "fresh successor memory usage must not be erased after namespace lock loss"
+        );
+        cache.remove(BUCKET);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn prepare_bucket_usage_preserves_successor_snapshot_cache_after_lock_loss() {
+        const BUCKET: &str = "successor-snapshot-bucket";
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-snapshot-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new(BUCKET, ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("namespace lock acquisition should not fail")
+                .expect("namespace lock should be acquired"),
+        );
+        let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
+        let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+        *snapshot_cache = Some(CachedDataUsageSnapshot {
+            info: Some(successor),
+            loaded_at: tokio::time::Instant::now(),
+        });
+        memory_cache()
+            .write()
+            .await
+            .insert(BUCKET.to_string(), cached_bucket_usage_now(BucketUsageInfo::default()));
+
+        let guard_for_prepare = guard.clone();
+        let prepare =
+            tokio::spawn(
+                async move { prepare_bucket_usage_for_namespace_change(BUCKET, Some(guard_for_prepare.as_ref())).await },
+            );
+        loop {
+            if !memory_cache().read().await.contains_key(BUCKET) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        drop(snapshot_cache);
+        let err = prepare
+            .await
+            .expect("prepare task should join")
+            .expect_err("lock loss while waiting for the snapshot cache must stop cleanup");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let snapshot_cache = data_usage_snapshot_cache().read().await;
+        assert_eq!(
+            snapshot_cache
+                .as_ref()
+                .and_then(|cached| cached.info.as_ref())
+                .and_then(|info| info.buckets_usage.get(BUCKET))
+                .map(|usage| usage.objects_count),
+            Some(7),
+            "fresh successor snapshot cache must not be erased after namespace lock loss"
+        );
+        drop(snapshot_cache);
+        *data_usage_snapshot_cache().write().await = None;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remove_bucket_usage_preserves_successor_snapshot_cache_after_lock_loss() {
+        const BUCKET: &str = "successor-final-snapshot-bucket";
+        let ttl = Duration::from_millis(20);
+        let lock = NamespaceLock::new("usage-final-snapshot-lock-loss-test".to_string(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new(BUCKET, ""), LockType::Exclusive, "cleanup-owner")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("namespace lock acquisition should not fail")
+                .expect("namespace lock should be acquired"),
+        );
+        let store = Arc::new(UsageCasStore::default());
+        let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
+        let mut snapshot_cache = data_usage_snapshot_cache().write().await;
+        *snapshot_cache = Some(CachedDataUsageSnapshot {
+            info: Some(successor),
+            loaded_at: tokio::time::Instant::now(),
+        });
+
+        let store_for_cleanup = store.clone();
+        let guard_for_cleanup = guard.clone();
+        let cleanup = tokio::spawn(async move {
+            remove_bucket_usage_from_backend_with_guard(store_for_cleanup.as_ref(), BUCKET, Some(guard_for_cleanup.as_ref()))
+                .await
+        });
+        loop {
+            if store.state.lock().await.put_count >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        drop(snapshot_cache);
+        let err = cleanup
+            .await
+            .expect("cleanup task should join")
+            .expect_err("lock loss while waiting for final cache invalidation must stop cleanup");
+        assert!(err.to_string().contains("namespace lock was lost"));
+
+        let snapshot_cache = data_usage_snapshot_cache().read().await;
+        assert_eq!(
+            snapshot_cache
+                .as_ref()
+                .and_then(|cached| cached.info.as_ref())
+                .and_then(|info| info.buckets_usage.get(BUCKET))
+                .map(|usage| usage.objects_count),
+            Some(7),
+            "fresh successor snapshot cache must not be erased by final invalidation after lock loss"
+        );
+        drop(snapshot_cache);
+        *data_usage_snapshot_cache().write().await = None;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn remove_bucket_usage_invalidates_snapshot_cache_after_backend_error() {
+        const BUCKET: &str = "backend-error-cache-bucket";
+        let store = UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((b"{".to_vec(), 1)),
+                ..Default::default()
+            }),
+        };
+        let stale = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
+        *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
+            info: Some(stale),
+            loaded_at: tokio::time::Instant::now(),
+        });
+
+        remove_bucket_usage_from_backend_with_guard(&store, BUCKET, None)
+            .await
+            .expect_err("the malformed backend snapshot should be reported");
+
+        assert!(
+            data_usage_snapshot_cache().read().await.is_none(),
+            "a failed cleanup must still invalidate cached predecessor usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_writes_fences_when_bucket_is_already_absent() {
+        let last_update = SystemTime::now() - Duration::from_secs(10);
+        let snapshot = data_usage_info_for_test("bucket-b", 3, 126, last_update);
+        let encoded = serde_json::to_vec(&snapshot).expect("usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((encoded.clone(), 1)),
+                backup_object: Some((encoded, 1)),
+                ..Default::default()
+            }),
+        });
+
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should fence both snapshots even when the bucket is absent");
+
+        let state = store.state.lock().await;
+        assert_eq!(state.object.as_ref().map(|(_, revision)| *revision), Some(2));
+        assert_eq!(state.backup_object.as_ref().map(|(_, revision)| *revision), Some(2));
+        for (data, _) in [state.object.as_ref(), state.backup_object.as_ref()].into_iter().flatten() {
+            let saved = serde_json::from_slice::<DataUsageInfo>(data).expect("saved usage snapshot should decode");
+            assert!(saved.last_update.is_some_and(|updated| updated > last_update));
+            assert_eq!(saved.buckets_usage.get("bucket-b").map(|usage| usage.objects_count), Some(3));
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_creates_primary_and_backup_fences_when_missing() {
+        let store = Arc::new(UsageCasStore::default());
+
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should create both usage fences");
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 2);
+        for (data, revision) in [state.object.as_ref(), state.backup_object.as_ref()].into_iter().flatten() {
+            let saved = serde_json::from_slice::<DataUsageInfo>(data).expect("saved usage snapshot should decode");
+            assert_eq!(*revision, 1);
+            assert!(saved.last_update.is_some());
+            assert!(!data_usage_contains_bucket(&saved, "bucket-a"));
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_migrates_legacy_snapshot_without_hiding_other_buckets() {
+        let mut legacy = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        legacy.buckets_usage.insert(
+            "bucket-b".to_string(),
+            BucketUsageInfo {
+                objects_count: 3,
+                versions_count: 3,
+                size: 126,
+                ..Default::default()
+            },
+        );
+        legacy.bucket_sizes.insert("bucket-b".to_string(), 126);
+        legacy.buckets_count = 2;
+        legacy.calculate_totals();
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                legacy_object: Some((serde_json::to_vec(&legacy).expect("legacy usage snapshot should encode"), 1)),
+                ..Default::default()
+            }),
+        });
+
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should migrate the legacy usage baseline");
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 3);
+        for (data, _) in [
+            state.object.as_ref(),
+            state.backup_object.as_ref(),
+            state.legacy_object.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let saved = serde_json::from_slice::<DataUsageInfo>(data).expect("saved usage snapshot should decode");
+            assert!(!data_usage_contains_bucket(&saved, "bucket-a"));
+            assert_eq!(
+                saved
+                    .buckets_usage
+                    .get("bucket-b")
+                    .map(|usage| (usage.objects_count, usage.size)),
+                Some((3, 126))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_seeds_missing_backup_from_updated_primary() {
+        let mut primary = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        primary.buckets_usage.insert(
+            "bucket-b".to_string(),
+            BucketUsageInfo {
+                objects_count: 3,
+                versions_count: 3,
+                size: 126,
+                ..Default::default()
+            },
+        );
+        primary.bucket_sizes.insert("bucket-b".to_string(), 126);
+        primary.buckets_count = 2;
+        primary.calculate_totals();
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((serde_json::to_vec(&primary).expect("primary usage snapshot should encode"), 1)),
+                ..Default::default()
+            }),
+        });
+
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should seed a missing backup from the updated primary");
+
+        let state = store.state.lock().await;
+        assert_eq!(state.put_count, 2);
+        for (data, _) in [state.object.as_ref(), state.backup_object.as_ref()].into_iter().flatten() {
+            let saved = serde_json::from_slice::<DataUsageInfo>(data).expect("saved usage snapshot should decode");
+            assert!(!data_usage_contains_bucket(&saved, "bucket-a"));
+            assert_eq!(
+                saved
+                    .buckets_usage
+                    .get("bucket-b")
+                    .map(|usage| (usage.objects_count, usage.size)),
+                Some((3, 126))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_fences_reject_stale_primary_and_backup_writes() {
+        let stale = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now() - Duration::from_secs(10));
+        let stale_data = serde_json::to_vec(&stale).expect("stale usage snapshot should encode");
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((stale_data.clone(), 1)),
+                ..Default::default()
+            }),
+        });
+
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should write both usage fences");
+
+        let mut stale_primary = PutObjReader::from_vec(stale_data.clone());
+        let primary_err = store
+            .put_object(
+                RUSTFS_META_BUCKET,
+                DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                &mut stale_primary,
+                &ObjectOptions {
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_match: Some("usage-1".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the pre-delete primary baseline must be fenced");
+        assert_eq!(primary_err, Error::PreconditionFailed);
+
+        let mut stale_backup = PutObjReader::from_vec(stale_data);
+        let backup_err = store
+            .put_object(
+                RUSTFS_META_BUCKET,
+                DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+                &mut stale_backup,
+                &ObjectOptions {
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_none_match: Some("*".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the missing pre-delete backup baseline must be fenced");
+        assert_eq!(backup_err, Error::PreconditionFailed);
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_confirms_ambiguous_committed_final_attempt() {
+        let initial = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((serde_json::to_vec(&initial).expect("initial usage snapshot should encode"), 1)),
+                error_after_commit_put: Some(1),
+                ..Default::default()
+            }),
+        });
+
+        remove_bucket_usage_from_object_with_retries(
+            store.as_ref(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            "bucket-a",
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect("final-attempt read-back should confirm the ambiguous committed removal");
+
+        let state = store.state.lock().await;
+        let saved = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("usage snapshot should remain").0)
+            .expect("saved usage snapshot should decode");
+        assert_eq!(state.put_count, 1);
+        assert!(!saved.buckets_usage.contains_key("bucket-a"));
+        assert!(!saved.bucket_sizes.contains_key("bucket-a"));
+    }
+
+    #[tokio::test]
+    async fn remove_bucket_usage_updates_primary_and_backup_snapshots() {
+        let now = SystemTime::now();
+        let primary = data_usage_info_for_test("bucket-a", 2, 84, now);
+        let mut backup = primary.clone();
+        backup.buckets_usage.insert(
+            "bucket-b".to_string(),
+            BucketUsageInfo {
+                objects_count: 3,
+                versions_count: 3,
+                size: 126,
+                ..Default::default()
+            },
+        );
+        backup.bucket_sizes.insert("bucket-b".to_string(), 126);
+        backup.calculate_totals();
+        let store = Arc::new(UsageCasStore {
+            state: Mutex::new(UsageCasState {
+                object: Some((serde_json::to_vec(&primary).expect("primary usage snapshot should encode"), 1)),
+                backup_object: Some((serde_json::to_vec(&backup).expect("backup usage snapshot should encode"), 1)),
+                ..Default::default()
+            }),
+        });
+
+        remove_bucket_usage_from_backend_with_store(store.as_ref(), "bucket-a")
+            .await
+            .expect("bucket removal should update both usage snapshots");
+
+        let state = store.state.lock().await;
+        let primary = serde_json::from_slice::<DataUsageInfo>(&state.object.as_ref().expect("primary snapshot should remain").0)
+            .expect("primary snapshot should decode");
+        let backup =
+            serde_json::from_slice::<DataUsageInfo>(&state.backup_object.as_ref().expect("backup snapshot should remain").0)
+                .expect("backup snapshot should decode");
+        assert_eq!(state.put_count, 2);
+        assert!(!data_usage_contains_bucket(&primary, "bucket-a"));
+        assert!(!data_usage_contains_bucket(&backup, "bucket-a"));
+        assert_eq!(
+            backup
+                .buckets_usage
+                .get("bucket-b")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((3, 126))
         );
     }
 
@@ -2227,7 +3467,9 @@ mod tests {
         let persisted = data_usage_info_for_test("bucket-a", 1, 42, SystemTime::now() - Duration::from_secs(10));
         replace_bucket_usage_memory_from_info(&persisted).await;
         record_bucket_object_delete_memory("bucket-a", 42, true).await;
-        clear_bucket_usage_memory("bucket-a").await;
+        clear_bucket_usage_memory("bucket-a", None)
+            .await
+            .expect("bucket usage memory cleanup should succeed");
 
         let mut response = DataUsageInfo {
             last_update: Some(SystemTime::now()),

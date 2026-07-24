@@ -32,6 +32,20 @@ use std::{
 /// save forever and freeze admin usage stats; callers must bypass the skip instead.
 pub const USAGE_LAST_UPDATE_FUTURE_TOLERANCE: Duration = Duration::from_secs(5 * 60);
 
+/// Authoritative cluster-wide usage snapshot written by coordinated scanners.
+///
+/// This object name is intentionally distinct from the legacy unfenced
+/// snapshot. Older binaries can continue writing the legacy object during a
+/// rolling upgrade without overwriting a snapshot produced by the current
+/// scanner protocol.
+pub const DATA_USAGE_OBJECT_NAME: &str = ".usage.v2.json";
+
+/// Usage snapshot written by scanner implementations predating distributed
+/// leadership fencing. It is read only when neither authoritative snapshot
+/// copy exists.
+// RUSTFS_COMPAT_TODO(scanner-usage-v2): keep .usage.json readable and removable during rolling upgrades from pre-v2 scanners. Remove after supported direct-upgrade sources all write .usage.v2.json.
+pub const LEGACY_DATA_USAGE_OBJECT_NAME: &str = ".usage.json";
+
 /// Returns true when `existing_last_update` is ahead of `now` by more than
 /// [`USAGE_LAST_UPDATE_FUTURE_TOLERANCE`], i.e. the persisted timestamp cannot be
 /// trusted for staleness comparisons and a fresh snapshot save must be allowed.
@@ -95,7 +109,7 @@ impl AllTierStats {
 }
 
 /// Bucket target usage info provides replication statistics
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketTargetUsageInfo {
     pub replication_pending_size: u64,
     pub replication_failed_size: u64,
@@ -107,7 +121,7 @@ pub struct BucketTargetUsageInfo {
 }
 
 /// Bucket usage info provides bucket-level statistics
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketUsageInfo {
     pub size: u64,
     // Following five fields suffixed with V1 are here for backward compatibility
@@ -133,7 +147,7 @@ pub struct BucketUsageInfo {
 }
 
 /// DataUsageInfo represents data usage stats of the underlying storage
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataUsageInfo {
     /// Total capacity
     pub total_capacity: u64,
@@ -144,6 +158,22 @@ pub struct DataUsageInfo {
 
     /// LastUpdate is the timestamp of when the data usage info was last updated
     pub last_update: Option<SystemTime>,
+
+    /// Monotonic scanner cycle that produced this complete snapshot.
+    ///
+    /// Older snapshots omit this field and continue to use `last_update` for
+    /// compatibility. New scanner snapshots use the cycle to fence stale
+    /// leaders independently of wall-clock skew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_cycle: Option<u64>,
+
+    /// Persisted scanner leadership epoch that produced this snapshot.
+    ///
+    /// The epoch is claimed through the cycle-state CAS before scanning. It
+    /// orders snapshots from different leaders even when their wall clocks or
+    /// cycle counters coincide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_epoch: Option<u64>,
 
     /// Objects total count across all buckets
     pub objects_total_count: u64,
@@ -168,7 +198,7 @@ pub struct DataUsageInfo {
 }
 
 /// Metadata describing the status of a disk-level data usage snapshot.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskUsageStatus {
     pub disk_id: String,
     pub pool_index: Option<usize>,
@@ -268,12 +298,30 @@ impl DataUsageHash {
 pub type DataUsageHashMap = HashSet<String>;
 
 /// Size histogram for object size distribution
-#[derive(Clone, Debug, Serialize, Deserialize)]
+const SIZE_HISTOGRAM_LEN: usize = 11;
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SizeHistogram(Vec<u64>);
 
 impl Default for SizeHistogram {
     fn default() -> Self {
-        Self(vec![0; 11]) // DATA_USAGE_BUCKET_LEN = 11
+        Self(vec![0; SIZE_HISTOGRAM_LEN])
+    }
+}
+
+impl<'de> Deserialize<'de> for SizeHistogram {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = Vec::<u64>::deserialize(deserializer)?;
+        if values.len() != SIZE_HISTOGRAM_LEN {
+            return Err(serde::de::Error::invalid_length(
+                values.len(),
+                &"exactly 11 object-size histogram buckets",
+            ));
+        }
+        Ok(Self(values))
     }
 }
 
@@ -343,7 +391,7 @@ impl SizeHistogram {
             .zip(names.iter())
             .filter(|((_, (start, end)), name)| name != &&"BETWEEN_1024B_AND_1_MB" && *start >= 1024 && *end < ONE_MIB)
             .map(|((count, _), _)| *count)
-            .sum();
+            .fold(0, u64::saturating_add);
 
         let mut res = HashMap::new();
         for (count, name) in self.0.iter().zip(names.iter()) {
@@ -364,12 +412,30 @@ impl SizeHistogram {
 }
 
 /// Versions histogram for version count distribution
-#[derive(Clone, Debug, Serialize, Deserialize)]
+const VERSIONS_HISTOGRAM_LEN: usize = 7;
+
+#[derive(Clone, Debug, Serialize)]
 pub struct VersionsHistogram(Vec<u64>);
 
 impl Default for VersionsHistogram {
     fn default() -> Self {
-        Self(vec![0; 7]) // DATA_USAGE_VERSION_LEN = 7
+        Self(vec![0; VERSIONS_HISTOGRAM_LEN])
+    }
+}
+
+impl<'de> Deserialize<'de> for VersionsHistogram {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let values = Vec::<u64>::deserialize(deserializer)?;
+        if values.len() != VERSIONS_HISTOGRAM_LEN {
+            return Err(serde::de::Error::invalid_length(
+                values.len(),
+                &"exactly 7 object-version histogram buckets",
+            ));
+        }
+        Ok(Self(values))
     }
 }
 
@@ -535,13 +601,74 @@ impl DataUsageEntry {
             }
         }
 
-        for (i, v) in other.obj_sizes.0.iter().enumerate() {
-            self.obj_sizes.0[i] += v;
-        }
+        self.obj_sizes.merge_from(&other.obj_sizes);
+        self.obj_versions.merge_from(&other.obj_versions);
+    }
 
-        for (i, v) in other.obj_versions.0.iter().enumerate() {
-            self.obj_versions.0[i] += v;
+    pub fn checked_merge(&mut self, other: &DataUsageEntry) -> bool {
+        let scalar_counts_fit = self.objects.checked_add(other.objects).is_some()
+            && self.versions.checked_add(other.versions).is_some()
+            && self.delete_markers.checked_add(other.delete_markers).is_some()
+            && self.size.checked_add(other.size).is_some()
+            && self.failed_objects.checked_add(other.failed_objects).is_some();
+        let histograms_fit = self.obj_sizes.0.len() == SIZE_HISTOGRAM_LEN
+            && other.obj_sizes.0.len() == SIZE_HISTOGRAM_LEN
+            && self.obj_versions.0.len() == VERSIONS_HISTOGRAM_LEN
+            && other.obj_versions.0.len() == VERSIONS_HISTOGRAM_LEN
+            && self
+                .obj_sizes
+                .0
+                .iter()
+                .zip(other.obj_sizes.0.iter())
+                .all(|(left, right)| left.checked_add(*right).is_some())
+            && self
+                .obj_versions
+                .0
+                .iter()
+                .zip(other.obj_versions.0.iter())
+                .all(|(left, right)| left.checked_add(*right).is_some());
+        let replication_fits = match (&self.replication_stats, &other.replication_stats) {
+            (_, None) | (None, Some(_)) => true,
+            (Some(left), Some(right)) => {
+                left.replica_size.checked_add(right.replica_size).is_some()
+                    && left.replica_count.checked_add(right.replica_count).is_some()
+                    && right.targets.iter().all(|(target, right_stats)| {
+                        left.targets.get(target).is_none_or(|left_stats| {
+                            left_stats.pending_size.checked_add(right_stats.pending_size).is_some()
+                                && left_stats.replicated_size.checked_add(right_stats.replicated_size).is_some()
+                                && left_stats.failed_size.checked_add(right_stats.failed_size).is_some()
+                                && left_stats.failed_count.checked_add(right_stats.failed_count).is_some()
+                                && left_stats.pending_count.checked_add(right_stats.pending_count).is_some()
+                                && left_stats
+                                    .missed_threshold_size
+                                    .checked_add(right_stats.missed_threshold_size)
+                                    .is_some()
+                                && left_stats
+                                    .after_threshold_size
+                                    .checked_add(right_stats.after_threshold_size)
+                                    .is_some()
+                                && left_stats
+                                    .missed_threshold_count
+                                    .checked_add(right_stats.missed_threshold_count)
+                                    .is_some()
+                                && left_stats
+                                    .after_threshold_count
+                                    .checked_add(right_stats.after_threshold_count)
+                                    .is_some()
+                                && left_stats
+                                    .replicated_count
+                                    .checked_add(right_stats.replicated_count)
+                                    .is_some()
+                        })
+                    })
+            }
+        };
+
+        if !scalar_counts_fit || !histograms_fit || !replication_fits {
+            return false;
         }
+        self.merge(other);
+        true
     }
 }
 
@@ -1396,6 +1523,17 @@ mod tests {
     }
 
     #[test]
+    fn test_size_histogram_compat_rollup_saturates_on_corrupt_counts() {
+        let mut hist = SizeHistogram::default();
+        hist.0[1] = u64::MAX;
+        hist.0[2] = 1;
+
+        let map = hist.to_map();
+
+        assert_eq!(map["BETWEEN_1024B_AND_1_MB"], u64::MAX);
+    }
+
+    #[test]
     fn test_data_usage_cache_merge_adds_missing_child() {
         let mut base = DataUsageCache::default();
         base.info.name = "bucket".to_string();
@@ -1707,5 +1845,87 @@ mod tests {
         assert!(cache.find("bucket/large").is_some_and(|entry| !entry.compacted));
         assert!(cache.find("bucket/large/a").is_some());
         assert!(cache.find("bucket/large/b").is_some());
+    }
+
+    #[test]
+    fn checked_merge_rejects_scalar_and_replication_overflow_without_mutation() {
+        let mut entry = DataUsageEntry {
+            objects: usize::MAX,
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let other = DataUsageEntry {
+            objects: 1,
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: u64::MAX,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(!entry.checked_merge(&other));
+        assert_eq!(entry.objects, usize::MAX);
+        assert_eq!(entry.replication_stats.as_ref().map(|stats| stats.replica_size), Some(7));
+    }
+
+    #[test]
+    fn checked_merge_accepts_valid_usage() {
+        let mut entry = DataUsageEntry {
+            objects: 2,
+            size: 20,
+            ..Default::default()
+        };
+        let other = DataUsageEntry {
+            objects: 3,
+            size: 30,
+            ..Default::default()
+        };
+
+        assert!(entry.checked_merge(&other));
+        assert_eq!(entry.objects, 5);
+        assert_eq!(entry.size, 50);
+    }
+
+    #[test]
+    fn histogram_deserialization_rejects_noncanonical_lengths() {
+        let invalid_sizes =
+            rmp_serde::to_vec(&vec![0_u64; SIZE_HISTOGRAM_LEN + 1]).expect("encode invalid object-size histogram fixture");
+        let invalid_versions =
+            rmp_serde::to_vec(&vec![0_u64; VERSIONS_HISTOGRAM_LEN - 1]).expect("encode invalid object-version histogram fixture");
+
+        assert!(rmp_serde::from_slice::<SizeHistogram>(&invalid_sizes).is_err());
+        assert!(rmp_serde::from_slice::<VersionsHistogram>(&invalid_versions).is_err());
+    }
+
+    #[test]
+    fn replication_target_deserialization_preserves_large_historical_maps() {
+        let mut stats = ReplicationAllStats::default();
+        for index in 0..=1024 {
+            stats.targets.insert(format!("target-{index}"), ReplicationStats::default());
+        }
+        let encoded = rmp_serde::to_vec_named(&stats).expect("large replication target fixture should encode");
+        let decoded = rmp_serde::from_slice::<ReplicationAllStats>(&encoded)
+            .expect("historical replication target maps must remain readable");
+
+        assert_eq!(decoded.targets.len(), stats.targets.len());
+    }
+
+    #[test]
+    fn checked_merge_rejects_noncanonical_histograms_without_mutation() {
+        let mut entry = DataUsageEntry {
+            objects: 2,
+            ..Default::default()
+        };
+        let other = DataUsageEntry {
+            objects: 3,
+            obj_sizes: SizeHistogram(vec![0; SIZE_HISTOGRAM_LEN + 1]),
+            ..Default::default()
+        };
+
+        assert!(!entry.checked_merge(&other));
+        assert_eq!(entry.objects, 2);
     }
 }

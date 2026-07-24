@@ -30,8 +30,8 @@ pub use client::{
 };
 pub use http_auth::{
     TONIC_RPC_PREFIX, build_auth_headers, gen_signature_headers, gen_tonic_signature_headers, normalize_tonic_rpc_audience,
-    set_tonic_canonical_body_digest, sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest,
-    verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
+    set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_ns_scanner_capability,
+    verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
 };
 #[cfg(test)]
 pub(crate) use internode_data_transport::TcpHttpInternodeDataTransport;
@@ -41,6 +41,6 @@ pub use peer_rest_client::{
     SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity,
 };
 pub(crate) use peer_s3_client::heal_bucket_local_on_disks;
-pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys};
+pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys, ScannerBucketListing, ScannerSetBucketListing};
 pub use remote_disk::RemoteDisk;
 pub use remote_locker::RemoteClient;

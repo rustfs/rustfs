@@ -165,6 +165,7 @@ pub fn internode_rpc_max_message_size() -> usize {
 
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
 pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
 pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
@@ -347,6 +348,230 @@ pub fn canonical_tier_mutation_rpc_response_body(
         body.extend_from_slice(error_info);
     }
     Ok(body)
+}
+
+/// Builds the stable byte representation authenticated for a scanner activity request.
+pub fn canonical_scanner_activity_request_body(
+    request: &proto_gen::node_service::ScannerActivityRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-request-v1\0";
+
+    let challenge = request.challenge.as_ref();
+    let acknowledge_instance_id = request.acknowledge_instance_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + acknowledge_instance_id.len() + 4 + 8 * 3);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&request.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(acknowledge_instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(acknowledge_instance_id);
+    body.extend_from_slice(&request.acknowledge_dirty_usage_generation.to_be_bytes());
+    Ok(body)
+}
+
+/// Builds the protocol-v4 byte representation authenticated for a scanner activity response.
+pub fn canonical_scanner_activity_v4_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v1\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 5 + 1);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    Ok(body)
+}
+
+/// Builds the stable byte representation authenticated for a scanner activity response.
+pub fn canonical_scanner_activity_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v2\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 6 + 2);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    Ok(body)
+}
+
+#[cfg(test)]
+mod scanner_activity_tests {
+    use super::{
+        canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
+        canonical_scanner_activity_v4_response_body,
+        proto_gen::node_service::{ScannerActivityRequest, ScannerActivityResponse},
+    };
+
+    #[test]
+    fn canonical_scanner_activity_request_binds_every_field() {
+        let request = ScannerActivityRequest {
+            challenge: vec![1; 16].into(),
+            protocol_version: 5,
+            acknowledge_instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            acknowledge_dirty_usage_generation: 11,
+        };
+        let baseline = canonical_scanner_activity_request_body(&request).expect("scanner activity request should encode");
+
+        let variants = [
+            ScannerActivityRequest {
+                challenge: vec![2; 16].into(),
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                protocol_version: 4,
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                acknowledge_instance_id: "1123456789abcdef0123456789abcdef".to_string(),
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                acknowledge_dirty_usage_generation: 12,
+                ..request
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_request_body(&variant).expect("scanner activity request variant should encode")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_scanner_activity_response_binds_challenge_and_every_status_field() {
+        let response = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: 4,
+            topology_digest: vec![9; 32].into(),
+            data_movement_active: true,
+            response_proof: Vec::new().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+        };
+        let baseline =
+            canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
+
+        let variants = [
+            ScannerActivityResponse {
+                instance_id: "1123456789abcdef0123456789abcdef".to_string(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                namespace_generation: 8,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                maintenance_generation: 4,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                protocol_version: 5,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                topology_digest: vec![8; 32].into(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                data_movement_active: false,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                dirty_usage_generation: 12,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                dirty_usage_pending: false,
+                ..response.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_response_body(&[1; 16], &variant)
+                    .expect("scanner activity response variant should encode")
+            );
+        }
+        assert_ne!(
+            baseline,
+            canonical_scanner_activity_response_body(&[2; 16], &response)
+                .expect("scanner activity response with a different challenge should encode")
+        );
+    }
+
+    #[test]
+    fn scanner_activity_v4_response_canonicalization_ignores_v5_fields() {
+        let response = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: 4,
+            topology_digest: vec![9; 32].into(),
+            data_movement_active: true,
+            response_proof: Vec::new().into(),
+            dirty_usage_generation: 0,
+            dirty_usage_pending: false,
+        };
+        let baseline =
+            canonical_scanner_activity_v4_response_body(&[1; 16], &response).expect("scanner activity v4 response should encode");
+        let expected = [
+            b"rustfs-scanner-activity-response-v1\0".as_slice(),
+            16u64.to_be_bytes().as_slice(),
+            [1u8; 16].as_slice(),
+            32u64.to_be_bytes().as_slice(),
+            b"0123456789abcdef0123456789abcdef".as_slice(),
+            7u64.to_be_bytes().as_slice(),
+            3u64.to_be_bytes().as_slice(),
+            4u32.to_be_bytes().as_slice(),
+            32u64.to_be_bytes().as_slice(),
+            [9u8; 32].as_slice(),
+            [1u8].as_slice(),
+        ]
+        .concat();
+        assert_eq!(
+            baseline, expected,
+            "protocol v4 response bytes must remain stable during rolling upgrades"
+        );
+        let extended = ScannerActivityResponse {
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+            ..response
+        };
+
+        assert_eq!(
+            baseline,
+            canonical_scanner_activity_v4_response_body(&[1; 16], &extended)
+                .expect("scanner activity v4 response should ignore v5 fields")
+        );
+    }
 }
 
 #[cfg(test)]

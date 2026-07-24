@@ -17,7 +17,8 @@ use crate::cluster::rpc::client::{
     node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::internode_data_transport::{
-    InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
+    InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, ReadStreamRequest, WalkDirStreamRequest,
+    WriteStreamRequest,
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
@@ -81,6 +82,7 @@ const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 const REMOTE_DISK_OPEN_READ_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_READ_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+const NS_SCANNER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Base backoff for idempotent read-only RPC retries (grpc-optimization P3-3); doubles per attempt.
 const REMOTE_DISK_READ_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
 const ENV_RUSTFS_METADATA_BATCH_READ: &str = "RUSTFS_METADATA_BATCH_READ";
@@ -96,6 +98,17 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
+
+fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
+    volume_infos
+        .into_iter()
+        .enumerate()
+        .map(|(index, json)| {
+            serde_json::from_str::<VolumeInfo>(&json)
+                .map_err(|err| Error::other(format!("decode list volumes entry {index} failed: {err}")))
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchMetadataRpcMode {
@@ -264,6 +277,71 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let probe = self.data_transport.probe_ns_scanner(NsScannerCapabilityRequest {
+            endpoint: self.endpoint.grid_host(),
+        });
+        let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
+            .await
+            .map_err(|_| DiskError::other("remote namespace scanner capability probe timed out"))?;
+        match result {
+            Ok(server_epoch) => Ok(Some(server_epoch)),
+            // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers and legacy transports lack the authenticated startup-epoch handshake. Remove after every supported peer implements namespace scanner protocol v3.
+            Err(DiskError::MethodNotAllowed) => Ok(None),
+            Err(err)
+                if matches!(
+                    err.internode_http_error_kind(),
+                    Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status))
+                        if matches!(status.as_u16(), 404 | 405)
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err)
+                if matches!(
+                    err.internode_http_error_kind(),
+                    Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)) if status.as_u16() == 426
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) async fn open_ns_scanner_stream(&self, request: crate::disk::NsScannerOpenRequest) -> Result<FileReader> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let crate::disk::NsScannerOpenRequest {
+            request_id,
+            server_epoch,
+            session_id,
+            session_sequence,
+            next_cycle,
+            leader_epoch,
+            body,
+            stall_timeout,
+        } = request;
+        self.data_transport
+            .open_ns_scanner(NsScannerStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk: self.disk_ref().await,
+                request_id,
+                server_epoch,
+                session_id,
+                session_sequence,
+                next_cycle,
+                leader_epoch,
+                body,
+                stall_timeout,
+            })
+            .await
+    }
+
     fn recovery_monitor_span(addr: &str, endpoint: &Endpoint) -> tracing::Span {
         tracing::info_span!(
             "recovery-monitor",
@@ -1336,11 +1414,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let infos = response
-                    .volume_infos
-                    .into_iter()
-                    .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
-                    .collect();
+                let infos = decode_volume_infos(response.volume_infos)?;
 
                 Ok(infos)
             },
@@ -2724,6 +2798,19 @@ mod tests {
     static INIT: Once = Once::new();
 
     #[test]
+    fn list_volumes_decode_rejects_a_malformed_entry() {
+        let valid = serde_json::to_string(&VolumeInfo {
+            name: "bucket".to_string(),
+            created: None,
+        })
+        .expect("volume info should serialize");
+        let err = decode_volume_infos(vec![valid, "{".to_string()])
+            .expect_err("a malformed volume entry must fail the complete response");
+
+        assert!(err.to_string().contains("entry 1"));
+    }
+
+    #[test]
     fn decoded_remote_metadata_rejects_default_like_delete_marker() {
         let forged = FileInfo {
             deleted: true,
@@ -2795,14 +2882,31 @@ mod tests {
         Read(ReadStreamRequest),
         Write(WriteStreamRequest),
         WalkDir(WalkDirStreamRequest),
+        NsScanner(NsScannerStreamRequest),
+        NsScannerProbe(NsScannerCapabilityRequest),
     }
 
     #[derive(Debug, Clone, Default)]
     struct RecordingInternodeDataTransport {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
+        ns_scanner_probe_status: Arc<StdMutex<Option<u16>>>,
     }
 
     impl RecordingInternodeDataTransport {
+        fn with_ns_scanner_probe_status(status: u16) -> Self {
+            Self {
+                calls: Arc::default(),
+                ns_scanner_probe_status: Arc::new(StdMutex::new(Some(status))),
+            }
+        }
+
+        fn set_ns_scanner_probe_status(&self, status: Option<u16>) {
+            *self
+                .ns_scanner_probe_status
+                .lock()
+                .expect("namespace scanner probe status lock poisoned") = status;
+        }
+
         fn calls(&self) -> Vec<RecordedTransportCall> {
             self.calls.lock().expect("recorded transport calls lock poisoned").clone()
         }
@@ -3247,6 +3351,26 @@ mod tests {
             Ok(Box::new(EmptyTestReader))
         }
 
+        async fn open_ns_scanner(&self, request: NsScannerStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::NsScanner(request));
+            Ok(Box::new(EmptyTestReader))
+        }
+
+        async fn probe_ns_scanner(&self, request: NsScannerCapabilityRequest) -> Result<Uuid> {
+            self.record(RecordedTransportCall::NsScannerProbe(request));
+            if let Some(status) = *self
+                .ns_scanner_probe_status
+                .lock()
+                .expect("namespace scanner probe status lock poisoned")
+            {
+                let status = reqwest::StatusCode::from_u16(status).expect("test status code should be valid");
+                return Err(
+                    rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)).into(),
+                );
+            }
+            Ok(Uuid::from_u128(1))
+        }
+
         fn name(&self) -> &'static str {
             "recording"
         }
@@ -3279,6 +3403,14 @@ mod tests {
             }
         }
 
+        async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
+            panic!("open_ns_scanner should not be used in walk_dir retry test");
+        }
+
+        async fn probe_ns_scanner(&self, _request: NsScannerCapabilityRequest) -> Result<Uuid> {
+            Ok(Uuid::from_u128(1))
+        }
+
         fn name(&self) -> &'static str {
             "retrying-walk-dir"
         }
@@ -3305,6 +3437,14 @@ mod tests {
 
         async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
             panic!("open_walk_dir should not be used in open_write retry test");
+        }
+
+        async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
+            panic!("open_ns_scanner should not be used in open_write retry test");
+        }
+
+        async fn probe_ns_scanner(&self, _request: NsScannerCapabilityRequest) -> Result<Uuid> {
+            Ok(Uuid::from_u128(1))
         }
 
         fn name(&self) -> &'static str {
@@ -3968,6 +4108,139 @@ mod tests {
             }
             other => panic!("expected walk-dir transport call, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+        let expected_body = b"namespace-scanner-request".to_vec();
+        let expected_request_id = Uuid::new_v4();
+        let expected_server_epoch = Uuid::new_v4();
+        let expected_session_id = Uuid::new_v4();
+
+        let _reader = remote_disk
+            .open_ns_scanner_stream(crate::disk::NsScannerOpenRequest {
+                request_id: expected_request_id,
+                server_epoch: expected_server_epoch,
+                session_id: expected_session_id,
+                session_sequence: 3,
+                next_cycle: 7,
+                leader_epoch: 9,
+                body: expected_body.clone(),
+                stall_timeout: Some(Duration::from_secs(15)),
+            })
+            .await
+            .expect("namespace scanner stream should open");
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::NsScanner(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.request_id, expected_request_id);
+                assert_eq!(request.server_epoch, expected_server_epoch);
+                assert_eq!(request.session_id, expected_session_id);
+                assert_eq!(request.session_sequence, 3);
+                assert_eq!(request.next_cycle, 7);
+                assert_eq!(request.leader_epoch, 9);
+                assert_eq!(request.body, expected_body);
+                assert_eq!(request.stall_timeout, Some(Duration::from_secs(15)));
+            }
+            other => panic!("expected namespace scanner transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("namespace scanner capability probe should succeed"),
+            Some(Uuid::from_u128(1))
+        );
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::NsScannerProbe(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+            }
+            other => panic!("expected namespace scanner capability probe, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_rejects_old_and_incompatible_peers() {
+        for status in [404, 405, 426] {
+            let transport = RecordingInternodeDataTransport::with_ns_scanner_probe_status(status);
+            let remote_disk = new_remote_disk_with_transport(Arc::new(transport)).await;
+
+            assert_eq!(
+                remote_disk
+                    .ns_scanner_server_epoch()
+                    .await
+                    .expect("unsupported namespace scanner response should be classified"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_rejects_legacy_transport() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RetryingOpenReadInternodeDataTransport::default())).await;
+
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("legacy transport should be classified as unsupported"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_reprobes_after_peer_upgrade() {
+        let transport = RecordingInternodeDataTransport::with_ns_scanner_probe_status(404);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("old peer should be classified as unsupported"),
+            None
+        );
+        transport.set_ns_scanner_probe_status(None);
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("upgraded peer should be re-probed"),
+            Some(Uuid::from_u128(1))
+        );
+        assert_eq!(transport.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_propagates_transient_failure() {
+        let transport = RecordingInternodeDataTransport::with_ns_scanner_probe_status(503);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport)).await;
+
+        let err = remote_disk
+            .ns_scanner_server_epoch()
+            .await
+            .expect_err("transient capability failure must not be reported as unsupported");
+        assert!(matches!(
+            err.internode_http_error_kind(),
+            Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)) if status.as_u16() == 503
+        ));
     }
 
     #[tokio::test]

@@ -410,9 +410,12 @@ pub(crate) async fn read_admin_config_without_migrate(api: Arc<ECStore>) -> Resu
     ecstore_config::com::read_config_without_migrate(api).await
 }
 
+#[cfg(test)]
 pub(crate) async fn read_admin_config_without_migrate_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
     ecstore_config::com::read_config_without_migrate_no_lock(api).await
 }
+
+pub(crate) type AdminServerConfigSnapshot = ecstore_config::com::ServerConfigSnapshot;
 
 pub(crate) async fn save_admin_config(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
     ecstore_config::com::save_config(api, file, data).await
@@ -427,6 +430,7 @@ pub(crate) async fn save_admin_server_config(api: Arc<ECStore>, cfg: &rustfs_con
     ecstore_config::com::save_server_config(api, cfg).await
 }
 
+#[cfg(test)]
 pub(crate) async fn save_admin_server_config_no_lock(
     api: Arc<ECStore>,
     cfg: &rustfs_config::server_config::Config,
@@ -434,6 +438,7 @@ pub(crate) async fn save_admin_server_config_no_lock(
     ecstore_config::com::save_server_config_no_lock(api, cfg).await
 }
 
+#[cfg(test)]
 pub(crate) async fn with_admin_server_config_write_lock<F, Fut, T>(api: Arc<ECStore>, operation: F) -> Result<T>
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -441,6 +446,18 @@ where
     T: Send + 'static,
 {
     ecstore_config::com::with_server_config_write_lock(api, operation).await
+}
+
+pub(crate) async fn read_admin_server_config_snapshot(api: Arc<ECStore>) -> Result<AdminServerConfigSnapshot> {
+    ecstore_config::com::read_server_config_snapshot(api).await
+}
+
+pub(crate) async fn save_admin_server_config_snapshot(
+    api: Arc<ECStore>,
+    cfg: &rustfs_config::server_config::Config,
+    snapshot: &AdminServerConfigSnapshot,
+) -> Result<bool> {
+    ecstore_config::com::save_server_config_snapshot(api, cfg, snapshot).await
 }
 
 pub(crate) fn init_admin_config_defaults() {
@@ -540,13 +557,16 @@ pub(crate) mod cluster {
 }
 
 pub(crate) mod config {
-    #[cfg(test)]
-    pub(crate) use super::save_admin_server_config;
     pub(crate) use super::storageclass;
     pub(crate) use super::{
-        RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config, init_admin_config_defaults, read_admin_config,
-        read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_config,
-        save_admin_server_config_no_lock, with_admin_server_config_write_lock,
+        AdminServerConfigSnapshot, RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config, init_admin_config_defaults,
+        read_admin_config, read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_config,
+        save_admin_server_config_snapshot,
+    };
+    #[cfg(test)]
+    pub(crate) use super::{
+        read_admin_config_without_migrate_no_lock, save_admin_server_config, save_admin_server_config_no_lock,
+        with_admin_server_config_write_lock,
     };
 }
 

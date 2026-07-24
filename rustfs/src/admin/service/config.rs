@@ -37,8 +37,11 @@ use rustfs_targets::config::{
 };
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::future::Future;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use url::Url;
+
+static RUNTIME_CONFIG_RELOAD_MUTEX: AsyncMutex<()> = AsyncMutex::const_new(());
 
 pub fn is_dynamic_config_subsystem(sub_system: &str) -> bool {
     NOTIFY_SUB_SYSTEMS.contains(&sub_system)
@@ -393,6 +396,7 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
 }
 
 pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
+    let _reload_guard = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
     if sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM {
         let store = resolve_runtime_config_store_for_context(context)?;
         let notify_result = reconcile_event_notifier_from_store(store).await;
@@ -414,6 +418,14 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
         warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
         internal_error(format!("failed to load server config: {err}"))
     })?;
+
+    if matches!(sub_system, SCANNER_SUB_SYS | HEAL_SUB_SYS) {
+        validate_server_config_for_context(context, &config, Some(sub_system)).await?;
+        // Scanner cycles refresh from the process-wide server config before
+        // each pass. Publish the same validated snapshot first so that refresh
+        // cannot overwrite this peer's dynamic scanner update with stale data.
+        publish_server_config_for_context(context, config.clone());
+    }
     apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
         .await
         .inspect_err(|_| {
@@ -463,6 +475,7 @@ where
 }
 
 pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppContext>) -> S3Result<()> {
+    let _reload_guard = RUNTIME_CONFIG_RELOAD_MUTEX.lock().await;
     let store = resolve_runtime_config_store_for_context(context)?;
 
     reload_runtime_config_snapshot_with(
@@ -641,13 +654,16 @@ pub async fn signal_config_snapshot_reload_checked() -> S3Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::runtime_sources::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};
+    use crate::admin::runtime_sources::{
+        IamInterface, KmsInterface, NotificationSystemInterface, ServerConfigInterface, StorageClassInterface,
+    };
     use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use crate::admin::storage_api::config::{
         read_admin_config_without_migrate, read_admin_config_without_migrate_no_lock, save_admin_server_config,
         save_admin_server_config_no_lock, with_admin_server_config_write_lock,
     };
     use crate::admin::storage_api::error::StorageError;
+    use crate::admin::storage_api::runtime_sources::NotificationSys;
     use crate::server::{
         ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot, is_event_notifier_reconciled,
         refresh_persisted_module_switches_from, save_persisted_module_switches_to,
@@ -656,7 +672,7 @@ mod tests {
     use crate::storage_api::startup::storage::{init_local_disks_with_instance_ctx, new_instance_ctx};
     use rustfs_config::notify::{ENV_NOTIFY_WEBHOOK_ENABLE, ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_WEBHOOK_SUB_SYS};
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
-    use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
+    use rustfs_config::{ENV_SCANNER_CYCLE, HEAL_SUB_SYS, SCANNER_CYCLE, SCANNER_SUB_SYS};
     use rustfs_config::{MQTT_BROKER, MQTT_QUEUE_DIR, MQTT_TOPIC, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR};
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_kms::KmsServiceManager;
@@ -674,6 +690,36 @@ mod tests {
     const LIFECYCLE_RELOAD_LABEL: &str = "lifecycle";
     const REAL_STORE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     const REPLICATION_RELOAD_LABEL: &str = "replication";
+
+    struct TestNotificationSystemInterface(Arc<NotificationSys>);
+
+    impl NotificationSystemInterface for TestNotificationSystemInterface {
+        fn handle(&self) -> Option<Arc<NotificationSys>> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_scanner_reload_reports_unreachable_peer() {
+        let temp_dir = TempDir::new().expect("scanner reload temp dir");
+        let store = build_isolated_heterogeneous_store(temp_dir.path()).await;
+        let mut notification_system = NotificationSys::new(EndpointServerPools::default()).await;
+        notification_system.peer_clients.push(None);
+        let context = AppContext::new(
+            store,
+            Arc::new(TestIamInterface),
+            Arc::new(TestKmsInterface {
+                manager: Arc::new(KmsServiceManager::new()),
+            }),
+        )
+        .with_test_notification_system_interface(Arc::new(TestNotificationSystemInterface(Arc::new(notification_system))));
+
+        let err = signal_dynamic_config_reload_checked_for_context(Some(&context), SCANNER_SUB_SYS)
+            .await
+            .expect_err("scanner config must not report success when a peer did not reload it");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("1 peer(s) failed dynamic config reload for scanner"));
+    }
 
     fn without_storage_class_env<R>(f: impl FnOnce() -> R) -> R {
         temp_env::with_vars_unset(
@@ -775,6 +821,16 @@ mod tests {
         config
             .0
             .insert(STORAGE_CLASS_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
+        config
+    }
+
+    fn scanner_server_config(cycle: &str) -> ServerConfig {
+        let mut config = ServerConfig::new();
+        let mut kvs = KVS::new();
+        kvs.insert(SCANNER_CYCLE.to_string(), cycle.to_string());
+        config
+            .0
+            .insert(SCANNER_SUB_SYS.to_string(), HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]));
         config
     }
 
@@ -1121,6 +1177,47 @@ mod tests {
                 );
             },
         )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(scanner_env)]
+    async fn peer_scanner_reload_publishes_server_snapshot_used_by_cycle_refresh() {
+        temp_env::async_with_vars([(ENV_SCANNER_CYCLE, None::<&str>)], async {
+            let fixture = runtime_config_reload_fixture().await;
+            let candidate = scanner_server_config("61");
+            save_admin_server_config(fixture.context.object_store(), &candidate)
+                .await
+                .expect("persist scanner config");
+
+            reload_dynamic_config_runtime_state_for_context(Some(&fixture.context), SCANNER_SUB_SYS)
+                .await
+                .expect("scanner peer reload should apply persisted config");
+
+            assert_eq!(fixture.server_set_calls.load(Ordering::SeqCst), 1);
+            let snapshot = fixture
+                .server_snapshot
+                .lock()
+                .expect("server config result lock")
+                .clone()
+                .expect("scanner peer reload should publish a server config snapshot");
+            assert_eq!(
+                snapshot
+                    .get_value(SCANNER_SUB_SYS, DEFAULT_DELIMITER)
+                    .expect("scanner defaults should be present")
+                    .get(SCANNER_CYCLE),
+                "61",
+                "scanner peer reload must keep the process-wide config source current"
+            );
+            let runtime = rustfs_scanner::scanner_runtime_config_status();
+            assert_eq!(runtime.cycle_interval_seconds.value, 61);
+            assert_eq!(
+                runtime.cycle_interval_seconds.source,
+                rustfs_scanner::runtime_config::ScannerRuntimeConfigSource::Config
+            );
+
+            rustfs_scanner::apply_scanner_runtime_config(&ServerConfig::new()).expect("restore scanner runtime defaults");
+        })
         .await;
     }
 
