@@ -2975,19 +2975,15 @@ pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> 
 
 /// Register a new disk in the global path tracker and return two callbacks:
 /// one to update the current path and one to deregister the disk when done.
-pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
+pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
     let tracker = Arc::new(CurrentPathTracker::new(initial.to_string()));
     let disk_name = disk.to_string();
 
-    let tracker_clone = Arc::clone(&tracker);
-    let disk_insert = disk_name.clone();
-    tokio::spawn(async move {
-        global_metrics()
-            .current_paths
-            .write()
-            .await
-            .insert(disk_insert, tracker_clone);
-    });
+    global_metrics()
+        .current_paths
+        .write()
+        .await
+        .insert(disk_name.clone(), Arc::clone(&tracker));
 
     let update_fn: UpdateCurrentPathFn = {
         let tracker = Arc::clone(&tracker);
@@ -3015,23 +3011,28 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 // CloseDiskGuard
 // ---------------------------------------------------------------------------
 
-pub struct CloseDiskGuard(CloseDiskFn);
+pub struct CloseDiskGuard(Option<CloseDiskFn>);
 
 impl CloseDiskGuard {
     pub fn new(close_disk: CloseDiskFn) -> Self {
-        Self(close_disk)
+        Self(Some(close_disk))
     }
 
-    pub async fn close(&self) {
-        self.0().await;
+    pub async fn close(&mut self) {
+        let Some(close_disk) = self.0.clone() else {
+            return;
+        };
+        close_disk().await;
+        self.0 = None;
     }
 }
 
 impl Drop for CloseDiskGuard {
     fn drop(&mut self) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let close_fn = self.0.clone();
-            handle.spawn(async move { close_fn().await });
+        if let Some(close_disk) = self.0.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(close_disk());
         }
         // If there is no runtime we are in a test or shutdown path; skip cleanup.
     }
@@ -3064,6 +3065,36 @@ mod tests {
             .await
             .expect("drop cleanup should run")
             .expect("drop cleanup should signal");
+    }
+
+    #[tokio::test]
+    async fn close_disk_guard_runs_explicit_cleanup_once() {
+        let close_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let close_disk: CloseDiskFn = {
+            let close_count = Arc::clone(&close_count);
+            Arc::new(move || {
+                close_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(std::future::ready(()))
+            })
+        };
+
+        let mut guard = CloseDiskGuard::new(close_disk);
+        guard.close().await;
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert_eq!(close_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn current_path_updater_registers_before_return() {
+        let disk = format!("test-disk-{}", uuid::Uuid::new_v4());
+        let (_update_path, close_disk) = current_path_updater(&disk, "bucket-a").await;
+
+        assert!(global_metrics().current_paths.read().await.contains_key(&disk));
+
+        close_disk().await;
+        assert!(!global_metrics().current_paths.read().await.contains_key(&disk));
     }
 
     #[tokio::test]

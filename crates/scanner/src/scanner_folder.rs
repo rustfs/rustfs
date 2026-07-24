@@ -2772,8 +2772,8 @@ pub async fn scan_data_folder(
     // Get disk path
     let base_path = local_disk.path().to_string_lossy().to_string();
 
-    let (update_current_path, close_disk) = current_path_updater(&base_path, &cache.info.name);
-    let _close_disk_guard = CloseDiskGuard::new(close_disk.clone());
+    let (update_current_path, close_disk) = current_path_updater(&base_path, &cache.info.name).await;
+    let mut close_disk_guard = CloseDiskGuard::new(close_disk);
 
     // Create skip_heal flag
     let is_erasure_mode = scanner_is_erasure().await;
@@ -2852,7 +2852,7 @@ pub async fn scan_data_folder(
                 global_metrics().record_scanner_checkpoint_cleared();
             }
 
-            close_disk().await;
+            close_disk_guard.close().await;
             if unresolved_objects {
                 Err(ScannerError::PartialCache(Box::new(new_cache.clone())))
             } else {
@@ -2881,7 +2881,7 @@ pub async fn scan_data_folder(
                     if root_has_progress {
                         set_scan_checkpoint(new_cache, checkpoint_reason_from_budget(budget.reason()));
                     }
-                    close_disk().await;
+                    close_disk_guard.close().await;
                     return Err(ScannerError::PartialCache(Box::new(new_cache.clone())));
                 }
             }
@@ -2890,10 +2890,10 @@ pub async fn scan_data_folder(
                 partial_cache.info.last_update = Some(SystemTime::now());
                 partial_cache.info.next_cycle = cache.info.next_cycle;
                 partial_cache.info.snapshot_complete = false;
-                close_disk().await;
+                close_disk_guard.close().await;
                 return Err(ScannerError::NamespaceNotFoundCache(Box::new(partial_cache)));
             }
-            close_disk().await;
+            close_disk_guard.close().await;
             // No useful information, return original cache
             Err(e)
         }
@@ -4310,6 +4310,51 @@ mod tests {
             .expect("partial update channel should remain open");
 
         assert!(update.compacted, "partial update should preserve compacted state");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_data_folder_cancelled_before_scan_clears_current_path() {
+        let (scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir),
+        };
+        let parent = CancellationToken::new();
+        parent.cancel();
+        let budget = ScannerCycleBudget::new(&parent, Default::default());
+        let cache = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let disk_path = scanner.local_disk.path().to_string_lossy().to_string();
+
+        let result = scan_data_folder(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk,
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ScannerError::Other(message)) if message == "Operation cancelled"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let report = global_metrics().report().await;
+                if report.active_paths.iter().all(|path| !path.starts_with(&disk_path)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled scan should deregister its active path");
     }
 
     #[tokio::test]
