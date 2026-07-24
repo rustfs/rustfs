@@ -39,6 +39,7 @@ ecstore-serial-flaky = { max-threads = 1 }
 # servers never run at once. ci-7's nightly picks these up via the e2e suite;
 # they are deliberately NOT in the fast PR `e2e-smoke` filter.
 e2e-reliability = { max-threads = 1 }
+e2e-inline-boundaries = { max-threads = 1 }
 
 # --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.overrides]]
@@ -60,6 +61,10 @@ test-group = 'ecstore-serial-flaky'
 [[profile.default.overrides]]
 filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
 test-group = 'e2e-reliability'
+
+[[profile.default.overrides]]
+filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
+test-group = 'e2e-inline-boundaries'
 
 # ---------------------------------------------------------------------------
 # ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
@@ -314,3 +319,7 @@ path = "junit.xml"
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
 test-group = 'e2e-reliability'
+
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
+test-group = 'e2e-inline-boundaries'

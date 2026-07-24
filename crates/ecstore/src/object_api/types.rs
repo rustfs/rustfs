@@ -800,6 +800,60 @@ mod tests {
     use super::*;
     use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
 
+    fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
+        ObjectInfo {
+            size,
+            inlined: true,
+            version_id: versioned.then(|| Uuid::from_u128(1)),
+            parts: Arc::new(vec![ObjectPartInfo::default()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inline_fast_path_eligibility_preserves_exact_versioned_boundaries() {
+        for (case, size, versioned, expected) in [
+            ("unversioned below", 128 * 1024 - 1, false, true),
+            ("unversioned exact", 128 * 1024, false, true),
+            ("unversioned above", 128 * 1024 + 1, false, false),
+            ("versioned below", 16 * 1024 - 1, true, true),
+            ("versioned exact", 16 * 1024, true, true),
+            ("versioned above", 16 * 1024 + 1, true, false),
+        ] {
+            assert_eq!(
+                inline_fast_path_object(size, versioned).is_inline_fast_path_eligible(),
+                expected,
+                "{case}: object_size={size}, versioned={versioned}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_fast_path_eligibility_rejects_incompatible_object_shapes() {
+        let mut object = inline_fast_path_object(ObjectInfo::INLINE_MAX_SIZE, false);
+
+        object.inlined = false;
+        assert!(!object.is_inline_fast_path_eligible(), "non-inline objects must fall back");
+
+        object.inlined = true;
+        object.parts = Arc::new(vec![ObjectPartInfo::default(), ObjectPartInfo::default()]);
+        assert!(!object.is_inline_fast_path_eligible(), "multipart objects must fall back");
+
+        object.parts = Arc::new(vec![ObjectPartInfo::default()]);
+        object.user_defined = Arc::new(HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())]));
+        assert!(!object.is_inline_fast_path_eligible(), "encrypted objects must fall back");
+
+        object.user_defined = Arc::new(HashMap::from([(
+            rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_COMPRESSION),
+            "zstd".to_string(),
+        )]));
+        assert!(!object.is_inline_fast_path_eligible(), "compressed objects must fall back");
+
+        object.user_defined = Arc::default();
+        object.transitioned_object.tier = "remote-tier".to_string();
+        assert!(!object.is_inline_fast_path_eligible(), "transitioned objects must fall back");
+    }
+
     #[test]
     fn versions_after_marker_handles_null_version_marker() {
         let first_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
