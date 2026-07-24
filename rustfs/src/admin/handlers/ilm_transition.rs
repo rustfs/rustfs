@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS: u64 = 10_000;
 const MAX_MANUAL_TRANSITION_OBJECTS: u64 = 100_000;
+const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +47,8 @@ struct ManualTransitionRunQuery {
     dry_run: Option<bool>,
     #[serde(rename = "maxObjects")]
     max_objects: Option<u64>,
+    #[serde(rename = "maxDurationSeconds")]
+    max_duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,7 +66,6 @@ pub fn register_ilm_transition_route(r: &mut S3Router<AdminOperation>) -> std::i
         format!("{ADMIN_PREFIX}/v3/ilm/transition/run").as_str(),
         AdminOperation(&ManualTransitionRunHandler {}),
     )?;
-
     Ok(())
 }
 
@@ -88,6 +90,12 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
     if max_objects == 0 || max_objects > MAX_MANUAL_TRANSITION_OBJECTS {
         return Err(s3_error!(InvalidArgument, "maxObjects is outside the allowed range"));
     }
+    if query
+        .max_duration_seconds
+        .is_some_and(|duration| duration == 0 || duration > MAX_MANUAL_TRANSITION_DURATION_SECONDS)
+    {
+        return Err(s3_error!(InvalidArgument, "maxDurationSeconds is outside the allowed range"));
+    }
 
     Ok((
         bucket.to_string(),
@@ -98,6 +106,7 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
             tier: query.tier.map(|tier| tier.trim().to_string()).filter(|tier| !tier.is_empty()),
             dry_run: query.dry_run.unwrap_or(false),
             max_objects: Some(max_objects),
+            max_duration: query.max_duration_seconds.map(std::time::Duration::from_secs),
         },
     ))
 }
@@ -126,7 +135,7 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
 }
 
 fn response_state(report: &ManualTransitionRunReport) -> &'static str {
-    if report.truncated_by_limit || report.has_partial_enqueue() {
+    if report.was_truncated() || report.has_partial_enqueue() {
         "partial"
     } else {
         "completed"
@@ -187,6 +196,15 @@ mod tests {
         assert_eq!(options.tier.as_deref(), Some("warm"));
         assert!(!options.dry_run);
         assert_eq!(options.max_objects, Some(DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS));
+        assert_eq!(options.max_duration, None);
+    }
+
+    #[test]
+    fn manual_transition_query_accepts_duration_budget() {
+        let (_bucket, options) =
+            parse_manual_transition_query(Some("bucket=data&maxDurationSeconds=30")).expect("valid query should parse");
+
+        assert_eq!(options.max_duration, Some(std::time::Duration::from_secs(30)));
     }
 
     #[test]
@@ -204,9 +222,31 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_query_rejects_invalid_duration_budget() {
+        let err = parse_manual_transition_query(Some("bucket=data&maxDurationSeconds=0")).expect_err("zero budget must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+
+        let err = parse_manual_transition_query(Some("bucket=data&maxDurationSeconds=3601"))
+            .expect_err("budget above the cap must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn manual_transition_response_reports_partial_for_queue_pressure() {
         let report = ManualTransitionRunReport {
             skipped_queue_full: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(response_state(&report), "partial");
+    }
+
+    #[test]
+    fn manual_transition_response_reports_partial_for_duration_budget() {
+        let report = ManualTransitionRunReport {
+            truncated_by_duration: true,
             ..Default::default()
         };
 
