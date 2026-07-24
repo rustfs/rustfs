@@ -26,6 +26,7 @@ script-tests: ## Run shell script tests
 	@echo "Running script tests..."
 	./scripts/test_build_rustfs_options.sh
 	./scripts/test_entrypoint_credentials.sh
+	./scripts/test_internode_grpc_ab_bench.sh
 	./scripts/test_object_batch_bench_enhanced.sh
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	python3 ./scripts/check_object_data_cache_follower_samples.py --self-test
