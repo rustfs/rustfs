@@ -15,7 +15,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use http::{StatusCode, header::RANGE};
 use rustfs_s3select_api::{
-    QueryError,
+    QueryError, S3SelectPolicyError,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
@@ -104,9 +104,12 @@ async fn send_select_events_until_deadline(
         .await
         .is_err()
     {
-        terminal_permit.send(Err(map_query_error_to_s3(QueryError::QueryTimeout {
-            seconds: timeout_seconds,
-        })));
+        terminal_permit.send(Err(map_query_error_to_s3(
+            S3SelectPolicyError::QueryTimeout {
+                seconds: timeout_seconds,
+            }
+            .into(),
+        )));
     }
 }
 
@@ -522,18 +525,22 @@ fn clamp_i64(value: u64) -> i64 {
 }
 
 fn map_query_error_to_s3(err: QueryError) -> S3Error {
+    if let Some(policy_error) = err.s3_select_policy_error() {
+        let message = policy_error.to_string();
+        return match policy_error {
+            S3SelectPolicyError::UnsupportedSqlStructure { .. } => {
+                S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message)
+            }
+            S3SelectPolicyError::QueryConcurrencyLimit => S3Error::with_message(S3ErrorCode::SlowDown, message),
+            S3SelectPolicyError::QueryTimeout { .. } => S3Error::with_message(S3ErrorCode::Busy, message),
+            _ => S3Error::with_message(S3ErrorCode::InternalError, message),
+        };
+    }
     let message = err.to_string();
     match err {
         QueryError::Parser { .. } => parse_select_failure(message),
-        QueryError::MultiStatement { .. } | QueryError::UnsupportedSqlStructure { .. } => {
-            S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message)
-        }
+        QueryError::MultiStatement { .. } => S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message),
         QueryError::NotImplemented { .. } => S3Error::with_message(S3ErrorCode::NotImplemented, message),
-        QueryError::QueryConcurrencyLimit => S3Error::with_message(S3ErrorCode::SlowDown, message),
-        QueryError::QueryTimeout { .. } => S3Error::with_message(S3ErrorCode::Busy, message),
-        QueryError::Datafusion { source } if is_query_timeout(source.as_ref()) => {
-            S3Error::with_message(S3ErrorCode::Busy, message)
-        }
         QueryError::Datafusion { source } if is_resource_exhausted(source.as_ref()) => {
             S3Error::with_message(S3ErrorCode::Busy, message)
         }
@@ -575,12 +582,6 @@ fn is_resource_exhausted(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<DataFusionError>()
         .is_some_and(|err| matches!(err, DataFusionError::ResourcesExhausted(_)))
         || err.source().is_some_and(is_resource_exhausted)
-}
-
-fn is_query_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
-    err.downcast_ref::<QueryError>()
-        .is_some_and(|err| matches!(err, QueryError::QueryTimeout { .. }))
-        || err.source().is_some_and(is_query_timeout)
 }
 
 fn is_unexpected_eof(err: &(dyn std::error::Error + 'static)) -> bool {
@@ -688,13 +689,16 @@ mod tests {
 
     #[test]
     fn map_query_policy_errors_to_s3_errors() {
-        let unsupported = map_query_error_to_s3(QueryError::UnsupportedSqlStructure {
-            message: "JOIN is not supported".to_string(),
-        });
-        let saturated = map_query_error_to_s3(QueryError::QueryConcurrencyLimit);
-        let timed_out = map_query_error_to_s3(QueryError::QueryTimeout { seconds: 300 });
+        let unsupported = map_query_error_to_s3(
+            S3SelectPolicyError::UnsupportedSqlStructure {
+                message: "JOIN is not supported".to_string(),
+            }
+            .into(),
+        );
+        let saturated = map_query_error_to_s3(S3SelectPolicyError::QueryConcurrencyLimit.into());
+        let timed_out = map_query_error_to_s3(S3SelectPolicyError::QueryTimeout { seconds: 300 }.into());
         let stream_timed_out = map_query_error_to_s3(QueryError::Datafusion {
-            source: Box::new(DataFusionError::External(Box::new(QueryError::QueryTimeout { seconds: 300 }))),
+            source: Box::new(DataFusionError::External(Box::new(S3SelectPolicyError::QueryTimeout { seconds: 300 }))),
         });
         let exhausted = map_query_error_to_s3(QueryError::Datafusion {
             source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
@@ -716,9 +720,16 @@ mod tests {
         });
 
         assert_eq!(unsupported.code(), &S3ErrorCode::UnsupportedSqlStructure);
+        assert_eq!(unsupported.message(), Some("Unsupported S3 Select SQL structure: JOIN is not supported"));
         assert_eq!(saturated.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(saturated.message(), Some("S3 Select query concurrency limit reached"));
         assert_eq!(timed_out.code(), &S3ErrorCode::Busy);
+        assert_eq!(timed_out.message(), Some("S3 Select query exceeded the 300-second execution limit"));
         assert_eq!(stream_timed_out.code(), &S3ErrorCode::Busy);
+        assert_eq!(
+            stream_timed_out.message(),
+            Some("S3 Select query exceeded the 300-second execution limit")
+        );
         assert_eq!(exhausted.code(), &S3ErrorCode::Busy);
         assert_eq!(truncated.code(), &S3ErrorCode::InternalError);
         assert_eq!(invalid_object_size.code(), &S3ErrorCode::InternalError);

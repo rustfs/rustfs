@@ -23,7 +23,7 @@ use datafusion::sql::{
     },
 };
 use rustfs_s3select_api::{
-    QueryError, QueryResult,
+    QueryError, QueryResult, S3SelectPolicyError,
     query::{
         ast::ExtStatement,
         logical_planner::{LogicalPlanner, Plan, QueryPlan},
@@ -206,9 +206,10 @@ fn validate_select(select: &Select) -> QueryResult<()> {
 }
 
 fn unsupported_structure(message: &str) -> QueryError {
-    QueryError::UnsupportedSqlStructure {
+    S3SelectPolicyError::UnsupportedSqlStructure {
         message: message.to_string(),
     }
+    .into()
 }
 
 struct SubqueryDetector {
@@ -233,7 +234,7 @@ mod tests {
     use super::validate_s3_select_statement;
     use crate::sql::parser::ExtParser;
     use datafusion::sql::sqlparser::ast::Statement;
-    use rustfs_s3select_api::{QueryError, query::ast::ExtStatement};
+    use rustfs_s3select_api::{S3SelectPolicyError, query::ast::ExtStatement};
 
     fn parse_statement(sql: &str) -> Statement {
         let mut statements = ExtParser::parse_sql(sql).expect("SQL should parse");
@@ -268,7 +269,10 @@ mod tests {
 
         assert!(matches!(
             validate_s3_select_statement(&statement),
-            Err(QueryError::UnsupportedSqlStructure { message }) if message == "JOIN is not supported"
+            Err(ref err) if matches!(
+                err.s3_select_policy_error(),
+                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "JOIN is not supported"
+            )
         ));
     }
 
@@ -278,7 +282,10 @@ mod tests {
 
         assert!(matches!(
             validate_s3_select_statement(&statement),
-            Err(QueryError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
+            Err(ref err) if matches!(
+                err.s3_select_policy_error(),
+                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
+            )
         ));
     }
 
@@ -288,7 +295,10 @@ mod tests {
 
         assert!(matches!(
             validate_s3_select_statement(&statement),
-            Err(QueryError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
+            Err(ref err) if matches!(
+                err.s3_select_policy_error(),
+                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "subqueries are not supported"
+            )
         ));
     }
 
@@ -298,7 +308,10 @@ mod tests {
 
         assert!(matches!(
             validate_s3_select_statement(&statement),
-            Err(QueryError::UnsupportedSqlStructure { message }) if message == "the source must be S3Object"
+            Err(ref err) if matches!(
+                err.s3_select_policy_error(),
+                Some(S3SelectPolicyError::UnsupportedSqlStructure { message }) if message == "the source must be S3Object"
+            )
         ));
     }
 
@@ -311,7 +324,10 @@ mod tests {
         ] {
             let statement = parse_statement(sql);
             assert!(
-                matches!(validate_s3_select_statement(&statement), Err(QueryError::UnsupportedSqlStructure { .. })),
+                matches!(
+                    validate_s3_select_statement(&statement),
+                    Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::UnsupportedSqlStructure { .. }))
+                ),
                 "query should be rejected: {sql}"
             );
         }

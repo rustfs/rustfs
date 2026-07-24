@@ -38,7 +38,7 @@ use datafusion::{
 use futures::Stream;
 use parking_lot::Mutex;
 use rustfs_s3select_api::{
-    QueryError, QueryResult,
+    QueryError, QueryResult, S3SelectPolicyError,
     query::{
         Query,
         ast::ExtStatement,
@@ -209,7 +209,7 @@ impl QueryDispatcher for SimpleQueryDispatcher {
             .query_admission
             .clone()
             .try_acquire_owned()
-            .map_err(|_| QueryError::QueryConcurrencyLimit)?;
+            .map_err(|_| QueryError::from(S3SelectPolicyError::QueryConcurrencyLimit))?;
         let query_tracker = QueryExecutionTracker::new(
             &self.query_execution_owner,
             Arc::new(permit),
@@ -243,8 +243,11 @@ impl SimpleQueryDispatcher {
         future: impl Future<Output = QueryResult<T>>,
     ) -> QueryResult<T> {
         let deadline = query_tracker.deadline();
-        let timeout_error = || QueryError::QueryTimeout {
-            seconds: query_tracker.timeout_seconds(),
+        let timeout_error = || {
+            S3SelectPolicyError::QueryTimeout {
+                seconds: query_tracker.timeout_seconds(),
+            }
+            .into()
         };
         match query_tracker.status() {
             QueryExecutionStatus::TimedOut => {
@@ -291,12 +294,14 @@ impl SimpleQueryDispatcher {
             return QueryError::Cancel;
         }
         match query_tracker.status() {
-            QueryExecutionStatus::TimedOut => QueryError::QueryTimeout {
+            QueryExecutionStatus::TimedOut => S3SelectPolicyError::QueryTimeout {
                 seconds: query_tracker.timeout_seconds(),
-            },
-            QueryExecutionStatus::Active if Instant::now() >= query_tracker.deadline() => QueryError::QueryTimeout {
+            }
+            .into(),
+            QueryExecutionStatus::Active if Instant::now() >= query_tracker.deadline() => S3SelectPolicyError::QueryTimeout {
                 seconds: query_tracker.timeout_seconds(),
-            },
+            }
+            .into(),
             QueryExecutionStatus::Active | QueryExecutionStatus::Finished => QueryError::Cancel,
         }
     }
@@ -583,7 +588,7 @@ impl Stream for TrackedRecordBatchStream {
 }
 
 fn query_timeout_error(timeout_seconds: u64) -> datafusion::common::DataFusionError {
-    datafusion::common::DataFusionError::External(Box::new(QueryError::QueryTimeout {
+    datafusion::common::DataFusionError::External(Box::new(S3SelectPolicyError::QueryTimeout {
         seconds: timeout_seconds,
     }))
 }
@@ -728,7 +733,7 @@ mod tests {
     };
     use futures::{StreamExt, stream};
     use rustfs_s3select_api::{
-        QueryError, QueryResult,
+        QueryError, QueryResult, S3SelectPolicyError,
         query::{
             Context as QueryContext, Query,
             dispatcher::QueryDispatcher,
@@ -759,6 +764,16 @@ mod tests {
         sync::{Barrier, Semaphore},
         time::Instant,
     };
+
+    async fn wait_for_query_timeout(query_tracker: &QueryExecutionTracker) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while query_tracker.status() != QueryExecutionStatus::TimedOut {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("query deadline should expire");
+    }
 
     struct DropSignal(Arc<AtomicBool>);
 
@@ -1022,7 +1037,10 @@ mod tests {
 
         let result = dispatcher.execute_query(&query).await;
 
-        assert!(matches!(result, Err(QueryError::QueryConcurrencyLimit)));
+        assert!(matches!(
+            result,
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryConcurrencyLimit))
+        ));
     }
 
     #[tokio::test]
@@ -1037,7 +1055,10 @@ mod tests {
 
         let result = dispatcher.build_query_state_machine(query).await;
 
-        assert!(matches!(result, Err(QueryError::QueryConcurrencyLimit)));
+        assert!(matches!(
+            result,
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryConcurrencyLimit))
+        ));
     }
 
     #[tokio::test]
@@ -1131,11 +1152,10 @@ mod tests {
             .await
             .expect("dispatcher should enforce its query setup timeout");
 
-        match result {
-            Err(QueryError::QueryTimeout { seconds: 0 }) => {}
-            Err(err) => panic!("unexpected query result: {err:?}"),
-            Ok(_) => panic!("query setup unexpectedly completed"),
-        }
+        assert!(matches!(
+            result,
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 0 }))
+        ));
         assert_eq!(admission.available_permits(), 1);
     }
 
@@ -1164,7 +1184,7 @@ mod tests {
 
         assert!(matches!(
             dispatcher.execute_logical_plan(logical_plan, query_state_machine).await,
-            Err(QueryError::QueryTimeout { seconds: 300 })
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 300 }))
         ));
         assert_eq!(admission.available_permits(), 1);
     }
@@ -1291,12 +1311,17 @@ mod tests {
                 .expect("tracked state machine should accept its bound session"),
         );
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_for_query_timeout(
+            query_state_machine
+                .query_tracker()
+                .expect("tracked query should retain its tracker"),
+        )
+        .await;
 
         assert_eq!(admission.available_permits(), 1);
         assert!(matches!(
             dispatcher.build_logical_plan(query_state_machine).await,
-            Err(QueryError::QueryTimeout { seconds: 1 })
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 1 }))
         ));
     }
 
@@ -1313,7 +1338,7 @@ mod tests {
         assert!(query_tracker.claim_planning(&owner));
         assert!(query_tracker.mark_planned(&owner));
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_for_query_timeout(&query_tracker).await;
 
         assert_eq!(query_tracker.status(), QueryExecutionStatus::TimedOut);
         assert_eq!(admission.available_permits(), 1);
@@ -1331,7 +1356,7 @@ mod tests {
             QueryExecutionTracker::new(&setup_owner, Arc::new(setup_permit), Instant::now() + Duration::from_millis(10), 1);
         let setup_guard = QueryPhaseGuard::new(&setup_tracker, &setup_owner);
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_for_query_timeout(&setup_tracker).await;
 
         assert_eq!(setup_tracker.status(), QueryExecutionStatus::TimedOut);
         assert_eq!(setup_admission.available_permits(), 0);
@@ -1350,7 +1375,7 @@ mod tests {
         assert!(planning_tracker.claim_planning(&planning_owner));
         let planning_guard = QueryPhaseGuard::new(&planning_tracker, &planning_owner);
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_for_query_timeout(&planning_tracker).await;
 
         assert_eq!(planning_tracker.status(), QueryExecutionStatus::TimedOut);
         assert_eq!(planning_admission.available_permits(), 0);
@@ -1397,7 +1422,7 @@ mod tests {
         release_drop_tx.send(()).expect("release result drop");
         assert!(matches!(
             task.await.expect("deadline task should finish"),
-            Err(QueryError::QueryTimeout { seconds: 1 })
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(S3SelectPolicyError::QueryTimeout { seconds: 1 }))
         ));
         assert_eq!(admission.available_permits(), 1);
     }
@@ -1535,8 +1560,8 @@ mod tests {
             panic!("expected external query error");
         };
         assert!(matches!(
-            source.downcast_ref::<QueryError>(),
-            Some(QueryError::QueryTimeout { seconds: 300 })
+            source.downcast_ref::<S3SelectPolicyError>(),
+            Some(S3SelectPolicyError::QueryTimeout { seconds: 300 })
         ));
         assert!(inner_dropped.load(Ordering::SeqCst));
         assert_eq!(admission.available_permits(), 1);
@@ -1674,8 +1699,8 @@ mod tests {
             panic!("expected external query error");
         };
         assert!(matches!(
-            source.downcast_ref::<QueryError>(),
-            Some(QueryError::QueryTimeout { seconds: 300 })
+            source.downcast_ref::<S3SelectPolicyError>(),
+            Some(S3SelectPolicyError::QueryTimeout { seconds: 300 })
         ));
         assert_eq!(admission.available_permits(), 1);
         assert!(output.next().await.is_none());
@@ -1724,8 +1749,8 @@ mod tests {
             panic!("expected external query error");
         };
         assert!(matches!(
-            source.downcast_ref::<QueryError>(),
-            Some(QueryError::QueryTimeout { seconds: 1 })
+            source.downcast_ref::<S3SelectPolicyError>(),
+            Some(S3SelectPolicyError::QueryTimeout { seconds: 1 })
         ));
         assert_eq!(admission.available_permits(), 1);
         assert!(output.next().await.is_none());

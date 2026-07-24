@@ -75,7 +75,11 @@ fn validated_object_size(size: i64) -> Result<u64> {
 /// size limit.
 ///
 /// Default: 128 MiB.  This matches the AWS S3 Select limit for JSON DOCUMENT
-/// inputs.
+/// inputs. The query memory pool also applies: RustFS reserves 64 times the
+/// input size for parsing and output. With the default 64 MiB query memory
+/// limit, JSON DOCUMENT inputs larger than 1 MiB are rejected; raise
+/// `RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES` to process larger inputs, up to this
+/// hard cap.
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 const JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER: usize = 64;
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =

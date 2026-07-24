@@ -42,20 +42,11 @@ pub enum QueryError {
     #[error("Multi-statement not allow, found num:{num}, sql:{sql}")]
     MultiStatement { num: usize, sql: String },
 
-    #[error("Unsupported S3 Select SQL structure: {message}")]
-    UnsupportedSqlStructure { message: String },
-
     #[error("Failed to build QueryDispatcher. err: {err}")]
     BuildQueryDispatcher { err: String },
 
     #[error("The query has been canceled")]
     Cancel,
-
-    #[error("S3 Select query concurrency limit reached")]
-    QueryConcurrencyLimit,
-
-    #[error("S3 Select query exceeded the {seconds}-second execution limit")]
-    QueryTimeout { seconds: u64 },
 
     #[error("{source}")]
     Parser {
@@ -71,6 +62,48 @@ pub enum QueryError {
 
     #[error("Store Error, e:{e}.")]
     StoreError { e: String },
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum S3SelectPolicyError {
+    #[error("Unsupported S3 Select SQL structure: {message}")]
+    UnsupportedSqlStructure { message: String },
+
+    #[error("S3 Select query concurrency limit reached")]
+    QueryConcurrencyLimit,
+
+    #[error("S3 Select query exceeded the {seconds}-second execution limit")]
+    QueryTimeout { seconds: u64 },
+}
+
+impl S3SelectPolicyError {
+    fn from_error<'a>(mut err: &'a (dyn std::error::Error + 'static)) -> Option<&'a Self> {
+        for _ in 0..16 {
+            if let Some(policy_error) = err.downcast_ref::<Self>() {
+                return Some(policy_error);
+            }
+            err = err.source()?;
+        }
+        None
+    }
+}
+
+impl QueryError {
+    pub fn s3_select_policy_error(&self) -> Option<&S3SelectPolicyError> {
+        match self {
+            Self::Datafusion { source } => S3SelectPolicyError::from_error(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<S3SelectPolicyError> for QueryError {
+    fn from(value: S3SelectPolicyError) -> Self {
+        Self::Datafusion {
+            source: Box::new(DataFusionError::External(Box::new(value))),
+        }
+    }
 }
 
 impl From<DataFusionError> for QueryError {
@@ -125,7 +158,7 @@ mod tests {
         };
         assert_eq!(err.to_string(), "Multi-statement not allow, found num:2, sql:SELECT 1; SELECT 2;");
 
-        let err = QueryError::UnsupportedSqlStructure {
+        let err = S3SelectPolicyError::UnsupportedSqlStructure {
             message: "JOIN is not supported".to_string(),
         };
         assert_eq!(err.to_string(), "Unsupported S3 Select SQL structure: JOIN is not supported");
@@ -133,9 +166,12 @@ mod tests {
         let err = QueryError::Cancel;
         assert_eq!(err.to_string(), "The query has been canceled");
 
-        assert_eq!(QueryError::QueryConcurrencyLimit.to_string(), "S3 Select query concurrency limit reached");
         assert_eq!(
-            QueryError::QueryTimeout { seconds: 300 }.to_string(),
+            S3SelectPolicyError::QueryConcurrencyLimit.to_string(),
+            "S3 Select query concurrency limit reached"
+        );
+        assert_eq!(
+            S3SelectPolicyError::QueryTimeout { seconds: 300 }.to_string(),
             "S3 Select query exceeded the 300-second execution limit"
         );
 
@@ -161,6 +197,35 @@ mod tests {
             }
             _ => panic!("Expected Datafusion error"),
         }
+    }
+
+    #[test]
+    fn query_error_variants_remain_source_compatible() {
+        fn exhaustive_match(err: QueryError) {
+            match err {
+                QueryError::Datafusion { .. }
+                | QueryError::NotImplemented { .. }
+                | QueryError::MultiStatement { .. }
+                | QueryError::BuildQueryDispatcher { .. }
+                | QueryError::Cancel
+                | QueryError::Parser { .. }
+                | QueryError::FunctionNotExists { .. }
+                | QueryError::FunctionExists { .. }
+                | QueryError::StoreError { .. } => {}
+            }
+        }
+
+        exhaustive_match(QueryError::Cancel);
+    }
+
+    #[test]
+    fn policy_error_is_recoverable_from_query_error() {
+        let err: QueryError = S3SelectPolicyError::QueryTimeout { seconds: 300 }.into();
+
+        assert!(matches!(
+            err.s3_select_policy_error(),
+            Some(S3SelectPolicyError::QueryTimeout { seconds: 300 })
+        ));
     }
 
     #[test]
