@@ -188,6 +188,9 @@ mod heal_erasure_disk_rebuild_test;
 mod copy_object_metadata_test;
 
 #[cfg(test)]
+mod copy_object_tagging_test;
+
+#[cfg(test)]
 mod copy_object_version_restore_test;
 
 #[cfg(test)]

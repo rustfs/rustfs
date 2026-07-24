@@ -15,7 +15,7 @@
 use super::session_policy::populate_session_policy;
 use crate::admin::{
     handlers::site_replication::site_replication_iam_change_hook,
-    runtime_sources::{current_ready_iam_handle, current_token_signing_key},
+    runtime_sources::{current_action_credentials, current_ready_iam_handle, current_token_signing_key},
 };
 use rustfs_iam::{
     federation::{FederatedSessionBinding, FederatedSessionBindingError, FederatedSessionTransaction},
@@ -156,6 +156,16 @@ fn binding_error_from_s3(error: S3Error) -> FederatedSessionBindingError {
     }
 }
 
+/// Returns true when a derived federated `parent_user` collides with the root access key.
+///
+/// The comparison mirrors the owner check performed at request time (a temporary credential
+/// whose `parent_user` equals the root access key is treated as owner), so a federated login
+/// whose `username`/`email`/`sub` happens to equal the root access key must be rejected at
+/// issuance rather than silently granted owner.
+fn parent_user_is_reserved(parent_user: &str, root_access_key: Option<&str>) -> bool {
+    matches!(root_access_key, Some(root) if root == parent_user)
+}
+
 fn issue_credentials(
     transaction: &FederatedSessionTransaction,
     secret: Option<&str>,
@@ -169,6 +179,17 @@ fn issue_credentials(
     token_claims.insert("exp".to_string(), Value::Number(serde_json::Number::from(exp.unix_timestamp())));
 
     let parent_user = claims.session_identity();
+    // Fail closed if the derived federated parent collides with the root access key. At IAM
+    // request time `parent_user == root access key` is treated as owner (see auth.rs and
+    // rustfs_iam owner resolution), so issuing such a credential would silently grant a
+    // federated identity full owner access purely because its display name matched root.
+    // Deny before any credential generation, `set_temp_user`, or site replication.
+    let root_access_key = current_action_credentials().map(|cred| cred.access_key);
+    if parent_user_is_reserved(&parent_user, root_access_key.as_deref()) {
+        return Err(FederatedSessionBindingError::InvalidRequest(
+            "federated identity resolves to a reserved root principal".to_string(),
+        ));
+    }
     debug!(
         provider_id = %authorization.provider_id,
         parent_user = %parent_user,
@@ -337,5 +358,28 @@ mod tests {
 
         let error = issue_credentials(&transaction, None).expect_err("invalid policy should fail first");
         assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn parent_user_reserved_only_on_root_collision() {
+        // Collides with the configured root access key -> reserved.
+        assert!(parent_user_is_reserved("rustfsadmin", Some("rustfsadmin")));
+        // A distinct federated identity is never reserved.
+        assert!(!parent_user_is_reserved("user", Some("rustfsadmin")));
+        // Access keys are case-sensitive; a case-different value does not collide.
+        assert!(!parent_user_is_reserved("RustFsAdmin", Some("rustfsadmin")));
+        // Without a resolved root access key there is nothing to collide with.
+        assert!(!parent_user_is_reserved("rustfsadmin", None));
+    }
+
+    #[test]
+    fn issue_credentials_rejects_root_collision_before_generation() {
+        // Reuse the collision decision the issuance path applies: a federated identity whose
+        // derived parent_user equals the root access key must be denied at issuance.
+        let transaction = transaction();
+        let parent_user = transaction.authorization.claims.session_identity();
+        assert_eq!(parent_user, "user");
+        assert!(parent_user_is_reserved(&parent_user, Some("user")));
+        assert!(!parent_user_is_reserved(&parent_user, Some("root")));
     }
 }

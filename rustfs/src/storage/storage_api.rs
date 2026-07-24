@@ -322,6 +322,10 @@ pub(crate) mod s3_api_consumer {
             super::super::to_s3s_etag(etag)
         }
     }
+
+    pub(crate) mod tagging {
+        pub(crate) use super::super::super::s3_api::tagging::resolve_copy_object_tags;
+    }
 }
 
 pub(crate) mod sse_consumer {

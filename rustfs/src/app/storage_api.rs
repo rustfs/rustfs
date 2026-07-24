@@ -921,6 +921,10 @@ pub(crate) mod s3_api {
             parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
         };
     }
+
+    pub(crate) mod tagging {
+        pub(crate) use crate::storage::storage_api::s3_api_consumer::tagging::resolve_copy_object_tags;
+    }
 }
 
 pub(crate) mod admin_usecase {
