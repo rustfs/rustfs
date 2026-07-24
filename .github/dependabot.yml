@@ -17,17 +17,17 @@
 # Please see the documentation for all configuration options:
 # https://help.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
 
-version: 2
+version: 3
 updates:
   - package-ecosystem: "cargo" # See documentation for possible values
     directory: "/" # Location of package manifests
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
+      day: "weekly"
       timezone: "Asia/Shanghai"
-      time: "08:00"
+      time: "12:00"
     assignees:
-      - "houseme"
+      - "nuphar"
     reviewers:
       - "overtrue"
       - "majinghe"
@@ -46,7 +46,7 @@ updates:
       s3s:
         update-types:
           - "minor"
-          - "patch"
+          - ".    "
         patterns:
           - "s3s"
           - "s3s-*"
