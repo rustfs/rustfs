@@ -35,6 +35,7 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 #[cfg(test)]
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
+use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::{HashSet, VecDeque};
@@ -412,12 +413,43 @@ fn has_v2_auth_headers(headers: &HeaderMap) -> bool {
     .any(|name| headers.contains_key(*name))
 }
 
+/// Whether the server requires target-bound v2 authentication on every internode gRPC request,
+/// rejecting the legacy constant-target fallback instead of accepting it. Default-off rollout
+/// lever gated on the v1-fallback counter reading zero fleet-wide; see
+/// [`rustfs_config::ENV_INTERNODE_RPC_SIGNATURE_STRICT`] and
+/// <https://github.com/rustfs/backlog/issues/1327>.
+fn internode_rpc_signature_strict() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_SIGNATURE_STRICT,
+        rustfs_config::DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT,
+    )
+}
+
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
 pub fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &HeaderMap) -> std::io::Result<()> {
+    verify_tonic_rpc_signature_with_strictness(audience, path, headers, internode_rpc_signature_strict())
+}
+
+/// [`verify_tonic_rpc_signature`] with the strict gate injected as a parameter, so both rollout
+/// postures are unit-testable without racing on process-global environment variables.
+fn verify_tonic_rpc_signature_with_strictness(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    strict: bool,
+) -> std::io::Result<()> {
     if !has_v2_auth_headers(headers) {
         // RUSTFS_COMPAT_TODO(heal-rpc-auth-v2): accept old peers during rolling upgrades. Remove after the minimum
         // supported RustFS peer version sends v2 authentication on every internode gRPC request.
-        return verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, headers);
+        if strict {
+            return Err(std::io::Error::other("RPC v2 authentication required"));
+        }
+        verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, headers)?;
+        // Count only ACCEPTED legacy-only requests: this counter is the convergence gate that must
+        // read zero fleet-wide across a release window before
+        // `RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT` may be enabled.
+        global_internode_metrics().record_signature_v1_fallback();
+        return Ok(());
     }
 
     let path = path
@@ -1111,12 +1143,99 @@ mod tests {
         assert_eq!(error.to_string(), "Invalid RPC v2 signature");
     }
 
+    // The `rpc_v1_fallback_counter` serial group covers every test that drives (or asserts on) the
+    // process-global v1-fallback counter, so exact-delta assertions cannot race with each other.
     #[test]
+    #[serial_test::serial(rpc_v1_fallback_counter)]
     fn legacy_tonic_signature_remains_accepted_during_rolling_upgrade() {
         ensure_test_rpc_secret();
         let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
 
         assert!(verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/Ping", &headers).is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial(rpc_v1_fallback_counter)]
+    fn accepted_legacy_fallback_increments_v1_fallback_counter() {
+        ensure_test_rpc_secret();
+        let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
+        let before = global_internode_metrics().snapshot().signature_v1_fallback_total;
+
+        assert!(
+            verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &headers, false)
+                .is_ok(),
+            "a legacy-only peer must keep authenticating while the strict gate is off"
+        );
+
+        let after = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        assert_eq!(
+            after,
+            before + 1,
+            "an accepted legacy-only request must increment the v1 fallback counter exactly once"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rpc_v1_fallback_counter)]
+    fn rejected_legacy_fallback_does_not_count_as_v1_fallback() {
+        ensure_test_rpc_secret();
+        // Legacy-shaped headers with a forged signature: the fallback path runs but must reject,
+        // and a rejected request is not a rollout-convergence signal.
+        let mut headers = HeaderMap::new();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        headers.insert(SIGNATURE_HEADER, HeaderValue::from_static("not-a-real-signature"));
+        headers.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&now.to_string()).unwrap());
+        let before = global_internode_metrics().snapshot().signature_v1_fallback_total;
+
+        assert!(
+            verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &headers, false)
+                .is_err(),
+            "a forged legacy signature must still be rejected"
+        );
+
+        let after = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        assert_eq!(after, before, "a rejected legacy request must not count as an accepted fallback");
+    }
+
+    #[test]
+    #[serial_test::serial(rpc_v1_fallback_counter)]
+    fn strict_gate_rejects_legacy_only_auth_but_keeps_v2() {
+        ensure_test_rpc_secret();
+        let legacy = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
+        let before = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        let error = verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &legacy, true)
+            .expect_err("strict mode must reject legacy-only authentication");
+        assert_eq!(error.to_string(), "RPC v2 authentication required");
+
+        let v2 = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "Ping", None)
+            .expect("tonic auth headers should build");
+        assert!(
+            verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &v2, true).is_ok(),
+            "strict mode must keep accepting v2-authenticated peers"
+        );
+        let after = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        assert_eq!(after, before, "neither a strict rejection nor a v2 acceptance is a legacy fallback");
+    }
+
+    #[test]
+    #[serial_test::serial(rpc_v1_fallback_counter)]
+    fn strict_gate_default_posture_is_fail_open_legacy_accept() {
+        ensure_test_rpc_secret();
+        // The public entry point resolves strictness from the environment, whose compile-time
+        // default is pinned to false in `rustfs_config`. A legacy-only peer therefore keeps
+        // authenticating through the default build with no configuration at all.
+        assert!(!rustfs_config::DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT);
+        let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
+        assert!(
+            verify_tonic_rpc_signature_with_strictness(
+                "node-a:9000",
+                "/node_service.NodeService/Ping",
+                &headers,
+                rustfs_config::DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT,
+            )
+            .is_ok(),
+            "the default strict posture must accept legacy-only peers"
+        );
     }
 
     #[test]
