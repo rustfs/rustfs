@@ -160,7 +160,7 @@ use s3s::dto::{
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
     SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption, StorageClass,
-    StreamingBlob, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
+    StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
@@ -5736,6 +5736,8 @@ impl DefaultObjectUsecase {
             copy_source_sse_customer_key_md5,
             metadata_directive,
             metadata,
+            tagging,
+            tagging_directive,
             copy_source_if_match,
             copy_source_if_none_match,
             content_type,
@@ -5787,7 +5789,13 @@ impl DefaultObjectUsecase {
         // when an explicit storage class change is requested, or when restoring a specific historical
         // version onto the current key (source carries a versionId). Reject only a true no-op self-copy
         // where none of these apply (issue #4238).
+        let replacement_tags = super::storage_api::object_usecase::s3_api::tagging::resolve_copy_object_tags(
+            tagging.as_deref(),
+            tagging_directive.as_ref(),
+        )?;
+
         if metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE)
+            && tagging_directive.as_ref().map(TaggingDirective::as_str) != Some(TaggingDirective::REPLACE)
             && storage_class.is_none()
             && version_id.is_none()
             && src_bucket == bucket
@@ -5940,6 +5948,7 @@ impl DefaultObjectUsecase {
 
         // Extract user_defined from Arc for mutation; it will be re-wrapped after all edits.
         let mut user_defined = (*src_info.user_defined).clone();
+        let effective_tags = replacement_tags.unwrap_or_else(|| (*src_info.user_tags).clone());
 
         strip_managed_encryption_metadata(&mut user_defined);
 
@@ -5982,6 +5991,12 @@ impl DefaultObjectUsecase {
                 user_defined.insert("content-type".to_string(), ct);
             }
         }
+
+        user_defined.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_OBJECT_TAGGING));
+        if !effective_tags.is_empty() {
+            user_defined.insert(AMZ_OBJECT_TAGGING.to_string(), effective_tags.clone());
+        }
+        src_info.user_tags = Arc::new(effective_tags);
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
         remove_object_lock_metadata_for_copy(&mut user_defined);
