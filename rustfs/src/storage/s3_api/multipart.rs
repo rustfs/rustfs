@@ -164,6 +164,8 @@ pub(crate) fn build_list_multipart_uploads_output(
         delimiter: result.delimiter,
         key_marker: result.key_marker,
         upload_id_marker: result.upload_id_marker,
+        next_key_marker: result.next_key_marker,
+        next_upload_id_marker: result.next_upload_id_marker,
         max_uploads: Some(result.max_uploads as i32),
         is_truncated: Some(result.is_truncated),
         uploads: Some(
@@ -285,6 +287,8 @@ mod tests {
             delimiter: Some("/".to_string()),
             key_marker: Some("key-marker".to_string()),
             upload_id_marker: Some("upload-id-marker".to_string()),
+            next_key_marker: Some("next-key-marker".to_string()),
+            next_upload_id_marker: Some("next-upload-id-marker".to_string()),
             max_uploads: 1000,
             is_truncated: true,
             uploads: vec![MultipartInfo {
@@ -307,6 +311,8 @@ mod tests {
         assert_eq!(output.delimiter.as_deref(), Some("/"));
         assert_eq!(output.key_marker.as_deref(), Some("key-marker"));
         assert_eq!(output.upload_id_marker.as_deref(), Some("upload-id-marker"));
+        assert_eq!(output.next_key_marker.as_deref(), Some("next-key-marker"));
+        assert_eq!(output.next_upload_id_marker.as_deref(), Some("next-upload-id-marker"));
         assert_eq!(output.max_uploads, Some(1000));
         assert_eq!(output.is_truncated, Some(true));
 
