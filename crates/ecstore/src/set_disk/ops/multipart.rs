@@ -21,6 +21,7 @@
 //! unchanged; method bodies are moved verbatim and runtime behavior is the same.
 
 use super::super::*;
+use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use crate::crash_inject::{self, CrashPoint};
 use std::future::Future;
 use std::time::Duration;
@@ -435,15 +436,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         //     return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
         // }
 
-        let shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
+        let mut shuffle_disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
         let part_suffix = format!("part.{part_id}");
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
         let result: Result<PartInfo> = async {
-            let erasure = coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
-                .map_err(Error::from)?;
+            let erasure =
+                Arc::new(coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
+                    .map_err(Error::from)?);
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
             let mut writers = Vec::with_capacity(shuffle_disks.len());
@@ -527,16 +529,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let (reader, w_size) = match write_path {
                 SmallWritePath::SingleBlockNonInline => {
-                    Arc::new(erasure)
+                    Arc::clone(&erasure)
                         .encode_single_block_non_inline(stream, &mut writers, write_quorum)
                         .await?
                 }
                 SmallWritePath::PipelineBatchedLarge => {
-                    Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await?
+                    Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await?
                 }
-                SmallWritePath::Inline | SmallWritePath::Pipeline => {
-                    Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
-                }
+                SmallWritePath::Inline | SmallWritePath::Pipeline => Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await?,
             };
 
             if let Some(stage_start) = encode_stage_start {
@@ -565,6 +565,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     "put_object_part write size < data.size(), w_size={}, data.size={}",
                     w_size,
                     data.size()
+                )))?;
+            }
+
+            let committed_shards = drop_failed_writer_disks(&mut shuffle_disks, &writers);
+            if committed_shards < write_quorum {
+                Err(Error::other(format!(
+                    "put_object_part write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
                 )))?;
             }
 
@@ -607,6 +614,28 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             drop(writers); // drop writers to close all files
 
+            if fi.erasure.parity_blocks == 0 {
+                let written_size = i64::try_from(w_size).map_err(|_| Error::other("put_object_part written size overflows i64"))?;
+                let logical_shard_size = usize::try_from(erasure.shard_file_size(written_size))
+                    .map_err(|_| Error::other("put_object_part shard size overflows usize"))?;
+                verify_written_bitrot_shards(
+                    &shuffle_disks,
+                    None,
+                    BitrotSelfVerifyTarget {
+                        operation: "put_object_part",
+                        bucket,
+                        object,
+                        part_number: Some(part_id),
+                        volume: RUSTFS_META_TMP_BUCKET,
+                        path: &tmp_part_path,
+                        logical_shard_size,
+                        shard_size: erasure.shard_size(),
+                        write_quorum,
+                    },
+                )
+                .await?;
+            }
+
             let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
 
             // Serialize only the commit (rename_part), not the whole upload. Each
@@ -645,7 +674,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let _ = self
                 .rename_part(
-                    &disks,
+                    &shuffle_disks,
                     RUSTFS_META_TMP_BUCKET,
                     &tmp_part_path,
                     RUSTFS_META_MULTIPART_BUCKET,
