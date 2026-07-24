@@ -196,6 +196,9 @@ mod copy_object_version_restore_test;
 #[cfg(test)]
 mod copy_object_checksum_test;
 
+#[cfg(test)]
+mod multipart_storage_class_test;
+
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;

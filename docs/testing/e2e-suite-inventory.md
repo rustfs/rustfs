@@ -61,6 +61,7 @@
 | list_objects_v2_pagination_test | 12 | ✅ |
 | mc_mirror_small_bucket_test | 1 |  |
 | multipart_auth_test | 109 |  |
+| multipart_storage_class_test | 3 | ✅ |
 | namespace_lock_quorum_test | 2 |  |
 | negative_sigv4_test | 6 | ✅ |
 | notification_webhook_test | 2 | ✅ |
@@ -84,4 +85,4 @@
 
 `notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
 
-**Total listed: 472 tests across 64 modules · PR smoke subset: 119 tests / 29 modules** (27 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-24.
+**Total listed: 475 tests across 65 modules · PR smoke subset: 122 tests / 30 modules** (28 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-24.
