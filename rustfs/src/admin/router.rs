@@ -197,18 +197,86 @@ struct ReplicationResetStatusTarget {
     error: Option<String>,
 }
 
+const REPLICATION_CHECK_PROBE_PREFIX: &str = ".rustfs.sys/replication-check/";
+const REPLICATION_CHECK_ERROR_MAX_BYTES: usize = 512;
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReplicationCheckResponse {
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "ActiveMutation")]
+    active_mutation: bool,
+    #[serde(rename = "MutationDescription")]
+    mutation_description: &'static str,
+    #[serde(rename = "ProbeNamespace")]
+    probe_namespace: &'static str,
+    #[serde(rename = "Targets")]
+    targets: Vec<ReplicationCheckTargetStatus>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationCheckTargetStatus {
     #[serde(rename = "Arn")]
     arn: String,
-    #[serde(rename = "Endpoint")]
-    endpoint: String,
     #[serde(rename = "Bucket")]
     bucket: String,
     #[serde(rename = "Status")]
     status: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(rename = "Phases")]
+    phases: ReplicationCheckPhases,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationCheckPhases {
+    #[serde(rename = "Bucket")]
+    bucket: ReplicationCheckPhaseStatus,
+    #[serde(rename = "Versioning")]
+    versioning: ReplicationCheckPhaseStatus,
+    #[serde(rename = "ObjectLock")]
+    object_lock: ReplicationCheckPhaseStatus,
+    #[serde(rename = "Put")]
+    put: ReplicationCheckPhaseStatus,
+    #[serde(rename = "DeleteMarker")]
+    delete_marker: ReplicationCheckPhaseStatus,
+    #[serde(rename = "VersionDelete")]
+    version_delete: ReplicationCheckPhaseStatus,
+    #[serde(rename = "Cleanup")]
+    cleanup: ReplicationCheckPhaseStatus,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReplicationCheckPhaseStatus {
+    #[serde(rename = "Status")]
+    status: &'static str,
+    #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl Default for ReplicationCheckPhaseStatus {
+    fn default() -> Self {
+        Self {
+            status: "SKIPPED",
+            error: None,
+        }
+    }
+}
+
+impl ReplicationCheckPhaseStatus {
+    fn passed() -> Self {
+        Self {
+            status: "OK",
+            error: None,
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: "FAILED",
+            error: Some(bound_replication_check_error(error.into())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1727,19 +1795,38 @@ fn build_replication_reset_status_response(
 
 fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatus>) -> S3Result<S3Response<Body>> {
     targets.sort_by(|left, right| left.arn.cmp(&right.arn));
+    let status = if targets.iter().all(|target| target.status == "OK") {
+        "OK"
+    } else {
+        "FAILED"
+    };
+    let data = serde_json::to_vec(&ReplicationCheckResponse {
+        status: status.to_string(),
+        active_mutation: true,
+        mutation_description: "Writes a probe object, creates a delete marker, deletes the probe version, and cleans up all probe artifacts on each target.",
+        probe_namespace: REPLICATION_CHECK_PROBE_PREFIX,
+        targets,
+    })
+    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+    let mut response = S3Response::with_status(Body::from(data), StatusCode::OK);
+    response
+        .headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
+}
 
-    if let Some(target) = targets.into_iter().find(|target| target.status != "OK") {
-        let detail = target.error.unwrap_or_else(|| target.status.to_lowercase());
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication check failed for target {} (bucket {}): {}",
-            target.arn,
-            target.bucket,
-            detail
-        ));
+fn bound_replication_check_error(mut error: String) -> String {
+    error = error.replace(['\r', '\n'], " ");
+    if error.len() <= REPLICATION_CHECK_ERROR_MAX_BYTES {
+        return error;
     }
-
-    Ok(S3Response::with_status(Body::empty(), StatusCode::OK))
+    let mut end = REPLICATION_CHECK_ERROR_MAX_BYTES.saturating_sub(3);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    error.truncate(end);
+    error.push_str("...");
+    error
 }
 
 fn format_replication_check_client_error(err: &S3ClientError, context: ReplicationCheckFailureContext) -> String {
@@ -1769,12 +1856,15 @@ fn format_replication_check_client_error(err: &S3ClientError, context: Replicati
         ReplicationCheckFailureContext::ObjectLockCheck => "target object lock check failed",
     };
 
-    match (err.code.as_deref(), err.message.as_deref()) {
-        (Some("NoSuchBucket" | "NotFound"), _) => format!("{context}: target bucket does not exist"),
-        (Some(code), Some(message)) if !message.is_empty() => format!("{context}: {code}: {message}"),
-        (Some(code), _) => format!("{context}: {code}"),
-        (None, Some(message)) if !message.is_empty() => format!("{context}: {message}"),
-        _ => format!("{context}: {}", err.error),
+    // Remote messages and transport errors may echo a signed URL, credentials, or
+    // endpoint user-info. Only expose the structured S3 code, which is sufficient
+    // for operators and safe to return to an untrusted caller.
+    match err.code.as_deref() {
+        Some("NoSuchBucket" | "NotFound") => format!("{context}: target bucket does not exist"),
+        Some(code) if code.chars().all(|ch| ch.is_ascii_alphanumeric()) => {
+            bound_replication_check_error(format!("{context}: {code}"))
+        }
+        _ => format!("{context}: remote request failed"),
     }
 }
 
@@ -1839,113 +1929,246 @@ fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::R
         .collect()
 }
 
-async fn check_replication_target(bucket: &str, target: &BucketTarget) -> ReplicationCheckTargetStatus {
+async fn check_replication_target(
+    bucket: &str,
+    target: &BucketTarget,
+    source_requires_object_lock: bool,
+) -> ReplicationCheckTargetStatus {
     let mut result = ReplicationCheckTargetStatus {
         arn: target.arn.clone(),
-        endpoint: target.endpoint.clone(),
         bucket: target.target_bucket.clone(),
         status: "OK".to_string(),
         error: None,
+        phases: ReplicationCheckPhases::default(),
     };
 
     if target.target_bucket == bucket
         && !target.deployment_id.is_empty()
         && current_deployment_id().as_deref() == Some(target.deployment_id.as_str())
     {
-        result.status = "FAILED".to_string();
-        result.error = Some("target bucket must not match source bucket on the same deployment".to_string());
+        fail_replication_check_target(&mut result, "target bucket must not match source bucket on the same deployment");
         return result;
     }
 
     let target_client = match resolve_replication_target_client(bucket, target).await {
         Ok(client) => client,
-        Err(err) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(err);
+        Err(_) => {
+            fail_replication_check_target(&mut result, "target client initialization failed");
             return result;
         }
     };
 
-    match target_client.bucket_exists(&target.target_bucket).await {
-        Ok(true) => {}
-        Ok(false) => {
-            result.status = "FAILED".to_string();
-            result.error = Some("target bucket does not exist".to_string());
-            return result;
-        }
+    match target_client.client.head_bucket().bucket(&target.target_bucket).send().await {
+        Ok(_) => result.phases.bucket = ReplicationCheckPhaseStatus::passed(),
         Err(err) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck));
+            let err = S3ClientError::from(err);
+            let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
+            result.phases.bucket = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(&mut result, error);
             return result;
         }
     }
 
     match target_client.get_bucket_versioning(&target.target_bucket).await {
-        Ok(Some(_)) => {}
+        Ok(Some(_)) => result.phases.versioning = ReplicationCheckPhaseStatus::passed(),
         Ok(None) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(format!("target bucket {} is not versioned", target.target_bucket));
+            let error = "target bucket is not versioned";
+            result.phases.versioning = ReplicationCheckPhaseStatus::failed(error);
+            fail_replication_check_target(&mut result, error);
             return result;
         }
         Err(err) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(format_replication_check_client_error(
-                &err,
-                ReplicationCheckFailureContext::VersioningCheck,
-            ));
+            let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::VersioningCheck);
+            result.phases.versioning = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(&mut result, error);
             return result;
         }
     }
 
-    let probe_key = format!(".rustfs-replication-check-{}", Uuid::new_v4());
-    let (probe_version_id, probe_time) =
-        match put_replication_probe_object(&target_client, &target.target_bucket, &probe_key).await {
-            Ok(output) => output,
-            Err(err) => {
-                result.status = "FAILED".to_string();
-                result.error = Some(format_replication_check_client_error(
-                    &err,
-                    ReplicationCheckFailureContext::ReplicateObject,
-                ));
+    if source_requires_object_lock {
+        match target_client_object_lock_enabled_with_client(&target_client, &target.target_bucket).await {
+            Ok(true) => result.phases.object_lock = ReplicationCheckPhaseStatus::passed(),
+            Ok(false) => {
+                let error = "target bucket is not object lock enabled";
+                result.phases.object_lock = ReplicationCheckPhaseStatus::failed(error);
+                fail_replication_check_target(&mut result, error);
                 return result;
             }
-        };
-
-    if let Err(err) = delete_replication_probe_object(
-        &target_client,
-        &target.target_bucket,
-        &probe_key,
-        probe_version_id.as_deref(),
-        build_replication_probe_remove_options(probe_time, true),
-    )
-    .await
-    {
-        result.status = "FAILED".to_string();
-        result.error = Some(format_replication_check_client_error(
-            &err,
-            ReplicationCheckFailureContext::ReplicateDeleteMarker,
-        ));
-        return result;
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ObjectLockCheck);
+                result.phases.object_lock = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(&mut result, error);
+                return result;
+            }
+        }
+    } else {
+        result.phases.object_lock = ReplicationCheckPhaseStatus::passed();
     }
 
-    if let Err(err) = delete_replication_probe_object(
-        &target_client,
-        &target.target_bucket,
-        &probe_key,
-        probe_version_id.as_deref(),
-        build_replication_probe_remove_options(probe_time, false),
-    )
-    .await
-    {
-        result.status = "FAILED".to_string();
-        result.error = Some(format_replication_check_client_error(
-            &err,
-            ReplicationCheckFailureContext::DeleteObjectVersion,
-        ));
-        return result;
-    }
-
+    let probe_key = match allocate_replication_probe_key(&target_client, &target.target_bucket).await {
+        Ok(key) => key,
+        Err(error) => {
+            result.phases.put = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(&mut result, error);
+            return result;
+        }
+    };
+    let mut operations = RemoteReplicationProbeOperations {
+        client: &target_client,
+        bucket: &target.target_bucket,
+        key: &probe_key,
+        time: OffsetDateTime::now_utc(),
+    };
+    execute_replication_probe(&mut result, &mut operations).await;
     result
+}
+
+fn fail_replication_check_target(result: &mut ReplicationCheckTargetStatus, error: impl Into<String>) {
+    result.status = "FAILED".to_string();
+    if result.error.is_none() {
+        result.error = Some(bound_replication_check_error(error.into()));
+    }
+}
+
+#[async_trait::async_trait]
+trait ReplicationProbeOperations {
+    async fn put(&mut self) -> Result<Option<String>, S3ClientError>;
+    async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError>;
+    async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError>;
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String>;
+}
+
+struct RemoteReplicationProbeOperations<'a> {
+    client: &'a TargetClient,
+    bucket: &'a str,
+    key: &'a str,
+    time: OffsetDateTime,
+}
+
+#[async_trait::async_trait]
+impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
+    async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+        put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
+    }
+
+    async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
+        delete_replication_probe_object(
+            self.client,
+            self.bucket,
+            self.key,
+            version_id,
+            build_replication_probe_remove_options(self.time, true),
+        )
+        .await
+    }
+
+    async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError> {
+        delete_replication_probe_object(
+            self.client,
+            self.bucket,
+            self.key,
+            version_id,
+            build_replication_probe_remove_options(self.time, false),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+        cleanup_replication_probe(self.client, self.bucket, self.key, known_version_ids).await
+    }
+}
+
+async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, operations: &mut impl ReplicationProbeOperations) {
+    let mut probe_version_id = None;
+    let mut delete_marker_version_id = None;
+    let mut cleanup_required = true;
+
+    match operations.put().await {
+        Ok(version_id) => {
+            probe_version_id = version_id;
+            result.phases.put = ReplicationCheckPhaseStatus::passed();
+        }
+        Err(err) => {
+            let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+            result.phases.put = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(result, error);
+            // The conditional PUT cannot have created an artifact when the
+            // target reports a collision with a concurrently-created key.
+            cleanup_required = err.code.as_deref() != Some("PreconditionFailed");
+        }
+    }
+
+    if result.phases.put.status == "OK" {
+        match operations.create_delete_marker(probe_version_id.as_deref()).await {
+            Ok(version_id) => {
+                delete_marker_version_id = version_id;
+                result.phases.delete_marker = ReplicationCheckPhaseStatus::passed();
+            }
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateDeleteMarker);
+                result.phases.delete_marker = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, error);
+            }
+        }
+
+        match operations.delete_version(probe_version_id.as_deref()).await {
+            Ok(()) => result.phases.version_delete = ReplicationCheckPhaseStatus::passed(),
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::DeleteObjectVersion);
+                result.phases.version_delete = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, error);
+            }
+        }
+    }
+
+    if cleanup_required {
+        match operations
+            .cleanup([probe_version_id.as_deref(), delete_marker_version_id.as_deref()])
+            .await
+        {
+            Ok(()) => result.phases.cleanup = ReplicationCheckPhaseStatus::passed(),
+            Err(error) => {
+                result.phases.cleanup = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, format!("probe cleanup failed: {error}"));
+            }
+        }
+    } else {
+        result.phases.cleanup = ReplicationCheckPhaseStatus::passed();
+    }
+}
+
+fn new_replication_probe_key() -> String {
+    format!("{REPLICATION_CHECK_PROBE_PREFIX}{}/{}", Uuid::new_v4(), Uuid::new_v4())
+}
+
+async fn allocate_replication_probe_key(target_client: &TargetClient, target_bucket: &str) -> Result<String, String> {
+    for _ in 0..4 {
+        let probe_key = new_replication_probe_key();
+        let output = target_client
+            .client
+            .list_object_versions()
+            .bucket(target_bucket)
+            .prefix(&probe_key)
+            .max_keys(2)
+            .send()
+            .await
+            .map_err(|err| {
+                format_replication_check_client_error(&S3ClientError::from(err), ReplicationCheckFailureContext::ReplicateObject)
+            })?;
+        let occupied = output
+            .versions()
+            .iter()
+            .any(|version| version.key() == Some(probe_key.as_str()))
+            || output
+                .delete_markers()
+                .iter()
+                .any(|marker| marker.key() == Some(probe_key.as_str()));
+        if !occupied {
+            return Ok(probe_key);
+        }
+    }
+    Err("could not allocate a collision-free replication probe key".to_string())
 }
 
 async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) -> Result<Arc<TargetClient>, String> {
@@ -1990,8 +2213,8 @@ async fn put_replication_probe_object(
     target_client: &TargetClient,
     target_bucket: &str,
     probe_key: &str,
-) -> Result<(Option<String>, OffsetDateTime), S3ClientError> {
-    let now = OffsetDateTime::now_utc();
+    now: OffsetDateTime,
+) -> Result<Option<String>, S3ClientError> {
     let options = build_replication_probe_put_options(now);
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &options.internal.source_version_id);
@@ -2012,6 +2235,7 @@ async fn put_replication_probe_object(
         .put_object()
         .bucket(target_bucket)
         .key(probe_key)
+        .if_none_match("*")
         .content_length(8)
         .body(AwsByteStream::from_static(b"aaaaaaaa"))
         .customize()
@@ -2023,7 +2247,7 @@ async fn put_replication_probe_object(
         })
         .send()
         .await
-        .map(|output| (output.version_id().map(ToOwned::to_owned), now))
+        .map(|output| output.version_id().map(ToOwned::to_owned))
         .map_err(S3ClientError::from)
 }
 
@@ -2033,7 +2257,7 @@ async fn delete_replication_probe_object(
     probe_key: &str,
     version_id: Option<&str>,
     options: RemoveObjectOptions,
-) -> Result<(), S3ClientError> {
+) -> Result<Option<String>, S3ClientError> {
     let mut headers = HeaderMap::new();
     if options.replication_delete_marker {
         insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
@@ -2067,8 +2291,110 @@ async fn delete_replication_probe_object(
         })
         .send()
         .await
+        .map(|output| output.version_id().map(ToOwned::to_owned))
+        .map_err(S3ClientError::from)
+}
+
+async fn delete_replication_probe_version(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    version_id: &str,
+) -> Result<(), S3ClientError> {
+    target_client
+        .client
+        .delete_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .version_id(version_id)
+        .send()
+        .await
         .map(|_| ())
         .map_err(S3ClientError::from)
+}
+
+async fn cleanup_replication_probe<'a>(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    known_version_ids: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let mut deleted_ids = HashSet::new();
+    for version_id in known_version_ids.into_iter().flatten() {
+        if deleted_ids.insert(version_id.to_string())
+            && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, version_id).await
+        {
+            errors.push(format_replication_check_client_error(
+                &err,
+                ReplicationCheckFailureContext::DeleteObjectVersion,
+            ));
+        }
+    }
+
+    let mut key_marker = None;
+    let mut version_id_marker = None;
+    loop {
+        let output = target_client
+            .client
+            .list_object_versions()
+            .bucket(target_bucket)
+            .prefix(probe_key)
+            .set_key_marker(key_marker.clone())
+            .set_version_id_marker(version_id_marker.clone())
+            .send()
+            .await
+            .map_err(|err| {
+                format_replication_check_client_error(
+                    &S3ClientError::from(err),
+                    ReplicationCheckFailureContext::DeleteObjectVersion,
+                )
+            })?;
+
+        let mut discovered_ids = Vec::new();
+        discovered_ids.extend(
+            output
+                .versions()
+                .iter()
+                .filter(|version| version.key() == Some(probe_key))
+                .filter_map(|version| version.version_id().map(ToOwned::to_owned)),
+        );
+        discovered_ids.extend(
+            output
+                .delete_markers()
+                .iter()
+                .filter(|marker| marker.key() == Some(probe_key))
+                .filter_map(|marker| marker.version_id().map(ToOwned::to_owned)),
+        );
+        for version_id in discovered_ids {
+            if deleted_ids.insert(version_id.clone())
+                && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, &version_id).await
+            {
+                errors.push(format_replication_check_client_error(
+                    &err,
+                    ReplicationCheckFailureContext::DeleteObjectVersion,
+                ));
+            }
+        }
+
+        if output.is_truncated() != Some(true) {
+            break;
+        }
+        let next_key_marker = output.next_key_marker().map(ToOwned::to_owned);
+        let next_version_id_marker = output.next_version_id_marker().map(ToOwned::to_owned);
+        if next_key_marker.is_none() || next_key_marker == key_marker {
+            errors.push("target returned an invalid cleanup pagination marker".to_string());
+            break;
+        }
+        key_marker = next_key_marker;
+        version_id_marker = next_version_id_marker;
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(bound_replication_check_error(errors.join("; ")))
+    }
 }
 
 async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
@@ -2105,39 +2431,20 @@ async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
 
     let mut statuses = Vec::with_capacity(replication_targets.len());
     for target in &replication_targets {
-        let mut status = check_replication_target(bucket, target).await;
-        if status.status == "OK" && source_requires_object_lock {
-            let target_lock_enabled = match target_client_object_lock_enabled(bucket, target).await {
-                Ok(enabled) => enabled,
-                Err(err) => {
-                    status.status = "FAILED".to_string();
-                    status.error = Some(format_replication_check_client_error(
-                        &err,
-                        ReplicationCheckFailureContext::ObjectLockCheck,
-                    ));
-                    false
-                }
-            };
-            if status.status == "OK" && !target_lock_enabled {
-                status.status = "FAILED".to_string();
-                status.error = Some(format!("target bucket {} is not object lock enabled", target.target_bucket));
-            }
-        }
-        statuses.push(status);
+        statuses.push(check_replication_target(bucket, target, source_requires_object_lock).await);
     }
 
     build_replication_check_response(statuses)
 }
 
-async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) -> Result<bool, S3ClientError> {
-    let target_client = resolve_replication_target_client(bucket, target)
-        .await
-        .map_err(S3ClientError::new)?;
-
+async fn target_client_object_lock_enabled_with_client(
+    target_client: &TargetClient,
+    target_bucket: &str,
+) -> Result<bool, S3ClientError> {
     match target_client
         .client
         .get_object_lock_configuration()
-        .bucket(&target.target_bucket)
+        .bucket(target_bucket)
         .send()
         .await
     {
@@ -2995,54 +3302,185 @@ mod tests {
         assert_eq!(payload["Targets"][0]["Error"], "boom");
     }
 
+    fn replication_check_target(arn: &str, status: &str, error: Option<&str>) -> ReplicationCheckTargetStatus {
+        ReplicationCheckTargetStatus {
+            arn: arn.to_string(),
+            bucket: format!("bucket-{arn}"),
+            status: status.to_string(),
+            error: error.map(ToOwned::to_owned),
+            phases: ReplicationCheckPhases::default(),
+        }
+    }
+
+    #[derive(Default)]
+    struct ScriptedReplicationProbe {
+        put_error: Option<&'static str>,
+        delete_marker_error: Option<&'static str>,
+        version_delete_error: Option<&'static str>,
+        cleanup_error: Option<&'static str>,
+        calls: Vec<&'static str>,
+        cleanup_ids: Vec<Option<String>>,
+    }
+
+    fn scripted_probe_error(code: &str) -> S3ClientError {
+        S3ClientError::with_metadata(
+            format!("{code}: secret remote detail"),
+            None,
+            Some(code.to_string()),
+            Some("secret remote detail".to_string()),
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicationProbeOperations for ScriptedReplicationProbe {
+        async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+            self.calls.push("put");
+            match self.put_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(Some("object-version".to_string())),
+            }
+        }
+
+        async fn create_delete_marker(&mut self, _version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
+            self.calls.push("delete-marker");
+            match self.delete_marker_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(Some("marker-version".to_string())),
+            }
+        }
+
+        async fn delete_version(&mut self, _version_id: Option<&str>) -> Result<(), S3ClientError> {
+            self.calls.push("version-delete");
+            match self.version_delete_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(()),
+            }
+        }
+
+        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+            self.calls.push("cleanup");
+            self.cleanup_ids = known_version_ids
+                .into_iter()
+                .map(|version_id| version_id.map(ToOwned::to_owned))
+                .collect();
+            match self.cleanup_error {
+                Some(error) => Err(error.to_string()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_probe_attempts_cleanup_after_ambiguous_put_failure() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            put_error: Some("InternalError"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "cleanup"]);
+        assert_eq!(result.status, "FAILED");
+        assert_eq!(result.phases.put.status, "FAILED");
+        assert_eq!(result.phases.delete_marker.status, "SKIPPED");
+        assert_eq!(result.phases.version_delete.status, "SKIPPED");
+        assert_eq!(result.phases.cleanup.status, "OK");
+    }
+
+    #[tokio::test]
+    async fn replication_probe_continues_version_delete_and_cleanup_after_marker_failure() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            delete_marker_error: Some("AccessDenied"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(operations.cleanup_ids, [Some("object-version".to_string()), None]);
+        assert_eq!(result.phases.delete_marker.status, "FAILED");
+        assert_eq!(result.phases.version_delete.status, "OK");
+        assert_eq!(result.phases.cleanup.status, "OK");
+    }
+
+    #[tokio::test]
+    async fn replication_probe_reports_version_delete_and_cleanup_failures_separately() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            version_delete_error: Some("AccessDenied"),
+            cleanup_error: Some("cleanup unavailable"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(
+            operations.cleanup_ids,
+            [Some("object-version".to_string()), Some("marker-version".to_string())]
+        );
+        assert_eq!(result.phases.version_delete.status, "FAILED");
+        assert_eq!(result.phases.cleanup.status, "FAILED");
+        assert_eq!(result.phases.cleanup.error.as_deref(), Some("cleanup unavailable"));
+        assert!(
+            result.error.as_deref().unwrap_or_default().contains("permissions missing"),
+            "the first mutation failure remains the target summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_probe_does_not_clean_up_a_conditional_collision() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            put_error: Some("PreconditionFailed"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put"]);
+        assert_eq!(result.phases.put.status, "FAILED");
+        assert_eq!(result.phases.cleanup.status, "OK");
+    }
+
     #[test]
-    fn build_replication_check_response_returns_empty_body_on_success() {
+    fn build_replication_check_response_documents_active_mutations() {
         let response = build_replication_check_response(vec![
-            ReplicationCheckTargetStatus {
-                arn: "arn:a".to_string(),
-                endpoint: "remote-a:9000".to_string(),
-                bucket: "bucket-a".to_string(),
-                status: "OK".to_string(),
-                error: None,
-            },
-            ReplicationCheckTargetStatus {
-                arn: "arn:z".to_string(),
-                endpoint: "remote-z:9000".to_string(),
-                bucket: "bucket-z".to_string(),
-                status: "OK".to_string(),
-                error: None,
-            },
+            replication_check_target("arn:a", "OK", None),
+            replication_check_target("arn:z", "OK", None),
         ])
         .expect("response should build");
 
         let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
             .expect("body should read")
             .to_bytes();
-        assert!(bytes.is_empty());
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+        assert_eq!(payload["Status"], "OK");
+        assert_eq!(payload["ActiveMutation"], true);
+        assert_eq!(payload["ProbeNamespace"], REPLICATION_CHECK_PROBE_PREFIX);
+        assert!(payload["MutationDescription"].as_str().unwrap_or_default().contains("Writes"));
+        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
     }
 
     #[test]
-    fn build_replication_check_response_surfaces_first_failure() {
-        let err = build_replication_check_response(vec![
-            ReplicationCheckTargetStatus {
-                arn: "arn:z".to_string(),
-                endpoint: "remote-z:9000".to_string(),
-                bucket: "bucket-z".to_string(),
-                status: "FAILED".to_string(),
-                error: Some("boom".to_string()),
-            },
-            ReplicationCheckTargetStatus {
-                arn: "arn:a".to_string(),
-                endpoint: "remote-a:9000".to_string(),
-                bucket: "bucket-a".to_string(),
-                status: "OK".to_string(),
-                error: None,
-            },
+    fn build_replication_check_response_preserves_partial_target_results() {
+        let response = build_replication_check_response(vec![
+            replication_check_target("arn:z", "FAILED", Some("boom")),
+            replication_check_target("arn:a", "OK", None),
         ])
-        .expect_err("failed target should surface as request error");
+        .expect("partial result should remain structured");
 
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
-        assert!(err.message().unwrap_or_default().contains("arn:z"));
+        let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
+            .expect("body should read")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+        assert_eq!(payload["Status"], "FAILED");
+        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
+        assert_eq!(payload["Targets"][0]["Status"], "OK");
+        assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
+        assert_eq!(payload["Targets"][1]["Error"], "boom");
     }
 
     #[test]
@@ -3070,7 +3508,7 @@ mod tests {
     }
 
     #[test]
-    fn format_replication_check_client_error_uses_remote_code_and_message() {
+    fn format_replication_check_client_error_excludes_remote_message() {
         let err = S3ClientError::with_metadata(
             "InvalidRequest: bucket versioning is suspended",
             None,
@@ -3079,10 +3517,50 @@ mod tests {
         );
 
         let formatted = format_replication_check_client_error(&err, ReplicationCheckFailureContext::VersioningCheck);
+        assert_eq!(formatted, "target bucket versioning check failed: InvalidRequest");
+        assert!(!formatted.contains("suspended"));
+    }
+
+    #[test]
+    fn replication_check_error_is_single_line_and_bounded() {
+        let error = format!("first\nsecond {}", "é".repeat(REPLICATION_CHECK_ERROR_MAX_BYTES));
+        let bounded = bound_replication_check_error(error);
+
+        assert!(bounded.len() <= REPLICATION_CHECK_ERROR_MAX_BYTES);
+        assert!(!bounded.contains('\n'));
+        assert!(bounded.ends_with("..."));
+    }
+
+    #[test]
+    fn replication_probe_keys_use_reserved_high_entropy_namespace() {
+        let first = new_replication_probe_key();
+        let second = new_replication_probe_key();
+
+        assert!(first.starts_with(REPLICATION_CHECK_PROBE_PREFIX));
         assert_eq!(
-            formatted,
-            "target bucket versioning check failed: InvalidRequest: bucket versioning is suspended"
+            first
+                .strip_prefix(REPLICATION_CHECK_PROBE_PREFIX)
+                .expect("prefix should exist")
+                .split('/')
+                .count(),
+            2
         );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn replication_check_unknown_transport_error_does_not_expose_secrets() {
+        let err = S3ClientError::with_metadata(
+            "https://ACCESS:SECRET@example.test/?X-Amz-Signature=signature",
+            None,
+            None,
+            Some("Authorization: Bearer token".to_string()),
+        );
+
+        let formatted = format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
+        assert_eq!(formatted, "target bucket check failed: remote request failed");
+        assert!(!formatted.contains("SECRET"));
+        assert!(!formatted.contains("token"));
     }
 
     #[test]
