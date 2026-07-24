@@ -25,14 +25,22 @@ use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_utils::{
+    MaskedAccessKey,
+    http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
+};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS: u64 = 10_000;
 const MAX_MANUAL_TRANSITION_OBJECTS: u64 = 100_000;
 const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_ILM_TRANSITION: &str = "ilm_transition";
+const EVENT_ADMIN_ILM_TRANSITION_STATE: &str = "admin_ilm_transition_state";
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -111,10 +119,102 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
     ))
 }
 
-async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<()> {
+fn admin_request_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .or_else(|| headers.get(AMZ_REQUEST_ID))
+        .and_then(|value| value.to_str().ok())
+}
+
+fn admin_remote_addr(req: &S3Request<Body>) -> Option<String> {
+    req.extensions
+        .get::<Option<RemoteAddr>>()
+        .and_then(|opt| opt.map(|addr| addr.0.to_string()))
+}
+
+fn log_manual_transition_rejected(reason: &str, request_id: &str, actor: &str, remote_addr: &str) {
+    warn!(
+        event = EVENT_ADMIN_ILM_TRANSITION_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_ILM_TRANSITION,
+        operation = "manual_transition_run",
+        result = "rejected",
+        reason,
+        request_id = %request_id,
+        actor = %actor,
+        remote_addr = %remote_addr,
+        "admin manual ILM transition request rejected"
+    );
+}
+
+fn log_manual_transition_failed(reason: &str, request_id: &str, actor: &str, remote_addr: &str, err: &dyn std::fmt::Display) {
+    error!(
+        event = EVENT_ADMIN_ILM_TRANSITION_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_ILM_TRANSITION,
+        operation = "manual_transition_run",
+        result = "failed",
+        reason,
+        request_id = %request_id,
+        actor = %actor,
+        remote_addr = %remote_addr,
+        error = %err,
+        "admin manual ILM transition request failed"
+    );
+}
+
+fn log_manual_transition_completed(
+    state: &str,
+    request_id: &str,
+    actor: &str,
+    remote_addr: &str,
+    max_objects: Option<u64>,
+    max_duration_seconds: Option<u64>,
+    report: &ManualTransitionRunReport,
+) {
+    info!(
+        event = EVENT_ADMIN_ILM_TRANSITION_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_ILM_TRANSITION,
+        operation = "manual_transition_run",
+        result = "success",
+        state,
+        mode = "enqueue_only",
+        request_id = %request_id,
+        actor = %actor,
+        remote_addr = %remote_addr,
+        bucket = %report.bucket,
+        prefix = %report.prefix,
+        tier = report.tier.as_deref().unwrap_or_default(),
+        dry_run = report.dry_run,
+        max_objects = max_objects.unwrap_or_default(),
+        max_duration_seconds = max_duration_seconds.unwrap_or_default(),
+        lifecycle_config_found = report.lifecycle_config_found,
+        scanned = report.scanned,
+        eligible = report.eligible,
+        enqueued = report.enqueued,
+        dry_run_eligible = report.dry_run_eligible,
+        skipped_not_transition = report.skipped_not_transition,
+        skipped_tier = report.skipped_tier,
+        skipped_delete_marker = report.skipped_delete_marker,
+        skipped_directory = report.skipped_directory,
+        skipped_replication = report.skipped_replication,
+        skipped_already_transitioned = report.skipped_already_transitioned,
+        skipped_already_in_flight = report.skipped_already_in_flight,
+        skipped_queue_full = report.skipped_queue_full,
+        skipped_queue_closed = report.skipped_queue_closed,
+        skipped_queue_timeout = report.skipped_queue_timeout,
+        truncated_by_limit = report.truncated_by_limit,
+        truncated_by_duration = report.truncated_by_duration,
+        "admin manual ILM transition request completed"
+    );
+}
+
+async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
+    let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
     let (cred, owner) =
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
@@ -131,7 +231,9 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
         vec![Action::AdminAction(AdminAction::SetTierAction)],
         remote_addr,
     )
-    .await
+    .await?;
+
+    Ok(actor)
 }
 
 fn response_state(report: &ManualTransitionRunReport) -> &'static str {
@@ -158,17 +260,37 @@ pub struct ManualTransitionRunHandler {}
 #[async_trait::async_trait]
 impl Operation for ManualTransitionRunHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_manual_transition_request(&req).await?;
-        let (bucket, options) = parse_manual_transition_query(req.uri.query())?;
+        let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
+        let remote_addr = admin_remote_addr(&req).unwrap_or_default();
+        let actor = authorize_manual_transition_request(&req).await?;
+        let (bucket, options) = match parse_manual_transition_query(req.uri.query()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                log_manual_transition_rejected("invalid_query_parameters", &request_id, &actor, &remote_addr);
+                return Err(err);
+            }
+        };
         let Some(store) = object_store_from_extensions(&req.extensions) else {
+            log_manual_transition_rejected("object_store_not_initialized", &request_id, &actor, &remote_addr);
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
+        let max_objects = options.max_objects;
+        let max_duration_seconds = options.max_duration.map(|duration| duration.as_secs());
 
-        let report = enqueue_transition_for_existing_objects_scoped(store, &bucket, options)
-            .await
-            .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("manual transition run failed: {err}")))?;
+        let report = match enqueue_transition_for_existing_objects_scoped(store, &bucket, options).await {
+            Ok(report) => report,
+            Err(err) => {
+                log_manual_transition_failed("enqueue_failed", &request_id, &actor, &remote_addr, &err);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("manual transition run failed: {err}"),
+                ));
+            }
+        };
+        let state = response_state(&report);
+        log_manual_transition_completed(state, &request_id, &actor, &remote_addr, max_objects, max_duration_seconds, &report);
         let response = ManualTransitionRunResponse {
-            state: response_state(&report),
+            state,
             mode: "enqueue_only",
             job_id: None,
             status_endpoint: None,
@@ -281,6 +403,29 @@ mod tests {
 
         assert!(auth_block.contains("AdminAction::SetTierAction"));
         assert!(!auth_block.contains("AdminAction::ServerInfoAdminAction"));
+    }
+
+    #[test]
+    fn manual_transition_logs_masked_actor_and_aggregate_counters() {
+        let src = include_str!("ilm_transition.rs");
+        let auth_block = extract_block_between_markers(src, "async fn authorize_manual_transition_request", "fn response_state");
+        let log_block = extract_block_between_markers(
+            src,
+            "fn log_manual_transition_completed",
+            "async fn authorize_manual_transition_request",
+        );
+
+        assert!(auth_block.contains("MaskedAccessKey"));
+        assert!(log_block.contains("EVENT_ADMIN_ILM_TRANSITION_STATE"));
+        assert!(log_block.contains("request_id"));
+        assert!(log_block.contains("remote_addr"));
+        assert!(log_block.contains("scanned"));
+        assert!(log_block.contains("eligible"));
+        assert!(log_block.contains("enqueued"));
+        assert!(log_block.contains("skipped_already_transitioned"));
+        assert!(log_block.contains("skipped_queue_full"));
+        assert!(!log_block.contains("next_marker"));
+        assert!(!log_block.contains("next_version_idmarker"));
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
