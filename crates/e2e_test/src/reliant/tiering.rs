@@ -345,6 +345,7 @@ struct ManualTransitionRunReport {
     skipped_queue_closed: u64,
     skipped_queue_timeout: u64,
     truncated_by_limit: bool,
+    truncated_by_duration: bool,
 }
 
 async fn manual_transition_run(
@@ -590,6 +591,7 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(due.report.skipped_directory, 0);
     assert_eq!(due.report.skipped_replication, 0);
     assert!(!due.report.truncated_by_limit);
+    assert!(!due.report.truncated_by_duration);
     wait_for_transition(&hot_client, MANUAL_DUE_BUCKET, MANUAL_DUE_KEY, StdDuration::from_secs(90)).await?;
     let remote_count_after_due = cold_tier_object_count(&cold_client).await?;
 
@@ -615,6 +617,7 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(dry.report.dry_run_eligible, 1, "dry-run report: {:#?}", dry.report);
     assert_eq!(dry.report.enqueued, 0, "dry-run report: {:#?}", dry.report);
     assert_eq!(dry.report.skipped_not_transition, 1, "dry-run report: {:#?}", dry.report);
+    assert!(!dry.report.truncated_by_duration);
     assert_eq!(
         cold_tier_object_count(&cold_client).await?,
         before_dry_run_remote_count,
@@ -639,6 +642,7 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(not_due.report.skipped_queue_full, 0);
     assert_eq!(not_due.report.skipped_queue_closed, 0);
     assert_eq!(not_due.report.skipped_queue_timeout, 0);
+    assert!(!not_due.report.truncated_by_duration);
     assert_remains_not_transitioned(&hot_client, MANUAL_NOT_DUE_BUCKET, MANUAL_NOT_DUE_KEY, StdDuration::from_secs(2)).await?;
 
     Ok(())
