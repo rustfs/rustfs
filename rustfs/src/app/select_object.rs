@@ -578,20 +578,40 @@ fn looks_like_bucket_not_found(message: &str) -> bool {
     message.contains("NoSuchBucket") || message.contains("bucket not found") || message.contains("BucketNotFound")
 }
 
+const MAX_ERROR_SOURCE_DEPTH: usize = 16;
+
+fn error_chain_any(
+    mut err: &(dyn std::error::Error + 'static),
+    predicate: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    for _ in 0..MAX_ERROR_SOURCE_DEPTH {
+        if predicate(err) {
+            return true;
+        }
+        let Some(source) = err.source() else {
+            return false;
+        };
+        err = source;
+    }
+    false
+}
+
 fn is_resource_exhausted(err: &(dyn std::error::Error + 'static)) -> bool {
-    err.downcast_ref::<DataFusionError>()
-        .is_some_and(|err| matches!(err, DataFusionError::ResourcesExhausted(_)))
-        || err.source().is_some_and(is_resource_exhausted)
+    error_chain_any(err, |err| {
+        err.downcast_ref::<DataFusionError>()
+            .is_some_and(|err| matches!(err, DataFusionError::ResourcesExhausted(_)))
+    })
 }
 
 fn is_unexpected_eof(err: &(dyn std::error::Error + 'static)) -> bool {
-    err.downcast_ref::<std::io::Error>()
-        .is_some_and(|err| err.kind() == std::io::ErrorKind::UnexpectedEof)
-        || err.source().is_some_and(is_unexpected_eof)
+    error_chain_any(err, |err| {
+        err.downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::UnexpectedEof)
+    })
 }
 
 fn is_invalid_object_size(err: &(dyn std::error::Error + 'static)) -> bool {
-    err.downcast_ref::<std::num::TryFromIntError>().is_some() || err.source().is_some_and(is_invalid_object_size)
+    error_chain_any(err, |err| err.downcast_ref::<std::num::TryFromIntError>().is_some())
 }
 
 fn looks_like_object_not_found(message: &str) -> bool {
@@ -627,6 +647,21 @@ mod tests {
     };
     use http::HeaderMap;
     use s3s::dto::{CSVInput, ParquetInput, ScanRange};
+
+    #[derive(Debug)]
+    struct CyclicError;
+
+    impl std::fmt::Display for CyclicError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("cyclic error")
+        }
+    }
+
+    impl std::error::Error for CyclicError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self)
+        }
+    }
 
     fn base_input() -> SelectObjectContentInput {
         SelectObjectContentInput {
@@ -733,6 +768,15 @@ mod tests {
         assert_eq!(exhausted.code(), &S3ErrorCode::Busy);
         assert_eq!(truncated.code(), &S3ErrorCode::InternalError);
         assert_eq!(invalid_object_size.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn error_source_matching_stops_at_the_depth_bound() {
+        let err = CyclicError;
+
+        assert!(!is_resource_exhausted(&err));
+        assert!(!is_unexpected_eof(&err));
+        assert!(!is_invalid_object_size(&err));
     }
 
     #[tokio::test(start_paused = true)]

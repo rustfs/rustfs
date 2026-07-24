@@ -294,15 +294,6 @@ impl SessionCtxFactory {
             .await
     }
 
-    pub async fn create_session_ctx_with_tracker(
-        &self,
-        context: &Context,
-        query_tracker: QueryExecutionTracker,
-    ) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_with_tracker_and_memory_limit(context, query_tracker, DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES)
-            .await
-    }
-
     pub async fn create_session_ctx_with_tracker_and_memory_limit(
         &self,
         context: &Context,

@@ -1302,7 +1302,11 @@ mod tests {
             1,
         );
         let session = SessionCtxFactory::new(true)
-            .create_session_ctx_with_tracker(query.context(), query_tracker.clone())
+            .create_session_ctx_with_tracker_and_memory_limit(
+                query.context(),
+                query_tracker.clone(),
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
             .await
             .expect("tracked test session should be available");
         assert!(query_tracker.mark_admitted(&dispatcher.query_execution_owner));
@@ -1514,7 +1518,11 @@ mod tests {
         assert_eq!(forged_tracker.status(), QueryExecutionStatus::Active);
         assert_eq!(admission.available_permits(), 0);
         let session = SessionCtxFactory::new(true)
-            .create_session_ctx_with_tracker(query.context(), forged_tracker.clone())
+            .create_session_ctx_with_tracker_and_memory_limit(
+                query.context(),
+                forged_tracker.clone(),
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
             .await
             .expect("tracked test session should be available");
         let query_state_machine = Arc::new(
