@@ -69,6 +69,8 @@ const SOURCE_BUCKET: &str = "ilm7-hot";
 const MANUAL_DUE_BUCKET: &str = "ilm7-manual-due";
 const MANUAL_DRY_RUN_BUCKET: &str = "ilm7-manual-dry-run";
 const MANUAL_NOT_DUE_BUCKET: &str = "ilm7-manual-not-due";
+const MANUAL_QUEUE_PRESSURE_BUCKET: &str = "ilm7-manual-queue-pressure";
+const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
 const MANUAL_DRY_RUN_KEY: &str = "manual-dry-run/report.bin";
@@ -281,12 +283,12 @@ async fn put_multipart_object(client: &Client, bucket: &str, key: &str, data: &[
     Ok(())
 }
 
-async fn put_single_part_object(client: &Client, bucket: &str, key: &str, body: &'static [u8]) -> TestResult {
+async fn put_single_part_object(client: &Client, bucket: &str, key: &str, body: &[u8]) -> TestResult {
     client
         .put_object()
         .bucket(bucket)
         .key(key)
-        .body(ByteStream::from_static(body))
+        .body(ByteStream::from(body.to_vec()))
         .send()
         .await?;
     Ok(())
@@ -354,11 +356,22 @@ async fn manual_transition_run(
     prefix: &str,
     dry_run: bool,
 ) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
+    manual_transition_run_with_max_objects(hot, bucket, prefix, dry_run, 10).await
+}
+
+async fn manual_transition_run_with_max_objects(
+    hot: &RustFSTestEnvironment,
+    bucket: &str,
+    prefix: &str,
+    dry_run: bool,
+    max_objects: u64,
+) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
     let bucket = urlencoding::encode(bucket);
     let prefix = urlencoding::encode(prefix);
     let tier = urlencoding::encode(TIER_NAME);
-    let path =
-        format!("/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects=10");
+    let path = format!(
+        "/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects={max_objects}"
+    );
     let (status, body) = signed_admin_request(&hot.url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
     if !status.is_success() {
         return Err(format!("manual transition run failed: status={status}, body={body}").into());
@@ -646,4 +659,110 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_remains_not_transitioned(&hot_client, MANUAL_NOT_DUE_BUCKET, MANUAL_NOT_DUE_KEY, StdDuration::from_secs(2)).await?;
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_run_queue_pressure_partial() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualpressurecoldtieradmin".to_string();
+    cold.secret_key = "manualpressurecoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_SCANNER_ENABLED", "false"),
+            ("RUSTFS_SCANNER_CYCLE", "3600"),
+            ("RUSTFS_MAX_TRANSITION_WORKERS", "1"),
+            ("RUSTFS_TRANSITION_QUEUE_CAPACITY", "1"),
+        ],
+    )
+    .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(MANUAL_QUEUE_PRESSURE_BUCKET).send().await?;
+    for idx in 0..20 {
+        let key = format!("{MANUAL_QUEUE_PRESSURE_PREFIX}obj-{idx:02}");
+        let body = vec![0x5a; 1024 * 1024];
+        put_single_part_object(&hot_client, MANUAL_QUEUE_PRESSURE_BUCKET, &key, &body).await?;
+    }
+
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_QUEUE_PRESSURE_BUCKET,
+        "manual-queue-pressure",
+        MANUAL_QUEUE_PRESSURE_PREFIX,
+        0,
+    )
+    .await?;
+
+    let result =
+        manual_transition_run_with_max_objects(&hot, MANUAL_QUEUE_PRESSURE_BUCKET, MANUAL_QUEUE_PRESSURE_PREFIX, false, 20)
+            .await?;
+    assert_eq!(result.state, "partial");
+    assert!(
+        result.report.skipped_queue_full > 0,
+        "queue-pressure partial should record queue full skips: {:#?}",
+        result.report
+    );
+    assert!(
+        !result.report.truncated_by_duration,
+        "queue-pressure partial should be pressure-driven: {:#?}",
+        result.report
+    );
+
+    let remaining = cold_tier_object_count(&cold_client).await?;
+    assert!(
+        remaining < 20,
+        "queue-pressure partial should skip at least one enqueue, remote count should be <20, got {remaining}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_run_async_not_implemented() -> TestResult {
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+
+    let mode_async =
+        manual_transition_run_with_query(&hot, "/rustfs/admin/v3/ilm/transition/run?bucket=manual-async-test&mode=async").await?;
+    let (mode_async_status, mode_async_body) = mode_async;
+    assert_eq!(
+        mode_async_status,
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "mode=async must remain unimplemented"
+    );
+    assert!(
+        mode_async_body.contains("NotImplemented"),
+        "mode=async body must advertise NotImplemented, body: {mode_async_body}"
+    );
+
+    let async_bool =
+        manual_transition_run_with_query(&hot, "/rustfs/admin/v3/ilm/transition/run?bucket=manual-async-test&async=true").await?;
+    let (async_bool_status, async_bool_body) = async_bool;
+    assert_eq!(
+        async_bool_status,
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "async=true must remain unimplemented"
+    );
+    assert!(
+        async_bool_body.contains("NotImplemented"),
+        "async=true body must advertise NotImplemented, body: {async_bool_body}"
+    );
+
+    hot.stop_server();
+    Ok(())
+}
+
+async fn manual_transition_run_with_query(
+    hot: &RustFSTestEnvironment,
+    path: &str,
+) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    signed_admin_request(&hot.url, Method::POST, path, None, &hot.access_key, &hot.secret_key).await
 }

@@ -32,6 +32,7 @@ use rustfs_utils::{
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tracing::{error, info, warn};
 
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -41,6 +42,82 @@ const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_ILM_TRANSITION: &str = "ilm_transition";
 const EVENT_ADMIN_ILM_TRANSITION_STATE: &str = "admin_ilm_transition_state";
+
+static ACTIVE_MANUAL_TRANSITION_SCOPES: OnceLock<Mutex<Vec<ManualTransitionRunScope>>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualTransitionRunScope {
+    bucket: String,
+    prefix: String,
+    tier: Option<String>,
+    dry_run: bool,
+}
+
+impl ManualTransitionRunScope {
+    fn new(bucket: &str, options: &ManualTransitionRunOptions) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            prefix: options.prefix.clone(),
+            tier: options.tier.as_ref().map(|tier| tier.to_ascii_uppercase()),
+            dry_run: options.dry_run,
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.bucket == other.bucket
+            && self.dry_run == other.dry_run
+            && prefixes_overlap(&self.prefix, &other.prefix)
+            && match (self.tier.as_deref(), other.tier.as_deref()) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
+    }
+}
+
+#[derive(Debug)]
+struct ManualTransitionRunAdmission {
+    scope: ManualTransitionRunScope,
+}
+
+impl Drop for ManualTransitionRunAdmission {
+    fn drop(&mut self) {
+        let mut scopes = lock_active_manual_transition_scopes();
+        if let Some(index) = scopes.iter().position(|scope| scope == &self.scope) {
+            scopes.swap_remove(index);
+        }
+    }
+}
+
+fn active_manual_transition_scopes() -> &'static Mutex<Vec<ManualTransitionRunScope>> {
+    ACTIVE_MANUAL_TRANSITION_SCOPES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn lock_active_manual_transition_scopes() -> MutexGuard<'static, Vec<ManualTransitionRunScope>> {
+    match active_manual_transition_scopes().lock() {
+        Ok(scopes) => scopes,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn prefixes_overlap(left: &str, right: &str) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn manual_transition_already_running_error() -> S3Error {
+    s3_error!(
+        OperationAborted,
+        "manual transition run already active for this bucket, prefix, tier, and dry-run mode"
+    )
+}
+
+fn acquire_manual_transition_admission(scope: ManualTransitionRunScope) -> S3Result<ManualTransitionRunAdmission> {
+    let mut scopes = lock_active_manual_transition_scopes();
+    if scopes.iter().any(|active| active.overlaps(&scope)) {
+        return Err(manual_transition_already_running_error());
+    }
+    scopes.push(scope.clone());
+    Ok(ManualTransitionRunAdmission { scope })
+}
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -296,6 +373,14 @@ impl Operation for ManualTransitionRunHandler {
         };
         let max_objects = options.max_objects;
         let max_duration_seconds = options.max_duration.map(|duration| duration.as_secs());
+        let scope = ManualTransitionRunScope::new(&bucket, &options);
+        let _admission = match acquire_manual_transition_admission(scope) {
+            Ok(admission) => admission,
+            Err(err) => {
+                log_manual_transition_rejected("already_running", &request_id, &actor, &remote_addr);
+                return Err(err);
+            }
+        };
 
         let report = match enqueue_transition_for_existing_objects_scoped(store, &bucket, options).await {
             Ok(report) => report,
@@ -390,6 +475,109 @@ mod tests {
             .expect_err("unknown mode must not be silently accepted");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn manual_transition_scope_ignores_resume_and_budget_parameters() {
+        let (bucket, first) = parse_manual_transition_query(Some(
+            "bucket=data&prefix=logs/&tier=warm&marker=logs/a&versionMarker=v1&maxObjects=10",
+        ))
+        .expect("first query should parse");
+        let (_, second) = parse_manual_transition_query(Some(
+            "bucket=data&prefix=logs/&tier=WARM&marker=logs/z&versionMarker=v9&maxObjects=20",
+        ))
+        .expect("second query should parse");
+
+        assert_eq!(
+            ManualTransitionRunScope::new(&bucket, &first),
+            ManualTransitionRunScope::new(&bucket, &second)
+        );
+    }
+
+    #[test]
+    fn manual_transition_scope_distinguishes_dry_run_mode() {
+        let (bucket, real) =
+            parse_manual_transition_query(Some("bucket=data&prefix=logs/&tier=warm")).expect("real query should parse");
+        let (_, dry_run) = parse_manual_transition_query(Some("bucket=data&prefix=logs/&tier=warm&dryRun=true"))
+            .expect("dry-run query should parse");
+
+        assert_ne!(
+            ManualTransitionRunScope::new(&bucket, &real),
+            ManualTransitionRunScope::new(&bucket, &dry_run)
+        );
+    }
+
+    #[test]
+    fn manual_transition_admission_rejects_same_scope_until_guard_drops() {
+        let (bucket, options) =
+            parse_manual_transition_query(Some("bucket=admission-test&prefix=logs/&tier=warm")).expect("query should parse");
+        let scope = ManualTransitionRunScope::new(&bucket, &options);
+        let first = acquire_manual_transition_admission(scope.clone()).expect("first admission should succeed");
+
+        let err = acquire_manual_transition_admission(scope.clone()).expect_err("same scope must be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::OperationAborted);
+        assert_eq!(err.status_code(), Some(StatusCode::CONFLICT));
+
+        let different = ManualTransitionRunScope::new(
+            "admission-test",
+            &ManualTransitionRunOptions {
+                prefix: "other/".into(),
+                ..options
+            },
+        );
+        let other = acquire_manual_transition_admission(different).expect("different scope should run independently");
+
+        drop(other);
+        drop(first);
+
+        acquire_manual_transition_admission(scope).expect("scope should be released after guard drops");
+    }
+
+    #[test]
+    fn manual_transition_admission_rejects_overlapping_prefix_or_tier() {
+        let (bucket, options) =
+            parse_manual_transition_query(Some("bucket=admission-overlap-test&prefix=logs/")).expect("query should parse");
+        let scope = ManualTransitionRunScope::new(&bucket, &options);
+        let active = acquire_manual_transition_admission(scope).expect("first admission should succeed");
+
+        let overlapping_prefix = ManualTransitionRunScope::new(
+            "admission-overlap-test",
+            &ManualTransitionRunOptions {
+                prefix: "logs/2026/".into(),
+                tier: Some("warm".into()),
+                ..ManualTransitionRunOptions::default()
+            },
+        );
+        let err =
+            acquire_manual_transition_admission(overlapping_prefix).expect_err("wildcard tier and nested prefix must conflict");
+
+        assert_eq!(err.status_code(), Some(StatusCode::CONFLICT));
+
+        let disjoint_prefix = ManualTransitionRunScope::new(
+            "admission-overlap-test",
+            &ManualTransitionRunOptions {
+                prefix: "archive/".into(),
+                tier: Some("warm".into()),
+                ..ManualTransitionRunOptions::default()
+            },
+        );
+        let disjoint = acquire_manual_transition_admission(disjoint_prefix).expect("disjoint prefix should run independently");
+
+        drop(disjoint);
+        drop(active);
+    }
+
+    #[test]
+    fn manual_transition_handler_acquires_admission_before_enqueue() {
+        let src = include_str!("ilm_transition.rs");
+        let handler_block = extract_block_between_markers(
+            src,
+            "impl Operation for ManualTransitionRunHandler",
+            "let report = match enqueue_transition_for_existing_objects_scoped",
+        );
+
+        assert!(handler_block.contains("acquire_manual_transition_admission"));
     }
 
     #[test]
