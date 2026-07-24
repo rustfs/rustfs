@@ -4408,20 +4408,7 @@ pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_m
 
 /// Validates if the given storage class is supported
 pub fn is_valid_storage_class(storage_class: &str) -> bool {
-    matches!(
-        storage_class,
-        storageclass::STANDARD
-            | storageclass::RRS
-            | storageclass::DEEP_ARCHIVE
-            | storageclass::EXPRESS_ONEZONE
-            | storageclass::GLACIER
-            | storageclass::GLACIER_IR
-            | storageclass::INTELLIGENT_TIERING
-            | storageclass::ONEZONE_IA
-            | storageclass::OUTPOSTS
-            | storageclass::SNOW
-            | storageclass::STANDARD_IA
-    )
+    storageclass::is_supported_write_class(storage_class)
 }
 
 /// Returns true if the storage class is a cold storage tier that requires special handling
@@ -7796,23 +7783,10 @@ mod tests {
 
     #[test]
     fn test_is_valid_storage_class() {
-        // Test valid storage classes
         assert!(is_valid_storage_class(storageclass::STANDARD));
         assert!(is_valid_storage_class(storageclass::RRS));
-        assert!(is_valid_storage_class(storageclass::DEEP_ARCHIVE));
-        assert!(is_valid_storage_class(storageclass::EXPRESS_ONEZONE));
-        assert!(is_valid_storage_class(storageclass::GLACIER));
-        assert!(is_valid_storage_class(storageclass::GLACIER_IR));
-        assert!(is_valid_storage_class(storageclass::INTELLIGENT_TIERING));
-        assert!(is_valid_storage_class(storageclass::ONEZONE_IA));
-        assert!(is_valid_storage_class(storageclass::OUTPOSTS));
-        assert!(is_valid_storage_class(storageclass::SNOW));
-        assert!(is_valid_storage_class(storageclass::STANDARD_IA));
-
-        // Test invalid storage classes
+        assert!(!is_valid_storage_class(storageclass::STANDARD_IA));
         assert!(!is_valid_storage_class("INVALID"));
-        assert!(!is_valid_storage_class(""));
-        assert!(!is_valid_storage_class("standard")); // lowercase
     }
 
     #[test]

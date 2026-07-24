@@ -79,10 +79,11 @@
 | snowball_auto_extract_test | 6 |  |
 | special_chars_test | 14 | ✅ |
 | stale_multipart_cleanup_cluster_test | 1 |  |
+| storage_class_capability_test | 4 | ✅ |
 | tls_gen | 3 |  |
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
 `notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
 
-**Total listed: 475 tests across 65 modules · PR smoke subset: 122 tests / 30 modules** (28 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-24.
+**Total listed: 479 tests across 66 modules · PR smoke subset: 126 tests / 31 modules** (29 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-24.

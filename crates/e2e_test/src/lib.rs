@@ -203,6 +203,9 @@ mod copy_object_checksum_test;
 #[cfg(test)]
 mod multipart_storage_class_test;
 
+#[cfg(test)]
+mod storage_class_capability_test;
+
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;

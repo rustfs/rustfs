@@ -1512,6 +1512,10 @@ pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
     ecstore_set_disk::is_valid_storage_class(storage_class)
 }
 
+pub(crate) fn effective_storage_class<'a>(stored_class: Option<&'a str>, completed_transition_tier: Option<&'a str>) -> &'a str {
+    ecstore_config::storageclass::effective_class(stored_class, completed_transition_tier)
+}
+
 pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool
 where
     F: Fn(EventArgs) + Send + Sync + 'static,

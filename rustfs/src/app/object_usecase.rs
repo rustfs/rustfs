@@ -2778,11 +2778,16 @@ fn apply_put_request_metadata(
 }
 
 fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
-    info.storage_class
-        .clone()
-        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
-        .filter(|storage_class| !storage_class.is_empty() && storage_class != storageclass::STANDARD)
-        .map(StorageClass::from)
+    let stored_class = info
+        .storage_class
+        .as_deref()
+        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).map(String::as_str));
+    let transitioned_tier = (info.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE
+        && !info.transitioned_object.tier.is_empty())
+    .then_some(info.transitioned_object.tier.as_str());
+    let effective_class = storageclass::effective_class(stored_class, transitioned_tier);
+
+    (effective_class != storageclass::STANDARD).then(|| StorageClass::from(effective_class.to_string()))
 }
 
 fn response_storage_class_for_object_attributes(
@@ -2794,12 +2799,17 @@ fn response_storage_class_for_object_attributes(
         return None;
     }
 
-    info.storage_class
-        .clone()
-        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
-        .or_else(|| Some(storageclass::STANDARD.to_string()))
-        .filter(|storage_class| !storage_class.is_empty())
-        .map(StorageClass::from)
+    let stored_class = info
+        .storage_class
+        .as_deref()
+        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).map(String::as_str));
+    let transitioned_tier = (info.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE
+        && !info.transitioned_object.tier.is_empty())
+    .then_some(info.transitioned_object.tier.as_str());
+
+    Some(StorageClass::from(
+        storageclass::effective_class(stored_class, transitioned_tier).to_string(),
+    ))
 }
 
 async fn apply_put_request_object_lock_opts(
@@ -12286,7 +12296,7 @@ mod tests {
     }
 
     #[test]
-    fn response_storage_class_omits_standard_and_keeps_non_default() {
+    fn response_storage_class_reports_effective_layout_and_preserves_transition_tier() {
         let metadata = HashMap::new();
         let standard_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD.to_string()),
@@ -12297,16 +12307,39 @@ mod tests {
 
         let mut metadata = HashMap::new();
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
-        let infrequent_access_info = ObjectInfo {
+        let label_only_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD_IA.to_string()),
             user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
+        assert!(
+            response_storage_class(&label_only_info, &metadata).is_none(),
+            "historical STANDARD_IA labels must report the effective implicit STANDARD layout"
+        );
+
+        let rrs_info = ObjectInfo {
+            storage_class: Some(storageclass::RRS.to_string()),
+            ..Default::default()
+        };
         assert_eq!(
-            response_storage_class(&infrequent_access_info, &metadata)
+            response_storage_class(&rrs_info, &HashMap::new())
                 .as_ref()
                 .map(StorageClass::as_str),
-            Some(storageclass::STANDARD_IA)
+            Some(storageclass::RRS)
+        );
+
+        let mut transitioned_info = label_only_info;
+        transitioned_info.transitioned_object.tier = "WARM-TIER".to_string();
+        assert!(
+            response_storage_class(&transitioned_info, &metadata).is_none(),
+            "a tier name without a completed transition must not override the effective local class"
+        );
+        transitioned_info.transitioned_object.status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        assert_eq!(
+            response_storage_class(&transitioned_info, &metadata)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some("WARM-TIER")
         );
 
         let mut metadata = HashMap::new();
@@ -12333,6 +12366,17 @@ mod tests {
 
         assert_eq!(
             response_storage_class_for_object_attributes(&info, &metadata, true)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some(storageclass::STANDARD)
+        );
+
+        let legacy_info = ObjectInfo {
+            storage_class: Some(storageclass::STANDARD_IA.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            response_storage_class_for_object_attributes(&legacy_info, &HashMap::new(), true)
                 .as_ref()
                 .map(StorageClass::as_str),
             Some(storageclass::STANDARD)
@@ -12575,7 +12619,7 @@ mod tests {
             })
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
-            .storage_class(Some(StorageClass::from_static(storageclass::STANDARD_IA)))
+            .storage_class(Some(StorageClass::from_static(storageclass::RRS)))
             .build()
             .unwrap();
 
