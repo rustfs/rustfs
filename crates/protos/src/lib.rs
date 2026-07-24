@@ -25,7 +25,7 @@ use std::{
     collections::HashMap,
     error::Error,
     sync::LazyLock,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -54,7 +54,11 @@ pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
 const TLS_GENERATION_CACHE_MAX_SIZE: usize = 512;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET: u8 = 0;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE: u8 = 1;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE: u8 = 2;
 static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
     if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
@@ -642,13 +646,33 @@ mod tier_mutation_rpc_tests {
 /// decode the compatibility field. Operators must also set the fleet-confirmed guard after the
 /// convergence runbook proves every peer supports `_bin` and rollback.
 pub fn internode_rpc_msgpack_only() -> bool {
-    rustfs_utils::get_env_bool(
+    match INTERNODE_RPC_MSGPACK_ONLY_CACHE.load(Ordering::Acquire) {
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE => return false,
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE => return true,
+        _ => {}
+    }
+
+    let enabled = rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
         rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
     ) && rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
         rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
-    )
+    );
+    INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(
+        if enabled {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE
+        } else {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE
+        },
+        Ordering::Release,
+    );
+    enabled
+}
+
+#[doc(hidden)]
+pub fn reset_internode_rpc_msgpack_only_cache() {
+    INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
 }
 
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
@@ -949,6 +973,35 @@ mod tests {
     fn bulk_channel_pool_size_is_at_least_one() {
         // Even without env configuration the pool size is clamped to a usable minimum.
         assert!(bulk_channel_pool_size() >= 1);
+    }
+
+    #[test]
+    fn internode_rpc_msgpack_only_reuses_cached_env_until_reset() {
+        reset_internode_rpc_msgpack_only_cache();
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                assert!(internode_rpc_msgpack_only());
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                assert!(internode_rpc_msgpack_only(), "cached value should avoid repeated env reads");
+                reset_internode_rpc_msgpack_only_cache();
+                assert!(!internode_rpc_msgpack_only(), "reset must reload current env values");
+            },
+        );
+
+        reset_internode_rpc_msgpack_only_cache();
     }
 
     #[tokio::test]
