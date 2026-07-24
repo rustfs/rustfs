@@ -361,9 +361,10 @@ pub mod notification {
 pub mod object {
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource,
-        GetObjectReader, ObjectInfo, ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader, StreamConsumer,
-        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
-        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        GetObjectReader, GetObjectSse, ObjectInfo, ObjectMutationHook, ObjectOptions, PutObjReader, RangedDecompressReader,
+        StreamConsumer, get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook,
+        register_get_object_body_cache_hook, register_object_mutation_hook, unregister_get_object_body_cache_hook,
+        unregister_object_mutation_hook,
     };
     pub use crate::store::PreparedGetObjectReader;
 }
@@ -399,7 +400,10 @@ pub mod set_disk {
 }
 
 pub mod sse {
-    pub use crate::sse::{ManagedDekProvider, ManagedSseScheme, managed_dek_provider};
+    pub use crate::sse::{
+        ManagedDekProvider, ManagedSseScheme, PersistedEncryptionError, PersistedManagedEncryption,
+        classify_persisted_managed_encryption, decrypt_minio_static_kms_dek,
+    };
 }
 
 pub mod store_list {

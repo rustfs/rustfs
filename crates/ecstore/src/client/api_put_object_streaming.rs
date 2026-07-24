@@ -657,6 +657,7 @@ mod tests {
             stream: Box::new(r),
             object_info: Default::default(),
             buffered_body: None,
+            resolved_sse: None,
             body_source: Default::default(),
         });
 
@@ -687,6 +688,7 @@ mod tests {
             stream: Box::new(r),
             object_info: Default::default(),
             buffered_body: None,
+            resolved_sse: None,
             body_source: Default::default(),
         });
         let buf = read_multipart_part(&mut reader, 100).await.unwrap();

@@ -30,6 +30,7 @@ Two rules keep this directory healthy:
 ## Contracts & invariants
 
 - [erasure-coding.md](erasure-coding.md) — normative erasure-coding algorithm and on-disk (`xl.meta`) compatibility contract; the frozen invariants for all user-data read/write, encode/decode, quorum, heal, and decode tolerance
+- [minio-sse-key-hierarchy.md](minio-sse-key-hierarchy.md) — MinIO-compatible SSE key hierarchy, wrapping algorithms, DARE 2.0 stream format, metadata persistence, and RustFS layer boundaries
 - [placement-repair-invariants.md](placement-repair-invariants.md)
 - [unified-object-generation.md](unified-object-generation.md) — single per-object generation authority (fencing epoch, transport/encoding/proto/mixed-version contracts)
 - [runtime-capability-contracts.md](runtime-capability-contracts.md)

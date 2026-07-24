@@ -181,6 +181,7 @@ libc = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 aes-gcm = { workspace = true, features = ["rand_core"] }
 chacha20poly1305 = { workspace = true }
+zeroize.workspace = true
 
 # Observability and Metrics
 metrics = { workspace = true }

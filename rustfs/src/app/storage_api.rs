@@ -994,7 +994,7 @@ pub(crate) mod object_usecase {
         object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
     pub(crate) use crate::storage::storage_api::{
-        ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
+        ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageGetObjectSse, StorageObjectInfo,
         StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
         get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
         parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,

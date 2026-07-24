@@ -1240,6 +1240,7 @@ mod tests {
             stream: Box::new(Cursor::new(raw_payload.clone())),
             object_info: object_info.clone(),
             buffered_body: None,
+            resolved_sse: None,
             body_source: Default::default(),
         };
 

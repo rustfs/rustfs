@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
+import json
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,21 @@ def load_lab_module():
 
 
 lab = load_lab_module()
+sys.modules["lab"] = lab
+
+
+def load_beta5_module():
+    module_path = Path(__file__).with_name("capture_rustfs_beta5.py")
+    spec = importlib.util.spec_from_file_location("rustfs_beta5_fixture_capture", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+beta5 = load_beta5_module()
 
 
 class DiscoverMinioLauncherTests(unittest.TestCase):
@@ -201,6 +217,32 @@ class KmsSecretKeyTests(unittest.TestCase):
             env["MINIO_KMS_SECRET_KEY"],
             "local-fixture-key:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
+
+
+class RustfsBeta5CaptureTests(unittest.TestCase):
+    def test_explicit_beta5_binary_is_used_without_download(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binary = Path(temp_dir) / "rustfs"
+            binary.write_bytes(b"beta5")
+
+            resolved = beta5.resolve_binary(binary, Path(temp_dir))
+
+            self.assertEqual(resolved, binary.resolve())
+
+    def test_local_kms_key_has_beta5_compatible_shape_and_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            key_dir = Path(temp_dir) / "kms"
+
+            beta5.write_local_kms_key(key_dir)
+
+            key_path = key_dir / f"{beta5.KMS_KEY_ID}.key"
+            payload = json.loads(key_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["key_id"], beta5.KMS_KEY_ID)
+            self.assertEqual(payload["algorithm"], "AES_256")
+            self.assertEqual(payload["usage"], "EncryptDecrypt")
+            self.assertEqual(len(base64.b64decode(payload["encrypted_key_material"])), 32)
+            self.assertEqual(payload["nonce"], [])
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

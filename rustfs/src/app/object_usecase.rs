@@ -197,8 +197,9 @@ use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
-    GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions,
-    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+    GetObjectReader, StorageDeletedObject, StorageGetObjectSse as GetObjectSse, StorageObjectInfo as ObjectInfo,
+    StorageObjectLockDeleteOptions, StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete,
+    StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
     ColdFillCoordinateOutcome, ColdFillDiskPermitOwner, ColdFillError, ColdFillProducer, GetObjectBodyCacheLookup,
@@ -3826,6 +3827,7 @@ impl DefaultObjectUsecase {
         // metadata resolution.
         let cache_hook_served = reader.is_cache_hook_served();
         let cache_hook_probed = reader.cache_hook_probed();
+        let resolved_sse = reader.resolved_sse;
         let info = reader.object_info;
         let stream = reader.stream;
         let buffered_body = reader.buffered_body;
@@ -3899,15 +3901,12 @@ impl DefaultObjectUsecase {
             req.input.sse_customer_key.is_some()
         );
 
-        let decryption_request = DecryptionRequest {
-            bucket,
-            key,
-            metadata: &info.user_defined,
-            sse_customer_key: req.input.sse_customer_key.as_ref(),
-            sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
-        };
-
         let response_content_length = content_length;
+        // A cache-served body did not pass through ecstore's encryption-material
+        // resolver. Keep one KMS/SSE-C validation on that path; storage-backed
+        // readers have already resolved their material and only need response
+        // header classification here.
+        let resolved_sse = (!cache_hook_served).then_some(resolved_sse).flatten();
 
         let (
             server_side_encryption,
@@ -3917,22 +3916,60 @@ impl DefaultObjectUsecase {
             encryption_applied,
             final_stream,
             buffered_body,
-        ) = match sse_decryption(decryption_request).await? {
-            Some(material) => {
-                let server_side_encryption = Some(material.server_side_encryption.clone());
-                let sse_customer_algorithm = matches!(material.sse_type, SSEType::SseC).then_some(material.algorithm.clone());
-                let sse_customer_key_md5 = material.customer_key_md5.clone();
-                (
-                    server_side_encryption,
-                    sse_customer_algorithm,
-                    sse_customer_key_md5,
-                    material.kms_key_id,
-                    true,
-                    wrap_reader(stream),
-                    None,
-                )
-            }
-            None => (None, None, None, None, false, wrap_reader(stream), buffered_body),
+        ) = match resolved_sse {
+            Some(GetObjectSse::SseC { customer_key_md5 }) => (
+                Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                Some(SSECustomerAlgorithm::from(ServerSideEncryption::AES256.to_string())),
+                Some(customer_key_md5),
+                None,
+                true,
+                wrap_reader(stream),
+                None,
+            ),
+            Some(GetObjectSse::SseS3) => (
+                Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+                None,
+                None,
+                None,
+                true,
+                wrap_reader(stream),
+                None,
+            ),
+            Some(GetObjectSse::SseKms { key_id }) => (
+                Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+                None,
+                None,
+                Some(SSEKMSKeyId::from(key_id)),
+                true,
+                wrap_reader(stream),
+                None,
+            ),
+            None if !cache_hook_served => (None, None, None, None, false, wrap_reader(stream), buffered_body),
+            None => match sse_decryption(DecryptionRequest {
+                bucket,
+                key,
+                metadata: &info.user_defined,
+                sse_customer_key: req.input.sse_customer_key.as_ref(),
+                sse_customer_key_md5: req.input.sse_customer_key_md5.as_ref(),
+            })
+            .await?
+            {
+                Some(material) => {
+                    let server_side_encryption = Some(material.server_side_encryption.clone());
+                    let sse_customer_algorithm = matches!(material.sse_type, SSEType::SseC).then_some(material.algorithm.clone());
+                    let sse_customer_key_md5 = material.customer_key_md5.clone();
+                    (
+                        server_side_encryption,
+                        sse_customer_algorithm,
+                        sse_customer_key_md5,
+                        material.kms_key_id,
+                        true,
+                        wrap_reader(stream),
+                        None,
+                    )
+                }
+                None => (None, None, None, None, false, wrap_reader(stream), buffered_body),
+            },
         };
 
         Ok(GetObjectReadSetup {
@@ -8096,6 +8133,185 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn storage_resolved_sse_skips_second_app_layer_material_resolution() {
+        let input = GetObjectInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .build()
+            .expect("GET input must build");
+        let request = build_request(input, Method::GET);
+        let reader = GetObjectReader {
+            stream: Box::new(std::io::Cursor::new(b"body".to_vec())),
+            object_info: ObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "object".to_string(),
+                size: 4,
+                actual_size: 4,
+                user_defined: Arc::new(HashMap::from([
+                    ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
+                    ("x-rustfs-encryption-key".to_string(), "not-base64".to_string()),
+                ])),
+                ..Default::default()
+            },
+            buffered_body: None,
+            resolved_sse: Some(GetObjectSse::SseS3),
+            body_source: GetObjectBodySource::Unprobed,
+        };
+
+        let setup = DefaultObjectUsecase::finish_get_object_read(
+            &request,
+            get_concurrency_manager(),
+            "bucket",
+            "object",
+            None,
+            None,
+            std::time::Instant::now(),
+            reader,
+            false,
+        )
+        .await
+        .expect("storage-resolved SSE must not reparse the malformed envelope in the app layer");
+
+        assert_eq!(
+            setup.server_side_encryption.as_ref().map(ServerSideEncryption::as_str),
+            Some(ServerSideEncryption::AES256)
+        );
+        assert!(setup.encryption_applied);
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cache_served_minio_static_kms_object_resolves_locally() {
+        use aes_gcm::{
+            Aes256Gcm, Nonce,
+            aead::{Aead, KeyInit, Payload},
+        };
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        type HmacSha256 = Hmac<Sha256>;
+
+        let master_key = [0x31; 32];
+        let external_key = [0x42; 32];
+        let object_key = [0x53; 32];
+        let kms_iv = [0x64; 16];
+        let kms_nonce = [0x75; 12];
+        let mut kms_mac = HmacSha256::new_from_slice(&master_key).expect("valid KMS master key");
+        kms_mac.update(&kms_iv);
+        let kms_sealing_key = kms_mac.finalize().into_bytes();
+        let mut encrypted_dek = Aes256Gcm::new_from_slice(kms_sealing_key.as_slice())
+            .expect("valid KMS sealing key")
+            .encrypt(
+                &Nonce::from(kms_nonce),
+                Payload {
+                    msg: &external_key,
+                    aad: br#"{"bucket":"bucket/object"}"#,
+                },
+            )
+            .expect("encrypt static-KMS fixture DEK");
+        encrypted_dek.extend_from_slice(&kms_iv);
+        encrypted_dek.extend_from_slice(&kms_nonce);
+
+        let sealing_iv = [0x86; 32];
+        let mut object_mac = HmacSha256::new_from_slice(&external_key).expect("valid external key");
+        object_mac.update(&sealing_iv);
+        object_mac.update(b"SSE-KMS");
+        object_mac.update(b"DAREv2-HMAC-SHA256");
+        object_mac.update(b"bucket/object");
+        let object_sealing_key = object_mac.finalize().into_bytes();
+        let mut sealed_header = [0u8; 16];
+        sealed_header[0] = 0x20;
+        sealed_header[2..4].copy_from_slice(&(31u16).to_le_bytes());
+        sealed_header[4] = 0x80;
+        let mut sealed_object_key = sealed_header.to_vec();
+        sealed_object_key.extend_from_slice(
+            &Aes256Gcm::new_from_slice(object_sealing_key.as_slice())
+                .expect("valid object sealing key")
+                .encrypt(
+                    &Nonce::from(<[u8; 12]>::try_from(&sealed_header[4..]).expect("12-byte nonce")),
+                    Payload {
+                        msg: &object_key,
+                        aad: &sealed_header[..4],
+                    },
+                )
+                .expect("seal object key"),
+        );
+
+        let input = GetObjectInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .build()
+            .expect("GET input must build");
+        let request = build_request(input, Method::GET);
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            ("x-amz-server-side-encryption-aws-kms-key-id".to_string(), "minio-key".to_string()),
+            (
+                "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id".to_string(),
+                "minio-key".to_string(),
+            ),
+            (
+                "X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key".to_string(),
+                BASE64_STANDARD.encode(encrypted_dek),
+            ),
+            (
+                "X-Minio-Internal-Server-Side-Encryption-Kms-Sealed-Key".to_string(),
+                BASE64_STANDARD.encode(sealed_object_key),
+            ),
+            (
+                "X-Minio-Internal-Server-Side-Encryption-Iv".to_string(),
+                BASE64_STANDARD.encode(sealing_iv),
+            ),
+            (
+                "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm".to_string(),
+                "DAREv2-HMAC-SHA256".to_string(),
+            ),
+        ]);
+        let configured_key = format!("minio-key:{}", BASE64_STANDARD.encode(master_key));
+
+        temp_env::async_with_vars([("RUSTFS_MINIO_STATIC_KMS_KEY", Some(configured_key))], async {
+            let reader = GetObjectReader {
+                stream: Box::new(std::io::Cursor::new(b"body".to_vec())),
+                object_info: ObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "object".to_string(),
+                    size: 4,
+                    actual_size: 4,
+                    user_defined: Arc::new(metadata),
+                    ..Default::default()
+                },
+                buffered_body: Some(Bytes::from_static(b"body")),
+                resolved_sse: None,
+                body_source: GetObjectBodySource::HookServed,
+            };
+
+            let setup = DefaultObjectUsecase::finish_get_object_read(
+                &request,
+                get_concurrency_manager(),
+                "bucket",
+                "object",
+                None,
+                None,
+                std::time::Instant::now(),
+                reader,
+                false,
+            )
+            .await
+            .expect("cache-served MinIO static-KMS object must resolve without external KMS");
+
+            assert_eq!(
+                setup.server_side_encryption.as_ref().map(ServerSideEncryption::as_str),
+                Some(ServerSideEncryption::AWS_KMS)
+            );
+            assert_eq!(setup.ssekms_key_id.as_deref(), Some("minio-key"));
+            assert!(setup.encryption_applied);
+        })
+        .await;
+    }
+
     #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {
         let version_id = Uuid::new_v4().to_string();
@@ -8911,6 +9127,7 @@ mod tests {
                         ..Default::default()
                     },
                     buffered_body: None,
+                    resolved_sse: None,
                     body_source: GetObjectBodySource::HookMissed,
                 })
             },
@@ -9011,6 +9228,7 @@ mod tests {
                         ..Default::default()
                     },
                     buffered_body: None,
+                    resolved_sse: None,
                     body_source: GetObjectBodySource::HookMissed,
                 })
             },
@@ -9614,6 +9832,7 @@ mod tests {
                                 ..Default::default()
                             },
                             buffered_body: Some(Bytes::from_static(b"body")),
+                            resolved_sse: None,
                             body_source: GetObjectBodySource::HookMissed,
                         })
                     },
@@ -9788,6 +10007,7 @@ mod tests {
                                         ..Default::default()
                                     },
                                     buffered_body: Some(Bytes::from_static(b"body")),
+                                    resolved_sse: None,
                                     body_source: GetObjectBodySource::HookMissed,
                                 })
                             },
@@ -9918,6 +10138,7 @@ mod tests {
                             ..Default::default()
                         },
                         buffered_body: None,
+                        resolved_sse: None,
                         body_source: GetObjectBodySource::HookMissed,
                     })
                 },
@@ -9991,6 +10212,7 @@ mod tests {
                         ..Default::default()
                     },
                     buffered_body: Some(Bytes::from_static(b"body")),
+                    resolved_sse: None,
                     body_source: GetObjectBodySource::HookMissed,
                 })
             },
@@ -10051,6 +10273,7 @@ mod tests {
                         ..Default::default()
                     },
                     buffered_body: None,
+                    resolved_sse: None,
                     body_source: GetObjectBodySource::HookMissed,
                 })
             },
@@ -10182,6 +10405,7 @@ mod tests {
                                             ..Default::default()
                                         },
                                         buffered_body: None,
+                                        resolved_sse: None,
                                         body_source: GetObjectBodySource::HookMissed,
                                     })
                                 },

@@ -206,7 +206,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         //     });
         // }
 
-        if object_info.size == 0 {
+        if object_info.size == 0 && !object_info.is_encrypted() {
             record_get_object_reader_path_observation(GET_OBJECT_PATH_EMPTY, object_class, size_bucket);
             // if let Some(rs) = range {
             //     let _ = rs.get_offset_length(object_info.size)?;
@@ -216,6 +216,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 stream: Box::new(Cursor::new(Vec::new())),
                 object_info,
                 buffered_body: Some(Bytes::new()),
+                resolved_sse: None,
                 body_source: GetObjectBodySource::Unprobed,
             };
             return Ok(reader);
@@ -303,6 +304,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         stream: Box::new(Cursor::new(body.clone())),
                         object_info,
                         buffered_body: Some(body),
+                        resolved_sse: None,
                         body_source: GetObjectBodySource::Unprobed,
                     };
                     return Ok(reader);
@@ -381,6 +383,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     stream: Box::new(Cursor::new(body.clone())),
                     object_info,
                     buffered_body: Some(body),
+                    resolved_sse: None,
                     body_source: GetObjectBodySource::Unprobed,
                 };
                 return Ok(reader);
@@ -462,6 +465,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         stream: Box::new(Cursor::new(body.clone())),
                         object_info,
                         buffered_body: Some(body),
+                        resolved_sse: None,
                         body_source: GetObjectBodySource::HookServed,
                     };
                     if lock_optimization_enabled {
@@ -505,6 +509,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     stream: Box::new(Cursor::new(body.clone())),
                     object_info,
                     buffered_body: Some(body),
+                    resolved_sse: None,
                     body_source,
                 };
                 if lock_optimization_enabled {
@@ -547,6 +552,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 stream: Box::new(Cursor::new(body.clone())),
                 object_info,
                 buffered_body: Some(body),
+                resolved_sse: None,
                 body_source,
             };
             if lock_optimization_enabled {
@@ -3311,6 +3317,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             stream: Box::new(TransitionUploadReader::new(pr, Arc::clone(&consumed))),
             object_info: oi,
             buffered_body: None,
+            resolved_sse: None,
             body_source: GetObjectBodySource::Unprobed,
         });
 
@@ -4044,6 +4051,54 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         .await;
 
         (temp_dirs, disk_stores, set_disks)
+    }
+}
+
+#[cfg(test)]
+mod zero_length_encrypted_read_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+
+    #[tokio::test]
+    async fn encrypted_zero_length_object_does_not_use_plain_empty_fast_path() {
+        let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "zero-length-encrypted-read";
+        let object = "empty";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(Vec::new());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("empty object should be written");
+
+        let metadata = HashMap::from([(rustfs_utils::http::SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("SSE-C metadata should be persisted");
+
+        let result = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await;
+        let error = match result {
+            Ok(_) => panic!("encrypted empty object must validate SSE-C headers"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("SSE-C") || error.to_string().contains("customer"),
+            "the encrypted read must fail at SSE-C validation, got: {error}"
+        );
     }
 }
 

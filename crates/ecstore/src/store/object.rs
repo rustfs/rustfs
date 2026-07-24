@@ -2646,6 +2646,7 @@ mod tests {
                 stream: Box::new(Cursor::new(Vec::<u8>::new())),
                 object_info: ObjectInfo::default(),
                 buffered_body: None,
+                resolved_sse: None,
                 body_source: Default::default(),
             };
 
@@ -2686,6 +2687,7 @@ mod tests {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
                 buffered_body: None,
+                resolved_sse: None,
                 body_source: Default::default(),
             };
 
@@ -2723,6 +2725,7 @@ mod tests {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
                 buffered_body: Some(Bytes::from_static(b"123")),
+                resolved_sse: None,
                 body_source: Default::default(),
             };
 
@@ -2760,6 +2763,7 @@ mod tests {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
                 buffered_body: None,
+                resolved_sse: None,
                 body_source: Default::default(),
             };
 

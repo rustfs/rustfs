@@ -82,6 +82,7 @@ pub(crate) mod contract {
 
 pub(crate) type StorageDeletedObject = contract::object::DeletedObject;
 pub(crate) type StorageGetObjectReader = super::GetObjectReader;
+pub(crate) type StorageGetObjectSse = GetObjectSse;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
@@ -492,9 +493,9 @@ pub(crate) mod ecstore_object {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
-        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, ObjectMutationHook, get_object_body_cache_plaintext_len,
-        lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectSse, ObjectMutationHook,
+        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
+        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
     };
 }
 
@@ -503,7 +504,9 @@ pub(crate) mod ecstore_set_disk {
 }
 
 pub(crate) mod ecstore_sse {
-    pub(crate) use rustfs_ecstore::api::sse::{ManagedDekProvider, ManagedSseScheme, managed_dek_provider};
+    pub(crate) use rustfs_ecstore::api::sse::{ManagedDekProvider, ManagedSseScheme, classify_persisted_managed_encryption};
+    #[cfg(feature = "rio-v2")]
+    pub(crate) use rustfs_ecstore::api::sse::{PersistedManagedEncryption, decrypt_minio_static_kms_dek};
 }
 
 pub(crate) mod ecstore_storage {
@@ -1563,6 +1566,7 @@ impl StorageVersioningConfigExt for s3s::dto::VersioningConfiguration {
 }
 
 pub(crate) type GetObjectReader = <ECStore as contract::object::ObjectIO>::GetObjectReader;
+pub(crate) type GetObjectSse = ecstore_object::GetObjectSse;
 pub(crate) type ObjectInfo = <ECStore as contract::object::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as contract::object::ObjectOperations>::ObjectOptions;
 pub(crate) type PutObjReader = <ECStore as contract::object::ObjectIO>::PutObjectReader;

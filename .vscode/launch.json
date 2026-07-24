@@ -133,6 +133,29 @@
             ],
         },
         {
+            "name": "Debug executable target/debug/rustfs with sse-s3",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/rustfs",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUSTFS_ACCESS_KEY": "rustfsadmin",
+                "RUSTFS_SECRET_KEY": "rustfsadmin",
+                "RUSTFS_VOLUMES": "./target/volumes/test{1...4}",
+                "RUSTFS_ADDRESS": ":9000",
+                "RUSTFS_CONSOLE_ENABLE": "true",
+                "RUSTFS_CONSOLE_ADDRESS": "127.0.0.1:9001",
+                "RUSTFS_OBS_LOG_DIRECTORY": "./target/logs",
+                "RUSTFS_UNSAFE_BYPASS_DISK_CHECK": "true",
+                "RUSTFS_SSE_S3_MASTER_KEY": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                "RUST_LOG": "rustfs=debug,ecstore=debug,s3s=debug,iam=debug"
+            },
+            "sourceLanguages": [
+                "rust"
+            ]
+        },
+        {
             "type": "lldb",
             "request": "launch",
             "name": "Debug test_lifecycle_transition_basic",

@@ -1625,6 +1625,7 @@ mod tests {
                     ..Default::default()
                 },
                 buffered_body: None,
+                resolved_sse: None,
                 body_source: Default::default(),
             })
         }

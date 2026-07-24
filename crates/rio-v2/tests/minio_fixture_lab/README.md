@@ -136,7 +136,7 @@ tests read):
 # Pass case ids to override, or "all" for the full default matrix.
 ./capture_via_docker.sh
 
-RUSTFS_MINIO_STATIC_KMS_KEY_B64=IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= \
+RUSTFS_MINIO_STATIC_KMS_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= \
   cargo test -p rustfs-ecstore --features rio-v2 --test minio_generated_read_test -- --ignored
 ```
 
@@ -144,6 +144,28 @@ This is exactly what the nightly `minio-interop` GitHub Actions workflow runs
 (`.github/workflows/minio-interop.yml`), so the local and CI paths stay in sync.
 SSE-C cases still need the host-`minio` + TLS path above; the Docker helper
 targets the SSE-S3 / SSE-KMS multipart cases the interop tests assert on.
+
+## RustFS beta.5 KMS Compatibility Fixture
+
+The same CI gate also downloads the pinned RustFS `1.0.0-beta.5` release,
+verifies its published archive SHA-256, starts it with the production local KMS
+backend, writes a real SSE-KMS object, and exports the resulting four-disk
+backend plus its one-time KMS key directory:
+
+```bash
+uv run python ./capture_rustfs_beta5.py
+
+RUSTFS_BETA5_FIXTURE_ROOT=../fixtures/rustfs-beta5-generated \
+  cargo test -p rustfs-ecstore --features rio-v2 \
+    --test minio_generated_read_test \
+    reads_real_rustfs_beta5_sse_kms_fixture_through_production_reader \
+    -- --ignored
+```
+
+Outside Linux x86_64, pass `--rustfs-binary` with the matching beta.5 binary.
+The generated fixture and KMS key stay under the ignored fixture root and are
+recreated for every CI run; neither key material nor plaintext keys are logged
+or committed.
 
 ## Capture Guidance
 

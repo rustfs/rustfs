@@ -153,6 +153,7 @@ pub fn new_getobjectreader<'a>(
                 object_info: oi.clone(),
                 stream: Box::new(input_reader),
                 buffered_body: None,
+                resolved_sse: None,
                 body_source: Default::default(),
             };
             r
@@ -166,6 +167,7 @@ pub fn new_getobjectreader<'a>(
             object_info: oi.clone(),
             stream: Box::new(input_reader),
             buffered_body: None,
+            resolved_sse: None,
             body_source: Default::default(),
         });
 

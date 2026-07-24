@@ -36,6 +36,7 @@ pub(crate) mod legacy_bitrot_read {
 }
 
 pub(crate) mod minio_generated_read {
+    pub(crate) use super::storage_contracts::HTTPRangeSpec;
     pub(crate) use super::{
         DiskAPI, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
     };

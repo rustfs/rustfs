@@ -141,6 +141,7 @@ impl MigrationBackendSpy {
             stream: Box::new(Cursor::new(vec![0_u8; 3])),
             object_info: ObjectInfo::default(),
             buffered_body: None,
+            resolved_sse: None,
             body_source: Default::default(),
         }
     }

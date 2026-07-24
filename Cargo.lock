@@ -8952,6 +8952,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "zeroize",
  "zip",
  "zstd",
 ]
@@ -9093,6 +9094,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "bytesize",
+ "chacha20",
  "chacha20poly1305",
  "chrono",
  "criterion",
@@ -9189,6 +9191,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "xxhash-rust",
+ "zeroize",
 ]
 
 [[package]]

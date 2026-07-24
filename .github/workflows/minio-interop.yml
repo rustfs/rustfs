@@ -15,18 +15,37 @@
 # MinIO on-disk interop: prove RustFS reads MinIO-written erasure-coded SSE
 # objects with byte-identical data and correct logical size.
 #
-# This is NOT a PR gate. The fixtures are real MinIO backend trees generated on
-# the fly (they are gitignored, never committed), so the job regenerates them
-# each run with Docker and then runs the `#[ignore]` reader tests in
-# crates/ecstore/tests/minio_generated_read_test.rs.
+# The fixtures are real MinIO backend trees generated on the fly (they are
+# gitignored, never committed), so the job regenerates them each run with
+# Docker and then runs the `#[ignore]` reader tests in
+# crates/ecstore/tests/minio_generated_read_test.rs. SSE/RIO changes run this
+# as a path-filtered PR gate; nightly and manual runs retain broader coverage.
 #
 # Runner: GitHub-hosted `ubuntu-latest`. It reliably ships Docker + Python,
 # unlike the self-hosted fleet, whose pods drift in Docker/pip availability
-# (see the infra note in e2e-s3tests.yml). Nightly + manual only.
+# (see the infra note in e2e-s3tests.yml).
 name: minio-interop
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/minio-interop.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/ecstore/Cargo.toml"
+      - "crates/ecstore/src/io_support/rio.rs"
+      - "crates/ecstore/src/client/api_put_object_streaming.rs"
+      - "crates/ecstore/src/object_api/readers.rs"
+      - "crates/ecstore/src/set_disk/ops/object.rs"
+      - "crates/ecstore/src/sse/**"
+      - "crates/ecstore/src/store/object.rs"
+      - "crates/ecstore/tests/minio_generated_read_test.rs"
+      - "crates/kms/**"
+      - "crates/rio-v2/**"
+      - "rustfs/src/app/object_usecase.rs"
+      - "rustfs/Cargo.toml"
+      - "rustfs/src/storage/sse.rs"
   schedule:
     # Nightly at 03:17 UTC (offset from other nightly jobs).
     - cron: "17 3 * * *"
@@ -41,13 +60,13 @@ permissions:
 jobs:
   minio-interop:
     name: MinIO interop (EC + SSE read parity)
-    # Skip on forks: needs the repo's runners and is not a contributor gate.
+    # Skip on forks because this job depends on the repository's CI setup.
     if: github.repository == 'rustfs/rustfs'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       # Fixed 32-byte test KMS key baked into the fixture lab; not a secret.
-      RUSTFS_MINIO_STATIC_KMS_KEY_B64: IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g=
+      RUSTFS_MINIO_STATIC_KMS_KEY: minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g=
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -61,7 +80,10 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Generate real MinIO fixtures via Docker
-        run: bash crates/rio-v2/tests/minio_fixture_lab/capture_via_docker.sh
+        run: bash crates/rio-v2/tests/minio_fixture_lab/capture_via_docker.sh all
+
+      - name: Generate real RustFS beta.5 KMS fixture
+        run: uv run python crates/rio-v2/tests/minio_fixture_lab/capture_rustfs_beta5.py
 
       - name: Run MinIO interop reader tests
         run: |

@@ -406,6 +406,9 @@ impl WritePlan {
                     false,
                 )?,
                 WriteEncryptionMode::Singlepart { base_nonce } => HashReader::from_reader(
+                    #[cfg(feature = "rio-v2")]
+                    rustfs_rio::EncryptReader::new(reader, encryption.key_bytes, base_nonce),
+                    #[cfg(not(feature = "rio-v2"))]
                     EncryptReader::new(reader, encryption.key_bytes, base_nonce),
                     HashReader::SIZE_PRESERVE_LAYER,
                     actual_size,
@@ -417,6 +420,9 @@ impl WritePlan {
                     base_nonce,
                     multipart_part_number,
                 } => HashReader::from_reader(
+                    #[cfg(feature = "rio-v2")]
+                    rustfs_rio::EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number),
+                    #[cfg(not(feature = "rio-v2"))]
                     EncryptReader::new_multipart(reader, encryption.key_bytes, base_nonce, multipart_part_number),
                     HashReader::SIZE_PRESERVE_LAYER,
                     actual_size,
@@ -509,6 +515,10 @@ mod tests {
             .await
             .expect("read transformed ciphertext");
 
+        #[cfg(feature = "rio-v2")]
+        let decrypt_reader =
+            rustfs_rio::DecryptReader::new_multipart(Cursor::new(ciphertext), key_bytes, base_nonce, vec![part_number]);
+        #[cfg(not(feature = "rio-v2"))]
         let decrypt_reader = DecryptReader::new_multipart(Cursor::new(ciphertext), key_bytes, base_nonce, vec![part_number]);
         let mut decompressed = DecompressReader::new(Box::new(decrypt_reader), CompressionAlgorithm::default());
 
@@ -705,7 +715,7 @@ mod tests {
             .expect("read transformed ciphertext");
 
         let mut decrypted_compressed = Vec::new();
-        DecryptReader::new(Cursor::new(ciphertext), key_bytes, base_nonce)
+        rustfs_rio::DecryptReader::new(Cursor::new(ciphertext), key_bytes, base_nonce)
             .read_to_end(&mut decrypted_compressed)
             .await
             .expect("decrypt compressed stream");
