@@ -24,7 +24,6 @@ use super::storage_api::multipart_usecase::bucket::{
     replication::{must_replicate_object, schedule_object_replication},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::multipart_usecase::compression::is_disk_compressible;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _, MultipartUploadResult};
@@ -37,11 +36,11 @@ use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_n
 use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan};
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
-    parse_copy_source_range, put_opts, validate_archive_content_encoding,
+    namespace_reserved_user_metadata, parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
 use super::storage_api::multipart_usecase::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
@@ -74,7 +73,7 @@ use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
     SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_source_scheme,
-    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
+    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
 use s3s::dto::{
@@ -85,9 +84,7 @@ use s3s::dto::{
 };
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -176,6 +173,26 @@ fn complete_part_from_s3(value: CompletedPart) -> CompletePart {
         checksum_sha256: value.checksum_sha256,
         checksum_crc64nvme: value.checksum_crc64nvme,
     }
+}
+
+fn create_multipart_upload_metadata(
+    input_metadata: Option<HashMap<String, String>>,
+    headers: &HeaderMap,
+    tagging: Option<String>,
+    storage_class: Option<&s3s::dto::StorageClass>,
+) -> HashMap<String, String> {
+    let mut metadata = input_metadata.unwrap_or_default();
+    namespace_reserved_user_metadata(&mut metadata);
+    extract_metadata_from_mime(headers, &mut metadata);
+
+    if let Some(tags) = tagging {
+        metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
+    }
+    if let Some(storage_class) = storage_class {
+        metadata.insert(AMZ_STORAGE_CLASS.to_owned(), storage_class.as_str().to_owned());
+    }
+
+    metadata
 }
 
 async fn validate_table_catalog_object_mutation(bucket: &str, key: &str) -> S3Result<()> {
@@ -643,12 +660,7 @@ impl DefaultMultipartUsecase {
             req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
 
-        let mut metadata = input_metadata.unwrap_or_default();
-        extract_metadata_from_mime(&req.headers, &mut metadata);
-
-        if let Some(tags) = tagging {
-            metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
-        }
+        let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
         if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
@@ -691,13 +703,8 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        if is_disk_compressible(&req.headers, &key) {
-            rustfs_utils::http::insert_str(
-                &mut metadata,
-                rustfs_utils::http::SUFFIX_COMPRESSION,
-                compression_metadata_value(CompressionAlgorithm::default()),
-            );
-        }
+        // Multipart parts are independent physical streams. Advertising object-level
+        // compression here would make GET decode the completed object as one stream.
 
         let mt2 = metadata.clone();
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
@@ -1693,6 +1700,42 @@ mod tests {
 
         let err = make_usecase().execute_create_multipart_upload(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[test]
+    fn create_multipart_upload_metadata_persists_dto_storage_class_without_raw_header() {
+        let metadata = create_multipart_upload_metadata(
+            None,
+            &HeaderMap::new(),
+            None,
+            Some(&StorageClass::from_static("REDUCED_REDUNDANCY")),
+        );
+
+        assert_eq!(metadata.get(AMZ_STORAGE_CLASS), Some(&"REDUCED_REDUNDANCY".to_string()));
+    }
+
+    #[test]
+    fn create_multipart_upload_metadata_keeps_user_and_system_namespaces_separate() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        headers.insert(AMZ_STORAGE_CLASS, HeaderValue::from_static("STANDARD"));
+        let input_metadata = HashMap::from([
+            ("content-type".to_string(), "user-content-type".to_string()),
+            (AMZ_STORAGE_CLASS.to_string(), "user-storage-class".to_string()),
+        ]);
+
+        let metadata = create_multipart_upload_metadata(
+            Some(input_metadata),
+            &headers,
+            Some("project=rustfs".to_string()),
+            Some(&StorageClass::from_static("REDUCED_REDUNDANCY")),
+        );
+
+        assert_eq!(metadata.get("content-type"), Some(&"application/octet-stream".to_string()));
+        assert_eq!(metadata.get("x-amz-meta-content-type"), Some(&"user-content-type".to_string()));
+        assert_eq!(metadata.get(AMZ_STORAGE_CLASS), Some(&"REDUCED_REDUNDANCY".to_string()));
+        assert_eq!(metadata.get("x-amz-meta-x-amz-storage-class"), Some(&"user-storage-class".to_string()));
+        assert_eq!(metadata.get(AMZ_OBJECT_TAGGING), Some(&"project=rustfs".to_string()));
     }
 
     #[tokio::test]

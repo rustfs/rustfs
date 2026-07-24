@@ -194,6 +194,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/tier"),
         admin_route_sample(Method::POST, "/v3/tier/{tiername}", "/v3/tier/HOT"),
         admin_route(Method::POST, "/v3/tier/clear"),
+        admin_route(Method::POST, "/v3/ilm/transition/run"),
         admin_route(Method::PUT, "/v3/set-bucket-quota"),
         admin_route(Method::GET, "/v3/get-bucket-quota"),
         admin_route_sample(Method::PUT, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
@@ -830,6 +831,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/config"));
     assert_route(&router, Method::PUT, &admin_path("/v3/config"));
     assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/run"));
 
     assert_route(&router, Method::GET, &table_catalog_path("/config"));
     assert_route(&router, Method::PUT, &table_catalog_path("/buckets/analytics"));

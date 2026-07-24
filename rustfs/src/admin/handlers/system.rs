@@ -24,6 +24,7 @@ use crate::admin::runtime_sources::{
 use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
 };
+use crate::admin::storage_api::storageclass as storage_class_contract;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -635,12 +636,32 @@ pub struct RuntimeCapabilitiesSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    pub storage_classes: StorageClassCapabilities,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<CapabilityStatus>,
     pub observability: crate::admin::storage_api::cluster::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StorageClassCapabilities {
+    pub contract_version: u32,
+    pub supported_write_classes: [&'static str; 2],
+    pub unsupported_write_error: &'static str,
+    pub legacy_label_behavior: &'static str,
+}
+
+impl StorageClassCapabilities {
+    fn current() -> Self {
+        Self {
+            contract_version: storage_class_contract::CAPABILITY_CONTRACT_VERSION,
+            supported_write_classes: storage_class_contract::SUPPORTED_WRITE_CLASSES,
+            unsupported_write_error: storage_class_contract::UNSUPPORTED_WRITE_ERROR,
+            legacy_label_behavior: storage_class_contract::LEGACY_LABEL_BEHAVIOR,
+        }
+    }
 }
 
 pub struct RuntimeCapabilitiesHandler {}
@@ -669,6 +690,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        storage_classes: StorageClassCapabilities::current(),
         cluster_snapshot_path: usecase.cluster_snapshot_route().to_string(),
         cluster_snapshot_summary: cluster_snapshot_discovery.summary,
         observability,
@@ -931,11 +953,22 @@ mod tests {
         assert_eq!(response.summary.site_replication_info.state, CapabilityState::Supported);
         assert_eq!(response.summary.site_replication_edit.state, CapabilityState::Supported);
         assert_eq!(response.summary.site_replication_resync.state, CapabilityState::Supported);
+        assert_eq!(response.storage_classes.contract_version, 1);
+        assert_eq!(response.storage_classes.supported_write_classes, ["STANDARD", "REDUCED_REDUNDANCY"]);
+        assert_eq!(response.storage_classes.unsupported_write_error, "InvalidStorageClass");
+        assert_eq!(response.storage_classes.legacy_label_behavior, "normalized_to_effective_class");
 
         let value = serde_json::to_value(response).expect("runtime capability response should serialize");
         assert_eq!(value["summary"]["site_replication_info"]["state"], "supported");
         assert_eq!(value["summary"]["site_replication_edit"]["state"], "supported");
         assert_eq!(value["summary"]["site_replication_resync"]["state"], "supported");
+        assert_eq!(value["storage_classes"]["contract_version"], 1);
+        assert_eq!(
+            value["storage_classes"]["supported_write_classes"],
+            json!(["STANDARD", "REDUCED_REDUNDANCY"])
+        );
+        assert_eq!(value["storage_classes"]["unsupported_write_error"], "InvalidStorageClass");
+        assert_eq!(value["storage_classes"]["legacy_label_behavior"], "normalized_to_effective_class");
     }
 
     #[test]

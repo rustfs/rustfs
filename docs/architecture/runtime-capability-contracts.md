@@ -59,3 +59,33 @@ owners through read-only providers:
 
 Unsupported or unavailable runtime capabilities are reported as `unsupported`
 or `unknown` contract states instead of activating fallback behavior.
+
+## Storage-Class Write Contract
+
+Authenticated clients discover the storage-class write contract from
+`GET /rustfs/admin/v4/runtime/capabilities`. The additive
+`storage_classes` object is versioned independently from the route:
+
+```json
+{
+  "storage_classes": {
+    "contract_version": 1,
+    "supported_write_classes": ["STANDARD", "REDUCED_REDUNDANCY"],
+    "unsupported_write_error": "InvalidStorageClass",
+    "legacy_label_behavior": "normalized_to_effective_class"
+  }
+}
+```
+
+`supported_write_classes` is the complete client-selectable write allowlist.
+Any other value fails before object or multipart mutation with the stable S3
+error named by `unsupported_write_error`. `legacy_label_behavior` means
+non-transitioned historical label-only metadata is reported as its effective
+local class; actual lifecycle transition tier names remain unchanged.
+
+The values are sourced from
+[`crates/ecstore/src/config/storageclass.rs`](../../crates/ecstore/src/config/storageclass.rs),
+which also owns write validation and response normalization. Consumers must
+branch on `contract_version` before assigning meaning to future fields. The
+admin route continues to require `ServerInfoAdminAction`; capability discovery
+does not weaken authentication or authorization.

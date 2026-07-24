@@ -193,6 +193,21 @@ pub(crate) mod bucket_target_sys {
 }
 
 pub(crate) mod lifecycle {
+    pub(crate) type ManualTransitionRunOptions =
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunOptions;
+    pub(crate) type ManualTransitionRunReport = super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunReport;
+
+    pub(crate) async fn enqueue_transition_for_existing_objects_scoped(
+        api: std::sync::Arc<super::ECStore>,
+        bucket: &str,
+        options: ManualTransitionRunOptions,
+    ) -> super::Result<ManualTransitionRunReport> {
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects_scoped(
+            api, bucket, options,
+        )
+        .await
+    }
+
     pub(crate) mod tier_last_day_stats {
         #[cfg(test)]
         pub(crate) type LastDayTierStats = super::super::ecstore_bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
@@ -375,9 +390,11 @@ pub(crate) mod versioning_sys {
 }
 
 pub(crate) mod storageclass {
+    pub(crate) const CAPABILITY_CONTRACT_VERSION: u32 = super::ecstore_config::storageclass::CAPABILITY_CONTRACT_VERSION;
     #[cfg(test)]
     pub(crate) const CLASS_STANDARD: &str = super::ecstore_config::storageclass::CLASS_STANDARD;
     pub(crate) const INLINE_BLOCK_ENV: &str = super::ecstore_config::storageclass::INLINE_BLOCK_ENV;
+    pub(crate) const LEGACY_LABEL_BEHAVIOR: &str = super::ecstore_config::storageclass::LEGACY_LABEL_BEHAVIOR;
     pub(crate) const OPTIMIZE_ENV: &str = super::ecstore_config::storageclass::OPTIMIZE_ENV;
     #[cfg(test)]
     pub(crate) const RRS: &str = super::ecstore_config::storageclass::RRS;
@@ -385,6 +402,8 @@ pub(crate) mod storageclass {
     #[cfg(test)]
     pub(crate) const STANDARD: &str = super::ecstore_config::storageclass::STANDARD;
     pub(crate) const STANDARD_ENV: &str = super::ecstore_config::storageclass::STANDARD_ENV;
+    pub(crate) const SUPPORTED_WRITE_CLASSES: [&str; 2] = super::ecstore_config::storageclass::SUPPORTED_WRITE_CLASSES;
+    pub(crate) const UNSUPPORTED_WRITE_ERROR: &str = super::ecstore_config::storageclass::UNSUPPORTED_WRITE_ERROR;
 
     pub(crate) type Config = super::ecstore_config::storageclass::Config;
 

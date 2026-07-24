@@ -923,36 +923,29 @@ async fn prepare_tier_mutation_peers(
         error: tier_mutation_fanout_admin_error("prepare", err),
         prepared_peers: Vec::new(),
     })?);
-    let results = join_all(peers.into_iter().map(|peer| {
-        let payload = payload.clone();
-        async move {
-            let label = peer.peer_label();
-            let result = peer.prepare_tier_mutation(mutation_id, payload).await;
-            (peer, label, result)
-        }
-    }))
-    .await;
 
-    let mut prepared = Vec::with_capacity(results.len());
-    let mut failure = None;
-    for (peer, label, result) in results {
+    let mut prepared = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let label = peer.peer_label();
+        let result = peer.prepare_tier_mutation(mutation_id, payload.clone()).await;
         match result {
             Ok(PeerTierMutationState::Prepared) => prepared.push(peer),
             Ok(state) => {
-                failure = Some(tier_mutation_fanout_admin_error(
-                    "prepare",
-                    format!("peer {label} returned unexpected state {state:?}"),
-                ));
+                return Err(TierMutationPrepareFailure {
+                    error: tier_mutation_fanout_admin_error(
+                        "prepare",
+                        format!("peer {label} returned unexpected state {state:?}"),
+                    ),
+                    prepared_peers: prepared,
+                });
             }
-            Err(err) => failure = Some(tier_mutation_fanout_admin_error("prepare", format!("peer {label}: {err}"))),
+            Err(err) => {
+                return Err(TierMutationPrepareFailure {
+                    error: tier_mutation_fanout_admin_error("prepare", format!("peer {label}: {err}")),
+                    prepared_peers: prepared,
+                });
+            }
         }
-    }
-
-    if let Some(err) = failure {
-        return Err(TierMutationPrepareFailure {
-            error: err,
-            prepared_peers: prepared,
-        });
     }
     Ok(prepared)
 }
@@ -5903,6 +5896,126 @@ mod tests {
             self.record(format!("{}:abort:{}", self.label, mutation_id));
             self.abort.map_err(Error::other)
         }
+    }
+
+    struct ConcurrencyTrackingTierMutationPeer {
+        label: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl ConcurrencyTrackingTierMutationPeer {
+        fn boxed(
+            label: &'static str,
+            calls: Arc<Mutex<Vec<String>>>,
+            active: Arc<AtomicUsize>,
+            max_active: Arc<AtomicUsize>,
+        ) -> Arc<dyn TierMutationPeer> {
+            Arc::new(Self {
+                label,
+                calls,
+                active,
+                max_active,
+            })
+        }
+
+        async fn track(&self, action: &str) {
+            let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            lock_unpoisoned(&self.calls).push(format!("{}:{action}", self.label));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TierMutationPeer for ConcurrencyTrackingTierMutationPeer {
+        fn peer_label(&self) -> String {
+            self.label.to_string()
+        }
+
+        async fn prepare_tier_mutation(
+            &self,
+            _mutation_id: uuid::Uuid,
+            _canonical_payload: Bytes,
+        ) -> Result<PeerTierMutationState> {
+            self.track("prepare").await;
+            Ok(PeerTierMutationState::Prepared)
+        }
+
+        async fn commit_tier_mutation(
+            &self,
+            _mutation_id: uuid::Uuid,
+            _canonical_payload: Bytes,
+        ) -> Result<PeerTierMutationState> {
+            self.track("commit").await;
+            Ok(PeerTierMutationState::Committed)
+        }
+
+        async fn abort_tier_mutation(&self, _mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
+            Ok(PeerTierMutationState::Aborted)
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_tier_mutation_peers_serializes_peer_prepare_writes() {
+        let mutation_id = uuid::Uuid::from_u128(34);
+        let intent = prepared_remove_intent("COLD-A", mutation_id);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let prepared = prepare_tier_mutation_peers(
+            mutation_id,
+            vec![
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-a", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-b", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-c", calls.clone(), active.clone(), max_active.clone()),
+            ],
+            &intent,
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("successful prepare fanout should prepare every peer: {}", failure.error.message));
+
+        assert_eq!(prepared.len(), 3);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "peer prepare fanout must not write the same intent concurrently"
+        );
+        assert_eq!(
+            lock_unpoisoned(&calls).as_slice(),
+            &["peer-a:prepare", "peer-b:prepare", "peer-c:prepare"]
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_tier_mutation_peers_keeps_peer_commits_concurrent() {
+        let mutation_id = uuid::Uuid::from_u128(35);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        commit_tier_mutation_peers(
+            mutation_id,
+            vec![
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-a", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-b", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-c", calls.clone(), active.clone(), max_active.clone()),
+            ],
+            "etag-new",
+        )
+        .await
+        .expect("successful commit fanout should commit every peer");
+
+        assert!(
+            max_active.load(Ordering::SeqCst) > 1,
+            "peer commit fanout should remain concurrent after serializing prepare"
+        );
+        let mut calls = lock_unpoisoned(&calls).clone();
+        calls.sort();
+        assert_eq!(calls.as_slice(), &["peer-a:commit", "peer-b:commit", "peer-c:commit"]);
     }
 
     #[tokio::test]

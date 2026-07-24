@@ -903,9 +903,9 @@ pub(crate) mod set_disk {
 }
 
 pub(crate) mod storage_class {
-    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::STANDARD;
     #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::STANDARD_IA;
+    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{RRS, STANDARD_IA};
+    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{STANDARD, effective_class};
 }
 
 pub(crate) mod timeout_wrapper {
@@ -1027,9 +1027,7 @@ pub(crate) mod multipart_usecase {
         }
     }
 
-    pub(crate) use super::{
-        access, bucket, compression, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse,
-    };
+    pub(crate) use super::{access, bucket, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse};
     pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectOptions, StoragePutObjReader};
 }
 
