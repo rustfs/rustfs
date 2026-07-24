@@ -212,6 +212,7 @@ metrics-util = { version = "0.20", features = ["debugging"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 rsa = { workspace = true }
 rcgen = { workspace = true }
+rustfs-test-utils.workspace = true
 # diagnose_e2e fixtures (archives are generated in-test, never checked in)
 zip = { workspace = true }
 zstd = { workspace = true }

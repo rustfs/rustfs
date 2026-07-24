@@ -1124,7 +1124,7 @@ impl Operation for ImportIam {
                     }
 
                     if !owner {
-                        let _ = rustfs_iam::sys::remove_federated_policy_snapshot(&mut req.claims);
+                        let _ = rustfs_iam::sys::remove_verified_federated_policy(&mut req.claims);
                     }
                     let opts = NewServiceAccountOpts {
                         session_policy: sp,

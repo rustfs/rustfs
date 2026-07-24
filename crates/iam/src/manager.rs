@@ -782,6 +782,7 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         if cache.users.contains_key(&cred.access_key) || cache.sts_accounts.contains_key(&cred.access_key) {
             return Err(Error::AccessKeyAlreadyExists);
@@ -800,6 +801,7 @@ where
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
+        let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         let Some(ui) = cache.users.get(name).cloned() else {
             return Err(Error::NoSuchServiceAccount(name.to_string()));
@@ -891,12 +893,13 @@ where
         cr.session_token = jwt_sign(&m, &cr.secret_key)?;
 
         let u = UserIdentity::new(cr);
+        let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
         self.api
             .save_user_identity(&u.credentials.access_key, UserType::Svc, u.clone(), None)
             .await?;
         self.update_user_with_claims(&u.credentials.access_key, u.clone())?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
@@ -1361,9 +1364,24 @@ where
     }
 
     pub async fn delete_user(&self, access_key: &str, utype: UserType) -> Result<()> {
+        self.delete_user_with_revision(access_key, utype).await?;
+        Ok(())
+    }
+
+    pub async fn delete_service_account_with_revision(&self, access_key: &str) -> Result<OffsetDateTime> {
+        self.delete_user_with_revision(access_key, UserType::Svc).await
+    }
+
+    async fn delete_user_with_revision(&self, access_key: &str, utype: UserType) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
+
+        let _service_account_guard = if utype == UserType::Svc {
+            Some(self.cache.service_account_mutation_lock().lock().await)
+        } else {
+            None
+        };
 
         if utype == UserType::Reg {
             let cache = self.cache.snapshot();
@@ -1429,15 +1447,15 @@ where
             return Err(err);
         }
 
+        let deleted_at = OffsetDateTime::now_utc();
         self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
             if utype == UserType::Sts {
-                cache.delete_sts_account(access_key, now);
+                cache.delete_sts_account(access_key, deleted_at);
             }
-            cache.delete_user(access_key, now);
+            cache.delete_user(access_key, deleted_at);
         });
 
-        Ok(())
+        Ok(deleted_at)
     }
 
     pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
@@ -1958,6 +1976,11 @@ where
         Ok(())
     }
     pub async fn user_notification_handler(&self, name: &str, user_type: UserType) -> Result<()> {
+        let _service_account_guard = if user_type == UserType::Svc {
+            Some(self.cache.service_account_mutation_lock().lock().await)
+        } else {
+            None
+        };
         let mut m = HashMap::new();
         if let Err(err) = self.api.load_user_no_lock(name, user_type, &mut m).await {
             if !is_err_no_such_user(&err) {
@@ -2222,9 +2245,10 @@ mod tests {
         collections::HashMap,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+    use tokio::sync::Notify;
 
     #[derive(Clone)]
     struct FailingInitialLoadStore;
@@ -2357,6 +2381,12 @@ mod tests {
         saved_user: Arc<Mutex<Option<UserIdentity>>>,
         load_attempts: Arc<AtomicUsize>,
         visible_after_attempt: usize,
+        block_service_save: Arc<AtomicBool>,
+        service_save_started: Arc<Notify>,
+        release_service_save: Arc<Notify>,
+        block_service_load: Arc<AtomicBool>,
+        service_load_started: Arc<Notify>,
+        release_service_load: Arc<Notify>,
     }
 
     impl DelayedTempUserVisibilityStore {
@@ -2365,6 +2395,12 @@ mod tests {
                 saved_user: Arc::new(Mutex::new(None)),
                 load_attempts: Arc::new(AtomicUsize::new(0)),
                 visible_after_attempt,
+                block_service_save: Arc::new(AtomicBool::new(false)),
+                service_save_started: Arc::new(Notify::new()),
+                release_service_save: Arc::new(Notify::new()),
+                block_service_load: Arc::new(AtomicBool::new(false)),
+                service_load_started: Arc::new(Notify::new()),
+                release_service_load: Arc::new(Notify::new()),
             }
         }
     }
@@ -2390,16 +2426,21 @@ mod tests {
         async fn save_user_identity(
             &self,
             _name: &str,
-            _user_type: UserType,
+            user_type: UserType,
             item: UserIdentity,
             _ttl: Option<usize>,
         ) -> Result<()> {
+            if user_type == UserType::Svc && self.block_service_save.load(Ordering::SeqCst) {
+                self.service_save_started.notify_one();
+                self.release_service_save.notified().await;
+            }
             *self.saved_user.lock().expect("saved_user mutex poisoned") = Some(item);
             Ok(())
         }
 
         async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> Result<()> {
-            Err(Error::InvalidArgument)
+            *self.saved_user.lock().expect("saved_user mutex poisoned") = None;
+            Ok(())
         }
 
         async fn load_user_identity(&self, name: &str, _user_type: UserType) -> Result<UserIdentity> {
@@ -2415,8 +2456,19 @@ mod tests {
                 .ok_or_else(|| Error::NoSuchUser(name.to_string()))
         }
 
-        async fn load_user(&self, _name: &str, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
-            Err(Error::InvalidArgument)
+        async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            let loaded = self
+                .saved_user
+                .lock()
+                .expect("saved_user mutex poisoned")
+                .clone()
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))?;
+            if user_type == UserType::Svc && self.block_service_load.load(Ordering::SeqCst) {
+                self.service_load_started.notify_one();
+                self.release_service_load.notified().await;
+            }
+            m.insert(name.to_string(), loaded);
+            Ok(())
         }
 
         async fn load_users(&self, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
@@ -2485,7 +2537,7 @@ mod tests {
             _is_group: bool,
             _m: &mut HashMap<String, MappedPolicy>,
         ) -> Result<()> {
-            Err(Error::InvalidArgument)
+            Err(Error::NoSuchPolicy)
         }
 
         async fn load_mapped_policies(
@@ -2574,6 +2626,169 @@ mod tests {
             !snapshot.sts_accounts.contains_key(&cred.access_key),
             "cache must not publish a temp user that was not durably visible"
         );
+    }
+
+    #[tokio::test]
+    async fn service_account_notification_cannot_overwrite_concurrent_update() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let access_key = "SERIALIZEDSERVICE01";
+        let secret_key = "serializedServiceSecret123";
+        let metadata = HashMap::from([
+            ("parent".to_string(), Value::String("parent-user".to_string())),
+            (iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string())),
+        ]);
+        let credentials = Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            session_token: jwt_sign(&metadata, secret_key).expect("sign service account token"),
+            status: auth::ACCOUNT_ON.to_string(),
+            parent_user: "parent-user".to_string(),
+            claims: Some(metadata),
+            description: Some("old".to_string()),
+            ..Default::default()
+        };
+        cache.add_service_account(credentials).await.expect("seed service account");
+
+        store.block_service_load.store(true, Ordering::SeqCst);
+        let notification = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.user_notification_handler(access_key, UserType::Svc).await })
+        };
+        store.service_load_started.notified().await;
+
+        let update = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .update_service_account(
+                        access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: None,
+                            secret_key: None,
+                            name: None,
+                            description: Some("new".to_string()),
+                            expiration: None,
+                            status: None,
+                            allow_site_replicator_account: false,
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!update.is_finished(), "update must wait for the in-flight cache refresh");
+
+        store.release_service_load.notify_one();
+        notification.await.expect("notification task").expect("notification refresh");
+        update.await.expect("update task").expect("service account update");
+
+        let snapshot = cache.cache.snapshot();
+        assert_eq!(
+            snapshot
+                .users
+                .get(access_key)
+                .and_then(|identity| identity.credentials.description.as_deref()),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_service_account_create_cannot_overwrite_first_writer() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        store.block_service_save.store(true, Ordering::SeqCst);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let access_key = "SERIALIZEDSERVICE00";
+        let credentials = |secret_key: &str| Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            status: auth::ACCOUNT_ON.to_string(),
+            parent_user: "parent-user".to_string(),
+            ..Default::default()
+        };
+
+        let first = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.add_service_account(credentials("firstServiceSecret123")).await })
+        };
+        store.service_save_started.notified().await;
+
+        let second = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.add_service_account(credentials("secondServiceSecret234")).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished(), "second create must wait for the first writer");
+
+        store.block_service_save.store(false, Ordering::SeqCst);
+        store.release_service_save.notify_waiters();
+        first.await.expect("first create task").expect("first create");
+        let err = second
+            .await
+            .expect("second create task")
+            .expect_err("duplicate create must fail");
+
+        assert_eq!(err, Error::AccessKeyAlreadyExists);
+        assert_eq!(
+            cache
+                .cache
+                .snapshot()
+                .users
+                .get(access_key)
+                .map(|identity| identity.credentials.secret_key.as_str()),
+            Some("firstServiceSecret123")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_account_notification_cannot_restore_concurrent_delete() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let access_key = "SERIALIZEDSERVICE02";
+        let secret_key = "serializedServiceSecret234";
+        let metadata = HashMap::from([
+            ("parent".to_string(), Value::String("parent-user".to_string())),
+            (iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string())),
+        ]);
+        let credentials = Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            session_token: jwt_sign(&metadata, secret_key).expect("sign service account token"),
+            status: auth::ACCOUNT_ON.to_string(),
+            parent_user: "parent-user".to_string(),
+            claims: Some(metadata),
+            ..Default::default()
+        };
+        cache.add_service_account(credentials).await.expect("seed service account");
+
+        store.block_service_load.store(true, Ordering::SeqCst);
+        let notification = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.user_notification_handler(access_key, UserType::Svc).await })
+        };
+        store.service_load_started.notified().await;
+
+        let delete = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.delete_service_account_with_revision(access_key).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished(), "delete must wait for the in-flight cache refresh");
+
+        store.release_service_load.notify_one();
+        notification.await.expect("notification task").expect("notification refresh");
+        delete.await.expect("delete task").expect("service account delete");
+
+        assert!(!cache.cache.snapshot().users.contains_key(access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
     }
 
     #[tokio::test]

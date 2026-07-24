@@ -14,7 +14,7 @@
 
 use super::iam_error::iam_error_to_s3_error;
 use crate::admin::access_key_identity;
-use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
+use crate::admin::handlers::site_replication::{encode_service_account_replication_policy, site_replication_iam_change_hook};
 use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
@@ -30,7 +30,7 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials as StoredCredentials;
 use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
-use rustfs_iam::sys::{NewServiceAccountOpts, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, UpdateServiceAccountOpts};
+use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
 use rustfs_madmin::{
     ACCESS_KEY_LIST_ALL, ACCESS_KEY_LIST_STS_ONLY, ACCESS_KEY_LIST_SVCACC_ONLY, ACCESS_KEY_LIST_USERS_ONLY, AddServiceAccountReq,
     AddServiceAccountResp, Credentials, InfoServiceAccountResp, ListAccessKeysResp, ListServiceAccountsResp,
@@ -38,7 +38,7 @@ use rustfs_madmin::{
     ServiceAccountInfo, TemporaryAccountInfoResp, UpdateServiceAccountReq,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_policy::policy::{Args, Policy};
+use rustfs_policy::policy::{Args, DEFAULT_VERSION, Policy};
 use s3s::S3ErrorCode::InvalidRequest;
 use s3s::header::CONTENT_LENGTH;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
@@ -52,14 +52,36 @@ use url::form_urlencoded;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_SERVICE_ACCOUNT: &str = "service_account";
 const EVENT_ADMIN_SERVICE_ACCOUNT_STATE: &str = "admin_service_account_state";
+const EMPTY_EXPLICIT_SERVICE_ACCOUNT_POLICY: &str =
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#;
 
-fn sr_session_policy_from_value(value: Option<&serde_json::Value>) -> S3Result<SRSessionPolicy> {
-    let Some(value) = value else {
+fn sr_session_policy_from_policy(policy: Option<&Policy>) -> S3Result<SRSessionPolicy> {
+    let Some(policy) = policy else {
         return Ok(SRSessionPolicy::default());
     };
 
-    let raw = serde_json::to_string(value).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+    let raw = serde_json::to_string(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
     SRSessionPolicy::from_json(&raw).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))
+}
+
+fn normalize_service_account_policy(mut policy: Policy) -> S3Result<Policy> {
+    if policy.statements.is_empty() && (!policy.id.is_empty() || !policy.version.is_empty()) {
+        let id = policy.id;
+        policy = Policy::parse_config(EMPTY_EXPLICIT_SERVICE_ACCOUNT_POLICY.as_bytes())
+            .map_err(|e| s3_error!(InternalError, "parse empty service account policy failed: {:?}", e))?;
+        policy.id = id;
+    } else if policy.version.is_empty() && !policy.statements.is_empty() {
+        policy.version = DEFAULT_VERSION.to_string();
+    }
+    Ok(policy)
+}
+
+fn parse_new_service_account_policy(policy: Option<&serde_json::Value>) -> S3Result<Option<Policy>> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let policy = normalize_service_account_policy(parse_service_account_policy(policy)?)?;
+    Ok((!policy.id.is_empty() || !policy.version.is_empty() || !policy.statements.is_empty()).then_some(policy))
 }
 
 fn compat_time_sentinel() -> OffsetDateTime {
@@ -84,34 +106,6 @@ fn delete_service_account_success_status(path: &str) -> StatusCode {
     } else {
         StatusCode::OK
     }
-}
-
-fn merge_derived_service_account_claims(
-    target_claims: &mut HashMap<String, serde_json::Value>,
-    source_claims: &HashMap<String, serde_json::Value>,
-    federated_snapshot: Option<HashMap<String, serde_json::Value>>,
-    has_child_session_policy: bool,
-) -> bool {
-    for (key, value) in source_claims {
-        if key == "exp" {
-            continue;
-        }
-        target_claims.insert(key.clone(), value.clone());
-    }
-    let inherited_snapshot = rustfs_iam::sys::remove_federated_policy_snapshot(target_claims);
-    let Some(snapshot) = federated_snapshot else {
-        return !inherited_snapshot;
-    };
-    target_claims.remove(SESSION_POLICY_NAME);
-    target_claims.remove(SESSION_POLICY_NAME_EXTRACTED);
-    target_claims.extend(snapshot);
-    if !has_child_session_policy {
-        target_claims.insert(
-            SESSION_POLICY_NAME.to_string(),
-            serde_json::Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(b"{}")),
-        );
-    }
-    true
 }
 
 fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
@@ -226,6 +220,27 @@ fn parse_update_service_account_policy(new_policy: Option<serde_json::Value>) ->
     Ok(Some(parse_service_account_policy(&policy)?))
 }
 
+fn service_account_update_replication_change(
+    access_key: &str,
+    update: &UpdateServiceAccountReq,
+    session_policy: Option<&Policy>,
+) -> S3Result<SRSvcAccChange> {
+    Ok(SRSvcAccChange {
+        update: Some(SRSvcAccUpdate {
+            access_key: access_key.to_string(),
+            secret_key: update.new_secret_key.clone().unwrap_or_default(),
+            status: update.new_status.clone().unwrap_or_default(),
+            name: update.new_name.clone().unwrap_or_default(),
+            description: update.new_description.clone().unwrap_or_default(),
+            session_policy: sr_session_policy_from_policy(session_policy)?,
+            expiration: update.new_expiration,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        }),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    })
+}
+
 pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
@@ -309,11 +324,12 @@ impl Operation for AddServiceAccount {
 
         create_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
-        let session_policy = if let Some(policy) = &create_req.policy {
-            Some(parse_service_account_policy(policy)?)
-        } else {
-            None
-        };
+        let session_policy = parse_new_service_account_policy(create_req.policy.as_ref())?;
+        let replication_policy = session_policy
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
 
         let Some(sys_cred) = current_action_credentials() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
@@ -374,15 +390,6 @@ impl Operation for AddServiceAccount {
         }
 
         let is_svc_acc = target_user == req_user || target_user == req_parent_user;
-        let federated_snapshot = if is_svc_acc && !cred.is_service_account() {
-            iam_store
-                .federated_service_account_claims(cred.claims_or_empty())
-                .await
-                .map_err(|_| s3_error!(AccessDenied, "access denied"))?
-        } else {
-            None
-        };
-
         // GHSA-5354: confine a non-owner caller to its own scope so it cannot mint
         // a root-parented (owner) service account. Evaluated on the original
         // `target_user` the caller submitted, before the derived-credential rewrite
@@ -394,7 +401,7 @@ impl Operation for AddServiceAccount {
         }
 
         let mut target_groups = None;
-        let mut opts = NewServiceAccountOpts {
+        let opts = NewServiceAccountOpts {
             access_key: create_req.access_key,
             secret_key: create_req.secret_key,
             name: create_req.name,
@@ -413,51 +420,44 @@ impl Operation for AddServiceAccount {
             }
 
             target_groups = req_groups;
-
-            if let Some(claims) = cred.claims
-                && !merge_derived_service_account_claims(
-                    opts.claims.get_or_insert_default(),
-                    &claims,
-                    federated_snapshot,
-                    opts.session_policy.is_some(),
-                )
-            {
-                return Err(s3_error!(AccessDenied, "access denied"));
-            }
         }
 
-        let replication_claims = opts.claims.clone().unwrap_or_default();
-        let replication_policy = create_req
-            .policy
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
         let replication_groups = target_groups.clone().unwrap_or_default();
         let replication_name = opts.name.clone().unwrap_or_default();
         let replication_description = opts.description.clone().unwrap_or_default();
         let replication_expiration = opts.expiration;
 
-        let (new_cred, _) = iam_store
-            .new_service_account(&target_user, target_groups, opts)
-            .await
-            .map_err(|e| {
-                debug!(
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
-                    event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
-                    target_user = %target_user,
-                    result = "create_failed",
-                    error = ?e,
-                    "admin service account state"
-                );
-                match e {
-                    rustfs_iam::error::Error::InvalidAccessKeyLength
-                    | rustfs_iam::error::Error::InvalidSecretKeyLength
-                    | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(e),
-                    err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
-                }
-            })?;
+        let create_result = if is_svc_acc {
+            iam_store
+                .new_service_account_from_caller(&target_user, target_groups, opts, &cred)
+                .await
+        } else {
+            let replication_claims = opts.claims.clone().unwrap_or_default();
+            iam_store
+                .new_service_account(&target_user, target_groups, opts)
+                .await
+                .map(|(credentials, updated_at)| (credentials, updated_at, replication_claims))
+        };
+        let (new_cred, updated_at, mut replication_claims) = create_result.map_err(|e| {
+            debug!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                target_user = %target_user,
+                result = "create_failed",
+                error = ?e,
+                "admin service account state"
+            );
+            match e {
+                rustfs_iam::error::Error::InvalidAccessKeyLength
+                | rustfs_iam::error::Error::InvalidSecretKeyLength
+                | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(e),
+                rustfs_iam::error::Error::IAMActionNotAllowed => s3_error!(AccessDenied, "access denied"),
+                err => s3_error!(InternalError, "create service account failed, e: {:?}", err),
+            }
+        })?;
+        let replication_session_policy =
+            encode_service_account_replication_policy(&mut replication_claims, replication_policy.as_deref())?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "service-account".to_string(),
@@ -468,12 +468,7 @@ impl Operation for AddServiceAccount {
                     secret_key: new_cred.secret_key.clone(),
                     groups: replication_groups,
                     claims: replication_claims,
-                    session_policy: replication_policy
-                        .as_deref()
-                        .map(SRSessionPolicy::from_json)
-                        .transpose()
-                        .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?
-                        .unwrap_or_default(),
+                    session_policy: replication_session_policy,
                     status: String::new(),
                     name: replication_name,
                     description: replication_description,
@@ -483,7 +478,7 @@ impl Operation for AddServiceAccount {
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
             }),
-            updated_at: Some(OffsetDateTime::now_utc()),
+            updated_at: Some(updated_at),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         })
@@ -647,6 +642,7 @@ impl Operation for UpdateServiceAccount {
         let new_policy = update_req.new_policy.clone();
 
         let sp = parse_update_service_account_policy(new_policy.clone())?;
+        let svc_acc_change = service_account_update_replication_change(&access_key, &update_req, sp.as_ref())?;
 
         let opts = UpdateServiceAccountOpts {
             secret_key: new_secret_key.clone(),
@@ -665,20 +661,7 @@ impl Operation for UpdateServiceAccount {
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "service-account".to_string(),
-            svc_acc_change: Some(SRSvcAccChange {
-                update: Some(SRSvcAccUpdate {
-                    access_key: access_key.clone(),
-                    secret_key: new_secret_key.unwrap_or_default(),
-                    status: new_status.unwrap_or_default(),
-                    name: new_name.unwrap_or_default(),
-                    description: new_description.unwrap_or_default(),
-                    session_policy: sr_session_policy_from_value(new_policy.as_ref())?,
-                    expiration: new_expiration,
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                }),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            }),
+            svc_acc_change: Some(svc_acc_change),
             updated_at: Some(updated_at),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
@@ -1379,33 +1362,37 @@ impl Operation for DeleteServiceAccount {
             }
         }
 
-        iam_store.delete_service_account(&query.access_key, true).await.map_err(|e| {
-            debug!(
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
-                event = "service_account_delete_failed",
-                access_key = %query.access_key,
-                error = ?e,
-                "Failed to delete service account"
-            );
-            s3_error!(InternalError, "delete service account failed")
-        })?;
+        let deleted_at = iam_store
+            .delete_service_account_with_revision(&query.access_key, true)
+            .await
+            .map_err(|e| {
+                debug!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                    event = "service_account_delete_failed",
+                    access_key = %query.access_key,
+                    error = ?e,
+                    "Failed to delete service account"
+                );
+                s3_error!(InternalError, "delete service account failed")
+            })?;
 
-        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
-            r#type: "service-account".to_string(),
-            svc_acc_change: Some(SRSvcAccChange {
-                delete: Some(SRSvcAccDelete {
-                    access_key: query.access_key.clone(),
+        if let Some(deleted_at) = deleted_at
+            && let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+                r#type: "service-account".to_string(),
+                svc_acc_change: Some(SRSvcAccChange {
+                    delete: Some(SRSvcAccDelete {
+                        access_key: query.access_key.clone(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    }),
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
                 }),
+                updated_at: Some(deleted_at),
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
-            }),
-            updated_at: Some(OffsetDateTime::now_utc()),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
-        .await
+            })
+            .await
         {
             warn!(
                 component = LOG_COMPONENT_ADMIN,
@@ -1741,6 +1728,81 @@ mod tests {
     }
 
     #[test]
+    fn sparse_explicit_create_policy_is_normalized_before_persistence_and_replication() {
+        let id_only = parse_new_service_account_policy(Some(&json!({"ID": "deny-boundary", "Version": "", "Statement": []})))
+            .expect("ID-only policy should normalize")
+            .expect("normalized explicit policy");
+        assert_eq!(id_only.id.as_str(), "deny-boundary");
+        assert_eq!(id_only.version, DEFAULT_VERSION);
+        assert!(!id_only.statements.is_empty());
+
+        let missing_version = parse_new_service_account_policy(Some(&json!({
+            "Statement": [{
+                "Effect": "Deny",
+                "Action": ["s3:GetObject"],
+                "Resource": ["arn:aws:s3:::bucket/*"]
+            }]
+        })))
+        .expect("policy version should normalize")
+        .expect("normalized explicit policy");
+        assert_eq!(missing_version.version, DEFAULT_VERSION);
+    }
+
+    #[test]
+    fn explicit_empty_create_policy_is_canonicalized_as_inherited() {
+        let policy = parse_new_service_account_policy(Some(&json!({}))).expect("parse empty create policy");
+
+        assert!(policy.is_none());
+    }
+
+    #[test]
+    fn sparse_explicit_update_policy_preserves_existing_semantics() {
+        let id_only = parse_update_service_account_policy(Some(json!({"ID": "clear-boundary", "Version": "", "Statement": []})))
+            .expect("parse ID-only update")
+            .expect("explicit update policy");
+        assert_eq!(id_only.id.as_str(), "clear-boundary");
+        assert!(id_only.version.is_empty());
+        assert!(id_only.statements.is_empty());
+
+        let missing_version = parse_update_service_account_policy(Some(json!({
+            "Statement": [{
+                "Effect": "Deny",
+                "Action": ["s3:GetObject"],
+                "Resource": ["arn:aws:s3:::bucket/*"]
+            }]
+        })))
+        .expect("parse versionless update")
+        .expect("explicit update policy");
+        assert!(missing_version.version.is_empty());
+        assert!(!missing_version.statements.is_empty());
+    }
+
+    #[test]
+    fn replication_update_stays_partial() {
+        let update = UpdateServiceAccountReq {
+            new_policy: Some(json!({})),
+            new_secret_key: None,
+            new_status: None,
+            new_name: None,
+            new_description: None,
+            new_expiration: None,
+        };
+
+        let session_policy = parse_update_service_account_policy(update.new_policy.clone()).expect("parse update policy");
+        let change = service_account_update_replication_change("OIDCSERVICEACCOUNT01", &update, session_policy.as_ref())
+            .expect("build replication update");
+
+        assert!(change.create.is_none());
+        assert!(change.delete.is_none());
+        let update = change.update.expect("partial update");
+        let cleared: Policy =
+            serde_json::from_str(update.session_policy.as_str().expect("explicit policy clear")).expect("parse policy clear");
+        assert!(cleared.id.is_empty());
+        assert!(cleared.version.is_empty());
+        assert!(cleared.statements.is_empty());
+    }
+
+    #[test]
     fn parse_service_account_policy_reports_missing_resource() {
         let err = parse_service_account_policy(&json!({
             "Version": "2012-10-17",
@@ -1799,53 +1861,6 @@ mod tests {
         assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
         assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
         assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
-    }
-
-    #[test]
-    fn merge_derived_service_account_claims_strips_non_inheritable_claims() {
-        let mut merged = HashMap::new();
-        let source = HashMap::from([
-            ("exp".to_string(), json!(123456)),
-            ("parent".to_string(), json!("owner-user")),
-            ("custom".to_string(), json!("value")),
-            ("x-rustfs-internal-federated-policy".to_string(), json!(true)),
-            ("x-rustfs-internal-federated-boundary".to_string(), json!("boundary")),
-        ]);
-
-        assert!(!merge_derived_service_account_claims(&mut merged, &source, None, false));
-
-        assert!(!merged.contains_key("exp"));
-        assert!(!merged.contains_key("x-rustfs-internal-federated-policy"));
-        assert!(!merged.contains_key("x-rustfs-internal-federated-boundary"));
-        assert_eq!(merged.get("parent"), Some(&json!("owner-user")));
-        assert_eq!(merged.get("custom"), Some(&json!("value")));
-    }
-
-    #[test]
-    fn merge_federated_snapshot_keeps_legacy_root_guard() {
-        let mut merged = HashMap::new();
-        let source = HashMap::from([
-            (SESSION_POLICY_NAME.to_string(), json!("parent-session")),
-            (SESSION_POLICY_NAME_EXTRACTED.to_string(), json!("parent-session-json")),
-        ]);
-        let snapshot = HashMap::from([("snapshot".to_string(), json!(true))]);
-
-        assert!(merge_derived_service_account_claims(&mut merged, &source, Some(snapshot), false));
-        assert_eq!(
-            merged.get(SESSION_POLICY_NAME),
-            Some(&json!(base64_simd::URL_SAFE_NO_PAD.encode_to_string(b"{}")))
-        );
-        assert!(!merged.contains_key(SESSION_POLICY_NAME_EXTRACTED));
-        assert_eq!(merged.get("snapshot"), Some(&json!(true)));
-    }
-
-    #[test]
-    fn merge_federated_snapshot_does_not_replace_child_session_policy() {
-        let mut merged = HashMap::new();
-        let source = HashMap::from([(SESSION_POLICY_NAME.to_string(), json!("parent-session"))]);
-
-        assert!(merge_derived_service_account_claims(&mut merged, &source, Some(HashMap::new()), true,));
-        assert!(!merged.contains_key(SESSION_POLICY_NAME));
     }
 
     #[test]
