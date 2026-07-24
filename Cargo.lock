@@ -3676,6 +3676,8 @@ dependencies = [
  "hyper-util",
  "local-ip-address",
  "md5",
+ "opentelemetry-proto",
+ "prost 0.14.4",
  "rand 0.10.2",
  "rcgen",
  "reqwest",

@@ -24,7 +24,6 @@ use super::storage_api::multipart_usecase::bucket::{
     replication::{must_replicate_object, schedule_object_replication},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::multipart_usecase::compression::is_disk_compressible;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _, MultipartUploadResult};
@@ -37,7 +36,7 @@ use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_n
 use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan};
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
@@ -691,13 +690,8 @@ impl DefaultMultipartUsecase {
             None => (None, None),
         };
 
-        if is_disk_compressible(&req.headers, &key) {
-            rustfs_utils::http::insert_str(
-                &mut metadata,
-                rustfs_utils::http::SUFFIX_COMPRESSION,
-                compression_metadata_value(CompressionAlgorithm::default()),
-            );
-        }
+        // Multipart parts are independent physical streams. Advertising object-level
+        // compression here would make GET decode the completed object as one stream.
 
         let mt2 = metadata.clone();
         let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
