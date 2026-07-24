@@ -23,9 +23,13 @@
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use crate::crash_inject::{self, CrashPoint};
+use crate::multipart_listing::paginate_multipart_listing;
+use futures::{StreamExt, stream};
 use std::future::Future;
 use std::time::Duration;
 use tokio::task::JoinSet;
+
+const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -234,6 +238,51 @@ fn paginate_upload_page(remaining: &[MultipartInfo], max_uploads: usize) -> (Vec
         None
     };
     (page, is_truncated, next_upload_id_marker)
+}
+
+async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str) -> disk::error::Result<Vec<String>> {
+    if !disk.is_online().await {
+        return Err(DiskError::DiskNotFound);
+    }
+
+    let sha_dirs = match disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, "", -1).await {
+        Ok(entries) => entries,
+        Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+
+    let sha_dirs = sha_dirs
+        .into_iter()
+        .map(|sha_dir| sha_dir.trim_end_matches('/').to_owned())
+        .filter(|sha_dir| sha_dir.len() == 64 && sha_dir.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .collect::<Vec<_>>();
+    let listed_upload_dirs = stream::iter(sha_dirs)
+        .map(|sha_dir| {
+            let disk = disk.clone();
+            async move {
+                match disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1).await {
+                    Ok(entries) => Ok((sha_dir, entries)),
+                    Err(DiskError::FileNotFound) => Ok((sha_dir, Vec::new())),
+                    Err(err) => Err(err),
+                }
+            }
+        })
+        .buffer_unordered(MULTIPART_LIST_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut upload_paths = Vec::new();
+    for listed_upload_dirs in listed_upload_dirs {
+        let (sha_dir, upload_dirs) = listed_upload_dirs?;
+        upload_paths.reserve(upload_dirs.len());
+        upload_paths.extend(upload_dirs.into_iter().filter_map(|upload_dir| {
+            let upload_dir = upload_dir.trim_end_matches('/');
+            (!upload_dir.is_empty() && upload_dir != "." && upload_dir != ".." && !upload_dir.contains(['/', '\\']))
+                .then(|| format!("{sha_dir}/{upload_dir}"))
+        }));
+    }
+
+    Ok(upload_paths)
 }
 
 impl SetDisks {
@@ -843,131 +892,184 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
     async fn list_multipart_uploads(
         &self,
         bucket: &str,
-        object: &str,
+        prefix: &str,
         key_marker: Option<String>,
         upload_id_marker: Option<String>,
         delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        let disks = {
-            let disks = self.get_online_local_disks().await;
-            if disks.is_empty() {
-                // TODO: getOnlineDisksWithHealing
-                self.get_online_disks().await
-            } else {
-                disks
-            }
+        let disks = self.disks.read().await.clone();
+        if disks.is_empty() {
+            return Err(Error::ErasureReadQuorum);
+        }
+        let discovery_quorum = if self.default_parity_count == 0 {
+            disks.len()
+        } else {
+            (disks.len() / 2).max(1)
         };
-
-        let mut upload_ids: Vec<String> = Vec::new();
-
-        for disk in disks.iter().flatten() {
-            if !disk.is_online().await {
-                continue;
-            }
-
-            let has_uoload_ids = match disk
-                .list_dir(
-                    bucket,
-                    RUSTFS_META_MULTIPART_BUCKET,
-                    Self::get_multipart_sha_dir(bucket, object).as_str(),
-                    -1,
-                )
-                .await
-            {
-                Ok(res) => Some(res),
-                Err(err) => {
-                    if err == DiskError::DiskNotFound {
-                        None
-                    } else if err == DiskError::FileNotFound {
-                        return Ok(ListMultipartsInfo {
-                            key_marker: key_marker.to_owned(),
-                            max_uploads,
-                            prefix: object.to_owned(),
-                            delimiter: delimiter.to_owned(),
-                            ..Default::default()
-                        });
-                    } else {
-                        return Err(to_object_err(err.into(), vec![bucket, object]));
-                    }
-                }
-            };
-
-            if let Some(ids) = has_uoload_ids {
-                upload_ids = ids;
-                break;
-            }
-        }
-
-        let mut uploads = Vec::new();
-
-        let mut populated_upload_ids = HashSet::new();
-
-        for upload_id in upload_ids.iter() {
-            let upload_id = upload_id.trim_end_matches(SLASH_SEPARATOR).to_string();
-            if populated_upload_ids.contains(&upload_id) {
-                continue;
-            }
-
-            let start_time = {
-                let now = OffsetDateTime::now_utc();
-
-                let splits: Vec<&str> = upload_id.split("x").collect();
-                if splits.len() == 2 {
-                    if let Ok(unix) = splits[1].parse::<i128>() {
-                        OffsetDateTime::from_unix_timestamp_nanos(unix)?
-                    } else {
-                        now
-                    }
-                } else {
-                    now
-                }
-            };
-
-            uploads.push(MultipartInfo {
-                bucket: bucket.to_owned(),
-                object: object.to_owned(),
-                upload_id: runtime_sources::deployment_upload_id(&upload_id),
-                initiated: Some(start_time),
-                ..Default::default()
+        let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
+        let mut candidate_counts = HashMap::<String, usize>::new();
+        let mut discovery_tasks = JoinSet::new();
+        for (index, disk) in disks.iter().enumerate() {
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            discovery_tasks.spawn(async move {
+                let result = match disk {
+                    Some(disk) => multipart_upload_paths_on_disk(disk, &bucket).await,
+                    None => Err(DiskError::DiskNotFound),
+                };
+                (index, result)
             });
-
-            populated_upload_ids.insert(upload_id);
         }
 
-        uploads.sort_by_key(|a| a.initiated);
-
-        let mut upload_idx = 0;
-        if let Some(upload_id_marker) = &upload_id_marker {
-            while upload_idx < uploads.len() {
-                if &uploads[upload_idx].upload_id != upload_id_marker {
-                    upload_idx += 1;
-                    continue;
+        while let Some(task_result) = discovery_tasks.join_next().await {
+            let Ok((index, result)) = task_result else {
+                continue;
+            };
+            match result {
+                Ok(paths) => {
+                    discovery_errors[index] = None;
+                    for path in paths {
+                        *candidate_counts.entry(path).or_insert(0) += 1;
+                    }
                 }
-
-                if &uploads[upload_idx].upload_id == upload_id_marker {
-                    upload_idx += 1;
-                    break;
-                }
-
-                upload_idx += 1;
+                Err(err) => discovery_errors[index] = Some(err),
             }
         }
 
-        // `upload_idx` is the post-marker offset, so `uploads[upload_idx..]` is the
-        // page candidate. The helper applies the `max_uploads` cap, using the first
-        // overflow element only as a truncation probe (never returned).
-        let (ret_uploads, is_truncated, next_upload_id_marker) = paginate_upload_page(&uploads[upload_idx..], max_uploads);
+        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
+            return Err(to_object_err(err.into(), vec![bucket, prefix]));
+        }
+
+        let candidate_paths = candidate_counts
+            .into_iter()
+            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
+            .collect::<Vec<_>>();
+        let listed_uploads = stream::iter(candidate_paths)
+            .map(|upload_path| {
+                let disks = &disks;
+                async move {
+                    let (sha_dir, raw_upload_id) = upload_path
+                        .rsplit_once('/')
+                        .filter(|(sha_dir, upload_id)| !sha_dir.is_empty() && !upload_id.is_empty())
+                        .ok_or(DiskError::CorruptedFormat)?;
+                    let (parts_metadata, errs) = Self::read_all_fileinfo(
+                        disks,
+                        bucket,
+                        RUSTFS_META_MULTIPART_BUCKET,
+                        &upload_path,
+                        "",
+                        false,
+                        false,
+                        false,
+                    )
+                    .await?;
+                    let missing_metadata = errs
+                        .iter()
+                        .filter(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::VolumeNotFound)))
+                        .count();
+                    if missing_metadata >= discovery_quorum {
+                        // Completion moves the authoritative upload metadata into the
+                        // committed object before it removes the staging directory. A
+                        // crash in that window intentionally leaves a reclaimable
+                        // upload directory whose object name can still be proven for
+                        // an exact-key listing by matching the namespace hash.
+                        if !prefix.is_empty() && sha_dir == Self::get_multipart_sha_dir(bucket, prefix) {
+                            let initiated = raw_upload_id
+                                .rsplit_once('x')
+                                .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
+                                .and_then(|timestamp| OffsetDateTime::from_unix_timestamp_nanos(timestamp).ok());
+                            return Ok(Some(MultipartInfo {
+                                bucket: bucket.to_owned(),
+                                object: prefix.to_owned(),
+                                upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
+                                initiated,
+                                ..Default::default()
+                            }));
+                        }
+                        return Ok(None);
+                    }
+                    let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+                    let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
+                    if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+                        return Err(err);
+                    }
+                    let (_, mod_time, etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
+                    let file_info = Self::pick_valid_fileinfo(&parts_metadata, mod_time, etag, read_quorum)?;
+
+                    let object = match (
+                        file_info.metadata.get(RUSTFS_MULTIPART_BUCKET_KEY),
+                        file_info.metadata.get(RUSTFS_MULTIPART_OBJECT_KEY),
+                    ) {
+                        (Some(stored_bucket), Some(object)) if stored_bucket == bucket && !object.is_empty() => object.clone(),
+                        _ => return Err(DiskError::CorruptedFormat),
+                    };
+                    if !object.starts_with(prefix) {
+                        return Ok(None);
+                    }
+
+                    let initiated = raw_upload_id
+                        .rsplit_once('x')
+                        .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
+                        .and_then(|timestamp| OffsetDateTime::from_unix_timestamp_nanos(timestamp).ok())
+                        .or(file_info.mod_time);
+
+                    Ok(Some(MultipartInfo {
+                        bucket: bucket.to_owned(),
+                        object,
+                        upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
+                        initiated,
+                        ..Default::default()
+                    }))
+                }
+            })
+            .buffer_unordered(MULTIPART_LIST_IO_CONCURRENCY)
+            .collect::<Vec<disk::error::Result<Option<MultipartInfo>>>>()
+            .await;
+
+        let mut uploads = Vec::with_capacity(listed_uploads.len());
+        for result in listed_uploads {
+            if let Some(upload) = result.map_err(Error::from)? {
+                uploads.push(upload);
+            }
+        }
+
+        let mut common_prefixes = HashSet::new();
+        let mut unfolded_uploads = Vec::with_capacity(uploads.len());
+        let delimiter_value = delimiter.as_deref().filter(|delimiter| !delimiter.is_empty());
+        for upload in uploads {
+            let Some(delimiter) = delimiter_value else {
+                unfolded_uploads.push(upload);
+                continue;
+            };
+            let suffix = upload.object.strip_prefix(prefix).ok_or(DiskError::CorruptedFormat)?;
+            if let Some((common_prefix, _)) = suffix.split_once(delimiter) {
+                common_prefixes.insert(format!("{prefix}{common_prefix}{delimiter}"));
+            } else {
+                unfolded_uploads.push(upload);
+            }
+        }
+
+        let page = paginate_multipart_listing(
+            unfolded_uploads,
+            common_prefixes.into_iter().collect(),
+            key_marker.as_deref(),
+            key_marker.as_ref().and(upload_id_marker.as_deref()),
+            max_uploads,
+            false,
+        );
 
         Ok(ListMultipartsInfo {
             key_marker: key_marker.to_owned(),
-            next_upload_id_marker,
+            upload_id_marker: upload_id_marker.to_owned(),
+            next_key_marker: page.next_key_marker,
+            next_upload_id_marker: page.next_upload_id_marker,
             max_uploads,
-            is_truncated,
-            uploads: ret_uploads,
-            prefix: object.to_owned(),
+            is_truncated: page.is_truncated,
+            uploads: page.uploads,
+            common_prefixes: page.common_prefixes,
+            prefix: prefix.to_owned(),
             delimiter: delimiter.to_owned(),
-            ..Default::default()
         })
     }
 
@@ -3112,11 +3214,12 @@ mod tests {
         // Paginating one upload at a time must enumerate every upload exactly once,
         // with no gaps and no duplicates, and terminate.
         let mut seen = HashSet::new();
-        let mut marker: Option<String> = None;
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
         let mut pages = 0usize;
         loop {
             let page = set_disks
-                .list_multipart_uploads(bucket, object, None, marker.clone(), None, 1)
+                .list_multipart_uploads(bucket, object, key_marker.clone(), upload_id_marker.clone(), None, 1)
                 .await
                 .expect("list should succeed");
             assert!(page.uploads.len() <= 1, "max_uploads=1 must never return more than one upload");
@@ -3132,13 +3235,176 @@ mod tests {
             if !page.is_truncated {
                 break;
             }
-            marker = page.next_upload_id_marker.clone();
-            assert!(marker.is_some(), "a truncated page must carry a next marker to continue");
+            key_marker = page.next_key_marker.clone();
+            upload_id_marker = page.next_upload_id_marker.clone();
+            assert!(key_marker.is_some(), "a truncated page must carry a next key marker");
+            assert!(upload_id_marker.is_some(), "a truncated upload page must carry a next upload marker");
         }
         assert_eq!(
             seen, created,
             "single-upload pagination must enumerate every upload with no loss or duplication"
         );
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_enumerates_bucket_and_prefix() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-prefix-list-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut expected = Vec::new();
+        for object in ["logs/a.bin", "logs/a.bin", "logs/b.bin", "other/c.bin"] {
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+            expected.push((object.to_string(), upload.upload_id));
+        }
+        expected.sort();
+
+        let all = set_disks
+            .list_multipart_uploads(bucket, "", None, None, None, 1000)
+            .await
+            .expect("bucket-wide multipart listing should succeed");
+        let listed = all
+            .uploads
+            .iter()
+            .map(|upload| (upload.object.clone(), upload.upload_id.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(listed, expected);
+        assert!(!all.is_truncated);
+
+        let logs = set_disks
+            .list_multipart_uploads(bucket, "logs/", None, None, None, 1000)
+            .await
+            .expect("prefix multipart listing should succeed");
+        assert_eq!(logs.uploads.len(), 3);
+        assert!(logs.uploads.iter().all(|upload| upload.object.starts_with("logs/")));
+
+        let exact = set_disks
+            .list_multipart_uploads(bucket, "logs/a.bin", None, None, None, 1000)
+            .await
+            .expect("exact-key multipart listing should remain supported");
+        assert_eq!(exact.uploads.len(), 2);
+        assert!(exact.uploads.iter().all(|upload| upload.object == "logs/a.bin"));
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_paginates_across_same_key_boundary() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-prefix-page-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut expected = Vec::new();
+        for object in ["logs/a.bin", "logs/a.bin", "logs/b.bin"] {
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+            expected.push((object.to_string(), upload.upload_id));
+        }
+        expected.sort();
+
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+        let mut listed = Vec::new();
+        for _ in 0..expected.len() {
+            let page = set_disks
+                .list_multipart_uploads(bucket, "logs/", key_marker.clone(), upload_id_marker.clone(), None, 1)
+                .await
+                .expect("multipart page should succeed");
+            assert_eq!(page.uploads.len(), 1);
+            listed.push((page.uploads[0].object.clone(), page.uploads[0].upload_id.clone()));
+            if !page.is_truncated {
+                break;
+            }
+            key_marker = page.next_key_marker;
+            upload_id_marker = page.next_upload_id_marker;
+            assert!(key_marker.is_some());
+            assert!(upload_id_marker.is_some());
+        }
+
+        assert_eq!(listed, expected);
+
+        let key_only = set_disks
+            .list_multipart_uploads(bucket, "logs/", Some("logs/a.bin".to_string()), None, None, 1000)
+            .await
+            .expect("key-only marker should succeed");
+        assert_eq!(
+            key_only
+                .uploads
+                .iter()
+                .map(|upload| upload.object.as_str())
+                .collect::<Vec<_>>(),
+            vec!["logs/b.bin"]
+        );
+
+        let upload_only = set_disks
+            .list_multipart_uploads(bucket, "logs/", None, Some(expected[0].1.clone()), None, 1000)
+            .await
+            .expect("an upload marker without a key marker should be ignored");
+        assert_eq!(upload_only.uploads.len(), expected.len());
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_folds_delimiter_and_paginates_prefixes() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-delimiter-list-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        for object in [
+            "logs/2025",
+            "logs/2025/a.bin",
+            "logs/2026/b.bin",
+            "logs/root.bin",
+            "other/c.bin",
+        ] {
+            set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+        }
+
+        let first = set_disks
+            .list_multipart_uploads(bucket, "logs/", None, None, Some("/".to_string()), 2)
+            .await
+            .expect("delimiter multipart listing should succeed");
+        assert_eq!(first.uploads.len(), 1);
+        assert_eq!(first.uploads[0].object, "logs/2025");
+        assert_eq!(first.common_prefixes, vec!["logs/2025/".to_string()]);
+        assert!(first.is_truncated);
+        assert_eq!(first.next_key_marker.as_deref(), Some("logs/2025/"));
+        assert!(first.next_upload_id_marker.is_none());
+
+        let second = set_disks
+            .list_multipart_uploads(
+                bucket,
+                "logs/",
+                first.next_key_marker,
+                first.next_upload_id_marker,
+                Some("/".to_string()),
+                2,
+            )
+            .await
+            .expect("delimiter continuation should succeed");
+        assert_eq!(second.uploads.len(), 1);
+        assert_eq!(second.uploads[0].object, "logs/root.bin");
+        assert_eq!(second.common_prefixes, vec!["logs/2026/".to_string()]);
+        assert!(!second.is_truncated);
+
+        let exact_boundary = set_disks
+            .list_multipart_uploads(bucket, "logs/", None, None, Some("/".to_string()), 4)
+            .await
+            .expect("delimiter exact boundary should succeed");
+        assert_eq!(exact_boundary.uploads.len(), 2);
+        assert_eq!(exact_boundary.common_prefixes.len(), 2);
+        assert!(!exact_boundary.is_truncated);
     }
 
     /// Recursively collect every file named `file_name` under the multipart
