@@ -2440,6 +2440,7 @@ pub struct ManualTransitionRunOptions {
     pub tier: Option<String>,
     pub dry_run: bool,
     pub max_objects: Option<u64>,
+    pub max_duration: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -2463,6 +2464,7 @@ pub struct ManualTransitionRunReport {
     pub skipped_queue_closed: u64,
     pub skipped_queue_timeout: u64,
     pub truncated_by_limit: bool,
+    pub truncated_by_duration: bool,
     #[serde(skip_serializing)]
     pub next_marker: Option<String>,
     #[serde(skip_serializing)]
@@ -2482,6 +2484,10 @@ impl ManualTransitionRunReport {
 
     pub fn has_partial_enqueue(&self) -> bool {
         self.skipped_queue_full > 0 || self.skipped_queue_closed > 0 || self.skipped_queue_timeout > 0
+    }
+
+    pub fn was_truncated(&self) -> bool {
+        self.truncated_by_limit || self.truncated_by_duration
     }
 }
 
@@ -2507,6 +2513,7 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
     let mut previous_marker = marker.clone();
     let mut previous_version_marker = version_marker.clone();
     let src = LcEventSrc::Scanner;
+    let deadline = options.max_duration.map(|duration| tokio::time::Instant::now() + duration);
 
     loop {
         let page = api
@@ -2515,6 +2522,12 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
             .await?;
 
         for (index, object) in page.objects.iter().enumerate() {
+            if manual_transition_duration_elapsed(deadline) {
+                report.truncated_by_duration = true;
+                report.next_marker.clone_from(&previous_marker);
+                report.next_version_idmarker.clone_from(&previous_version_marker);
+                return Ok(report);
+            }
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(object, &lc, &src, &options, &mut report).await;
             if report.has_partial_enqueue() {
@@ -2535,6 +2548,12 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
         }
 
         if !page.is_truncated {
+            return Ok(report);
+        }
+        if manual_transition_duration_elapsed(deadline) {
+            report.truncated_by_duration = true;
+            report.next_marker.clone_from(&previous_marker);
+            report.next_version_idmarker.clone_from(&previous_version_marker);
             return Ok(report);
         }
 
@@ -2733,6 +2752,10 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
 
 fn manual_transition_has_more_after_limit(page_index: usize, page_len: usize, page_is_truncated: bool) -> bool {
     page_index.saturating_add(1) < page_len || page_is_truncated
+}
+
+fn manual_transition_duration_elapsed(deadline: Option<tokio::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
 }
 
 fn manual_transition_version_marker(oi: &ObjectInfo) -> String {
@@ -3652,7 +3675,7 @@ mod tests {
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
-        manual_transition_has_more_after_limit, manual_transition_version_marker,
+        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
         resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
         resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
@@ -6352,6 +6375,21 @@ mod tests {
         assert!(!manual_transition_has_more_after_limit(9, 10, false));
         assert!(manual_transition_has_more_after_limit(9, 11, false));
         assert!(manual_transition_has_more_after_limit(9, 10, true));
+    }
+
+    #[test]
+    fn manual_transition_duration_budget_detects_elapsed_deadline() {
+        let report = ManualTransitionRunReport {
+            truncated_by_duration: true,
+            ..Default::default()
+        };
+
+        assert!(!manual_transition_duration_elapsed(None));
+        assert!(manual_transition_duration_elapsed(Some(tokio::time::Instant::now())));
+        assert!(!manual_transition_duration_elapsed(Some(
+            tokio::time::Instant::now() + StdDuration::from_secs(60)
+        )));
+        assert!(report.was_truncated());
     }
 
     #[tokio::test]
