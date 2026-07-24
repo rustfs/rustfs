@@ -949,6 +949,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .map(|upload_path| {
                 let disks = &disks;
                 async move {
+                    let (sha_dir, raw_upload_id) = upload_path
+                        .rsplit_once('/')
+                        .filter(|(sha_dir, upload_id)| !sha_dir.is_empty() && !upload_id.is_empty())
+                        .ok_or(DiskError::CorruptedFormat)?;
                     let (parts_metadata, errs) = Self::read_all_fileinfo(
                         disks,
                         bucket,
@@ -965,6 +969,24 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         .filter(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::VolumeNotFound)))
                         .count();
                     if missing_metadata >= discovery_quorum {
+                        // Completion moves the authoritative upload metadata into the
+                        // committed object before it removes the staging directory. A
+                        // crash in that window intentionally leaves a reclaimable
+                        // upload directory whose object name can still be proven for
+                        // an exact-key listing by matching the namespace hash.
+                        if !prefix.is_empty() && sha_dir == Self::get_multipart_sha_dir(bucket, prefix) {
+                            let initiated = raw_upload_id
+                                .rsplit_once('x')
+                                .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
+                                .and_then(|timestamp| OffsetDateTime::from_unix_timestamp_nanos(timestamp).ok());
+                            return Ok(Some(MultipartInfo {
+                                bucket: bucket.to_owned(),
+                                object: prefix.to_owned(),
+                                upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
+                                initiated,
+                                ..Default::default()
+                            }));
+                        }
                         return Ok(None);
                     }
                     let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
@@ -986,11 +1008,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         return Ok(None);
                     }
 
-                    let raw_upload_id = upload_path
-                        .rsplit_once('/')
-                        .map(|(_, upload_id)| upload_id)
-                        .filter(|upload_id| !upload_id.is_empty())
-                        .ok_or(DiskError::CorruptedFormat)?;
                     let initiated = raw_upload_id
                         .rsplit_once('x')
                         .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
