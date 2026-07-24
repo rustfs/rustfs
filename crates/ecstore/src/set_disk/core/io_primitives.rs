@@ -602,8 +602,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
     responses: &[Option<Vec<ObjectPartInfo>>],
     read_quorum: usize,
 ) -> disk::error::Result<ObjectPartInfo> {
-    let mut etag_quorum = HashMap::new();
-    let mut part_infos = Vec::new();
+    let mut part_quorum: HashMap<(&str, usize, usize, i64), (usize, &ObjectPartInfo)> = HashMap::new();
     let mut present_count = 0usize;
     let mut missing_count = 0usize;
     let mut transient_error_count = 0usize;
@@ -621,8 +620,10 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
 
         if !parts[part_idx].etag.is_empty() {
             present_count += 1;
-            *etag_quorum.entry(parts[part_idx].etag.clone()).or_insert(0) += 1;
-            part_infos.push(parts[part_idx].clone());
+            let part = &parts[part_idx];
+            let key = (part.etag.as_str(), part.number, part.size, part.actual_size);
+            let (count, _) = part_quorum.entry(key).or_insert((0, part));
+            *count += 1;
             continue;
         }
 
@@ -633,31 +634,12 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
         }
     }
 
-    let mut max_etag_quorum = 0;
-    let mut max_etag = None;
-    for (etag, quorum) in etag_quorum.iter() {
-        if quorum > &max_etag_quorum {
-            max_etag_quorum = *quorum;
-            max_etag = Some(etag);
-        }
-    }
-    let max_quorum = max_etag_quorum.max(missing_count);
-
-    let mut found = None;
-    for info in part_infos.iter() {
-        if let Some(etag) = max_etag
-            && info.etag == *etag
-        {
-            found = Some(info.clone());
-            break;
-        }
-    }
-
-    if let (Some(found), Some(max_etag)) = (found, max_etag)
-        && !found.etag.is_empty()
-        && etag_quorum.get(max_etag).unwrap_or(&0) >= &read_quorum
+    let max_part = part_quorum.values().max_by_key(|(count, _)| count);
+    let max_quorum = max_part.map_or(0, |(count, _)| *count).max(missing_count);
+    if let Some((count, part)) = max_part
+        && *count >= read_quorum
     {
-        return Ok(found);
+        return Ok((*part).clone());
     }
 
     if missing_count >= read_quorum {
@@ -5134,17 +5116,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_read_part_returns_part_when_etag_reaches_quorum() {
-        let responses = vec![
-            Some(vec![read_part_test_part(1, "winner")]),
-            Some(vec![read_part_test_part(1, "loser")]),
-            Some(vec![read_part_test_part(1, "winner")]),
-        ];
+    fn resolve_read_part_requires_layout_fields_to_reach_quorum() {
+        let mut valid = read_part_test_part(1, "winner");
+        valid.size = 100;
+        valid.actual_size = 90;
+        let mut wrong_etag = valid.clone();
+        wrong_etag.etag = "loser".to_string();
+        let mut wrong_number = valid.clone();
+        wrong_number.number = 2;
+        let mut wrong_size = valid.clone();
+        wrong_size.size = 50;
+        let mut wrong_actual_size = valid.clone();
+        wrong_actual_size.actual_size = 40;
 
-        let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
-            .expect("etag quorum should resolve the present part");
+        for (field, corrupted) in [
+            ("etag", wrong_etag),
+            ("number", wrong_number),
+            ("size", wrong_size),
+            ("actual_size", wrong_actual_size),
+        ] {
+            let responses = vec![Some(vec![corrupted]), Some(vec![valid.clone()]), Some(vec![valid.clone()])];
+            let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+                .unwrap_or_else(|err| panic!("{field} mismatch must not defeat layout quorum: {err}"));
 
-        assert_eq!(part.etag, "winner");
+            assert_eq!(part.etag, "winner", "{field}");
+            assert_eq!(part.number, 1, "{field}");
+            assert_eq!(part.size, 100, "{field}");
+            assert_eq!(part.actual_size, 90, "{field}");
+        }
     }
 
     #[test]

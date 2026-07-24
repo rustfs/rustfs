@@ -19,17 +19,18 @@
 //! and ID token verification.
 
 use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
+use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreJsonWebKeySet};
 use openidconnect::{
-    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, LogoutRequest, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, RequestTokenError,
-    Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, JsonWebKeySetUrl,
+    LogoutRequest, Nonce, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl,
+    RequestTokenError, Scope,
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
+use rustfs_utils::egress::OutboundPolicy;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -172,19 +173,29 @@ pub fn oidc_plugin_authn_metrics_snapshot() -> OidcPluginAuthnMetricsSnapshot {
     OIDC_PLUGIN_AUTHN_METRICS.snapshot()
 }
 
+/// Header names whose values may carry OIDC secrets (client credentials, cookies,
+/// bearer tokens). Their values are never emitted to logs, only their byte length.
+const SENSITIVE_HEADER_NAMES: [&str; 4] = ["authorization", "proxy-authorization", "cookie", "set-cookie"];
+
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADER_NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 fn format_http_headers(headers: &http::HeaderMap) -> String {
     headers
         .iter()
         .map(|(name, value)| {
-            let value = value.to_str().unwrap_or("<non-utf8>");
-            format!("{}={}", name.as_str(), value)
+            if is_sensitive_header(name.as_str()) {
+                format!("{}=<redacted len={}>", name.as_str(), value.as_bytes().len())
+            } else {
+                let value = value.to_str().unwrap_or("<non-utf8>");
+                format!("{}={}", name.as_str(), value)
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-fn format_http_body(body: &[u8]) -> String {
-    String::from_utf8_lossy(body).into_owned()
 }
 
 #[derive(Debug, Default)]
@@ -242,6 +253,7 @@ fn oidc_http_error_diagnostics(error: &OidcHttpError) -> (&'static str, String) 
         }
         OidcHttpError::Reqwest(_) => ("request", String::new()),
         OidcHttpError::Http(_) => ("http_build", String::new()),
+        OidcHttpError::ForbiddenOutbound(_) => ("forbidden_outbound", String::new()),
     }
 }
 
@@ -252,6 +264,10 @@ fn oidc_http_error_diagnostics(error: &OidcHttpError) -> (&'static str, String) 
 pub enum OidcHttpError {
     Reqwest(reqwest::Error),
     Http(http::Error),
+    /// The outbound destination was rejected by the shared egress policy before any
+    /// connection was attempted (invalid URL, loopback/link-local/metadata/private IP,
+    /// or a malformed allow-origins configuration).
+    ForbiddenOutbound(String),
 }
 
 impl std::fmt::Display for OidcHttpError {
@@ -259,6 +275,7 @@ impl std::fmt::Display for OidcHttpError {
         match self {
             Self::Reqwest(e) => write!(f, "{e}"),
             Self::Http(e) => write!(f, "{e}"),
+            Self::ForbiddenOutbound(reason) => write!(f, "outbound request rejected: {reason}"),
         }
     }
 }
@@ -268,24 +285,48 @@ impl std::error::Error for OidcHttpError {
         match self {
             Self::Reqwest(e) => Some(e),
             Self::Http(e) => Some(e),
+            Self::ForbiddenOutbound(_) => None,
         }
     }
 }
 
 /// HTTP client adapter bridging reqwest 0.13 to the `openidconnect` `AsyncHttpClient` trait.
+///
+/// A fresh client is built for every request so the destination is re-validated and the
+/// resolved IP is re-classified at connection time. This closes the SSRF / DNS-rebinding
+/// gap where a one-shot URL string check is bypassed by a hostname that resolves to an
+/// internal address only at connection time, and it also covers endpoints discovered from
+/// the provider metadata (JWKS, token) rather than only the operator-configured `config_url`.
 pub(crate) struct ReqwestHttpClient {
-    default: Client,
-    no_proxy: Client,
+    /// `None` in production: the process-cached outbound policy from the environment is used.
+    /// `Some(..)` only in tests, to explicitly allow a loopback mock endpoint.
+    policy_override: Option<OutboundPolicy>,
 }
 
-fn build_oidc_http_client(disable_proxy: bool) -> Result<Client, String> {
-    let mut builder = reqwest::Client::builder();
-    if disable_proxy {
+/// Build a reqwest client pinned to the shared outbound egress policy for a single request.
+///
+/// [`OutboundPolicy::resolver_for`] validates the URL shape and rejects loopback,
+/// link-local, metadata, multicast and unauthorized private addresses up front, and the
+/// returned `OutboundDnsResolver` re-resolves and re-classifies the host on every new
+/// connection so DNS rebinding fails closed. Redirects are not followed: a redirect target
+/// would otherwise skip URL-shape re-validation.
+fn build_oidc_http_client(uri: &str, policy_override: Option<&OutboundPolicy>) -> Result<Client, OidcHttpError> {
+    let url = Url::parse(uri).map_err(|_| OidcHttpError::ForbiddenOutbound("invalid outbound OIDC URL".to_string()))?;
+    let resolver = match policy_override {
+        Some(policy) => policy.resolver_for(&url),
+        None => OutboundPolicy::from_env_cached()
+            .map_err(|err| OidcHttpError::ForbiddenOutbound(err.to_string()))?
+            .resolver_for(&url),
+    }
+    .map_err(|err| OidcHttpError::ForbiddenOutbound(err.to_string()))?;
+
+    let mut builder = reqwest::Client::builder()
+        .dns_resolver(resolver)
+        .redirect(reqwest::redirect::Policy::none());
+    if should_bypass_proxy_for_oidc_uri(uri) {
         builder = builder.no_proxy();
     }
-    builder
-        .build()
-        .map_err(|err| format!("failed to build OIDC reqwest client: {err}"))
+    builder.build().map_err(OidcHttpError::Reqwest)
 }
 
 fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
@@ -299,17 +340,15 @@ fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
 
 impl ReqwestHttpClient {
     fn new() -> Result<Self, String> {
-        Ok(Self {
-            default: build_oidc_http_client(false)?,
-            no_proxy: build_oidc_http_client(true)?,
-        })
+        Ok(Self { policy_override: None })
     }
 
-    fn client_for_uri(&self, uri: &str) -> &Client {
-        if should_bypass_proxy_for_oidc_uri(uri) {
-            &self.no_proxy
-        } else {
-            &self.default
+    /// Test-only constructor that pins outbound requests to an explicit policy, so a
+    /// loopback mock server can be reached without depending on process-wide environment.
+    #[cfg(test)]
+    fn with_policy(policy: OutboundPolicy) -> Self {
+        Self {
+            policy_override: Some(policy),
         }
     }
 }
@@ -326,7 +365,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let uri = parts.uri.to_string();
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let request_headers = format_http_headers(&parts.headers);
-                let request_body = format_http_body(&body);
                 debug!(
                     event = EVENT_OIDC_HTTP,
                     component = LOG_COMPONENT_IAM,
@@ -336,12 +374,11 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                     uri = %uri,
                     request_headers = %request_headers,
                     request_body_len = body.len(),
-                    request_body = %request_body,
                     "oidc outbound http"
                 );
             }
 
-            let client = self.client_for_uri(&uri);
+            let client = build_oidc_http_client(&uri, self.policy_override.as_ref())?;
             let response = client
                 .request(parts.method, uri.clone())
                 .headers(parts.headers)
@@ -387,7 +424,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             })?;
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let response_headers = format_http_headers(&headers);
-                let response_body = format_http_body(&body_bytes);
                 debug!(
                     event = EVENT_OIDC_HTTP,
                     component = LOG_COMPONENT_IAM,
@@ -400,7 +436,6 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                     elapsed_ms,
                     response_headers = %response_headers,
                     response_body_len = body_bytes.len(),
-                    response_body = %response_body,
                     "oidc outbound http"
                 );
             }
@@ -430,6 +465,7 @@ pub struct OidcProviderConfig {
     pub id: String,
     pub enabled: bool,
     pub config_url: String,
+    pub issuer: Option<String>,
     pub client_id: String,
     pub client_secret: Option<String>,
     pub scopes: Vec<String>,
@@ -453,6 +489,7 @@ impl fmt::Debug for OidcProviderConfig {
             .field("id", &self.id)
             .field("enabled", &self.enabled)
             .field("config_url", &self.config_url)
+            .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("client_secret", &redacted_optional_secret(self.client_secret.as_deref()))
             .field("scopes", &self.scopes)
@@ -814,7 +851,6 @@ impl OidcSys {
                 }
                 RequestTokenError::Parse(parse_err, body) => {
                     let shape = inspect_token_response_body(body);
-                    let response_body = format_http_body(body);
                     error!(
                         event = EVENT_OIDC_DIAGNOSTICS,
                         component = LOG_COMPONENT_IAM,
@@ -837,12 +873,11 @@ impl OidcSys {
                         response_has_error = shape.has_error,
                         response_has_error_description = shape.has_error_description,
                         response_looks_like_html = shape.looks_like_html,
-                        response_body = %response_body,
                         error = %e,
                         "oidc token exchange failed"
                     );
                     format!(
-                        "token exchange failed: {e}: stage=token_response_parse_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, parse_error_path={}, response_body_len={}, response_json_keys={}, response_has_id_token={}, response_has_error={}, response_looks_like_html={}, response_body={}",
+                        "token exchange failed: {e}: stage=token_response_parse_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, parse_error_path={}, response_body_len={}, response_json_keys={}, response_has_id_token={}, response_has_error={}, response_looks_like_html={}",
                         session.provider_id,
                         config.config_url,
                         issuer,
@@ -854,8 +889,7 @@ impl OidcSys {
                         shape.json_keys,
                         shape.has_id_token,
                         shape.has_error,
-                        shape.looks_like_html,
-                        response_body
+                        shape.looks_like_html
                     )
                 }
                 RequestTokenError::Other(message) => {
@@ -1406,6 +1440,7 @@ impl OidcSys {
 
         let enable_val = get_env(ENV_IDENTITY_OPENID_ENABLE);
         let config_url = get_env(ENV_IDENTITY_OPENID_CONFIG_URL);
+        let issuer = get_env(ENV_IDENTITY_OPENID_ISSUER);
 
         // Skip if no config URL
         if config_url.is_empty() {
@@ -1482,6 +1517,7 @@ impl OidcSys {
             id: id.to_string(),
             enabled,
             config_url,
+            issuer: if issuer.is_empty() { None } else { Some(issuer) },
             client_id: get_env(ENV_IDENTITY_OPENID_CLIENT_ID),
             client_secret,
             scopes,
@@ -1550,6 +1586,7 @@ impl OidcSys {
             id: id.to_string(),
             enabled,
             config_url,
+            issuer: kvs.lookup(OIDC_ISSUER).filter(|v| !v.is_empty()),
             client_id: kvs.get(OIDC_CLIENT_ID),
             client_secret,
             scopes,
@@ -1571,6 +1608,10 @@ impl OidcSys {
     /// Perform OIDC discovery for a provider.
     /// `discover_async` fetches the discovery document and JWKS in one step.
     async fn discover_provider(config: &OidcProviderConfig, http_client: &ReqwestHttpClient) -> Result<ProviderState, String> {
+        if let Some(issuer) = config.issuer.as_deref().filter(|issuer| !issuer.trim().is_empty()) {
+            return Self::discover_provider_from_config_url(config, issuer, http_client).await;
+        }
+
         // The openidconnect crate expects the issuer URL (base), not the
         // .well-known/openid-configuration URL.
         let base_issuer = normalize_config_url(&config.config_url)?;
@@ -1637,6 +1678,49 @@ impl OidcSys {
             candidates,
             last_errors.join("; ")
         ))
+    }
+
+    async fn discover_provider_from_config_url(
+        config: &OidcProviderConfig,
+        issuer: &str,
+        http_client: &ReqwestHttpClient,
+    ) -> Result<ProviderState, String> {
+        let issuer_url = IssuerUrl::new(issuer.trim().to_string()).map_err(|e| format!("invalid issuer URL: {e}"))?;
+        let discovery_url = discovery_url_from_config_url(&config.config_url)?;
+        let request = http::Request::builder()
+            .uri(discovery_url.to_string())
+            .method(http::Method::GET)
+            .header(http::header::ACCEPT, "application/json")
+            .body(Vec::new())
+            .map_err(|err| format!("failed to prepare discovery request: {err}"))?;
+
+        let response = http_client
+            .call(request)
+            .await
+            .map_err(|err| format!("discovery request failed: {err}"))?;
+        if response.status() != http::StatusCode::OK {
+            return Err(format!("discovery failed: HTTP status code {} at {}", response.status(), discovery_url));
+        }
+
+        let provider_metadata = serde_json::from_slice::<ProviderMetadataWithLogout>(response.body())
+            .map_err(|err| format!("failed to parse discovery response: {err}"))?;
+        if provider_metadata.issuer() != &issuer_url {
+            return Err(format!(
+                "unexpected issuer URI `{}` (expected `{}`)",
+                provider_metadata.issuer().as_str(),
+                issuer_url.as_str()
+            ));
+        }
+
+        let jwks_url = jwks_url_from_config_url(&config.config_url, &issuer_url, provider_metadata.jwks_uri())?;
+        let jwks = CoreJsonWebKeySet::fetch_async(&jwks_url, http_client)
+            .await
+            .map_err(|err| format!("failed to fetch JWKS: {err}"))?;
+
+        Ok(ProviderState {
+            metadata: provider_metadata.set_jwks(jwks),
+            discovered_at: Instant::now(),
+        })
     }
 }
 
@@ -1751,6 +1835,61 @@ fn normalize_config_url(config_url: &str) -> Result<String, String> {
     Ok(issuer)
 }
 
+fn discovery_url_from_config_url(config_url: &str) -> Result<Url, String> {
+    let mut url = Url::parse(config_url.trim()).map_err(|e| format!("invalid config_url: {e}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(format!("invalid config_url scheme: {}", url.scheme()));
+    }
+    if url.host_str().is_none() {
+        return Err("config_url missing host".to_string());
+    }
+
+    let path = url.path().to_string();
+    let without_trailing_slash = path.strip_suffix('/').unwrap_or(&path);
+    if without_trailing_slash.ends_with("/.well-known/openid-configuration") {
+        url.set_path(without_trailing_slash);
+        return Ok(url);
+    }
+    if without_trailing_slash.contains("/.well-known/") {
+        return Err("config_url uses an unsupported .well-known discovery URL".into());
+    }
+
+    let discovery_path = if without_trailing_slash.is_empty() || without_trailing_slash == "/" {
+        "/.well-known/openid-configuration".to_string()
+    } else {
+        format!("{without_trailing_slash}/.well-known/openid-configuration")
+    };
+    url.set_path(&discovery_path);
+    Ok(url)
+}
+
+fn jwks_url_from_config_url(
+    config_url: &str,
+    issuer_url: &IssuerUrl,
+    jwks_url: &JsonWebKeySetUrl,
+) -> Result<JsonWebKeySetUrl, String> {
+    let issuer = issuer_url.url();
+    let jwks = jwks_url.url();
+    if issuer.origin() != jwks.origin() {
+        return Ok(jwks_url.clone());
+    }
+
+    let issuer_path = issuer.path().trim_end_matches('/');
+    let Some(suffix) = jwks.path().strip_prefix(issuer_path) else {
+        return Ok(jwks_url.clone());
+    };
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return Ok(jwks_url.clone());
+    }
+
+    let mut internal_url =
+        Url::parse(&normalize_config_url(config_url)?).map_err(|err| format!("invalid config_url issuer base: {err}"))?;
+    let internal_path = internal_url.path().trim_end_matches('/');
+    internal_url.set_path(&format!("{internal_path}{suffix}"));
+    internal_url.set_query(jwks.query());
+    Ok(JsonWebKeySetUrl::from_url(internal_url))
+}
+
 fn issuer_candidates(base: &str) -> Vec<String> {
     let original = base.trim();
     let mut variants = Vec::with_capacity(2);
@@ -1847,6 +1986,39 @@ mod tests {
         assert_eq!(extract_string_claim(&claims, "email"), "user@example.com");
         assert_eq!(extract_string_claim(&claims, "sub"), "12345");
         assert_eq!(extract_string_claim(&claims, "missing"), "");
+    }
+
+    #[test]
+    fn format_http_headers_redacts_sensitive_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Basic Y2xpZW50OnNlY3JldA==".parse().unwrap());
+        headers.insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(http::header::COOKIE, "session=super-secret".parse().unwrap());
+
+        let rendered = format_http_headers(&headers);
+
+        // Sensitive header values never appear; only their length is emitted.
+        assert!(!rendered.contains("Y2xpZW50OnNlY3JldA=="), "authorization value leaked: {rendered}");
+        assert!(!rendered.contains("super-secret"), "cookie value leaked: {rendered}");
+        assert!(
+            rendered.contains("authorization=<redacted len="),
+            "expected redacted authorization: {rendered}"
+        );
+        assert!(rendered.contains("cookie=<redacted len="), "expected redacted cookie: {rendered}");
+        // Non-sensitive header values are preserved for diagnostics.
+        assert!(
+            rendered.contains("content-type=application/json"),
+            "content-type should be visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_header_is_case_insensitive() {
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("PROXY-AUTHORIZATION"));
+        assert!(is_sensitive_header("Set-Cookie"));
+        assert!(!is_sensitive_header("content-type"));
+        assert!(!is_sensitive_header("x-request-id"));
     }
 
     #[test]
@@ -2047,6 +2219,23 @@ mod tests {
     }
 
     #[test]
+    fn test_discovery_url_from_config_url() {
+        assert_eq!(
+            discovery_url_from_config_url("https://idp.example.com/.well-known/openid-configuration")
+                .expect("config URL should parse")
+                .as_str(),
+            "https://idp.example.com/.well-known/openid-configuration"
+        );
+        assert_eq!(
+            discovery_url_from_config_url("https://idp.example.com/realms/app")
+                .expect("issuer URL should derive discovery URL")
+                .as_str(),
+            "https://idp.example.com/realms/app/.well-known/openid-configuration"
+        );
+        assert!(discovery_url_from_config_url("https://idp.example.com/.well-known/not-openid").is_err());
+    }
+
+    #[test]
     fn test_issuer_candidates() {
         assert_eq!(
             issuer_candidates("https://idp.example.com/realm"),
@@ -2073,6 +2262,7 @@ mod tests {
             id: id.to_string(),
             enabled: true,
             config_url: config_url.to_string(),
+            issuer: None,
             client_id: "rustfs-oidc-test".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
@@ -2096,7 +2286,7 @@ mod tests {
         max_requests: usize,
     ) -> Option<(String, std::thread::JoinHandle<()>)>
     where
-        F: Fn(&str) -> String + Send + 'static,
+        F: Fn(&str) -> (String, String, String) + Send + 'static,
     {
         use std::io::Read;
         use std::io::Write;
@@ -2116,12 +2306,12 @@ mod tests {
             Err(err) => panic!("test listener should bind: {err}"),
         };
         let base = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
-        let discovery_issuer = build_discovery_issuer(&base);
+        let (discovery_issuer, discovery_jwks_uri, expected_jwks_path) = build_discovery_issuer(&base);
         let discovery_body = serde_json::json!({
             "issuer": discovery_issuer,
             "authorization_endpoint": format!("{base}/authorize"),
             "token_endpoint": format!("{base}/token"),
-            "jwks_uri": format!("{base}/jwks"),
+            "jwks_uri": discovery_jwks_uri,
             "response_types_supported": ["code"],
             "response_modes_supported": ["query"],
             "subject_types_supported": ["public"],
@@ -2192,7 +2382,7 @@ mod tests {
 
                 let (status, body) = if path.contains("/.well-known/openid-configuration") {
                     (200, discovery_body.as_str())
-                } else if path.contains("/jwks") {
+                } else if path == expected_jwks_path {
                     (200, jwks_body)
                 } else {
                     (404, r#"{"error":"not found"}"#)
@@ -2226,7 +2416,14 @@ mod tests {
     }
 
     async fn validate_mocked_oidc_provider_config(config: &OidcProviderConfig) -> Result<OidcProviderValidationResult, String> {
-        let http_client = ReqwestHttpClient::new()?;
+        // The mock discovery/JWKS/token endpoints share the loopback origin of `config_url`.
+        // Explicitly allow that origin so the egress policy does not reject the loopback mock.
+        let origin = Url::parse(&config.config_url)
+            .map_err(|_| "invalid mock config_url".to_string())?
+            .origin()
+            .ascii_serialization();
+        let policy = OutboundPolicy::from_allowed_origins(&origin).map_err(|err| err.to_string())?;
+        let http_client = ReqwestHttpClient::with_policy(policy);
         let state = OidcSys::discover_provider(config, &http_client).await?;
 
         Ok(OidcProviderValidationResult {
@@ -2240,7 +2437,10 @@ mod tests {
     async fn test_validate_oidc_provider_config_retries_with_issuer_candidates() {
         // Discovery document must advertise the canonical issuer path. The first candidate has no
         // trailing slash; openidconnect rejects issuer mismatch, then the second variant succeeds.
-        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/rustfs/"), 8) else {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |base| (format!("{base}/application/o/rustfs/"), format!("{base}/jwks"), "/jwks".to_string()),
+            8,
+        ) else {
             return;
         };
         let config_url = format!("{base}/application/o/rustfs");
@@ -2254,8 +2454,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validate_oidc_provider_config_fetches_issuer_relative_jwks_from_config_url() {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |_| {
+                (
+                    "http://127.0.0.1:1/public/realms/app".to_string(),
+                    "http://127.0.0.1:1/public/realms/app/jwks?version=1".to_string(),
+                    "/internal/realms/app/jwks?version=1".to_string(),
+                )
+            },
+            2,
+        ) else {
+            return;
+        };
+        let mut config =
+            build_mocked_oidc_provider_config("default", &format!("{base}/internal/realms/app/.well-known/openid-configuration"));
+        config.issuer = Some("http://127.0.0.1:1/public/realms/app".to_string());
+
+        let validation_result = validate_mocked_oidc_provider_config(&config)
+            .await
+            .expect("OIDC provider validation should succeed");
+
+        assert_eq!(validation_result.issuer, "http://127.0.0.1:1/public/realms/app");
+        assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn test_jwks_url_from_config_url_preserves_unrelated_urls() {
+        let issuer = IssuerUrl::new("https://public.example.com/realms/app".to_string()).expect("issuer URL should parse");
+        for raw_jwks_url in [
+            "https://keys.example.com/jwks",
+            "http://public.example.com/realms/app/jwks",
+            "https://public.example.com:8443/realms/app/jwks",
+            "https://public.example.com/keys/jwks",
+            "https://public.example.com/realms/application/jwks",
+        ] {
+            let jwks_url = JsonWebKeySetUrl::new(raw_jwks_url.to_string()).expect("JWKS URL should parse");
+
+            let resolved = jwks_url_from_config_url(
+                "http://keycloak.internal/realms/app/.well-known/openid-configuration",
+                &issuer,
+                &jwks_url,
+            )
+            .expect("JWKS URL should resolve");
+
+            assert_eq!(resolved.as_str(), raw_jwks_url);
+        }
+
+        let issuer_root_jwks = JsonWebKeySetUrl::new(issuer.as_str().to_string()).expect("JWKS URL should parse");
+        let resolved = jwks_url_from_config_url(
+            "http://keycloak.internal/realms/app/.well-known/openid-configuration",
+            &issuer,
+            &issuer_root_jwks,
+        )
+        .expect("issuer-root JWKS URL should resolve");
+        assert_eq!(resolved.as_str(), "http://keycloak.internal/realms/app");
+
+        let issuer_with_slash =
+            IssuerUrl::new("https://public.example.com/realms/app/".to_string()).expect("issuer URL should parse");
+        let jwks_url =
+            JsonWebKeySetUrl::new("https://public.example.com/realms/app/jwks".to_string()).expect("JWKS URL should parse");
+        let resolved = jwks_url_from_config_url(
+            "http://keycloak.internal/realms/app/.well-known/openid-configuration",
+            &issuer_with_slash,
+            &jwks_url,
+        )
+        .expect("issuer-relative JWKS URL should resolve");
+        assert_eq!(resolved.as_str(), "http://keycloak.internal/realms/app/jwks");
+    }
+
+    #[tokio::test]
+    async fn test_validate_oidc_provider_config_rejects_separate_issuer_mismatch() {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |base| {
+                (
+                    "https://public.example.com/realms/other".to_string(),
+                    format!("{base}/jwks"),
+                    "/jwks".to_string(),
+                )
+            },
+            1,
+        ) else {
+            return;
+        };
+        let mut config =
+            build_mocked_oidc_provider_config("default", &format!("{base}/internal/realms/app/.well-known/openid-configuration"));
+        config.issuer = Some("https://public.example.com/realms/app".to_string());
+
+        let err = validate_mocked_oidc_provider_config(&config)
+            .await
+            .expect_err("OIDC provider validation should fail");
+
+        assert!(err.contains("unexpected issuer URI"));
+        assert!(err.contains("https://public.example.com/realms/app"));
+        assert!(handle.join().is_ok());
+    }
+
+    #[tokio::test]
     async fn test_validate_oidc_provider_config_returns_detailed_errors() {
-        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8) else {
+        let Some((base, handle)) = start_mock_oidc_discovery_server(
+            |base| (format!("{base}/application/o/other"), format!("{base}/jwks"), "/jwks".to_string()),
+            8,
+        ) else {
             return;
         };
         let config_url = format!("{base}/application/o/rustfs");
@@ -2364,6 +2664,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_single_provider_reads_issuer() {
+        temp_env::with_vars(
+            [
+                (
+                    ENV_IDENTITY_OPENID_CONFIG_URL,
+                    Some("http://keycloak.ns.svc.cluster.local:8080/realms/app/.well-known/openid-configuration"),
+                ),
+                (ENV_IDENTITY_OPENID_ISSUER, Some("https://app.local/realms/app")),
+                (ENV_IDENTITY_OPENID_CLIENT_ID, Some("console")),
+            ],
+            || {
+                let config = OidcSys::parse_single_provider("", "default").expect("provider config should parse");
+
+                assert_eq!(config.issuer.as_deref(), Some("https://app.local/realms/app"));
+            },
+        );
+    }
+
+    #[test]
     fn test_parse_persisted_provider_config() {
         let mut cfg = ServerConfig::new();
         let mut kvs = KVS(vec![
@@ -2389,6 +2708,7 @@ mod tests {
         );
         kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
         kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
+        kvs.insert(OIDC_ISSUER.to_string(), "https://issuer.example".to_string());
         kvs.insert(OIDC_ROLES_CLAIM.to_string(), "app_roles".to_string());
 
         cfg.0
@@ -2400,6 +2720,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "default");
         assert_eq!(parsed[0].client_id, "console");
+        assert_eq!(parsed[0].issuer.as_deref(), Some("https://issuer.example"));
         assert!(parsed[0].enabled);
         assert_eq!(parsed[0].roles_claim, "app_roles");
     }
@@ -2473,6 +2794,49 @@ mod tests {
         assert!(!should_bypass_proxy_for_oidc_uri("not-a-url"));
     }
 
+    #[test]
+    fn build_oidc_http_client_rejects_forbidden_targets_without_allowlist() {
+        // Cloud metadata endpoint is never allowed.
+        assert!(
+            matches!(
+                build_oidc_http_client("http://169.254.169.254/latest/meta-data/", None),
+                Err(OidcHttpError::ForbiddenOutbound(_))
+            ),
+            "metadata endpoint must be rejected"
+        );
+        // Loopback is rejected by default (no allow-origins configured).
+        assert!(
+            matches!(
+                build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", None),
+                Err(OidcHttpError::ForbiddenOutbound(_))
+            ),
+            "loopback must be rejected by default"
+        );
+        // A public hostname passes the up-front shape/host check; the resolved IP is still
+        // re-classified at connection time by the pinned resolver.
+        assert!(
+            build_oidc_http_client("https://accounts.example.com/.well-known/openid-configuration", None).is_ok(),
+            "public https endpoint should build"
+        );
+    }
+
+    #[test]
+    fn build_oidc_http_client_honors_explicit_allowlist_for_loopback() {
+        let policy = OutboundPolicy::from_allowed_origins("http://127.0.0.1:8080").expect("origin should parse");
+        assert!(
+            build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", Some(&policy)).is_ok(),
+            "explicitly allow-listed loopback origin should build"
+        );
+        // A metadata endpoint stays forbidden even when a loopback origin is allow-listed.
+        assert!(
+            matches!(
+                build_oidc_http_client("http://169.254.169.254/", Some(&policy)),
+                Err(OidcHttpError::ForbiddenOutbound(_))
+            ),
+            "metadata endpoint stays forbidden despite an unrelated allow-list entry"
+        );
+    }
+
     /// Helper to create an OidcSys with configs only (no provider states needed).
     fn make_test_sys(configs: Vec<OidcProviderConfig>) -> OidcSys {
         let mut config_map = HashMap::new();
@@ -2492,6 +2856,7 @@ mod tests {
             id: id.to_string(),
             enabled: true,
             config_url: format!("https://example.com/{id}/.well-known/openid-configuration"),
+            issuer: None,
             client_id: "client-id".to_string(),
             client_secret: None,
             scopes: vec!["openid".to_string()],
@@ -2794,6 +3159,7 @@ mod tests {
             id: "test".to_string(),
             enabled: true,
             config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+            issuer: None,
             client_id: "my-client".to_string(),
             client_secret: Some("secret".to_string()),
             scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
