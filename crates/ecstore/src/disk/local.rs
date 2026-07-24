@@ -1859,6 +1859,46 @@ where
     with_walk_stall_deadline(stall, fut).await?
 }
 
+async fn read_dir_entries_with_walk_stall(path: &Path, count: i32, stall: Option<Duration>) -> Result<Vec<String>> {
+    let mut entries = with_walk_stall_deadline(stall, fs::read_dir(path))
+        .await?
+        .map_err(to_file_error)?;
+    let mut names = Vec::new();
+    let mut remaining = count;
+
+    loop {
+        let Some(entry) = with_walk_stall_deadline(stall, entries.next_entry())
+            .await?
+            .map_err(to_file_error)?
+        else {
+            break;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+
+        let file_type = with_walk_stall_deadline(stall, entry.file_type())
+            .await?
+            .map_err(to_file_error)?;
+        if file_type.is_file() {
+            names.push(name);
+        } else if file_type.is_dir() {
+            names.push(format!("{name}{SLASH_SEPARATOR}"));
+        } else {
+            continue;
+        }
+
+        remaining -= 1;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    Ok(names)
+}
+
 impl FileCacheReclaimReader {
     fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
         #[cfg(target_os = "macos")]
@@ -5163,17 +5203,22 @@ impl LocalDisk {
 
         let stall = opts.stall_timeout_duration();
 
-        // `count = -1` enumerates the whole directory in one `list_dir` call, and
-        // the stall budget bounds that entire enumeration as a single unit. On a
-        // WIDE, FLAT directory (millions of immediate children) that one readdir
-        // can exceed `stall` on a healthy disk and fail the whole walk -- see the
-        // wide-directory stall hazard documented on `list_dir`
-        // (rustfs/backlog#1216, a #2999 sub-class). Mitigate operationally with a
-        // larger `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or the high-latency
-        // drive-timeout profile; a streaming readdir rewrite is a separate,
-        // higher-risk follow-up and is intentionally not done here.
+        // A wide prefix can contain many immediate children. Keep the existing
+        // in-memory sort contract, but bound each directory-entry read rather
+        // than treating the whole enumeration as one stalled disk operation.
         let read_dir_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let read_dir_result = with_walk_stall_timeout(stall, self.list_dir("", &opts.bucket, &current, -1)).await;
+        let dir_path_abs = self.get_object_path(&opts.bucket, current.trim_start_matches(SLASH_SEPARATOR))?;
+        let read_dir_result = match read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await {
+            Err(err) if err == Error::FileNotFound && !skip_access_checks(&opts.bucket) => {
+                let volume_dir = self.get_bucket_path(&opts.bucket)?;
+                if let Err(access_err) = access(&volume_dir).await {
+                    Err(to_access_error(access_err, DiskError::VolumeAccessDenied).into())
+                } else {
+                    Err(err)
+                }
+            }
+            result => result,
+        };
         if let Some(started) = read_dir_started {
             rustfs_io_metrics::record_list_objects_local_read_dir(rustfs_io_metrics::ListObjectsLocalReadDirObservation {
                 outcome: if read_dir_result.is_ok() {
@@ -6577,28 +6622,8 @@ impl DiskAPI for LocalDisk {
     }
 
     /// List a single directory. `count < 0` enumerates the *whole* directory in
-    /// one `os::read_dir` call.
-    ///
-    /// Wide-directory stall hazard (rustfs/backlog#1216, a #2999 sub-class):
-    /// the walk caller wraps this whole call in the per-read stall budget
-    /// (`with_walk_stall_timeout`, default 5s via
-    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`) as if the entire directory
-    /// enumeration were a single read. For a *wide, flat* directory -- one
-    /// bucket prefix holding millions of immediate children -- a single
-    /// `readdir` of the whole directory can itself exceed the stall budget on a
-    /// healthy disk. That trips `DiskError::Timeout`, which the listing path can
-    /// escalate to a quorum failure and surface to the client as a ListObjects
-    /// 500, even though nothing is actually wrong with the drive.
-    ///
-    /// This is deliberately NOT fixed here by rewriting the one-shot
-    /// `os::read_dir` into a streaming/batched readdir that would refresh the
-    /// stall deadline between chunks: that is an architecture-level change with
-    /// high regression surface (ordering, the `count` contract, quorum merge
-    /// semantics) and is tracked as a separate follow-up. The supported
-    /// mitigation for wide-directory deployments today is operational -- raise
-    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or run with the high-latency
-    /// drive-timeout profile (see `get_drive_walkdir_stall_timeout`), both of
-    /// which widen the budget without any code change.
+    /// one `os::read_dir` call. Object listing uses `read_dir_entries_with_walk_stall`
+    /// instead so wide prefixes refresh the stall budget per directory entry.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
