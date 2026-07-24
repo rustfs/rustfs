@@ -929,11 +929,13 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidArgument);
         }
 
-        let boundary = if let Some(encoded) = claims.get(SESSION_POLICY_NAME).and_then(Value::as_str) {
-            decode_session_policy(encoded)?;
-            Some(encoded.to_string())
-        } else {
-            None
+        let boundary = match claims.get(SESSION_POLICY_NAME) {
+            Some(Value::String(encoded)) => {
+                decode_session_policy(encoded)?;
+                Some(encoded.clone())
+            }
+            Some(_) => return Err(IamError::InvalidArgument),
+            None => None,
         };
 
         let mut verified_claims = HashMap::from([
@@ -3844,5 +3846,30 @@ mod tests {
         assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("---"));
         assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("-_-"));
         assert!(!IamSys::<StsTestMockStore>::is_safe_claim_policy_name("-.:_"));
+    }
+
+    #[tokio::test]
+    async fn verified_federated_policy_rejects_malformed_session_boundary() {
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+        let parent_user = "virtual-parent";
+        let claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+            (SESSION_POLICY_NAME.to_string(), Value::Bool(true)),
+        ]);
+
+        let result = iam_sys
+            .verified_federated_service_account_claims(&claims, parent_user, &None)
+            .await;
+
+        assert!(matches!(result, Err(IamError::InvalidArgument)));
     }
 }
