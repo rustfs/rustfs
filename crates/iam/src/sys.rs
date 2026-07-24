@@ -3043,6 +3043,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_owner_import_cannot_preserve_verified_federated_policy() {
+        ensure_test_global_credentials();
+
+        let iam_sys = test_iam_sys().await;
+        let parent_user = "sts-fallback-test-parent";
+        iam_sys
+            .store
+            .cache
+            .add_or_update_user_policy(parent_user, &MappedPolicy::new("readwrite"), OffsetDateTime::now_utc());
+        let mut claims = HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("default".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("parent".to_string(), Value::String(parent_user.to_string())),
+            (OIDC_VIRTUAL_PARENT_CLAIM.to_string(), Value::String(parent_user.to_string())),
+            (POLICYNAME.to_string(), Value::String("readwrite".to_string())),
+            (VERIFIED_FEDERATED_POLICY_CLAIM.to_string(), Value::Bool(true)),
+            (
+                FEDERATED_POLICY_BOUNDARY_CLAIM.to_string(),
+                Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes())),
+            ),
+        ]);
+
+        remove_verified_federated_policy(&mut claims);
+        let (credential, _) = iam_sys
+            .new_service_account(
+                parent_user,
+                None,
+                NewServiceAccountOpts {
+                    access_key: "IMPORTEDOIDCSERVICE1".to_string(),
+                    secret_key: "importedOidcServiceSecret123".to_string(),
+                    claims: Some(claims),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("sanitized service account should be persisted");
+        let stored_claims = iam_sys
+            .get_claims_for_svc_acc(&credential.access_key)
+            .await
+            .expect("stored service-account claims should decode");
+        assert!(!stored_claims.contains_key(VERIFIED_FEDERATED_POLICY_CLAIM));
+        assert!(!stored_claims.contains_key(FEDERATED_POLICY_BOUNDARY_CLAIM));
+        assert!(!stored_claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM));
+
+        let args = Args {
+            account: &credential.access_key,
+            groups: &None,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &stored_claims,
+            deny_only: false,
+        };
+        assert!(!iam_sys.is_allowed(&args).await);
+    }
+
+    #[tokio::test]
     async fn oidc_service_account_rejects_mismatched_virtual_parent() {
         ensure_test_global_credentials();
         let iam_sys = IamSys::new(IamCache::new(StsTestMockStore::new(true)).await.unwrap());
