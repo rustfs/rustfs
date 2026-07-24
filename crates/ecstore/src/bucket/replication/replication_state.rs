@@ -15,9 +15,11 @@
 use super::replication_error_boundary::Error;
 use super::replication_filemeta_boundary::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use super::replication_resync_boundary::ResyncStatusType;
+#[cfg(test)]
+use super::replication_stats_boundary::FailStats;
 use super::replication_stats_boundary::{
     ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, ProxyMetric, ProxyStatsCache,
-    QueueCache, SRMetricsSummary, XferStats,
+    QueueCache, ReplicationMetricScope, SRMetricsSummary, XferStats,
 };
 use super::runtime_boundary as runtime_sources;
 use std::collections::HashMap;
@@ -361,10 +363,12 @@ impl ReplicationStats {
                 if rs.transfer_duration > Duration::default() {
                     stat.latency.update(rs.transfer_size, rs.transfer_duration);
                     stat.update_xfer_rate(rs.transfer_size, rs.transfer_duration);
+                    stat.latency_scope = ReplicationMetricScope::NodeLocal;
                 }
             }
             (false, true, false) => {
                 stat.fail_stats.add_size(rs.transfer_size, rs.err.as_ref());
+                stat.failed = stat.fail_stats.to_metric();
             }
             (false, false, true) => {
                 // Pending status, no processing for now
@@ -379,7 +383,10 @@ impl ReplicationStats {
         let mut result = HashMap::with_capacity(cache.len());
 
         for (bucket, stats) in cache.iter() {
-            result.insert(bucket.clone(), stats.clone_stats());
+            let mut snapshot = stats.clone_stats();
+            snapshot.mark_node_local_provider_available();
+            snapshot.queue_scope = ReplicationMetricScope::NodeLocal;
+            result.insert(bucket.clone(), snapshot);
         }
         drop(cache);
 
@@ -388,6 +395,8 @@ impl ReplicationStats {
             for (bucket, queue_stats) in &q_cache.bucket_stats {
                 let bucket_stats = result.entry(bucket.clone()).or_insert_with(BucketReplicationStats::new);
                 bucket_stats.q_stat = queue_stats.snapshot();
+                bucket_stats.mark_node_local_provider_available();
+                bucket_stats.queue_scope = ReplicationMetricScope::NodeLocal;
             }
         }
 
@@ -405,9 +414,13 @@ impl ReplicationStats {
     pub async fn get(&self, bucket: &str) -> BucketReplicationStats {
         let cache = self.cache.read().await;
         if let Some(stats) = cache.get(bucket) {
-            stats.clone_stats()
+            let mut snapshot = stats.clone_stats();
+            snapshot.mark_node_local_provider_available();
+            snapshot
         } else {
-            BucketReplicationStats::new()
+            let mut snapshot = BucketReplicationStats::new();
+            snapshot.mark_node_local_provider_available();
+            snapshot
         }
     }
 
@@ -453,11 +466,15 @@ impl ReplicationStats {
         let mut tq = InQueueMetric::default();
 
         for bucket_stat in &bucket_stats {
-            tot_replica_size += bucket_stat.replication_stats.replica_size;
-            tot_replica_count += bucket_stat.replication_stats.replica_count;
+            tot_replica_size = tot_replica_size.saturating_add(bucket_stat.replication_stats.replica_size);
+            tot_replica_count = tot_replica_count.saturating_add(bucket_stat.replication_stats.replica_count);
 
-            for q in &bucket_stat.queue_stats.nodes {
-                tq = tq.merge(&q.q_stats);
+            if bucket_stat.replication_stats.queue_scope != ReplicationMetricScope::Unavailable {
+                tq = tq.merge(&bucket_stat.replication_stats.q_stat);
+            } else {
+                for q in &bucket_stat.queue_stats.nodes {
+                    tq = tq.merge(&q.q_stats);
+                }
             }
 
             for (arn, stat) in &bucket_stat.replication_stats.stats {
@@ -470,22 +487,38 @@ impl ReplicationStats {
                 let f_stats = stat.fail_stats.merge(&old_stat.fail_stats);
                 let lrg = old_stat.xfer_rate_lrg.merge(&stat.xfer_rate_lrg);
                 let sml = old_stat.xfer_rate_sml.merge(&stat.xfer_rate_sml);
+                let latency_available = stat.latency_scope != ReplicationMetricScope::Unavailable
+                    || old_stat.latency_scope != ReplicationMetricScope::Unavailable;
+                let bandwidth_available = stat.bandwidth_scope != ReplicationMetricScope::Unavailable
+                    || old_stat.bandwidth_scope != ReplicationMetricScope::Unavailable;
 
                 *old_stat = BucketReplicationStat {
                     failed: f_stats.to_metric(),
                     fail_stats: f_stats,
-                    replicated_size: stat.replicated_size + old_stat.replicated_size,
-                    replicated_count: stat.replicated_count + old_stat.replicated_count,
+                    replicated_size: stat.replicated_size.saturating_add(old_stat.replicated_size),
+                    replicated_count: stat.replicated_count.saturating_add(old_stat.replicated_count),
                     latency: stat.latency.merge(&old_stat.latency),
                     xfer_rate_lrg: lrg,
                     xfer_rate_sml: sml,
-                    bandwidth_limit_bytes_per_sec: stat.bandwidth_limit_bytes_per_sec,
+                    bandwidth_limit_bytes_per_sec: stat
+                        .bandwidth_limit_bytes_per_sec
+                        .saturating_add(old_stat.bandwidth_limit_bytes_per_sec),
                     current_bandwidth_bytes_per_sec: stat.current_bandwidth_bytes_per_sec
                         + old_stat.current_bandwidth_bytes_per_sec,
+                    latency_scope: if latency_available {
+                        ReplicationMetricScope::ClusterAggregated
+                    } else {
+                        ReplicationMetricScope::Unavailable
+                    },
+                    bandwidth_scope: if bandwidth_available {
+                        ReplicationMetricScope::ClusterAggregated
+                    } else {
+                        ReplicationMetricScope::Unavailable
+                    },
                 };
 
-                tot_replicated_size += stat.replicated_size;
-                tot_replicated_count += stat.replicated_count;
+                tot_replicated_size = tot_replicated_size.saturating_add(stat.replicated_size);
+                tot_replicated_count = tot_replicated_count.saturating_add(stat.replicated_count);
             }
         }
 
@@ -499,23 +532,28 @@ impl ReplicationStats {
             resync_started_count: bucket_stats
                 .iter()
                 .map(|stats| stats.replication_stats.resync_started_count)
-                .sum(),
+                .fold(0i64, i64::saturating_add),
             resync_completed_count: bucket_stats
                 .iter()
                 .map(|stats| stats.replication_stats.resync_completed_count)
-                .sum(),
+                .fold(0i64, i64::saturating_add),
             resync_failed_count: bucket_stats
                 .iter()
                 .map(|stats| stats.replication_stats.resync_failed_count)
-                .sum(),
+                .fold(0i64, i64::saturating_add),
             resync_canceled_count: bucket_stats
                 .iter()
                 .map(|stats| stats.replication_stats.resync_canceled_count)
-                .sum(),
+                .fold(0i64, i64::saturating_add),
             resync_duration_ms: bucket_stats
                 .iter()
                 .map(|stats| stats.replication_stats.resync_duration_ms)
-                .sum(),
+                .fold(0i64, i64::saturating_add),
+            provider_available: true,
+            cluster_complete: true,
+            observed_node_count: u32::try_from(bucket_stats.len()).unwrap_or(u32::MAX),
+            expected_node_count: u32::try_from(bucket_stats.len()).unwrap_or(u32::MAX),
+            queue_scope: ReplicationMetricScope::ClusterAggregated,
         };
 
         let qs = Default::default();
@@ -547,6 +585,33 @@ impl ReplicationStats {
         bs
     }
 
+    pub async fn aggregate_bucket_replication_stats(
+        &self,
+        bucket: &str,
+        bucket_stats: Vec<BucketStats>,
+        expected_node_count: u32,
+    ) -> BucketStats {
+        let mut aggregated = self.calculate_bucket_replication_stats(bucket, bucket_stats).await;
+        let observed_node_count = aggregated.replication_stats.observed_node_count;
+        let complete = observed_node_count == expected_node_count;
+        aggregated.replication_stats.expected_node_count = expected_node_count;
+        aggregated.replication_stats.cluster_complete = complete;
+        aggregated.replication_stats.queue_scope = if complete {
+            ReplicationMetricScope::ClusterAggregated
+        } else {
+            ReplicationMetricScope::PartialCluster
+        };
+        for stat in aggregated.replication_stats.stats.values_mut() {
+            if stat.latency_scope != ReplicationMetricScope::Unavailable {
+                stat.latency_scope = aggregated.replication_stats.queue_scope;
+            }
+            if stat.bandwidth_scope != ReplicationMetricScope::Unavailable {
+                stat.bandwidth_scope = aggregated.replication_stats.queue_scope;
+            }
+        }
+        aggregated
+    }
+
     /// Get latest replication statistics
     pub async fn get_latest_replication_stats(&self, bucket: &str) -> BucketStats {
         // In actual implementation, statistics would be obtained from cluster
@@ -567,6 +632,15 @@ impl ReplicationStats {
         };
         drop(cache);
 
+        {
+            let q_cache = self.q_cache.lock().await;
+            if let Some(queue_stats) = q_cache.bucket_stats.get(bucket) {
+                replication_stats.q_stat = queue_stats.snapshot();
+            }
+        }
+        replication_stats.mark_node_local_provider_available();
+        replication_stats.queue_scope = ReplicationMetricScope::NodeLocal;
+
         if let Some(monitor) = runtime_sources::bucket_monitor() {
             let bw_report = monitor.get_report(|name| name == bucket);
             for (opts, bw) in bw_report.bucket_stats {
@@ -578,8 +652,7 @@ impl ReplicationStats {
                         xfer_rate_sml: XferStats::new(),
                         ..Default::default()
                     });
-                stat.bandwidth_limit_bytes_per_sec = bw.limit_bytes_per_sec;
-                stat.current_bandwidth_bytes_per_sec = bw.current_bandwidth_bytes_per_sec;
+                stat.set_node_local_bandwidth(bw.limit_bytes_per_sec, bw.current_bandwidth_bytes_per_sec);
             }
         }
 
@@ -722,6 +795,132 @@ mod tests {
         let stat = &bucket_stats.stats["test-arn"];
         assert_eq!(stat.replicated_size, 1024);
         assert_eq!(stat.replicated_count, 1);
+    }
+
+    #[tokio::test]
+    async fn latest_stats_include_queue_until_drained() {
+        let stats = ReplicationStats::new();
+
+        stats.inc_q("queued-bucket", 4096, false, ReplicationType::Object).await;
+        let queued = stats.get_latest_replication_stats("queued-bucket").await;
+        assert!(queued.replication_stats.provider_available);
+        assert_eq!(queued.replication_stats.q_stat.curr.count, 1);
+        assert_eq!(queued.replication_stats.q_stat.curr.bytes, 4096);
+        assert_eq!(queued.replication_stats.queue_scope, ReplicationMetricScope::NodeLocal);
+
+        stats.dec_q("queued-bucket", 4096, false, ReplicationType::Object).await;
+        let drained = stats.get_latest_replication_stats("queued-bucket").await;
+        assert_eq!(drained.replication_stats.q_stat.curr.count, 0);
+        assert_eq!(drained.replication_stats.q_stat.curr.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_metric_matches_authoritative_fail_stats() {
+        let stats = ReplicationStats::new();
+        let target_info = ReplicatedTargetInfo {
+            arn: "failed-arn".to_string(),
+            size: 2048,
+            duration: Duration::from_millis(25),
+            op_type: ReplicationType::Object,
+            error: Some("target unavailable".to_string()),
+            ..Default::default()
+        };
+
+        stats
+            .update(
+                "failed-bucket",
+                &target_info,
+                ReplicationStatusType::Failed,
+                ReplicationStatusType::Pending,
+            )
+            .await;
+
+        let snapshot = stats.get_latest_replication_stats("failed-bucket").await;
+        let target = &snapshot.replication_stats.stats["failed-arn"];
+        assert_eq!(target.failed.count, target.fail_stats.count);
+        assert_eq!(target.failed.size, target.fail_stats.size);
+        assert_eq!(target.failed.count, 1);
+        assert_eq!(target.failed.size, 2048);
+    }
+
+    #[tokio::test]
+    async fn valid_empty_provider_is_not_reported_as_unavailable() {
+        let stats = ReplicationStats::new();
+
+        let snapshot = stats.get_latest_replication_stats("empty-bucket").await;
+
+        assert!(snapshot.replication_stats.provider_available);
+        assert!(snapshot.replication_stats.cluster_complete);
+        assert_eq!(snapshot.replication_stats.observed_node_count, 1);
+        assert_eq!(snapshot.replication_stats.expected_node_count, 1);
+        assert!(snapshot.replication_stats.stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_aggregation_counts_each_node_once_and_marks_partial() {
+        let stats = ReplicationStats::new();
+        let node = |failed_count, failed_size, queued_count, queued_size| {
+            let mut fail_stats = FailStats::new();
+            fail_stats.count = failed_count;
+            fail_stats.size = failed_size;
+            let mut targets = HashMap::new();
+            targets.insert(
+                "arn".to_string(),
+                BucketReplicationStat {
+                    fail_stats,
+                    latency_scope: ReplicationMetricScope::NodeLocal,
+                    ..Default::default()
+                },
+            );
+            let q_stat = InQueueMetric::default();
+            q_stat.curr.now_count.store(queued_count, Ordering::Relaxed);
+            q_stat.curr.now_bytes.store(queued_size, Ordering::Relaxed);
+            let q_stat = q_stat.snapshot();
+            BucketStats {
+                replication_stats: BucketReplicationStats {
+                    stats: targets,
+                    q_stat,
+                    provider_available: true,
+                    queue_scope: ReplicationMetricScope::NodeLocal,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+
+        let aggregated = stats
+            .aggregate_bucket_replication_stats("bucket", vec![node(1, 10, 2, 20), node(3, 30, 4, 40)], 3)
+            .await;
+
+        let target = &aggregated.replication_stats.stats["arn"];
+        assert_eq!(target.failed.count, 4);
+        assert_eq!(target.failed.size, 40);
+        assert_eq!(aggregated.replication_stats.q_stat.curr.count, 6);
+        assert_eq!(aggregated.replication_stats.q_stat.curr.bytes, 60);
+        assert_eq!(aggregated.replication_stats.observed_node_count, 2);
+        assert_eq!(aggregated.replication_stats.expected_node_count, 3);
+        assert!(!aggregated.replication_stats.cluster_complete);
+        assert_eq!(aggregated.replication_stats.queue_scope, ReplicationMetricScope::PartialCluster);
+        assert_eq!(target.latency_scope, ReplicationMetricScope::PartialCluster);
+    }
+
+    #[tokio::test]
+    async fn concurrent_queue_updates_are_visible_without_lost_counts() {
+        let stats = Arc::new(ReplicationStats::new());
+        let mut tasks = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let stats = Arc::clone(&stats);
+            tasks.push(tokio::spawn(async move {
+                stats.inc_q("concurrent-bucket", 7, false, ReplicationType::Object).await;
+            }));
+        }
+        for task in tasks {
+            task.await.expect("queue update task should complete");
+        }
+
+        let snapshot = stats.get_latest_replication_stats("concurrent-bucket").await;
+        assert_eq!(snapshot.replication_stats.q_stat.curr.count, 32);
+        assert_eq!(snapshot.replication_stats.q_stat.curr.bytes, 224);
     }
 
     #[tokio::test]

@@ -68,6 +68,33 @@ const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_ski
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
 
+#[derive(Debug, Default)]
+pub struct DurableMrfBacklog {
+    pub available: bool,
+    pub entries: Vec<MrfReplicateEntry>,
+}
+
+fn durable_mrf_backlog_from_read(result: Result<Vec<u8>, EcstoreError>) -> DurableMrfBacklog {
+    match result {
+        Ok(data) => match decode_mrf_file(&data) {
+            Ok(entries) if entries.iter().all(|entry| entry.size >= 0) => DurableMrfBacklog {
+                available: true,
+                entries,
+            },
+            Ok(_) | Err(_) => DurableMrfBacklog::default(),
+        },
+        Err(EcstoreError::ConfigNotFound) => DurableMrfBacklog {
+            available: true,
+            entries: Vec::new(),
+        },
+        Err(_) => DurableMrfBacklog::default(),
+    }
+}
+
+pub async fn read_durable_mrf_backlog<S: ReplicationObjectIO>(storage: Arc<S>) -> DurableMrfBacklog {
+    durable_mrf_backlog_from_read(ReplicationConfigStore::read(storage, ReplicationMetadataStore::MRF_REPLICATION_FILE).await)
+}
+
 /// Main replication pool structure
 #[derive(Debug)]
 pub struct ReplicationPool<S: ReplicationStorage> {
@@ -2232,5 +2259,54 @@ mod tests {
         // The "deleteMarkerMtime" key was absent in old files — #[serde(default)] must fill in
         // None so replay falls back to the current time (backlog#867 backward compatibility).
         assert_eq!(entry.delete_marker_mtime, None, "missing deleteMarkerMtime key must default to None");
+    }
+
+    #[test]
+    fn durable_mrf_snapshot_reads_restart_backlog_and_valid_empty_state() {
+        let entries = vec![MrfReplicateEntry {
+            bucket: "restart-bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 512,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+        }];
+        let encoded = encode_mrf_file(&entries).expect("durable MRF backlog should encode");
+
+        let recovered = durable_mrf_backlog_from_read(Ok(encoded));
+        assert!(recovered.available);
+        assert_eq!(recovered.entries.len(), 1);
+        assert_eq!(recovered.entries[0].bucket, "restart-bucket");
+        assert_eq!(recovered.entries[0].size, 512);
+
+        let missing_file = durable_mrf_backlog_from_read(Err(EcstoreError::ConfigNotFound));
+        assert!(missing_file.available);
+        assert!(missing_file.entries.is_empty());
+    }
+
+    #[test]
+    fn durable_mrf_snapshot_marks_corrupt_or_invalid_data_unavailable() {
+        let corrupt = durable_mrf_backlog_from_read(Ok(vec![0, 1, 2]));
+        assert!(!corrupt.available);
+        assert!(corrupt.entries.is_empty());
+
+        let negative = encode_mrf_file(&[MrfReplicateEntry {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+            retry_count: 0,
+            size: -1,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+            delete_marker_mtime: None,
+        }])
+        .expect("invalid persisted entry should still encode for boundary testing");
+        let invalid = durable_mrf_backlog_from_read(Ok(negative));
+        assert!(!invalid.available);
+        assert!(invalid.entries.is_empty());
     }
 }

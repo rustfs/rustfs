@@ -699,6 +699,17 @@ impl StorageReplicationStatsHandle {
         self.inner.get_latest_replication_stats(bucket).await
     }
 
+    pub(crate) async fn aggregate_bucket_replication_stats(
+        &self,
+        bucket: &str,
+        stats: Vec<ecstore_bucket::replication::BucketStats>,
+        expected_node_count: u32,
+    ) -> ecstore_bucket::replication::BucketStats {
+        self.inner
+            .aggregate_bucket_replication_stats(bucket, stats, expected_node_count)
+            .await
+    }
+
     pub(crate) async fn site_metrics_snapshot(&self) -> ReplicationSiteMetricsSnapshot {
         let metrics = self.inner.get_sr_metrics_for_node().await;
         ReplicationSiteMetricsSnapshot {
