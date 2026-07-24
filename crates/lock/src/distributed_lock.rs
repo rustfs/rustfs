@@ -19,6 +19,7 @@ use crate::{
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
 use futures::future::join_all;
+use rand::RngExt as _;
 use rustfs_io_metrics::{
     record_lock_refresh_quorum_lost, record_read_lock_held_acquire, record_read_lock_held_release,
     record_write_lock_held_acquire, record_write_lock_held_release,
@@ -548,8 +549,15 @@ impl DistributedLock {
         pending
     }
 
-    fn lock_acquire_retry_backoff(attempt: usize) -> Duration {
-        LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF.saturating_mul(attempt.try_into().unwrap_or(u32::MAX))
+    fn lock_acquire_retry_backoff(attempt: usize, rng: &mut impl rand::Rng) -> Duration {
+        let base = LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF.saturating_mul(attempt.try_into().unwrap_or(u32::MAX));
+        let jitter = base / 4;
+        let lower = base.saturating_sub(jitter);
+        let upper = base.saturating_add(jitter);
+        let lower_millis = u64::try_from(lower.as_millis()).unwrap_or(u64::MAX);
+        let upper_millis = u64::try_from(upper.as_millis()).unwrap_or(u64::MAX);
+
+        Duration::from_millis(rng.random_range(lower_millis..=upper_millis))
     }
 
     fn lock_acquire_attempt_timeout(&self, remaining: Duration) -> Duration {
@@ -703,7 +711,7 @@ impl DistributedLock {
             }
 
             last_result = Some(result);
-            let backoff = Self::lock_acquire_retry_backoff(attempt);
+            let backoff = Self::lock_acquire_retry_backoff(attempt, &mut rand::rng());
             if start.elapsed().saturating_add(backoff) >= request.acquire_timeout {
                 break;
             }
@@ -1006,10 +1014,11 @@ fn record_lock_held_release(lock_type: LockType) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LockAcquireFailureKind, is_remote_lock_rpc_failure,
-        should_warn_lock_failure,
+        DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF, LockAcquireFailureKind,
+        is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
+    use rand::{SeedableRng as _, rngs::StdRng};
     use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{
@@ -1023,6 +1032,21 @@ mod tests {
         Alive,    // Ok(true)  refresh succeeded
         NotFound, // Ok(false) remote already lost the lock (reclaimed / never held)
         RpcError, // Err        RPC jitter
+    }
+
+    #[test]
+    fn lock_acquire_retry_backoff_uses_bounded_jitter() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let base = LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF * 3;
+        let jitter = base / 4;
+        let lower = base - jitter;
+        let upper = base + jitter;
+        let samples = (0..32)
+            .map(|_| DistributedLock::lock_acquire_retry_backoff(3, &mut rng))
+            .collect::<Vec<_>>();
+
+        assert!(samples.iter().all(|delay| *delay >= lower && *delay <= upper));
+        assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
     }
 
     /// Counting test client: acquires successfully and echoes back request.lock_id as
@@ -1997,7 +2021,7 @@ mod tests {
         drop(guard);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn acquire_guard_returns_timeout_when_quorum_remains_contended() {
         let clients: Vec<Arc<dyn LockClient>> = vec![
             ResponseClient::new(LockResponse::failure("lock already held", Duration::ZERO)).into_client(),
@@ -2009,9 +2033,9 @@ mod tests {
         let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
             .with_acquire_timeout(Duration::from_millis(120));
 
-        let result = lock.acquire_guard(&request).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), lock.acquire_guard(&request)).await;
 
-        assert!(matches!(result, Ok(None)), "unexpected result: {result:?}");
+        assert_matches!(result, Ok(Ok(None)));
     }
 
     #[tokio::test]
