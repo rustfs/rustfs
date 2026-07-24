@@ -70,7 +70,9 @@ use rustfs_config::{
     ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
-use rustfs_filemeta::{FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, get_file_info, is_restored_object_on_disk};
+use rustfs_filemeta::{
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
+};
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ObjectLockConfiguration, RestoreRequest,
@@ -2459,6 +2461,7 @@ pub struct ManualTransitionRunReport {
     pub skipped_delete_marker: u64,
     pub skipped_directory: u64,
     pub skipped_replication: u64,
+    pub skipped_already_transitioned: u64,
     pub skipped_already_in_flight: u64,
     pub skipped_queue_full: u64,
     pub skipped_queue_closed: u64,
@@ -2771,6 +2774,19 @@ async fn enqueue_transition_with_lifecycle_report(
     options: &ManualTransitionRunOptions,
     report: &mut ManualTransitionRunReport,
 ) -> bool {
+    if oi.transitioned_object.status == TRANSITION_COMPLETE {
+        if options
+            .tier
+            .as_deref()
+            .is_some_and(|tier| !oi.transitioned_object.tier.eq_ignore_ascii_case(tier))
+        {
+            report.skipped_tier = report.skipped_tier.saturating_add(1);
+        } else {
+            report.skipped_already_transitioned = report.skipped_already_transitioned.saturating_add(1);
+        }
+        return false;
+    }
+
     let event = lc.eval(&oi.to_lifecycle_opts()).await;
     match event.action {
         IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
@@ -3669,8 +3685,8 @@ mod tests {
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, FreeVersionTask, ManualTransitionRunOptions, ManualTransitionRunReport,
         StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
-        TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
-        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject,
+        VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report,
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
@@ -6352,6 +6368,26 @@ mod tests {
         assert!(!handled);
         assert_eq!(report.eligible, 0);
         assert_eq!(report.skipped_tier, 1);
+    }
+
+    #[tokio::test]
+    async fn manual_transition_counts_already_transitioned_object() {
+        let lc = latest_transition_lifecycle();
+        let mut object = current_object(ReplicationStatusType::Completed);
+        object.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+        object.transitioned_object.tier = "WARM".to_string();
+        let options = ManualTransitionRunOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let mut report = ManualTransitionRunReport::new(&object.bucket, &options);
+
+        let handled = enqueue_transition_with_lifecycle_report(&object, &lc, &LcEventSrc::Scanner, &options, &mut report).await;
+
+        assert!(!handled);
+        assert_eq!(report.eligible, 0);
+        assert_eq!(report.skipped_not_transition, 0);
+        assert_eq!(report.skipped_already_transitioned, 1);
     }
 
     #[test]
