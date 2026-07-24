@@ -16,6 +16,7 @@ for later deletion.
 - `heal-rpc-auth-v2` internode gRPC authentication: servers temporarily accept legacy prefix signatures so old peers remain available during rolling upgrades. Remove the legacy fallback after the minimum supported RustFS peer version sends v2 authentication on every internode gRPC request.
 - `heal-status-rpc-v1` node heal status capability: new peers treat an unimplemented BackgroundHealStatus RPC as an explicitly incomplete rolling-upgrade response. Remove the fallback after the minimum supported RustFS peer version implements BackgroundHealStatus.
 - `backlog-1316` legacy encrypted multipart range seek: the feature remains opt-in until every server that can initiate, write, or complete multipart uploads supports the candidate-to-final marker protocol and uploadId commit lock, and pre-upgrade multipart uploads have drained. Remove the RUSTFS_ENCRYPTED_RANGE_SEEK switch after the minimum supported release does so; keep the quorum marker and malformed-layout full-read guards permanently.
+- `rustfs-5063` pre-beta.9 Local KMS recovery: persisted Local KMS configs from beta.8 and earlier predate the explicit insecure-development flag, and encrypted key files use the legacy SHA-256 KDF. Remove the config fallback after supported upgrades have rewritten or explicitly resaved all pre-beta.9 configs with the development-default field, and remove the legacy KDF after supported upgrades have rewritten all pre-beta.9 Local KMS key files with explicit at-rest protection.
 
 ## Review Checklist
 

@@ -83,7 +83,8 @@ pub use api_types::{
     TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
-pub use error::{KmsError, Result};
+pub use encryption::is_data_key_envelope;
+pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{

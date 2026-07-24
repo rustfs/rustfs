@@ -24,6 +24,7 @@ use crate::error::{KmsError, Result};
 use async_trait::async_trait;
 use jiff::Zoned;
 use rand::Rng;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -42,6 +43,30 @@ pub struct DataKeyEnvelope {
     pub encryption_context: HashMap<String, String>,
     #[serde(with = "crate::time_serde::zoned")]
     pub created_at: Zoned,
+}
+
+#[derive(Deserialize)]
+struct DataKeyEnvelopeMarker {
+    #[serde(rename = "key_id")]
+    _key_id: IgnoredAny,
+    #[serde(rename = "master_key_id")]
+    _master_key_id: IgnoredAny,
+    #[serde(rename = "key_spec")]
+    _key_spec: IgnoredAny,
+    #[serde(rename = "encrypted_key")]
+    _encrypted_key: IgnoredAny,
+    #[serde(rename = "nonce")]
+    _nonce: IgnoredAny,
+    #[serde(rename = "encryption_context")]
+    _encryption_context: IgnoredAny,
+    #[serde(rename = "created_at")]
+    _created_at: IgnoredAny,
+}
+
+/// Returns whether ciphertext is a RustFS KMS data-key envelope.
+pub fn is_data_key_envelope(ciphertext: &[u8]) -> bool {
+    ciphertext.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'{')
+        && serde_json::from_slice::<DataKeyEnvelopeMarker>(ciphertext).is_ok()
 }
 
 /// Trait for encrypting and decrypting data encryption keys (DEK)
@@ -328,5 +353,47 @@ mod tests {
         let deserialized: DataKeyEnvelope = serde_json::from_str(envelope_json).expect("Should deserialize legacy format");
         assert_eq!(deserialized.key_id, "test-key-id");
         assert_eq!(deserialized.master_key_id, "master-key-id");
+    }
+
+    #[test]
+    fn test_data_key_envelope_discriminator_rejects_local_formats() {
+        let kms_envelope = br#"{
+            "key_id": "test-key-id",
+            "master_key_id": "master-key-id",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+        let minio_legacy = br#"{"aead":"AES-256-GCM-HMAC-SHA-256","iv":[1],"nonce":[2],"bytes":[3]}"#;
+        let duplicate_key_id = [b"{\"key_id\":\"duplicate\",".as_slice(), &kms_envelope[1..]].concat();
+
+        assert!(is_data_key_envelope(kms_envelope));
+        assert!(is_data_key_envelope(&[b" \n".as_slice(), kms_envelope].concat()));
+        assert!(!is_data_key_envelope(&duplicate_key_id));
+        assert!(!is_data_key_envelope(b"bm9uY2U=:Y2lwaGVydGV4dA=="));
+        assert!(!is_data_key_envelope(minio_legacy));
+
+        let envelope_value: serde_json::Value = serde_json::from_slice(kms_envelope).expect("parse KMS envelope fixture");
+        for required_field in [
+            "key_id",
+            "master_key_id",
+            "key_spec",
+            "encrypted_key",
+            "nonce",
+            "encryption_context",
+            "created_at",
+        ] {
+            let mut incomplete = envelope_value.clone();
+            incomplete
+                .as_object_mut()
+                .expect("KMS envelope fixture is an object")
+                .remove(required_field);
+            assert!(
+                !is_data_key_envelope(&serde_json::to_vec(&incomplete).expect("serialize incomplete envelope")),
+                "missing {required_field} must not classify as a KMS envelope"
+            );
+        }
     }
 }
