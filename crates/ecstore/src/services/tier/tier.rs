@@ -20,7 +20,7 @@
 
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use futures::FutureExt;
+use futures::{FutureExt, future::join_all};
 use http::HeaderMap;
 use http::status::StatusCode;
 use lazy_static::lazy_static;
@@ -956,10 +956,14 @@ struct TierMutationPrepareFailure {
 }
 
 async fn abort_tier_mutation_peers(mutation_id: uuid::Uuid, peers: Vec<Arc<dyn TierMutationPeer>>) -> io::Result<()> {
-    let mut failures = Vec::new();
-    for peer in peers {
+    let results = join_all(peers.into_iter().map(|peer| async move {
         let label = peer.peer_label();
         let result = peer.abort_tier_mutation(mutation_id).await;
+        (label, result)
+    }))
+    .await;
+    let mut failures = Vec::new();
+    for (label, result) in results {
         match result {
             Ok(PeerTierMutationState::Aborted) => {}
             Ok(state) => {
@@ -981,9 +985,16 @@ async fn commit_tier_mutation_peers(
     committed_config_etag: &str,
 ) -> io::Result<()> {
     let payload = Bytes::copy_from_slice(committed_config_etag.as_bytes());
-    for peer in peers {
-        let label = peer.peer_label();
-        let result = peer.commit_tier_mutation(mutation_id, payload.clone()).await;
+    let results = join_all(peers.into_iter().map(|peer| {
+        let payload = payload.clone();
+        async move {
+            let label = peer.peer_label();
+            let result = peer.commit_tier_mutation(mutation_id, payload).await;
+            (label, result)
+        }
+    }))
+    .await;
+    for (label, result) in results {
         match result {
             Ok(PeerTierMutationState::Committed) => {}
             Ok(state) => {
@@ -5909,11 +5920,12 @@ mod tests {
             })
         }
 
-        async fn track_prepare(&self) {
+        async fn track(&self, action: &str) {
             let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(current, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(20)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
+            lock_unpoisoned(&self.calls).push(format!("{}:{action}", self.label));
         }
     }
 
@@ -5928,8 +5940,7 @@ mod tests {
             _mutation_id: uuid::Uuid,
             _canonical_payload: Bytes,
         ) -> Result<PeerTierMutationState> {
-            self.track_prepare().await;
-            lock_unpoisoned(&self.calls).push(format!("{}:prepare", self.label));
+            self.track("prepare").await;
             Ok(PeerTierMutationState::Prepared)
         }
 
@@ -5938,6 +5949,7 @@ mod tests {
             _mutation_id: uuid::Uuid,
             _canonical_payload: Bytes,
         ) -> Result<PeerTierMutationState> {
+            self.track("commit").await;
             Ok(PeerTierMutationState::Committed)
         }
 
@@ -5976,6 +5988,34 @@ mod tests {
             lock_unpoisoned(&calls).as_slice(),
             &["peer-a:prepare", "peer-b:prepare", "peer-c:prepare"]
         );
+    }
+
+    #[tokio::test]
+    async fn commit_tier_mutation_peers_keeps_peer_commits_concurrent() {
+        let mutation_id = uuid::Uuid::from_u128(35);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        commit_tier_mutation_peers(
+            mutation_id,
+            vec![
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-a", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-b", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-c", calls.clone(), active.clone(), max_active.clone()),
+            ],
+            "etag-new",
+        )
+        .await
+        .expect("successful commit fanout should commit every peer");
+
+        assert!(
+            max_active.load(Ordering::SeqCst) > 1,
+            "peer commit fanout should remain concurrent after serializing prepare"
+        );
+        let mut calls = lock_unpoisoned(&calls).clone();
+        calls.sort();
+        assert_eq!(calls.as_slice(), &["peer-a:commit", "peer-b:commit", "peer-c:commit"]);
     }
 
     #[tokio::test]
