@@ -5203,9 +5203,11 @@ impl LocalDisk {
 
         let stall = opts.stall_timeout_duration();
 
-        // A wide prefix can contain many immediate children. Keep the existing
-        // in-memory sort contract, but bound each directory-entry read rather
-        // than treating the whole enumeration as one stalled disk operation.
+        // Keep the existing in-memory sort contract, but bound each directory-entry
+        // read rather than treating the whole enumeration as one stalled disk
+        // operation. Object listing keeps using per-entry stall deadlines through
+        // `read_dir_entries_with_walk_stall` so wide prefixes can still be handled
+        // as a single logical read in API semantics.
         let read_dir_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let dir_path_abs = self.get_object_path(&opts.bucket, current.trim_start_matches(SLASH_SEPARATOR))?;
         let read_dir_result = match read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await {
@@ -6622,8 +6624,33 @@ impl DiskAPI for LocalDisk {
     }
 
     /// List a single directory. `count < 0` enumerates the *whole* directory in
-    /// one `os::read_dir` call. Object listing uses `read_dir_entries_with_walk_stall`
-    /// instead so wide prefixes refresh the stall budget per directory entry.
+    /// one `os::read_dir` call.
+    ///
+    /// Wide-directory stall hazard (rustfs/backlog#1216, a #2999 sub-class):
+    /// the walk caller wraps this whole call in the per-read stall budget
+    /// (`with_walk_stall_timeout`, default 5s via
+    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`) as if the entire directory
+    /// enumeration were a single read. For a *wide, flat* directory -- one
+    /// bucket prefix holding millions of immediate children -- a single
+    /// `readdir` of the whole directory can itself exceed the stall budget on a
+    /// healthy disk. That trips `DiskError::Timeout`, which the listing path can
+    /// escalate to a quorum failure and surface to the client as a ListObjects
+    /// 500, even though nothing is actually wrong with the drive.
+    ///
+    /// This path keeps the legacy one-shot call contract and does not attempt
+    /// per-entry timeout segmentation for compatibility reasons. Wide prefix
+    /// listing workarounds therefore remain operational: raise
+    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or use the
+    /// high-latency drive-timeout profile from
+    /// `get_drive_walkdir_stall_timeout`.
+    ///
+    /// This is deliberately NOT fixed here by rewriting this one-shot
+    /// `os::read_dir` into a streaming/batched readdir with per-chunk timeout
+    /// refresh: that is an architecture-level change with high regression
+    /// surface (ordering, the `count` contract, quorum merge semantics) and is
+    /// tracked as a separate follow-up. Object listing now uses
+    /// `scan_dir` + `read_dir_entries_with_walk_stall` to keep wide-prefix
+    /// listing resilient while preserving existing full-enumeration behavior.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
