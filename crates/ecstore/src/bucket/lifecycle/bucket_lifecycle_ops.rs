@@ -2492,6 +2492,24 @@ impl ManualTransitionRunReport {
     pub fn was_truncated(&self) -> bool {
         self.truncated_by_limit || self.truncated_by_duration
     }
+
+    fn record_enqueue_outcome(&mut self, outcome: TransitionEnqueueOutcome) {
+        match outcome {
+            TransitionEnqueueOutcome::Queued => self.enqueued = self.enqueued.saturating_add(1),
+            TransitionEnqueueOutcome::AlreadyInFlight => {
+                self.skipped_already_in_flight = self.skipped_already_in_flight.saturating_add(1);
+            }
+            TransitionEnqueueOutcome::QueueFull => {
+                self.skipped_queue_full = self.skipped_queue_full.saturating_add(1);
+            }
+            TransitionEnqueueOutcome::QueueClosed => {
+                self.skipped_queue_closed = self.skipped_queue_closed.saturating_add(1);
+            }
+            TransitionEnqueueOutcome::QueueSendTimedOut => {
+                self.skipped_queue_timeout = self.skipped_queue_timeout.saturating_add(1);
+            }
+        }
+    }
 }
 
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
@@ -2818,21 +2836,7 @@ async fn enqueue_transition_with_lifecycle_report(
             let outcome = runtime_sources::transition_state_handle()
                 .queue_transition_task_outcome(oi, &event, src)
                 .await;
-            match outcome {
-                TransitionEnqueueOutcome::Queued => report.enqueued = report.enqueued.saturating_add(1),
-                TransitionEnqueueOutcome::AlreadyInFlight => {
-                    report.skipped_already_in_flight = report.skipped_already_in_flight.saturating_add(1);
-                }
-                TransitionEnqueueOutcome::QueueFull => {
-                    report.skipped_queue_full = report.skipped_queue_full.saturating_add(1);
-                }
-                TransitionEnqueueOutcome::QueueClosed => {
-                    report.skipped_queue_closed = report.skipped_queue_closed.saturating_add(1);
-                }
-                TransitionEnqueueOutcome::QueueSendTimedOut => {
-                    report.skipped_queue_timeout = report.skipped_queue_timeout.saturating_add(1);
-                }
-            }
+            report.record_enqueue_outcome(outcome);
             return outcome.is_handled();
         }
         _ => report.skipped_not_transition = report.skipped_not_transition.saturating_add(1),
@@ -6388,6 +6392,20 @@ mod tests {
         assert_eq!(report.eligible, 0);
         assert_eq!(report.skipped_not_transition, 0);
         assert_eq!(report.skipped_already_transitioned, 1);
+    }
+
+    #[test]
+    fn manual_transition_report_marks_queue_pressure_partial() {
+        let options = ManualTransitionRunOptions::default();
+        let mut report = ManualTransitionRunReport::new("bucket", &options);
+
+        report.record_enqueue_outcome(TransitionEnqueueOutcome::QueueFull);
+
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.skipped_queue_full, 1);
+        assert_eq!(report.skipped_queue_closed, 0);
+        assert_eq!(report.skipped_queue_timeout, 0);
+        assert!(report.has_partial_enqueue());
     }
 
     #[test]
