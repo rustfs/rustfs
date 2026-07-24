@@ -935,6 +935,296 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct CompatPayloadField {
+        message: &'static str,
+        json_field: &'static str,
+        bin_field: &'static str,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RequestJsonPolicy {
+        MsgpackOnlyEligible,
+        AlwaysDualWriteUntilFallbackZero,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RequestCompatSendSite {
+        field: CompatPayloadField,
+        json_encoder: &'static str,
+        policy: RequestJsonPolicy,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ResponseCompatSendSite {
+        field: CompatPayloadField,
+        json_encoder: &'static str,
+    }
+
+    const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "BatchReadVersionRequest",
+                json_field: "batch_read_version_req",
+                bin_field: "batch_read_version_req_bin",
+            },
+            json_encoder: "let batch_read_version_req = compat_json(&req)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = serde_json::to_string(&fi)?;",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts = serde_json::to_string(&opts)?;",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionsRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts = match serde_json::to_string(&opts) {",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionsRequest",
+                json_field: "versions",
+                bin_field: "versions_bin",
+            },
+            json_encoder: "versions_str.push(match serde_json::to_string(file_info_versions) {",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadMultipleRequest",
+                json_field: "read_multiple_req",
+                bin_field: "read_multiple_req_bin",
+            },
+            json_encoder: "let read_multiple_req = compat_json(&req)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadVersionRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts_str = compat_json(opts)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "RenameDataRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = compat_json(&fi)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "UpdateMetadataRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = compat_json(&fi)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "UpdateMetadataRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts_str = compat_json(&opts)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "WriteMetadataRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = compat_json(&fi)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+    ];
+
+    const RESPONSE_COMPAT_SEND_SITES: &[ResponseCompatSendSite] = &[
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "BatchReadVersionResponse",
+                json_field: "batch_read_version_resps",
+                bin_field: "batch_read_version_resps_bin",
+            },
+            json_encoder: "compat_response_json(batch_read_version_resp)",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadMultipleResponse",
+                json_field: "read_multiple_resps",
+                bin_field: "read_multiple_resps_bin",
+            },
+            json_encoder: "compat_response_json(read_multiple_resp)",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadVersionResponse",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info_json = compat_response_json(&file_info);",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadXLResponse",
+                json_field: "raw_file_info",
+                bin_field: "raw_file_info_bin",
+            },
+            json_encoder: "let raw_file_info_json = compat_response_json(&raw_file_info);",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "RenameDataResponse",
+                json_field: "rename_data_resp",
+                bin_field: "rename_data_resp_bin",
+            },
+            json_encoder: "let rename_data_resp_json = compat_response_json(&rename_data_resp);",
+        },
+    ];
+
+    fn proto_bin_json_fields(message_suffix: &str) -> Vec<CompatPayloadField> {
+        let proto = include_str!("node.proto");
+        let mut fields = Vec::new();
+        let mut current_message = None;
+
+        for line in proto.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("message ") {
+                current_message = rest.split_whitespace().next();
+                continue;
+            }
+            if line == "}" {
+                current_message = None;
+                continue;
+            }
+            let Some(message) = current_message else {
+                continue;
+            };
+            if line.starts_with("//") || !message.ends_with(message_suffix) || !line.contains("_bin") {
+                continue;
+            }
+            let Some(bin_field) = line.split_whitespace().find(|part| part.ends_with("_bin")) else {
+                continue;
+            };
+            let Some(json_field) = bin_field.strip_suffix("_bin") else {
+                continue;
+            };
+            fields.push(CompatPayloadField {
+                message,
+                json_field,
+                bin_field,
+            });
+        }
+
+        fields.sort();
+        fields
+    }
+
+    fn production_source(source: &'static str, file_name: &str) -> &'static str {
+        source
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| panic!("{file_name} should contain production source before tests"))
+    }
+
+    #[test]
+    fn request_compat_send_site_manifest_covers_node_proto_bin_fields() {
+        let mut manifest_fields = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| send_site.field)
+            .collect::<Vec<_>>();
+        manifest_fields.sort();
+        manifest_fields.dedup();
+
+        assert_eq!(
+            manifest_fields.len(),
+            REQUEST_COMPAT_SEND_SITES.len(),
+            "duplicate request send-site manifest entry"
+        );
+        assert_eq!(manifest_fields, proto_bin_json_fields("Request"));
+    }
+
+    #[test]
+    fn request_compat_send_site_manifest_pins_json_policy_and_encoder() {
+        let source = production_source(include_str!("../../ecstore/src/cluster/rpc/remote_disk.rs"), "remote_disk.rs");
+        let msgpack_only_eligible = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .filter(|send_site| send_site.policy == RequestJsonPolicy::MsgpackOnlyEligible)
+            .count();
+        let always_dual_write = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .filter(|send_site| send_site.policy == RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero)
+            .count();
+
+        assert_eq!(msgpack_only_eligible, 7);
+        assert_eq!(always_dual_write, 4);
+        for send_site in REQUEST_COMPAT_SEND_SITES {
+            assert!(
+                source.contains(send_site.json_encoder),
+                "{}.{} must keep its manifest encoder: {}",
+                send_site.field.message,
+                send_site.field.json_field,
+                send_site.json_encoder
+            );
+        }
+    }
+
+    #[test]
+    fn response_compat_send_site_manifest_covers_node_proto_bin_fields() {
+        let mut manifest_fields = RESPONSE_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| send_site.field)
+            .collect::<Vec<_>>();
+        manifest_fields.sort();
+        manifest_fields.dedup();
+
+        assert_eq!(
+            manifest_fields.len(),
+            RESPONSE_COMPAT_SEND_SITES.len(),
+            "duplicate response send-site manifest entry"
+        );
+        assert_eq!(manifest_fields, proto_bin_json_fields("Response"));
+    }
+
+    #[test]
+    fn response_compat_send_site_manifest_pins_json_encoder() {
+        let source = production_source(include_str!("../../../rustfs/src/storage/rpc/node_service/disk.rs"), "disk.rs");
+
+        for send_site in RESPONSE_COMPAT_SEND_SITES {
+            assert!(
+                source.contains(send_site.json_encoder),
+                "{}.{} must keep its manifest encoder: {}",
+                send_site.field.message,
+                send_site.field.json_field,
+                send_site.json_encoder
+            );
+        }
+    }
+
     #[test]
     fn enforce_tls_generation_cache_bound_evicts_when_retained_entries_still_full() {
         let mut cache = HashMap::new();
