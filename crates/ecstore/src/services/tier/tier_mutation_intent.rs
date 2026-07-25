@@ -256,6 +256,15 @@ impl TierMutationIntent {
         }
     }
 
+    pub(crate) fn same_identity_as(&self, other: &Self) -> bool {
+        self.mutation_id == other.mutation_id
+            && self.kind == other.kind
+            && self.old_config_etag == other.old_config_etag
+            && self.candidate_digest == other.candidate_digest
+            && self.affected_targets == other.affected_targets
+            && self.expires_at_unix_nanos == other.expires_at_unix_nanos
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let intent_bytes = serde_json::to_vec(self)?;
@@ -567,7 +576,23 @@ where
         }
         match save_tier_mutation_intent_record_if_current_with_prefix(api.clone(), prefix, &intent, &current_etag).await {
             Ok(()) => return Ok((intent, true)),
-            Err(Error::PreconditionFailed) if attempt + 1 < TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS => continue,
+            Err(Error::PreconditionFailed) => {
+                let (mut current, _) =
+                    load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await?;
+                if !current.same_identity_as(&intent) {
+                    return Err(Error::PreconditionFailed);
+                }
+                let replayed = current
+                    .advance_idempotent(next, intent.committed_config_etag.clone())
+                    .map_err(tier_mutation_intent_store_error)?;
+                if replayed {
+                    if attempt + 1 < TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS {
+                        continue;
+                    }
+                    return Err(Error::PreconditionFailed);
+                }
+                return Ok((current, false));
+            }
             Err(err) => return Err(err),
         }
     }
