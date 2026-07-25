@@ -41,9 +41,13 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 thiserror.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 smallvec = { workspace = true, features = ["serde"] }
 smartstring.workspace = true
 crossbeam-queue = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lib]
 doctest = false
