@@ -1748,7 +1748,11 @@ async fn apply_managed_decryption_material(
         // When a test-injected provider is registered via set_sse_dek_provider_for_test,
         // use it instead of creating a fresh KmsSseDekProvider which cannot resolve
         // a KMS service without an AppContext.
-        if let Some(cached) = GLOBAL_SSE_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
+        //
+        // Reads GLOBAL_KMS_DEK_PROVIDER (populated only by set_sse_dek_provider_for_test),
+        // never GLOBAL_SSE_DEK_PROVIDER, so a local provider cached by a prior
+        // get_local_sse_dek_provider call cannot be selected to unwrap a KMS envelope.
+        if let Some(cached) = GLOBAL_KMS_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
             cached
         } else {
             Arc::new(KmsSseDekProvider::new().await?)
@@ -1970,41 +1974,33 @@ impl SseDekProvider for KmsSseDekProvider {
 // Test/Simple DEK Provider
 // ============================================================================
 
-/// Simple SSE DEK provider for testing purposes
+/// Local SSE DEK provider for deployments without a KMS.
 ///
-/// This provider reads a single 32-byte customer master key (CMK) from the
-/// `__RUSTFS_SSE_SIMPLE_CMK` environment variable. The key must be base64-encoded.
+/// Uses `RUSTFS_SSE_S3_MASTER_KEY` (base64-encoded 32-byte key) to wrap
+/// data-encryption keys with AES-256-GCM.  This is the production fallback
+/// when no KMS service is configured.
 ///
-/// # Environment Variable Format
+/// # Environment Variable
 ///
 /// ```text
-/// __RUSTFS_SSE_SIMPLE_CMK=<base64_encoded_32_byte_key>
+/// RUSTFS_SSE_S3_MASTER_KEY=<base64_encoded_32_byte_key>
 /// ```
-///
-/// Example:
-/// ```bash
-/// export __RUSTFS_SSE_SIMPLE_CMK="AKHul86TBMMJ3+VrGlh9X3dHJsOtSXOXHOODPwmAnOo="
-/// ```
-///
-/// # Key Generation
-///
-/// Use the provided script to generate a valid key:
-/// ```bash
-/// # Windows
-/// .\scripts\generate-sse-keys.ps1
-///
-/// # Linux/Unix/macOS
-/// ./scripts/generate-sse-keys.sh
-/// ```
-pub(crate) struct TestSseDekProvider {
+pub(crate) struct LocalSseDekProvider {
     master_key: [u8; 32],
 }
+
+/// Test-only alias so existing test code that references `TestSseDekProvider`
+/// continues to compile without changes.
+#[cfg(test)]
+#[allow(non_camel_case_types)]
+pub(crate) type TestSseDekProvider = LocalSseDekProvider;
 
 /// Parse the base64-encoded 32-byte master key from `__RUSTFS_SSE_SIMPLE_CMK`.
 ///
 /// Returns an error (never crashes) for a missing, non-base64, wrong-length, or
 /// all-zero key so callers on the request path can fail the request instead of
 /// taking the whole server down (backlog#806).
+#[cfg(test)]
 fn parse_simple_sse_cmk(cmk_value: &str) -> Result<[u8; 32], ApiError> {
     let trimmed = cmk_value.trim();
     if trimmed.is_empty() {
@@ -2027,21 +2023,23 @@ fn parse_simple_sse_cmk(cmk_value: &str) -> Result<[u8; 32], ApiError> {
     Ok(master_key)
 }
 
-impl TestSseDekProvider {
-    /// Create a SimpleSseDekProvider with a predefined key (for testing)
+impl LocalSseDekProvider {
+    /// Create a LocalSseDekProvider with a predefined key (for testing)
     #[cfg(test)]
     pub fn new_with_key(master_key: [u8; 32]) -> Self {
         Self { master_key }
     }
 
+    /// Create a TestSseDekProvider from `__RUSTFS_SSE_SIMPLE_CMK` (test-only).
+    #[cfg(test)]
     pub fn new() -> Result<Self, ApiError> {
         let cmk_value = std::env::var("__RUSTFS_SSE_SIMPLE_CMK").unwrap_or_default();
         // A missing/invalid key must surface as a request error, never crash the
-        // whole server: `TestSseDekProvider::new` is reached from the SSE request
+        // whole server: `LocalSseDekProvider::new` is reached from the SSE request
         // path (get_sse_dek_provider), so `process::exit(1)` here turned a bad
         // `__RUSTFS_SSE_SIMPLE_CMK` into a process crash-loop DoS (backlog#806).
         let master_key = parse_simple_sse_cmk(&cmk_value)?;
-        tracing::info!("Successfully loaded SSE master key (32 bytes)");
+        tracing::info!("Successfully loaded SSE master key (32 bytes) from __RUSTFS_SSE_SIMPLE_CMK");
         Ok(Self { master_key })
     }
 
@@ -2051,7 +2049,7 @@ impl TestSseDekProvider {
     /// The failures here are server configuration problems, not internal
     /// faults: surface them as `InvalidRequest` (HTTP 400) so a managed-SSE
     /// request against an unconfigured server does not report 500 (rustfs#4844).
-    pub fn new_for_local_sse() -> Result<Self, ApiError> {
+    pub fn new_from_env() -> Result<Self, ApiError> {
         fn sse_not_configured(message: impl Into<String>) -> ApiError {
             ApiError {
                 code: S3ErrorCode::InvalidRequest,
@@ -2131,7 +2129,7 @@ impl TestSseDekProvider {
 }
 
 #[async_trait]
-impl SseDekProvider for TestSseDekProvider {
+impl SseDekProvider for LocalSseDekProvider {
     async fn generate_sse_dek(
         &self,
         _context: &ObjectEncryptionContext,
@@ -2176,8 +2174,21 @@ impl SseDekProvider for TestSseDekProvider {
 // Factory Function for SSE DEK Provider
 // ============================================================================
 
-/// Global SSE DEK provider cache
+/// Global SSE DEK provider cache for local / test providers.
+///
+/// Populated by `get_local_sse_dek_provider` and (for backward-compat in tests)
+/// `set_sse_dek_provider_for_test`.  Read by `get_local_sse_dek_provider` only —
+/// the KMS-envelope decrypt path uses `GLOBAL_KMS_DEK_PROVIDER` so that a cached
+/// local provider can never be selected for a KMS-wrapped data-key.
 static GLOBAL_SSE_DEK_PROVIDER: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Global KMS DEK provider cache for test-injected KMS providers.
+///
+/// Populated **only** by `set_sse_dek_provider_for_test` (test-only).
+/// Read **only** by the KMS-envelope branch of `apply_managed_decryption_material`.
+/// Separation from `GLOBAL_SSE_DEK_PROVIDER` prevents a previously-cached local
+/// provider from being selected to unwrap a KMS data-key envelope.
+static GLOBAL_KMS_DEK_PROVIDER: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Get or initialize the global SSE DEK provider
 ///
@@ -2215,14 +2226,26 @@ async fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiErro
         return Ok(provider);
     }
 
-    // Determine provider: KMS when available, else test env, else local SSE-S3 fallback (no KMS)
-    let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
-        debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
-        Arc::new(TestSseDekProvider::new()?)
-    } else {
-        debug!("Using local SSE-S3 provider (KMS not configured)");
-        Arc::new(TestSseDekProvider::new_for_local_sse()?)
-    };
+    // In test mode, prefer the simple CMK provider when the env var is set.
+    #[cfg(test)]
+    {
+        if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
+            debug!("Using LocalSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
+            let provider: Arc<dyn SseDekProvider> = Arc::new(LocalSseDekProvider::new()?);
+            let mut slot = GLOBAL_SSE_DEK_PROVIDER
+                .write()
+                .map_err(|_| ApiError::from(StorageError::other("Failed to update global SSE DEK provider cache")))?;
+            if let Some(existing) = slot.as_ref() {
+                return Ok(existing.clone());
+            }
+            *slot = Some(provider.clone());
+            return Ok(provider);
+        }
+    }
+
+    // Production fallback: local SSE-S3 provider (no KMS configured).
+    debug!("Using local SSE-S3 provider (KMS not configured)");
+    let provider: Arc<dyn SseDekProvider> = Arc::new(LocalSseDekProvider::new_from_env()?);
 
     let mut slot = GLOBAL_SSE_DEK_PROVIDER
         .write()
@@ -2235,14 +2258,17 @@ async fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiErro
     Ok(provider)
 }
 
-/// Reset the global SSE DEK provider (for testing only)
+/// Reset both global SSE DEK provider caches (for testing only)
 ///
-/// Note: OnceLock doesn't support reset in stable Rust.
-/// Tests should set environment variables before first call to `get_sse_dek_provider()`.
+/// Clears GLOBAL_SSE_DEK_PROVIDER (local/test providers) and
+/// GLOBAL_KMS_DEK_PROVIDER (test-injected KMS providers).
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn reset_sse_dek_provider() {
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = GLOBAL_KMS_DEK_PROVIDER.write() {
         *slot = None;
     }
 }
@@ -2250,6 +2276,9 @@ pub fn reset_sse_dek_provider() {
 #[cfg(test)]
 #[cfg(feature = "rio-v2")]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
+    if let Ok(mut slot) = GLOBAL_KMS_DEK_PROVIDER.write() {
+        *slot = Some(provider.clone());
+    }
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
         *slot = Some(provider);
     }
@@ -4200,6 +4229,76 @@ mod tests {
         };
         assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
 
+        reset_sse_dek_provider();
+    }
+
+    /// Regression test for "local provider cached → dynamically enable KMS → decrypt KMS envelope".
+    ///
+    /// Verifies that a `TestSseDekProvider` previously cached in `GLOBAL_SSE_DEK_PROVIDER`
+    /// is NEVER selected to unwrap a KMS data-key envelope. The KMS-envelope branch must
+    /// read `GLOBAL_KMS_DEK_PROVIDER` (or fall back to `KmsSseDekProvider::new()`), not
+    /// the local-provider cache.
+    #[tokio::test]
+    async fn test_kms_envelope_never_routes_to_cached_local_provider() {
+        use rustfs_kms::config::KmsConfig;
+        use tempfile::TempDir;
+
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        // 1. Populate GLOBAL_SSE_DEK_PROVIDER with a local provider — the kind
+        //    that `get_local_sse_dek_provider` would cache when KMS is absent.
+        let local_master_key = [0xAAu8; 32];
+        *super::GLOBAL_SSE_DEK_PROVIDER
+            .write()
+            .expect("write local provider into local cache") = Some(Arc::new(TestSseDekProvider::new_with_key(local_master_key)));
+
+        // 2. Start a KMS service (dynamic enable).
+        let manager = rustfs_kms::init_global_kms_service_manager();
+        let key_dir = TempDir::new().expect("create KMS key directory");
+        manager
+            .reconfigure(KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .await
+            .expect("start test KMS service");
+
+        // 3. Construct a KMS JSON envelope — the persisted format of a KMS-wrapped DEK.
+        //    is_data_key_envelope() will return true for this payload.
+        let kms_envelope = br#"{
+            "key_id": "envelope-key",
+            "master_key_id": "master-key-id",
+            "key_spec": "AES_256",
+            "encrypted_key": [10, 20, 30, 40],
+            "nonce": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "encryption_context": {},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode(kms_envelope)),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([0x14; 12])),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "envelope-key".to_string()),
+        ]);
+
+        // 4. Decrypt the KMS envelope. Before the fix, this would pick up the cached
+        //    TestSseDekProvider from GLOBAL_SSE_DEK_PROVIDER and either panic (wrong
+        //    format) or produce garbage. After the fix, it routes to KmsSseDekProvider,
+        //    which fails because the envelope contains dummy encrypted bytes that the
+        //    test KMS cannot decrypt — but crucially the error code is NOT a local-
+        //    provider error.
+        let error = match apply_managed_decryption_material("bucket", "object", &metadata).await {
+            Ok(_) => panic!("dummy KMS envelope must not produce valid decryption material"),
+            Err(error) => error,
+        };
+        // The KMS service was reached (ServiceUnavailable or the KMS's own decrypt
+        // failure), not a local-provider format error.
+        assert!(
+            error.code == S3ErrorCode::ServiceUnavailable || error.code == S3ErrorCode::InternalError,
+            "KMS envelope must be routed to KMS provider, not local; got code {:?} msg '{}'",
+            error.code,
+            error.message,
+        );
+
+        manager.stop().await.expect("stop test KMS service");
         reset_sse_dek_provider();
     }
 
