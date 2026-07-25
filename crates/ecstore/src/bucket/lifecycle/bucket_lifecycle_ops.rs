@@ -2649,7 +2649,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     loop {
         let Ok(page) = api
             .clone()
-            .list_object_versions(&oi.bucket, &oi.name, marker.clone(), version_marker.clone(), None, 1000)
+            .list_object_versions_for_lifecycle(&oi.bucket, &oi.name, marker.clone(), version_marker.clone(), None, 1000)
             .await
         else {
             return;
@@ -3210,7 +3210,7 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
     loop {
         let page = api
             .clone()
-            .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
+            .list_object_versions_for_lifecycle(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
             .await?;
 
         for object in page.objects {

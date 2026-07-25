@@ -3888,6 +3888,20 @@ impl ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
+        self.inner_list_object_versions_with_purge(bucket, prefix, marker, version_marker, delimiter, max_keys, false)
+            .await
+    }
+
+    async fn inner_list_object_versions_with_purge(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        include_version_purge: bool,
+    ) -> Result<ListObjectVersionsInfo> {
         let max_keys = normalize_max_keys(max_keys);
         if marker.is_none() && version_marker.is_some() {
             return Err(StorageError::NotImplemented);
@@ -3947,14 +3961,19 @@ impl ECStore {
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
         let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
 
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-            version_marker,
-        )
-        .await;
+        let entries = list_result.entries.unwrap_or_default();
+        let get_objects = if include_version_purge {
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(
+                &entries,
+                bucket,
+                prefix,
+                delimiter.clone(),
+                version_marker,
+            )
+            .await
+        } else {
+            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker).await
+        };
 
         let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
             get_objects,

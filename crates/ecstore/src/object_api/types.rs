@@ -557,6 +557,29 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
+        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, false)
+            .await
+    }
+
+    pub(crate) async fn from_meta_cache_entries_sorted_versions_for_lifecycle(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+    ) -> Vec<ObjectInfo> {
+        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, true)
+            .await
+    }
+
+    async fn from_meta_cache_entries_sorted_versions_with_purge(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+        include_version_purge: bool,
+    ) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
         let mut prev_prefix = "";
@@ -604,7 +627,7 @@ impl ObjectInfo {
                 };
 
                 for fi in versions.iter() {
-                    if !fi.version_purge_status().is_empty() {
+                    if !include_version_purge && !fi.version_purge_status().is_empty() {
                         continue;
                     }
 
