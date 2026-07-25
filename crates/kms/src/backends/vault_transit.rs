@@ -602,7 +602,7 @@ impl VaultTransitKmsBackend {
                 metadata_key_prefix: vault_config.key_path_prefix.clone(),
                 tls: vault_config.tls.clone(),
             },
-            crate::config::BackendConfig::Local(_) => {
+            crate::config::BackendConfig::Local(_) | crate::config::BackendConfig::Static(_) => {
                 return Err(KmsError::configuration_error("Expected Vault Transit backend configuration"));
             }
         };

@@ -78,9 +78,10 @@ pub mod types;
 
 // Re-export public API
 pub use api_types::{
-    CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureVaultKmsRequest,
-    ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest, StartKmsResponse, StopKmsResponse,
-    TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
+    CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureStaticKmsRequest,
+    ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest,
+    StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
+    UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
 pub use encryption::is_data_key_envelope;
