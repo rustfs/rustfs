@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_condition_keys_ignore_spoofed_headers() {
+    fn ghsa_6r96_identity_condition_keys_ignore_spoofed_headers() {
         let cred = create_test_credentials();
         let mut headers = HeaderMap::new();
         // A caller naming its headers after identity condition keys must not be able
@@ -1369,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claim_condition_keys_ignore_spoofed_headers() {
+    fn ghsa_6r96_claim_condition_keys_ignore_spoofed_headers() {
         // The credential carries no groups/roles claims, so these keys are absent --
         // precisely the case a spoofed header would otherwise fill in.
         let cred = create_test_credentials();

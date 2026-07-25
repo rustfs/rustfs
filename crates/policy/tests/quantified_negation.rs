@@ -26,7 +26,7 @@ fn eval(json: &str, values: &HashMap<String, Vec<String>>) -> bool {
 }
 
 #[test]
-fn for_all_values_string_not_equals_partial_overlap() {
+fn ghsa_v9cp_for_all_values_not_equals_partial_overlap() {
     // groups = {art, hr}; policy set = {prod, art}. "art" IS in the set,
     // so not every value is "not equal" -> AWS says false.
     let v = ctx("groups", &["art", "hr"]);
@@ -38,7 +38,7 @@ fn for_all_values_string_not_equals_partial_overlap() {
 }
 
 #[test]
-fn for_any_value_string_not_equals_partial_overlap() {
+fn ghsa_v9cp_for_any_value_not_equals_partial_overlap() {
     // groups = {art, hr}; policy set = {prod, art}. "hr" is NOT in the set,
     // so at least one value is "not equal" -> AWS says true.
     let v = ctx("groups", &["art", "hr"]);

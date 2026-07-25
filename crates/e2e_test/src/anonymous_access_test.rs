@@ -177,7 +177,7 @@ async fn test_anonymous_access_allowed_when_restrict_public_buckets_disabled()
 /// same public-access gate as a direct grant.
 #[tokio::test]
 #[serial]
-async fn test_anonymous_list_object_versions_denied_when_restrict_public_buckets_enabled()
+async fn ghsa_x298_anonymous_list_object_versions_denied_when_restrict_public_buckets_enabled()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
     info!("Starting test: anonymous ListObjectVersions denied with RestrictPublicBuckets=true...");
