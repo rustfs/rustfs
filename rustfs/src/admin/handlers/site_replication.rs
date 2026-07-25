@@ -5845,7 +5845,20 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
         status: "running".to_string(),
         ..Default::default()
     };
-    let targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let Some(pool) = current_replication_pool_handle() else {
+        bucket_status.status = "failed".to_string();
+        bucket_status.err_detail = "replication pool is not initialized".to_string();
+        return bucket_status;
+    };
+    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let _transaction_guard = match metadata_sys::acquire_bucket_targets_transaction_lock(bucket).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            bucket_status.status = "failed".to_string();
+            bucket_status.err_detail = "replication target metadata transaction lock is unavailable".to_string();
+            return bucket_status;
+        }
+    };
 
     let (config, _) = match metadata_sys::get_replication_config(bucket).await {
         Ok(config) => config,
@@ -5856,7 +5869,7 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
         }
     };
 
-    let mut targets = match metadata_sys::list_bucket_targets(bucket).await {
+    let targets = match metadata_sys::list_bucket_targets_from_disk(bucket).await {
         Ok(targets) => targets,
         Err(err) => {
             bucket_status.status = "failed".to_string();
@@ -5864,13 +5877,6 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
             return bucket_status;
         }
     };
-
-    let Some(pool) = current_replication_pool_handle() else {
-        bucket_status.status = "failed".to_string();
-        bucket_status.err_detail = "replication pool is not initialized".to_string();
-        return bucket_status;
-    };
-
     let Some(target_index) = targets
         .targets
         .iter()
@@ -5898,7 +5904,7 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
 
     let reset_before = Some(OffsetDateTime::now_utc());
     let target_arn = {
-        let target = &mut targets.targets[target_index];
+        let target = &targets.targets[target_index];
 
         let (has_arn, existing_object_enabled) = config.has_existing_object_replication(&target.arn);
         if !has_arn || !existing_object_enabled {
@@ -5907,35 +5913,46 @@ async fn start_site_bucket_resync(bucket: &str, target_arn: &str, resync_id: &st
             return bucket_status;
         }
 
-        target.reset_id = resync_id.to_string();
-        target.reset_before_date = reset_before;
         target.arn.clone()
     };
 
-    let json_targets = match serde_json::to_vec(&targets) {
-        Ok(json_targets) => json_targets,
+    let opts = replication::resync_opts(bucket, target_arn.clone(), resync_id, reset_before);
+    let admission_pool = pool.clone();
+    let activation_pool = pool.clone();
+    let committed_targets = match replication::commit_resync_target(
+        targets,
+        opts,
+        move |opts| async move { admission_pool.admit_bucket_resync(opts).await },
+        move |encoded| async move {
+            metadata_sys::update_bucket_targets_under_transaction_lock(bucket, encoded)
+                .await
+                .map(|_| ())
+                .map_err(|_| {
+                    StorageError::other(
+                        "replication resync was accepted but target metadata commit failed; retry the same resync ID to reconcile",
+                    )
+                })
+        },
+        move |opts, recovering| async move { activation_pool.activate_bucket_resync(opts, recovering).await },
+    )
+    .await
+    {
+        Ok(targets) => targets,
         Err(err) => {
             bucket_status.status = "failed".to_string();
-            bucket_status.err_detail = err.to_string();
+            if let Some(active_resync_id) = replication::resync_start_conflict_id(&err) {
+                bucket_status.status = "conflict".to_string();
+                bucket_status.err_detail =
+                    format!("replication resync {active_resync_id} is already active for this target");
+            } else {
+                bucket_status.err_detail = err.to_string();
+            }
             return bucket_status;
         }
     };
-
-    if let Err(err) = metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets).await {
-        bucket_status.status = "failed".to_string();
-        bucket_status.err_detail = err.to_string();
-        return bucket_status;
-    }
-    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
-    drop(targets_guard);
-
-    if let Err(err) = pool
-        .start_bucket_resync(replication::resync_opts(bucket, target_arn, resync_id, reset_before))
-        .await
-    {
-        bucket_status.status = "failed".to_string();
-        bucket_status.err_detail = err.to_string();
-    }
+    BucketTargetSys::get()
+        .update_all_targets(bucket, Some(&committed_targets))
+        .await;
 
     bucket_status
 }

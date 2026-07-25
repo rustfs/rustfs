@@ -53,6 +53,10 @@ impl ReplicationMetadataStore {
         format!("{REPLICATION_DIR}/{bucket}/{arn}")
     }
 
+    pub(crate) fn resync_admission_lock_key(bucket: &str) -> String {
+        format!("{REPLICATION_DIR}/{bucket}/admission.lock")
+    }
+
     pub(crate) fn bucket_resync_dir_path(bucket: &str) -> String {
         path_join_buf(&[BUCKET_META_PREFIX, bucket, REPLICATION_DIR])
     }
@@ -72,6 +76,10 @@ mod tests {
         assert_eq!(
             ReplicationMetadataStore::resync_lock_key("bucket-a", "arn-a"),
             ".replication/bucket-a/arn-a"
+        );
+        assert_eq!(
+            ReplicationMetadataStore::resync_admission_lock_key("bucket-a"),
+            ".replication/bucket-a/admission.lock"
         );
         assert_eq!(
             ReplicationMetadataStore::bucket_resync_dir_path("bucket-a"),

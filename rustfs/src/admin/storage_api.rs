@@ -264,6 +264,14 @@ pub(crate) mod metadata_sys {
         crate::storage::storage_api::update_bucket_metadata_config(bucket, config_file, data).await
     }
 
+    pub(crate) async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+        crate::storage::storage_api::acquire_bucket_targets_transaction_lock(bucket).await
+    }
+
+    pub(crate) async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
+        crate::storage::storage_api::update_bucket_targets_under_transaction_lock(bucket, data).await
+    }
+
     pub(crate) async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
         crate::storage::storage_api::delete_bucket_metadata_config(bucket, config_file).await
     }
@@ -278,6 +286,14 @@ pub(crate) mod metadata_sys {
 
     pub(crate) async fn get_config_from_disk(bucket: &str) -> Result<BucketMetadata> {
         super::ecstore_bucket::metadata_sys::get_config_from_disk(bucket).await
+    }
+
+    pub(crate) async fn list_bucket_targets_from_disk(bucket: &str) -> Result<BucketTargets> {
+        let metadata = get_config_from_disk(bucket).await?;
+        if metadata.bucket_targets_config_json.is_empty() {
+            return Ok(BucketTargets::default());
+        }
+        serde_json::from_slice(&metadata.bucket_targets_config_json).map_err(super::Error::other)
     }
 
     pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(BucketLifecycleConfiguration, OffsetDateTime)> {
@@ -361,6 +377,174 @@ pub(crate) mod replication {
             arn,
             resync_id: resync_id.to_string(),
             resync_before,
+        }
+    }
+
+    pub(crate) fn resync_start_conflict_id(error: &super::Error) -> Option<&str> {
+        super::ecstore_bucket::replication::resync_start_conflict_id(error)
+    }
+
+    pub(crate) async fn commit_resync_target<Admit, AdmitFuture, Persist, PersistFuture, Activate, ActivateFuture>(
+        mut targets: super::target::BucketTargets,
+        opts: ResyncOpts,
+        admit: Admit,
+        persist: Persist,
+        activate: Activate,
+    ) -> super::Result<super::target::BucketTargets>
+    where
+        Admit: FnOnce(ResyncOpts) -> AdmitFuture,
+        AdmitFuture: std::future::Future<Output = super::Result<bool>>,
+        Persist: FnOnce(Vec<u8>) -> PersistFuture,
+        PersistFuture: std::future::Future<Output = super::Result<()>>,
+        Activate: FnOnce(ResyncOpts, bool) -> ActivateFuture,
+        ActivateFuture: std::future::Future<Output = super::Result<()>>,
+    {
+        let target = targets
+            .targets
+            .iter_mut()
+            .find(|target| target.arn == opts.arn)
+            .ok_or_else(|| super::Error::other("replication resync target is not configured"))?;
+        target.reset_id = opts.resync_id.clone();
+        target.reset_before_date = opts.resync_before;
+        let encoded = serde_json::to_vec(&targets).map_err(super::Error::other)?;
+
+        let new_run = admit(opts.clone()).await?;
+        persist(encoded).await?;
+        activate(opts, !new_run).await?;
+        Ok(targets)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::sync::Mutex;
+
+        fn targets() -> super::super::target::BucketTargets {
+            super::super::target::BucketTargets {
+                targets: vec![
+                    super::super::target::BucketTarget {
+                        arn: "arn:primary".to_string(),
+                        reset_id: "old-primary".to_string(),
+                        ..Default::default()
+                    },
+                    super::super::target::BucketTarget {
+                        arn: "arn:other".to_string(),
+                        reset_id: "other-node-value".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            }
+        }
+
+        fn opts() -> ResyncOpts {
+            ResyncOpts {
+                bucket: "bucket".to_string(),
+                arn: "arn:primary".to_string(),
+                resync_id: "accepted-id".to_string(),
+                resync_before: Some(time::OffsetDateTime::UNIX_EPOCH),
+            }
+        }
+
+        #[tokio::test]
+        async fn admission_failure_never_mutates_or_persists_target_metadata() {
+            let persist_calls = Arc::new(AtomicUsize::new(0));
+            let activate_calls = Arc::new(AtomicUsize::new(0));
+            let original = targets();
+            let error = commit_resync_target(
+                original.clone(),
+                opts(),
+                |_| async { Err(super::super::Error::other("pool unavailable")) },
+                {
+                    let persist_calls = persist_calls.clone();
+                    move |_| async move {
+                        persist_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                {
+                    let activate_calls = activate_calls.clone();
+                    move |_, _| async move {
+                        activate_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .expect_err("admission failure must fail closed");
+
+            assert!(error.to_string().contains("pool unavailable"));
+            assert_eq!(persist_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(activate_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(original.targets[0].reset_id, "old-primary");
+        }
+
+        #[tokio::test]
+        async fn commit_failure_after_durable_admission_waits_for_recovery_without_rollback() {
+            let admitted = Arc::new(AtomicBool::new(false));
+            let activate_calls = Arc::new(AtomicUsize::new(0));
+            let result = commit_resync_target(
+                targets(),
+                opts(),
+                {
+                    let admitted = admitted.clone();
+                    move |_| async move {
+                        admitted.store(true, Ordering::SeqCst);
+                        Ok(true)
+                    }
+                },
+                |_| async { Err(super::super::Error::other("injected target write failure")) },
+                {
+                    let activate_calls = activate_calls.clone();
+                    move |_, _| async move {
+                        activate_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert!(admitted.load(Ordering::SeqCst));
+            assert_eq!(activate_calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn committed_resync_changes_only_its_target_and_activates_after_write() {
+            let persisted = Arc::new(Mutex::new(Vec::new()));
+            let write_finished = Arc::new(AtomicBool::new(false));
+            let committed = commit_resync_target(
+                targets(),
+                opts(),
+                |_| async { Ok(true) },
+                {
+                    let persisted = persisted.clone();
+                    let write_finished = write_finished.clone();
+                    move |encoded| async move {
+                        *persisted.lock().await = encoded;
+                        write_finished.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                {
+                    let write_finished = write_finished.clone();
+                    move |_, recovering| async move {
+                        assert!(!recovering);
+                        assert!(write_finished.load(Ordering::SeqCst));
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .expect("transaction should commit");
+
+            assert_eq!(committed.targets[0].reset_id, "accepted-id");
+            assert_eq!(committed.targets[1].reset_id, "other-node-value");
+            let persisted: super::super::target::BucketTargets =
+                serde_json::from_slice(&persisted.lock().await).expect("persisted targets should decode");
+            assert_eq!(persisted.targets[0].reset_id, "accepted-id");
+            assert_eq!(persisted.targets[1].reset_id, "other-node-value");
         }
     }
 }

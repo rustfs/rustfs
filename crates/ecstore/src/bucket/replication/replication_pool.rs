@@ -95,6 +95,24 @@ pub async fn read_durable_mrf_backlog<S: ReplicationObjectIO>(storage: Arc<S>) -
     durable_mrf_backlog_from_read(ReplicationConfigStore::read(storage, ReplicationMetadataStore::MRF_REPLICATION_FILE).await)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("replication resync {active_resync_id} is already active for {bucket}/{arn}")]
+struct ResyncActiveConflictError {
+    bucket: String,
+    arn: String,
+    active_resync_id: String,
+}
+
+pub fn resync_start_conflict_id(error: &EcstoreError) -> Option<&str> {
+    match error {
+        EcstoreError::Io(io_error) => io_error
+            .get_ref()?
+            .downcast_ref::<ResyncActiveConflictError>()
+            .map(|conflict| conflict.active_resync_id.as_str()),
+        _ => None,
+    }
+}
+
 /// Main replication pool structure
 #[derive(Debug)]
 pub struct ReplicationPool<S: ReplicationStorage> {
@@ -975,47 +993,123 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     pub async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError> {
-        let now = OffsetDateTime::now_utc();
-        let bucket_status = {
-            let mut status_map = self.resyncer.status_map.write().await;
-            let bucket_status = status_map.entry(opts.bucket.clone()).or_insert_with(|| {
-                let mut status = BucketReplicationResyncStatus::new();
-                status.id = 0;
-                status
-            });
+        let new_run = self.clone().admit_bucket_resync(opts.clone()).await?;
+        self.activate_bucket_resync(opts, !new_run).await
+    }
 
-            bucket_status.last_update = Some(now);
-            bucket_status.targets_map.insert(
-                opts.arn.clone(),
-                TargetReplicationResyncStatus {
-                    start_time: Some(now),
-                    last_update: Some(now),
-                    resync_id: opts.resync_id.clone(),
-                    resync_before_date: opts.resync_before,
-                    resync_status: ResyncStatusType::ResyncPending,
-                    failed_size: 0,
-                    failed_count: 0,
-                    replicated_size: 0,
-                    replicated_count: 0,
-                    bucket: opts.bucket.clone(),
-                    object: String::new(),
-                    error: None,
-                },
-            );
+    pub async fn admit_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError> {
+        tokio::spawn(async move { self.admit_bucket_resync_transaction(opts).await })
+            .await
+            .map_err(|error| EcstoreError::other(format!("replication resync admission task failed: {error}")))?
+    }
 
-            bucket_status.clone()
+    async fn admit_bucket_resync_transaction(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError> {
+        let admission_lock_key = ReplicationMetadataStore::resync_admission_lock_key(&opts.bucket);
+        let admission_lock = self
+            .storage
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), &admission_lock_key)
+            .await?;
+        // Lock order: bucket resync admission lock -> resync status config-object lock.
+        let _admission_guard = match admission_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
+            Ok(guard) => guard,
+            Err(lock_error) => {
+                if let Ok(status) = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await {
+                    self.resyncer.status_map.write().await.insert(opts.bucket.clone(), status);
+                }
+                return Err(EcstoreError::from(lock_error));
+            }
         };
 
+        let mut bucket_status = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await?;
+        if let Some(active) = bucket_status.targets_map.get(&opts.arn) {
+            if active.resync_id == opts.resync_id {
+                self.resyncer
+                    .status_map
+                    .write()
+                    .await
+                    .insert(opts.bucket.clone(), bucket_status);
+                return Ok(false);
+            }
+            if should_auto_resume_resync(active.resync_status) {
+                let active_resync_id = active.resync_id.clone();
+                self.resyncer
+                    .status_map
+                    .write()
+                    .await
+                    .insert(opts.bucket.clone(), bucket_status);
+                return Err(EcstoreError::other(ResyncActiveConflictError {
+                    bucket: opts.bucket.clone(),
+                    arn: opts.arn.clone(),
+                    active_resync_id,
+                }));
+            }
+        }
+
+        let now = OffsetDateTime::now_utc();
+        bucket_status.last_update = Some(now);
+        bucket_status.targets_map.insert(
+            opts.arn.clone(),
+            TargetReplicationResyncStatus {
+                start_time: Some(now),
+                last_update: Some(now),
+                resync_id: opts.resync_id.clone(),
+                resync_before_date: opts.resync_before,
+                resync_status: ResyncStatusType::ResyncPending,
+                failed_size: 0,
+                failed_count: 0,
+                replicated_size: 0,
+                replicated_count: 0,
+                bucket: opts.bucket.clone(),
+                object: String::new(),
+                error: None,
+            },
+        );
+
         save_resync_status(&opts.bucket, &bucket_status, self.storage.clone()).await?;
+        self.resyncer
+            .status_map
+            .write()
+            .await
+            .insert(opts.bucket.clone(), bucket_status);
+
+        Ok(true)
+    }
+
+    pub async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError> {
+        let bucket_status = load_bucket_resync_metadata(&opts.bucket, self.storage.clone()).await?;
+        let Some(target_status) = bucket_status.targets_map.get(&opts.arn) else {
+            return Err(EcstoreError::other("replication resync admission is missing"));
+        };
+        if target_status.resync_id != opts.resync_id {
+            return Err(EcstoreError::other(ResyncActiveConflictError {
+                bucket: opts.bucket.clone(),
+                arn: opts.arn.clone(),
+                active_resync_id: target_status.resync_id.clone(),
+            }));
+        }
+        if !should_auto_resume_resync(target_status.resync_status) {
+            return Ok(());
+        }
+        self.resyncer
+            .status_map
+            .write()
+            .await
+            .insert(opts.bucket.clone(), bucket_status);
 
         let resyncer = self.resyncer.clone();
         let storage = self.storage.clone();
         let cancel_token = CancellationToken::new();
-        resyncer.register_cancel_token(&opts, cancel_token.clone()).await;
-        tokio::spawn(async move {
-            Box::pin(resyncer.clone().resync_bucket(cancel_token, storage, false, opts.clone())).await;
-            resyncer.clear_cancel_token(&opts).await;
-        });
+        if resyncer.register_cancel_token(&opts, cancel_token.clone()).await {
+            tokio::spawn(async move {
+                Box::pin(
+                    resyncer
+                        .clone()
+                        .resync_bucket(cancel_token, storage, recovering, opts.clone()),
+                )
+                .await;
+                resyncer.clear_cancel_token(&opts).await;
+            });
+        }
 
         Ok(())
     }
@@ -1168,9 +1262,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let resync = self.resyncer.clone();
             let storage = self.storage.clone();
             tokio::spawn(async move {
-                resync.register_cancel_token(&opts, ctx.clone()).await;
-                Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
-                resync.clear_cancel_token(&opts).await;
+                if resync.register_cancel_token(&opts, ctx.clone()).await {
+                    Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
+                    resync.clear_cancel_token(&opts).await;
+                }
             });
         }
 
@@ -1274,6 +1369,8 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
+    async fn admit_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError>;
+    async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError>;
     async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError>;
     async fn init_resync(
         self: Arc<Self>,
@@ -1315,6 +1412,14 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
         self.cancel_bucket_resync(opts).await
+    }
+
+    async fn admit_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<bool, EcstoreError> {
+        self.admit_bucket_resync(opts).await
+    }
+
+    async fn activate_bucket_resync(self: Arc<Self>, opts: ResyncOpts, recovering: bool) -> Result<(), EcstoreError> {
+        self.activate_bucket_resync(opts, recovering).await
     }
 
     async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError> {
@@ -1580,7 +1685,9 @@ mod tests {
     use std::collections::HashMap;
     use std::fmt::{Debug, Formatter};
     use std::io::Cursor;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use tokio::io::AsyncReadExt;
     use tokio::sync::Notify;
     use uuid::Uuid;
 
@@ -1589,10 +1696,16 @@ mod tests {
     type TestObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, EcstoreError>;
 
     struct LoadResyncSharedState {
-        data: Vec<u8>,
+        data: StdMutex<Vec<u8>>,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         first_read_started: Notify,
+        delay_first_read: AtomicBool,
         read_count: AtomicUsize,
+        write_count: AtomicUsize,
+        fail_next_write: AtomicBool,
+        block_next_write: AtomicBool,
+        write_started: Notify,
+        allow_write: Notify,
     }
 
     struct LoadResyncNodeStore {
@@ -1633,22 +1746,31 @@ mod tests {
             _h: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader, Self::Error> {
-            if object != ReplicationMetadataStore::bucket_resync_file_path("load-resync-lock") {
+            if !object.ends_with("/.replication/resync.bin") {
                 return Err(EcstoreError::FileNotFound);
             }
 
             let read_index = self.shared.read_count.fetch_add(1, Ordering::SeqCst);
-            if read_index == 0 {
+            if read_index == 0 && self.shared.delay_first_read.load(Ordering::SeqCst) {
                 self.shared.first_read_started.notify_waiters();
                 tokio::time::sleep(Duration::from_millis(1_500)).await;
             }
 
-            let data = self.shared.data.clone();
+            let data = self
+                .shared
+                .data
+                .lock()
+                .expect("test data lock should not be poisoned")
+                .clone();
+            if data.is_empty() {
+                return Err(EcstoreError::FileNotFound);
+            }
+            let size = i64::try_from(data.len()).expect("test metadata length should fit i64");
             Ok(Self::GetObjectReader {
-                stream: Box::new(Cursor::new(data.clone())),
+                stream: Box::new(Cursor::new(data)),
                 object_info: ObjectInfo {
-                    size: data.len() as i64,
-                    actual_size: data.len() as i64,
+                    size,
+                    actual_size: size,
                     ..Default::default()
                 },
                 buffered_body: None,
@@ -1660,9 +1782,20 @@ mod tests {
             &self,
             _bucket: &str,
             _object: &str,
-            _data: &mut Self::PutObjectReader,
+            data: &mut Self::PutObjectReader,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
+            if self.shared.fail_next_write.swap(false, Ordering::SeqCst) {
+                return Err(EcstoreError::Unexpected);
+            }
+            if self.shared.block_next_write.swap(false, Ordering::SeqCst) {
+                self.shared.write_started.notify_one();
+                self.shared.allow_write.notified().await;
+            }
+            let mut encoded = Vec::new();
+            data.stream.read_to_end(&mut encoded).await.map_err(EcstoreError::from)?;
+            *self.shared.data.lock().expect("test data lock should not be poisoned") = encoded;
+            self.shared.write_count.fetch_add(1, Ordering::SeqCst);
             Ok(ObjectInfo::default())
         }
     }
@@ -1896,6 +2029,267 @@ mod tests {
         encode_resync_file(&status).expect("test resync metadata should encode")
     }
 
+    fn empty_resync_shared_state() -> Arc<LoadResyncSharedState> {
+        Arc::new(LoadResyncSharedState {
+            data: StdMutex::new(Vec::new()),
+            lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
+            first_read_started: Notify::new(),
+            delay_first_read: AtomicBool::new(false),
+            read_count: AtomicUsize::new(0),
+            write_count: AtomicUsize::new(0),
+            fail_next_write: AtomicBool::new(false),
+            block_next_write: AtomicBool::new(false),
+            write_started: Notify::new(),
+            allow_write: Notify::new(),
+        })
+    }
+
+    async fn hold_resync_runtime_lock(
+        shared: &Arc<LoadResyncSharedState>,
+        bucket: &str,
+        arn: &str,
+    ) -> rustfs_lock::NamespaceLockGuard {
+        let lock =
+            rustfs_lock::NamespaceLock::with_local_manager("resync-start-blocker".to_string(), shared.lock_manager.clone());
+        let lock = rustfs_lock::NamespaceLockWrapper::new(
+            lock,
+            rustfs_lock::ObjectKey::new(
+                ReplicationMetadataStore::rustfs_meta_bucket().to_string(),
+                ReplicationMetadataStore::resync_lock_key(bucket, arn),
+            ),
+            "blocker".to_string(),
+        );
+        lock.get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("test should hold the runtime resync lock")
+    }
+
+    fn test_resync_opts(bucket: &str, arn: &str, id: &str) -> ResyncOpts {
+        ResyncOpts {
+            bucket: bucket.to_string(),
+            arn: arn.to_string(),
+            resync_id: id.to_string(),
+            resync_before: Some(OffsetDateTime::UNIX_EPOCH),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_resync_starts_accept_one_id_and_reject_the_other() {
+        let shared = empty_resync_shared_state();
+        let first_pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let second_pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()))).await;
+        let _runtime_guard = hold_resync_runtime_lock(&shared, "atomic-start", "arn:test").await;
+
+        let first = first_pool
+            .clone()
+            .start_bucket_resync(test_resync_opts("atomic-start", "arn:test", "run-a"));
+        let second = second_pool
+            .clone()
+            .start_bucket_resync(test_resync_opts("atomic-start", "arn:test", "run-b"));
+        let (first, second) = tokio::join!(first, second);
+
+        let (accepted_id, conflict) = match (first, second) {
+            (Ok(()), Err(conflict)) => ("run-a", conflict),
+            (Err(conflict), Ok(())) => ("run-b", conflict),
+            outcome => panic!("exactly one concurrent start should be accepted: {outcome:?}"),
+        };
+        assert_eq!(resync_start_conflict_id(&conflict), Some(accepted_id));
+
+        let persisted = decode_resync_file(&shared.data.lock().expect("test data lock should not be poisoned"))
+            .expect("accepted status should be persisted");
+        assert_eq!(persisted.targets_map["arn:test"].resync_id, accepted_id);
+        assert_eq!(persisted.targets_map["arn:test"].resync_status, ResyncStatusType::ResyncPending);
+        assert_eq!(
+            first_pool.resyncer.status_map.read().await["atomic-start"].targets_map["arn:test"].resync_id,
+            accepted_id
+        );
+        assert_eq!(
+            second_pool.resyncer.status_map.read().await["atomic-start"].targets_map["arn:test"].resync_id,
+            accepted_id
+        );
+    }
+
+    #[tokio::test]
+    async fn same_resync_id_retry_is_idempotent_without_rewriting_status() {
+        let shared = empty_resync_shared_state();
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let _runtime_guard = hold_resync_runtime_lock(&shared, "same-id", "arn:test").await;
+        let opts = test_resync_opts("same-id", "arn:test", "run-a");
+
+        pool.clone()
+            .start_bucket_resync(opts.clone())
+            .await
+            .expect("first start should be accepted");
+        let first_status = pool
+            .resyncer
+            .status_map
+            .read()
+            .await
+            .get("same-id")
+            .expect("accepted status should be published")
+            .targets_map["arn:test"]
+            .clone();
+
+        pool.clone()
+            .start_bucket_resync(opts)
+            .await
+            .expect("same ID retry should be accepted idempotently");
+        let retried_status = pool
+            .resyncer
+            .status_map
+            .read()
+            .await
+            .get("same-id")
+            .expect("retried status should remain published")
+            .targets_map["arn:test"]
+            .clone();
+
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), 1);
+        assert_eq!(retried_status.resync_id, first_status.resync_id);
+        assert_eq!(retried_status.start_time, first_status.start_time);
+        assert_eq!(retried_status.resync_status, ResyncStatusType::ResyncPending);
+        assert_eq!(pool.resyncer.cancel_tokens.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admitted_resync_waits_for_target_metadata_commit_before_activation() {
+        let shared = empty_resync_shared_state();
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let _runtime_guard = hold_resync_runtime_lock(&shared, "two-phase-start", "arn:test").await;
+        let opts = test_resync_opts("two-phase-start", "arn:test", "run-a");
+
+        let new_run = pool
+            .clone()
+            .admit_bucket_resync(opts.clone())
+            .await
+            .expect("admission should persist the intent");
+        assert!(new_run);
+        assert!(pool.resyncer.cancel_tokens.read().await.is_empty());
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), 1);
+
+        pool.clone()
+            .activate_bucket_resync(opts, false)
+            .await
+            .expect("activation should start the admitted run");
+        assert_eq!(pool.resyncer.cancel_tokens.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_id_retry_after_restart_recreates_missing_runtime_task() {
+        let shared = empty_resync_shared_state();
+        let mut persisted = BucketReplicationResyncStatus::new();
+        persisted.targets_map.insert(
+            "arn:test".to_string(),
+            TargetReplicationResyncStatus {
+                bucket: "restart-retry".to_string(),
+                resync_id: "run-a".to_string(),
+                resync_status: ResyncStatusType::ResyncPending,
+                ..Default::default()
+            },
+        );
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            encode_resync_file(&persisted).expect("restart status should encode");
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let _runtime_guard = hold_resync_runtime_lock(&shared, "restart-retry", "arn:test").await;
+
+        pool.clone()
+            .start_bucket_resync(test_resync_opts("restart-retry", "arn:test", "run-a"))
+            .await
+            .expect("same ID retry should recover an accepted run");
+
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.resyncer.cancel_tokens.read().await.len(), 1);
+        assert_eq!(
+            pool.resyncer.status_map.read().await["restart-retry"].targets_map["arn:test"].resync_id,
+            "run-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_completed_resync_id_retry_does_not_restart_work() {
+        let shared = empty_resync_shared_state();
+        let mut persisted = BucketReplicationResyncStatus::new();
+        persisted.targets_map.insert(
+            "arn:test".to_string(),
+            TargetReplicationResyncStatus {
+                bucket: "completed-retry".to_string(),
+                resync_id: "run-a".to_string(),
+                resync_status: ResyncStatusType::ResyncCompleted,
+                ..Default::default()
+            },
+        );
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            encode_resync_file(&persisted).expect("completed status should encode");
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+
+        pool.clone()
+            .start_bucket_resync(test_resync_opts("completed-retry", "arn:test", "run-a"))
+            .await
+            .expect("completed same ID retry should remain idempotent");
+
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), 0);
+        assert!(pool.resyncer.cancel_tokens.read().await.is_empty());
+        assert_eq!(
+            pool.resyncer.status_map.read().await["completed-retry"].targets_map["arn:test"].resync_status,
+            ResyncStatusType::ResyncCompleted
+        );
+    }
+
+    #[tokio::test]
+    async fn start_failure_does_not_publish_or_persist_requested_id() {
+        let shared = empty_resync_shared_state();
+        shared.fail_next_write.store(true, Ordering::SeqCst);
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+
+        let error = pool
+            .clone()
+            .start_bucket_resync(test_resync_opts("failed-start", "arn:test", "run-a"))
+            .await
+            .expect_err("metadata save failure should reject the start");
+
+        assert!(matches!(error, EcstoreError::Unexpected));
+        assert!(shared.data.lock().expect("test data lock should not be poisoned").is_empty());
+        assert!(!pool.resyncer.status_map.read().await.contains_key("failed-start"));
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn canceled_start_request_finishes_accepted_transaction() {
+        let shared = empty_resync_shared_state();
+        shared.block_next_write.store(true, Ordering::SeqCst);
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+        let _runtime_guard = hold_resync_runtime_lock(&shared, "canceled-start", "arn:test").await;
+
+        let start_pool = pool.clone();
+        let start = tokio::spawn(async move {
+            start_pool
+                .start_bucket_resync(test_resync_opts("canceled-start", "arn:test", "run-a"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), shared.write_started.notified())
+            .await
+            .expect("start transaction should reach the durable write");
+        start.abort();
+        assert!(start.await.expect_err("caller task should be canceled").is_cancelled());
+        shared.allow_write.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if pool.resyncer.status_map.read().await.contains_key("canceled-start") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached admission transaction should finish after caller cancellation");
+        assert_eq!(shared.write_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pool.resyncer.status_map.read().await["canceled-start"].targets_map["arn:test"].resync_id,
+            "run-a"
+        );
+    }
+
     #[test]
     fn replication_queue_admission_combines_target_results() {
         let mut admission = ReplicationQueueAdmission::Skipped;
@@ -1985,10 +2379,16 @@ mod tests {
     async fn load_resync_leader_lock_allows_only_one_startup_recovery() {
         temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
             let shared = Arc::new(LoadResyncSharedState {
-                data: load_resync_test_metadata(),
+                data: StdMutex::new(load_resync_test_metadata()),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 first_read_started: Notify::new(),
+                delay_first_read: AtomicBool::new(true),
                 read_count: AtomicUsize::new(0),
+                write_count: AtomicUsize::new(0),
+                fail_next_write: AtomicBool::new(false),
+                block_next_write: AtomicBool::new(false),
+                write_started: Notify::new(),
+                allow_write: Notify::new(),
             });
             let leader_pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
             let skipped_pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()))).await;

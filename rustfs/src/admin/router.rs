@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
-use super::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
@@ -1738,14 +1737,18 @@ fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3R
     Ok(resp)
 }
 
-fn apply_replication_reset_to_targets(targets: &mut BucketTargets, reset: &ReplicationResetStartRequest) -> S3Result<()> {
-    let Some(target) = targets.targets.iter_mut().find(|target| target.arn == reset.arn) else {
-        return Err(s3_error!(InvalidRequest, "replication reset arn is not configured for this bucket"));
-    };
+fn map_replication_resync_start_error(error: StorageError) -> S3Error {
+    match replication::resync_start_conflict_id(&error) {
+        Some(active_resync_id) => replication_resync_active_conflict_error(active_resync_id),
+        None => s3_error!(InternalError, "{error}"),
+    }
+}
 
-    target.reset_id = reset.reset_id.clone();
-    target.reset_before_date = reset.reset_before;
-    Ok(())
+fn replication_resync_active_conflict_error(active_resync_id: &str) -> S3Error {
+    s3_error!(
+        OperationAborted,
+        "replication resync {active_resync_id} is already active for this target"
+    )
 }
 
 fn parse_reset_status_target(uri: &Uri) -> ReplicationResetStatusRequest {
@@ -2467,34 +2470,43 @@ async fn target_client_object_lock_enabled_with_client(
 }
 
 async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<ReplicationResetTarget> {
-    let targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
-    let resolved_arn = resolve_replication_reset_target_arn(&config, &reset.arn)?;
-    let mut resolved_reset = reset.clone();
-    resolved_reset.arn = resolved_arn.clone();
-
-    let mut targets = metadata_sys::list_bucket_targets(bucket).await.map_err(ApiError::from)?;
-    apply_replication_reset_to_targets(&mut targets, &resolved_reset)?;
-
-    let json_targets = serde_json::to_vec(&targets).map_err(|e| s3_error!(InternalError, "{e}"))?;
-    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
-        .await
-        .map_err(ApiError::from)?;
-    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
-    drop(targets_guard);
-
     let Some(pool) = current_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
-    pool.start_bucket_resync(replication::resync_opts(
-        bucket,
-        resolved_arn.clone(),
-        &reset.reset_id,
-        reset.reset_before,
-    ))
+    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let _transaction_guard = metadata_sys::acquire_bucket_targets_transaction_lock(bucket)
+        .await
+        .map_err(ApiError::from)?;
+    let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
+    let resolved_arn = resolve_replication_reset_target_arn(&config, &reset.arn)?;
+    let targets = metadata_sys::list_bucket_targets_from_disk(bucket)
+        .await
+        .map_err(ApiError::from)?;
+    let opts = replication::resync_opts(bucket, resolved_arn.clone(), &reset.reset_id, reset.reset_before);
+    let admission_pool = pool.clone();
+    let activation_pool = pool.clone();
+    let committed_targets = replication::commit_resync_target(
+        targets,
+        opts,
+        move |opts| async move { admission_pool.admit_bucket_resync(opts).await },
+        move |encoded| async move {
+            metadata_sys::update_bucket_targets_under_transaction_lock(bucket, encoded)
+                .await
+                .map(|_| ())
+                .map_err(|_| {
+                    StorageError::other(
+                        "replication resync was accepted but target metadata commit failed; retry the same reset ID to reconcile",
+                    )
+                })
+        },
+        move |opts, recovering| async move { activation_pool.activate_bucket_resync(opts, recovering).await },
+    )
     .await
-    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+    .map_err(map_replication_resync_start_error)?;
+    BucketTargetSys::get()
+        .update_all_targets(bucket, Some(&committed_targets))
+        .await;
 
     Ok(ReplicationResetTarget {
         arn: resolved_arn,
@@ -3197,23 +3209,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_replication_reset_to_targets_updates_matching_target() {
-        let mut targets = BucketTargets {
-            targets: vec![crate::admin::storage_api::bucket::target::BucketTarget {
-                arn: "arn:target".to_string(),
-                ..Default::default()
-            }],
-        };
-        let reset = ReplicationResetStartRequest {
-            arn: "arn:target".to_string(),
-            reset_id: "rid-1".to_string(),
-            reset_before: Some(OffsetDateTime::now_utc()),
-        };
+    fn active_replication_resync_conflict_maps_to_http_conflict() {
+        let error = replication_resync_active_conflict_error("run-active");
 
-        apply_replication_reset_to_targets(&mut targets, &reset).expect("target update should succeed");
-
-        assert_eq!(targets.targets[0].reset_id, "rid-1");
-        assert_eq!(targets.targets[0].reset_before_date, reset.reset_before);
+        assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+        assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+        assert!(error.message().unwrap_or_default().contains("run-active"));
     }
 
     #[test]
