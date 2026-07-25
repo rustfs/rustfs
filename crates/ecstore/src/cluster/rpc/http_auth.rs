@@ -496,9 +496,8 @@ fn verify_tonic_mutation_body_digest_with_strictness<T>(
     match digest {
         Some(digest) if digest != UNSIGNED_PAYLOAD => verify_tonic_canonical_body_digest(request, canonical_body),
         _ => {
-            // RUSTFS_COMPAT_TODO(disk-mutation-body-digest): accept digestless peers during rolling
-            // upgrades. Remove after the minimum supported RustFS peer version body-binds every
-            // mutating disk RPC.
+            // RUSTFS_COMPAT_TODO(disk-mutation-body-digest): accept digestless peers during rolling upgrades. Remove after the
+            // minimum supported RustFS peer version body-binds every mutating disk RPC.
             if strict {
                 return Err(std::io::Error::other("RPC mutation requires a body-bound v2 signature"));
             }
