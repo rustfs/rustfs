@@ -255,11 +255,13 @@ fn resync_status_duration(
     Some(std::time::Duration::from_millis(millis))
 }
 
+type ResyncCancelKey = (String, String, String);
+
 #[derive(Debug)]
 pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
     pub worker_size: usize,
-    pub cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    pub(crate) cancel_tokens: Arc<RwLock<HashMap<ResyncCancelKey, CancellationToken>>>,
 }
 
 impl ReplicationResyncer {
@@ -271,12 +273,19 @@ impl ReplicationResyncer {
         }
     }
 
-    fn cancel_key(opts: &ResyncOpts) -> String {
-        format!("{}:{}", opts.bucket, opts.arn)
+    fn cancel_key(opts: &ResyncOpts) -> ResyncCancelKey {
+        (opts.bucket.clone(), opts.arn.clone(), opts.resync_id.clone())
     }
 
-    pub async fn register_cancel_token(&self, opts: &ResyncOpts, token: CancellationToken) {
-        self.cancel_tokens.write().await.insert(Self::cancel_key(opts), token);
+    pub async fn register_cancel_token(&self, opts: &ResyncOpts, token: CancellationToken) -> bool {
+        let mut cancel_tokens = self.cancel_tokens.write().await;
+        match cancel_tokens.entry(Self::cancel_key(opts)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(token);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
     }
 
     pub async fn clear_cancel_token(&self, opts: &ResyncOpts) {

@@ -640,6 +640,8 @@ pub struct ScannerMetrics {
     pub last_cycle_usage_saves: u64,
     #[serde(rename = "failed_cycles", default)]
     pub failed_cycles: u64,
+    #[serde(rename = "superseded_cycles", default)]
+    pub superseded_cycles: u64,
     #[serde(rename = "partial_cycles_unknown", default)]
     pub partial_cycles_unknown: u64,
     #[serde(rename = "partial_cycles_runtime", default)]
@@ -820,6 +822,7 @@ impl ScannerMetrics {
             .saturating_add(other.last_cycle_replication_checks);
         self.last_cycle_usage_saves = self.last_cycle_usage_saves.saturating_add(other.last_cycle_usage_saves);
         self.failed_cycles = self.failed_cycles.saturating_add(other.failed_cycles);
+        self.superseded_cycles = self.superseded_cycles.saturating_add(other.superseded_cycles);
         self.partial_cycles_unknown = self.partial_cycles_unknown.saturating_add(other.partial_cycles_unknown);
         self.partial_cycles_runtime = self.partial_cycles_runtime.saturating_add(other.partial_cycles_runtime);
         self.partial_cycles_objects = self.partial_cycles_objects.saturating_add(other.partial_cycles_objects);
@@ -1862,6 +1865,7 @@ mod tests {
             last_cycle_replication_checks: 7,
             last_cycle_usage_saves: 8,
             failed_cycles: 1,
+            superseded_cycles: 2,
             partial_cycles_unknown: 2,
             partial_cycles_runtime: 3,
             partial_cycles_objects: 4,
@@ -1933,6 +1937,7 @@ mod tests {
             last_cycle_replication_checks: 70,
             last_cycle_usage_saves: 80,
             failed_cycles: 10,
+            superseded_cycles: 20,
             partial_cycles_unknown: 20,
             partial_cycles_runtime: 30,
             partial_cycles_objects: 40,
@@ -2014,6 +2019,7 @@ mod tests {
         assert_eq!(scanner.last_cycle_replication_checks, 77);
         assert_eq!(scanner.last_cycle_usage_saves, 88);
         assert_eq!(scanner.failed_cycles, 11);
+        assert_eq!(scanner.superseded_cycles, 22);
         assert_eq!(scanner.partial_cycles_unknown, 22);
         assert_eq!(scanner.partial_cycles_runtime, 33);
         assert_eq!(scanner.partial_cycles_objects, 44);

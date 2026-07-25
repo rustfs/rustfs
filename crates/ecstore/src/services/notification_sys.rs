@@ -29,7 +29,7 @@ use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
 use rustfs_utils::XHost;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1041,6 +1041,40 @@ impl NotificationSys {
         Ok(generations)
     }
 
+    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<bool> {
+        let mut by_host = HashMap::with_capacity(acknowledgements.len());
+        for (host, instance_id, generation) in acknowledgements {
+            if by_host.insert(host.clone(), (instance_id, generation)).is_some() {
+                return Err(Error::other(format!("duplicate scanner dirty usage acknowledgement target: {host}")));
+            }
+        }
+
+        let clients = self
+            .peer_clients
+            .iter()
+            .flatten()
+            .map(|client| (client.grid_host.clone(), client.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut failures = Vec::new();
+        let mut futures = Vec::with_capacity(by_host.len());
+        for (host, (instance_id, generation)) in by_host {
+            let Some(client) = clients.get(&host).cloned() else {
+                failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: peer is not reachable"));
+                continue;
+            };
+            futures.push(async move {
+                let result = scanner_activity_with_timeout(
+                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                    &host,
+                    client.acknowledge_scanner_dirty_usage(instance_id, generation),
+                )
+                .await;
+                (host, result)
+            });
+        }
+        aggregate_scanner_dirty_usage_acknowledgement_results(join_all(futures).await, failures)
+    }
+
     pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter() {
@@ -1591,6 +1625,23 @@ fn aggregate_notification_failures(operation: &str, failures: Vec<String>) -> Re
     )))
 }
 
+fn aggregate_scanner_dirty_usage_acknowledgement_results(
+    results: Vec<(String, Result<ScannerPeerActivity>)>,
+    mut failures: Vec<String>,
+) -> Result<bool> {
+    let mut dirty_usage_pending = false;
+    for (host, result) in results {
+        match result {
+            Ok(activity) => {
+                dirty_usage_pending |= activity.dirty_usage_pending != Some(false);
+            }
+            Err(err) => failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: {err}")),
+        }
+    }
+    aggregate_notification_failures("acknowledge_scanner_dirty_usage", failures)?;
+    Ok(dirty_usage_pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1840,6 +1891,78 @@ mod tests {
 
         assert!(err.to_string().contains("timed out"));
         assert!(err.to_string().contains("peer-1"));
+    }
+
+    #[tokio::test]
+    async fn scanner_dirty_usage_acknowledgement_rejects_missing_and_duplicate_targets() {
+        let sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+        };
+        let missing = sys
+            .acknowledge_scanner_dirty_usage(vec![("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7)])
+            .await
+            .expect_err("a missing acknowledgement target must remain pending");
+        assert!(missing.to_string().contains("peer is not reachable"));
+
+        let duplicate = sys
+            .acknowledge_scanner_dirty_usage(vec![
+                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
+                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
+            ])
+            .await
+            .expect_err("duplicate acknowledgement targets must be rejected");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate scanner dirty usage acknowledgement target")
+        );
+    }
+
+    #[test]
+    fn scanner_dirty_usage_acknowledgement_preserves_newer_pending_work() {
+        let activity = |dirty_usage_pending| ScannerPeerActivity {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 1,
+            maintenance_generation: 1,
+            protocol_version: crate::storage_api_contracts::internode::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: Some([0; 32]),
+            data_movement_active: Some(false),
+            dirty_usage_generation: Some(2),
+            dirty_usage_pending,
+        };
+
+        let pending = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![
+                ("peer-1".to_string(), Ok(activity(Some(false)))),
+                ("peer-2".to_string(), Ok(activity(Some(true)))),
+            ],
+            Vec::new(),
+        )
+        .expect("successful acknowledgements should return their pending state");
+        assert!(pending, "new dirty usage reported by an acknowledged peer must remain pending");
+
+        let cleared = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![("peer-1".to_string(), Ok(activity(Some(false))))],
+            Vec::new(),
+        )
+        .expect("a cleared acknowledgement should succeed");
+        assert!(!cleared, "an explicitly cleared peer must not remain pending");
+
+        let unknown =
+            aggregate_scanner_dirty_usage_acknowledgement_results(vec![("peer-1".to_string(), Ok(activity(None)))], Vec::new())
+                .expect("an acknowledgement without a pending field should remain retryable");
+        assert!(unknown, "a peer that cannot prove its dirty state is clear must remain pending");
+
+        let err = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![("peer-1".to_string(), Err(Error::other("injected acknowledgement failure")))],
+            Vec::new(),
+        )
+        .expect_err("a reachable peer acknowledgement failure must be reported");
+        assert!(err.to_string().contains("peer-1"));
+        assert!(err.to_string().contains("injected acknowledgement failure"));
     }
 
     #[tokio::test]

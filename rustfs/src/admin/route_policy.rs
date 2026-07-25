@@ -416,6 +416,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/transition/jobs/{job_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/ilm/transition/jobs/{job_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v3/audit/target/list",
         GET_BUCKET_TARGET,
         RouteRiskLevel::Sensitive,
@@ -636,6 +648,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v3/site-replication/repair",
         SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/site-replication/repair/status",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::Sensitive,
     ),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/profile", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/status", PROFILING, RouteRiskLevel::High),
@@ -1797,7 +1815,11 @@ mod tests {
     #[test]
     fn route_policy_requires_set_tier_for_manual_transition_run() {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
+        assert_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
         assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
+        assert_not_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
     }
 
     #[test]
@@ -1854,6 +1876,11 @@ mod tests {
     #[test]
     fn route_policy_requires_operation_for_site_replication_repair() {
         assert_action(HttpMethod::Put, "/rustfs/admin/v3/site-replication/repair", SITE_REPLICATION_OPERATION);
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/site-replication/repair/status",
+            SITE_REPLICATION_OPERATION,
+        );
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {

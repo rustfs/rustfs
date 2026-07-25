@@ -69,6 +69,8 @@ const SOURCE_BUCKET: &str = "ilm7-hot";
 const MANUAL_DUE_BUCKET: &str = "ilm7-manual-due";
 const MANUAL_DRY_RUN_BUCKET: &str = "ilm7-manual-dry-run";
 const MANUAL_NOT_DUE_BUCKET: &str = "ilm7-manual-not-due";
+const MANUAL_QUEUE_PRESSURE_BUCKET: &str = "ilm7-manual-queue-pressure";
+const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
 const MANUAL_DRY_RUN_KEY: &str = "manual-dry-run/report.bin";
@@ -354,11 +356,22 @@ async fn manual_transition_run(
     prefix: &str,
     dry_run: bool,
 ) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
+    manual_transition_run_with_max(hot, bucket, prefix, dry_run, 10).await
+}
+
+async fn manual_transition_run_with_max(
+    hot: &RustFSTestEnvironment,
+    bucket: &str,
+    prefix: &str,
+    dry_run: bool,
+    max_objects: u64,
+) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
     let bucket = urlencoding::encode(bucket);
     let prefix = urlencoding::encode(prefix);
     let tier = urlencoding::encode(TIER_NAME);
-    let path =
-        format!("/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects=10");
+    let path = format!(
+        "/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects={max_objects}"
+    );
     let (status, body) = signed_admin_request(&hot.url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
     if !status.is_success() {
         return Err(format!("manual transition run failed: status={status}, body={body}").into());
@@ -645,5 +658,102 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert!(!not_due.report.truncated_by_duration);
     assert_remains_not_transitioned(&hot_client, MANUAL_NOT_DUE_BUCKET, MANUAL_NOT_DUE_KEY, StdDuration::from_secs(2)).await?;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualcontractcoldtieradmin".to_string();
+    cold.secret_key = "manualcontractcoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket("ilm7-manual-contract").send().await?;
+
+    let (status, body) = signed_admin_request(
+        &hot.url,
+        Method::POST,
+        "/rustfs/admin/v3/ilm/transition/run?bucket=ilm7-manual-contract",
+        None,
+        &hot.access_key,
+        &hot.secret_key,
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "manual transition contract call should still be OK");
+    let response: serde_json::Value = serde_json::from_str(&body)?;
+
+    assert!(response.get("state").is_some(), "response should include state field");
+    assert!(response.get("job_id").is_none() || response.get("job_id").is_some_and(|v| v.is_null()));
+    assert!(response.get("status").is_none() || response.get("status").is_some_and(|v| v.is_null()));
+    assert!(response.get("status_endpoint").is_none() || response.get("status_endpoint").is_some_and(|v| v.is_null()));
+    assert!(response.get("cancel").is_none() || response.get("cancel").is_some_and(|v| v.is_null()));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_run_queue_pressure_partial() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualpressurecoldtieradmin".to_string();
+    cold.secret_key = "manualpressurecoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_SCANNER_ENABLED", "false"),
+            ("RUSTFS_SCANNER_CYCLE", "3600"),
+            ("RUSTFS_MAX_TRANSITION_WORKERS", "1"),
+            ("RUSTFS_TRANSITION_QUEUE_CAPACITY", "1"),
+        ],
+    )
+    .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(MANUAL_QUEUE_PRESSURE_BUCKET).send().await?;
+    for idx in 0..20 {
+        let key = format!("{MANUAL_QUEUE_PRESSURE_PREFIX}obj-{idx:02}");
+        put_single_part_object(&hot_client, MANUAL_QUEUE_PRESSURE_BUCKET, &key, b"queue-pressure payload").await?;
+    }
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_QUEUE_PRESSURE_BUCKET,
+        "manual-queue-pressure",
+        MANUAL_QUEUE_PRESSURE_PREFIX,
+        0,
+    )
+    .await?;
+
+    let response =
+        manual_transition_run_with_max(&hot, MANUAL_QUEUE_PRESSURE_BUCKET, MANUAL_QUEUE_PRESSURE_PREFIX, false, 20).await?;
+
+    assert_eq!(response.state, "partial");
+    assert_eq!(response.report.bucket, MANUAL_QUEUE_PRESSURE_BUCKET);
+    assert_eq!(response.report.prefix, MANUAL_QUEUE_PRESSURE_PREFIX);
+    assert!(
+        response.report.skipped_queue_full > 0,
+        "expected queue-pressure path to skip at least one object: {:#?}",
+        response.report
+    );
+    assert!(!response.report.truncated_by_duration);
+    assert!(response.report.enqueued < 20, "partial run should not enqueue all items in this setup");
+
+    let remote_count = cold_tier_object_count(&cold_client).await?;
+    assert!(
+        remote_count < 20,
+        "queue pressure must leave at least one object unqueued, remote_count={remote_count}"
+    );
     Ok(())
 }
