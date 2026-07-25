@@ -167,6 +167,7 @@ use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
+const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 const ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES";
 const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const PUT_EAGER_STATUS_ELIGIBLE: &str = "eligible";
@@ -2576,6 +2577,31 @@ async fn should_schedule_replica_delete_replication(
 fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
     opts.http_preconditions = None;
     opts
+}
+
+fn expected_current_version_id(headers: &HeaderMap) -> S3Result<Option<String>> {
+    headers
+        .get(RUSTFS_EXPECTED_CURRENT_VERSION_ID)
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map(str::trim)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid expected current version ID header"))?;
+            if value.eq_ignore_ascii_case("null") {
+                return Ok(Uuid::nil().to_string());
+            }
+            Uuid::parse_str(value)
+                .map(|version| version.to_string())
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid expected current version ID header"))
+        })
+        .transpose()
+}
+
+fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> S3Result<()> {
+    if expected.is_some() && expected != requested {
+        return Err(s3_error!(PreconditionFailed));
+    }
+    Ok(())
 }
 
 fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
@@ -6030,12 +6056,21 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
+        let expected_current_version_id = expected_current_version_id(&req.headers)?;
+        if expected_current_version_id.is_some()
+            && (!cp_src_dst_same || version_id.is_none() || dest_version_id.is_some() || !dst_opts.versioned)
+        {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Expected current version precondition requires a versioned same-object historical copy that creates a new version"
+            ));
+        }
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let _self_copy_lock_guard = if cp_src_dst_same {
+        let _self_copy_lock_guard = if cp_src_dst_same && expected_current_version_id.is_none() {
             let guard = acquire_self_copy_namespace_lock(store.as_ref(), &bucket, &key).await?;
             src_opts.no_lock = true;
             src_get_opts.no_lock = true;
@@ -6044,21 +6079,30 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
+        dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
         let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
             get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
                 .await
                 .map_err(ApiError::from)?,
         );
-        if cp_src_dst_same {
+        if _self_copy_lock_guard.is_some() {
             current_opts.no_lock = true;
         }
         let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info, &dst_opts)?;
+                if let Some(expected) = expected_current_version_id.as_deref()
+                    && existing_obj_info.version_id.unwrap_or_default().to_string() != expected
+                {
+                    return Err(s3_error!(PreconditionFailed));
+                }
                 Some(existing_obj_info.size.max(0) as u64)
             }
             Err(err) => {
+                if expected_current_version_id.is_some() {
+                    return Err(s3_error!(PreconditionFailed));
+                }
                 if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
                     return Err(ApiError::from(err).into());
                 }
@@ -6905,9 +6949,18 @@ impl DefaultObjectUsecase {
             // }
         }
 
+        let expected_current_version_id = expected_current_version_id(&req.headers)?;
+        if expected_current_version_id.is_some() && (force_delete || !opts.versioned) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Expected current version precondition requires a version-specific delete in a versioned bucket"
+            ));
+        }
+        validate_undo_delete_version(expected_current_version_id.as_deref(), opts.version_id.as_deref())?;
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        opts.expected_current_version_id = expected_current_version_id.clone();
 
         let replicate_force_delete = force_delete
             && !replica
@@ -6927,7 +6980,6 @@ impl DefaultObjectUsecase {
         let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
             .await
             .map_err(ApiError::from)?;
-
         let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
             Ok(obj_info) => {
                 // Check for bypass governance retention header (permission already verified in access.rs)
@@ -12935,6 +12987,70 @@ mod tests {
 
         let err = Box::pin(usecase.execute_delete_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn expected_current_version_header_normalizes_uuid_and_null() {
+        let version = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RUSTFS_EXPECTED_CURRENT_VERSION_ID,
+            HeaderValue::from_str(&version.to_string().to_uppercase()).unwrap(),
+        );
+        assert_eq!(expected_current_version_id(&headers).unwrap(), Some(version.to_string()));
+
+        headers.insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_static(" null "));
+        assert_eq!(expected_current_version_id(&headers).unwrap(), Some(Uuid::nil().to_string()));
+    }
+
+    #[test]
+    fn expected_current_version_header_rejects_empty_and_malformed_values() {
+        for value in ["", "not-a-version"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(value).unwrap());
+            assert_eq!(expected_current_version_id(&headers).unwrap_err().code(), &S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_rejects_expected_version_for_different_destination() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "test-bucket".into(),
+                key: "source-key".into(),
+                version_id: Some(Uuid::new_v4().to_string().into()),
+            })
+            .bucket("test-bucket".to_string())
+            .key("destination-key".to_string())
+            .build()
+            .unwrap();
+        let mut req = build_request(input, Method::PUT);
+        req.headers.insert(
+            RUSTFS_EXPECTED_CURRENT_VERSION_ID,
+            HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
+        );
+
+        let err = Box::pin(DefaultObjectUsecase::without_context().execute_copy_object(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn undo_delete_requires_version_id_to_match_expected_current() {
+        let expected = Uuid::new_v4().to_string();
+        assert!(validate_undo_delete_version(Some(&expected), Some(&expected)).is_ok());
+        assert_eq!(
+            validate_undo_delete_version(Some(&expected), Some(&Uuid::new_v4().to_string()))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        assert_eq!(
+            validate_undo_delete_version(Some(&expected), None).unwrap_err().code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        assert!(validate_undo_delete_version(None, None).is_ok());
     }
 
     #[tokio::test]

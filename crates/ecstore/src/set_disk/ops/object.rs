@@ -1054,6 +1054,31 @@ impl SetDisks {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
+            if let Some(expected) = opts.expected_current_version_id.as_deref() {
+                let current = self
+                    .get_object_info(
+                        bucket,
+                        object,
+                        &ObjectOptions {
+                            no_lock: true,
+                            metadata_cache_safe: false,
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                            StorageError::PreconditionFailed
+                        } else {
+                            err
+                        }
+                    })?;
+                if current.version_id.map(|version| version.to_string()).as_deref() != Some(expected) {
+                    return Err(StorageError::PreconditionFailed);
+                }
+            }
+
             // Phase 2 (backlog#899): fence the commit on lock loss. If the refresh
             // heartbeat has observed a refresh-quorum loss, another writer may have
             // re-acquired this object's lock; committing now would race a double-write.
@@ -2944,6 +2969,34 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             self.invalidate_all_get_object_metadata_cache();
             return Ok(ObjectInfo::default());
+        }
+
+        if let Some(expected) = opts.expected_current_version_id.as_deref() {
+            let current = self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        StorageError::PreconditionFailed
+                    } else {
+                        err
+                    }
+                })?;
+            if !current.delete_marker
+                || current.version_id.map(|version| version.to_string()).as_deref() != Some(expected)
+                || opts.version_id.as_deref() != Some(expected)
+            {
+                return Err(StorageError::PreconditionFailed);
+            }
         }
 
         // TODO: Lifecycle
