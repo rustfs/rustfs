@@ -20,7 +20,7 @@
 
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use futures::{FutureExt, future::join_all};
+use futures::FutureExt;
 use http::HeaderMap;
 use http::status::StatusCode;
 use lazy_static::lazy_static;
@@ -956,14 +956,10 @@ struct TierMutationPrepareFailure {
 }
 
 async fn abort_tier_mutation_peers(mutation_id: uuid::Uuid, peers: Vec<Arc<dyn TierMutationPeer>>) -> io::Result<()> {
-    let results = join_all(peers.into_iter().map(|peer| async move {
+    let mut failures = Vec::new();
+    for peer in peers {
         let label = peer.peer_label();
         let result = peer.abort_tier_mutation(mutation_id).await;
-        (label, result)
-    }))
-    .await;
-    let mut failures = Vec::new();
-    for (label, result) in results {
         match result {
             Ok(PeerTierMutationState::Aborted) => {}
             Ok(state) => {
@@ -985,16 +981,9 @@ async fn commit_tier_mutation_peers(
     committed_config_etag: &str,
 ) -> io::Result<()> {
     let payload = Bytes::copy_from_slice(committed_config_etag.as_bytes());
-    let results = join_all(peers.into_iter().map(|peer| {
-        let payload = payload.clone();
-        async move {
-            let label = peer.peer_label();
-            let result = peer.commit_tier_mutation(mutation_id, payload).await;
-            (label, result)
-        }
-    }))
-    .await;
-    for (label, result) in results {
+    for peer in peers {
+        let label = peer.peer_label();
+        let result = peer.commit_tier_mutation(mutation_id, payload.clone()).await;
         match result {
             Ok(PeerTierMutationState::Committed) => {}
             Ok(state) => {
@@ -5954,6 +5943,7 @@ mod tests {
         }
 
         async fn abort_tier_mutation(&self, _mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
+            self.track("abort").await;
             Ok(PeerTierMutationState::Aborted)
         }
     }
@@ -5991,7 +5981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_tier_mutation_peers_keeps_peer_commits_concurrent() {
+    async fn commit_tier_mutation_peers_serializes_shared_record_writes() {
         let mutation_id = uuid::Uuid::from_u128(35);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(AtomicUsize::new(0));
@@ -6009,13 +5999,38 @@ mod tests {
         .await
         .expect("successful commit fanout should commit every peer");
 
-        assert!(
-            max_active.load(Ordering::SeqCst) > 1,
-            "peer commit fanout should remain concurrent after serializing prepare"
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "peer commit fanout must not write the same intent concurrently"
         );
-        let mut calls = lock_unpoisoned(&calls).clone();
-        calls.sort();
-        assert_eq!(calls.as_slice(), &["peer-a:commit", "peer-b:commit", "peer-c:commit"]);
+        assert_eq!(lock_unpoisoned(&calls).as_slice(), &["peer-a:commit", "peer-b:commit", "peer-c:commit"]);
+    }
+
+    #[tokio::test]
+    async fn abort_tier_mutation_peers_serializes_shared_record_writes() {
+        let mutation_id = uuid::Uuid::from_u128(36);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        abort_tier_mutation_peers(
+            mutation_id,
+            vec![
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-a", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-b", calls.clone(), active.clone(), max_active.clone()),
+                ConcurrencyTrackingTierMutationPeer::boxed("peer-c", calls.clone(), active.clone(), max_active.clone()),
+            ],
+        )
+        .await
+        .expect("successful abort fanout should abort every peer");
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "peer abort fanout must not write the same intent concurrently"
+        );
+        assert_eq!(lock_unpoisoned(&calls).as_slice(), &["peer-a:abort", "peer-b:abort", "peer-c:abort"]);
     }
 
     #[tokio::test]

@@ -1267,7 +1267,7 @@ async fn test_anonymous_post_object_accepts_storage_class_exact_policy_match()
     let bucket = "anon-post-storage-class";
     let object_key = "post-storage-class-object.txt";
     let expected_body = b"post-storage-class-body".to_vec();
-    let storage_class = "STANDARD_IA";
+    let storage_class = "REDUCED_REDUNDANCY";
 
     let admin_client = env.create_s3_client();
     admin_client.create_bucket().bucket(bucket).send().await?;
@@ -5138,7 +5138,7 @@ async fn test_signed_put_object_extract_preserves_storage_class() -> Result<(), 
         .put_object()
         .bucket(bucket)
         .key(archive_key)
-        .storage_class(aws_sdk_s3::types::StorageClass::StandardIa)
+        .storage_class(aws_sdk_s3::types::StorageClass::ReducedRedundancy)
         .body(ByteStream::from(tar_bytes))
         .customize()
         .mutate_request(move |req| {
@@ -5155,7 +5155,7 @@ async fn test_signed_put_object_extract_preserves_storage_class() -> Result<(), 
         .send()
         .await?;
 
-    assert_eq!(head.storage_class().map(|value| value.as_str()), Some("STANDARD_IA"));
+    assert_eq!(head.storage_class().map(|value| value.as_str()), Some("REDUCED_REDUNDANCY"));
 
     Ok(())
 }

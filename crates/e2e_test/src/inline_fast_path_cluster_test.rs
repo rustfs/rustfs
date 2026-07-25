@@ -56,6 +56,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -81,7 +82,6 @@ const FALLBACK_REQUEST_DIRECTION: &str = "request";
 const FALLBACK_RESPONSE_DIRECTION: &str = "response";
 const MPU_PART_1_SIZE: usize = 5 * 1024 * 1024;
 const MPU_PART_2_SIZE: usize = 16 * KIB;
-const TIER_NAME: &str = "COLDTIER";
 const TIER_BUCKET: &str = "inline-fallback-cold-tier";
 const TIER_PREFIX: &str = "tiered";
 const MSGPACK_FALLBACK_CONTROL_SERIES: [(&str, &str); 4] = [
@@ -928,11 +928,15 @@ async fn signed_admin_request(
     Ok((status, text))
 }
 
-async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEnvironment) -> TestResult {
+fn unique_tier_name() -> String {
+    format!("COLDTIER{}", Uuid::new_v4().simple()).to_ascii_uppercase()
+}
+
+async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEnvironment, tier_name: &str) -> TestResult {
     let body = serde_json::json!({
         "type": "rustfs",
         "rustfs": {
-            "name": TIER_NAME,
+            "name": tier_name,
             "endpoint": cold.url.as_str(),
             "accessKey": cold.access_key.as_str(),
             "secretKey": cold.secret_key.as_str(),
@@ -957,7 +961,7 @@ async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEn
         .await?;
         let attempt = format!("status={status}, body={}", compact_body(&response));
         if status.is_success() {
-            wait_for_tier_verifiable(hot, &format!("status={status}, body={response}")).await?;
+            wait_for_tier_verifiable(hot, tier_name, &format!("status={status}, body={response}")).await?;
             return Ok(());
         }
         attempts.push(attempt);
@@ -972,10 +976,10 @@ async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEn
     Err(format!("AddTier(RustFS) failed after readiness polling: {final_error}").into())
 }
 
-async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment, add_tier_response: &str) -> TestResult {
+async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment, tier_name: &str, add_tier_response: &str) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(60);
     let final_error = loop {
-        let snapshot = tier_readiness_snapshot(hot).await?;
+        let snapshot = tier_readiness_snapshot(hot, tier_name).await?;
         if snapshot.iter().any(|node| node.verify_status.is_success()) {
             return Ok(());
         }
@@ -988,7 +992,7 @@ async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment, add_tier_r
         sleep(Duration::from_millis(500)).await;
     };
     Err(format!(
-        "tier {TIER_NAME} was not verifiable on any hot node within 60s after AddTier({add_tier_response}): {final_error}"
+        "tier {tier_name} was not verifiable on any hot node within 60s after AddTier({add_tier_response}): {final_error}"
     )
     .into())
 }
@@ -1003,7 +1007,7 @@ struct TierNodeReadiness {
     verify_body: String,
 }
 
-async fn tier_readiness_snapshot(hot: &RustFSTestClusterEnvironment) -> TestResult<Vec<TierNodeReadiness>> {
+async fn tier_readiness_snapshot(hot: &RustFSTestClusterEnvironment, tier_name: &str) -> TestResult<Vec<TierNodeReadiness>> {
     let mut snapshot = Vec::with_capacity(hot.nodes.len());
     for (node_index, node) in hot.nodes.iter().enumerate() {
         let (list_status, list_body) =
@@ -1011,7 +1015,7 @@ async fn tier_readiness_snapshot(hot: &RustFSTestClusterEnvironment) -> TestResu
         let (verify_status, verify_body) = signed_admin_request(
             &node.url,
             Method::GET,
-            &format!("/rustfs/admin/v3/tier/{TIER_NAME}"),
+            &format!("/rustfs/admin/v3/tier/{tier_name}"),
             None,
             &hot.access_key,
             &hot.secret_key,
@@ -1021,7 +1025,7 @@ async fn tier_readiness_snapshot(hot: &RustFSTestClusterEnvironment) -> TestResu
             node_index,
             node_url: node.url.clone(),
             list_status,
-            list_has_tier: tier_list_contains(&list_body),
+            list_has_tier: tier_list_contains(&list_body, tier_name),
             list_body,
             verify_status,
             verify_body,
@@ -1030,18 +1034,18 @@ async fn tier_readiness_snapshot(hot: &RustFSTestClusterEnvironment) -> TestResu
     Ok(snapshot)
 }
 
-fn tier_list_contains(response: &str) -> bool {
+fn tier_list_contains(response: &str, tier_name: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(response)
         .ok()
         .and_then(|value| value.as_array().cloned())
         .is_some_and(|tiers| {
             tiers.iter().any(|tier| {
-                tier.get("name").and_then(serde_json::Value::as_str) == Some(TIER_NAME)
+                tier.get("name").and_then(serde_json::Value::as_str) == Some(tier_name)
                     || tier
                         .get("rustfs")
                         .and_then(|rustfs| rustfs.get("name"))
                         .and_then(serde_json::Value::as_str)
-                        == Some(TIER_NAME)
+                        == Some(tier_name)
             })
         })
 }
@@ -1088,30 +1092,30 @@ fn is_retryable_add_tier_error(response: &str) -> bool {
     response.contains("Remote tier configuration is already being replaced")
 }
 
-fn transition_rule() -> TestResult<LifecycleRule> {
+fn transition_rule(tier_name: &str) -> TestResult<LifecycleRule> {
     Ok(LifecycleRule::builder()
         .id("inline-fallback-transition")
         .filter(LifecycleRuleFilter::builder().prefix("transition/").build())
         .transitions(
             Transition::builder()
                 .days(0)
-                .storage_class(TransitionStorageClass::from(TIER_NAME))
+                .storage_class(TransitionStorageClass::from(tier_name))
                 .build(),
         )
         .status(ExpirationStatus::Enabled)
         .build()?)
 }
 
-async fn wait_for_transition(client: &Client, bucket: &str, key: &str) -> TestResult {
+async fn wait_for_transition(client: &Client, bucket: &str, key: &str, tier_name: &str) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let head = client.head_object().bucket(bucket).key(key).send().await?;
-        if head.storage_class().map(|storage_class| storage_class.as_str()) == Some(TIER_NAME) {
+        if head.storage_class().map(|storage_class| storage_class.as_str()) == Some(tier_name) {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "object {bucket}/{key} was not transitioned to {TIER_NAME} within 90s (storage_class={:?})",
+                "object {bucket}/{key} was not transitioned to {tier_name} within 90s (storage_class={:?})",
                 head.storage_class()
             )
             .into());
@@ -1130,10 +1134,12 @@ async fn cold_tier_object_count(cold_client: &Client) -> TestResult<usize> {
         .len())
 }
 
-async fn put_lifecycle_with_transition_retry(client: &Client, bucket: &str) -> TestResult {
+async fn put_lifecycle_with_transition_retry(client: &Client, bucket: &str, tier_name: &str) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let lifecycle = BucketLifecycleConfiguration::builder().rules(transition_rule()?).build()?;
+        let lifecycle = BucketLifecycleConfiguration::builder()
+            .rules(transition_rule(tier_name)?)
+            .build()?;
         match client
             .put_bucket_lifecycle_configuration()
             .bucket(bucket)
@@ -1511,14 +1517,15 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
 
     let fallback_before = collector.msgpack_json_fallback_totals().await;
 
-    add_rustfs_tier(&hot, &cold).await?;
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
     let bucket = "inline-transitioned-mixed-msgpack-controls";
     hot_client.create_bucket().bucket(bucket).send().await?;
-    put_lifecycle_with_transition_retry(&hot_client, bucket).await?;
+    put_lifecycle_with_transition_retry(&hot_client, bucket, &tier_name).await?;
 
     let key = "transition/mixed-multipart.bin";
     let (body, _, etag) = put_two_part_multipart(&hot_client, bucket, key).await?;
-    wait_for_transition(&hot_client, bucket, key).await?;
+    wait_for_transition(&hot_client, bucket, key, &tier_name).await?;
     assert!(
         cold_tier_object_count(&cold_client).await? >= 1,
         "cold-tier bucket must hold transitioned objects"
@@ -1602,14 +1609,15 @@ async fn four_node_transitioned_inline_fallback() -> TestResult {
     hot.start().await?;
     let hot_client = hot.create_s3_client(0)?;
 
-    add_rustfs_tier(&hot, &cold).await?;
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
     let bucket = "inline-transitioned-fallback";
     hot_client.create_bucket().bucket(bucket).send().await?;
-    put_lifecycle_with_transition_retry(&hot_client, bucket).await?;
+    put_lifecycle_with_transition_retry(&hot_client, bucket, &tier_name).await?;
 
     let key = "transition/two-part.bin";
     let (body, _, etag) = put_two_part_multipart(&hot_client, bucket, key).await?;
-    wait_for_transition(&hot_client, bucket, key).await?;
+    wait_for_transition(&hot_client, bucket, key, &tier_name).await?;
     assert!(
         cold_tier_object_count(&cold_client).await? >= 1,
         "cold-tier bucket must hold the transitioned object"

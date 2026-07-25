@@ -111,7 +111,7 @@ async fn handle_prepare(
         }
         Err(Error::PreconditionFailed) => {
             let existing = load_tier_mutation_intent_record(api, mutation_id).await?;
-            if !same_mutation_identity(&existing, &intent) {
+            if !existing.same_identity_as(&intent) {
                 return Err(TierMutationPeerError::ConflictingIntent);
             }
             match existing.state {
@@ -234,15 +234,6 @@ fn peer_state_from_intent(state: TierMutationIntentState) -> TierMutationPeerSta
         TierMutationIntentState::Committed => TierMutationPeerState::Committed,
         TierMutationIntentState::Aborted => TierMutationPeerState::Aborted,
     }
-}
-
-fn same_mutation_identity(existing: &TierMutationIntent, expected: &TierMutationIntent) -> bool {
-    existing.mutation_id == expected.mutation_id
-        && existing.kind == expected.kind
-        && existing.old_config_etag == expected.old_config_etag
-        && existing.candidate_digest == expected.candidate_digest
-        && existing.affected_targets == expected.affected_targets
-        && existing.expires_at_unix_nanos == expected.expires_at_unix_nanos
 }
 
 #[cfg(test)]
