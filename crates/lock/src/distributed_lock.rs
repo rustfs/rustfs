@@ -554,10 +554,10 @@ impl DistributedLock {
         let jitter = base / 4;
         let lower = base.saturating_sub(jitter);
         let upper = base.saturating_add(jitter);
-        let lower_millis = u64::try_from(lower.as_millis()).unwrap_or(u64::MAX);
-        let upper_millis = u64::try_from(upper.as_millis()).unwrap_or(u64::MAX);
+        let lower_nanos = u64::try_from(lower.as_nanos()).unwrap_or(u64::MAX);
+        let upper_nanos = u64::try_from(upper.as_nanos()).unwrap_or(u64::MAX);
 
-        Duration::from_millis(rng.random_range(lower_millis..=upper_millis))
+        Duration::from_nanos(rng.random_range(lower_nanos..=upper_nanos))
     }
 
     fn lock_acquire_attempt_timeout(&self, remaining: Duration) -> Duration {
@@ -1018,8 +1018,9 @@ mod tests {
         is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
-    use rand::{SeedableRng as _, rngs::StdRng};
+    use rand::{SeedableRng as _, TryRng, rngs::StdRng};
     use std::assert_matches;
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{
         collections::{HashMap, VecDeque},
@@ -1032,6 +1033,27 @@ mod tests {
         Alive,    // Ok(true)  refresh succeeded
         NotFound, // Ok(false) remote already lost the lock (reclaimed / never held)
         RpcError, // Err        RPC jitter
+    }
+
+    struct ConstantRng(u64);
+
+    impl TryRng for ConstantRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.0 as u32)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.0)
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            for chunk in dst.chunks_mut(size_of::<u64>()) {
+                chunk.copy_from_slice(&self.0.to_ne_bytes()[..chunk.len()]);
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -1047,6 +1069,11 @@ mod tests {
 
         assert!(samples.iter().all(|delay| *delay >= lower && *delay <= upper));
         assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
+
+        let mut lower_rng = ConstantRng(0);
+        let mut upper_rng = ConstantRng(u64::MAX);
+        assert_eq!(DistributedLock::lock_acquire_retry_backoff(3, &mut lower_rng), lower);
+        assert_eq!(DistributedLock::lock_acquire_retry_backoff(3, &mut upper_rng), upper);
     }
 
     /// Counting test client: acquires successfully and echoes back request.lock_id as
