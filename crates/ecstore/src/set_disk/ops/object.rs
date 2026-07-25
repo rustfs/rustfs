@@ -2348,6 +2348,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             )
         };
 
+        if let Some(expected) = dst_opts.expected_current_version_id.as_deref() {
+            let current = self
+                .get_object_info(
+                    dst_bucket,
+                    dst_object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        StorageError::PreconditionFailed
+                    } else {
+                        err
+                    }
+                })?;
+            if current.version_id.map(|version| version.to_string()).as_deref() != Some(expected) {
+                return Err(StorageError::PreconditionFailed);
+            }
+        }
+
         self.invalidate_get_object_metadata_cache(dst_bucket, dst_object).await;
 
         if dst_opts.http_preconditions.is_some()
