@@ -892,6 +892,7 @@ pub struct RustFSTestClusterEnvironment {
     pub access_key: String,
     pub secret_key: String,
     pub extra_env: Vec<(String, String)>,
+    pub node_extra_env: Vec<Vec<(String, String)>>,
     pub topology: ClusterTopology,
 }
 
@@ -990,6 +991,7 @@ impl RustFSTestClusterEnvironment {
             access_key: "rustfs-cluster-test-access".to_string(),
             secret_key: "rustfs-cluster-test-secret".to_string(),
             extra_env,
+            node_extra_env: vec![Vec::new(); topology.node_count],
             topology,
         })
     }
@@ -1001,6 +1003,22 @@ impl RustFSTestClusterEnvironment {
         V: Into<String>,
     {
         self.extra_env.push((key.into(), value.into()));
+    }
+
+    /// Add an extra environment variable applied to a single cluster node.
+    pub fn set_node_env<K, V>(
+        &mut self,
+        node_idx: usize,
+        key: K,
+        value: V,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.ensure_node_index(node_idx)?;
+        self.node_extra_env[node_idx].push((key.into(), value.into()));
+        Ok(())
     }
 
     fn ensure_node_index(&self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1089,6 +1107,9 @@ impl RustFSTestClusterEnvironment {
             for (key, value) in &self.extra_env {
                 command.env(key, value);
             }
+            for (key, value) in &self.node_extra_env[i] {
+                command.env(key, value);
+            }
 
             let process = command.current_dir(&node.data_dir).spawn()?;
 
@@ -1128,6 +1149,9 @@ impl RustFSTestClusterEnvironment {
             .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
 
         for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+        for (key, value) in &self.node_extra_env[node_idx] {
             command.env(key, value);
         }
 
@@ -1371,6 +1395,7 @@ mod tests {
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             extra_env: Vec::new(),
+            node_extra_env: vec![Vec::new(); topology.node_count],
             topology,
         }
     }
@@ -1454,5 +1479,25 @@ mod tests {
         assert!(ClusterTopology::single_pool(4).validate().is_ok());
         assert!(ClusterTopology::single_pool_multidrive(4, 4).validate().is_ok());
         assert!(ClusterTopology::single_pool_multidrive(1, 1).validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_node_env_supports_per_node_overrides() {
+        let mut env = fake_cluster(ClusterTopology::single_pool(4));
+        env.set_node_env(2, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY", "true").unwrap();
+        assert_eq!(
+            env.node_extra_env[2].as_slice(),
+            [("RUSTFS_INTERNODE_RPC_MSGPACK_ONLY".to_string(), "true".to_string())]
+        );
+    }
+
+    #[test]
+    fn cluster_node_env_rejects_invalid_index() {
+        let mut env = fake_cluster(ClusterTopology::single_pool(4));
+        let err = env
+            .set_node_env(4, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY", "true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid"), "unexpected error: {err}");
     }
 }
