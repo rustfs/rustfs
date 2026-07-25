@@ -39,6 +39,7 @@ use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
 use crate::admin::storage_api::error::Error as StorageError;
+use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::auth::{check_key_valid, constant_time_eq, get_session_token};
 use crate::config::get_config_snapshot;
@@ -98,9 +99,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-#[cfg(test)]
-use std::sync::Arc;
-use std::sync::{LazyLock, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
@@ -114,6 +113,7 @@ const EVENT_ADMIN_SITE_REPLICATION_STATE: &str = "admin_site_replication_state";
 const SERVICE_ACCOUNT_ENVELOPE_VERSION: u64 = 2;
 const SITE_REPLICATION_STATE_PATH: &str = "config/site-replication/state.json";
 const SITE_REPLICATION_REPAIR_STATE_PATH: &str = "config/site-replication/repair-state.json";
+const SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH: &str = "config/site-replication/repair-execution.lock";
 const SITE_REPL_ADD_SUCCESS: &str = "Requested sites were configured for replication successfully.";
 const SITE_REPL_EDIT_SUCCESS: &str = "Requested site was updated successfully.";
 const SITE_REPL_REMOVE_SUCCESS: &str = "Requested site(s) were removed from cluster replication successfully.";
@@ -344,7 +344,6 @@ impl TryFrom<&PeerSite> for PeerConnection {
 static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
 // Lock order: lifecycle -> bucket operation -> repair admission -> state -> per-bucket metadata.
 static SITE_REPLICATION_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static SITE_REPLICATION_REPAIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SITE_REPLICATION_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 static SITE_REPLICATION_ADD_BOOTSTRAP: LazyLock<StdMutex<Option<SiteReplicationAddBootstrap>>> =
@@ -487,8 +486,21 @@ struct SiteReplicationRepairFamilyStatus {
     planned: usize,
     succeeded: usize,
     failed: usize,
+    #[serde(default)]
+    retry_events: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tasks: Vec<SiteReplicationRepairTaskStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SiteReplicationRepairTaskStatus {
+    task_id: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,6 +518,13 @@ struct SiteReplicationRepairRequest {
 enum SiteReplicationRepairMode {
     DryRun,
     Execute,
+}
+
+struct SiteReplicationRepairExecutionRequest {
+    local_peer: PeerInfo,
+    preflight_token: String,
+    operation_id: String,
+    signing_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -547,6 +566,8 @@ struct SiteReplicationRepairFamilyResponse {
     planned: usize,
     succeeded: usize,
     failed: usize,
+    retry_events: usize,
+    tasks: Vec<SiteReplicationRepairTaskStatus>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<String>,
 }
@@ -1024,9 +1045,7 @@ async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
     }
 }
 
-async fn load_site_replication_repair_state_from_store(
-    store: Arc<crate::admin::storage_api::ECStore>,
-) -> S3Result<SiteReplicationRepairState> {
+async fn load_site_replication_repair_state_from_store(store: Arc<ECStore>) -> S3Result<SiteReplicationRepairState> {
     match read_config_no_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH).await {
         Ok(data) => serde_json::from_slice(&data).map_err(|e| {
             S3Error::with_message(S3ErrorCode::InternalError, format!("invalid site replication repair state: {e}"))
@@ -1039,10 +1058,7 @@ async fn load_site_replication_repair_state_from_store(
     }
 }
 
-async fn save_site_replication_repair_state_to_store(
-    store: Arc<crate::admin::storage_api::ECStore>,
-    state: &SiteReplicationRepairState,
-) -> S3Result<()> {
+async fn save_site_replication_repair_state_to_store(store: Arc<ECStore>, state: &SiteReplicationRepairState) -> S3Result<()> {
     let data = serde_json::to_vec(state)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize repair state failed: {e}")))?;
     save_config_no_lock(store, SITE_REPLICATION_REPAIR_STATE_PATH, data)
@@ -3150,36 +3166,73 @@ fn site_replication_repair_preflight_token(
     Ok(URL_SAFE_NO_PAD.encode(digest.finalize().into_bytes()))
 }
 
+fn site_replication_repair_task_checkpoint_id(
+    signing_key: &[u8],
+    peer_deployment_id: &str,
+    task: &SiteReplicationRepairTask<'_>,
+) -> S3Result<String> {
+    let mut digest = <Hmac<Sha256> as hmac::digest::KeyInit>::new_from_slice(signing_key)
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid repair signing key".to_string()))?;
+    digest.update(b"rustfs:site-replication:repair-task:v1\0");
+    digest.update(peer_deployment_id.as_bytes());
+    digest.update(&[0]);
+    digest.update(task.id()?.as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(digest.finalize().into_bytes()))
+}
+
 fn site_replication_repair_sites(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     plan: &SiteReplicationBootstrapPlan,
-) -> BTreeMap<String, SiteReplicationRepairSiteStatus> {
+    signing_key: &[u8],
+) -> S3Result<BTreeMap<String, SiteReplicationRepairSiteStatus>> {
     let mut planned = BTreeMap::new();
+    let mut family_paths = BTreeMap::<String, BTreeSet<String>>::new();
     for (_, task) in site_replication_repair_tasks(plan) {
-        planned
+        let family = task.family().to_string();
+        let family_status = planned
             .entry(task.family().to_string())
-            .or_insert_with(SiteReplicationRepairFamilyStatus::default)
-            .planned += 1;
+            .or_insert_with(SiteReplicationRepairFamilyStatus::default);
+        family_status.planned += 1;
+        family_paths.entry(family).or_default().insert(task.path().to_string());
     }
 
-    state
-        .peers
-        .values()
-        .filter(|peer| {
-            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-        })
-        .map(|peer| {
-            (
-                peer.deployment_id.clone(),
-                SiteReplicationRepairSiteStatus {
-                    deployment_id: peer.deployment_id.clone(),
-                    name: peer.name.clone(),
-                    families: planned.clone(),
-                },
-            )
-        })
-        .collect()
+    let mut sites = BTreeMap::new();
+    for peer in state.peers.values().filter(|peer| {
+        peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+    }) {
+        let mut families = planned.clone();
+        for (_, task) in site_replication_repair_tasks(plan) {
+            let family = families
+                .get_mut(task.family())
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "repair task family is missing".to_string()))?;
+            family.tasks.push(SiteReplicationRepairTaskStatus {
+                task_id: site_replication_repair_task_checkpoint_id(signing_key, &peer.deployment_id, &task)?,
+                status: "planned".to_string(),
+                error: None,
+            });
+        }
+        for (family, status) in &mut families {
+            status.retry_events = state
+                .retry_queue
+                .iter()
+                .filter(|event| {
+                    event.peer_deployment_id == peer.deployment_id
+                        && retry_event_replayed_by_bootstrap(event)
+                        && family_paths.get(family).is_some_and(|paths| paths.contains(&event.path))
+                })
+                .count();
+        }
+        sites.insert(
+            peer.deployment_id.clone(),
+            SiteReplicationRepairSiteStatus {
+                deployment_id: peer.deployment_id.clone(),
+                name: peer.name.clone(),
+                families,
+            },
+        );
+    }
+    Ok(sites)
 }
 
 fn update_site_replication_repair_task(
@@ -3203,17 +3256,23 @@ fn update_site_replication_repair_task(
             "repair operation task checkpoint is invalid".to_string(),
         ));
     }
+    let task_status = family_status.tasks.get_mut(family_index).ok_or_else(|| {
+        S3Error::with_message(S3ErrorCode::InternalError, "repair operation task checkpoint is missing".to_string())
+    })?;
     family_status.failed = 0;
     family_status.errors.clear();
     match result {
         Ok(()) => {
             family_status.succeeded = family_status.succeeded.saturating_add(1);
+            task_status.status = "succeeded".to_string();
+            task_status.error = None;
         }
         Err(error) => {
+            let error = classify_site_replication_repair_error(error).to_string();
             family_status.failed = 1;
-            family_status
-                .errors
-                .push(classify_site_replication_repair_error(error).to_string());
+            family_status.errors.push(error.clone());
+            task_status.status = "failed".to_string();
+            task_status.error = Some(error);
         }
     }
     Ok(())
@@ -3246,6 +3305,16 @@ fn prepare_site_replication_repair_retry(operation: &mut SiteReplicationRepairOp
     for family in operation.sites.values_mut().flat_map(|site| site.families.values_mut()) {
         family.failed = 0;
         family.errors.clear();
+        for task in &mut family.tasks {
+            match task.status.as_str() {
+                "succeeded" => task.status = "skipped".to_string(),
+                "failed" => {
+                    task.status = "planned".to_string();
+                    task.error = None;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -3320,6 +3389,8 @@ fn site_replication_repair_operation_response(
                                         planned: status.planned,
                                         succeeded: status.succeeded,
                                         failed: status.failed,
+                                        retry_events: status.retry_events,
+                                        tasks: status.tasks.clone(),
                                         errors: status.errors.clone(),
                                     },
                                 )
@@ -3397,6 +3468,180 @@ async fn persist_site_replication_repair_task(
         dequeue_site_replication_retry_events(&mut latest.retry_queue, peer, path);
     }
     persist_site_replication_state(&latest).await
+}
+
+fn admit_site_replication_repair_operation(
+    repair_state: &mut SiteReplicationRepairState,
+    operation_id: String,
+    supplied_token: &str,
+    candidate: SiteReplicationRepairOperation,
+) -> S3Result<SiteReplicationRepairOperation> {
+    if let Some(existing) = repair_state.operations.get(&operation_id) {
+        if !constant_time_eq(&existing.preflight_token, supplied_token) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::ClientTokenConflict,
+                "repair operation ID is already bound to a different preflight".to_string(),
+            ));
+        }
+        if !constant_time_eq(&existing.plan_token, &candidate.plan_token) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::PreconditionFailed,
+                "site replication repair plan changed after partial execution".to_string(),
+            ));
+        }
+        return Ok(existing.clone());
+    }
+    if repair_state
+        .operations
+        .values()
+        .any(|operation| operation.status == "running")
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::ClientTokenConflict,
+            "another site replication repair is active".to_string(),
+        ));
+    }
+    repair_state.operations.insert(operation_id, candidate.clone());
+    prune_site_replication_repair_operations(&mut repair_state.operations);
+    Ok(candidate)
+}
+
+async fn execute_site_replication_repair(
+    request: SiteReplicationRepairExecutionRequest,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let store =
+        current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
+    with_config_object_write_lock(store, SITE_REPLICATION_REPAIR_EXECUTION_LOCK_PATH.to_string(), move || async move {
+        execute_site_replication_repair_locked(request).await
+    })
+    .await
+    .map_err(|_| {
+        S3Error::with_message(S3ErrorCode::ClientTokenConflict, "another site replication repair is active".to_string())
+    })?
+}
+
+async fn execute_site_replication_repair_locked(
+    request: SiteReplicationRepairExecutionRequest,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let state = {
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let state = load_site_replication_state().await?;
+        if !state.enabled() || state.service_account_access_key.is_empty() {
+            return Err(s3_error!(InvalidRequest, "site replication is not configured"));
+        }
+        state
+    };
+    let info = build_sr_info(&state, &request.local_peer).await?;
+    let plan = site_replication_bootstrap_plan(&info)?;
+    let plan_token = site_replication_repair_plan_token(&state, &plan)?;
+    let preflight_token = site_replication_repair_preflight_token(&state, &plan, request.signing_key.as_bytes())?;
+    let sites = site_replication_repair_sites(&state, &request.local_peer, &plan, request.signing_key.as_bytes())?;
+
+    let repair_state = read_site_replication_repair_state().await?;
+    if let Some(existing) = repair_state.operations.get(&request.operation_id) {
+        if !constant_time_eq(&existing.preflight_token, &request.preflight_token) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::ClientTokenConflict,
+                "repair operation ID is already bound to a different preflight".to_string(),
+            ));
+        }
+        if existing.status == "success" {
+            return json_response(&site_replication_repair_operation_response(existing));
+        }
+        if !constant_time_eq(&existing.plan_token, &plan_token) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::PreconditionFailed,
+                "site replication repair plan changed after partial execution".to_string(),
+            ));
+        }
+    } else if !constant_time_eq(&request.preflight_token, &preflight_token) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::PreconditionFailed,
+            "site replication repair preflight is stale".to_string(),
+        ));
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let candidate = SiteReplicationRepairOperation {
+        operation_id: request.operation_id.clone(),
+        preflight_token,
+        plan_token,
+        status: "running".to_string(),
+        sites,
+        created_at: Some(now),
+        updated_at: Some(now),
+        completed_at: None,
+    };
+    let supplied_token = request.preflight_token;
+    let operation_id = request.operation_id;
+    let mut operation = update_site_replication_repair_state(move |repair_state| {
+        admit_site_replication_repair_operation(repair_state, operation_id, &supplied_token, candidate)
+    })
+    .await?;
+    if operation.status == "success" {
+        return json_response(&site_replication_repair_operation_response(&operation));
+    }
+
+    let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
+    prepare_site_replication_repair_retry(&mut operation);
+    operation.status = "running".to_string();
+    operation.completed_at = None;
+    operation.updated_at = Some(OffsetDateTime::now_utc());
+    persist_site_replication_repair_operation(&operation).await?;
+
+    let tasks = site_replication_repair_tasks(&plan);
+    for peer in state.peers.values().filter(|peer| {
+        peer.deployment_id != request.local_peer.deployment_id
+            && !same_identity_endpoint(&peer.endpoint, &request.local_peer.endpoint)
+    }) {
+        let transport = match PeerTransport::for_runtime_peer(peer).await {
+            Ok(transport) => transport,
+            Err(err) => {
+                let error = err.to_string();
+                for (family_index, task) in &tasks {
+                    if !site_replication_repair_task_pending(&operation, &peer.deployment_id, task.family(), *family_index)? {
+                        continue;
+                    }
+                    update_site_replication_repair_task(
+                        &mut operation,
+                        &peer.deployment_id,
+                        task.family(),
+                        *family_index,
+                        Err(&error),
+                    )?;
+                    summarize_site_replication_repair_operation(&mut operation);
+                    persist_site_replication_repair_task(&operation, peer, task.family(), task.path()).await?;
+                }
+                continue;
+            }
+        };
+
+        for (family_index, task) in &tasks {
+            if !site_replication_repair_task_pending(&operation, &peer.deployment_id, task.family(), *family_index)? {
+                continue;
+            }
+            let result = task
+                .send(&transport, &state.service_account_access_key, &service_account_secret_key)
+                .await;
+            let error = result.err().map(|err| err.to_string());
+            update_site_replication_repair_task(
+                &mut operation,
+                &peer.deployment_id,
+                task.family(),
+                *family_index,
+                match error.as_deref() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                },
+            )?;
+            summarize_site_replication_repair_operation(&mut operation);
+            persist_site_replication_repair_task(&operation, peer, task.family(), task.path()).await?;
+        }
+    }
+
+    summarize_site_replication_repair_operation(&mut operation);
+    persist_site_replication_repair_operation(&operation).await?;
+    json_response(&site_replication_repair_operation_response(&operation))
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
@@ -8461,12 +8706,11 @@ impl Operation for SiteReplicationRepairHandler {
         let body: SiteReplicationRepairRequest = read_site_replication_json(req, "", false).await?;
         let info = build_sr_info(&state, &local_peer).await?;
         let plan = site_replication_bootstrap_plan(&info)?;
-        let plan_token = site_replication_repair_plan_token(&state, &plan)?;
         let signing_key = current_token_signing_key().ok_or_else(|| {
             S3Error::with_message(S3ErrorCode::InternalError, "token signing key is not initialized".to_string())
         })?;
         let preflight_token = site_replication_repair_preflight_token(&state, &plan, signing_key.as_bytes())?;
-        let sites = site_replication_repair_sites(&state, &local_peer, &plan);
+        let sites = site_replication_repair_sites(&state, &local_peer, &plan, signing_key.as_bytes())?;
 
         if body.mode == SiteReplicationRepairMode::DryRun {
             if body.preflight_token.is_some() || body.operation_id.is_some() {
@@ -8501,158 +8745,13 @@ impl Operation for SiteReplicationRepairHandler {
                 .to_string(),
             None => Uuid::new_v4().to_string(),
         };
-        let repair_state = read_site_replication_repair_state().await?;
-        if let Some(existing) = repair_state.operations.get(&operation_id) {
-            if !constant_time_eq(&existing.preflight_token, supplied_token) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::ClientTokenConflict,
-                    "repair operation ID is already bound to a different preflight".to_string(),
-                ));
-            }
-            if existing.status == "success" {
-                return json_response(&site_replication_repair_operation_response(existing));
-            }
-            if !constant_time_eq(&existing.plan_token, &plan_token) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::PreconditionFailed,
-                    "site replication repair plan changed after partial execution".to_string(),
-                ));
-            }
-        } else if !constant_time_eq(supplied_token, &preflight_token) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::PreconditionFailed,
-                "site replication repair preflight is stale".to_string(),
-            ));
-        }
-
-        let _repair_guard = SITE_REPLICATION_REPAIR_LOCK.try_lock().map_err(|_| {
-            S3Error::with_message(S3ErrorCode::ClientTokenConflict, "another site replication repair is active".to_string())
-        })?;
-        {
-            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
-            let latest = load_site_replication_state().await?;
-            let latest_plan_token = site_replication_repair_plan_token(&latest, &plan)?;
-            let existing = repair_state.operations.get(&operation_id);
-            if existing.is_some_and(|operation| !constant_time_eq(&operation.plan_token, &latest_plan_token))
-                || (existing.is_none()
-                    && !constant_time_eq(
-                        &site_replication_repair_preflight_token(&latest, &plan, signing_key.as_bytes())?,
-                        supplied_token,
-                    ))
-            {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::PreconditionFailed,
-                    "site replication repair preflight is stale".to_string(),
-                ));
-            }
-        }
-
-        let now = OffsetDateTime::now_utc();
-        let candidate = SiteReplicationRepairOperation {
-            operation_id: operation_id.clone(),
-            preflight_token,
-            plan_token,
-            status: "running".to_string(),
-            sites,
-            created_at: Some(now),
-            updated_at: Some(now),
-            completed_at: None,
-        };
-        let supplied_token = supplied_token.to_string();
-        let mut operation = update_site_replication_repair_state(move |repair_state| {
-            if let Some(existing) = repair_state.operations.get(&operation_id) {
-                if !constant_time_eq(&existing.preflight_token, &supplied_token) {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ClientTokenConflict,
-                        "repair operation ID is already bound to a different preflight".to_string(),
-                    ));
-                }
-                if !constant_time_eq(&existing.plan_token, &candidate.plan_token) {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::PreconditionFailed,
-                        "site replication repair plan changed after partial execution".to_string(),
-                    ));
-                }
-                return Ok(existing.clone());
-            }
-            if repair_state
-                .operations
-                .values()
-                .any(|operation| operation.status == "running")
-            {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::ClientTokenConflict,
-                    "another site replication repair is active".to_string(),
-                ));
-            }
-            repair_state.operations.insert(operation_id, candidate.clone());
-            prune_site_replication_repair_operations(&mut repair_state.operations);
-            Ok(candidate)
+        execute_site_replication_repair(SiteReplicationRepairExecutionRequest {
+            local_peer,
+            preflight_token: supplied_token.to_string(),
+            operation_id,
+            signing_key,
         })
-        .await?;
-        if operation.status == "success" {
-            return json_response(&site_replication_repair_operation_response(&operation));
-        }
-
-        let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
-        prepare_site_replication_repair_retry(&mut operation);
-        operation.status = "running".to_string();
-        operation.completed_at = None;
-        operation.updated_at = Some(OffsetDateTime::now_utc());
-        persist_site_replication_repair_operation(&operation).await?;
-
-        let tasks = site_replication_repair_tasks(&plan);
-        for peer in state.peers.values().filter(|peer| {
-            peer.deployment_id != local_peer.deployment_id && !same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-        }) {
-            let transport = match PeerTransport::for_runtime_peer(peer).await {
-                Ok(transport) => transport,
-                Err(err) => {
-                    let error = err.to_string();
-                    for (family_index, task) in &tasks {
-                        if !site_replication_repair_task_pending(&operation, &peer.deployment_id, task.family(), *family_index)? {
-                            continue;
-                        }
-                        update_site_replication_repair_task(
-                            &mut operation,
-                            &peer.deployment_id,
-                            task.family(),
-                            *family_index,
-                            Err(&error),
-                        )?;
-                        summarize_site_replication_repair_operation(&mut operation);
-                        persist_site_replication_repair_task(&operation, peer, task.family(), task.path()).await?;
-                    }
-                    continue;
-                }
-            };
-
-            for (family_index, task) in &tasks {
-                if !site_replication_repair_task_pending(&operation, &peer.deployment_id, task.family(), *family_index)? {
-                    continue;
-                }
-                let result = task
-                    .send(&transport, &state.service_account_access_key, &service_account_secret_key)
-                    .await;
-                let error = result.err().map(|err| err.to_string());
-                update_site_replication_repair_task(
-                    &mut operation,
-                    &peer.deployment_id,
-                    task.family(),
-                    *family_index,
-                    match error.as_deref() {
-                        Some(error) => Err(error),
-                        None => Ok(()),
-                    },
-                )?;
-                summarize_site_replication_repair_operation(&mut operation);
-                persist_site_replication_repair_task(&operation, peer, task.family(), task.path()).await?;
-            }
-        }
-
-        summarize_site_replication_repair_operation(&mut operation);
-        persist_site_replication_repair_operation(&operation).await?;
-        json_response(&site_replication_repair_operation_response(&operation))
+        .await
     }
 }
 
@@ -11078,6 +11177,10 @@ mod tests {
                 ),
             ]),
             retry_queue: vec![SiteReplicationRetryEvent {
+                peer_deployment_id: "remote-dep".to_string(),
+                path: format!(
+                    "{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=photos&operation={SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING}"
+                ),
                 last_error: "credential=retry-secret".to_string(),
                 ..Default::default()
             }],
@@ -11097,6 +11200,9 @@ mod tests {
                 }),
                 ..Default::default()
             }],
+            bucket_make_ops: vec![format!(
+                "{SITE_REPLICATION_PEER_BUCKET_OPS_PATH}?bucket=photos&operation={SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING}"
+            )],
             ..Default::default()
         };
         let before = serde_json::to_vec(&state).expect("serialize state before planning");
@@ -11108,7 +11214,7 @@ mod tests {
             preflight_token: site_replication_repair_preflight_token(&state, &plan, b"test-signing-key")
                 .expect("preflight token"),
             retry_events: state.retry_queue.len(),
-            sites: site_replication_repair_sites(&state, local, &plan),
+            sites: site_replication_repair_sites(&state, local, &plan, b"test-signing-key").expect("repair sites"),
         };
         let encoded = serde_json::to_string(&response).expect("serialize preflight");
 
@@ -11118,6 +11224,29 @@ mod tests {
         assert!(!encoded.contains("retry-secret"));
         assert!(!encoded.contains("remote.example.com"));
         assert_eq!(response.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].planned, 1);
+        let bucket_family = &response.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY];
+        assert_eq!(bucket_family.retry_events, 1);
+        let task_id = &bucket_family.tasks[0].task_id;
+        assert_eq!(task_id.len(), 43);
+        assert!(
+            task_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+        assert!(!task_id.contains("bucket"));
+        assert!(!task_id.contains("photos"));
+        assert!(!task_id.contains("remote-dep"));
+        assert_eq!(bucket_family.tasks[0].status, "planned");
+        let repeated = site_replication_repair_sites(&state, local, &plan, b"test-signing-key").expect("repeat repair sites");
+        assert_eq!(
+            task_id,
+            &repeated["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].task_id
+        );
+        let rotated = site_replication_repair_sites(&state, local, &plan, b"rotated-signing-key").expect("rotated repair sites");
+        assert_ne!(
+            task_id,
+            &rotated["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].task_id
+        );
     }
 
     #[test]
@@ -11214,7 +11343,7 @@ mod tests {
                 .expect("preflight token"),
             plan_token: site_replication_repair_plan_token(&state, &plan).expect("plan token"),
             status: "running".to_string(),
-            sites: site_replication_repair_sites(&state, &local, &plan),
+            sites: site_replication_repair_sites(&state, &local, &plan, b"test-signing-key").expect("repair sites"),
             created_at: Some(now),
             updated_at: Some(now),
             completed_at: None,
@@ -11232,6 +11361,14 @@ mod tests {
         .expect("record injected failure");
         summarize_site_replication_repair_operation(&mut operation);
         assert_eq!(operation.status, "partial");
+        assert_eq!(
+            operation.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].tasks[0].status,
+            "succeeded"
+        );
+        assert_eq!(
+            operation.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].status,
+            "failed"
+        );
         assert!(
             !site_replication_repair_task_pending(&operation, &remote.deployment_id, first_task.family(), *first_index)
                 .expect("first task state")
@@ -11259,6 +11396,14 @@ mod tests {
         assert!(!String::from_utf8(encoded).expect("operation JSON").contains("must-not-leak"));
 
         prepare_site_replication_repair_retry(&mut recovered);
+        assert_eq!(
+            recovered.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_IAM_FAMILY].tasks[0].status,
+            "skipped"
+        );
+        assert_eq!(
+            recovered.sites["remote-dep"].families[SITE_REPLICATION_REPAIR_BUCKET_FAMILY].tasks[0].status,
+            "planned"
+        );
         assert!(
             site_replication_repair_task_pending(&recovered, &remote.deployment_id, second_task.family(), *second_index)
                 .expect("failed task becomes retryable")
@@ -11288,6 +11433,64 @@ mod tests {
             classify_site_replication_repair_error("peer request body contained secret=private"),
             "remote-operation-failed"
         );
+    }
+
+    #[test]
+    fn test_site_replication_repair_admission_resumes_same_id_and_rejects_conflicts() {
+        let existing = SiteReplicationRepairOperation {
+            operation_id: "operation-a".to_string(),
+            preflight_token: "preflight-a".to_string(),
+            plan_token: "plan-a".to_string(),
+            status: "running".to_string(),
+            ..Default::default()
+        };
+        let mut state = SiteReplicationRepairState {
+            operations: BTreeMap::from([(existing.operation_id.clone(), existing.clone())]),
+        };
+
+        let resumed = admit_site_replication_repair_operation(
+            &mut state,
+            existing.operation_id.clone(),
+            &existing.preflight_token,
+            existing.clone(),
+        )
+        .expect("same operation ID and preflight should resume");
+        assert_eq!(resumed.operation_id, existing.operation_id);
+
+        let conflicting_operation = SiteReplicationRepairOperation {
+            operation_id: "operation-b".to_string(),
+            preflight_token: "preflight-b".to_string(),
+            plan_token: "plan-b".to_string(),
+            status: "running".to_string(),
+            ..Default::default()
+        };
+        let conflicting_preflight = conflicting_operation.preflight_token.clone();
+        let err = admit_site_replication_repair_operation(
+            &mut state,
+            conflicting_operation.operation_id.clone(),
+            &conflicting_preflight,
+            conflicting_operation,
+        )
+        .expect_err("a different operation must not pass a persisted running operation");
+        assert_eq!(err.code(), &S3ErrorCode::ClientTokenConflict);
+
+        let stale_candidate = SiteReplicationRepairOperation {
+            plan_token: "plan-changed".to_string(),
+            ..existing.clone()
+        };
+        let err = admit_site_replication_repair_operation(
+            &mut state,
+            existing.operation_id.clone(),
+            &existing.preflight_token,
+            stale_candidate,
+        )
+        .expect_err("a resumed operation must remain bound to its original plan");
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+
+        let err =
+            admit_site_replication_repair_operation(&mut state, existing.operation_id.clone(), "different-preflight", existing)
+                .expect_err("an operation ID must remain bound to its original preflight");
+        assert_eq!(err.code(), &S3ErrorCode::ClientTokenConflict);
     }
 
     #[test]
