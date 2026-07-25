@@ -1065,6 +1065,10 @@ pub(crate) mod test {
             pub(crate) use super::super::super::storage_contracts::MultipartOperations;
         }
 
+        pub(crate) mod namespace {
+            pub(crate) use super::super::super::storage_contracts::NamespaceLocking;
+        }
+
         pub(crate) mod object {
             pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
         }

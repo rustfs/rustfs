@@ -30,6 +30,8 @@ pub struct ObjectOptions {
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
+    /// RustFS-only compare-and-set condition checked under the object write lock.
+    pub expected_current_version_id: Option<String>,
     pub no_lock: bool,
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
