@@ -40,6 +40,21 @@ where
     com::read_config(api, file).await
 }
 
+pub(crate) async fn read_config_with_metadata<S>(api: Arc<S>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    com::read_config_with_metadata(api, file, opts).await
+}
+
 pub(crate) async fn save_config<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
 where
     S: ObjectIO<
@@ -53,6 +68,21 @@ where
         >,
 {
     com::save_config(api, file, data).await
+}
+
+pub(crate) async fn save_config_with_opts<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
+    com::save_config_with_opts(api, file, data, opts).await
 }
 
 pub(crate) async fn delete_config<S>(api: Arc<S>, file: &str) -> Result<()>

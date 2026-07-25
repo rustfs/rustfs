@@ -21,6 +21,13 @@ use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
+use crate::bucket::lifecycle::manual_transition_job::{
+    MANUAL_TRANSITION_JOB_RECORD_PREFIX, ManualTransitionJobRecord, ManualTransitionScopeAdmission,
+    ManualTransitionScopeAdmissionClaim, claim_manual_transition_scope_admission,
+    delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
+    load_manual_transition_job_record_with_etag, manual_transition_job_id_from_record_object_name,
+    manual_transition_job_lease_expired, persist_manual_transition_job_progress, save_manual_transition_job_record_if_current,
+};
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
     ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta,
@@ -36,7 +43,7 @@ use crate::bucket::lifecycle::transition_transaction::run_transition_transaction
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
-use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
+use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
 use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
@@ -58,7 +65,6 @@ use crate::storage_api_contracts::{
 };
 use crate::store::ECStore;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
-use futures::Future;
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_common::metrics::{
@@ -83,6 +89,7 @@ use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -116,6 +123,7 @@ pub type ExpiryOpType = Box<dyn ExpiryOp + Send + Sync + 'static>;
 
 static XXHASH_SEED: u64 = 0;
 static TIER_FREE_VERSION_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
+static MANUAL_TRANSITION_JOB_RECOVERY_STARTED: OnceLock<()> = OnceLock::new();
 
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
@@ -135,6 +143,7 @@ const TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL: StdDuration = StdDuration::f
 const TIER_FREE_VERSION_RECOVERY_JITTER_PERCENT: u64 = 10;
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
+const DEFAULT_MANUAL_TRANSITION_JOB_RECOVERY_LIMIT: usize = 100;
 
 // Phase 5 (backlog#939): lifecycle expiry/transition state moved into the
 // per-instance `InstanceContext`; these owner helpers forward to the current
@@ -1165,6 +1174,20 @@ impl TransitionState {
         global_metrics().record_scanner_lifecycle_transition_state(self.scanner_transition_state_update());
     }
 
+    pub fn manual_transition_queue_snapshot(&self) -> ManualTransitionQueueSnapshot {
+        let state = self.scanner_transition_state_update();
+        ManualTransitionQueueSnapshot {
+            queue_capacity: state.queue_capacity,
+            queued: state.queued,
+            active: state.active,
+            workers: state.workers,
+            queue_full: state.queue_full,
+            queue_send_timeout: state.queue_send_timeout,
+            compensation_pending: state.compensation_pending,
+            compensation_running: state.compensation_running,
+        }
+    }
+
     fn handle_immediate_enqueue_failure(self: &Arc<Self>, oi: &ObjectInfo, src: &LcEventSrc, failure: ImmediateEnqueueFailure) {
         Self::inc_counter(&self.missed_immediate_tasks);
         let scheduled = self.schedule_bucket_compensation(&oi.bucket);
@@ -1569,7 +1592,276 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     ExpiryState::resize_workers(workers, api.clone()).await;
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
     spawn_tier_delete_journal_recovery_once(api.clone());
-    spawn_transition_transaction_recovery_once(api);
+    spawn_transition_transaction_recovery_once(api.clone());
+    spawn_manual_transition_job_recovery_once(api);
+}
+
+fn spawn_manual_transition_job_recovery_once(api: Arc<ECStore>) -> Option<JoinHandle<()>> {
+    if MANUAL_TRANSITION_JOB_RECOVERY_STARTED.set(()).is_err() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_default();
+        select! {
+            _ = cancel_token.cancelled() => {}
+            result = recover_manual_transition_jobs_once(api, DEFAULT_MANUAL_TRANSITION_JOB_RECOVERY_LIMIT, None) => {
+                match result {
+                    Ok(stats) => {
+                        debug!(
+                            event = EVENT_LIFECYCLE_WORKER_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            scanned = stats.scanned,
+                            resumed = stats.resumed,
+                            cancelled = stats.cancelled,
+                            skipped = stats.skipped,
+                            failed = stats.failed,
+                            truncated = stats.truncated,
+                            next_marker = ?stats.next_marker,
+                            state = "manual_transition_recovery_completed",
+                            "Manual transition job recovery completed"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            event = EVENT_LIFECYCLE_WORKER_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            error = %err,
+                            state = "manual_transition_recovery_failed",
+                            "Manual transition job recovery failed"
+                        );
+                    }
+                }
+            }
+        }
+    }))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManualTransitionJobRecoveryStats {
+    pub scanned: u64,
+    pub resumed: u64,
+    pub cancelled: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub next_marker: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualTransitionJobRecoveryOutcome {
+    Resumed,
+    Cancelled,
+    Skipped,
+}
+
+pub async fn recover_manual_transition_jobs_once(
+    api: Arc<ECStore>,
+    limit: usize,
+    marker: Option<String>,
+) -> Result<ManualTransitionJobRecoveryStats, Error> {
+    if limit == 0 {
+        return Err(Error::other("manual transition job recovery limit must be greater than zero"));
+    }
+    let list_limit = i32::try_from(limit).map_or(i32::MAX, |value| value);
+    let page = api
+        .clone()
+        .list_objects_v2(
+            RUSTFS_META_BUCKET,
+            MANUAL_TRANSITION_JOB_RECORD_PREFIX,
+            marker,
+            None,
+            list_limit,
+            false,
+            None,
+            false,
+        )
+        .await?;
+    let mut stats = ManualTransitionJobRecoveryStats {
+        next_marker: page.next_continuation_token,
+        truncated: page.is_truncated,
+        ..Default::default()
+    };
+
+    for object in page.objects {
+        stats.scanned = stats.scanned.saturating_add(1);
+        let job_id = match manual_transition_job_id_from_record_object_name(&object.name) {
+            Ok(job_id) => job_id,
+            Err(err) => {
+                stats.failed = stats.failed.saturating_add(1);
+                warn!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    object = %object.name,
+                    error = %err,
+                    state = "manual_transition_recovery_skipped",
+                    "Manual transition recovery skipped a corrupt job record path"
+                );
+                continue;
+            }
+        };
+        match recover_manual_transition_job(api.clone(), job_id).await {
+            Ok(ManualTransitionJobRecoveryOutcome::Resumed) => stats.resumed = stats.resumed.saturating_add(1),
+            Ok(ManualTransitionJobRecoveryOutcome::Cancelled) => stats.cancelled = stats.cancelled.saturating_add(1),
+            Ok(ManualTransitionJobRecoveryOutcome::Skipped) => stats.skipped = stats.skipped.saturating_add(1),
+            Err(err) => {
+                stats.failed = stats.failed.saturating_add(1);
+                warn!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    job_id = %job_id,
+                    error = %err,
+                    state = "manual_transition_recovery_failed",
+                    "Manual transition recovery failed a job"
+                );
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+async fn recover_manual_transition_job(api: Arc<ECStore>, job_id: Uuid) -> Result<ManualTransitionJobRecoveryOutcome, Error> {
+    let (mut record, etag) = match load_manual_transition_job_record_with_etag(api.clone(), job_id).await {
+        Ok(record) => record,
+        Err(Error::ConfigNotFound) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+        Err(err) => return Err(err),
+    };
+    if record.is_terminal() || !manual_transition_job_lease_expired(&record) {
+        return Ok(ManualTransitionJobRecoveryOutcome::Skipped);
+    }
+
+    if record.cancel_requested {
+        let mut report = record.report.clone();
+        report.cancelled = true;
+        record.complete(report, manual_transition_queue_snapshot());
+        return match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => {
+                release_manual_transition_recovery_admission(api, &record).await;
+                Ok(ManualTransitionJobRecoveryOutcome::Cancelled)
+            }
+            Err(Error::PreconditionFailed) => Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+            Err(err) => Err(err),
+        };
+    }
+
+    record.claim_recovery_lease(manual_transition_recovery_owner_id(), manual_transition_queue_snapshot());
+    let recovery_lease_id = record.lease_id;
+    match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+        Ok(()) => {}
+        Err(Error::PreconditionFailed) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+        Err(err) => return Err(err),
+    }
+
+    match claim_manual_transition_scope_admission(api.clone(), &ManualTransitionScopeAdmission::from_job(&record)).await {
+        Ok(ManualTransitionScopeAdmissionClaim::Claimed) => {}
+        Ok(ManualTransitionScopeAdmissionClaim::Conflict(_)) => {
+            abandon_manual_transition_recovery_lease(api, job_id, recovery_lease_id).await?;
+            return Ok(ManualTransitionJobRecoveryOutcome::Skipped);
+        }
+        Err(err) => {
+            abandon_manual_transition_recovery_lease(api, job_id, recovery_lease_id).await?;
+            return Err(err);
+        }
+    }
+
+    let mut options = record.resume_options();
+    options.cancel_check = Some(manual_transition_recovery_cancel_check(api.clone(), job_id));
+    options.progress_sink = Some(manual_transition_recovery_progress_sink(api.clone(), job_id));
+    let result = enqueue_transition_for_existing_objects_scoped(api.clone(), &record.bucket, options).await;
+    let final_record = finalize_recovered_manual_transition_job(api.clone(), job_id, result).await?;
+    release_manual_transition_recovery_admission(api, &final_record).await;
+    Ok(ManualTransitionJobRecoveryOutcome::Resumed)
+}
+
+fn manual_transition_recovery_owner_id() -> &'static str {
+    "ecstore-manual-transition-recovery"
+}
+
+fn manual_transition_recovery_cancel_check(api: Arc<ECStore>, job_id: Uuid) -> ManualTransitionCancelCheck {
+    Arc::new(move || {
+        let api = api.clone();
+        Box::pin(async move {
+            match load_manual_transition_job_record(api, job_id).await {
+                Ok(record) => record.cancel_requested || record.is_terminal(),
+                Err(_) => true,
+            }
+        })
+    })
+}
+
+fn manual_transition_recovery_progress_sink(api: Arc<ECStore>, job_id: Uuid) -> ManualTransitionProgressSink {
+    Arc::new(move |report| {
+        let api = api.clone();
+        Box::pin(async move {
+            persist_manual_transition_job_progress(api, job_id, &report, manual_transition_queue_snapshot())
+                .await
+                .map(|_| ())
+        })
+    })
+}
+
+async fn finalize_recovered_manual_transition_job(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    result: Result<ManualTransitionRunReport, Error>,
+) -> Result<ManualTransitionJobRecord, Error> {
+    for _ in 0..4 {
+        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+        if record.is_terminal() {
+            return Ok(record);
+        }
+        match &result {
+            Ok(report) => record.complete(report.clone(), manual_transition_queue_snapshot()),
+            Err(err) => record.fail(format!("manual transition recovery failed: {err}")),
+        }
+        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => return Ok(record),
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Error::PreconditionFailed)
+}
+
+async fn release_manual_transition_recovery_admission(api: Arc<ECStore>, record: &ManualTransitionJobRecord) {
+    if let Err(err) =
+        delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id).await
+    {
+        debug!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            job_id = %record.job_id,
+            error = %err,
+            state = "manual_transition_recovery_admission_release_failed",
+            "Manual transition recovery failed to release admission"
+        );
+    }
+}
+
+async fn abandon_manual_transition_recovery_lease(api: Arc<ECStore>, job_id: Uuid, lease_id: Uuid) -> Result<(), Error> {
+    for _ in 0..4 {
+        let (mut record, etag) = match load_manual_transition_job_record_with_etag(api.clone(), job_id).await {
+            Ok(record) => record,
+            Err(Error::ConfigNotFound) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if record.lease_id != lease_id || record.is_terminal() {
+            return Ok(());
+        }
+        record.abandon_recovery_lease(lease_id);
+        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => return Ok(()),
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<()>) -> Option<JoinHandle<()>> {
@@ -2434,18 +2726,63 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub type ManualTransitionCancelCheck = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
+pub type ManualTransitionProgressSink =
+    Arc<dyn Fn(ManualTransitionRunReport) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> + Send + Sync + 'static>;
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ManualTransitionRunOptions {
     pub prefix: String,
     pub marker: Option<String>,
     pub version_marker: Option<String>,
+    pub continuation_token: Option<String>,
     pub tier: Option<String>,
     pub dry_run: bool,
     pub max_objects: Option<u64>,
     pub max_duration: Option<std::time::Duration>,
+    #[serde(skip)]
+    pub cancel_token: Option<CancellationToken>,
+    #[serde(skip)]
+    pub cancel_check: Option<ManualTransitionCancelCheck>,
+    #[serde(skip)]
+    pub progress_sink: Option<ManualTransitionProgressSink>,
 }
 
+impl std::fmt::Debug for ManualTransitionRunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManualTransitionRunOptions")
+            .field("prefix", &self.prefix)
+            .field("marker", &self.marker)
+            .field("version_marker", &self.version_marker)
+            .field("continuation_token", &self.continuation_token)
+            .field("tier", &self.tier)
+            .field("dry_run", &self.dry_run)
+            .field("max_objects", &self.max_objects)
+            .field("max_duration", &self.max_duration)
+            .field("cancel_token", &self.cancel_token.is_some())
+            .field("cancel_check", &self.cancel_check.is_some())
+            .field("progress_sink", &self.progress_sink.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ManualTransitionRunOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix
+            && self.marker == other.marker
+            && self.version_marker == other.version_marker
+            && self.continuation_token == other.continuation_token
+            && self.tier == other.tier
+            && self.dry_run == other.dry_run
+            && self.max_objects == other.max_objects
+            && self.max_duration == other.max_duration
+    }
+}
+
+impl Eq for ManualTransitionRunOptions {}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManualTransitionRunReport {
     pub bucket: String,
     pub prefix: String,
@@ -2466,12 +2803,28 @@ pub struct ManualTransitionRunReport {
     pub skipped_queue_full: u64,
     pub skipped_queue_closed: u64,
     pub skipped_queue_timeout: u64,
+    pub tier_failure: u64,
     pub truncated_by_limit: bool,
     pub truncated_by_duration: bool,
-    #[serde(skip_serializing)]
+    pub cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+    #[serde(skip)]
     pub next_marker: Option<String>,
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub next_version_idmarker: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManualTransitionQueueSnapshot {
+    pub queue_capacity: u64,
+    pub queued: u64,
+    pub active: u64,
+    pub workers: u64,
+    pub queue_full: u64,
+    pub queue_send_timeout: u64,
+    pub compensation_pending: u64,
+    pub compensation_running: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2496,7 +2849,7 @@ impl ManualTransitionRunReport {
     }
 
     pub fn was_truncated(&self) -> bool {
-        self.truncated_by_limit || self.truncated_by_duration
+        self.truncated_by_limit || self.truncated_by_duration || self.cancelled
     }
 
     fn record_enqueue_outcome(&mut self, outcome: TransitionEnqueueOutcome) {
@@ -2518,9 +2871,84 @@ impl ManualTransitionRunReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualTransitionContinuationToken {
+    marker: Option<String>,
+    version_marker: Option<String>,
+}
+
+fn encode_manual_transition_continuation_token(marker: Option<String>, version_marker: Option<String>) -> Option<String> {
+    if marker.is_none() && version_marker.is_none() {
+        return None;
+    }
+    let token = ManualTransitionContinuationToken { marker, version_marker };
+    serde_json::to_vec(&token)
+        .ok()
+        .map(|encoded| base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encoded))
+}
+
+pub fn decode_manual_transition_continuation_token(token: &str) -> Result<(Option<String>, Option<String>), Error> {
+    if token.trim().is_empty() {
+        return Err(Error::other("manual transition continuation token is empty"));
+    }
+    let decoded = base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(token.as_bytes())
+        .map_err(|err| Error::other(format!("decode manual transition continuation token failed: {err}")))?;
+    let token: ManualTransitionContinuationToken = serde_json::from_slice(&decoded)
+        .map_err(|err| Error::other(format!("parse manual transition continuation token failed: {err}")))?;
+    Ok((
+        token.marker.filter(|marker| !marker.is_empty()),
+        token.version_marker.filter(|marker| !marker.is_empty()),
+    ))
+}
+
+async fn persist_manual_transition_progress(
+    options: &ManualTransitionRunOptions,
+    report: &ManualTransitionRunReport,
+) -> Result<(), Error> {
+    if let Some(progress_sink) = &options.progress_sink {
+        progress_sink(report.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn persist_manual_transition_page_checkpoint(
+    options: &ManualTransitionRunOptions,
+    report: &ManualTransitionRunReport,
+    marker: Option<String>,
+    version_marker: Option<String>,
+) -> Result<(), Error> {
+    let mut checkpoint = report.clone();
+    checkpoint.next_marker.clone_from(&marker);
+    checkpoint.next_version_idmarker.clone_from(&version_marker);
+    checkpoint.continuation_token = encode_manual_transition_continuation_token(marker, version_marker);
+    persist_manual_transition_progress(options, &checkpoint).await
+}
+
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let _ = enqueue_transition_for_existing_objects_scoped(api, bucket, ManualTransitionRunOptions::default()).await?;
     Ok(())
+}
+
+pub fn manual_transition_queue_snapshot() -> ManualTransitionQueueSnapshot {
+    runtime_sources::transition_state_handle().manual_transition_queue_snapshot()
+}
+
+pub async fn enqueue_transition_for_existing_objects_scoped_with_cancel(
+    api: Arc<ECStore>,
+    bucket: &str,
+    mut options: ManualTransitionRunOptions,
+    cancel_token: Option<CancellationToken>,
+) -> Result<ManualTransitionRunExecution, Error> {
+    if cancel_token.is_some() {
+        options.cancel_token = cancel_token;
+    }
+    let report = enqueue_transition_for_existing_objects_scoped(api, bucket, options).await?;
+    Ok(ManualTransitionRunExecution {
+        cancelled: report.cancelled,
+        report,
+    })
 }
 
 pub async fn enqueue_transition_for_existing_objects_scoped(
@@ -2528,104 +2956,93 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
     bucket: &str,
     options: ManualTransitionRunOptions,
 ) -> Result<ManualTransitionRunReport, Error> {
-    Ok(enqueue_transition_for_existing_objects_scoped_with_cancel(api, bucket, options, None)
-        .await?
-        .report)
-}
-
-pub async fn enqueue_transition_for_existing_objects_scoped_with_cancel(
-    api: Arc<ECStore>,
-    bucket: &str,
-    options: ManualTransitionRunOptions,
-    cancel_token: Option<CancellationToken>,
-) -> Result<ManualTransitionRunExecution, Error> {
     const LIST_PAGE_SIZE: i32 = 1000;
 
     let mut report = ManualTransitionRunReport::new(bucket, &options);
+    let (mut marker, mut version_marker) = if let Some(token) = options.continuation_token.as_deref() {
+        decode_manual_transition_continuation_token(token)?
+    } else {
+        (options.marker.clone(), options.version_marker.clone())
+    };
     let Some(lc) = runtime_sources::bucket_lifecycle_config(bucket).await else {
-        return Ok(ManualTransitionRunExecution {
-            report,
-            cancelled: false,
-        });
+        return Ok(report);
     };
     report.lifecycle_config_found = true;
-    let mut marker = options.marker.clone();
-    let mut version_marker = options.version_marker.clone();
     let mut previous_marker = marker.clone();
     let mut previous_version_marker = version_marker.clone();
     let src = LcEventSrc::Scanner;
     let deadline = options.max_duration.map(|duration| tokio::time::Instant::now() + duration);
 
     loop {
-        if manual_transition_cancelled(cancel_token.as_ref()) {
-            return Ok(ManualTransitionRunExecution { report, cancelled: true });
-        }
-
         let page = api
             .clone()
             .list_object_versions(bucket, &options.prefix, marker.clone(), version_marker.clone(), None, LIST_PAGE_SIZE)
             .await?;
 
         for (index, object) in page.objects.iter().enumerate() {
-            if manual_transition_cancelled(cancel_token.as_ref()) {
+            if manual_transition_cancel_requested(&options).await {
+                report.cancelled = true;
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
-                return Ok(ManualTransitionRunExecution { report, cancelled: true });
+                report.continuation_token =
+                    encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+                persist_manual_transition_progress(&options, &report).await?;
+                return Ok(report);
             }
             if manual_transition_duration_elapsed(deadline) {
                 report.truncated_by_duration = true;
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
-                return Ok(ManualTransitionRunExecution {
-                    report,
-                    cancelled: false,
-                });
+                report.continuation_token =
+                    encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+                persist_manual_transition_progress(&options, &report).await?;
+                return Ok(report);
             }
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(object, &lc, &src, &options, &mut report).await;
             if report.has_partial_enqueue() {
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
-                return Ok(ManualTransitionRunExecution {
-                    report,
-                    cancelled: false,
-                });
+                report.continuation_token =
+                    encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+                persist_manual_transition_progress(&options, &report).await?;
+                return Ok(report);
             }
             if options.max_objects.is_some_and(|max_objects| report.scanned >= max_objects) {
                 if manual_transition_has_more_after_limit(index, page.objects.len(), page.is_truncated) {
                     report.truncated_by_limit = true;
                     report.next_marker = Some(object.name.clone());
                     report.next_version_idmarker = Some(manual_transition_version_marker(object));
+                    report.continuation_token = encode_manual_transition_continuation_token(
+                        report.next_marker.clone(),
+                        report.next_version_idmarker.clone(),
+                    );
                 }
-                return Ok(ManualTransitionRunExecution {
-                    report,
-                    cancelled: false,
-                });
+                persist_manual_transition_progress(&options, &report).await?;
+                return Ok(report);
             }
             previous_marker = Some(object.name.clone());
             previous_version_marker = Some(manual_transition_version_marker(object));
         }
 
         if !page.is_truncated {
-            return Ok(ManualTransitionRunExecution {
-                report,
-                cancelled: false,
-            });
+            return Ok(report);
         }
         if manual_transition_duration_elapsed(deadline) {
             report.truncated_by_duration = true;
             report.next_marker.clone_from(&previous_marker);
             report.next_version_idmarker.clone_from(&previous_version_marker);
-            return Ok(ManualTransitionRunExecution {
-                report,
-                cancelled: false,
-            });
+            report.continuation_token =
+                encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+            persist_manual_transition_progress(&options, &report).await?;
+            return Ok(report);
         }
 
         marker = page.next_marker;
         version_marker = page.next_version_idmarker;
         previous_marker = marker.clone();
         previous_version_marker = version_marker.clone();
+        persist_manual_transition_page_checkpoint(&options, &report, marker.clone(), version_marker.clone()).await?;
     }
 }
 
@@ -2823,8 +3240,14 @@ fn manual_transition_duration_elapsed(deadline: Option<tokio::time::Instant>) ->
     deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
 }
 
-fn manual_transition_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
-    cancel_token.is_some_and(CancellationToken::is_cancelled)
+async fn manual_transition_cancel_requested(options: &ManualTransitionRunOptions) -> bool {
+    if options.cancel_token.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return true;
+    }
+    match options.cancel_check.as_ref() {
+        Some(cancel_check) => cancel_check().await,
+        None => false,
+    }
 }
 
 fn manual_transition_version_marker(oi: &ObjectInfo) -> String {
@@ -3742,9 +4165,10 @@ mod tests {
         enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report,
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
-        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets, manual_transition_cancelled,
+        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
         manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
+        persist_manual_transition_page_checkpoint, recover_manual_transition_jobs_once, replication_state_for_delete,
         resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
         resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
         set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
@@ -3754,6 +4178,14 @@ mod tests {
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+    use crate::bucket::lifecycle::bucket_lifecycle_ops::{
+        decode_manual_transition_continuation_token, encode_manual_transition_continuation_token,
+    };
+    use crate::bucket::lifecycle::manual_transition_job::{
+        ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, load_manual_transition_job_record,
+        load_manual_transition_scope_admission, save_manual_transition_job_record,
+        save_manual_transition_scope_admission_if_absent,
+    };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
     };
@@ -3769,7 +4201,7 @@ mod tests {
     use crate::client::transition_api::ReaderImpl;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::{RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
-    use crate::error::is_err_invalid_upload_id;
+    use crate::error::{Error, is_err_invalid_upload_id};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     #[cfg(feature = "test-util")]
@@ -6495,15 +6927,141 @@ mod tests {
     }
 
     #[test]
-    fn manual_transition_cancel_token_detects_cancelled_state() {
-        let cancel_token = CancellationToken::new();
+    fn manual_transition_continuation_token_round_trips_resume_cursor() {
+        let token = encode_manual_transition_continuation_token(Some("logs/a".to_string()), Some("null".to_string()))
+            .expect("non-empty cursor should encode");
 
-        assert!(!manual_transition_cancelled(None));
-        assert!(!manual_transition_cancelled(Some(&cancel_token)));
+        let (marker, version_marker) =
+            decode_manual_transition_continuation_token(&token).expect("continuation token should decode");
 
-        cancel_token.cancel();
+        assert_eq!(marker.as_deref(), Some("logs/a"));
+        assert_eq!(version_marker.as_deref(), Some("null"));
+    }
 
-        assert!(manual_transition_cancelled(Some(&cancel_token)));
+    #[test]
+    fn manual_transition_continuation_token_rejects_malformed_input() {
+        let err =
+            decode_manual_transition_continuation_token("not-base64").expect_err("malformed continuation token must fail closed");
+
+        assert!(err.to_string().contains("decode manual transition continuation token failed"));
+    }
+
+    #[test]
+    fn manual_transition_report_serializes_public_continuation_only() {
+        let report = ManualTransitionRunReport {
+            continuation_token: Some("opaque".to_string()),
+            next_marker: Some("logs/a".to_string()),
+            next_version_idmarker: Some("null".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(report).expect("report should serialize");
+
+        assert_eq!(value.get("continuation_token").and_then(|value| value.as_str()), Some("opaque"));
+        assert!(value.get("next_marker").is_none());
+        assert!(value.get("next_version_idmarker").is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_transition_page_checkpoint_persists_resume_cursor() {
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let sink_observed = Arc::clone(&observed);
+        let options = ManualTransitionRunOptions {
+            progress_sink: Some(Arc::new(move |report| {
+                let sink_observed = Arc::clone(&sink_observed);
+                Box::pin(async move {
+                    sink_observed.lock().expect("observed reports mutex poisoned").push(report);
+                    Ok(())
+                })
+            })),
+            ..Default::default()
+        };
+        let report = ManualTransitionRunReport {
+            bucket: "bucket".to_string(),
+            prefix: "logs/".to_string(),
+            scanned: 1000,
+            ..Default::default()
+        };
+
+        persist_manual_transition_page_checkpoint(&options, &report, Some("logs/page-end".to_string()), Some("null".to_string()))
+            .await
+            .expect("page checkpoint should persist");
+
+        assert!(report.continuation_token.is_none());
+        let observed = observed.lock().expect("observed reports mutex poisoned");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].scanned, 1000);
+        assert_eq!(observed[0].next_marker.as_deref(), Some("logs/page-end"));
+        assert_eq!(observed[0].next_version_idmarker.as_deref(), Some("null"));
+        let token = observed[0]
+            .continuation_token
+            .as_deref()
+            .expect("checkpoint should carry resume token");
+        let (marker, version_marker) =
+            decode_manual_transition_continuation_token(token).expect("checkpoint token should decode");
+        assert_eq!(marker.as_deref(), Some("logs/page-end"));
+        assert_eq!(version_marker.as_deref(), Some("null"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_recovery_replays_expired_running_record() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            continuation_token: Some(
+                encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                    .expect("resume token should encode"),
+            ),
+            max_objects: Some(7),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, "manual-recovery-bucket", &options, "old-owner");
+        record.report.continuation_token.clone_from(&options.continuation_token);
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("expired job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("expired scope admission should save");
+
+        let stats = recover_manual_transition_jobs_once(ecstore.clone(), 10, None)
+            .await
+            .expect("manual transition recovery should run");
+
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.resumed, 1);
+        assert_eq!(stats.failed, 0);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("recovered job should load");
+        assert_eq!(recovered.state, ManualTransitionJobState::Completed);
+        assert_eq!(recovered.max_objects, Some(7));
+        assert_eq!(recovered.report.bucket, "manual-recovery-bucket");
+        assert_eq!(recovered.report.prefix, "logs/");
+        assert!(!recovered.report.lifecycle_config_found);
+        assert!(recovered.report.continuation_token.is_none());
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &recovered.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "completed recovery must release the scope admission"
+        );
+    }
+
+    #[test]
+    fn manual_transition_cancelled_report_is_partial_and_resumable() {
+        let report = ManualTransitionRunReport {
+            cancelled: true,
+            continuation_token: Some("opaque".to_string()),
+            ..Default::default()
+        };
+
+        assert!(report.was_truncated());
+        assert!(!report.has_partial_enqueue());
     }
 
     #[tokio::test]

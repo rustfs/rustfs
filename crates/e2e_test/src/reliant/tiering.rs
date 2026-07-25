@@ -71,8 +71,10 @@ const MANUAL_DRY_RUN_BUCKET: &str = "ilm7-manual-dry-run";
 const MANUAL_NOT_DUE_BUCKET: &str = "ilm7-manual-not-due";
 const MANUAL_QUEUE_PRESSURE_BUCKET: &str = "ilm7-manual-queue-pressure";
 const MANUAL_ASYNC_STATUS_BUCKET: &str = "ilm7-manual-async-status";
+const MANUAL_CONTINUATION_BUCKET: &str = "ilm7-manual-continuation";
 const MANUAL_ASYNC_LIMIT_BUCKET: &str = "ilm7-manual-async-limit";
 const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
+const MANUAL_CONTINUATION_PREFIX: &str = "manual-continuation/";
 const MANUAL_ASYNC_LIMIT_PREFIX: &str = "manual-async-limit/";
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
@@ -352,6 +354,7 @@ struct ManualTransitionRunReport {
     skipped_queue_timeout: u64,
     truncated_by_limit: bool,
     truncated_by_duration: bool,
+    continuation_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,12 +383,27 @@ async fn manual_transition_run_with_max(
     dry_run: bool,
     max_objects: u64,
 ) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
+    manual_transition_run_with_max_and_continuation(hot, bucket, prefix, dry_run, max_objects, None).await
+}
+
+async fn manual_transition_run_with_max_and_continuation(
+    hot: &RustFSTestEnvironment,
+    bucket: &str,
+    prefix: &str,
+    dry_run: bool,
+    max_objects: u64,
+    continuation_token: Option<&str>,
+) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
     let bucket = urlencoding::encode(bucket);
     let prefix = urlencoding::encode(prefix);
     let tier = urlencoding::encode(TIER_NAME);
-    let path = format!(
+    let mut path = format!(
         "/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects={max_objects}"
     );
+    if let Some(token) = continuation_token {
+        path.push_str("&continuationToken=");
+        path.push_str(&urlencoding::encode(token));
+    }
     let (status, body) = signed_admin_request(&hot.url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
     if !status.is_success() {
         return Err(format!("manual transition run failed: status={status}, body={body}").into());
@@ -924,6 +942,77 @@ async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestRe
     assert!(response.get("status").is_none() || response.get("status").is_some_and(|v| v.is_null()));
     assert!(response.get("status_endpoint").is_none() || response.get("status_endpoint").is_some_and(|v| v.is_null()));
     assert!(response.get("cancel").is_none() || response.get("cancel").is_some_and(|v| v.is_null()));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_run_continuation_token_resumes_without_raw_markers() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualcontinuationcoldtieradmin".to_string();
+    cold.secret_key = "manualcontinuationcoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(MANUAL_CONTINUATION_BUCKET).send().await?;
+    for idx in 0..2 {
+        let key = format!("{MANUAL_CONTINUATION_PREFIX}obj-{idx:02}");
+        put_single_part_object(&hot_client, MANUAL_CONTINUATION_BUCKET, &key, b"manual continuation payload").await?;
+    }
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_CONTINUATION_BUCKET,
+        "manual-continuation",
+        MANUAL_CONTINUATION_PREFIX,
+        0,
+    )
+    .await?;
+
+    let first = manual_transition_run_with_max(&hot, MANUAL_CONTINUATION_BUCKET, MANUAL_CONTINUATION_PREFIX, true, 1).await?;
+    assert_eq!(first.state, "partial", "first continuation page: {first:#?}");
+    assert_eq!(first.mode, "enqueue_only");
+    assert_eq!(first.report.bucket, MANUAL_CONTINUATION_BUCKET);
+    assert_eq!(first.report.prefix, MANUAL_CONTINUATION_PREFIX);
+    assert!(first.report.dry_run);
+    assert_eq!(first.report.scanned, 1, "first continuation page: {first:#?}");
+    assert_eq!(first.report.eligible, 1, "first continuation page: {first:#?}");
+    assert_eq!(first.report.dry_run_eligible, 1, "first continuation page: {first:#?}");
+    assert!(first.report.truncated_by_limit);
+    let continuation = first
+        .report
+        .continuation_token
+        .as_deref()
+        .ok_or("partial manual transition run must return an opaque continuation token")?;
+    assert!(
+        !continuation.contains(MANUAL_CONTINUATION_PREFIX),
+        "continuation token must not expose the raw object prefix: {continuation}"
+    );
+
+    hot.restart_server_preserving_data(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+
+    let second = manual_transition_run_with_max_and_continuation(
+        &hot,
+        MANUAL_CONTINUATION_BUCKET,
+        MANUAL_CONTINUATION_PREFIX,
+        true,
+        10,
+        Some(continuation),
+    )
+    .await?;
+    assert_eq!(second.state, "completed", "second continuation page: {second:#?}");
+    assert_eq!(second.report.scanned, 1, "second continuation page: {second:#?}");
+    assert_eq!(second.report.eligible, 1, "second continuation page: {second:#?}");
+    assert_eq!(second.report.dry_run_eligible, 1, "second continuation page: {second:#?}");
+    assert!(!second.report.truncated_by_limit);
+    assert!(second.report.continuation_token.is_none());
 
     Ok(())
 }

@@ -193,10 +193,22 @@ pub(crate) mod bucket_target_sys {
 }
 
 pub(crate) mod lifecycle {
+    pub(crate) use super::ecstore_bucket::lifecycle::manual_transition_job::{
+        ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
+        claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
+        load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
+        manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired,
+        persist_manual_transition_job_progress, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
+        save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+    };
+    pub(crate) type ManualTransitionCancelCheck =
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionCancelCheck;
+    pub(crate) type ManualTransitionQueueSnapshot =
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionQueueSnapshot;
+    pub(crate) type ManualTransitionProgressSink =
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionProgressSink;
     pub(crate) type ManualTransitionRunOptions =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunOptions;
-    pub(crate) type ManualTransitionRunExecution =
-        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunExecution;
     pub(crate) type ManualTransitionRunReport = super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunReport;
 
     pub(crate) async fn enqueue_transition_for_existing_objects_scoped(
@@ -210,19 +222,8 @@ pub(crate) mod lifecycle {
         .await
     }
 
-    pub(crate) async fn enqueue_transition_for_existing_objects_scoped_with_cancel(
-        api: std::sync::Arc<super::ECStore>,
-        bucket: &str,
-        options: ManualTransitionRunOptions,
-        cancel_token: Option<tokio_util::sync::CancellationToken>,
-    ) -> super::Result<ManualTransitionRunExecution> {
-        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects_scoped_with_cancel(
-            api,
-            bucket,
-            options,
-            cancel_token,
-        )
-        .await
+    pub(crate) fn manual_transition_queue_snapshot() -> ManualTransitionQueueSnapshot {
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::manual_transition_queue_snapshot()
     }
 
     pub(crate) mod tier_last_day_stats {
