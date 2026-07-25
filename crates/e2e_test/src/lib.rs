@@ -79,6 +79,12 @@ mod bucket_policy_check_test;
 #[cfg(test)]
 mod security_boundary_test;
 
+// Cross-process replay/tamper acceptance for the internode NodeService v2 RPC
+// signature (backlog#1327): method-path transplant, nonce replay, body tampering
+// and the two strict rollout flips, all against a real spawned server.
+#[cfg(test)]
+mod internode_rpc_signature_e2e_test;
+
 // Opt-in per-client S3 API rate limiting (backlog#1191)
 #[cfg(test)]
 mod api_rate_limit_test;
