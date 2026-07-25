@@ -36,7 +36,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
 
@@ -1455,16 +1455,28 @@ where
                 rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
             }
             let reason = classify_io_error(&e);
-            record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
-            error!(
-                write_len,
-                total_written,
-                write_left,
-                stage = GET_STAGE_EMIT,
-                reason = reason.as_str(),
-                error = ?e,
-                "Write data blocks failed to emit bytes"
-            );
+            if reason == GetObjectFailureReason::DownstreamClosed {
+                debug!(
+                    write_len,
+                    total_written,
+                    write_left,
+                    stage = GET_STAGE_EMIT,
+                    reason = reason.as_str(),
+                    error = ?e,
+                    "Write data blocks stopped after downstream closed"
+                );
+            } else {
+                record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
+                error!(
+                    write_len,
+                    total_written,
+                    write_left,
+                    stage = GET_STAGE_EMIT,
+                    reason = reason.as_str(),
+                    error = ?e,
+                    "Write data blocks failed to emit bytes"
+                );
+            }
             return Err(e);
         }
         if let Some(write_stage_start) = write_stage_start {
