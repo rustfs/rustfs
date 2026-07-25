@@ -412,7 +412,7 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
 }
 
 fn response_state(report: &ManualTransitionRunReport) -> &'static str {
-    if report.was_truncated() || report.has_partial_enqueue() {
+    if report.was_truncated() || report.has_partial_enqueue() || report.tier_failure > 0 {
         "partial"
     } else {
         "completed"
@@ -1133,6 +1133,16 @@ mod tests {
     fn manual_transition_response_reports_partial_for_duration_budget() {
         let report = ManualTransitionRunReport {
             truncated_by_duration: true,
+            ..Default::default()
+        };
+
+        assert_eq!(response_state(&report), "partial");
+    }
+
+    #[test]
+    fn manual_transition_response_reports_partial_for_tier_failure() {
+        let report = ManualTransitionRunReport {
+            tier_failure: 1,
             ..Default::default()
         };
 

@@ -74,16 +74,19 @@ const MANUAL_ASYNC_STATUS_BUCKET: &str = "ilm7-manual-async-status";
 const MANUAL_CONTINUATION_BUCKET: &str = "ilm7-manual-continuation";
 const MANUAL_ASYNC_LIMIT_BUCKET: &str = "ilm7-manual-async-limit";
 const MANUAL_ASYNC_CONFLICT_BUCKET: &str = "ilm7-manual-async-conflict";
+const MANUAL_TIER_FAILURE_BUCKET: &str = "ilm7-manual-tier-failure";
 const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
 const MANUAL_CONTINUATION_PREFIX: &str = "manual-continuation/";
 const MANUAL_ASYNC_LIMIT_PREFIX: &str = "manual-async-limit/";
 const MANUAL_ASYNC_CONFLICT_PREFIX: &str = "manual-async-conflict/";
 const MANUAL_ASYNC_CONFLICT_NESTED_PREFIX: &str = "manual-async-conflict/nested/";
+const MANUAL_TIER_FAILURE_PREFIX: &str = "manual-tier-failure/";
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
 const MANUAL_DRY_RUN_KEY: &str = "manual-dry-run/report.bin";
 const MANUAL_NOT_DUE_KEY: &str = "manual-not-due/report.bin";
 const MANUAL_ASYNC_STATUS_KEY: &str = "manual-async-status/report.bin";
+const MANUAL_TIER_FAILURE_KEY: &str = "manual-tier-failure/report.bin";
 const CONTENT_TYPE: &str = "application/x-ilm7";
 const USER_META_KEY: &str = "ilm7-origin";
 const USER_META_VAL: &str = "hermetic-transition";
@@ -173,6 +176,15 @@ async fn add_rustfs_tier(hot: &RustFSTestEnvironment, cold: &RustFSTestEnvironme
     .await?;
     if !status.is_success() {
         return Err(format!("AddTier(RustFS) failed: status={status}, body={resp}").into());
+    }
+    Ok(())
+}
+
+async fn remove_rustfs_tier_force(hot: &RustFSTestEnvironment) -> TestResult {
+    let path = format!("/rustfs/admin/v3/tier/{TIER_NAME}?force=true");
+    let (status, resp) = signed_admin_request(&hot.url, Method::DELETE, &path, None, &hot.access_key, &hot.secret_key).await?;
+    if !status.is_success() {
+        return Err(format!("RemoveTier(RustFS) failed: status={status}, body={resp}").into());
     }
     Ok(())
 }
@@ -355,6 +367,10 @@ struct ManualTransitionRunReport {
     skipped_queue_full: u64,
     skipped_queue_closed: u64,
     skipped_queue_timeout: u64,
+    #[serde(default)]
+    tier_failure: u64,
+    #[serde(default)]
+    cancelled: bool,
     truncated_by_limit: bool,
     truncated_by_duration: bool,
     continuation_token: Option<String>,
@@ -718,6 +734,8 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(due.report.skipped_delete_marker, 0);
     assert_eq!(due.report.skipped_directory, 0);
     assert_eq!(due.report.skipped_replication, 0);
+    assert_eq!(due.report.tier_failure, 0);
+    assert!(!due.report.cancelled);
     assert!(!due.report.truncated_by_limit);
     assert!(!due.report.truncated_by_duration);
     wait_for_transition(&hot_client, MANUAL_DUE_BUCKET, MANUAL_DUE_KEY, StdDuration::from_secs(90)).await?;
@@ -745,6 +763,8 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(dry.report.dry_run_eligible, 1, "dry-run report: {:#?}", dry.report);
     assert_eq!(dry.report.enqueued, 0, "dry-run report: {:#?}", dry.report);
     assert_eq!(dry.report.skipped_not_transition, 1, "dry-run report: {:#?}", dry.report);
+    assert_eq!(dry.report.tier_failure, 0);
+    assert!(!dry.report.cancelled);
     assert!(!dry.report.truncated_by_duration);
     assert_eq!(
         cold_tier_object_count(&cold_client).await?,
@@ -767,6 +787,8 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(not_due.report.eligible, 0, "not-due report: {:#?}", not_due.report);
     assert_eq!(not_due.report.enqueued, 0, "not-due report: {:#?}", not_due.report);
     assert_eq!(not_due.report.skipped_not_transition, 1, "not-due report: {:#?}", not_due.report);
+    assert_eq!(not_due.report.tier_failure, 0);
+    assert!(!not_due.report.cancelled);
     assert_eq!(not_due.report.skipped_queue_full, 0);
     assert_eq!(not_due.report.skipped_queue_closed, 0);
     assert_eq!(not_due.report.skipped_queue_timeout, 0);
@@ -840,6 +862,8 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
     assert_eq!(terminal.report.skipped_queue_full, 0);
     assert_eq!(terminal.report.skipped_queue_closed, 0);
     assert_eq!(terminal.report.skipped_queue_timeout, 0);
+    assert_eq!(terminal.report.tier_failure, 0);
+    assert!(!terminal.report.cancelled);
     assert!(!terminal.report.truncated_by_limit);
     assert!(!terminal.report.truncated_by_duration);
 
@@ -909,6 +933,8 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(terminal.report.skipped_queue_full, 0);
     assert_eq!(terminal.report.skipped_queue_closed, 0);
     assert_eq!(terminal.report.skipped_queue_timeout, 0);
+    assert_eq!(terminal.report.tier_failure, 0);
+    assert!(!terminal.report.cancelled);
     assert!(terminal.report.truncated_by_limit);
     assert!(!terminal.report.truncated_by_duration);
 
@@ -920,12 +946,16 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(after_cancel.report.tier, terminal.report.tier);
     assert_eq!(after_cancel.report.scanned, terminal.report.scanned);
     assert_eq!(after_cancel.report.skipped_not_transition, terminal.report.skipped_not_transition);
+    assert_eq!(after_cancel.report.tier_failure, terminal.report.tier_failure);
+    assert_eq!(after_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(after_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
 
     let second_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(second_cancel.status, "partial");
     assert!(!second_cancel.cancel_requested);
     assert_eq!(second_cancel.report.scanned, terminal.report.scanned);
+    assert_eq!(second_cancel.report.tier_failure, terminal.report.tier_failure);
+    assert_eq!(second_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(second_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
     assert_eq!(cold_tier_object_count(&cold_client).await?, before_remote_count);
     Ok(())
@@ -1017,6 +1047,87 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_async_tier_failure_reports_terminal_partial() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualtierfailurecoldadmin".to_string();
+    cold.secret_key = "manualtierfailurecoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(MANUAL_TIER_FAILURE_BUCKET).send().await?;
+    let due_mtime = OffsetDateTime::now_utc() - time::Duration::hours(25);
+    put_backdated_single_part_object(
+        &hot_client,
+        MANUAL_TIER_FAILURE_BUCKET,
+        MANUAL_TIER_FAILURE_KEY,
+        b"manual tier failure object",
+        due_mtime,
+    )
+    .await?;
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_TIER_FAILURE_BUCKET,
+        "manual-tier-failure",
+        MANUAL_TIER_FAILURE_PREFIX,
+        0,
+    )
+    .await?;
+    remove_rustfs_tier_force(&hot).await?;
+
+    let before_remote_count = cold_tier_object_count(&cold_client).await?;
+    let accepted = manual_transition_async_run(&hot, MANUAL_TIER_FAILURE_BUCKET, MANUAL_TIER_FAILURE_PREFIX, false, 10).await?;
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.mode, "durable_job");
+    let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
+    let status_endpoint = accepted
+        .status_endpoint
+        .as_deref()
+        .ok_or("async response must include status_endpoint")?;
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
+    assert_eq!(terminal.job_id, job_id);
+    assert_eq!(terminal.status, "partial", "terminal tier failure job response: {terminal:#?}");
+    assert!(!terminal.cancel_requested);
+    assert_eq!(terminal.failure_reason, None);
+    assert_eq!(terminal.report.bucket, MANUAL_TIER_FAILURE_BUCKET);
+    assert_eq!(terminal.report.prefix, MANUAL_TIER_FAILURE_PREFIX);
+    assert_eq!(terminal.report.tier.as_deref(), Some(TIER_NAME));
+    assert!(!terminal.report.dry_run);
+    assert!(terminal.report.lifecycle_config_found);
+    assert_eq!(terminal.report.scanned, 1, "terminal tier failure job response: {terminal:#?}");
+    assert_eq!(terminal.report.eligible, 0, "terminal tier failure job response: {terminal:#?}");
+    assert_eq!(terminal.report.enqueued, 0, "terminal tier failure job response: {terminal:#?}");
+    assert_eq!(terminal.report.tier_failure, 1, "terminal tier failure job response: {terminal:#?}");
+    assert_eq!(terminal.report.skipped_queue_full, 0);
+    assert_eq!(terminal.report.skipped_queue_closed, 0);
+    assert_eq!(terminal.report.skipped_queue_timeout, 0);
+    assert!(!terminal.report.cancelled);
+    assert!(!terminal.report.truncated_by_limit);
+    assert!(!terminal.report.truncated_by_duration);
+    assert_eq!(
+        cold_tier_object_count(&cold_client).await?,
+        before_remote_count,
+        "tier failure must not create a remote object"
+    );
+    assert_remains_not_transitioned(
+        &hot_client,
+        MANUAL_TIER_FAILURE_BUCKET,
+        MANUAL_TIER_FAILURE_KEY,
+        StdDuration::from_secs(2),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestResult {
     let mut cold = RustFSTestEnvironment::new().await?;
     cold.access_key = "manualcontractcoldtieradmin".to_string();
@@ -1092,6 +1203,8 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     assert_eq!(first.report.scanned, 1, "first continuation page: {first:#?}");
     assert_eq!(first.report.eligible, 1, "first continuation page: {first:#?}");
     assert_eq!(first.report.dry_run_eligible, 1, "first continuation page: {first:#?}");
+    assert_eq!(first.report.tier_failure, 0);
+    assert!(!first.report.cancelled);
     assert!(first.report.truncated_by_limit);
     let continuation = first
         .report
@@ -1119,6 +1232,8 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     assert_eq!(second.report.scanned, 1, "second continuation page: {second:#?}");
     assert_eq!(second.report.eligible, 1, "second continuation page: {second:#?}");
     assert_eq!(second.report.dry_run_eligible, 1, "second continuation page: {second:#?}");
+    assert_eq!(second.report.tier_failure, 0);
+    assert!(!second.report.cancelled);
     assert!(!second.report.truncated_by_limit);
     assert!(second.report.continuation_token.is_none());
 
@@ -1173,6 +1288,8 @@ async fn test_manual_transition_run_queue_pressure_partial() -> TestResult {
         "expected queue-pressure path to skip at least one object: {:#?}",
         response.report
     );
+    assert_eq!(response.report.tier_failure, 0);
+    assert!(!response.report.cancelled);
     assert!(!response.report.truncated_by_duration);
     assert!(response.report.enqueued < 20, "partial run should not enqueue all items in this setup");
 
