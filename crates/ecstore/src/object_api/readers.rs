@@ -471,6 +471,14 @@ impl PutObjReader {
         }
     }
 
+    pub fn from_prehashed_bytes(data: Bytes, sha256hex: Option<String>) -> std::io::Result<Self> {
+        let content_length =
+            i64::try_from(data.len()).map_err(|_| std::io::Error::other("prehashed object payload exceeds i64 length"))?;
+        Ok(PutObjReader {
+            stream: HashReader::from_stream(Cursor::new(data), content_length, content_length, None, sha256hex, false)?,
+        })
+    }
+
     pub fn size(&self) -> i64 {
         self.stream.size()
     }

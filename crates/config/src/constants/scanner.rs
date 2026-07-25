@@ -220,12 +220,10 @@ pub const ENV_SCANNER_YIELD_EVERY_N_OBJECTS: &str = "RUSTFS_SCANNER_YIELD_EVERY_
 pub const DEFAULT_SCANNER_IDLE_MODE: bool = true;
 
 /// Default set scan concurrency budget.
-/// `0` means no additional limit beyond deployment topology.
-pub const DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS: usize = 0;
+pub const DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS: usize = 4;
 
 /// Default disk scan concurrency budget.
-/// `0` means no additional limit beyond available disks in the set.
-pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 0;
+pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 4;
 
 /// Default object interval for cooperative scanner yields.
 pub const DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS: u64 = 128;
