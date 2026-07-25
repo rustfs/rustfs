@@ -3131,6 +3131,26 @@ mod tests {
         assert!(err.contains("server:9000"), "unexpected error: {err}");
     }
 
+    #[test]
+    fn read_multiple_response_decode_reports_corrupt_json_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![
+                serde_json::to_string(&sample_read_multiple_resp("good", b"ok")).expect("json response should encode"),
+                "{not-json".to_string(),
+            ],
+            read_multiple_resps_bin: Vec::new(),
+            error: None,
+        };
+
+        let err = decode_read_multiple_response_items(response, &endpoint).expect_err("corrupt json item should fail");
+        let err = err.to_string();
+
+        assert!(err.contains("ReadMultipleResp json item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
+    }
+
     fn sample_batch_read_version_resp(index: usize, path: &str, success: bool) -> BatchReadVersionResp {
         let mut file_info = FileInfo::new(path, 1, 0);
         file_info.erasure.index = 1;
@@ -3207,6 +3227,27 @@ mod tests {
             .to_string();
 
         assert!(err.contains("BatchReadVersionResp msgpack item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_reports_corrupt_json_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = BatchReadVersionResponse {
+            success: true,
+            batch_read_version_resps: vec![
+                serde_json::to_string(&sample_batch_read_version_resp(0, "ok", false)).expect("json should encode"),
+                "{not-json".to_string(),
+            ],
+            batch_read_version_resps_bin: Vec::new(),
+            error: None,
+        };
+
+        let err = decode_batch_read_version_response_items(response, &endpoint)
+            .expect_err("corrupt json item should fail")
+            .to_string();
+
+        assert!(err.contains("BatchReadVersionResp json item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
     }
 
