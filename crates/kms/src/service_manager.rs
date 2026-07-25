@@ -384,6 +384,11 @@ impl KmsServiceManager {
                 let backend = crate::backends::vault_transit::VaultTransitKmsBackend::new(config.clone()).await?;
                 Arc::new(backend) as Arc<dyn KmsBackend>
             }
+            BackendConfig::Static(_) => {
+                info!("Creating Static KMS backend for version {}", version);
+                let backend = crate::backends::static_kms::StaticKmsBackend::new(config.clone()).await?;
+                Arc::new(backend) as Arc<dyn KmsBackend>
+            }
         };
 
         // Create KMS manager

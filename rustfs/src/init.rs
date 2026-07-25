@@ -283,7 +283,7 @@ fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
         .as_ref()
         .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
 
-    Ok(rustfs_kms::config::KmsConfig {
+    let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::Local,
         backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
             key_dir: std::path::PathBuf::from(key_dir),
@@ -296,7 +296,11 @@ fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
         retry_attempts: 3,
         enable_cache: true,
         cache_config: rustfs_kms::config::CacheConfig::default(),
-    })
+    };
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Local KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
 }
 
 /// Build KMS configuration for Vault backend
@@ -310,7 +314,7 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
         .as_ref()
         .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
 
-    Ok(rustfs_kms::config::KmsConfig {
+    let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::VaultKv2,
         backend_config: rustfs_kms::config::BackendConfig::VaultKv2(Box::new(rustfs_kms::config::VaultConfig {
             address: vault_address.clone(),
@@ -329,7 +333,11 @@ fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
         retry_attempts: 3,
         enable_cache: true,
         cache_config: rustfs_kms::config::CacheConfig::default(),
-    })
+    };
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Vault KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
 }
 
 /// Build KMS configuration for Vault Transit backend
@@ -343,7 +351,7 @@ fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustf
         .as_ref()
         .ok_or_else(|| Error::other("Vault token is required for vault-transit backend"))?;
 
-    Ok(rustfs_kms::config::KmsConfig {
+    let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::VaultTransit,
         backend_config: rustfs_kms::config::BackendConfig::VaultTransit(Box::new(rustfs_kms::config::VaultTransitConfig {
             address: vault_address.clone(),
@@ -360,7 +368,63 @@ fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustf
         retry_attempts: 3,
         enable_cache: true,
         cache_config: rustfs_kms::config::CacheConfig::default(),
-    })
+    };
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Vault Transit KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
+}
+
+/// Build KMS configuration for static single-key backend
+fn build_static_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    use rustfs_kms::config::{ENV_KMS_STATIC_SECRET_KEY, ENV_KMS_STATIC_SECRET_KEY_FILE, StaticConfig};
+
+    // Read secret from file first, then fall back to env var
+    let secret_str = if let Some(file_path) = rustfs_utils::get_env_opt_str(ENV_KMS_STATIC_SECRET_KEY_FILE) {
+        std::fs::read_to_string(&file_path).map_err(|e| {
+            Error::other(format!("Failed to read static KMS secret key file {file_path}: {e}"))
+        })?
+    } else {
+        rustfs_utils::get_env_str(ENV_KMS_STATIC_SECRET_KEY, "")
+    };
+
+    let secret_str = secret_str.trim();
+    if secret_str.is_empty() {
+        return Err(Error::other(format!(
+            "Static KMS requires {ENV_KMS_STATIC_SECRET_KEY} or {ENV_KMS_STATIC_SECRET_KEY_FILE} to be set"
+        )));
+    }
+
+    let colon_pos = secret_str.find(':').ok_or_else(|| {
+        Error::other(format!(
+            "Static KMS secret key must be in format <key-name>:<base64-key>, got: {secret_str}"
+        ))
+    })?;
+    let key_id = secret_str[..colon_pos].to_string();
+    let secret_key = secret_str[colon_pos + 1..].to_string();
+
+    if key_id.is_empty() || secret_key.is_empty() {
+        return Err(Error::other("Static KMS secret key must be in format <key-name>:<base64-key>"));
+    }
+
+    // Base64 decoding and 32-byte key length are validated by KmsConfig::validate() below
+    let static_config = StaticConfig {
+        key_id: key_id.clone(),
+        secret_key,
+    };
+
+    let kms_config = rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Static,
+        default_key_id: cfg.kms_default_key_id.clone().or(Some(key_id)),
+        backend_config: rustfs_kms::config::BackendConfig::Static(static_config),
+        allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        ..Default::default()
+    };
+
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Static KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
 }
 
 /// Configure and start KMS service
@@ -423,6 +487,7 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
             "local" => build_local_kms_config(config)?,
             "vault" | "vault-kv2" | "vault_kv2" => build_vault_kms_config(config)?,
             "vault-transit" | "vault_transit" => build_vault_transit_kms_config(config)?,
+            "static" => build_static_kms_config(config)?,
             _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
 

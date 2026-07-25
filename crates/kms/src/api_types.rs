@@ -16,7 +16,8 @@
 
 use crate::config::{
     BackendConfig, CacheConfig, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, KmsBackend,
-    KmsConfig, LocalConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig, redacted_secret_option,
+    KmsConfig, LocalConfig, StaticConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig, redacted_secret,
+    redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
@@ -136,6 +137,46 @@ pub struct ConfigureVaultTransitKmsRequest {
     pub allow_insecure_dev_defaults: Option<bool>,
 }
 
+/// Request to configure KMS with Static single-key backend
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigureStaticKmsRequest {
+    /// Key identifier (name) for the single configured key
+    pub key_id: String,
+    /// Base64-encoded 32-byte AES-256 key material
+    pub secret_key: String,
+    /// Default master key ID for auto-encryption
+    pub default_key_id: Option<String>,
+    /// Operation timeout in seconds
+    pub timeout_seconds: Option<u64>,
+    /// Number of retry attempts
+    pub retry_attempts: Option<u32>,
+    /// Enable caching
+    pub enable_cache: Option<bool>,
+    /// Maximum number of keys to cache
+    pub max_cached_keys: Option<usize>,
+    /// Cache TTL in seconds
+    pub cache_ttl_seconds: Option<u64>,
+    /// Allow development-only insecure defaults
+    pub allow_insecure_dev_defaults: Option<bool>,
+}
+
+impl fmt::Debug for ConfigureStaticKmsRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigureStaticKmsRequest")
+            .field("key_id", &self.key_id)
+            .field("secret_key", &redacted_secret(&self.secret_key))
+            .field("default_key_id", &self.default_key_id)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("retry_attempts", &self.retry_attempts)
+            .field("enable_cache", &self.enable_cache)
+            .field("max_cached_keys", &self.max_cached_keys)
+            .field("cache_ttl_seconds", &self.cache_ttl_seconds)
+            .field("allow_insecure_dev_defaults", &self.allow_insecure_dev_defaults)
+            .finish()
+    }
+}
+
 /// Generic KMS configuration request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "backend_type")]
@@ -155,6 +196,9 @@ pub enum ConfigureKmsRequest {
     /// Configure with Vault Transit backend
     #[serde(rename = "VaultTransit", alias = "vault-transit", alias = "vault_transit")]
     VaultTransit(ConfigureVaultTransitKmsRequest),
+    /// Configure with Static single-key backend
+    #[serde(rename = "Static", alias = "static")]
+    Static(ConfigureStaticKmsRequest),
 }
 
 /// KMS configuration response
@@ -316,6 +360,11 @@ pub enum BackendSummary {
         /// Skip TLS verification
         skip_tls_verify: bool,
     },
+    /// Static single-key backend summary
+    Static {
+        /// Configured key identifier
+        key_id: String,
+    },
 }
 
 impl From<&KmsConfig> for KmsConfigSummary {
@@ -359,6 +408,9 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 namespace: vault_config.namespace.clone(),
                 mount_path: vault_config.mount_path.clone(),
                 skip_tls_verify: vault_config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
+            },
+            BackendConfig::Static(static_config) => BackendSummary::Static {
+                key_id: static_config.key_id.clone(),
             },
         };
 
@@ -474,6 +526,29 @@ impl ConfigureVaultTransitKmsRequest {
     }
 }
 
+impl ConfigureStaticKmsRequest {
+    /// Convert to KmsConfig
+    pub fn to_kms_config(&self) -> KmsConfig {
+        KmsConfig {
+            backend: KmsBackend::Static,
+            default_key_id: self.default_key_id.clone(),
+            backend_config: BackendConfig::Static(StaticConfig {
+                key_id: self.key_id.clone(),
+                secret_key: self.secret_key.clone(),
+            }),
+            allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
+            timeout: Duration::from_secs(self.timeout_seconds.unwrap_or(30)),
+            retry_attempts: self.retry_attempts.unwrap_or(3),
+            enable_cache: self.enable_cache.unwrap_or(true),
+            cache_config: CacheConfig {
+                max_keys: self.max_cached_keys.unwrap_or(1000),
+                ttl: Duration::from_secs(self.cache_ttl_seconds.unwrap_or(3600)),
+                enable_metrics: true,
+            },
+        }
+    }
+}
+
 impl ConfigureKmsRequest {
     /// Convert to KmsConfig
     pub fn to_kms_config(&self) -> KmsConfig {
@@ -481,6 +556,7 @@ impl ConfigureKmsRequest {
             ConfigureKmsRequest::Local(req) => req.to_kms_config(),
             ConfigureKmsRequest::VaultKv2(req) => req.to_kms_config(),
             ConfigureKmsRequest::VaultTransit(req) => req.to_kms_config(),
+            ConfigureKmsRequest::Static(req) => req.to_kms_config(),
         }
     }
 }

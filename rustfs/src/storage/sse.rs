@@ -1601,12 +1601,23 @@ async fn apply_managed_encryption_material(
         // Try to get default key from KMS service (if available)
         if let Some(service) = runtime_sources::current_encryption_service().await {
             kms_key_candidate = service.get_default_key_id().cloned();
+            tracing::debug!(
+                default_key_id = ?kms_key_candidate,
+                "SSE-S3: KMS service available, default_key_id from config"
+            );
+        } else {
+            tracing::debug!("SSE-S3: KMS encryption service not available");
         }
     }
 
     let kms_key_to_use = match (encryption_type, kms_key_candidate.clone()) {
         (SSEType::SseS3, Some(kms_key_id)) => kms_key_id,
-        (SSEType::SseS3, None) => "default".to_string(),
+        (SSEType::SseS3, None) => {
+            tracing::debug!(
+                "SSE-S3: no KMS key configured, falling back to \"default\" key ID"
+            );
+            "default".to_string()
+        }
         (SSEType::SseKms, Some(kms_key_id)) => kms_key_id,
         (SSEType::SseKms, None) => {
             return Err(ApiError::from(StorageError::other(
@@ -1638,7 +1649,7 @@ async fn apply_managed_encryption_material(
     Ok(EncryptionMaterial {
         sse_type: encryption_type,
         server_side_encryption,
-        kms_key_id: matches!(encryption_type, SSEType::SseKms).then_some(kms_key_to_use),
+        kms_key_id: Some(kms_key_to_use),
         algorithm,
         key_bytes,
         base_nonce,
@@ -3442,7 +3453,7 @@ mod tests {
                 let material = material.expect("managed sse-s3 encryption should return material");
                 let metadata = encryption_material_to_metadata(&material).expect("managed SSE-S3 metadata should serialize");
 
-                assert_eq!(material.kms_key_id, None);
+                assert_eq!(material.kms_key_id.as_deref(), Some("default"));
                 assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
                 assert!(!metadata.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
                 assert_eq!(metadata.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER).map(String::as_str), Some("default"));
