@@ -73,9 +73,12 @@ const MANUAL_QUEUE_PRESSURE_BUCKET: &str = "ilm7-manual-queue-pressure";
 const MANUAL_ASYNC_STATUS_BUCKET: &str = "ilm7-manual-async-status";
 const MANUAL_CONTINUATION_BUCKET: &str = "ilm7-manual-continuation";
 const MANUAL_ASYNC_LIMIT_BUCKET: &str = "ilm7-manual-async-limit";
+const MANUAL_ASYNC_CONFLICT_BUCKET: &str = "ilm7-manual-async-conflict";
 const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
 const MANUAL_CONTINUATION_PREFIX: &str = "manual-continuation/";
 const MANUAL_ASYNC_LIMIT_PREFIX: &str = "manual-async-limit/";
+const MANUAL_ASYNC_CONFLICT_PREFIX: &str = "manual-async-conflict/";
+const MANUAL_ASYNC_CONFLICT_NESTED_PREFIX: &str = "manual-async-conflict/nested/";
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
 const MANUAL_DRY_RUN_KEY: &str = "manual-dry-run/report.bin";
@@ -367,6 +370,16 @@ struct ManualTransitionJobStatusResponse {
     report: ManualTransitionRunReport,
 }
 
+#[derive(Debug, Deserialize)]
+struct ManualTransitionJobConflictResponse {
+    state: String,
+    mode: String,
+    active_job_id: String,
+    status_endpoint: String,
+    cancel_endpoint: String,
+    scope_key: String,
+}
+
 async fn manual_transition_run(
     hot: &RustFSTestEnvironment,
     bucket: &str,
@@ -418,15 +431,25 @@ async fn manual_transition_async_run(
     dry_run: bool,
     max_objects: u64,
 ) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (status, body) = manual_transition_async_run_raw(hot, bucket, prefix, dry_run, max_objects).await?;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "async manual transition response: {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn manual_transition_async_run_raw(
+    hot: &RustFSTestEnvironment,
+    bucket: &str,
+    prefix: &str,
+    dry_run: bool,
+    max_objects: u64,
+) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let bucket = urlencoding::encode(bucket);
     let prefix = urlencoding::encode(prefix);
     let tier = urlencoding::encode(TIER_NAME);
     let path = format!(
         "/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects={max_objects}&mode=async"
     );
-    let (status, body) = signed_admin_request(&hot.url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
-    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "async manual transition response: {body}");
-    Ok(serde_json::from_str(&body)?)
+    signed_admin_request(&hot.url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await
 }
 
 async fn manual_transition_job_status(
@@ -905,6 +928,91 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(second_cancel.report.scanned, terminal.report.scanned);
     assert_eq!(second_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
     assert_eq!(cold_tier_object_count(&cold_client).await?, before_remote_count);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_job() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualasyncconflictcoldtieradmin".to_string();
+    cold.secret_key = "manualasyncconflictcoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(MANUAL_ASYNC_CONFLICT_BUCKET).send().await?;
+    for idx in 0..50 {
+        let key = format!("{MANUAL_ASYNC_CONFLICT_NESTED_PREFIX}obj-{idx:02}");
+        put_single_part_object(&hot_client, MANUAL_ASYNC_CONFLICT_BUCKET, &key, b"async conflict payload").await?;
+    }
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_ASYNC_CONFLICT_BUCKET,
+        "manual-async-conflict",
+        MANUAL_ASYNC_CONFLICT_PREFIX,
+        0,
+    )
+    .await?;
+
+    let (first, second) = tokio::join!(
+        manual_transition_async_run_raw(&hot, MANUAL_ASYNC_CONFLICT_BUCKET, MANUAL_ASYNC_CONFLICT_PREFIX, false, 50),
+        manual_transition_async_run_raw(&hot, MANUAL_ASYNC_CONFLICT_BUCKET, MANUAL_ASYNC_CONFLICT_NESTED_PREFIX, false, 50)
+    );
+    let responses = [first?, second?];
+    let accepted = responses
+        .iter()
+        .find(|(status, _)| *status == reqwest::StatusCode::ACCEPTED)
+        .ok_or("one concurrent async run must be accepted")?;
+    let conflict = responses
+        .iter()
+        .find(|(status, _)| *status == reqwest::StatusCode::CONFLICT)
+        .ok_or("one concurrent async run must report conflict")?;
+
+    let accepted: ManualTransitionRunResponse = serde_json::from_str(&accepted.1)?;
+    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict.1)?;
+    let job_id = accepted
+        .job_id
+        .as_deref()
+        .ok_or("accepted async response must include job_id")?;
+    let status_endpoint = accepted
+        .status_endpoint
+        .as_deref()
+        .ok_or("accepted async response must include status_endpoint")?;
+
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.mode, "durable_job");
+    assert_eq!(conflict.state, "conflict");
+    assert_eq!(conflict.mode, "durable_job");
+    assert_eq!(conflict.active_job_id, job_id);
+    assert_eq!(conflict.status_endpoint, status_endpoint);
+    assert_eq!(conflict.cancel_endpoint, status_endpoint);
+    assert!(!conflict.scope_key.is_empty());
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
+    assert_eq!(terminal.job_id, job_id);
+    assert_eq!(terminal.status, "completed", "terminal conflict winner response: {terminal:#?}");
+    assert!(!terminal.report.dry_run);
+    assert_eq!(terminal.report.bucket, MANUAL_ASYNC_CONFLICT_BUCKET);
+    assert!(
+        terminal.report.prefix == MANUAL_ASYNC_CONFLICT_PREFIX || terminal.report.prefix == MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
+        "terminal conflict winner response: {terminal:#?}"
+    );
+    assert_eq!(terminal.report.scanned, 50, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(terminal.report.eligible, 50, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(terminal.report.dry_run_eligible, 0, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(
+        terminal.report.enqueued + terminal.report.skipped_already_in_flight,
+        50,
+        "terminal conflict winner response: {terminal:#?}"
+    );
+    assert!(cold_tier_object_count(&cold_client).await? <= 50);
+
     Ok(())
 }
 

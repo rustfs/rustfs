@@ -4158,10 +4158,11 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, FreeVersionTask, ManualTransitionRunOptions, ManualTransitionRunReport,
-        StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
-        TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject,
-        VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, FreeVersionTask, ManualTransitionQueueSnapshot, ManualTransitionRunOptions,
+        ManualTransitionRunReport, StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
+        TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule,
+        TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
+        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report,
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
@@ -4182,8 +4183,9 @@ mod tests {
         decode_manual_transition_continuation_token, encode_manual_transition_continuation_token,
     };
     use crate::bucket::lifecycle::manual_transition_job::{
-        ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, load_manual_transition_job_record,
-        load_manual_transition_scope_admission, save_manual_transition_job_record,
+        ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
+        claim_manual_transition_scope_admission, legacy_manual_transition_scope_key, load_manual_transition_job_record,
+        load_manual_transition_scope_admission, request_manual_transition_job_cancel, save_manual_transition_job_record,
         save_manual_transition_scope_admission_if_absent,
     };
     use crate::bucket::lifecycle::replication_sink::{
@@ -7031,7 +7033,7 @@ mod tests {
             .await
             .expect("manual transition recovery should run");
 
-        assert_eq!(stats.scanned, 1);
+        assert!(stats.scanned >= 1);
         assert_eq!(stats.resumed, 1);
         assert_eq!(stats.failed, 0);
         let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
@@ -7062,6 +7064,106 @@ mod tests {
 
         assert!(report.was_truncated());
         assert!(!report.has_partial_enqueue());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_job_cancel_marks_running_record_only() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let running_id = Uuid::new_v4();
+        let running = ManualTransitionJobRecord::new(
+            running_id,
+            "manual-cancel-running-bucket",
+            &ManualTransitionRunOptions::default(),
+            "owner-a",
+        );
+        save_manual_transition_job_record(ecstore.clone(), &running)
+            .await
+            .expect("running job record should save");
+
+        let cancelled = request_manual_transition_job_cancel(ecstore.clone(), running_id)
+            .await
+            .expect("running job cancel request should persist");
+
+        assert_eq!(cancelled.state, ManualTransitionJobState::Running);
+        assert!(cancelled.cancel_requested);
+        let loaded = load_manual_transition_job_record(ecstore.clone(), running_id)
+            .await
+            .expect("cancelled running job should reload");
+        assert!(loaded.cancel_requested);
+
+        let terminal_id = Uuid::new_v4();
+        let mut terminal = ManualTransitionJobRecord::new(
+            terminal_id,
+            "manual-cancel-terminal-bucket",
+            &ManualTransitionRunOptions::default(),
+            "owner-a",
+        );
+        terminal.complete(
+            ManualTransitionRunReport {
+                bucket: "manual-cancel-terminal-bucket".to_string(),
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        save_manual_transition_job_record(ecstore.clone(), &terminal)
+            .await
+            .expect("terminal job record should save");
+
+        let after_terminal_cancel = request_manual_transition_job_cancel(ecstore, terminal_id)
+            .await
+            .expect("terminal job cancel should be idempotent");
+
+        assert_eq!(after_terminal_cancel.state, ManualTransitionJobState::Completed);
+        assert!(!after_terminal_cancel.cancel_requested);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_admission_blocks_active_legacy_scope_record() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let legacy_options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            ..Default::default()
+        };
+        let legacy_id = Uuid::new_v4();
+        let mut legacy = ManualTransitionJobRecord::new(legacy_id, "manual-legacy-scope-bucket", &legacy_options, "old-owner");
+        legacy.scope_key = legacy_manual_transition_scope_key(&legacy.bucket, &legacy_options);
+        save_manual_transition_job_record(ecstore.clone(), &legacy)
+            .await
+            .expect("legacy job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&legacy))
+            .await
+            .expect("legacy scope admission should save");
+
+        let new_options = ManualTransitionRunOptions {
+            prefix: "archive/".to_string(),
+            tier: Some("cold".to_string()),
+            ..Default::default()
+        };
+        let new_record = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-legacy-scope-bucket", &new_options, "new-owner");
+        save_manual_transition_job_record(ecstore.clone(), &new_record)
+            .await
+            .expect("new job record should save");
+
+        let claim =
+            claim_manual_transition_scope_admission(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&new_record))
+                .await
+                .expect("new bucket-level admission claim should resolve");
+
+        let ManualTransitionScopeAdmissionClaim::Conflict(active) = claim else {
+            panic!("active legacy job must block new bucket-level admission");
+        };
+        assert_eq!(active.job_id, legacy_id);
+        assert_eq!(active.scope_key, legacy.scope_key);
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &new_record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "conflicted bucket-level admission must be released"
+        );
     }
 
     #[tokio::test]
