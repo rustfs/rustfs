@@ -20,6 +20,7 @@ otherwise a rolling upgrade with mixed node versions could read an emptied field
 
 ```
 rustfs_system_network_internode_msgpack_json_fallback_total{direction, message}
+rustfs_system_network_internode_msgpack_json_decode_error_total{direction, message, codec}
 ```
 
 Incremented whenever a decode falls back to the JSON field because the msgpack payload was
@@ -29,6 +30,7 @@ absent.
 - `direction="response"` — a client decoding a peer's response (`cluster/rpc/remote_disk.rs`),
   including the list-level `ReadMultiple` / `BatchReadVersion` fallbacks.
 - `message` — the value name, e.g. `FileInfo`, `RawFileInfo`, `ReadMultipleResp`.
+- `codec` — the failed codec for decode errors: `msgpack` for corrupt non-empty `_bin`, or `json` for corrupt legacy fallback JSON.
 
 ## Stage 0 — Observe (current stage)
 
@@ -47,6 +49,16 @@ Every series must be `0`. A non-zero value means some peer is still emitting an 
 `_bin` (an old node, or a message whose sender does not fill `_bin`) — investigate the
 `{direction, message}` label before proceeding.
 
+Decode errors must also stay at zero across the observation window:
+
+```promql
+sum by (direction, message, codec) (
+  increase(rustfs_system_network_internode_msgpack_json_decode_error_total[30d])
+)
+```
+
+A non-zero `codec="msgpack"` series means a peer sent corrupt or incompatible `_bin` bytes; it must fail closed and block convergence. A non-zero `codec="json"` series means the legacy fallback field was corrupt or semantically incompatible; it also blocks convergence and rollback confidence.
+
 Standing alert (keep enabled through all stages):
 
 ```yaml
@@ -57,6 +69,13 @@ Standing alert (keep enabled through all stages):
   annotations:
     summary: "Internode RPC fell back to JSON decode ({{ $labels.direction }}/{{ $labels.message }})"
     description: "A peer sent an empty msgpack _bin payload. Do NOT advance msgpack-only convergence while this fires."
+- alert: InternodeMsgpackJsonDecodeError
+  expr: sum by (direction, message, codec) (increase(rustfs_system_network_internode_msgpack_json_decode_error_total[15m])) > 0
+  for: 5m
+  labels: { severity: warning }
+  annotations:
+    summary: "Internode RPC msgpack/JSON decode failed ({{ $labels.direction }}/{{ $labels.message }}/{{ $labels.codec }})"
+    description: "A peer sent an undecodable msgpack or JSON compatibility payload. Do NOT advance msgpack-only convergence while this fires."
 ```
 
 ## Field → peer-decoder audit

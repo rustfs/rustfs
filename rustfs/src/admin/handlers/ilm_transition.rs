@@ -537,6 +537,15 @@ fn request_manual_transition_job_cancel(job_id: &str) -> Option<ManualTransition
     Some(runtime.record.clone())
 }
 
+fn mark_manual_transition_job_owner_unknown(mut record: ManualTransitionJobRecord) -> ManualTransitionJobRecord {
+    if !record.status.is_terminal() {
+        record.status = ManualTransitionJobStatus::Unknown;
+        record.finished_at = Some(manual_transition_timestamp(OffsetDateTime::now_utc()));
+        record.failure_reason = Some("manual transition job owner is not active on this node".to_string());
+    }
+    record
+}
+
 fn remove_manual_transition_job(job_id: &str) {
     let mut jobs = lock_manual_transition_jobs();
     jobs.remove(job_id);
@@ -570,15 +579,10 @@ async fn load_manual_transition_job_record(store: Arc<ECStore>, job_id: &str) ->
     if let Some(record) = in_memory_manual_transition_job_record(job_id) {
         return Ok(record);
     }
-    let Some(mut record) = read_manual_transition_job_record(store, job_id).await? else {
+    let Some(record) = read_manual_transition_job_record(store, job_id).await? else {
         return Err(s3_error!(NoSuchKey, "manual transition job not found"));
     };
-    if !record.status.is_terminal() {
-        record.status = ManualTransitionJobStatus::Unknown;
-        record.finished_at = Some(manual_transition_timestamp(OffsetDateTime::now_utc()));
-        record.failure_reason = Some("manual transition job owner is not active on this node".to_string());
-    }
-    Ok(record)
+    Ok(mark_manual_transition_job_owner_unknown(record))
 }
 
 async fn persist_manual_transition_job_update(store: Arc<ECStore>, record: &ManualTransitionJobRecord) -> bool {
@@ -762,10 +766,8 @@ impl Operation for ManualTransitionJobCancelHandler {
                 return Err(s3_error!(NoSuchKey, "manual transition job not found"));
             };
             if !record.status.is_terminal() {
-                record.status = ManualTransitionJobStatus::Unknown;
                 record.cancel_requested = true;
-                record.finished_at = Some(manual_transition_timestamp(OffsetDateTime::now_utc()));
-                record.failure_reason = Some("manual transition job owner is not active on this node".to_string());
+                record = mark_manual_transition_job_owner_unknown(record);
                 save_manual_transition_job_record(store, &record).await?;
             }
             record
@@ -1063,6 +1065,47 @@ mod tests {
 
         assert!(cancelled.cancel_requested);
         assert!(cancel_token.is_cancelled());
+    }
+
+    #[test]
+    fn manual_transition_inactive_owner_marks_nonterminal_job_unknown() {
+        let (bucket, options, _run_mode) =
+            parse_manual_transition_query(Some("bucket=data&prefix=logs/&async=true")).expect("async query should parse");
+        let record = new_manual_transition_job_record(
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            &bucket,
+            &options,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        let unknown = mark_manual_transition_job_owner_unknown(record);
+
+        assert_eq!(unknown.status, ManualTransitionJobStatus::Unknown);
+        assert!(unknown.finished_at.is_some());
+        assert_eq!(
+            unknown.failure_reason.as_deref(),
+            Some("manual transition job owner is not active on this node")
+        );
+    }
+
+    #[test]
+    fn manual_transition_inactive_owner_preserves_terminal_job() {
+        let (bucket, options, _run_mode) =
+            parse_manual_transition_query(Some("bucket=data&prefix=logs/&async=true")).expect("async query should parse");
+        let mut record = new_manual_transition_job_record(
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            &bucket,
+            &options,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        record.status = ManualTransitionJobStatus::Completed;
+        record.finished_at = Some("1970-01-01T00:00:00Z".to_string());
+
+        let completed = mark_manual_transition_job_owner_unknown(record);
+
+        assert_eq!(completed.status, ManualTransitionJobStatus::Completed);
+        assert_eq!(completed.finished_at.as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(completed.failure_reason, None);
     }
 
     #[test]

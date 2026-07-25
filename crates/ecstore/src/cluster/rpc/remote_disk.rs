@@ -1118,13 +1118,19 @@ fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer).map_err(Error::from);
+        return T::deserialize(&mut deserializer).map_err(|err| {
+            crate::cluster::rpc::runtime_sources::record_response_msgpack_decode_error(value_name);
+            Error::from(err)
+        });
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     crate::cluster::rpc::runtime_sources::record_response_json_fallback(value_name);
-    serde_json::from_str(json).map_err(Error::from)
+    serde_json::from_str(json).map_err(|err| {
+        crate::cluster::rpc::runtime_sources::record_response_json_decode_error(value_name);
+        Error::from(err)
+    })
 }
 
 /// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
@@ -1172,8 +1178,10 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
     }
     let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps.len());
     for (index, json_str) in response.read_multiple_resps.iter().enumerate() {
-        let resp = serde_json::from_str::<ReadMultipleResp>(json_str)
-            .map_err(|err| Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}")))?;
+        let resp = serde_json::from_str::<ReadMultipleResp>(json_str).map_err(|err| {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode_error("ReadMultipleResp");
+            Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}"))
+        })?;
         read_multiple_resps.push(resp);
     }
 
@@ -1221,6 +1229,7 @@ fn decode_batch_read_version_response_items(
     let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps.len());
     for (index, json_str) in response.batch_read_version_resps.iter().enumerate() {
         let resp = serde_json::from_str::<BatchReadVersionResp>(json_str).map_err(|err| {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode_error("BatchReadVersionResp");
             Error::other(format!("decode BatchReadVersionResp json item {index} from {endpoint} failed: {err}"))
         })?;
         if resp.success {
@@ -3227,12 +3236,15 @@ mod tests {
             ],
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         let err = decode_read_multiple_response_items(response, &endpoint).expect_err("corrupt msgpack item should fail");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
         let err = err.to_string();
 
         assert!(err.contains("ReadMultipleResp msgpack item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt response msgpack should increment decode-error metrics");
     }
 
     #[test]
@@ -3247,12 +3259,15 @@ mod tests {
             read_multiple_resps_bin: Vec::new(),
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         let err = decode_read_multiple_response_items(response, &endpoint).expect_err("corrupt json item should fail");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
         let err = err.to_string();
 
         assert!(err.contains("ReadMultipleResp json item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt response JSON should increment decode-error metrics");
     }
 
     fn sample_batch_read_version_resp(index: usize, path: &str, success: bool) -> BatchReadVersionResp {
@@ -3325,13 +3340,16 @@ mod tests {
             ],
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         let err = decode_batch_read_version_response_items(response, &endpoint)
             .expect_err("corrupt msgpack item should fail")
             .to_string();
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         assert!(err.contains("BatchReadVersionResp msgpack item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt batch response msgpack should increment decode-error metrics");
     }
 
     #[test]
@@ -3346,13 +3364,16 @@ mod tests {
             batch_read_version_resps_bin: Vec::new(),
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         let err = decode_batch_read_version_response_items(response, &endpoint)
             .expect_err("corrupt json item should fail")
             .to_string();
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         assert!(err.contains("BatchReadVersionResp json item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt batch response JSON should increment decode-error metrics");
     }
 
     #[test]
