@@ -1030,10 +1030,10 @@ async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment, tier_name:
     .into())
 }
 
-async fn wait_for_tier_converged(hot: &RustFSTestClusterEnvironment, add_tier_responses: &str) -> TestResult {
+async fn wait_for_tier_converged(hot: &RustFSTestClusterEnvironment, tier_name: &str, add_tier_responses: &str) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(60);
     let final_error = loop {
-        let snapshot = tier_readiness_snapshot(hot).await?;
+        let snapshot = tier_readiness_snapshot(hot, tier_name).await?;
         if snapshot
             .iter()
             .all(|node| node.list_status.is_success() && node.list_has_tier && node.verify_status.is_success())
@@ -1051,7 +1051,7 @@ async fn wait_for_tier_converged(hot: &RustFSTestClusterEnvironment, add_tier_re
         sleep(Duration::from_millis(500)).await;
     };
     Err(format!(
-        "tier {TIER_NAME} did not converge on every hot node within 60s after AddTier({add_tier_responses}): {final_error}"
+        "tier {tier_name} did not converge on every hot node within 60s after AddTier({add_tier_responses}): {final_error}"
     )
     .into())
 }
@@ -1561,8 +1561,9 @@ async fn four_node_add_tier_committed_replay_converges() -> TestResult {
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
     hot.start().await?;
 
-    add_rustfs_tier(&hot, &cold).await?;
-    wait_for_tier_converged(&hot, "committed AddTier replay").await
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
+    wait_for_tier_converged(&hot, &tier_name, "committed AddTier replay").await
 }
 
 #[tokio::test]
