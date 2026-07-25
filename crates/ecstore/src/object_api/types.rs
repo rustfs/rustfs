@@ -822,10 +822,7 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_filemeta::{
-        FileInfo, FileMeta, MetaCacheEntry, ReplicationState as FileMetaReplicationState, TRANSITION_COMPLETE,
-        version_purge_statuses_map,
-    };
+    use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
 
     fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
         ObjectInfo {
@@ -1117,11 +1114,11 @@ mod tests {
             volume: "bucket".to_string(),
             name: "object".to_string(),
             version_id: Some(purge_version_id),
-            replication_state_internal: Some(FileMetaReplicationState {
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
                 version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
                 purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         })
         .expect("version purge status should be persisted");
