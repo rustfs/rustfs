@@ -23,10 +23,11 @@ use crate::bucket::lifecycle::lifecycle::{
 };
 use crate::bucket::lifecycle::manual_transition_job::{
     MANUAL_TRANSITION_JOB_RECORD_PREFIX, ManualTransitionJobRecord, ManualTransitionScopeAdmission,
-    ManualTransitionScopeAdmissionClaim, claim_manual_transition_scope_admission,
+    ManualTransitionScopeAdmissionClaim, ManualTransitionWorkerResult, claim_manual_transition_scope_admission,
     delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
     load_manual_transition_job_record_with_etag, manual_transition_job_id_from_record_object_name,
-    manual_transition_job_lease_expired, persist_manual_transition_job_progress, save_manual_transition_job_record_if_current,
+    manual_transition_job_lease_expired, persist_manual_transition_job_progress, record_manual_transition_worker_result,
+    renew_manual_transition_job_lease, save_manual_transition_job_record_if_current,
 };
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
@@ -953,6 +954,7 @@ struct TransitionTask {
     obj_info: ObjectInfo,
     src: LcEventSrc,
     event: lifecycle::Event,
+    manual_job_id: Option<Uuid>,
 }
 
 impl ExpiryOp for TransitionTask {
@@ -1258,6 +1260,7 @@ impl TransitionState {
         oi: &ObjectInfo,
         event: &lifecycle::Event,
         src: &LcEventSrc,
+        manual_job_id: Option<Uuid>,
     ) -> TransitionEnqueueOutcome {
         if is_immediate_transition_source(src) && should_force_immediate_transition_enqueue_timeout() {
             self.handle_immediate_enqueue_failure(oi, src, ImmediateEnqueueFailure::ForcedTimeout);
@@ -1279,6 +1282,7 @@ impl TransitionState {
             obj_info: oi.clone(),
             src: src.clone(),
             event: event.clone(),
+            manual_job_id,
         };
         if is_immediate_transition_source(src) {
             let outcome = match self.transition_tx.try_send(Some(task)) {
@@ -1360,7 +1364,7 @@ impl TransitionState {
     }
 
     pub async fn queue_transition_task(self: &Arc<Self>, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
-        self.queue_transition_task_outcome(oi, event, src).await.is_handled()
+        self.queue_transition_task_outcome(oi, event, src, None).await.is_handled()
     }
 
     pub async fn init(api: Arc<ECStore>) {
@@ -1453,24 +1457,43 @@ impl TransitionState {
                             ..Default::default()
                         };
 
-                            if let Err(err) = transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone())).await {
-                                global_metrics().record_scanner_transition_failed(1);
-                                if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
-                                    error!(
-                                        event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                        bucket = %task.obj_info.bucket,
-                                        object = %task.obj_info.name,
-                                        version_id = %task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
-                                        tier = %task.event.storage_class,
-                                        operation = "transition_object",
-                                        error = %err,
-                                        "Lifecycle tier operation failed"
-                                    );
-                                }
+                        if let Err(err) =
+                            transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone()))
+                                .await
+                        {
+                            if let Some(job_id) = task.manual_job_id {
+                                record_manual_transition_worker_result_for_task(
+                                    api.clone(),
+                                    job_id,
+                                    ManualTransitionWorkerResult::TierFailure,
+                                )
+                                .await;
+                            }
+                            global_metrics().record_scanner_transition_failed(1);
+                            if !is_err_version_not_found(&err) && !is_err_object_not_found(&err) && !is_network_or_host_down(&err.to_string(), false) && !err.to_string().contains("use of closed network connection") {
+                                error!(
+                                    event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                    bucket = %task.obj_info.bucket,
+                                    object = %task.obj_info.name,
+                                    version_id = %task.obj_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
+                                    tier = %task.event.storage_class,
+                                    operation = "transition_object",
+                                    error = %err,
+                                    "Lifecycle tier operation failed"
+                                );
+                            }
                             emit_transition_failed_event(obj_info_for_event);
                         } else {
+                            if let Some(job_id) = task.manual_job_id {
+                                record_manual_transition_worker_result_for_task(
+                                    api.clone(),
+                                    job_id,
+                                    ManualTransitionWorkerResult::Completed,
+                                )
+                                .await;
+                            }
                             global_metrics().record_scanner_transition_completed(1);
                             let mut ts = TierStats {
                                 total_size: task.obj_info.size as u64,
@@ -1572,6 +1595,20 @@ impl TransitionState {
             pruned_finished_transition_workers = pruned_finished_workers,
             state = "resized",
             "Lifecycle worker pool resized"
+        );
+    }
+}
+
+async fn record_manual_transition_worker_result_for_task(api: Arc<ECStore>, job_id: Uuid, result: ManualTransitionWorkerResult) {
+    if let Err(err) = record_manual_transition_worker_result(api, job_id, result, manual_transition_queue_snapshot()).await {
+        warn!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            job_id = %job_id,
+            error = %err,
+            state = "manual_transition_worker_result_failed",
+            "Manual transition worker failed to persist job result"
         );
     }
 }
@@ -1796,11 +1833,16 @@ async fn recover_manual_transition_job(api: Arc<ECStore>, job_id: Uuid) -> Resul
     }
 
     let mut options = record.resume_options();
+    options.job_id = Some(job_id);
     options.cancel_check = Some(manual_transition_recovery_cancel_check(api.clone(), job_id));
     options.progress_sink = Some(manual_transition_recovery_progress_sink(api.clone(), job_id));
     let result = enqueue_transition_for_existing_objects_scoped(api.clone(), &record.bucket, options).await;
     let final_record = finalize_recovered_manual_transition_job(api.clone(), job_id, result).await?;
-    release_manual_transition_recovery_admission(api, &final_record).await;
+    if final_record.is_terminal() {
+        release_manual_transition_recovery_admission(api, &final_record).await;
+    } else {
+        spawn_manual_transition_recovery_heartbeat(api, job_id);
+    }
     Ok(ManualTransitionJobRecoveryOutcome::Resumed)
 }
 
@@ -1868,6 +1910,34 @@ async fn release_manual_transition_recovery_admission(api: Arc<ECStore>, record:
             "Manual transition recovery failed to release admission"
         );
     }
+}
+
+fn spawn_manual_transition_recovery_heartbeat(api: Arc<ECStore>, job_id: Uuid) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            match renew_manual_transition_job_lease(api.clone(), job_id, manual_transition_queue_snapshot()).await {
+                Ok(record) if record.is_terminal() => {
+                    release_manual_transition_recovery_admission(api, &record).await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(Error::ConfigNotFound) => return,
+                Err(err) => {
+                    warn!(
+                        event = EVENT_LIFECYCLE_WORKER_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        job_id = %job_id,
+                        error = %err,
+                        state = "manual_transition_recovery_heartbeat_failed",
+                        "Manual transition recovery failed to renew job lease"
+                    );
+                }
+            }
+        }
+    });
 }
 
 async fn abandon_manual_transition_recovery_lease(api: Arc<ECStore>, job_id: Uuid, lease_id: Uuid) -> Result<(), Error> {
@@ -2767,6 +2837,8 @@ pub struct ManualTransitionRunOptions {
     pub max_objects: Option<u64>,
     pub max_duration: Option<std::time::Duration>,
     #[serde(skip)]
+    pub job_id: Option<Uuid>,
+    #[serde(skip)]
     pub cancel_token: Option<CancellationToken>,
     #[serde(skip)]
     pub cancel_check: Option<ManualTransitionCancelCheck>,
@@ -2785,6 +2857,7 @@ impl std::fmt::Debug for ManualTransitionRunOptions {
             .field("dry_run", &self.dry_run)
             .field("max_objects", &self.max_objects)
             .field("max_duration", &self.max_duration)
+            .field("job_id", &self.job_id)
             .field("cancel_token", &self.cancel_token.is_some())
             .field("cancel_check", &self.cancel_check.is_some())
             .field("progress_sink", &self.progress_sink.is_some())
@@ -2806,6 +2879,10 @@ impl PartialEq for ManualTransitionRunOptions {
 }
 
 impl Eq for ManualTransitionRunOptions {}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2829,6 +2906,10 @@ pub struct ManualTransitionRunReport {
     pub skipped_queue_full: u64,
     pub skipped_queue_closed: u64,
     pub skipped_queue_timeout: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub transition_completed: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub transition_failed: u64,
     pub tier_failure: u64,
     pub truncated_by_limit: bool,
     pub truncated_by_duration: bool,
@@ -2894,6 +2975,19 @@ impl ManualTransitionRunReport {
                 self.skipped_queue_timeout = self.skipped_queue_timeout.saturating_add(1);
             }
         }
+    }
+
+    pub fn merge_scan_report_preserving_worker(&mut self, scan_report: &ManualTransitionRunReport) {
+        let transition_completed = self.transition_completed;
+        let transition_failed = self.transition_failed;
+        *self = scan_report.clone();
+        self.transition_completed = transition_completed;
+        self.transition_failed = transition_failed;
+        self.tier_failure = scan_report.tier_failure.saturating_add(transition_failed);
+    }
+
+    pub fn worker_transition_pending(&self) -> bool {
+        self.transition_completed.saturating_add(self.transition_failed) < self.enqueued
     }
 }
 
@@ -3340,7 +3434,7 @@ async fn enqueue_transition_with_lifecycle_report(
                 return true;
             }
             let outcome = runtime_sources::transition_state_handle()
-                .queue_transition_task_outcome(oi, &event, src)
+                .queue_transition_task_outcome(oi, &event, src, options.job_id)
                 .await;
             report.record_enqueue_outcome(outcome);
             return outcome.is_handled();
@@ -6356,10 +6450,10 @@ mod tests {
         };
 
         let first = state
-            .queue_transition_task_outcome(&object, &event, &LcEventSrc::Scanner)
+            .queue_transition_task_outcome(&object, &event, &LcEventSrc::Scanner, None)
             .await;
         let second = state
-            .queue_transition_task_outcome(&object, &event, &LcEventSrc::Scanner)
+            .queue_transition_task_outcome(&object, &event, &LcEventSrc::Scanner, None)
             .await;
 
         assert_eq!(first, TransitionEnqueueOutcome::Queued);
@@ -6387,10 +6481,10 @@ mod tests {
         };
 
         let first = state
-            .queue_transition_task_outcome(&first_object, &event, &LcEventSrc::Scanner)
+            .queue_transition_task_outcome(&first_object, &event, &LcEventSrc::Scanner, None)
             .await;
         let second = state
-            .queue_transition_task_outcome(&second_object, &event, &LcEventSrc::Scanner)
+            .queue_transition_task_outcome(&second_object, &event, &LcEventSrc::Scanner, None)
             .await;
 
         assert_eq!(first, TransitionEnqueueOutcome::Queued);

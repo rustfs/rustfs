@@ -286,6 +286,7 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
             dry_run: query.dry_run.unwrap_or(false),
             max_objects: Some(max_objects),
             max_duration: query.max_duration_seconds.map(std::time::Duration::from_secs),
+            job_id: None,
             cancel_token: None,
             cancel_check: None,
             progress_sink: None,
@@ -412,7 +413,7 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
 }
 
 fn response_state(report: &ManualTransitionRunReport) -> &'static str {
-    if report.was_truncated() || report.has_partial_enqueue() || report.tier_failure > 0 {
+    if report.was_truncated() || report.has_partial_enqueue() || report.tier_failure > 0 || report.transition_failed > 0 {
         "partial"
     } else {
         "completed"
@@ -659,15 +660,25 @@ async fn finalize_manual_transition_job(
     }
 }
 
-fn spawn_manual_transition_job_heartbeat(store: Arc<ECStore>, job_id: Uuid, cancel_token: CancellationToken) {
+fn spawn_manual_transition_job_heartbeat(
+    store: Arc<ECStore>,
+    job_id: Uuid,
+    scan_cancel_token: CancellationToken,
+    shutdown_token: CancellationToken,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(StdDuration::from_secs(5));
         loop {
             tokio::select! {
-                _ = cancel_token.cancelled() => return,
+                _ = shutdown_token.cancelled() => return,
                 _ = interval.tick() => {
                     match renew_manual_transition_job_lease(store.clone(), job_id, manual_transition_queue_snapshot()).await {
-                        Ok(record) if record.cancel_requested => cancel_token.cancel(),
+                        Ok(record) if record.is_terminal() => {
+                            remove_active_manual_transition_job(job_id);
+                            scan_cancel_token.cancel();
+                            return;
+                        }
+                        Ok(record) if record.cancel_requested => scan_cancel_token.cancel(),
                         Ok(_) => {}
                         Err(err) => {
                         warn!(
@@ -724,20 +735,28 @@ async fn start_manual_transition_job(
         }
     }
 
-    let cancel_token = CancellationToken::new();
-    insert_active_manual_transition_job(job_id, cancel_token.clone());
+    let scan_cancel_token = CancellationToken::new();
+    let heartbeat_shutdown_token = CancellationToken::new();
+    insert_active_manual_transition_job(job_id, scan_cancel_token.clone());
     let mut run_options = options;
-    run_options.cancel_token = Some(cancel_token.clone());
+    run_options.job_id = Some(job_id);
+    run_options.cancel_token = Some(scan_cancel_token.clone());
     run_options.cancel_check = Some(manual_transition_durable_cancel_check(store.clone(), job_id));
     run_options.progress_sink = Some(manual_transition_progress_sink(store.clone(), job_id));
     let run_store = store.clone();
-    spawn_manual_transition_job_heartbeat(store, job_id, cancel_token);
+    let job_scan_cancel_token = scan_cancel_token.clone();
+    let job_heartbeat_shutdown_token = heartbeat_shutdown_token.clone();
+    spawn_manual_transition_job_heartbeat(store, job_id, scan_cancel_token, heartbeat_shutdown_token);
     tokio::spawn(async move {
         let result = enqueue_transition_for_existing_objects_scoped(run_store.clone(), &bucket, run_options).await;
         if let Some(final_record) = finalize_manual_transition_job(run_store.clone(), job_id, result).await {
-            release_manual_transition_admission(run_store, &final_record);
+            if final_record.is_terminal() {
+                release_manual_transition_admission(run_store, &final_record);
+                job_scan_cancel_token.cancel();
+                job_heartbeat_shutdown_token.cancel();
+                remove_active_manual_transition_job(job_id);
+            }
         }
-        remove_active_manual_transition_job(job_id);
     });
 
     Ok(StartManualTransitionJobResult::Started(Box::new(record)))
@@ -1150,6 +1169,16 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_response_reports_partial_for_worker_failure() {
+        let report = ManualTransitionRunReport {
+            transition_failed: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(response_state(&report), "partial");
+    }
+
+    #[test]
     fn manual_transition_response_omits_raw_resume_markers() {
         let report = ManualTransitionRunReport {
             truncated_by_limit: true,
@@ -1220,6 +1249,17 @@ mod tests {
 
         remove_active_manual_transition_job(job_id);
         assert!(active_manual_transition_cancel_token(job_id).is_none());
+    }
+
+    #[test]
+    fn manual_transition_heartbeat_keeps_running_after_scan_cancel() {
+        let src = include_str!("ilm_transition.rs");
+        let heartbeat_block =
+            extract_block_between_markers(src, "fn spawn_manual_transition_job_heartbeat", "enum StartManualTransitionJobResult");
+
+        assert!(heartbeat_block.contains("scan_cancel_token.cancel()"));
+        assert!(heartbeat_block.contains("shutdown_token.cancelled()"));
+        assert!(!heartbeat_block.contains("scan_cancel_token.cancelled()"));
     }
 
     #[tokio::test]

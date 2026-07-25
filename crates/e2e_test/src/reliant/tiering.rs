@@ -75,18 +75,21 @@ const MANUAL_CONTINUATION_BUCKET: &str = "ilm7-manual-continuation";
 const MANUAL_ASYNC_LIMIT_BUCKET: &str = "ilm7-manual-async-limit";
 const MANUAL_ASYNC_CONFLICT_BUCKET: &str = "ilm7-manual-async-conflict";
 const MANUAL_TIER_FAILURE_BUCKET: &str = "ilm7-manual-tier-failure";
+const MANUAL_WORKER_FAILURE_BUCKET: &str = "ilm7-manual-worker-failure";
 const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
 const MANUAL_CONTINUATION_PREFIX: &str = "manual-continuation/";
 const MANUAL_ASYNC_LIMIT_PREFIX: &str = "manual-async-limit/";
 const MANUAL_ASYNC_CONFLICT_PREFIX: &str = "manual-async-conflict/";
 const MANUAL_ASYNC_CONFLICT_NESTED_PREFIX: &str = "manual-async-conflict/nested/";
 const MANUAL_TIER_FAILURE_PREFIX: &str = "manual-tier-failure/";
+const MANUAL_WORKER_FAILURE_PREFIX: &str = "manual-worker-failure/";
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
 const MANUAL_DRY_RUN_KEY: &str = "manual-dry-run/report.bin";
 const MANUAL_NOT_DUE_KEY: &str = "manual-not-due/report.bin";
 const MANUAL_ASYNC_STATUS_KEY: &str = "manual-async-status/report.bin";
 const MANUAL_TIER_FAILURE_KEY: &str = "manual-tier-failure/report.bin";
+const MANUAL_WORKER_FAILURE_KEY: &str = "manual-worker-failure/report.bin";
 const CONTENT_TYPE: &str = "application/x-ilm7";
 const USER_META_KEY: &str = "ilm7-origin";
 const USER_META_VAL: &str = "hermetic-transition";
@@ -367,6 +370,10 @@ struct ManualTransitionRunReport {
     skipped_queue_full: u64,
     skipped_queue_closed: u64,
     skipped_queue_timeout: u64,
+    #[serde(default)]
+    transition_completed: u64,
+    #[serde(default)]
+    transition_failed: u64,
     #[serde(default)]
     tier_failure: u64,
     #[serde(default)]
@@ -833,6 +840,8 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
     assert!(accepted.report.dry_run);
     assert_eq!(accepted.report.scanned, 0);
     assert_eq!(accepted.report.eligible, 0);
+    assert_eq!(accepted.report.transition_completed, 0);
+    assert_eq!(accepted.report.transition_failed, 0);
     let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
     let status_endpoint = accepted
         .status_endpoint
@@ -862,6 +871,8 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
     assert_eq!(terminal.report.skipped_queue_full, 0);
     assert_eq!(terminal.report.skipped_queue_closed, 0);
     assert_eq!(terminal.report.skipped_queue_timeout, 0);
+    assert_eq!(terminal.report.transition_completed, 0);
+    assert_eq!(terminal.report.transition_failed, 0);
     assert_eq!(terminal.report.tier_failure, 0);
     assert!(!terminal.report.cancelled);
     assert!(!terminal.report.truncated_by_limit);
@@ -910,6 +921,8 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(accepted.report.bucket, MANUAL_ASYNC_LIMIT_BUCKET);
     assert_eq!(accepted.report.prefix, MANUAL_ASYNC_LIMIT_PREFIX);
     assert_eq!(accepted.report.scanned, 0);
+    assert_eq!(accepted.report.transition_completed, 0);
+    assert_eq!(accepted.report.transition_failed, 0);
     let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
     let status_endpoint = accepted
         .status_endpoint
@@ -933,6 +946,8 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(terminal.report.skipped_queue_full, 0);
     assert_eq!(terminal.report.skipped_queue_closed, 0);
     assert_eq!(terminal.report.skipped_queue_timeout, 0);
+    assert_eq!(terminal.report.transition_completed, 0);
+    assert_eq!(terminal.report.transition_failed, 0);
     assert_eq!(terminal.report.tier_failure, 0);
     assert!(!terminal.report.cancelled);
     assert!(terminal.report.truncated_by_limit);
@@ -946,6 +961,8 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(after_cancel.report.tier, terminal.report.tier);
     assert_eq!(after_cancel.report.scanned, terminal.report.scanned);
     assert_eq!(after_cancel.report.skipped_not_transition, terminal.report.skipped_not_transition);
+    assert_eq!(after_cancel.report.transition_completed, terminal.report.transition_completed);
+    assert_eq!(after_cancel.report.transition_failed, terminal.report.transition_failed);
     assert_eq!(after_cancel.report.tier_failure, terminal.report.tier_failure);
     assert_eq!(after_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(after_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
@@ -954,6 +971,8 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(second_cancel.status, "partial");
     assert!(!second_cancel.cancel_requested);
     assert_eq!(second_cancel.report.scanned, terminal.report.scanned);
+    assert_eq!(second_cancel.report.transition_completed, terminal.report.transition_completed);
+    assert_eq!(second_cancel.report.transition_failed, terminal.report.transition_failed);
     assert_eq!(second_cancel.report.tier_failure, terminal.report.tier_failure);
     assert_eq!(second_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(second_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
@@ -1041,6 +1060,12 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
         50,
         "terminal conflict winner response: {terminal:#?}"
     );
+    assert_eq!(
+        terminal.report.transition_completed, terminal.report.enqueued,
+        "terminal conflict winner must wait for all queued transitions: {terminal:#?}"
+    );
+    assert_eq!(terminal.report.transition_failed, 0, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(terminal.report.tier_failure, 0, "terminal conflict winner response: {terminal:#?}");
     assert!(cold_tier_object_count(&cold_client).await? <= 50);
 
     Ok(())
@@ -1085,6 +1110,8 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
     let accepted = manual_transition_async_run(&hot, MANUAL_TIER_FAILURE_BUCKET, MANUAL_TIER_FAILURE_PREFIX, false, 10).await?;
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.mode, "durable_job");
+    assert_eq!(accepted.report.transition_completed, 0);
+    assert_eq!(accepted.report.transition_failed, 0);
     let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
     let status_endpoint = accepted
         .status_endpoint
@@ -1104,6 +1131,11 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
     assert_eq!(terminal.report.scanned, 1, "terminal tier failure job response: {terminal:#?}");
     assert_eq!(terminal.report.eligible, 0, "terminal tier failure job response: {terminal:#?}");
     assert_eq!(terminal.report.enqueued, 0, "terminal tier failure job response: {terminal:#?}");
+    assert_eq!(
+        terminal.report.transition_completed, 0,
+        "terminal tier failure job response: {terminal:#?}"
+    );
+    assert_eq!(terminal.report.transition_failed, 0, "terminal tier failure job response: {terminal:#?}");
     assert_eq!(terminal.report.tier_failure, 1, "terminal tier failure job response: {terminal:#?}");
     assert_eq!(terminal.report.skipped_queue_full, 0);
     assert_eq!(terminal.report.skipped_queue_closed, 0);
@@ -1120,6 +1152,92 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
         &hot_client,
         MANUAL_TIER_FAILURE_BUCKET,
         MANUAL_TIER_FAILURE_KEY,
+        StdDuration::from_secs(2),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_async_worker_failure_reports_terminal_partial() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualworkerfailurecoldadmin".to_string();
+    cold.secret_key = "manualworkerfailurecoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+    cold.stop_server();
+
+    hot_client.create_bucket().bucket(MANUAL_WORKER_FAILURE_BUCKET).send().await?;
+    let due_mtime = OffsetDateTime::now_utc() - time::Duration::hours(25);
+    put_backdated_single_part_object(
+        &hot_client,
+        MANUAL_WORKER_FAILURE_BUCKET,
+        MANUAL_WORKER_FAILURE_KEY,
+        b"manual worker failure object",
+        due_mtime,
+    )
+    .await?;
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_WORKER_FAILURE_BUCKET,
+        "manual-worker-failure",
+        MANUAL_WORKER_FAILURE_PREFIX,
+        0,
+    )
+    .await?;
+
+    let accepted =
+        manual_transition_async_run(&hot, MANUAL_WORKER_FAILURE_BUCKET, MANUAL_WORKER_FAILURE_PREFIX, false, 10).await?;
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.mode, "durable_job");
+    assert_eq!(accepted.report.transition_completed, 0);
+    assert_eq!(accepted.report.transition_failed, 0);
+    let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
+    let status_endpoint = accepted
+        .status_endpoint
+        .as_deref()
+        .ok_or("async response must include status_endpoint")?;
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
+    assert_eq!(terminal.job_id, job_id);
+    assert_eq!(terminal.status, "partial", "terminal worker failure job response: {terminal:#?}");
+    assert!(!terminal.cancel_requested);
+    assert_eq!(terminal.failure_reason, None);
+    assert_eq!(terminal.report.bucket, MANUAL_WORKER_FAILURE_BUCKET);
+    assert_eq!(terminal.report.prefix, MANUAL_WORKER_FAILURE_PREFIX);
+    assert_eq!(terminal.report.tier.as_deref(), Some(TIER_NAME));
+    assert!(!terminal.report.dry_run);
+    assert!(terminal.report.lifecycle_config_found);
+    assert_eq!(terminal.report.scanned, 1, "terminal worker failure job response: {terminal:#?}");
+    assert_eq!(terminal.report.eligible, 1, "terminal worker failure job response: {terminal:#?}");
+    assert_eq!(terminal.report.enqueued, 1, "terminal worker failure job response: {terminal:#?}");
+    assert_eq!(
+        terminal.report.transition_completed, 0,
+        "terminal worker failure job response: {terminal:#?}"
+    );
+    assert_eq!(
+        terminal.report.transition_failed, 1,
+        "terminal worker failure job response: {terminal:#?}"
+    );
+    assert_eq!(terminal.report.tier_failure, 1, "terminal worker failure job response: {terminal:#?}");
+    assert_eq!(terminal.report.skipped_queue_full, 0);
+    assert_eq!(terminal.report.skipped_queue_closed, 0);
+    assert_eq!(terminal.report.skipped_queue_timeout, 0);
+    assert!(!terminal.report.cancelled);
+    assert!(!terminal.report.truncated_by_limit);
+    assert!(!terminal.report.truncated_by_duration);
+    assert_remains_not_transitioned(
+        &hot_client,
+        MANUAL_WORKER_FAILURE_BUCKET,
+        MANUAL_WORKER_FAILURE_KEY,
         StdDuration::from_secs(2),
     )
     .await?;
