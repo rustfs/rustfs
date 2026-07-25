@@ -633,6 +633,35 @@ struct ReaderPathExpectation<'a> {
     expected_size_bucket: Option<&'a str>,
 }
 
+struct PartNumberReaderPathExpectation<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    expected_part: &'a [u8],
+    full_object_size: usize,
+    object_class: &'a str,
+    expected_path: &'a str,
+}
+
+impl<'a> PartNumberReaderPathExpectation<'a> {
+    fn new(
+        bucket: &'a str,
+        key: &'a str,
+        expected_part: &'a [u8],
+        full_object_size: usize,
+        object_class: &'a str,
+        expected_path: &'a str,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            expected_part,
+            full_object_size,
+            object_class,
+            expected_path,
+        }
+    }
+}
+
 impl<'a> ReaderPathExpectation<'a> {
     fn plain(object: ReaderObject<'a>, expected_path: &'a str) -> Self {
         Self::for_class(object, expected_path, PLAIN_SINGLE_PART)
@@ -804,17 +833,21 @@ async fn assert_reader_path(
 async fn assert_part_number_reader_path(
     collector: &OtlpMetricCollector,
     client: &Client,
-    bucket: &str,
-    key: &str,
-    expected_part: &[u8],
-    full_object_size: usize,
-    expected_path: &str,
+    expectation: PartNumberReaderPathExpectation<'_>,
 ) -> TestResult {
+    let PartNumberReaderPathExpectation {
+        bucket,
+        key,
+        expected_part,
+        full_object_size,
+        object_class,
+        expected_path,
+    } = expectation;
     let paths = [INLINE_DIRECT, LEGACY_DUPLEX, EMPTY, REMOTE_TRANSITION];
     let size_bucket = size_bucket(full_object_size);
     let mut before = BTreeMap::<&str, u64>::new();
     for path in paths {
-        before.insert(path, collector.reader_path_total(path, MULTIPART, size_bucket).await);
+        before.insert(path, collector.reader_path_total(path, object_class, size_bucket).await);
     }
     let response = client.get_object().bucket(bucket).key(key).part_number(2).send().await?;
     assert_eq!(
@@ -825,17 +858,17 @@ async fn assert_part_number_reader_path(
     let body = response.body.collect().await?.into_bytes();
     assert_eq!(body.as_ref(), expected_part, "partNumber GET body changed for {key}");
     collector
-        .wait_for_reader_path_total(expected_path, MULTIPART, size_bucket, before[expected_path] + 1)
+        .wait_for_reader_path_total(expected_path, object_class, size_bucket, before[expected_path] + 1)
         .await?;
-    collector.wait_for_reader_paths_to_settle(MULTIPART, size_bucket).await?;
+    collector.wait_for_reader_paths_to_settle(object_class, size_bucket).await?;
     for path in paths {
         if path == expected_path {
             continue;
         }
         assert_eq!(
-            collector.reader_path_total(path, MULTIPART, size_bucket).await,
+            collector.reader_path_total(path, object_class, size_bucket).await,
             before[path],
-            "{READER_PATH_COUNTER}{{path={path}, object_class={MULTIPART}, size_bucket={size_bucket}}} must not advance for partNumber GET {key}; expected {expected_path} only"
+            "{READER_PATH_COUNTER}{{path={path}, object_class={object_class}, size_bucket={size_bucket}}} must not advance for partNumber GET {key}; expected {expected_path} only"
         );
     }
     Ok(())
@@ -1286,11 +1319,7 @@ async fn four_node_inline_fallback_controls() -> TestResult {
     assert_part_number_reader_path(
         &collector,
         &client,
-        bucket,
-        multipart_key,
-        &second_part,
-        multipart_body.len(),
-        LEGACY_DUPLEX,
+        PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
     )
     .await?;
 
@@ -1385,7 +1414,12 @@ async fn four_node_multipart_ignores_disk_compression_fallback() -> TestResult {
         ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), LEGACY_DUPLEX, MULTIPART),
     )
     .await?;
-    assert_part_number_reader_path(&collector, &client, bucket, key, &second_part, body.len(), LEGACY_DUPLEX).await?;
+    assert_part_number_reader_path(
+        &collector,
+        &client,
+        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), MULTIPART, LEGACY_DUPLEX),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1424,11 +1458,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     assert_part_number_reader_path(
         &collector,
         &client,
-        bucket,
-        multipart_key,
-        &second_part,
-        multipart_body.len(),
-        LEGACY_DUPLEX,
+        PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
     )
     .await?;
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
@@ -1517,7 +1547,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     put_lifecycle_with_transition_retry(&hot_client, bucket).await?;
 
     let key = "transition/mixed-multipart.bin";
-    let (body, _, etag) = put_two_part_multipart(&hot_client, bucket, key).await?;
+    let (body, second_part, etag) = put_two_part_multipart(&hot_client, bucket, key).await?;
     wait_for_transition(&hot_client, bucket, key).await?;
     assert!(
         cold_tier_object_count(&cold_client).await? >= 1,
@@ -1527,6 +1557,12 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
         &collector,
         &hot_client,
         ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), REMOTE_TRANSITION, REMOTE),
+    )
+    .await?;
+    assert_part_number_reader_path(
+        &collector,
+        &hot_client,
+        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), REMOTE, REMOTE_TRANSITION),
     )
     .await?;
 

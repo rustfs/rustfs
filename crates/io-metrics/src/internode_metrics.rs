@@ -35,6 +35,8 @@ pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
 /// peer's request vs a client decoding a peer's response (grpc-optimization P2).
 pub const INTERNODE_MSGPACK_DIRECTION_REQUEST: &str = "request";
 pub const INTERNODE_MSGPACK_DIRECTION_RESPONSE: &str = "response";
+pub const INTERNODE_MSGPACK_CODEC_MSGPACK: &str = "msgpack";
+pub const INTERNODE_MSGPACK_CODEC_JSON: &str = "json";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
@@ -44,6 +46,7 @@ const DOMINANT_ERROR_LABEL: &str = "dominant_error";
 const HTTP_VERSION_LABEL: &str = "http_version";
 const DIRECTION_LABEL: &str = "direction";
 const MESSAGE_LABEL: &str = "message";
+const CODEC_LABEL: &str = "codec";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
@@ -60,6 +63,7 @@ const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
 const INTERNODE_OPERATION_PAYLOAD_BYTES: &str = "rustfs_system_network_internode_operation_payload_bytes";
 const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_internode_operation_large_payloads_total";
 const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
+const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
@@ -167,6 +171,7 @@ pub struct InternodeMetrics {
     operation_http_versions_total: AtomicU64,
     operation_stall_timeouts_total: AtomicU64,
     operation_write_shutdown_errors_total: AtomicU64,
+    msgpack_json_decode_error_total: AtomicU64,
     signature_v1_fallback_total: AtomicU64,
 }
 
@@ -364,6 +369,22 @@ impl InternodeMetrics {
         counter!(INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL, DIRECTION_LABEL => direction, MESSAGE_LABEL => message).increment(1);
     }
 
+    pub fn record_msgpack_json_decode_error(&self, direction: &'static str, message: &'static str, codec: &'static str) {
+        self.msgpack_json_decode_error_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL,
+            DIRECTION_LABEL => direction,
+            MESSAGE_LABEL => message,
+            CODEC_LABEL => codec
+        )
+        .increment(1);
+    }
+
+    #[doc(hidden)]
+    pub fn msgpack_json_decode_error_total_for_test(&self) -> u64 {
+        self.msgpack_json_decode_error_total.load(Ordering::Relaxed)
+    }
+
     /// Count an internode gRPC request that was accepted through the legacy constant-target
     /// signature because it carried no v2 auth headers (rolling-upgrade fallback, see
     /// <https://github.com/rustfs/backlog/issues/1327>). Only accepted requests count: rejected
@@ -439,6 +460,7 @@ impl InternodeMetrics {
         self.operation_http_versions_total.store(0, Ordering::Relaxed);
         self.operation_stall_timeouts_total.store(0, Ordering::Relaxed);
         self.operation_write_shutdown_errors_total.store(0, Ordering::Relaxed);
+        self.msgpack_json_decode_error_total.store(0, Ordering::Relaxed);
         self.signature_v1_fallback_total.store(0, Ordering::Relaxed);
     }
 }
@@ -742,8 +764,14 @@ mod tests {
             INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
             "rustfs_system_network_internode_msgpack_json_fallback_total"
         );
+        assert_eq!(
+            INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_decode_error_total"
+        );
         assert_eq!(INTERNODE_MSGPACK_DIRECTION_REQUEST, "request");
         assert_eq!(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "response");
+        assert_eq!(INTERNODE_MSGPACK_CODEC_MSGPACK, "msgpack");
+        assert_eq!(INTERNODE_MSGPACK_CODEC_JSON, "json");
         assert_eq!(
             INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
             "rustfs_system_network_internode_signature_v1_fallback_total"
@@ -756,6 +784,27 @@ mod tests {
         let metrics = InternodeMetrics::default();
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+    }
+
+    #[test]
+    fn msgpack_json_decode_error_counter_tracks_codec_direction_and_message() {
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 0);
+
+        metrics.record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_REQUEST,
+            "FileInfo",
+            INTERNODE_MSGPACK_CODEC_MSGPACK,
+        );
+        metrics.record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+            "RawFileInfo",
+            INTERNODE_MSGPACK_CODEC_JSON,
+        );
+
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 2);
+        metrics.reset_for_test();
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 0);
     }
 
     #[test]
