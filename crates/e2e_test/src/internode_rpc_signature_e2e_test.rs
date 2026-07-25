@@ -434,11 +434,11 @@ async fn swapping_in_a_fresh_nonce_is_rejected(url: &str, audience: &str) {
 /// the canonical body from the fields it actually received, can catch this. It
 /// is the test that fails if a handler ever loses its digest gate.
 async fn tampered_mutation_body_is_rejected(url: &str, audience: &str) {
-    let signed = make_volume_request("signature-e2e-original");
+    let signed = make_volume_request("signature-e2e-tamper-a");
     let captured = mint_v2_headers(audience, "MakeVolume", Some(&canonical_digest(&signed)));
 
-    // One byte of the volume name differs from what the digest covers.
-    let tampered = make_volume_request("signature-e2e-originaX");
+    // Exactly one byte of the volume name differs from what the digest covers.
+    let tampered = make_volume_request("signature-e2e-tamper-b");
     let result = call_make_volume(url, tampered, captured).await;
     assert_rejected(
         result,
@@ -457,10 +457,10 @@ async fn tampered_mutation_body_is_rejected(url: &str, audience: &str) {
 /// digest header itself. Drop `content_sha256` from `update_signature_v2` and
 /// this is the test that goes green when it should not.
 async fn rewriting_the_digest_to_match_a_tampered_body_is_rejected(url: &str, audience: &str) {
-    let signed = make_volume_request("signature-e2e-scope-original");
+    let signed = make_volume_request("signature-e2e-scope-a");
     let mut captured = mint_v2_headers(audience, "MakeVolume", Some(&canonical_digest(&signed)));
 
-    let tampered = make_volume_request("signature-e2e-scope-originaX");
+    let tampered = make_volume_request("signature-e2e-scope-b");
     overwrite_header(&mut captured, CONTENT_SHA256_HEADER, &canonical_digest(&tampered));
 
     let result = call_make_volume(url, tampered, captured).await;
