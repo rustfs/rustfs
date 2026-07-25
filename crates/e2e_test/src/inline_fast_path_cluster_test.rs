@@ -1030,6 +1030,67 @@ async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment, tier_name:
     .into())
 }
 
+async fn wait_for_tier_converged(hot: &RustFSTestClusterEnvironment, add_tier_responses: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let final_error = loop {
+        let snapshot = tier_readiness_snapshot(hot).await?;
+        if snapshot
+            .iter()
+            .all(|node| node.list_status.is_success() && node.list_has_tier && node.verify_status.is_success())
+        {
+            return Ok(());
+        }
+        if snapshot.iter().any(|node| {
+            !node.list_status.is_success() || (!node.verify_status.is_success() && !is_retryable_tier_error(&node.verify_body))
+        }) {
+            break format_tier_readiness_snapshot(&snapshot);
+        }
+        if Instant::now() >= deadline {
+            break format_tier_readiness_snapshot(&snapshot);
+        }
+        sleep(Duration::from_millis(500)).await;
+    };
+    Err(format!(
+        "tier {TIER_NAME} did not converge on every hot node within 60s after concurrent AddTier({add_tier_responses}): {final_error}"
+    )
+    .into())
+}
+
+async fn add_rustfs_tier_concurrently(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEnvironment) -> TestResult {
+    assert_eq!(hot.nodes.len(), 4, "concurrent tier mutation regression requires four hot nodes");
+    let body = rustfs_tier_body(cold);
+    let path = "/rustfs/admin/v3/tier";
+    let (first, second, third, fourth) = tokio::join!(
+        signed_admin_request(&hot.nodes[0].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
+        signed_admin_request(&hot.nodes[1].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
+        signed_admin_request(&hot.nodes[2].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
+        signed_admin_request(&hot.nodes[3].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
+    );
+    let responses = [first?, second?, third?, fourth?];
+    let formatted = responses
+        .iter()
+        .enumerate()
+        .map(|(index, (status, response))| format!("node {index}: status={status}, body={}", compact_body(response)))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    assert!(
+        responses.iter().any(|(status, _)| status.is_success()),
+        "concurrent AddTier must commit once: {formatted}"
+    );
+    for (node_index, (status, response)) in responses.iter().enumerate() {
+        assert!(
+            !response.contains("PreconditionFailed"),
+            "node {node_index} must converge an already-committed peer mutation instead of surfacing PreconditionFailed: status={status}, body={response}"
+        );
+        assert!(
+            status.is_success() || is_retryable_add_tier_error(response) || response.contains("TierNameAlreadyExist"),
+            "node {node_index} returned an unexpected concurrent AddTier result: status={status}, body={response}"
+        );
+    }
+    wait_for_tier_converged(hot, &formatted).await
+}
+
 struct TierNodeReadiness {
     node_index: usize,
     node_url: String,
@@ -1519,6 +1580,23 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_add_tier_partial_concurrent_commit_converges() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inlineconcurrentcoldadmin".to_string();
+    cold.secret_key = "inlineconcurrentcoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    cold.create_s3_client().create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.start().await?;
+
+    add_rustfs_tier_concurrently(&hot, &cold).await
 }
 
 #[tokio::test]

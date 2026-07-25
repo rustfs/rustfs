@@ -930,6 +930,7 @@ async fn prepare_tier_mutation_peers(
         let result = peer.prepare_tier_mutation(mutation_id, payload.clone()).await;
         match result {
             Ok(PeerTierMutationState::Prepared) => prepared.push(peer),
+            Ok(PeerTierMutationState::Committed) => {}
             Ok(state) => {
                 return Err(TierMutationPrepareFailure {
                     error: tier_mutation_fanout_admin_error(
@@ -5981,6 +5982,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_tier_mutation_peers_accepts_replayed_committed_peer() {
+        let mutation_id = uuid::Uuid::from_u128(36);
+        let intent = prepared_remove_intent("COLD-A", mutation_id);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let peers = vec![
+            FakeTierMutationPeer::boxed_with_prepare_commit(
+                "peer-a",
+                calls.clone(),
+                Ok(PeerTierMutationState::Committed),
+                Ok(PeerTierMutationState::Committed),
+            ),
+            ConcurrencyTrackingTierMutationPeer::boxed(
+                "peer-b",
+                calls.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        ];
+
+        let prepared = match prepare_tier_mutation_peers(mutation_id, peers, &intent).await {
+            Ok(prepared) => prepared,
+            Err(_) => panic!("replayed committed peer should not fail the prepare fanout"),
+        };
+
+        assert_eq!(prepared.len(), 1);
+        let calls = lock_unpoisoned(&calls);
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[0].starts_with("peer-a:prepare:"),
+            "replayed peer must be prepared before the remaining peer"
+        );
+        assert_eq!(calls[1], "peer-b:prepare");
+    }
+
+    #[tokio::test]
     async fn commit_tier_mutation_peers_serializes_shared_record_writes() {
         let mutation_id = uuid::Uuid::from_u128(35);
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -6176,6 +6212,72 @@ mod tests {
         assert!(!applied);
         assert_eq!(observed.state, TierMutationIntentState::Committed);
         assert_eq!(observed.committed_config_etag.as_deref(), Some("etag-new"));
+    }
+
+    #[tokio::test]
+    async fn intent_advance_reconciles_matching_commit_after_final_cas_race() {
+        let store = Arc::new(CasConfigStore::default());
+        let mutation_id = uuid::Uuid::from_u128(37);
+        let prepared = prepared_remove_intent("COLD-A", mutation_id);
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &prepared)
+            .await
+            .expect("prepared intent fixture should persist");
+
+        let committed = committed_remove_intent("COLD-A", mutation_id, "etag-new");
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("record object should build");
+        store
+            .rewrite_on_next_if_match(object.clone(), prepared.encode().expect("prepared intent fixture should encode"))
+            .await;
+        store
+            .rewrite_on_next_if_match(object.clone(), prepared.encode().expect("prepared intent fixture should encode"))
+            .await;
+        store
+            .rewrite_on_next_if_match(object, committed.encode().expect("committed intent fixture should encode"))
+            .await;
+
+        let (observed, applied) = crate::services::tier::tier_mutation_intent::advance_tier_mutation_intent_record_idempotent(
+            store,
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("etag-new".to_string()),
+        )
+        .await
+        .expect("matching commit after the final CAS race should be idempotent");
+
+        assert!(!applied);
+        assert_eq!(observed.state, TierMutationIntentState::Committed);
+        assert_eq!(observed.committed_config_etag.as_deref(), Some("etag-new"));
+    }
+
+    #[tokio::test]
+    async fn intent_advance_rejects_unresolved_final_cas_race() {
+        let store = Arc::new(CasConfigStore::default());
+        let mutation_id = uuid::Uuid::from_u128(38);
+        let prepared = prepared_remove_intent("COLD-A", mutation_id);
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &prepared)
+            .await
+            .expect("prepared intent fixture should persist");
+
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("record object should build");
+        const CAS_ATTEMPTS_UNDER_TEST: usize = 3;
+        for _ in 0..CAS_ATTEMPTS_UNDER_TEST {
+            store
+                .rewrite_on_next_if_match(object.clone(), prepared.encode().expect("prepared intent fixture should encode"))
+                .await;
+        }
+
+        let err = crate::services::tier::tier_mutation_intent::advance_tier_mutation_intent_record_idempotent(
+            store,
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("etag-new".to_string()),
+        )
+        .await
+        .expect_err("a still-prepared intent after the final CAS race must fail closed");
+
+        assert!(matches!(err, Error::PreconditionFailed));
     }
 
     #[tokio::test]
@@ -8270,7 +8372,7 @@ mod tests {
     struct CasConfigStore {
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
         legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
-        if_match_race_rewrite: tokio::sync::Mutex<Option<(String, Vec<u8>)>>,
+        if_match_race_rewrite: tokio::sync::Mutex<std::collections::VecDeque<(String, Vec<u8>)>>,
         next_etag: AtomicUsize,
         fail_put: AtomicBool,
         truncate_reference_page_without_marker: AtomicBool,
@@ -8284,7 +8386,7 @@ mod tests {
             Self {
                 objects: tokio::sync::Mutex::new(HashMap::new()),
                 legacy_state: tokio::sync::Mutex::new(None),
-                if_match_race_rewrite: tokio::sync::Mutex::new(None),
+                if_match_race_rewrite: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
                 next_etag: AtomicUsize::new(0),
                 fail_put: AtomicBool::new(false),
                 truncate_reference_page_without_marker: AtomicBool::new(false),
@@ -8311,7 +8413,7 @@ mod tests {
         }
 
         async fn rewrite_on_next_if_match(&self, object: String, data: Vec<u8>) {
-            *self.if_match_race_rewrite.lock().await = Some((object, data));
+            self.if_match_race_rewrite.lock().await.push_back((object, data));
         }
 
         fn omit_truncated_reference_marker(&self) {
@@ -8380,7 +8482,7 @@ mod tests {
                 .and_then(HTTPPreconditions::if_match_value)
                 .is_some()
             {
-                self.if_match_race_rewrite.lock().await.take()
+                self.if_match_race_rewrite.lock().await.pop_front()
             } else {
                 None
             };
