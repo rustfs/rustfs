@@ -1310,6 +1310,14 @@ mod tests {
     }
 
     #[test]
+    fn decode_msgpack_or_json_reports_corrupt_json_item_when_msgpack_absent() {
+        let err = decode_msgpack_or_json::<SamplePayload>(&[], "{not-json", "SamplePayload")
+            .expect_err("corrupt json item should fail in fallback branch");
+
+        assert!(err.to_string().contains("decode SamplePayload failed"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn decode_msgpack_or_json_accepts_named_msgpack_and_legacy_json() {
         let payload = SamplePayload {
             name: "named".to_string(),
