@@ -34,8 +34,8 @@ use crate::diagnostics::get::{
     GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GET_STAGE_READER_SETUP_DROP_PENDING,
     GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM, GET_STAGE_READER_TASK_BITROT_READER_INIT,
     GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION, GetObjectFailureReason, classify_disk_error,
-    get_stage_timer_if_enabled, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
-    record_get_stage_duration_if_enabled,
+    get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
@@ -53,11 +53,59 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
 use super::core::io_primitives::*;
+
+#[derive(Clone, Copy)]
+pub(super) enum GetObjectOutputKind {
+    HttpResponse,
+    Internal,
+}
+
+struct GetObjectOutputWriter<'a, W> {
+    inner: &'a mut W,
+    output_kind: GetObjectOutputKind,
+}
+
+impl<'a, W> GetObjectOutputWriter<'a, W> {
+    fn new(inner: &'a mut W, output_kind: GetObjectOutputKind) -> Self {
+        Self { inner, output_kind }
+    }
+}
+
+fn map_get_object_output_error(output_kind: GetObjectOutputKind, err: std::io::Error) -> std::io::Error {
+    if matches!(output_kind, GetObjectOutputKind::HttpResponse) {
+        mark_get_object_downstream_closed(err)
+    } else {
+        err
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectOutputWriter<'_, W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let output_kind = self.output_kind;
+        Pin::new(&mut *self.inner)
+            .poll_write(cx, buf)
+            .map(|result| result.map_err(|err| map_get_object_output_error(output_kind, err)))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let output_kind = self.output_kind;
+        Pin::new(&mut *self.inner)
+            .poll_flush(cx)
+            .map(|result| result.map_err(|err| map_get_object_output_error(output_kind, err)))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let output_kind = self.output_kind;
+        Pin::new(&mut *self.inner)
+            .poll_shutdown(cx)
+            .map(|result| result.map_err(|err| map_get_object_output_error(output_kind, err)))
+    }
+}
 
 impl SetDisks {
     async fn get_object_metadata_cache_bypass_reason(
@@ -586,6 +634,7 @@ impl SetDisks {
         offset: usize,
         length: i64,
         writer: &mut W,
+        output_kind: GetObjectOutputKind,
         fi: FileInfo,
         files: Vec<FileInfo>,
         disks: &[Option<DiskStore>],
@@ -969,9 +1018,10 @@ impl SetDisks {
             let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+            let mut output_writer = GetObjectOutputWriter::new(writer, output_kind);
             let (written, err) = erasure
                 .decode_with_stripe_handles(
-                    writer,
+                    &mut output_writer,
                     readers,
                     part_offset,
                     part_length,
@@ -989,7 +1039,7 @@ impl SetDisks {
                 metrics_size_bucket,
                 decode_elapsed.as_secs_f64(),
             );
-            if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD || err.is_some() {
+            if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD && err.is_none() {
                 warn!(
                     event = EVENT_SET_DISK_READ,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1005,9 +1055,8 @@ impl SetDisks {
                     available_shards,
                     missing_shards,
                     elapsed_ms = decode_elapsed.as_millis(),
-                    error = ?err,
-                    state = if err.is_some() { "decode_failed_or_slow" } else { "decode_slow" },
-                    "Set disk object decode stage is slow or failed"
+                    state = "decode_slow",
+                    "Set disk object decode stage is slow"
                 );
             }
             debug!(
@@ -1051,7 +1100,7 @@ impl SetDisks {
                 if has_err {
                     let reason = classify_disk_error(&de_err);
                     if reason == GetObjectFailureReason::DownstreamClosed {
-                        warn!(
+                        debug!(
                             bucket,
                             object,
                             part_index = current_part,
@@ -1969,6 +2018,7 @@ mod metadata_cache_tests {
             2,
             1,
             &mut output,
+            GetObjectOutputKind::Internal,
             valid_test_fileinfo(object),
             Vec::new(),
             &[],
@@ -1992,6 +2042,7 @@ mod metadata_cache_tests {
             usize::MAX,
             1,
             &mut output,
+            GetObjectOutputKind::Internal,
             overflow,
             Vec::new(),
             &[],
@@ -2013,6 +2064,7 @@ mod metadata_cache_tests {
             1,
             1,
             &mut output,
+            GetObjectOutputKind::Internal,
             valid_test_fileinfo(object),
             Vec::new(),
             &[],
@@ -2036,6 +2088,7 @@ mod metadata_cache_tests {
             0,
             1,
             &mut output,
+            GetObjectOutputKind::Internal,
             invalid_erasure,
             Vec::new(),
             &[],
@@ -2079,6 +2132,7 @@ mod metadata_cache_tests {
             0,
             1,
             &mut output,
+            GetObjectOutputKind::Internal,
             fi,
             Vec::new(),
             &[],
@@ -2920,10 +2974,59 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+
+    struct ClosedOutputWriter;
+
+    impl AsyncWrite for ClosedOutputWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::from(ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn output_writer_marks_closed_duplex_reader_as_downstream_close() {
+        let (reader, mut inner) = tokio::io::duplex(64);
+        drop(reader);
+        let mut writer = GetObjectOutputWriter::new(&mut inner, GetObjectOutputKind::HttpResponse);
+        let err = writer
+            .write_all(b"range payload")
+            .await
+            .expect_err("closed duplex reader must fail the output write");
+
+        assert_eq!(
+            classify_disk_error(&DiskError::from(err)),
+            GetObjectFailureReason::DownstreamClosed,
+            "only the output adapter may classify a broken pipe as a downstream close"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_writer_preserves_remote_broken_pipe_as_io_failure() {
+        let mut inner = ClosedOutputWriter;
+        let mut writer = GetObjectOutputWriter::new(&mut inner, GetObjectOutputKind::Internal);
+        let err = writer
+            .write_all(b"transition payload")
+            .await
+            .expect_err("closed remote writer must fail the output write");
+
+        assert_eq!(
+            classify_disk_error(&DiskError::from(err)),
+            GetObjectFailureReason::Io,
+            "remote transition writer failures must not be mistaken for HTTP client cancellation"
+        );
+    }
 
     async fn local_test_disks(count: usize, bucket: &str) -> (Vec<tempfile::TempDir>, Vec<Option<crate::disk::DiskStore>>) {
         let mut dirs = Vec::with_capacity(count);
@@ -4019,6 +4122,7 @@ mod tests {
             0,
             part_data.len() as i64,
             &mut output,
+            GetObjectOutputKind::Internal,
             fi,
             files,
             &disks,

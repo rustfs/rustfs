@@ -21,6 +21,7 @@
 
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use crate::set_disk::read::GetObjectOutputKind;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
@@ -31,6 +32,7 @@ use crate::bucket::lifecycle::{
         save_transition_transaction_record,
     },
 };
+use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
@@ -522,6 +524,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 0,
                 object_info.size,
                 &mut output,
+                GetObjectOutputKind::Internal,
                 fi,
                 files,
                 &disks,
@@ -650,6 +653,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 offset,
                 length,
                 &mut writer,
+                GetObjectOutputKind::HttpResponse,
                 fi,
                 files,
                 &disks,
@@ -664,24 +668,43 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             .await
             {
                 let reason = classify_storage_error(&e);
-                record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
-                error!(
-                    event = EVENT_SET_DISK_WRITE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                    bucket,
-                    object,
-                    pool_index,
-                    set_index,
-                    offset,
-                    requested_length = length,
-                    skip_verify_bitrot = skip_verify,
-                    state = "read_pipeline_failed",
-                    stage = GET_STAGE_EMIT,
-                    reason = reason.as_str(),
-                    error = ?e,
-                    "Set disk object read pipeline failed"
-                );
+                if reason == GetObjectFailureReason::DownstreamClosed {
+                    debug!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        state = "downstream_closed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline stopped after downstream closed"
+                    );
+                } else {
+                    record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
+                    error!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        skip_verify_bitrot = skip_verify,
+                        state = "read_pipeline_failed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline failed"
+                    );
+                }
             };
         });
 
@@ -3356,6 +3379,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 0,
                 cloned_fi.size,
                 &mut writer,
+                GetObjectOutputKind::Internal,
                 cloned_fi,
                 meta_arr,
                 &online_disks,

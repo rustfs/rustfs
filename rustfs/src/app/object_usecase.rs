@@ -1500,11 +1500,7 @@ impl<R> GetObjectStreamingReader<R> {
             {
                 return "read_quorum";
             }
-            if error_msg.contains("connection reset")
-                || error_msg.contains("broken pipe")
-                || error_msg.contains("downstream")
-                || error_msg.contains("remote closed")
-            {
+            if error_msg.contains("getobject output closed:") {
                 return "downstream_closed";
             }
         }
@@ -10606,6 +10602,21 @@ mod tests {
             .expect_err("stalled reader should return an error");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn get_object_streaming_reader_distinguishes_internal_and_output_broken_pipes() {
+        let internal = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(GetObjectStreamingReader::<std::io::Cursor<Vec<u8>>>::classify_read_error(&internal), "io");
+
+        let output_closed = std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            std::io::Error::other("GetObject output closed: broken pipe"),
+        );
+        assert_eq!(
+            GetObjectStreamingReader::<std::io::Cursor<Vec<u8>>>::classify_read_error(&output_closed),
+            "downstream_closed"
+        );
     }
 
     #[tokio::test]

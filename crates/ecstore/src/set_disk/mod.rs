@@ -4446,6 +4446,7 @@ mod tests {
     use crate::layout::endpoints::SetupType;
     use crate::object_api::BLOCK_SIZE_V2;
     use crate::object_api::ObjectInfo;
+    use crate::set_disk::read::GetObjectOutputKind;
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
         namespace::NamespaceLocking as _, object::ObjectIO as _, object::ObjectOperations as _,
@@ -8400,6 +8401,7 @@ mod tests {
                 range_offset,
                 range_length as i64,
                 &mut writer,
+                GetObjectOutputKind::HttpResponse,
                 fi,
                 files,
                 &disks,
@@ -8511,6 +8513,7 @@ mod tests {
                 0,
                 total_size as i64,
                 &mut writer,
+                GetObjectOutputKind::HttpResponse,
                 fi,
                 files,
                 &disks,
