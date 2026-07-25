@@ -43,12 +43,27 @@ pub mod bucket {
 
         pub mod bucket_lifecycle_ops {
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
-                ExpiryState, LifecycleOps, ManualTransitionRunExecution, ManualTransitionRunOptions, ManualTransitionRunReport,
-                RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule, apply_transition_rule,
+                ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionQueueSnapshot,
+                ManualTransitionRunExecution, ManualTransitionRunOptions, ManualTransitionRunReport, RestoreRequestOps,
+                TransitionState, TransitionedObject, apply_expiry_rule, apply_transition_rule,
                 enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
                 enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
                 enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, post_restore_opts, run_stale_multipart_upload_cleanup_once, validate_transition_tier,
+                init_background_expiry, manual_transition_queue_snapshot, post_restore_opts,
+                run_stale_multipart_upload_cleanup_once, validate_transition_tier,
+            };
+        }
+
+        pub mod manual_transition_job {
+            pub use crate::bucket::lifecycle::manual_transition_job::{
+                ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
+                ManualTransitionScopeAdmissionClaim, claim_manual_transition_scope_admission,
+                delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
+                load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
+                manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired,
+                manual_transition_scope_key, persist_manual_transition_job_progress, request_manual_transition_job_cancel,
+                save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+                save_manual_transition_scope_admission_if_absent,
             };
         }
 

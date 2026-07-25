@@ -48,6 +48,7 @@ mod tests {
     const ADMIN_INFO_PATH: &str = "/rustfs/admin/v3/info";
     const ADMIN_MANUAL_TRANSITION_PATH: &str =
         "/rustfs/admin/v3/ilm/transition/run?bucket=auth-deny-manual-transition&maxObjects=1";
+    const ADMIN_MANUAL_TRANSITION_JOB_PATH: &str = "/rustfs/admin/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111";
 
     /// Send a SigV4-signed request to `path` (optionally with a JSON `body`) and
     /// return `(status, body)`. Uses the `UNSIGNED_PAYLOAD` content hash so a
@@ -189,6 +190,42 @@ mod tests {
             root_body.contains("\"mode\":\"enqueue_only\""),
             "root response should be the manual transition JSON contract, body: {root_body}"
         );
+        let (root_status, root_body) = signed_request(
+            &env.url,
+            http::Method::GET,
+            ADMIN_MANUAL_TRANSITION_JOB_PATH,
+            None,
+            &env.access_key,
+            &env.secret_key,
+        )
+        .await?;
+        assert_eq!(
+            root_status,
+            reqwest::StatusCode::NOT_FOUND,
+            "root credential must reach the manual transition status handler, body: {root_body}"
+        );
+        assert!(
+            root_body.contains("NoSuchKey"),
+            "missing durable job should return NoSuchKey once authorized, body: {root_body}"
+        );
+        let (root_status, root_body) = signed_request(
+            &env.url,
+            http::Method::DELETE,
+            ADMIN_MANUAL_TRANSITION_JOB_PATH,
+            None,
+            &env.access_key,
+            &env.secret_key,
+        )
+        .await?;
+        assert_eq!(
+            root_status,
+            reqwest::StatusCode::NOT_FOUND,
+            "root credential must reach the manual transition cancel handler, body: {root_body}"
+        );
+        assert!(
+            root_body.contains("NoSuchKey"),
+            "missing durable job cancel should return NoSuchKey once authorized, body: {root_body}"
+        );
 
         let (status, body) =
             signed_request(&env.url, http::Method::POST, ADMIN_MANUAL_TRANSITION_PATH, None, user_ak, user_sk).await?;
@@ -200,6 +237,28 @@ mod tests {
         assert!(
             body.contains("AccessDenied"),
             "manual transition rejection must carry the AccessDenied S3 error code, body: {body}"
+        );
+        let (status, body) =
+            signed_request(&env.url, http::Method::GET, ADMIN_MANUAL_TRANSITION_JOB_PATH, None, user_ak, user_sk).await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::FORBIDDEN,
+            "non-admin credential must get 403 on manual transition status, body: {body}"
+        );
+        assert!(
+            body.contains("AccessDenied"),
+            "manual transition status rejection must carry the AccessDenied S3 error code, body: {body}"
+        );
+        let (status, body) =
+            signed_request(&env.url, http::Method::DELETE, ADMIN_MANUAL_TRANSITION_JOB_PATH, None, user_ak, user_sk).await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::FORBIDDEN,
+            "non-admin credential must get 403 on manual transition cancel, body: {body}"
+        );
+        assert!(
+            body.contains("AccessDenied"),
+            "manual transition cancel rejection must carry the AccessDenied S3 error code, body: {body}"
         );
 
         env.stop_server();

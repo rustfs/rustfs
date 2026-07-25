@@ -58,7 +58,6 @@ use crate::storage_api_contracts::{
 };
 use crate::store::ECStore;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
-use futures::Future;
 use http::HeaderMap;
 use rand::RngExt as _;
 use rustfs_common::metrics::{
@@ -83,6 +82,7 @@ use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -1163,6 +1163,20 @@ impl TransitionState {
 
     fn record_scanner_transition_state(&self) {
         global_metrics().record_scanner_lifecycle_transition_state(self.scanner_transition_state_update());
+    }
+
+    pub fn manual_transition_queue_snapshot(&self) -> ManualTransitionQueueSnapshot {
+        let state = self.scanner_transition_state_update();
+        ManualTransitionQueueSnapshot {
+            queue_capacity: state.queue_capacity,
+            queued: state.queued,
+            active: state.active,
+            workers: state.workers,
+            queue_full: state.queue_full,
+            queue_send_timeout: state.queue_send_timeout,
+            compensation_pending: state.compensation_pending,
+            compensation_running: state.compensation_running,
+        }
     }
 
     fn handle_immediate_enqueue_failure(self: &Arc<Self>, oi: &ObjectInfo, src: &LcEventSrc, failure: ImmediateEnqueueFailure) {
@@ -2434,18 +2448,58 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub type ManualTransitionCancelCheck = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ManualTransitionRunOptions {
     pub prefix: String,
     pub marker: Option<String>,
     pub version_marker: Option<String>,
+    pub continuation_token: Option<String>,
     pub tier: Option<String>,
     pub dry_run: bool,
     pub max_objects: Option<u64>,
     pub max_duration: Option<std::time::Duration>,
+    #[serde(skip)]
+    pub cancel_token: Option<CancellationToken>,
+    #[serde(skip)]
+    pub cancel_check: Option<ManualTransitionCancelCheck>,
 }
 
+impl std::fmt::Debug for ManualTransitionRunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManualTransitionRunOptions")
+            .field("prefix", &self.prefix)
+            .field("marker", &self.marker)
+            .field("version_marker", &self.version_marker)
+            .field("continuation_token", &self.continuation_token)
+            .field("tier", &self.tier)
+            .field("dry_run", &self.dry_run)
+            .field("max_objects", &self.max_objects)
+            .field("max_duration", &self.max_duration)
+            .field("cancel_token", &self.cancel_token.is_some())
+            .field("cancel_check", &self.cancel_check.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ManualTransitionRunOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefix == other.prefix
+            && self.marker == other.marker
+            && self.version_marker == other.version_marker
+            && self.continuation_token == other.continuation_token
+            && self.tier == other.tier
+            && self.dry_run == other.dry_run
+            && self.max_objects == other.max_objects
+            && self.max_duration == other.max_duration
+    }
+}
+
+impl Eq for ManualTransitionRunOptions {}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManualTransitionRunReport {
     pub bucket: String,
     pub prefix: String,
@@ -2466,12 +2520,28 @@ pub struct ManualTransitionRunReport {
     pub skipped_queue_full: u64,
     pub skipped_queue_closed: u64,
     pub skipped_queue_timeout: u64,
+    pub tier_failure: u64,
     pub truncated_by_limit: bool,
     pub truncated_by_duration: bool,
-    #[serde(skip_serializing)]
+    pub cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+    #[serde(skip)]
     pub next_marker: Option<String>,
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub next_version_idmarker: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManualTransitionQueueSnapshot {
+    pub queue_capacity: u64,
+    pub queued: u64,
+    pub active: u64,
+    pub workers: u64,
+    pub queue_full: u64,
+    pub queue_send_timeout: u64,
+    pub compensation_pending: u64,
+    pub compensation_running: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2496,7 +2566,7 @@ impl ManualTransitionRunReport {
     }
 
     pub fn was_truncated(&self) -> bool {
-        self.truncated_by_limit || self.truncated_by_duration
+        self.truncated_by_limit || self.truncated_by_duration || self.cancelled
     }
 
     fn record_enqueue_outcome(&mut self, outcome: TransitionEnqueueOutcome) {
@@ -2518,9 +2588,61 @@ impl ManualTransitionRunReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualTransitionContinuationToken {
+    marker: Option<String>,
+    version_marker: Option<String>,
+}
+
+fn encode_manual_transition_continuation_token(marker: Option<String>, version_marker: Option<String>) -> Option<String> {
+    if marker.is_none() && version_marker.is_none() {
+        return None;
+    }
+    let token = ManualTransitionContinuationToken { marker, version_marker };
+    serde_json::to_vec(&token)
+        .ok()
+        .map(|encoded| base64_simd::URL_SAFE_NO_PAD.encode_to_string(&encoded))
+}
+
+pub fn decode_manual_transition_continuation_token(token: &str) -> Result<(Option<String>, Option<String>), Error> {
+    if token.trim().is_empty() {
+        return Err(Error::other("manual transition continuation token is empty"));
+    }
+    let decoded = base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(token.as_bytes())
+        .map_err(|err| Error::other(format!("decode manual transition continuation token failed: {err}")))?;
+    let token: ManualTransitionContinuationToken = serde_json::from_slice(&decoded)
+        .map_err(|err| Error::other(format!("parse manual transition continuation token failed: {err}")))?;
+    Ok((
+        token.marker.filter(|marker| !marker.is_empty()),
+        token.version_marker.filter(|marker| !marker.is_empty()),
+    ))
+}
+
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let _ = enqueue_transition_for_existing_objects_scoped(api, bucket, ManualTransitionRunOptions::default()).await?;
     Ok(())
+}
+
+pub fn manual_transition_queue_snapshot() -> ManualTransitionQueueSnapshot {
+    runtime_sources::transition_state_handle().manual_transition_queue_snapshot()
+}
+
+pub async fn enqueue_transition_for_existing_objects_scoped_with_cancel(
+    api: Arc<ECStore>,
+    bucket: &str,
+    mut options: ManualTransitionRunOptions,
+    cancel_token: Option<CancellationToken>,
+) -> Result<ManualTransitionRunExecution, Error> {
+    if cancel_token.is_some() {
+        options.cancel_token = cancel_token;
+    }
+    let report = enqueue_transition_for_existing_objects_scoped(api, bucket, options).await?;
+    Ok(ManualTransitionRunExecution {
+        cancelled: report.cancelled,
+        report,
+    })
 }
 
 pub async fn enqueue_transition_for_existing_objects_scoped(
@@ -2528,98 +2650,81 @@ pub async fn enqueue_transition_for_existing_objects_scoped(
     bucket: &str,
     options: ManualTransitionRunOptions,
 ) -> Result<ManualTransitionRunReport, Error> {
-    Ok(enqueue_transition_for_existing_objects_scoped_with_cancel(api, bucket, options, None)
-        .await?
-        .report)
-}
-
-pub async fn enqueue_transition_for_existing_objects_scoped_with_cancel(
-    api: Arc<ECStore>,
-    bucket: &str,
-    options: ManualTransitionRunOptions,
-    cancel_token: Option<CancellationToken>,
-) -> Result<ManualTransitionRunExecution, Error> {
     const LIST_PAGE_SIZE: i32 = 1000;
 
     let mut report = ManualTransitionRunReport::new(bucket, &options);
+    let (mut marker, mut version_marker) = if let Some(token) = options.continuation_token.as_deref() {
+        decode_manual_transition_continuation_token(token)?
+    } else {
+        (options.marker.clone(), options.version_marker.clone())
+    };
     let Some(lc) = runtime_sources::bucket_lifecycle_config(bucket).await else {
-        return Ok(ManualTransitionRunExecution {
-            report,
-            cancelled: false,
-        });
+        return Ok(report);
     };
     report.lifecycle_config_found = true;
-    let mut marker = options.marker.clone();
-    let mut version_marker = options.version_marker.clone();
     let mut previous_marker = marker.clone();
     let mut previous_version_marker = version_marker.clone();
     let src = LcEventSrc::Scanner;
     let deadline = options.max_duration.map(|duration| tokio::time::Instant::now() + duration);
 
     loop {
-        if manual_transition_cancelled(cancel_token.as_ref()) {
-            return Ok(ManualTransitionRunExecution { report, cancelled: true });
-        }
-
         let page = api
             .clone()
             .list_object_versions(bucket, &options.prefix, marker.clone(), version_marker.clone(), None, LIST_PAGE_SIZE)
             .await?;
 
         for (index, object) in page.objects.iter().enumerate() {
-            if manual_transition_cancelled(cancel_token.as_ref()) {
+            if manual_transition_cancel_requested(&options).await {
+                report.cancelled = true;
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
-                return Ok(ManualTransitionRunExecution { report, cancelled: true });
+                report.continuation_token =
+                    encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+                return Ok(report);
             }
             if manual_transition_duration_elapsed(deadline) {
                 report.truncated_by_duration = true;
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
-                return Ok(ManualTransitionRunExecution {
-                    report,
-                    cancelled: false,
-                });
+                report.continuation_token =
+                    encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+                return Ok(report);
             }
             report.scanned = report.scanned.saturating_add(1);
             enqueue_transition_with_lifecycle_report(object, &lc, &src, &options, &mut report).await;
             if report.has_partial_enqueue() {
                 report.next_marker.clone_from(&previous_marker);
                 report.next_version_idmarker.clone_from(&previous_version_marker);
-                return Ok(ManualTransitionRunExecution {
-                    report,
-                    cancelled: false,
-                });
+                report.continuation_token =
+                    encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+                return Ok(report);
             }
             if options.max_objects.is_some_and(|max_objects| report.scanned >= max_objects) {
                 if manual_transition_has_more_after_limit(index, page.objects.len(), page.is_truncated) {
                     report.truncated_by_limit = true;
                     report.next_marker = Some(object.name.clone());
                     report.next_version_idmarker = Some(manual_transition_version_marker(object));
+                    report.continuation_token = encode_manual_transition_continuation_token(
+                        report.next_marker.clone(),
+                        report.next_version_idmarker.clone(),
+                    );
                 }
-                return Ok(ManualTransitionRunExecution {
-                    report,
-                    cancelled: false,
-                });
+                return Ok(report);
             }
             previous_marker = Some(object.name.clone());
             previous_version_marker = Some(manual_transition_version_marker(object));
         }
 
         if !page.is_truncated {
-            return Ok(ManualTransitionRunExecution {
-                report,
-                cancelled: false,
-            });
+            return Ok(report);
         }
         if manual_transition_duration_elapsed(deadline) {
             report.truncated_by_duration = true;
             report.next_marker.clone_from(&previous_marker);
             report.next_version_idmarker.clone_from(&previous_version_marker);
-            return Ok(ManualTransitionRunExecution {
-                report,
-                cancelled: false,
-            });
+            report.continuation_token =
+                encode_manual_transition_continuation_token(report.next_marker.clone(), report.next_version_idmarker.clone());
+            return Ok(report);
         }
 
         marker = page.next_marker;
@@ -2823,8 +2928,14 @@ fn manual_transition_duration_elapsed(deadline: Option<tokio::time::Instant>) ->
     deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
 }
 
-fn manual_transition_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
-    cancel_token.is_some_and(CancellationToken::is_cancelled)
+async fn manual_transition_cancel_requested(options: &ManualTransitionRunOptions) -> bool {
+    if options.cancel_token.as_ref().is_some_and(|token| token.is_cancelled()) {
+        return true;
+    }
+    match options.cancel_check.as_ref() {
+        Some(cancel_check) => cancel_check().await,
+        None => false,
+    }
 }
 
 fn manual_transition_version_marker(oi: &ObjectInfo) -> String {
@@ -3742,7 +3853,7 @@ mod tests {
         enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report,
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
-        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets, manual_transition_cancelled,
+        lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
         manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate, replication_state_for_delete,
         resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
@@ -3754,6 +3865,9 @@ mod tests {
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+    use crate::bucket::lifecycle::bucket_lifecycle_ops::{
+        decode_manual_transition_continuation_token, encode_manual_transition_continuation_token,
+    };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
     };
@@ -6495,15 +6609,51 @@ mod tests {
     }
 
     #[test]
-    fn manual_transition_cancel_token_detects_cancelled_state() {
-        let cancel_token = CancellationToken::new();
+    fn manual_transition_continuation_token_round_trips_resume_cursor() {
+        let token = encode_manual_transition_continuation_token(Some("logs/a".to_string()), Some("null".to_string()))
+            .expect("non-empty cursor should encode");
 
-        assert!(!manual_transition_cancelled(None));
-        assert!(!manual_transition_cancelled(Some(&cancel_token)));
+        let (marker, version_marker) =
+            decode_manual_transition_continuation_token(&token).expect("continuation token should decode");
 
-        cancel_token.cancel();
+        assert_eq!(marker.as_deref(), Some("logs/a"));
+        assert_eq!(version_marker.as_deref(), Some("null"));
+    }
 
-        assert!(manual_transition_cancelled(Some(&cancel_token)));
+    #[test]
+    fn manual_transition_continuation_token_rejects_malformed_input() {
+        let err =
+            decode_manual_transition_continuation_token("not-base64").expect_err("malformed continuation token must fail closed");
+
+        assert!(err.to_string().contains("decode manual transition continuation token failed"));
+    }
+
+    #[test]
+    fn manual_transition_report_serializes_public_continuation_only() {
+        let report = ManualTransitionRunReport {
+            continuation_token: Some("opaque".to_string()),
+            next_marker: Some("logs/a".to_string()),
+            next_version_idmarker: Some("null".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(report).expect("report should serialize");
+
+        assert_eq!(value.get("continuation_token").and_then(|value| value.as_str()), Some("opaque"));
+        assert!(value.get("next_marker").is_none());
+        assert!(value.get("next_version_idmarker").is_none());
+    }
+
+    #[test]
+    fn manual_transition_cancelled_report_is_partial_and_resumable() {
+        let report = ManualTransitionRunReport {
+            cancelled: true,
+            continuation_token: Some("opaque".to_string()),
+            ..Default::default()
+        };
+
+        assert!(report.was_truncated());
+        assert!(!report.has_partial_enqueue());
     }
 
     #[tokio::test]
