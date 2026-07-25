@@ -24,7 +24,7 @@ pub use binding::FederatedSessionBinding;
 pub use error::{FederatedSessionBindingError, FederationError, Result};
 pub use model::{
     FederatedAuthorization, FederatedClaims, FederatedCodeExchange, FederatedLoginSession, FederatedSession,
-    FederatedSessionTransaction,
+    FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM,
 };
 pub use provider::FederatedIdentityProvider;
 pub use registry::FederatedIdentityRegistry;

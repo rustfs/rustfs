@@ -42,7 +42,7 @@ fn assert_managed_encryption_metadata_hidden(metadata: Option<&HashMap<String, S
     }
 }
 
-fn assert_storage_encrypted(storage_root: &std::path::Path, bucket: &str, key: &str, plaintext: &[u8]) {
+pub(super) fn assert_storage_encrypted(storage_root: &std::path::Path, bucket: &str, key: &str, plaintext: &[u8]) {
     let mut stack = VecDeque::from([storage_root.to_path_buf()]);
     let mut scanned = 0;
     let mut plaintext_path: Option<std::path::PathBuf> = None;

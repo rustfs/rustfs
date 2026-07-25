@@ -39,6 +39,7 @@ use local_ip_address::local_ip;
 use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
+use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use s3s::Body;
 use serde_json::Value;
 use serial_test::serial;
@@ -68,6 +69,11 @@ const NOTIFY_REGION: &str = "us-east-1";
 /// `arn:rustfs:sqs:<region>:<name>:webhook`.
 fn target_arn(target_name: &str) -> String {
     format!("arn:rustfs:sqs:{NOTIFY_REGION}:{target_name}:webhook")
+}
+
+fn endpoint_origin(endpoint: &str) -> Result<String, BoxError> {
+    let parsed = reqwest::Url::parse(endpoint)?;
+    Ok(parsed.origin().ascii_serialization())
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +159,7 @@ async fn spawn_event_collector() -> Result<(String, mpsc::UnboundedReceiver<Valu
     let endpoint_ip = local_ip()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = serve_event_collector(listener, tx);
-    Ok((format!("http://{endpoint_ip}.nip.io:{port}/events"), rx, handle))
+    Ok((format!("http://{}/events", std::net::SocketAddr::new(endpoint_ip, port)), rx, handle))
 }
 
 struct HttpsEventCollector {
@@ -209,9 +215,9 @@ fn spawn_https_event_collector(ca_path: &Path) -> Result<HttpsEventCollector, Bo
     listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
     let endpoint_ip = local_ip()?;
-    let endpoint_host = format!("{endpoint_ip}.nip.io");
+    let endpoint_host = endpoint_ip.to_string();
 
-    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![endpoint_host.clone()])?;
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![endpoint_host])?;
     std::fs::write(ca_path, cert.pem())?;
 
     let cert_chain = vec![cert.der().clone()];
@@ -246,7 +252,7 @@ fn spawn_https_event_collector(ca_path: &Path) -> Result<HttpsEventCollector, Bo
     });
 
     Ok(HttpsEventCollector {
-        endpoint: format!("https://{endpoint_host}:{}/events", addr.port()),
+        endpoint: format!("https://{}/events", std::net::SocketAddr::new(endpoint_ip, addr.port())),
         running,
         handle: Some(handle),
         events,
@@ -586,11 +592,17 @@ async fn test_https_webhook_target_delivers_event_with_notify_env_enabled() -> T
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
-        .await?;
-
     let ca_path = Path::new(&env.temp_dir).join("https-webhook-ca.pem");
     let mut collector = spawn_https_event_collector(&ca_path)?;
+    let allowed_origin = endpoint_origin(collector.endpoint())?;
+    env.start_rustfs_server_with_env(
+        vec![],
+        &[
+            ("RUSTFS_NOTIFY_ENABLE", "true"),
+            (ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str()),
+        ],
+    )
+    .await?;
     let target = "peri1https";
     let bucket = "peri1-https-events";
     let key = "uploads/https.dat";
@@ -635,9 +647,11 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
     init_logging();
 
     let (endpoint, mut rx, handle) = spawn_event_collector().await?;
+    let allowed_origin = endpoint_origin(&endpoint)?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str())])
+        .await?;
     enable_notify_module(&env).await?;
 
     let bucket = "peri1-events";
@@ -789,15 +803,6 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
 async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     init_logging();
 
-    let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
-    enable_notify_module(&env).await?;
-
-    let bucket = "peri1-redeliver";
-    let target = "peri1redeliver";
-    let client = env.create_s3_client();
-    client.create_bucket().bucket(bucket).send().await?;
-
     // Configure the target while its endpoint is reachable so activation and
     // ARN registration complete deterministically. Registering against a dead
     // endpoint stalls behind the reachability probe's timeout and flakes the
@@ -806,9 +811,20 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let port = listener.local_addr()?.port();
     let endpoint_ip = local_ip()?;
-    let endpoint = format!("http://{endpoint_ip}.nip.io:{port}/events");
+    let endpoint = format!("http://{}/events", std::net::SocketAddr::new(endpoint_ip, port));
+    let allowed_origin = endpoint_origin(&endpoint)?;
     let (setup_tx, _setup_rx) = mpsc::unbounded_channel();
     let setup_handle = serve_event_collector(listener, setup_tx);
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[(ENV_OUTBOUND_ALLOW_ORIGINS, allowed_origin.as_str())])
+        .await?;
+    enable_notify_module(&env).await?;
+
+    let bucket = "peri1-redeliver";
+    let target = "peri1redeliver";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
 
     configure_webhook_target(&env, target, &endpoint).await?;
     wait_for_target_registered(&env, target).await?;

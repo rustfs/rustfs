@@ -20,6 +20,8 @@
 //! SetDisks core (io_primitives) via inherent calls.
 
 use super::super::*;
+use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
@@ -30,6 +32,7 @@ use crate::bucket::lifecycle::{
         save_transition_transaction_record,
     },
 };
+use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
@@ -638,7 +641,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // task so it lives for the duration of the streaming read.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
-            let mut writer = wd;
+            let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
@@ -663,24 +666,43 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             .await
             {
                 let reason = classify_storage_error(&e);
-                record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
-                error!(
-                    event = EVENT_SET_DISK_WRITE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                    bucket,
-                    object,
-                    pool_index,
-                    set_index,
-                    offset,
-                    requested_length = length,
-                    skip_verify_bitrot = skip_verify,
-                    state = "read_pipeline_failed",
-                    stage = GET_STAGE_EMIT,
-                    reason = reason.as_str(),
-                    error = ?e,
-                    "Set disk object read pipeline failed"
-                );
+                if reason == GetObjectFailureReason::DownstreamClosed {
+                    debug!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        state = "downstream_closed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline stopped after downstream closed"
+                    );
+                } else {
+                    record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
+                    error!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        skip_verify_bitrot = skip_verify,
+                        state = "read_pipeline_failed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline failed"
+                    );
+                }
             };
         });
 
@@ -787,7 +809,7 @@ impl SetDisks {
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
         let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = async {
-            let erasure = erasure_from_file_info(&fi, false)?;
+            let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
             let put_object_size = known_put_object_storage_size(data.size());
             let is_inline_buffer = storage_class_config.should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
@@ -875,7 +897,7 @@ impl SetDisks {
 
             let encode_stage_start = Instant::now();
             let (reader, w_size) = match write_path {
-                SmallWritePath::Inline => match Arc::new(erasure)
+                SmallWritePath::Inline => match Arc::clone(&erasure)
                     .encode_inline_small(stream, &mut writers, write_quorum)
                     .await
                 {
@@ -885,7 +907,7 @@ impl SetDisks {
                         return Err(e.into());
                     }
                 },
-                SmallWritePath::SingleBlockNonInline => match Arc::new(erasure)
+                SmallWritePath::SingleBlockNonInline => match Arc::clone(&erasure)
                     .encode_single_block_non_inline(stream, &mut writers, write_quorum)
                     .await
                 {
@@ -896,7 +918,7 @@ impl SetDisks {
                     }
                 },
                 SmallWritePath::PipelineBatchedLarge => {
-                    match Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await {
+                    match Arc::clone(&erasure).encode_batched(stream, &mut writers, write_quorum).await {
                         Ok((r, w)) => (r, w),
                         Err(e) => {
                             error!("encode_batched err {:?}", e);
@@ -904,7 +926,7 @@ impl SetDisks {
                         }
                     }
                 }
-                SmallWritePath::Pipeline => match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
+                SmallWritePath::Pipeline => match Arc::clone(&erasure).encode(stream, &mut writers, write_quorum).await {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
                         error!("encode err {:?}", e);
@@ -1022,6 +1044,32 @@ impl SetDisks {
             }
 
             drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
+
+            if fi.erasure.parity_blocks == 0 {
+                let written_size = i64::try_from(w_size).map_err(|_| Error::other("put_object written size overflows i64"))?;
+                let logical_shard_size = usize::try_from(erasure.shard_file_size(written_size))
+                    .map_err(|_| Error::other("put_object shard size overflows usize"))?;
+                verify_written_bitrot_shards(
+                    &shuffle_disks,
+                    if is_inline_buffer {
+                        Some(parts_metadatas.as_slice())
+                    } else {
+                        None
+                    },
+                    BitrotSelfVerifyTarget {
+                        operation: "put_object",
+                        bucket,
+                        object,
+                        part_number: None,
+                        volume: RUSTFS_META_TMP_BUCKET,
+                        path: &tmp_object,
+                        logical_shard_size,
+                        shard_size,
+                        write_quorum,
+                    },
+                )
+                .await?;
+            }
 
             if !opts.no_lock && object_lock_guard.is_none() {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
@@ -3880,22 +3928,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
 }
 
-/// Null out any disk whose shard writer failed (or was never created) so its
-/// truncated/absent shard is not committed by `rename_data`, and return the
-/// number of disks that still carry a fully-written shard. Extracted for unit
-/// testing the write-quorum accounting (backlog#852 / #799 B3).
-fn drop_failed_writer_disks<D, W>(disks: &mut [Option<D>], writers: &[Option<W>]) -> usize {
-    let mut committed = 0usize;
-    for (slot, writer) in disks.iter_mut().zip(writers.iter()) {
-        if writer.is_none() {
-            *slot = None;
-        } else if slot.is_some() {
-            committed += 1;
-        }
-    }
-    committed
-}
-
 #[cfg(test)]
 mod erasure_construction_tests {
     use super::*;
@@ -3917,38 +3949,6 @@ mod erasure_construction_tests {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<ErasureConstructionError>());
-    }
-}
-
-#[cfg(test)]
-mod b3_write_quorum_tests {
-    use super::drop_failed_writer_disks;
-
-    #[test]
-    fn excludes_failed_writers_and_counts_committed() {
-        // Writer 2 failed (short write / error -> nulled). Its disk must be
-        // dropped so the truncated shard is not renamed or counted.
-        let mut disks = vec![Some(0u8), Some(1), Some(2), Some(3)];
-        let writers = vec![Some(()), Some(()), None, Some(())];
-        assert_eq!(drop_failed_writer_disks(&mut disks, &writers), 3);
-        assert_eq!(disks, vec![Some(0), Some(1), None, Some(3)]);
-    }
-
-    #[test]
-    fn offline_disk_stays_excluded_and_uncounted() {
-        // Disk 1 was offline at setup (disk None, writer None): stays None, not counted.
-        let mut disks = vec![Some(0u8), None, Some(2)];
-        let writers = vec![Some(()), None, Some(())];
-        assert_eq!(drop_failed_writer_disks(&mut disks, &writers), 2);
-        assert_eq!(disks, vec![Some(0), None, Some(2)]);
-    }
-
-    #[test]
-    fn all_writers_ok_keeps_every_disk() {
-        let mut disks = vec![Some(0u8), Some(1), Some(2)];
-        let writers = vec![Some(()), Some(()), Some(())];
-        assert_eq!(drop_failed_writer_disks(&mut disks, &writers), 3);
-        assert_eq!(disks, vec![Some(0), Some(1), Some(2)]);
     }
 }
 

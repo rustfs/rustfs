@@ -97,19 +97,44 @@ pub const ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE: &str = "RUSTFS_INTERNODE_RPC_MAX_M
 pub const ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: &str = "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES";
 pub const DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: usize = 8 * 1024 * 1024;
 
-/// Stop dual-writing the JSON compatibility strings on internode metadata RPCs and send only the
+/// Request stopping the JSON compatibility strings on internode metadata RPCs and sending only the
 /// msgpack `_bin` payloads (grpc-optimization P2-1).
 ///
-/// Defaults to `false` (dual-write, byte-for-byte legacy behavior). This is a rollout lever, not a
-/// wire-format change: it may only be enabled **after** the JSON-fallback counter
-/// (`rustfs_system_network_internode_msgpack_json_fallback_total`) has read zero across a release
-/// window fleet-wide, confirming every peer decodes `_bin` first. Single-env rollback. See
+/// Defaults to `false` (dual-write, byte-for-byte legacy behavior). This is only a request; RustFS
+/// keeps JSON compatibility fields unless [`ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED`] is also
+/// true after the release-window convergence and rollback gates pass. See
 /// `docs/operations/internode-msgpack-json-convergence-runbook.md`.
 pub const ENV_INTERNODE_RPC_MSGPACK_ONLY: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY";
 pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY: bool = false;
 
-// Compile-time invariant: dual-write by default so the base build is byte-for-byte legacy behavior.
+/// Explicit fleet-wide confirmation gate for [`ENV_INTERNODE_RPC_MSGPACK_ONLY`].
+///
+/// This separate default-off guard prevents a single legacy flag from accidentally emptying JSON
+/// fields in a mixed-version fleet where an older peer still reads the JSON field.
+pub const ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED";
+pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: bool = false;
+
+// Compile-time invariants: dual-write by default so the base build is byte-for-byte legacy behavior.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED);
+
+/// Require target-bound v2 signatures on every internode gRPC request, rejecting the legacy
+/// constant-target fallback instead of accepting it (<https://github.com/rustfs/backlog/issues/1327>).
+///
+/// Defaults to `false` (fail-open): a request without any v2 auth headers keeps authenticating
+/// through the legacy signature, so legacy-only peers survive rolling upgrades with byte-for-byte
+/// the pre-gate acceptance behavior. This is a rollout lever, not a wire-format change: it may only
+/// be enabled **after** the v1-fallback counter
+/// (`rustfs_system_network_internode_signature_v1_fallback_total`) has read zero across a release
+/// window fleet-wide, confirming every peer already sends v2 authentication on every internode gRPC
+/// request. Single-env rollback. Requests that do carry v2 headers are unaffected by this switch:
+/// they are always verified as v2 with no downgrade, strict or not.
+pub const ENV_INTERNODE_RPC_SIGNATURE_STRICT: &str = "RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT";
+pub const DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT: bool = false;
+
+// Compile-time invariant: fail-open by default so legacy-only peers keep authenticating during
+// rolling upgrades until the fleet-wide v1-fallback counter reads zero.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT);
 
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
 /// P3 observability).
@@ -273,8 +298,18 @@ mod tests {
 
     #[test]
     fn internode_msgpack_only_env_name_is_stable() {
-        // The dual-write-by-default invariant is asserted at compile time next to the definition.
+        // The dual-write-by-default invariants are asserted at compile time next to the definitions.
         assert_eq!(ENV_INTERNODE_RPC_MSGPACK_ONLY, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY");
+        assert_eq!(
+            ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
+            "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn internode_signature_strict_env_name_is_stable() {
+        // The fail-open default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_SIGNATURE_STRICT, "RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT");
     }
 
     #[test]

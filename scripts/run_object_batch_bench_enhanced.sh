@@ -53,6 +53,13 @@ SERVICE_PROMETHEUS_QUERY_URL=""
 SERVICE_PROMETHEUS_QUERY=""
 SERVICE_PROMETHEUS_QUERY_EXPLICIT=false
 SERVICE_METRICS_SERVICE_NAME=""
+SERVER_IMAGE_REF=""
+SERVER_IMAGE_DIGEST=""
+SERVER_REVISION=""
+REQUIRE_SERVER_PROVENANCE=false
+RUN_LABELS=()
+NODE_METRICS_URLS=()
+NODE_DOCKER_CONTAINERS=()
 
 usage() {
   cat <<'USAGE'
@@ -114,12 +121,26 @@ Enhanced options:
   --service-metrics-filter-regex
                                Regex for retained metrics lines after scrape
                                (default: auto by tool/mode)
+  --server-image-ref           Image reference of the benchmarked server
+  --server-image-digest        Immutable image digest of the benchmarked server
+  --server-revision            Source revision built into the benchmarked server
+  --require-server-provenance  Fail unless the three server identity fields are set
+  --label <key=value>          Repeatable run label written to run_manifest.env
+  --node-metrics-url <node=url>
+                               Repeatable node-specific Prometheus scrape URL captured
+                               before/after each round attempt
+  --node-docker-container <node=container>
+                               Repeatable Docker container mapped to a node; captures
+                               CPU, memory, network, and block I/O before/after each round
 
 Output files:
   round_results.csv            One row per round attempt (with retry trace)
   median_summary.csv           Median metrics per object size
   baseline_compare.csv         Delta vs baseline (if --baseline-csv is set)
   <service-metrics-dir>/*.prom  Optional per-round service metric snapshots
+  node_inventory.csv            Per-node container and immutable image identity
+  node_metrics_captures.csv    Per-node metric snapshot inventory
+  node_resource_captures.csv   Per-node Docker resource and block I/O snapshots
 
 Example:
   scripts/run_object_batch_bench_enhanced.sh \
@@ -185,6 +206,13 @@ parse_args() {
       --service-metrics-max-time-secs) SERVICE_METRICS_MAX_TIME_SECS="$2"; shift 2 ;;
       --service-metrics-settle-secs) SERVICE_METRICS_SETTLE_SECS="$2"; shift 2 ;;
       --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$2"; SERVICE_METRICS_FILTER_REGEX_EXPLICIT=true; shift 2 ;;
+      --server-image-ref) SERVER_IMAGE_REF="$2"; shift 2 ;;
+      --server-image-digest) SERVER_IMAGE_DIGEST="$2"; shift 2 ;;
+      --server-revision) SERVER_REVISION="$2"; shift 2 ;;
+      --require-server-provenance) REQUIRE_SERVER_PROVENANCE=true; shift ;;
+      --label) RUN_LABELS+=("$2"); shift 2 ;;
+      --node-metrics-url) NODE_METRICS_URLS+=("$2"); shift 2 ;;
+      --node-docker-container) NODE_DOCKER_CONTAINERS+=("$2"); shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
         EXTRA_ARGS=($2)
@@ -214,6 +242,53 @@ validate_nonnegative_int() {
   local n="$2"
   if ! [[ "$v" =~ ^[0-9]+$ ]]; then
     echo "ERROR: $n must be a nonnegative integer, got: $v" >&2
+    exit 1
+  fi
+}
+
+validate_named_value() {
+  local value="$1"
+  local option_name="$2"
+  if ! [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*=.+$ ]] || [[ "$value" == *$'\n'* || "$value" == *,* ]]; then
+    echo "ERROR: $option_name must be name=value without commas or newlines, got: $value" >&2
+    exit 1
+  fi
+}
+
+validate_named_values() {
+  local option_name="$1"
+  shift
+  local entry name seen_names=""
+  for entry in "$@"; do
+    validate_named_value "$entry" "$option_name"
+    name="${entry%%=*}"
+    if [[ " $seen_names " == *" $name "* ]]; then
+      echo "ERROR: $option_name repeats name: $name" >&2
+      exit 1
+    fi
+    seen_names="${seen_names} ${name}"
+  done
+}
+
+validate_manifest_labels() {
+  local entry key
+  if ((${#RUN_LABELS[@]} == 0)); then
+    return
+  fi
+  for entry in "${RUN_LABELS[@]}"; do
+    key="${entry%%=*}"
+    if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "ERROR: --label name must be a shell-compatible manifest key, got: $key" >&2
+      exit 1
+    fi
+  done
+}
+
+validate_manifest_value() {
+  local value="$1"
+  local option_name="$2"
+  if [[ "$value" == *$'\n'* || "$value" == *,* ]]; then
+    echo "ERROR: $option_name must not contain commas or newlines" >&2
     exit 1
   fi
 }
@@ -295,21 +370,41 @@ validate_args() {
     echo "ERROR: --service-metrics-url and --service-prometheus-query-url are mutually exclusive" >&2
     exit 1
   fi
-  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]] && [[ -z "$SERVICE_METRICS_DIR" ]]; then
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" || ${#NODE_METRICS_URLS[@]} -gt 0 ]] && [[ -z "$SERVICE_METRICS_DIR" ]]; then
     echo "ERROR: --service-metrics-dir is required when service metrics capture is enabled" >&2
     exit 1
   fi
-  if [[ -n "$SERVICE_METRICS_URL" ]]; then
+  if [[ -n "$SERVICE_METRICS_URL" || ${#NODE_METRICS_URLS[@]} -gt 0 ]]; then
     require_cmd curl
   fi
   if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     require_cmd "$PYTHON_BIN"
+  fi
+  if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)) && [[ "$DRY_RUN" != "true" ]]; then
+    require_cmd docker
   fi
   if [[ "$TOOL" == "s3bench" ]]; then
     validate_positive_int "$SAMPLES" "--samples"
   fi
   if [[ -n "$BASELINE_CSV" && ! -f "$BASELINE_CSV" ]]; then
     echo "ERROR: --baseline-csv does not exist: $BASELINE_CSV" >&2
+    exit 1
+  fi
+  if ((${#RUN_LABELS[@]} > 0)); then
+    validate_named_values "--label" "${RUN_LABELS[@]}"
+  fi
+  validate_manifest_labels
+  if ((${#NODE_METRICS_URLS[@]} > 0)); then
+    validate_named_values "--node-metrics-url" "${NODE_METRICS_URLS[@]}"
+  fi
+  if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+    validate_named_values "--node-docker-container" "${NODE_DOCKER_CONTAINERS[@]}"
+  fi
+  validate_manifest_value "$SERVER_IMAGE_REF" "--server-image-ref"
+  validate_manifest_value "$SERVER_IMAGE_DIGEST" "--server-image-digest"
+  validate_manifest_value "$SERVER_REVISION" "--server-revision"
+  if [[ "$REQUIRE_SERVER_PROVENANCE" == "true" ]] && { [[ -z "$SERVER_IMAGE_REF" ]] || [[ -z "$SERVER_IMAGE_DIGEST" ]] || [[ -z "$SERVER_REVISION" ]]; }; then
+    echo "ERROR: --require-server-provenance needs --server-image-ref, --server-image-digest, and --server-revision" >&2
     exit 1
   fi
   if [[ "$TOOL" == "warp" ]]; then
@@ -354,6 +449,10 @@ git_dirty_state() {
   echo "clean"
 }
 
+write_manifest_entry() {
+  printf '%s=%q\n' "$1" "$2"
+}
+
 write_run_manifest() {
   local manifest_file="$OUT_DIR/run_manifest.env"
   local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv
@@ -367,9 +466,13 @@ write_run_manifest() {
 
   cat >"$manifest_file" <<EOF
 started_at_utc=${started_at_utc}
+manifest_schema_version=2
 git_commit=${git_commit}
 git_branch=${git_branch}
 git_dirty=${git_dirty}
+runner_git_commit=${git_commit}
+runner_git_branch=${git_branch}
+runner_git_dirty=${git_dirty}
 rustc_version=${rustc_version}
 uname=${uname_s}
 tool=${TOOL}
@@ -407,6 +510,47 @@ service_metrics_max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 service_metrics_settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 dry_run=${DRY_RUN}
 EOF
+  {
+    write_manifest_entry server_image_ref "${SERVER_IMAGE_REF:-unknown}"
+    write_manifest_entry server_image_digest "${SERVER_IMAGE_DIGEST:-unknown}"
+    write_manifest_entry server_revision "${SERVER_REVISION:-unknown}"
+    echo "require_server_provenance=${REQUIRE_SERVER_PROVENANCE}"
+    echo "run_label_count=${#RUN_LABELS[@]}"
+    if ((${#RUN_LABELS[@]} > 0)); then
+      local label
+      for label in "${RUN_LABELS[@]}"; do
+        write_manifest_entry "run_label_${label%%=*}" "${label#*=}"
+      done
+    fi
+    echo "node_metrics_count=${#NODE_METRICS_URLS[@]}"
+    echo "node_docker_container_count=${#NODE_DOCKER_CONTAINERS[@]}"
+  } >>"$manifest_file"
+}
+
+write_node_inventory() {
+  local inventory_csv="$OUT_DIR/node_inventory.csv"
+  local entry node container container_id image_id image_ref image_digest status
+  if ((${#NODE_DOCKER_CONTAINERS[@]} == 0)); then
+    return
+  fi
+
+  echo "node,container,status,container_id,image_id,image_ref,image_digest" > "$inventory_csv"
+  for entry in "${NODE_DOCKER_CONTAINERS[@]}"; do
+    node="${entry%%=*}"
+    container="${entry#*=}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo "$node,$container,not_run_dry_run,N/A,N/A,N/A,N/A" >> "$inventory_csv"
+      continue
+    fi
+    if ! container_id="$(docker inspect --format '{{.Id}}' "$container" 2>/dev/null)" || ! image_id="$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null)" || ! image_ref="$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)"; then
+      echo "$node,$container,capture_failed,N/A,N/A,N/A,N/A" >> "$inventory_csv"
+      echo "WARN: failed to inspect Docker node=${node} container=${container}" >&2
+      continue
+    fi
+    image_digest="$(docker image inspect --format '{{join .RepoDigests ";"}}' "$image_id" 2>/dev/null || echo N/A)"
+    status=ok
+    echo "$node,$container,$status,$container_id,$image_id,$image_ref,${image_digest:-N/A}" >> "$inventory_csv"
+  done
 }
 
 setup_output() {
@@ -414,21 +558,33 @@ setup_output() {
     OUT_DIR="target/bench/object-batch-enhanced-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "$OUT_DIR/logs"
-  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" || ${#NODE_METRICS_URLS[@]} -gt 0 ]]; then
     mkdir -p "$SERVICE_METRICS_DIR"
+  fi
+  if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+    mkdir -p "$OUT_DIR/node_resources"
   fi
 
   ROUND_CSV="$OUT_DIR/round_results.csv"
   MEDIAN_CSV="$OUT_DIR/median_summary.csv"
   COMPARE_CSV="$OUT_DIR/baseline_compare.csv"
   SERVICE_METRICS_CSV="$OUT_DIR/service_metrics_captures.csv"
+  NODE_METRICS_CSV="$OUT_DIR/node_metrics_captures.csv"
+  NODE_RESOURCE_CSV="$OUT_DIR/node_resource_captures.csv"
 
   echo "size,tool,round,attempt,concurrency,status,exit_code,round_started_at_utc,round_finished_at_utc,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file,req_p90_human,req_p90_ms,req_p99_human,req_p99_ms" > "$ROUND_CSV"
   echo "size,tool,concurrency,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms,median_req_p90_ms,median_req_p99_ms" > "$MEDIAN_CSV"
   if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     echo "size,tool,round,attempt,phase,source,status,capture_attempt,raw_bytes,snapshot_bytes,status_file,snapshot_file,filter_regex,prometheus_query" > "$SERVICE_METRICS_CSV"
   fi
+  if ((${#NODE_METRICS_URLS[@]} > 0)); then
+    echo "size,tool,round,attempt,phase,node,status,capture_attempt,raw_bytes,snapshot_bytes,status_file,snapshot_file,filter_regex" > "$NODE_METRICS_CSV"
+  fi
+  if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+    echo "size,tool,round,attempt,phase,node,container,status,snapshot_file" > "$NODE_RESOURCE_CSV"
+  fi
   write_run_manifest
+  write_node_inventory
 }
 
 trim() {
@@ -759,24 +915,65 @@ EOF
     return 0
   fi
 
-  for ((capture_attempt=1; capture_attempt<=SERVICE_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
-    if curl -fsS --noproxy '*' \
-      --connect-timeout "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" \
-      --max-time "$SERVICE_METRICS_MAX_TIME_SECS" \
-      "$SERVICE_METRICS_URL" >"$tmp_file"; then
-      if [[ -s "$tmp_file" ]]; then
-        raw_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
-        filter_service_metrics_snapshot "$tmp_file" "$filtered_file"
-        mv "$filtered_file" "$snapshot_file"
-        snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
-        cat >"$status_file" <<EOF
+  capture_direct_metrics_snapshot "$size" "$round" "$attempt" "$phase" service "$SERVICE_METRICS_URL"
+}
+
+append_direct_metrics_capture() {
+  local size="$1" round="$2" attempt="$3" phase="$4" node="$5" status="$6" capture_attempt="$7" raw_bytes="$8" snapshot_bytes="$9" status_file="${10}" snapshot_file="${11}"
+  if [[ "$node" == "service" ]]; then
+    echo "$size,$TOOL,$round,$attempt,$phase,prometheus_text,$status,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
+    return
+  fi
+  echo "$size,$TOOL,$round,$attempt,$phase,$node,$status,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX" >> "$NODE_METRICS_CSV"
+}
+
+capture_direct_metrics_snapshot() {
+  local size="$1" round="$2" attempt="$3" phase="$4" node="$5" metrics_url="$6"
+  local token snapshot_file status_file tmp_file filtered_file capture_attempt raw_bytes snapshot_bytes
+  token="$(metric_snapshot_token "$size" "$round" "$attempt")"
+  if [[ "$node" == "service" ]]; then
+    snapshot_file="${SERVICE_METRICS_DIR}/${token}_${phase}.prom"
+  else
+    snapshot_file="${SERVICE_METRICS_DIR}/${token}_${node}_${phase}.prom"
+  fi
+  status_file="${SERVICE_METRICS_DIR}/${token}_${node}_${phase}.status"
+  tmp_file="${snapshot_file}.tmp"
+  filtered_file="${snapshot_file}.filtered.tmp"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
 size=${size}
 round=${round}
 attempt=${attempt}
 phase=${phase}
+node=${node}
+status=not_run_dry_run
+url=${metrics_url}
+filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+EOF
+    append_direct_metrics_capture "$size" "$round" "$attempt" "$phase" "$node" not_run_dry_run 0 0 0 "$status_file" "$snapshot_file"
+    return
+  fi
+
+  for ((capture_attempt=1; capture_attempt<=SERVICE_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
+    if curl -fsS --noproxy '*' \
+      --connect-timeout "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" \
+      --max-time "$SERVICE_METRICS_MAX_TIME_SECS" \
+      "$metrics_url" >"$tmp_file" && [[ -s "$tmp_file" ]]; then
+      raw_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
+      filter_service_metrics_snapshot "$tmp_file" "$filtered_file"
+      mv "$filtered_file" "$snapshot_file"
+      snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
+      cat >"$status_file" <<EOF
+size=${size}
+round=${round}
+attempt=${attempt}
+phase=${phase}
+node=${node}
 status=ok
 capture_attempt=${capture_attempt}
-url=${SERVICE_METRICS_URL}
+url=${metrics_url}
 connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
 max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
@@ -784,9 +981,8 @@ raw_bytes=${raw_bytes}
 snapshot_bytes=${snapshot_bytes}
 settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
-        echo "$size,$TOOL,$round,$attempt,$phase,prometheus_text,ok,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
-        return 0
-      fi
+      append_direct_metrics_capture "$size" "$round" "$attempt" "$phase" "$node" ok "$capture_attempt" "$raw_bytes" "$snapshot_bytes" "$status_file" "$snapshot_file"
+      return
     fi
 
     rm -f "$tmp_file" "$filtered_file"
@@ -801,16 +997,52 @@ size=${size}
 round=${round}
 attempt=${attempt}
 phase=${phase}
+node=${node}
 status=capture_failed
 capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
-url=${SERVICE_METRICS_URL}
+url=${metrics_url}
 connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
 max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
-  echo "$size,$TOOL,$round,$attempt,$phase,prometheus_text,capture_failed,$SERVICE_METRICS_CAPTURE_ATTEMPTS,N/A,N/A,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
-  echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
+  append_direct_metrics_capture "$size" "$round" "$attempt" "$phase" "$node" capture_failed "$SERVICE_METRICS_CAPTURE_ATTEMPTS" N/A N/A "$status_file" "$snapshot_file"
+  echo "WARN: failed to capture metrics size=${size} round=${round} attempt=${attempt} phase=${phase} node=${node}" >&2
+}
+
+capture_round_node_metrics() {
+  local size="$1" round="$2" attempt="$3" phase="$4" entry node metrics_url
+  if ((${#NODE_METRICS_URLS[@]} == 0)); then
+    return
+  fi
+  for entry in "${NODE_METRICS_URLS[@]}"; do
+    node="${entry%%=*}"
+    metrics_url="${entry#*=}"
+    capture_direct_metrics_snapshot "$size" "$round" "$attempt" "$phase" "$node" "$metrics_url"
+  done
+}
+
+capture_round_node_resources() {
+  local size="$1" round="$2" attempt="$3" phase="$4" entry node container token snapshot_file
+  if ((${#NODE_DOCKER_CONTAINERS[@]} == 0)); then
+    return
+  fi
+  for entry in "${NODE_DOCKER_CONTAINERS[@]}"; do
+    node="${entry%%=*}"
+    container="${entry#*=}"
+    token="$(metric_snapshot_token "$size" "$round" "$attempt")"
+    snapshot_file="$OUT_DIR/node_resources/${token}_${node}_${phase}.json"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      : >"$snapshot_file"
+      echo "$size,$TOOL,$round,$attempt,$phase,$node,$container,not_run_dry_run,$snapshot_file" >> "$NODE_RESOURCE_CSV"
+    elif docker stats --no-stream --format '{{json .}}' "$container" >"$snapshot_file" && [[ -s "$snapshot_file" ]]; then
+      echo "$size,$TOOL,$round,$attempt,$phase,$node,$container,ok,$snapshot_file" >> "$NODE_RESOURCE_CSV"
+    else
+      : >"$snapshot_file"
+      echo "$size,$TOOL,$round,$attempt,$phase,$node,$container,capture_failed,$snapshot_file" >> "$NODE_RESOURCE_CSV"
+      echo "WARN: failed to capture Docker resources node=${node} container=${container}" >&2
+    fi
+  done
 }
 
 median_from_numbers() {
@@ -844,6 +1076,8 @@ run_one_attempt() {
   local exit_code=0
   local started_at_utc finished_at_utc
   capture_round_service_metrics "$size" "$round" "$attempt" before
+  capture_round_node_metrics "$size" "$round" "$attempt" before
+  capture_round_node_resources "$size" "$round" "$attempt" before
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$TOOL" == "warp" ]]; then
@@ -917,6 +1151,8 @@ run_one_attempt() {
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   settle_before_after_metrics_capture
   capture_round_service_metrics "$size" "$round" "$attempt" after
+  capture_round_node_metrics "$size" "$round" "$attempt" after
+  capture_round_node_resources "$size" "$round" "$attempt" after
 
   local metrics throughput_human reqps latency_human throughput_bps latency_ms req_p90_human req_p90_ms req_p99_human req_p99_ms
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1069,6 +1305,17 @@ main() {
   echo "Rounds: $ROUNDS"
   echo "Retry per round: $RETRY_PER_ROUND"
   echo "Cooldown secs: $COOLDOWN_SECS"
+  echo "Server image digest: ${SERVER_IMAGE_DIGEST:-unknown}"
+  echo "Server revision: ${SERVER_REVISION:-unknown}"
+  if ((${#RUN_LABELS[@]} > 0)); then
+    echo "Run labels: ${RUN_LABELS[*]}"
+  fi
+  if ((${#NODE_METRICS_URLS[@]} > 0)); then
+    echo "Node metric targets: ${#NODE_METRICS_URLS[@]}"
+  fi
+  if ((${#NODE_DOCKER_CONTAINERS[@]} > 0)); then
+    echo "Node Docker targets: ${#NODE_DOCKER_CONTAINERS[@]}"
+  fi
   if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     echo "Service metrics filter: $SERVICE_METRICS_FILTER_REGEX"
     if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then

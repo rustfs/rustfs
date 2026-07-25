@@ -756,14 +756,26 @@ message SignalServiceRequest {
 message SignalServiceResponse {
   bool success = 1;
   optional string error_info = 2;
+  uint32 protocol_version = 3;
 }
 
-message ScannerActivityRequest {}
+message ScannerActivityRequest {
+  bytes challenge = 1;
+  uint32 protocol_version = 2;
+  string acknowledge_instance_id = 3;
+  uint64 acknowledge_dirty_usage_generation = 4;
+}
 
 message ScannerActivityResponse {
   string instance_id = 1;
   uint64 namespace_generation = 2;
   uint64 maintenance_generation = 3;
+  uint32 protocol_version = 4;
+  bytes topology_digest = 5;
+  bool data_movement_active = 6;
+  bytes response_proof = 7;
+  uint64 dirty_usage_generation = 8;
+  bool dirty_usage_pending = 9;
 }
 
 message BackgroundHealStatusRequest {}

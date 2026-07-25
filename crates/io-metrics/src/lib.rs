@@ -878,6 +878,19 @@ pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
     counter!("rustfs_io_get_object_codec_streaming_fallback_total", "reason" => reason).increment(1);
 }
 
+/// Record the read path chosen for one encrypted Range GET on the Legacy (rio v1) backend
+/// together with its read amplification — physical ciphertext bytes scheduled for the
+/// erasure layer divided by the plaintext bytes the client requested. Observed at the
+/// ReadPlan decision point (https://github.com/rustfs/backlog/issues/1316 Phase A).
+#[inline(always)]
+pub fn record_get_encrypted_range_read_amplification(path: &'static str, amplification: f64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_encrypted_range_read_path_total", "path" => path).increment(1);
+    histogram!("rustfs_io_get_encrypted_range_read_amplification", "path" => path).record(amplification);
+}
+
 /// Record the final codec-streaming rollout decision for a GET request.
 #[inline(always)]
 pub fn record_get_object_codec_streaming_decision(outcome: &'static str, object_class: &'static str, reason: &'static str) {

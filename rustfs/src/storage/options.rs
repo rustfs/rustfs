@@ -483,6 +483,31 @@ fn archive_content_encoding_strict_mode() -> bool {
     rustfs_utils::get_env_bool(ENV_REJECT_ARCHIVE_CONTENT_ENCODING, false)
 }
 
+const USER_METADATA_PREFIXES: &[&str] = &["x-amz-meta-", "x-rustfs-meta-", "x-minio-meta-"];
+const CANONICAL_USER_METADATA_PREFIX: &str = "x-amz-meta-";
+
+fn is_reserved_user_metadata_key(key: &str) -> bool {
+    SUPPORTED_HEADERS.iter().any(|header| key.eq_ignore_ascii_case(header))
+        || starts_with_ignore_ascii_case(key, "x-amz-")
+        || starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX)
+        || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
+}
+
+fn stored_user_metadata_key(key: &str) -> String {
+    if is_reserved_user_metadata_key(key) {
+        format!("{CANONICAL_USER_METADATA_PREFIX}{key}")
+    } else {
+        key.to_owned()
+    }
+}
+
+pub(crate) fn namespace_reserved_user_metadata(metadata: &mut HashMap<String, String>) {
+    *metadata = std::mem::take(metadata)
+        .into_iter()
+        .map(|(key, value)| (stored_user_metadata_key(&key), value))
+        .collect();
+}
+
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,
@@ -490,8 +515,6 @@ pub fn extract_metadata_from_mime_with_object_name(
     skip_content_type: bool,
     object_name: Option<&str>,
 ) {
-    const USER_METADATA_PREFIXES: &[&str] = &["x-amz-meta-", "x-rustfs-meta-", "x-minio-meta-"];
-
     for (k, v) in headers.iter() {
         if k.as_str() == "content-type" && skip_content_type {
             continue;
@@ -505,7 +528,7 @@ pub fn extract_metadata_from_mime_with_object_name(
                 continue;
             }
 
-            metadata.insert(key.to_owned(), String::from_utf8_lossy(v.as_bytes()).to_string());
+            metadata.insert(stored_user_metadata_key(key), String::from_utf8_lossy(v.as_bytes()).to_string());
             continue;
         }
 
@@ -599,6 +622,26 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
 
     let mut filtered_metadata = None;
     for (k, v) in metadata {
+        if starts_with_ignore_ascii_case(k, "x-amz-meta-internal-")
+            || k.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_MD5)
+            || k.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_LENGTH)
+        {
+            continue;
+        }
+
+        if let Some(key) = USER_METADATA_PREFIXES.iter().find_map(|prefix| {
+            k.get(..prefix.len())
+                .filter(|head| head.eq_ignore_ascii_case(prefix))
+                .map(|_| &k[prefix.len()..])
+        }) {
+            if !key.is_empty() {
+                filtered_metadata
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key.to_owned(), v.clone());
+            }
+            continue;
+        }
+
         if should_skip_object_metadata_key(k, v, EXCLUDED_HEADERS) {
             continue;
         }
@@ -857,7 +900,8 @@ mod tests {
         ENV_REJECT_ARCHIVE_CONTENT_ENCODING, ReplicationStatusType, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
         detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_default_opts, get_opts, parse_copy_source_range, put_opts, put_opts_from_headers, validate_archive_content_encoding,
+        get_default_opts, get_opts, namespace_reserved_user_metadata, parse_copy_source_range, put_opts, put_opts_from_headers,
+        validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
     use rustfs_utils::http::{
@@ -1571,6 +1615,45 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
+    }
+
+    #[test]
+    fn test_user_metadata_cannot_shadow_standard_or_internal_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("br"));
+        headers.insert("x-amz-meta-content-encoding", HeaderValue::from_static("user-encoding"));
+        headers.insert("x-amz-meta-x-rustfs-internal-healing", HeaderValue::from_static("user-value"));
+
+        let mut metadata = HashMap::new();
+        extract_metadata_from_mime(&headers, &mut metadata);
+
+        assert_eq!(metadata.get("content-encoding"), Some(&"br".to_string()));
+        assert_eq!(metadata.get("x-amz-meta-content-encoding"), Some(&"user-encoding".to_string()));
+        assert_eq!(metadata.get("x-amz-meta-x-rustfs-internal-healing"), Some(&"user-value".to_string()));
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should remain");
+        assert_eq!(filtered.get("content-encoding"), Some(&"user-encoding".to_string()));
+        assert_eq!(filtered.get("x-rustfs-internal-healing"), Some(&"user-value".to_string()));
+
+        let mut copied_metadata = HashMap::from([
+            ("content-type".to_string(), "user-type".to_string()),
+            ("x-amz-meta-content-type".to_string(), "nested-user-type".to_string()),
+            ("x-amz-storage-class".to_string(), "user-class".to_string()),
+        ]);
+        namespace_reserved_user_metadata(&mut copied_metadata);
+        assert_eq!(copied_metadata.get("x-amz-meta-content-type"), Some(&"user-type".to_string()));
+        assert_eq!(
+            copied_metadata.get("x-amz-meta-x-amz-meta-content-type"),
+            Some(&"nested-user-type".to_string())
+        );
+        assert_eq!(copied_metadata.get("x-amz-meta-x-amz-storage-class"), Some(&"user-class".to_string()));
+
+        let legacy_metadata = HashMap::from([
+            ("x-amz-meta-internal-secret".to_string(), "must-not-leak".to_string()),
+            ("x-amz-meta-x-amz-unencrypted-content-md5".to_string(), "must-not-leak".to_string()),
+            ("x-amz-meta-project".to_string(), "rustfs".to_string()),
+        ]);
+        let filtered_legacy = filter_object_metadata(&legacy_metadata).expect("safe user metadata should remain");
+        assert_eq!(filtered_legacy, HashMap::from([("project".to_string(), "rustfs".to_string())]));
     }
 
     #[test]

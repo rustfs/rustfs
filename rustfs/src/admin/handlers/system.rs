@@ -14,6 +14,9 @@
 
 use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
+use crate::admin::route_policy::{
+    ADMIN_ROUTE_POLICY_SPECS, DEFERRED_ADMIN_ROUTE_POLICIES, DeferredAdminRoutePolicy, DeferredRoutePolicyReason,
+};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase, object_store_from_req,
@@ -21,6 +24,7 @@ use crate::admin::runtime_sources::{
 use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
 };
+use crate::admin::storage_api::storageclass as storage_class_contract;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -31,9 +35,10 @@ use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+use rustfs_security_governance::{AdminRouteSpec, HttpMethod};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
@@ -54,6 +59,11 @@ const OBSERVABILITY_SUMMARY_RESOLVED: &str = "observability summary resolved fro
 const TOPOLOGY_SUMMARY_RESOLVED: &str = "topology summary resolved from capability snapshot";
 const TOPOLOGY_SNAPSHOT_NOT_AVAILABLE: &str = "endpoint topology is not available before storage endpoint pools initialize";
 pub(crate) const RUNTIME_CAPABILITIES_ROUTE_SUFFIX: &str = "/v4/runtime/capabilities";
+const SITE_REPLICATION_INFO_ROUTE: &str = "/rustfs/admin/v3/site-replication/info";
+const SITE_REPLICATION_EDIT_ROUTE: &str = "/rustfs/admin/v3/site-replication/edit";
+const SITE_REPLICATION_RESYNC_ROUTE: &str = "/rustfs/admin/v3/site-replication/resync/op";
+const SITE_REPLICATION_REPAIR_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair";
+const SITE_REPLICATION_REPAIR_STATUS_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair/status";
 
 macro_rules! log_system_request_rejected {
     ($operation:expr, $reason:expr) => {
@@ -609,7 +619,7 @@ impl Operation for StorageInfoHandler {
 
 pub struct DataUsageInfoHandler {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapabilitiesSummary {
     pub observability: CapabilityStatus,
     pub userspace_profiling: CapabilityStatus,
@@ -617,17 +627,177 @@ pub struct RuntimeCapabilitiesSummary {
     pub platform: CapabilityStatus,
     pub topology: CapabilityStatus,
     pub cluster_snapshot: CapabilityStatus,
+    #[serde(default)]
+    pub site_replication_info: CapabilityStatus,
+    #[serde(default)]
+    pub site_replication_edit: CapabilityStatus,
+    #[serde(default)]
+    pub site_replication_resync: CapabilityStatus,
+    #[serde(default)]
+    pub site_replication_repair: CapabilityStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    pub diagnostic_probes: DiagnosticProbeCapabilities,
+    pub inspect_archive: super::inspect_archive::InspectArchiveCapability,
+    pub storage_classes: StorageClassCapabilities,
+    pub site_replication_repair: SiteReplicationRepairCapabilities,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<CapabilityStatus>,
     pub observability: crate::admin::storage_api::cluster::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SiteReplicationRepairCapabilities {
+    pub contract_version: u32,
+    pub status: CapabilityStatus,
+    pub modes: [&'static str; 2],
+    pub execute_route: &'static str,
+    pub status_route: &'static str,
+    pub preflight_token_contract: &'static str,
+    pub operation_id_format: &'static str,
+    pub max_retained_successful_operations: usize,
+    pub disabled_by_default: bool,
+}
+
+impl SiteReplicationRepairCapabilities {
+    fn current() -> Self {
+        let execute = admin_route_capability(HttpMethod::Put, SITE_REPLICATION_REPAIR_ROUTE);
+        let status = admin_route_capability(HttpMethod::Get, SITE_REPLICATION_REPAIR_STATUS_ROUTE);
+        let supported = execute.state == CapabilityState::Supported && status.state == CapabilityState::Supported;
+        Self {
+            contract_version: 1,
+            status: if supported {
+                CapabilityStatus::supported().with_reason("durable dry-run, execute, and status contracts are registered")
+            } else {
+                CapabilityStatus::unsupported().with_reason("one or more durable repair routes are unavailable")
+            },
+            modes: ["dry-run", "execute"],
+            execute_route: SITE_REPLICATION_REPAIR_ROUTE,
+            status_route: SITE_REPLICATION_REPAIR_STATUS_ROUTE,
+            preflight_token_contract: "hmac-sha256-v1",
+            operation_id_format: "uuid",
+            max_retained_successful_operations: 32,
+            disabled_by_default: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticProbeCapabilities {
+    pub contract_version: u32,
+    pub health_info: DiagnosticProbeCapability,
+    pub inspect_archive: DiagnosticProbeCapability,
+    pub observed_drive_metrics: DiagnosticProbeCapability,
+    pub client_devnull: DiagnosticProbeCapability,
+    pub object_speedtest: DiagnosticProbeCapability,
+    pub inter_node_netperf: DiagnosticProbeCapability,
+    pub site_speedtest: DiagnosticProbeCapability,
+    pub site_replication_netperf: DiagnosticProbeCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticProbeCapability {
+    pub status: CapabilityStatus,
+    pub mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_duration_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
+}
+
+impl DiagnosticProbeCapabilities {
+    fn current() -> Self {
+        let unsupported = |reason, route| DiagnosticProbeCapability {
+            status: CapabilityStatus::unsupported().with_reason(reason),
+            mode: "unsupported",
+            route,
+            max_bytes: None,
+            max_duration_secs: None,
+            max_concurrency: None,
+        };
+
+        Self {
+            contract_version: 1,
+            health_info: DiagnosticProbeCapability {
+                status: CapabilityStatus::supported().with_reason("reports local host telemetry and observed storage state"),
+                mode: "system_observation",
+                route: Some("/rustfs/admin/v3/healthinfo"),
+                max_bytes: None,
+                max_duration_secs: None,
+                max_concurrency: None,
+            },
+            inspect_archive: unsupported(
+                "a bounded encrypted diagnostic archive is not implemented; v3 inspect-data returns object bytes",
+                None,
+            ),
+            observed_drive_metrics: DiagnosticProbeCapability {
+                status: CapabilityStatus::supported()
+                    .with_reason("reports observed StorageInfo throughput and latency, not an active benchmark"),
+                mode: "observed_storage_metrics",
+                route: Some("/rustfs/admin/v3/speedtest/drive"),
+                max_bytes: None,
+                max_duration_secs: None,
+                max_concurrency: None,
+            },
+            client_devnull: DiagnosticProbeCapability {
+                status: CapabilityStatus::supported().with_reason("actively drains a bounded client upload"),
+                mode: "active_upload_drain",
+                route: Some("/rustfs/admin/v3/speedtest/client/devnull"),
+                max_bytes: Some(super::diagnostics::CLIENT_DEVNULL_MAX_BYTES),
+                max_duration_secs: Some(super::diagnostics::CLIENT_DEVNULL_MAX_DURATION.as_secs()),
+                max_concurrency: Some(super::diagnostics::CLIENT_DEVNULL_MAX_CONCURRENCY),
+            },
+            object_speedtest: unsupported(
+                "object PUT/GET benchmark harness is not implemented",
+                Some("/rustfs/admin/v3/speedtest/object"),
+            ),
+            inter_node_netperf: unsupported(
+                "inter-node traffic benchmark harness is not implemented",
+                Some("/rustfs/admin/v3/speedtest/net"),
+            ),
+            site_speedtest: unsupported(
+                "site traffic benchmark harness is not implemented",
+                Some("/rustfs/admin/v3/speedtest/site"),
+            ),
+            site_replication_netperf: DiagnosticProbeCapability {
+                status: CapabilityStatus::unsupported().with_reason("site-replication netperf does not perform peer traffic"),
+                mode: "unsupported",
+                route: Some("/rustfs/admin/v3/site-replication/netperf"),
+                max_bytes: None,
+                max_duration_secs: None,
+                max_concurrency: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StorageClassCapabilities {
+    pub contract_version: u32,
+    pub supported_write_classes: [&'static str; 2],
+    pub unsupported_write_error: &'static str,
+    pub legacy_label_behavior: &'static str,
+}
+
+impl StorageClassCapabilities {
+    fn current() -> Self {
+        Self {
+            contract_version: storage_class_contract::CAPABILITY_CONTRACT_VERSION,
+            supported_write_classes: storage_class_contract::SUPPORTED_WRITE_CLASSES,
+            unsupported_write_error: storage_class_contract::UNSUPPORTED_WRITE_ERROR,
+            legacy_label_behavior: storage_class_contract::LEGACY_LABEL_BEHAVIOR,
+        }
+    }
 }
 
 pub struct RuntimeCapabilitiesHandler {}
@@ -639,6 +809,7 @@ pub(crate) async fn build_runtime_capabilities_response()
     let observability = observability_provider.observability_snapshot().await?;
     let workload_admission = workload_admission_registry_snapshot();
     let cluster_snapshot_discovery = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
+    let local_drive_count = crate::storage::all_local_disk().await.len();
 
     let (topology, topology_status) = if let Some(endpoint_pools) = current_endpoints_handle() {
         let topology_provider = EndpointTopologySnapshotProvider::new(endpoint_pools);
@@ -656,6 +827,10 @@ pub(crate) async fn build_runtime_capabilities_response()
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        diagnostic_probes: DiagnosticProbeCapabilities::current(),
+        inspect_archive: super::inspect_archive::InspectArchiveCapability::current(local_drive_count),
+        storage_classes: StorageClassCapabilities::current(),
+        site_replication_repair: SiteReplicationRepairCapabilities::current(),
         cluster_snapshot_path: usecase.cluster_snapshot_route().to_string(),
         cluster_snapshot_summary: cluster_snapshot_discovery.summary,
         observability,
@@ -729,7 +904,41 @@ fn build_runtime_capabilities_summary(
         cluster_snapshot: cluster_snapshot_summary.cloned().unwrap_or_else(|| {
             CapabilityStatus::unknown().with_reason("cluster snapshot is not available before storage endpoint pools initialize")
         }),
+        site_replication_info: admin_route_capability(HttpMethod::Get, SITE_REPLICATION_INFO_ROUTE),
+        site_replication_edit: admin_route_capability(HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE),
+        site_replication_resync: admin_route_capability(HttpMethod::Put, SITE_REPLICATION_RESYNC_ROUTE),
+        site_replication_repair: SiteReplicationRepairCapabilities::current().status,
     }
+}
+
+fn admin_route_capability(method: HttpMethod, path: &str) -> CapabilityStatus {
+    admin_route_capability_from_inventory(method, path, ADMIN_ROUTE_POLICY_SPECS, DEFERRED_ADMIN_ROUTE_POLICIES)
+}
+
+fn admin_route_capability_from_inventory(
+    method: HttpMethod,
+    path: &str,
+    direct: &[AdminRouteSpec],
+    deferred: &[DeferredAdminRoutePolicy],
+) -> CapabilityStatus {
+    if direct.iter().any(|spec| spec.method() == method && spec.path() == path) {
+        return CapabilityStatus::supported().with_reason("public admin route is registered with an implemented handler");
+    }
+
+    match deferred
+        .iter()
+        .find(|policy| policy.method() == method && policy.path() == path)
+        .map(|policy| policy.reason())
+    {
+        Some(DeferredRoutePolicyReason::NotImplemented) | None => {
+            CapabilityStatus::unsupported().with_reason("public admin route is absent or not implemented")
+        }
+        Some(_) => CapabilityStatus::supported().with_reason("public admin route is registered with contextual authorization"),
+    }
+}
+
+fn runtime_capabilities_gate_actions() -> Vec<Action> {
+    vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]
 }
 
 fn summarize_named_capability_statuses<const N: usize>(
@@ -767,15 +976,7 @@ impl Operation for RuntimeCapabilitiesHandler {
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-            remote_addr,
-        )
-        .await?;
+        validate_admin_request(&req.headers, &cred, owner, false, runtime_capabilities_gate_actions(), remote_addr).await?;
 
         let response = build_runtime_capabilities_response().await.map_err(|err| {
             log_system_request_failed!("runtime_capabilities", "build_runtime_capabilities_failed", err);
@@ -838,18 +1039,27 @@ impl Operation for DataUsageInfoHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBSERVABILITY_SUMMARY_RESOLVED, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
+        OBSERVABILITY_SUMMARY_RESOLVED, RuntimeCapabilitiesHandler, SITE_REPLICATION_EDIT_ROUTE, SITE_REPLICATION_INFO_ROUTE,
+        SITE_REPLICATION_REPAIR_ROUTE, SITE_REPLICATION_REPAIR_STATUS_ROUTE, SITE_REPLICATION_RESYNC_ROUTE, ServerInfoResponse,
+        TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED, admin_route_capability_from_inventory,
         build_runtime_capabilities_response, build_runtime_capabilities_summary, data_usage_info_gate_actions,
-        system_admin_discovery,
+        runtime_capabilities_gate_actions, system_admin_discovery,
     };
+    use crate::admin::router::Operation;
     use crate::admin::runtime_sources::DefaultAdminUsecase;
     use crate::admin::storage_api::cluster::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
     };
+    use http::{Extensions, HeaderMap, Uri};
+    use hyper::Method;
+    use matchit::Params;
     use rustfs_concurrency::WorkloadClass;
     use rustfs_madmin::{InfoMessage, StorageInfo};
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use rustfs_security_governance::HttpMethod;
+    use s3s::{Body, S3ErrorCode, S3Request};
+    use serde_json::json;
 
     /// Authz regression pin (rustfs/backlog#1306): datausageinfo stays an
     /// any-of gate over exactly DataUsageInfoAdminAction OR ListBucketAction.
@@ -882,6 +1092,180 @@ mod tests {
         assert_eq!(response.summary.cluster_snapshot.state, CapabilityState::Unknown);
         assert_eq!(response.observability.platform.os.as_deref(), Some(std::env::consts::OS));
         assert_eq!(response.workload_admission.entries().len(), WorkloadClass::REQUIRED.len());
+        assert_eq!(response.summary.site_replication_info.state, CapabilityState::Supported);
+        assert_eq!(response.summary.site_replication_edit.state, CapabilityState::Supported);
+        assert_eq!(response.summary.site_replication_resync.state, CapabilityState::Supported);
+        assert_eq!(response.summary.site_replication_repair.state, CapabilityState::Supported);
+        assert_eq!(response.site_replication_repair.contract_version, 1);
+        assert_eq!(response.site_replication_repair.status.state, CapabilityState::Supported);
+        assert_eq!(response.site_replication_repair.modes, ["dry-run", "execute"]);
+        assert_eq!(response.site_replication_repair.execute_route, SITE_REPLICATION_REPAIR_ROUTE);
+        assert_eq!(response.site_replication_repair.status_route, SITE_REPLICATION_REPAIR_STATUS_ROUTE);
+        assert_eq!(response.site_replication_repair.preflight_token_contract, "hmac-sha256-v1");
+        assert_eq!(response.site_replication_repair.operation_id_format, "uuid");
+        assert_eq!(response.site_replication_repair.max_retained_successful_operations, 32);
+        assert!(!response.site_replication_repair.disabled_by_default);
+        assert_eq!(response.diagnostic_probes.contract_version, 1);
+        assert_eq!(response.diagnostic_probes.health_info.status.state, CapabilityState::Supported);
+        assert_eq!(response.diagnostic_probes.observed_drive_metrics.mode, "observed_storage_metrics");
+        assert_eq!(response.diagnostic_probes.client_devnull.status.state, CapabilityState::Supported);
+        assert_eq!(
+            response.diagnostic_probes.client_devnull.max_bytes,
+            Some(super::super::diagnostics::CLIENT_DEVNULL_MAX_BYTES)
+        );
+        assert_eq!(
+            response.diagnostic_probes.client_devnull.max_duration_secs,
+            Some(super::super::diagnostics::CLIENT_DEVNULL_MAX_DURATION.as_secs())
+        );
+        assert_eq!(
+            response.diagnostic_probes.client_devnull.max_concurrency,
+            Some(super::super::diagnostics::CLIENT_DEVNULL_MAX_CONCURRENCY)
+        );
+        for probe in [
+            &response.diagnostic_probes.inspect_archive,
+            &response.diagnostic_probes.object_speedtest,
+            &response.diagnostic_probes.inter_node_netperf,
+            &response.diagnostic_probes.site_speedtest,
+            &response.diagnostic_probes.site_replication_netperf,
+        ] {
+            assert_eq!(probe.status.state, CapabilityState::Unsupported);
+            assert_eq!(probe.mode, "unsupported");
+            assert!(probe.status.reason.is_some());
+        }
+        assert_eq!(response.storage_classes.contract_version, 1);
+        assert_eq!(response.storage_classes.supported_write_classes, ["STANDARD", "REDUCED_REDUNDANCY"]);
+        assert_eq!(response.storage_classes.unsupported_write_error, "InvalidStorageClass");
+        assert_eq!(response.storage_classes.legacy_label_behavior, "normalized_to_effective_class");
+
+        let value = serde_json::to_value(response).expect("runtime capability response should serialize");
+        assert_eq!(value["summary"]["site_replication_info"]["state"], "supported");
+        assert_eq!(value["summary"]["site_replication_edit"]["state"], "supported");
+        assert_eq!(value["summary"]["site_replication_resync"]["state"], "supported");
+        assert_eq!(value["summary"]["site_replication_repair"]["state"], "supported");
+        assert_eq!(value["site_replication_repair"]["contract_version"], 1);
+        assert_eq!(value["site_replication_repair"]["status"]["state"], "supported");
+        assert_eq!(value["site_replication_repair"]["modes"], json!(["dry-run", "execute"]));
+        assert_eq!(value["site_replication_repair"]["execute_route"], SITE_REPLICATION_REPAIR_ROUTE);
+        assert_eq!(value["site_replication_repair"]["status_route"], SITE_REPLICATION_REPAIR_STATUS_ROUTE);
+        assert_eq!(value["site_replication_repair"]["max_retained_successful_operations"], 32);
+        assert_eq!(value["site_replication_repair"]["disabled_by_default"], false);
+        assert_eq!(value["diagnostic_probes"]["client_devnull"]["status"]["state"], "supported");
+        assert_eq!(
+            value["diagnostic_probes"]["client_devnull"]["max_bytes"],
+            super::super::diagnostics::CLIENT_DEVNULL_MAX_BYTES
+        );
+        assert_eq!(
+            value["diagnostic_probes"]["client_devnull"]["max_concurrency"],
+            super::super::diagnostics::CLIENT_DEVNULL_MAX_CONCURRENCY
+        );
+        assert_eq!(value["diagnostic_probes"]["site_replication_netperf"]["status"]["state"], "unsupported");
+        assert_eq!(value["storage_classes"]["contract_version"], 1);
+        assert_eq!(
+            value["storage_classes"]["supported_write_classes"],
+            json!(["STANDARD", "REDUCED_REDUNDANCY"])
+        );
+        assert_eq!(value["storage_classes"]["unsupported_write_error"], "InvalidStorageClass");
+        assert_eq!(value["storage_classes"]["legacy_label_behavior"], "normalized_to_effective_class");
+    }
+
+    #[test]
+    fn site_replication_capabilities_follow_public_route_inventory() {
+        for (method, path) in [
+            (HttpMethod::Get, SITE_REPLICATION_INFO_ROUTE),
+            (HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE),
+            (HttpMethod::Put, SITE_REPLICATION_RESYNC_ROUTE),
+            (HttpMethod::Put, SITE_REPLICATION_REPAIR_ROUTE),
+            (HttpMethod::Get, SITE_REPLICATION_REPAIR_STATUS_ROUTE),
+        ] {
+            assert_eq!(
+                admin_route_capability_from_inventory(
+                    method,
+                    path,
+                    crate::admin::route_policy::ADMIN_ROUTE_POLICY_SPECS,
+                    crate::admin::route_policy::DEFERRED_ADMIN_ROUTE_POLICIES,
+                )
+                .state,
+                CapabilityState::Supported,
+            );
+        }
+    }
+
+    #[test]
+    fn site_replication_capabilities_reject_absent_internal_only_and_not_implemented_routes() {
+        use crate::admin::route_policy::{DeferredAdminRoutePolicy, DeferredRoutePolicyReason};
+
+        let not_implemented = [DeferredAdminRoutePolicy::new(
+            HttpMethod::Put,
+            SITE_REPLICATION_EDIT_ROUTE,
+            DeferredRoutePolicyReason::NotImplemented,
+        )];
+        assert_eq!(
+            admin_route_capability_from_inventory(HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE, &[], &not_implemented).state,
+            CapabilityState::Unsupported,
+        );
+        assert_eq!(
+            admin_route_capability_from_inventory(HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE, &[], &[]).state,
+            CapabilityState::Unsupported,
+        );
+
+        let internal_only = crate::admin::route_policy::ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .copied()
+            .filter(|spec| spec.path() == "/rustfs/admin/v3/site-replication/peer/edit-capabilities")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            admin_route_capability_from_inventory(HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE, &internal_only, &[]).state,
+            CapabilityState::Unsupported,
+        );
+    }
+
+    #[test]
+    fn older_runtime_summary_defaults_site_replication_capabilities_to_unknown() {
+        let summary: super::RuntimeCapabilitiesSummary = serde_json::from_value(json!({
+            "observability": { "state": "supported" },
+            "userspace_profiling": { "state": "supported" },
+            "memory_sampling": { "state": "supported" },
+            "platform": { "state": "supported" },
+            "topology": { "state": "supported" },
+            "cluster_snapshot": { "state": "supported" }
+        }))
+        .expect("older runtime summary should remain compatible");
+
+        assert_eq!(summary.site_replication_info.state, CapabilityState::Unknown);
+        assert_eq!(summary.site_replication_edit.state, CapabilityState::Unknown);
+        assert_eq!(summary.site_replication_resync.state, CapabilityState::Unknown);
+        assert_eq!(summary.site_replication_repair.state, CapabilityState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn runtime_capabilities_authentication_failure_is_not_reported_as_unsupported() {
+        let request = S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static("/rustfs/admin/v4/runtime/capabilities"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let error = RuntimeCapabilitiesHandler {}
+            .call(request, Params::new())
+            .await
+            .expect_err("runtime capabilities must reject unauthenticated requests before capability resolution");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    /// Authorization denial for this exact action is pinned to AccessDenied by
+    /// `crate::admin::auth::tests::non_admin_credential_is_denied`.
+    #[test]
+    fn runtime_capabilities_gate_requires_server_info_authorization() {
+        assert_eq!(
+            runtime_capabilities_gate_actions(),
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]
+        );
     }
 
     #[test]

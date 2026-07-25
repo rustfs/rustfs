@@ -259,8 +259,10 @@ impl Operation for AccountInfoHandler {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        // Serve the last persisted scanner snapshot plus the in-memory overlay.
-        // This request path must never trigger a live full-version listing
+        // Serve the last persisted scanner snapshot plus an authoritative
+        // single-process overlay. Distributed nodes must not promote their
+        // process-local absolute counters to cluster-wide bucket totals.
+        // This path never triggers a live full-version listing
         // (rustfs/backlog#1306); freshness is owned by the scanner.
         let mut data_usage_info = map_data_usage_result(load_data_usage_from_backend_cached(store.clone()).await)?;
         apply_bucket_usage_memory_overlay(&mut data_usage_info).await;

@@ -1428,6 +1428,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3648,7 +3654,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e_test"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
@@ -3657,7 +3663,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-smithy-http-client",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "clap",
@@ -3670,6 +3676,8 @@ dependencies = [
  "hyper-util",
  "local-ip-address",
  "md5",
+ "opentelemetry-proto",
+ "prost 0.14.4",
  "rand 0.10.2",
  "rcgen",
  "reqwest",
@@ -3685,6 +3693,7 @@ dependencies = [
  "rustfs-protos",
  "rustfs-rio",
  "rustfs-signer",
+ "rustfs-utils",
  "rustls",
  "s3s",
  "serde",
@@ -8651,9 +8660,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.62.3"
+version = "0.62.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "059dd24c0fe20721639f7acad7b82cd51ec3dd3254ed8cf7a0b7df6c20eaff1c"
+checksum = "b8b67b5a0d8068c89dcbe9d95df986af7a851d1f3c604525274c37468e60464f"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -8824,7 +8833,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -8837,7 +8846,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "base64-simd",
  "bytes",
  "chacha20poly1305",
@@ -8878,6 +8887,7 @@ dependencies = [
  "quick-xml",
  "rand 0.10.2",
  "rcgen",
+ "regex",
  "reqwest",
  "rmp-serde",
  "rsa 0.10.0-rc.18",
@@ -8918,6 +8928,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-storage-api",
  "rustfs-targets",
+ "rustfs-test-utils",
  "rustfs-tls-runtime",
  "rustfs-trusted-proxies",
  "rustfs-utils",
@@ -8958,7 +8969,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-audit"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "chrono",
@@ -8980,7 +8991,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-checksums"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -8995,7 +9006,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-common"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "chrono",
  "metrics",
@@ -9010,7 +9021,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-concurrency"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "insta",
  "rustfs-io-core",
@@ -9022,7 +9033,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-config"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "const-str",
  "serde",
@@ -9031,7 +9042,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-credentials"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -9044,7 +9055,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-crypto"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -9064,7 +9075,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-data-usage"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "path-clean",
@@ -9075,7 +9086,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-ecstore"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -9088,7 +9099,7 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "base64 0.22.1",
+ "base64 0.23.0",
  "base64-simd",
  "byteorder",
  "bytes",
@@ -9193,9 +9204,9 @@ dependencies = [
 
 [[package]]
 name = "rustfs-erasure-codec"
-version = "8.0.0"
+version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8c8af301cb0273d7fb3a1670d74aa9eff015b448f427359658a9ca0f2184b06"
+checksum = "bb8ba5edcc507013a0a7bcf7424be94f0ef070b38eab8bcbc38206a8148bc70a"
 dependencies = [
  "cc",
  "cfg_aliases",
@@ -9210,7 +9221,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-extension-schema"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -9219,7 +9230,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-filemeta"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arc-swap",
  "byteorder",
@@ -9245,10 +9256,10 @@ dependencies = [
 
 [[package]]
 name = "rustfs-heal"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.0",
  "futures",
  "http 1.4.2",
  "metrics",
@@ -9275,7 +9286,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-iam"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -9312,7 +9323,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-core"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "bytes",
  "memmap2",
@@ -9324,7 +9335,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-io-metrics"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "criterion",
  "metrics",
@@ -9387,7 +9398,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-keystone"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "bytes",
  "futures",
@@ -9413,13 +9424,13 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kms"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "aes-gcm",
  "arc-swap",
  "argon2",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chacha20poly1305",
  "insta",
  "jiff",
@@ -9444,7 +9455,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-lifecycle"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "proptest",
@@ -9464,7 +9475,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-lock"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
@@ -9486,7 +9497,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-log-analyzer"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "chrono",
  "flate2",
@@ -9504,7 +9515,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-madmin"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "chrono",
  "humantime",
@@ -9518,7 +9529,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-notify"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -9552,7 +9563,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-capacity"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "criterion",
  "futures",
@@ -9570,7 +9581,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-object-data-cache"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "bytes",
  "criterion",
@@ -9586,7 +9597,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-obs"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -9638,7 +9649,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-policy"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "base64-simd",
@@ -9667,13 +9678,13 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protocols"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "dav-server",
  "futures",
@@ -9726,7 +9737,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-protos"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "flatbuffers",
  "prost 0.14.4",
@@ -9738,6 +9749,7 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
+ "temp-env",
  "tokio",
  "tonic",
  "tonic-prost",
@@ -9748,7 +9760,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-replication"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "byteorder",
  "bytes",
@@ -9765,12 +9777,12 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "aes-gcm",
  "arc-swap",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "crc-fast",
  "faster-hex",
@@ -9803,7 +9815,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-rio-v2"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -9825,14 +9837,14 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3-ops"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "rustfs-s3-types",
 ]
 
 [[package]]
 name = "rustfs-s3-types"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -9840,7 +9852,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-api"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "bytes",
@@ -9857,6 +9869,7 @@ dependencies = [
  "rustfs-test-utils",
  "s3s",
  "serde_json",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -9868,7 +9881,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-s3select-query"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -9884,17 +9897,21 @@ dependencies = [
 
 [[package]]
 name = "rustfs-scanner"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "futures",
+ "hex-simd",
+ "hmac 0.13.0",
  "http 1.4.2",
  "metrics",
  "rand 0.10.2",
  "rmp-serde",
  "rustfs-common",
  "rustfs-config",
+ "rustfs-credentials",
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-filemeta",
@@ -9904,7 +9921,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2 0.11.0",
  "temp-env",
+ "tempfile",
  "thiserror 2.0.19",
  "time",
  "tokio",
@@ -9916,14 +9935,14 @@ dependencies = [
 
 [[package]]
 name = "rustfs-security-governance"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "thiserror 2.0.19",
 ]
 
 [[package]]
 name = "rustfs-signer"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -9939,7 +9958,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-storage-api"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "insta",
@@ -9953,7 +9972,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-targets"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -10006,7 +10025,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-test-utils"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "rustfs-data-usage",
  "rustfs-ecstore",
@@ -10021,7 +10040,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-tls-runtime"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "arc-swap",
  "metrics",
@@ -10041,7 +10060,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-trusted-proxies"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -10077,7 +10096,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-utils"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "base64-simd",
  "blake2",
@@ -10098,6 +10117,7 @@ dependencies = [
  "netif",
  "proptest",
  "regex",
+ "reqwest",
  "rustix",
  "serde",
  "sha1 0.11.0",
@@ -10116,7 +10136,7 @@ dependencies = [
 
 [[package]]
 name = "rustfs-zip"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
@@ -10228,9 +10248,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.15.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
+checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
  "web-time",
  "zeroize",
@@ -10254,7 +10274,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10311,7 +10331,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.1"
-source = "git+https://github.com/s3s-project/s3s.git?rev=a5471625975f5014f7b28eee7e4d801f1b32f529#a5471625975f5014f7b28eee7e4d801f1b32f529"
+source = "git+https://github.com/s3s-project/s3s.git?rev=8136db4ac8253c0ccfd86f8216e00e0235747757#8136db4ac8253c0ccfd86f8216e00e0235747757"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -10356,6 +10376,7 @@ dependencies = [
  "transform-stream",
  "url",
  "urlencoding",
+ "xxhash-rust",
  "zeroize",
 ]
 

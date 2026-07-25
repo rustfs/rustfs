@@ -14,20 +14,27 @@
 
 use crate::{
     SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
-    SelectStore, resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
+    SelectStore,
+    query::session::{QueryExecutionGuard, QueryExecutionTracker},
+    resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
     select_is_err_version_not_found,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use datafusion::object_store::{
-    Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+use datafusion::{
+    common::{DataFusionError, runtime::SpawnedTask},
+    execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool},
+    object_store::{
+        Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+        MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+    },
 };
 use futures::pin_mut;
 use futures::{Stream, StreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
+use parking_lot::Mutex;
 use rustfs_common::DEFAULT_DELIMITER;
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
@@ -49,6 +56,13 @@ fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
 }
 
+fn validated_object_size(size: i64) -> Result<u64> {
+    u64::try_from(size).map_err(|err| o_Error::Generic {
+        store: "EcObjectStore",
+        source: Box::new(err),
+    })
+}
+
 /// Maximum allowed object size for JSON DOCUMENT mode.
 ///
 /// JSON DOCUMENT format requires loading the entire file into memory for DOM
@@ -61,8 +75,13 @@ fn select_default_read_buffer_size_u64() -> u64 {
 /// size limit.
 ///
 /// Default: 128 MiB.  This matches the AWS S3 Select limit for JSON DOCUMENT
-/// inputs.
+/// inputs. The query memory pool also applies: RustFS reserves 64 times the
+/// input size for parsing and output. With the default 64 MiB query memory
+/// limit, JSON DOCUMENT inputs larger than 1 MiB are rejected; raise
+/// `RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES` to process larger inputs, up to this
+/// hard cap.
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
+const JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER: usize = 64;
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
 
@@ -79,6 +98,8 @@ pub struct EcObjectStore {
     /// expression.  When set, `flatten_json_document_to_ndjson` navigates to
     /// this key in the root JSON object before flattening.
     json_sub_path: Option<String>,
+    memory_pool: Arc<dyn MemoryPool>,
+    query_tracker: Option<QueryExecutionTracker>,
 
     store: Arc<SelectStore>,
 }
@@ -108,7 +129,29 @@ pub struct InvalidScanRange;
 
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
-        let Some(store) = resolve_select_object_store_handle() else {
+        Self::build(input, Arc::new(UnboundedMemoryPool::default()), None, None)
+    }
+
+    pub(crate) fn new_with_memory_pool(input: Arc<SelectObjectContentInput>, memory_pool: Arc<dyn MemoryPool>) -> S3Result<Self> {
+        Self::build(input, memory_pool, None, None)
+    }
+
+    pub(crate) fn new_with_query_tracker(
+        input: Arc<SelectObjectContentInput>,
+        memory_pool: Arc<dyn MemoryPool>,
+        query_tracker: QueryExecutionTracker,
+        store: Option<Arc<SelectStore>>,
+    ) -> S3Result<Self> {
+        Self::build(input, memory_pool, Some(query_tracker), store)
+    }
+
+    fn build(
+        input: Arc<SelectObjectContentInput>,
+        memory_pool: Arc<dyn MemoryPool>,
+        query_tracker: Option<QueryExecutionTracker>,
+        store: Option<Arc<SelectStore>>,
+    ) -> S3Result<Self> {
+        let Some(store) = store.or_else(resolve_select_object_store_handle) else {
             return Err(s3_error!(InternalError, "ec store not inited"));
         };
 
@@ -151,6 +194,8 @@ impl EcObjectStore {
             delimiter,
             is_json_document,
             json_sub_path,
+            memory_pool,
+            query_tracker,
             store,
         })
     }
@@ -213,13 +258,30 @@ impl EcObjectStore {
         if range.is_empty() {
             return Ok(Bytes::new());
         }
-        let reader = self.object_reader(Some(http_range_spec_from_range(range)), opts).await?;
+        let reader = self
+            .object_reader(Some(http_range_spec_from_range(range.clone())), opts)
+            .await?;
+        let object_size = validated_object_size(reader.object_info.size)?;
+        let resolved_range = GetRange::Bounded(range)
+            .as_range(object_size)
+            .map_err(|err| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(err),
+            })?;
+        let expected_size = usize::try_from(resolved_range.end - resolved_range.start).map_err(|err| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(err),
+        })?;
         let mut reader = reader.stream;
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.map_err(|err| o_Error::Generic {
             store: "EcObjectStore",
             source: Box::new(err),
         })?;
+        if bytes.len() < expected_size {
+            return Err(incomplete_object_stream_error(expected_size - bytes.len()));
+        }
+        bytes.truncate(expected_size);
         Ok(Bytes::from(bytes))
     }
 
@@ -421,7 +483,7 @@ impl ObjectStore for EcObjectStore {
         let opts = self.object_options(&options);
         let needs_scan_context = options.range.is_none() && !options.head && self.input.request.scan_range.is_some();
         let source_size = if needs_scan_context {
-            Some(self.object_info(&opts).await?.size as u64)
+            Some(validated_object_size(self.object_info(&opts).await?.size)?)
         } else {
             None
         };
@@ -442,7 +504,10 @@ impl ObjectStore for EcObjectStore {
             self.object_reader(range, &opts).await?
         };
 
-        let original_size = source_size.unwrap_or(reader.object_info.size as u64);
+        let original_size = match source_size {
+            Some(source_size) => source_size,
+            None => validated_object_size(reader.object_info.size)?,
+        };
         let etag = reader.object_info.etag;
         let version = reader.object_info.version_id.map(|version| version.to_string());
         let attributes = Attributes::default();
@@ -473,20 +538,14 @@ impl ObjectStore for EcObjectStore {
             // which must load the whole file into memory; rejecting oversized
             // files upfront is safer than risking OOM.  Users should convert
             // their data to JSON LINES (NDJSON) format for large files.
-            if original_size > MAX_JSON_DOCUMENT_BYTES {
-                return Err(o_Error::Generic {
-                    store: "EcObjectStore",
-                    source: format!(
-                        "JSON DOCUMENT object is {original_size} bytes, which exceeds the \
-                         maximum allowed size of {MAX_JSON_DOCUMENT_BYTES} bytes \
-                         ({} MiB). Convert the input to JSON LINES (NDJSON) to process \
-                         large files.",
-                        MAX_JSON_DOCUMENT_BYTES / (1024 * 1024)
-                    )
-                    .into(),
-                });
-            }
-            let stream = json_document_ndjson_stream(reader.stream, original_size, self.json_sub_path.clone());
+            validate_json_document_size(original_size)?;
+            let stream = json_document_ndjson_stream(
+                reader.stream,
+                original_size,
+                self.json_sub_path.clone(),
+                Arc::clone(&self.memory_pool),
+                self.query_tracker.clone(),
+            );
             GetResultPayload::Stream(stream)
         } else if let Some((_, scan_range)) = scan_context {
             let delimiter = self.record_delimiter();
@@ -503,6 +562,7 @@ impl ObjectStore for EcObjectStore {
                 scan_range,
                 include_header && header.is_none(),
                 read_start,
+                original_size,
             )
             .boxed();
             let stream = if let Some(header) = header {
@@ -664,6 +724,7 @@ struct ScanRangeState<S> {
     record: Vec<u8>,
     pending: VecDeque<Bytes>,
     done: bool,
+    expected_end: u64,
 }
 
 fn scan_range_stream<S>(
@@ -672,6 +733,7 @@ fn scan_range_stream<S>(
     range: SelectScanRange,
     include_header: bool,
     base_offset: u64,
+    expected_end: u64,
 ) -> BoxStream<'static, Result<Bytes>>
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + Unpin + 'static,
@@ -686,6 +748,7 @@ where
         record: Vec::new(),
         pending: VecDeque::new(),
         done: false,
+        expected_end,
     };
 
     stream::unfold(state, |mut state| async move {
@@ -709,6 +772,10 @@ where
                     ));
                 }
                 None => {
+                    if state.offset < state.expected_end {
+                        state.done = true;
+                        return Some((Err(incomplete_object_stream_error(state.expected_end - state.offset)), state));
+                    }
                     state.finish_pending_record();
                     state.done = true;
                 }
@@ -855,11 +922,57 @@ fn json_document_ndjson_stream(
     stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
     original_size: u64,
     json_sub_path: Option<String>,
+    memory_pool: Arc<dyn MemoryPool>,
+    query_tracker: Option<QueryExecutionTracker>,
 ) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
+    json_document_ndjson_stream_with_parser(
+        stream,
+        original_size,
+        json_sub_path,
+        memory_pool,
+        query_tracker,
+        |all_bytes, json_sub_path| parse_json_document_to_lines(&all_bytes, json_sub_path.as_deref()),
+    )
+}
+
+fn json_document_ndjson_stream_with_parser<P>(
+    stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
+    original_size: u64,
+    json_sub_path: Option<String>,
+    memory_pool: Arc<dyn MemoryPool>,
+    query_tracker: Option<QueryExecutionTracker>,
+    parser: P,
+) -> futures_core::stream::BoxStream<'static, Result<Bytes>>
+where
+    P: FnOnce(Vec<u8>, Option<String>) -> std::io::Result<Vec<Bytes>> + Send + 'static,
+{
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
+        // Compact JSON can expand substantially into a serde_json DOM and
+        // per-record output buffers, so reserve a conservative upper bound
+        // before the source buffer is allocated.
+        let buffer_capacity = usize::try_from(original_size).map_err(|_| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                "JSON DOCUMENT input size {original_size} does not fit in memory"
+            ))),
+        })?;
+        let reservation_bytes = buffer_capacity
+            .checked_mul(JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER)
+            .ok_or_else(|| o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                    "JSON DOCUMENT memory reservation overflow for {original_size} input bytes"
+                ))),
+            })?;
+        let reservation = MemoryConsumer::new("S3 Select JSON document").register(&memory_pool);
+        reservation.try_resize(reservation_bytes).map_err(|err| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(err),
+        })?;
+
         pin_mut!(stream);
         // ── 1. Read phase (lazy: only runs when the stream is polled) ────
-        let mut all_bytes = Vec::with_capacity(original_size as usize);
+        let mut all_bytes = Vec::with_capacity(buffer_capacity);
         stream
             .take(original_size)
             .read_to_end(&mut all_bytes)
@@ -868,18 +981,26 @@ fn json_document_ndjson_stream(
                 store: "EcObjectStore",
                 source: Box::new(e),
             })?;
+        if all_bytes.len() != buffer_capacity {
+            return Err(incomplete_object_stream_error(buffer_capacity - all_bytes.len()));
+        }
 
         // ── 2. Parse phase (blocking thread pool, non-blocking runtime) ──
-        let lines = tokio::task::spawn_blocking(move || parse_json_document_to_lines(&all_bytes, json_sub_path.as_deref()))
-            .await
-            .map_err(|e| o_Error::Generic {
-                store: "EcObjectStore",
-                source: e.to_string().into(),
-            })?
-            .map_err(|e| o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(e),
-            })?;
+        let pending_query_guard = PendingQueryExecutionGuard::new(query_tracker);
+        let task_query_guard = pending_query_guard.task_state();
+        let (lines, _reservation, _query_guard) = SpawnedTask::spawn_blocking(move || {
+            let query_guard = PendingQueryExecutionGuard::start(&task_query_guard)?;
+            parser(all_bytes, json_sub_path).map(|lines| (lines, reservation, query_guard))
+        })
+        .await
+        .map_err(|e| o_Error::Generic {
+            store: "EcObjectStore",
+            source: e.to_string().into(),
+        })?
+        .map_err(|e| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(e),
+        })?;
 
         // ── 3. Yield phase (one Bytes per NDJSON line) ───────────────────
         for line in lines {
@@ -888,6 +1009,66 @@ fn json_document_ndjson_stream(
         Ok(())
     })
     .boxed()
+}
+
+struct PendingQueryExecutionGuard {
+    state: Arc<Mutex<QueryExecutionGuardState>>,
+}
+
+enum QueryExecutionGuardState {
+    Pending(Option<QueryExecutionTracker>),
+    Started,
+    Cancelled,
+}
+
+impl PendingQueryExecutionGuard {
+    fn new(query_tracker: Option<QueryExecutionTracker>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(QueryExecutionGuardState::Pending(query_tracker))),
+        }
+    }
+
+    fn task_state(&self) -> Arc<Mutex<QueryExecutionGuardState>> {
+        Arc::clone(&self.state)
+    }
+
+    fn start(state: &Mutex<QueryExecutionGuardState>) -> std::io::Result<Option<QueryExecutionGuard>> {
+        let mut state = state.lock();
+        match std::mem::replace(&mut *state, QueryExecutionGuardState::Started) {
+            QueryExecutionGuardState::Pending(None) => Ok(None),
+            QueryExecutionGuardState::Pending(Some(query_tracker)) => query_tracker.query_guard().map(Some).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "JSON DOCUMENT parse was cancelled before it started")
+            }),
+            QueryExecutionGuardState::Cancelled => {
+                *state = QueryExecutionGuardState::Cancelled;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "JSON DOCUMENT parse was cancelled before it started",
+                ))
+            }
+            QueryExecutionGuardState::Started => {
+                *state = QueryExecutionGuardState::Started;
+                Err(std::io::Error::other("JSON DOCUMENT parse started more than once"))
+            }
+        }
+    }
+}
+
+impl Drop for PendingQueryExecutionGuard {
+    fn drop(&mut self) {
+        let query_guard = {
+            let mut state = self.state.lock();
+            match std::mem::replace(&mut *state, QueryExecutionGuardState::Cancelled) {
+                QueryExecutionGuardState::Pending(query_guard) => query_guard,
+                QueryExecutionGuardState::Started => {
+                    *state = QueryExecutionGuardState::Started;
+                    None
+                }
+                QueryExecutionGuardState::Cancelled => None,
+            }
+        };
+        drop(query_guard);
+    }
 }
 
 /// Parse a JSON DOCUMENT (a single JSON value, possibly multi-line) into a
@@ -907,19 +1088,11 @@ fn parse_json_document_to_lines(bytes: &[u8], json_sub_path: Option<&str>) -> st
 
     // Navigate into the sub-path when the root is an object and a path was
     // extracted from the SQL FROM clause (e.g. `FROM s3object.employees`).
-    let value = if let Some(path) = json_sub_path {
-        if let serde_json::Value::Object(ref obj) = root {
-            match obj.get(path) {
-                Some(sub) => sub.clone(),
-                // Path not found – fall back to emitting the whole root object.
-                None => root,
-            }
-        } else {
-            // Root is already an array or scalar; ignore the path hint.
-            root
+    let value = match (root, json_sub_path) {
+        (serde_json::Value::Object(mut object), Some(path)) => {
+            object.remove(path).unwrap_or_else(|| serde_json::Value::Object(object))
         }
-    } else {
-        root
+        (root, _) => root,
     };
 
     let mut lines: Vec<Bytes> = Vec::new();
@@ -979,30 +1152,55 @@ where
             y.yield_ok(bytes).await;
         }
         if remaining > 0 {
-            return Err(o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("object stream ended with {remaining} bytes remaining"),
-                )),
-            });
+            return Err(incomplete_object_stream_error(remaining));
         }
         Ok(())
     })
 }
 
+fn validate_json_document_size(original_size: u64) -> Result<()> {
+    if original_size <= MAX_JSON_DOCUMENT_BYTES {
+        return Ok(());
+    }
+
+    Err(o_Error::Generic {
+        store: "EcObjectStore",
+        source: Box::new(DataFusionError::ResourcesExhausted(format!(
+            "JSON DOCUMENT object is {original_size} bytes, which exceeds the maximum allowed size of \
+             {MAX_JSON_DOCUMENT_BYTES} bytes ({} MiB). Convert the input to JSON LINES (NDJSON) to process large files.",
+            MAX_JSON_DOCUMENT_BYTES / (1024 * 1024)
+        ))),
+    })
+}
+
+fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error {
+    o_Error::Generic {
+        store: "EcObjectStore",
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("object stream ended with {remaining} bytes remaining"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::{
-        SelectScanRange, bytes_stream, convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter,
-        flatten_json_document_to_ndjson, http_range_spec_from_get_range, replace_symbol, scan_range_from_bounds,
-        scan_range_read_start, scan_range_stream, select_read_headers,
+        EcObjectStore, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, SelectScanRange, bytes_stream,
+        convert_field_delimiter_stream, extract_json_sub_path_from_expression, find_delimiter, flatten_json_document_to_ndjson,
+        http_range_spec_from_get_range, json_document_ndjson_stream, json_document_ndjson_stream_with_parser, replace_symbol,
+        scan_range_from_bounds, scan_range_read_start, scan_range_stream, select_read_headers, validate_json_document_size,
+        validated_object_size,
     };
+    use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
     use bytes::Bytes;
-    use datafusion::object_store::{self, GetRange};
-    use datafusion::object_store::{GetOptions, GetResultPayload, ObjectStore as _, path::Path};
+    use datafusion::{
+        common::DataFusionError,
+        execution::memory_pool::{GreedyMemoryPool, MemoryPool},
+        object_store::{self, GetOptions, GetRange, GetResultPayload, ObjectStore as _, path::Path},
+    };
     use futures::{StreamExt, TryStreamExt, stream};
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
@@ -1018,15 +1216,27 @@ mod test {
     };
 
     #[test]
+    fn ec_object_store_constructor_remains_source_compatible() {
+        let _constructor: fn(Arc<SelectObjectContentInput>) -> s3s::S3Result<EcObjectStore> = EcObjectStore::new;
+    }
+    use tokio::sync::Semaphore;
+
+    #[test]
     fn test_replace() {
         let result = replace_symbol(b"&&", b"dandan&&is&&best");
         assert_eq!(result, b"dandan,is,best");
     }
 
+    #[test]
+    fn test_validated_object_size_rejects_negative_metadata() {
+        assert_eq!(validated_object_size(0).expect("zero object size should be valid"), 0);
+        assert!(validated_object_size(-1).is_err());
+    }
+
     #[tokio::test]
     async fn test_scan_range_stream_keeps_header_and_selected_record() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"h1,h2\n1,a\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(10, 11), true, 0);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(10, 11), true, 0, 18);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1037,7 +1247,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_stream_skips_record_when_start_is_in_middle() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(2, 7), false, 0);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(2, 7), false, 0, 12);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1048,7 +1258,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_stream_keeps_record_when_end_is_in_middle() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 5), false, 0);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 5), false, 0, 12);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1059,7 +1269,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_stream_uses_base_offset_for_range_reader() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"\n2,b\n3,c\n"))]);
-        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(4, 7), false, 3);
+        let mut stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(4, 7), false, 3, 12);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
@@ -1074,12 +1284,32 @@ mod test {
             Ok::<_, std::io::Error>(Bytes::from_static(b"\n1,a\r\n2,b\r")),
             Ok::<_, std::io::Error>(Bytes::from_static(b"\n3,c\r\n")),
         ]);
-        let mut stream = scan_range_stream(chunks, b"\r\n".to_vec(), SelectScanRange::new(12, 14), true, 0);
+        let mut stream = scan_range_stream(chunks, b"\r\n".to_vec(), SelectScanRange::new(12, 14), true, 0, 22);
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
             output.extend_from_slice(&bytes.unwrap());
         }
         assert_eq!(output, b"h1,h2\r\n2,b\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_scan_range_stream_rejects_early_eof() {
+        let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"1,a\n"))]);
+        let mut output = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 7), false, 0, 8);
+
+        assert_eq!(output.next().await.expect("first stream item").expect("first record"), b"1,a\n"[..]);
+        let err = output
+            .next()
+            .await
+            .expect("early EOF error")
+            .expect_err("short ScanRange stream must fail");
+        let object_store::Error::Generic { source, .. } = err else {
+            panic!("expected generic object store error");
+        };
+        let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
+        assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(source.to_string().contains("4 bytes remaining"));
+        assert!(output.next().await.is_none());
     }
 
     #[test]
@@ -1157,7 +1387,7 @@ mod test {
     #[tokio::test]
     async fn test_scan_range_output_can_convert_field_delimiter() {
         let chunks = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"a&&1\nb&&2\n"))]);
-        let stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 10), false, 0);
+        let stream = scan_range_stream(chunks, b"\n".to_vec(), SelectScanRange::new(0, 10), false, 0, 10);
         let mut stream = convert_field_delimiter_stream(stream, Some("&&".to_string()));
         let mut output = Vec::new();
         while let Some(bytes) = stream.next().await {
@@ -1195,6 +1425,7 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
     async fn test_get_opts_validates_raw_length_before_delimiter_conversion() {
         let temp_root = tempfile::tempdir().expect("create s3select test temp root");
         let env = rustfs_test_utils::TestECStoreEnv::builder()
@@ -1242,6 +1473,8 @@ mod test {
             delimiter: "&&".to_string(),
             is_json_document: false,
             json_sub_path: None,
+            memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
+            query_tracker: None,
             store: env.ecstore,
         };
 
@@ -1255,6 +1488,13 @@ mod test {
         let chunks: Vec<Bytes> = stream.try_collect().await.expect("collect converted object stream");
 
         assert_eq!(chunks.concat(), b"a,1\n");
+
+        let requested_range = 3..10;
+        let ranges = store
+            .get_ranges(&Path::from(object), std::slice::from_ref(&requested_range))
+            .await
+            .expect("bounded range past EOF should return the object remainder");
+        assert_eq!(ranges, vec![Bytes::from_static(b"1\n")]);
     }
 
     #[tokio::test]
@@ -1300,6 +1540,278 @@ mod test {
         assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(source.to_string().contains("2 bytes remaining"));
         assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_json_document_stream_respects_query_memory_pool() {
+        let input = b"{}".to_vec();
+        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(required - 1));
+        let mut output = json_document_ndjson_stream(
+            Box::new(std::io::Cursor::new(input.clone())),
+            input.len() as u64,
+            None,
+            memory_pool,
+            None,
+        );
+
+        let err = output
+            .next()
+            .await
+            .expect("memory error")
+            .expect_err("reservation should exceed the pool");
+        let object_store::Error::Generic { source, .. } = err else {
+            panic!("expected generic object store error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<DataFusionError>(),
+            Some(DataFusionError::ResourcesExhausted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_json_document_stream_releases_memory_reservation() {
+        let input = b"[1,2]".to_vec();
+        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
+        let memory_pool = Arc::new(GreedyMemoryPool::new(required));
+        let output: Vec<Bytes> = json_document_ndjson_stream(
+            Box::new(std::io::Cursor::new(input.clone())),
+            input.len() as u64,
+            None,
+            memory_pool.clone(),
+            None,
+        )
+        .try_collect()
+        .await
+        .expect("JSON conversion should fit the pool");
+
+        assert_eq!(output, vec![Bytes::from_static(b"1\n"), Bytes::from_static(b"2\n")]);
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_json_document_stream_rejects_early_eof() {
+        let input = b"{}".to_vec();
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+        let mut output = json_document_ndjson_stream(Box::new(std::io::Cursor::new(input)), 4, None, memory_pool, None);
+
+        let err = output
+            .next()
+            .await
+            .expect("early EOF error")
+            .expect_err("short JSON document must fail");
+        let object_store::Error::Generic { source, .. } = err else {
+            panic!("expected generic object store error");
+        };
+        let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
+        assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(source.to_string().contains("2 bytes remaining"));
+        assert!(output.next().await.is_none());
+    }
+
+    #[test]
+    fn test_json_document_size_error_is_resource_exhausted() {
+        assert!(validate_json_document_size(super::MAX_JSON_DOCUMENT_BYTES).is_ok());
+
+        let err = validate_json_document_size(super::MAX_JSON_DOCUMENT_BYTES + 1).expect_err("oversized JSON document must fail");
+        let object_store::Error::Generic { source, .. } = err else {
+            panic!("expected generic object store error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<DataFusionError>(),
+            Some(DataFusionError::ResourcesExhausted(_))
+        ));
+    }
+
+    #[test]
+    fn test_json_document_queued_parse_releases_query_guard_when_cancelled() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        runtime.block_on(async {
+            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
+            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocking_started_tx.send(());
+                release_blocking_rx.recv().expect("release blocking worker");
+            });
+            blocking_started_rx.await.expect("blocking worker should start");
+
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = Arc::clone(&admission)
+                .acquire_owned()
+                .await
+                .expect("query permit should be available");
+            let query_guard: QueryExecutionGuard = Arc::new(permit);
+            let query_tracker = QueryExecutionTracker::new(
+                &QueryExecutionOwner::new(),
+                query_guard,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                30,
+            );
+            let input = b"{}".to_vec();
+            let memory_pool: Arc<dyn MemoryPool> =
+                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+            let mut output = json_document_ndjson_stream(
+                Box::new(std::io::Cursor::new(input.clone())),
+                input.len() as u64,
+                None,
+                memory_pool,
+                Some(query_tracker),
+            );
+
+            {
+                let next = output.next();
+                futures::pin_mut!(next);
+                assert!(futures::poll!(next.as_mut()).is_pending());
+            }
+            drop(output);
+
+            let recovered_permit =
+                tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
+                    .await
+                    .expect("queued JSON parse should be cancelled")
+                    .expect("query admission should remain open");
+            release_blocking_tx.send(()).expect("release blocking worker");
+            blocker.await.expect("blocking worker should finish");
+            drop(recovered_permit);
+            assert_eq!(admission.available_permits(), 1);
+        });
+    }
+
+    #[test]
+    fn test_json_document_expired_queued_parse_does_not_start() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        runtime.block_on(async {
+            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
+            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocking_started_tx.send(());
+                release_blocking_rx.recv().expect("release blocking worker");
+            });
+            blocking_started_rx.await.expect("blocking worker should start");
+
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = Arc::clone(&admission)
+                .acquire_owned()
+                .await
+                .expect("query permit should be available");
+            let owner = QueryExecutionOwner::new();
+            let query_tracker = QueryExecutionTracker::new(
+                &owner,
+                Arc::new(permit),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                30,
+            );
+            let input = b"{}".to_vec();
+            let memory_pool: Arc<dyn MemoryPool> =
+                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+            let parser_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let parser_started_in_task = Arc::clone(&parser_started);
+            let mut output = json_document_ndjson_stream_with_parser(
+                Box::new(std::io::Cursor::new(input.clone())),
+                input.len() as u64,
+                None,
+                memory_pool,
+                Some(query_tracker.clone()),
+                move |_, _| {
+                    parser_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(vec![Bytes::from_static(b"{}\n")])
+                },
+            );
+
+            {
+                let next = output.next();
+                futures::pin_mut!(next);
+                assert!(futures::poll!(next.as_mut()).is_pending());
+            }
+            query_tracker.expire(&owner);
+            assert_eq!(admission.available_permits(), 1);
+            release_blocking_tx.send(()).expect("release blocking worker");
+            blocker.await.expect("blocking worker should finish");
+
+            let err = tokio::time::timeout(std::time::Duration::from_secs(5), output.next())
+                .await
+                .expect("queued parser should resume")
+                .expect("queued parser should return an error")
+                .expect_err("expired queued parser must not run");
+            let object_store::Error::Generic { source, .. } = err else {
+                panic!("expected generic object store error");
+            };
+            let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
+            assert_eq!(source.kind(), std::io::ErrorKind::Interrupted);
+            assert!(!parser_started.load(std::sync::atomic::Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn test_json_document_started_parse_retains_query_guard_when_cancelled() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        runtime.block_on(async {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = Arc::clone(&admission)
+                .acquire_owned()
+                .await
+                .expect("query permit should be available");
+            let query_guard: QueryExecutionGuard = Arc::new(permit);
+            let query_tracker = QueryExecutionTracker::new(
+                &QueryExecutionOwner::new(),
+                query_guard,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                30,
+            );
+            let input = b"{}".to_vec();
+            let memory_pool: Arc<dyn MemoryPool> =
+                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+            let (parse_started_tx, parse_started_rx) = tokio::sync::oneshot::channel();
+            let (release_parse_tx, release_parse_rx) = std::sync::mpsc::channel();
+            let mut output = json_document_ndjson_stream_with_parser(
+                Box::new(std::io::Cursor::new(input.clone())),
+                input.len() as u64,
+                None,
+                memory_pool,
+                Some(query_tracker),
+                move |_, _| {
+                    let _ = parse_started_tx.send(());
+                    release_parse_rx.recv().expect("release JSON parser");
+                    Ok(vec![Bytes::from_static(b"{}\n")])
+                },
+            );
+
+            {
+                let next = output.next();
+                futures::pin_mut!(next);
+                assert!(futures::poll!(next.as_mut()).is_pending());
+            }
+            parse_started_rx.await.expect("JSON parser should start");
+            drop(output);
+
+            assert!(Arc::clone(&admission).try_acquire_owned().is_err());
+            release_parse_tx.send(()).expect("release JSON parser");
+            let recovered_permit =
+                tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
+                    .await
+                    .expect("started JSON parse should release the query guard")
+                    .expect("query admission should remain open");
+            drop(recovered_permit);
+            assert_eq!(admission.available_permits(), 1);
+        });
     }
 
     /// A JSON array is split into one NDJSON line per element.

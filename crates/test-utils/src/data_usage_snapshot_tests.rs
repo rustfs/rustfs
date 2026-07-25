@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+use rustfs_data_usage::{BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageInfo};
 use std::time::{Duration, SystemTime};
 
 use crate::TestECStoreEnv;
@@ -48,7 +48,7 @@ async fn data_usage_snapshot_recovery_wires_primary_backup_and_negative_cache() 
         .init_bucket_metadata(false)
         .build()
         .await;
-    let primary = format!("{BUCKET_META_PREFIX}/.usage.json");
+    let primary = format!("{BUCKET_META_PREFIX}/{DATA_USAGE_OBJECT_NAME}");
     let backup = format!("{primary}.bkp");
     let last_update = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let expected = snapshot("bucket-a", last_update);

@@ -310,10 +310,8 @@ pub fn check_list_multipart_args(
 ) -> Result<()> {
     check_list_objs_args(bucket, prefix, key_marker)?;
 
-    if let Some(upload_id_marker) = upload_id_marker {
-        if let Some(key_marker) = key_marker
-            && key_marker.ends_with('/')
-        {
+    if let (Some(key_marker), Some(upload_id_marker)) = (key_marker, upload_id_marker) {
+        if key_marker.ends_with('/') {
             return Err(StorageError::InvalidUploadIDKeyCombination(
                 upload_id_marker.to_string(),
                 key_marker.to_string(),
@@ -627,6 +625,11 @@ mod tests {
         assert!(check_list_objs_args("valid-bucket", "", &None).is_ok());
         assert!(check_list_objs_args("", "", &None).is_err());
         assert!(check_list_objs_args("INVALID", "", &None).is_err());
+    }
+
+    #[test]
+    fn test_list_multipart_upload_marker_is_ignored_without_key_marker() {
+        assert!(check_list_multipart_args("valid-bucket", "", &None, &Some("not-base64!".to_string()), &None,).is_ok());
     }
 
     #[test]
