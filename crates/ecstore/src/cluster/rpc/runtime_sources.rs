@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_MSGPACK_DIRECTION_RESPONSE, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+    INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 
 #[cfg(test)]
@@ -126,6 +127,22 @@ pub(crate) fn record_response_json_fallback(message: &'static str) {
     global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, message);
 }
 
+pub(crate) fn record_response_msgpack_decode_error(message: &'static str) {
+    global_internode_metrics().record_msgpack_json_decode_error(
+        INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+        message,
+        INTERNODE_MSGPACK_CODEC_MSGPACK,
+    );
+}
+
+pub(crate) fn record_response_json_decode_error(message: &'static str) {
+    global_internode_metrics().record_msgpack_json_decode_error(
+        INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+        message,
+        INTERNODE_MSGPACK_CODEC_JSON,
+    );
+}
+
 #[cfg(test)]
 pub(crate) fn reset_internode_metrics_for_test() {
     global_internode_metrics().reset_for_test();
@@ -134,4 +151,9 @@ pub(crate) fn reset_internode_metrics_for_test() {
 #[cfg(test)]
 pub(crate) fn internode_metrics_snapshot_for_test() -> InternodeMetricsSnapshot {
     global_internode_metrics().snapshot()
+}
+
+#[cfg(test)]
+pub(crate) fn internode_msgpack_json_decode_error_total_for_test() -> u64 {
+    global_internode_metrics().msgpack_json_decode_error_total_for_test()
 }

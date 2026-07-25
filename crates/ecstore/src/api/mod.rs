@@ -43,10 +43,10 @@ pub mod bucket {
 
         pub mod bucket_lifecycle_ops {
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
-                ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionQueueSnapshot,
-                ManualTransitionRunExecution, ManualTransitionRunOptions, ManualTransitionRunReport, RestoreRequestOps,
-                TransitionState, TransitionedObject, apply_expiry_rule, apply_transition_rule,
-                enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
+                ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
+                ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
+                ManualTransitionRunReport, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
+                apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
                 enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
                 enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
                 init_background_expiry, manual_transition_queue_snapshot, post_restore_opts,

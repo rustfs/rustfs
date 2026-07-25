@@ -18,13 +18,14 @@ use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::lifecycle::{
-    ManualTransitionCancelCheck, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionQueueSnapshot,
-    ManualTransitionRunOptions, ManualTransitionRunReport, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
-    claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
-    enqueue_transition_for_existing_objects_scoped, load_manual_transition_job_record,
-    load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission, manual_transition_job_lease_expired,
-    manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired, renew_manual_transition_job_lease,
-    request_manual_transition_job_cancel, save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+    ManualTransitionCancelCheck, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionProgressSink,
+    ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport, ManualTransitionScopeAdmission,
+    ManualTransitionScopeAdmissionClaim, claim_manual_transition_scope_admission,
+    delete_manual_transition_scope_admission_if_current, enqueue_transition_for_existing_objects_scoped,
+    load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
+    manual_transition_job_lease_expired, manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired,
+    persist_manual_transition_job_progress, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
+    save_manual_transition_job_record, save_manual_transition_job_record_if_current,
 };
 use crate::admin::storage_api::runtime::ECStore;
 use crate::auth::{check_key_valid, get_session_token};
@@ -171,7 +172,7 @@ struct ManualTransitionRunResponse {
 
 #[derive(Debug, Serialize)]
 struct ManualTransitionJobResponse {
-    state: ManualTransitionJobState,
+    status: ManualTransitionJobState,
     mode: &'static str,
     job_id: String,
     status_endpoint: String,
@@ -186,7 +187,7 @@ struct ManualTransitionJobResponse {
     completed_at_unix_nanos: Option<i128>,
     report: ManualTransitionRunReport,
     queue_snapshot: ManualTransitionQueueSnapshot,
-    error: Option<String>,
+    failure_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -287,6 +288,7 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
             max_duration: query.max_duration_seconds.map(std::time::Duration::from_secs),
             cancel_token: None,
             cancel_check: None,
+            progress_sink: None,
         },
         run_mode,
     ))
@@ -467,8 +469,8 @@ fn manual_transition_owner_id() -> &'static str {
 fn manual_transition_job_response(record: ManualTransitionJobRecord) -> ManualTransitionJobResponse {
     let status_endpoint = manual_transition_status_endpoint(record.job_id);
     ManualTransitionJobResponse {
-        state: record.state,
-        mode: "async",
+        status: record.state,
+        mode: "durable_job",
         job_id: record.job_id.to_string(),
         status_endpoint: status_endpoint.clone(),
         cancel_endpoint: status_endpoint,
@@ -482,7 +484,7 @@ fn manual_transition_job_response(record: ManualTransitionJobRecord) -> ManualTr
         completed_at_unix_nanos: record.completed_at_unix_nanos,
         report: record.report,
         queue_snapshot: record.queue_snapshot,
-        error: record.error,
+        failure_reason: record.error,
     }
 }
 
@@ -490,7 +492,7 @@ fn manual_transition_job_conflict_response(admission: ManualTransitionScopeAdmis
     let status_endpoint = manual_transition_status_endpoint(admission.job_id);
     ManualTransitionJobConflictResponse {
         state: "conflict",
-        mode: "async",
+        mode: "durable_job",
         active_job_id: admission.job_id.to_string(),
         status_endpoint: status_endpoint.clone(),
         cancel_endpoint: status_endpoint,
@@ -578,6 +580,17 @@ fn manual_transition_durable_cancel_check(store: Arc<ECStore>, job_id: Uuid) -> 
                 _ => false,
             }
         }) as Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    })
+}
+
+fn manual_transition_progress_sink(store: Arc<ECStore>, job_id: Uuid) -> ManualTransitionProgressSink {
+    Arc::new(move |report| {
+        let store = store.clone();
+        Box::pin(async move {
+            persist_manual_transition_job_progress(store, job_id, &report, manual_transition_queue_snapshot())
+                .await
+                .map(|_| ())
+        })
     })
 }
 
@@ -716,6 +729,7 @@ async fn start_manual_transition_job(
     let mut run_options = options;
     run_options.cancel_token = Some(cancel_token.clone());
     run_options.cancel_check = Some(manual_transition_durable_cancel_check(store.clone(), job_id));
+    run_options.progress_sink = Some(manual_transition_progress_sink(store.clone(), job_id));
     let run_store = store.clone();
     spawn_manual_transition_job_heartbeat(store, job_id, cancel_token);
     tokio::spawn(async move {
@@ -754,8 +768,8 @@ impl Operation for ManualTransitionRunHandler {
                     let record = *record;
                     let status_endpoint = manual_transition_status_endpoint(record.job_id);
                     let response = ManualTransitionRunResponse {
-                        state: "running",
-                        mode: "async",
+                        state: "accepted",
+                        mode: "durable_job",
                         job_id: Some(record.job_id.to_string()),
                         status_endpoint: Some(status_endpoint.clone()),
                         cancel_endpoint: Some(status_endpoint),
@@ -1177,8 +1191,8 @@ mod tests {
         let record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &ManualTransitionRunOptions::default(), "owner-a");
         let response = manual_transition_job_response(record);
 
-        assert_eq!(response.state, ManualTransitionJobState::Running);
-        assert_eq!(response.mode, "async");
+        assert_eq!(response.status, ManualTransitionJobState::Running);
+        assert_eq!(response.mode, "durable_job");
         assert!(response.status_endpoint.ends_with(&response.job_id));
         assert_eq!(response.cancel_endpoint, response.status_endpoint);
     }

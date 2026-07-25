@@ -197,13 +197,16 @@ pub(crate) mod lifecycle {
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
         claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
         load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
-        manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired, renew_manual_transition_job_lease,
-        request_manual_transition_job_cancel, save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+        manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired,
+        persist_manual_transition_job_progress, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
+        save_manual_transition_job_record, save_manual_transition_job_record_if_current,
     };
     pub(crate) type ManualTransitionCancelCheck =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionCancelCheck;
     pub(crate) type ManualTransitionQueueSnapshot =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionQueueSnapshot;
+    pub(crate) type ManualTransitionProgressSink =
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionProgressSink;
     pub(crate) type ManualTransitionRunOptions =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunOptions;
     pub(crate) type ManualTransitionRunReport = super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunReport;

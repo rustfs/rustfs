@@ -66,6 +66,8 @@ pub struct ManualTransitionJobRecord {
     pub prefix: String,
     pub tier: Option<String>,
     pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_objects: Option<u64>,
     pub owner_id: String,
     pub lease_id: Uuid,
     pub lease_expires_at_unix_nanos: i128,
@@ -93,6 +95,7 @@ impl ManualTransitionJobRecord {
             prefix: options.prefix.clone(),
             tier: options.tier.clone(),
             dry_run: options.dry_run,
+            max_objects: options.max_objects,
             owner_id: owner_id.into(),
             lease_id,
             lease_expires_at_unix_nanos: manual_transition_job_lease_expires_at(now),
@@ -137,6 +140,32 @@ impl ManualTransitionJobRecord {
     pub fn mark_cancel_requested(&mut self) {
         self.cancel_requested = true;
         self.updated_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    }
+
+    pub fn claim_recovery_lease(&mut self, owner_id: impl Into<String>, queue_snapshot: ManualTransitionQueueSnapshot) {
+        if self.state == ManualTransitionJobState::Running {
+            self.owner_id = owner_id.into();
+            self.lease_id = Uuid::new_v4();
+            self.renew_lease(queue_snapshot);
+        }
+    }
+
+    pub fn abandon_recovery_lease(&mut self, lease_id: Uuid) {
+        if self.state == ManualTransitionJobState::Running && self.lease_id == lease_id {
+            self.lease_expires_at_unix_nanos = 0;
+            self.updated_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        }
+    }
+
+    pub fn resume_options(&self) -> ManualTransitionRunOptions {
+        ManualTransitionRunOptions {
+            prefix: self.prefix.clone(),
+            continuation_token: self.report.continuation_token.clone(),
+            tier: self.tier.clone(),
+            dry_run: self.dry_run,
+            max_objects: self.max_objects,
+            ..Default::default()
+        }
     }
 
     pub fn renew_lease(&mut self, queue_snapshot: ManualTransitionQueueSnapshot) {
@@ -349,6 +378,35 @@ pub fn manual_transition_job_record_object_name(job_id: Uuid) -> Result<String, 
     ))
 }
 
+pub fn manual_transition_job_id_from_record_object_name(object_name: &str) -> Result<Uuid, ManualTransitionJobError> {
+    let Some(rest) = object_name.strip_prefix(MANUAL_TRANSITION_JOB_RECORD_PREFIX) else {
+        return Err(ManualTransitionJobError::Corrupt("job record object prefix is invalid"));
+    };
+    let rest = rest
+        .strip_prefix('/')
+        .ok_or(ManualTransitionJobError::Corrupt("job record object path is invalid"))?;
+    let mut parts = rest.split('/');
+    let first = parts
+        .next()
+        .ok_or(ManualTransitionJobError::Corrupt("job record first shard is missing"))?;
+    let second = parts
+        .next()
+        .ok_or(ManualTransitionJobError::Corrupt("job record second shard is missing"))?;
+    let file = parts
+        .next()
+        .ok_or(ManualTransitionJobError::Corrupt("job record file is missing"))?;
+    if parts.next().is_some() {
+        return Err(ManualTransitionJobError::Corrupt("job record object path has extra components"));
+    }
+    let job_key = file
+        .strip_suffix(".json")
+        .ok_or(ManualTransitionJobError::Corrupt("job record suffix is invalid"))?;
+    if job_key.len() != 32 || first.len() != 2 || second.len() != 2 || first != &job_key[..2] || second != &job_key[2..4] {
+        return Err(ManualTransitionJobError::Corrupt("job record shards do not match job id"));
+    }
+    Uuid::parse_str(job_key).map_err(|_| ManualTransitionJobError::Corrupt("job record job id is invalid"))
+}
+
 pub fn manual_transition_scope_record_object_name(scope_key: &str) -> Result<String, ManualTransitionJobError> {
     if scope_key.len() != 64
         || !scope_key
@@ -502,10 +560,16 @@ pub async fn claim_manual_transition_scope_admission(
 
     let (active, etag) = load_manual_transition_scope_admission_with_etag(api.clone(), &admission.scope_key).await?;
     let scope_lease_expired = manual_transition_scope_admission_lease_expired(&active);
-    let active_job_reclaimable = match load_manual_transition_job_record(api.clone(), active.job_id).await {
-        Ok(active_job) => active_job.is_terminal() || (scope_lease_expired && manual_transition_job_lease_expired(&active_job)),
-        Err(Error::ConfigNotFound) => true,
-        Err(err) => return Err(err),
+    let active_job_reclaimable = if active.job_id == admission.job_id {
+        scope_lease_expired
+    } else {
+        match load_manual_transition_job_record(api.clone(), active.job_id).await {
+            Ok(active_job) => {
+                active_job.is_terminal() || (scope_lease_expired && manual_transition_job_lease_expired(&active_job))
+            }
+            Err(Error::ConfigNotFound) => true,
+            Err(err) => return Err(err),
+        }
     };
     if active_job_reclaimable {
         return match save_manual_transition_scope_admission_if_current(api, admission, &etag).await {
@@ -625,6 +689,7 @@ mod tests {
         let options = ManualTransitionRunOptions {
             prefix: "logs/".to_string(),
             tier: Some("warm".to_string()),
+            max_objects: Some(17),
             ..Default::default()
         };
         let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
@@ -648,6 +713,59 @@ mod tests {
         assert_eq!(decoded.job_id, record.job_id);
         assert_eq!(decoded.state, ManualTransitionJobState::Cancelled);
         assert!(decoded.cancel_requested);
+        assert_eq!(decoded.max_objects, Some(17));
+    }
+
+    #[test]
+    fn manual_transition_job_record_builds_resume_options() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            continuation_token: Some("start-token".to_string()),
+            tier: Some("warm".to_string()),
+            dry_run: true,
+            max_objects: Some(3),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.report.continuation_token = Some("resume-token".to_string());
+
+        let resume = record.resume_options();
+
+        assert_eq!(resume.prefix, "logs/");
+        assert_eq!(resume.continuation_token.as_deref(), Some("resume-token"));
+        assert_eq!(resume.tier.as_deref(), Some("warm"));
+        assert!(resume.dry_run);
+        assert_eq!(resume.max_objects, Some(3));
+        assert!(resume.cancel_token.is_none());
+        assert!(resume.cancel_check.is_none());
+        assert!(resume.progress_sink.is_none());
+    }
+
+    #[test]
+    fn manual_transition_job_record_object_name_round_trips_job_id() {
+        let job_id = Uuid::new_v4();
+        let object_name = manual_transition_job_record_object_name(job_id).expect("job record path should encode");
+
+        let decoded = manual_transition_job_id_from_record_object_name(&object_name).expect("job record path should decode");
+
+        assert_eq!(decoded, job_id);
+    }
+
+    #[test]
+    fn manual_transition_job_record_object_name_rejects_shard_mismatch() {
+        let job_id = Uuid::new_v4();
+        let object_name = manual_transition_job_record_object_name(job_id).expect("job record path should encode");
+        let job_key = job_id.simple().to_string();
+        let bad_first_shard = if &job_key[..2] == "ff" { "00" } else { "ff" };
+        let object_name = object_name.replacen(
+            &format!("{MANUAL_TRANSITION_JOB_RECORD_PREFIX}/{}/", &job_key[..2]),
+            &format!("{MANUAL_TRANSITION_JOB_RECORD_PREFIX}/{bad_first_shard}/"),
+            1,
+        );
+
+        let err = manual_transition_job_id_from_record_object_name(&object_name).expect_err("bad shard must fail closed");
+
+        assert!(err.to_string().contains("shards"));
     }
 
     #[test]
