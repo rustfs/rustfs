@@ -2281,6 +2281,7 @@ pub fn reset_sse_dek_provider() {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
     if let Ok(mut slot) = GLOBAL_KMS_DEK_PROVIDER.write() {
         *slot = Some(provider.clone());
@@ -2288,6 +2289,15 @@ pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
         *slot = Some(provider);
     }
+}
+
+/// Provider explicitly injected via `set_sse_dek_provider_for_test`, if any.
+///
+/// Reads `GLOBAL_KMS_DEK_PROVIDER` because that slot is populated *only* by the
+/// test setter, so a hit here always means an explicit test injection.
+#[cfg(test)]
+fn test_injected_sse_dek_provider() -> Option<Arc<dyn SseDekProvider>> {
+    GLOBAL_KMS_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned())
 }
 
 // ============================================================================
