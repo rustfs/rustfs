@@ -223,14 +223,14 @@ impl KmsClient for StaticKmsBackend {
         };
 
         // Apply prefix filter if provided
-        if let Some(ref marker) = request.marker {
-            if self.key_id <= *marker {
-                return Ok(ListKeysResponse {
-                    keys: vec![],
-                    next_marker: None,
-                    truncated: false,
-                });
-            }
+        if let Some(ref marker) = request.marker
+            && self.key_id <= *marker
+        {
+            return Ok(ListKeysResponse {
+                keys: vec![],
+                next_marker: None,
+                truncated: false,
+            });
         }
 
         Ok(ListKeysResponse {
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(data_key.key_id, key_id);
         assert_eq!(data_key.version, 0);
         assert!(data_key.plaintext.is_some());
-        assert_eq!(data_key.plaintext.as_ref().unwrap().len(), 32);
+        assert_eq!(data_key.plaintext.as_ref().expect("plaintext should be set").len(), 32);
         // Ciphertext should be: encrypted(32) + tag(16) + nonce(12)
         assert_eq!(data_key.ciphertext.len(), 32 + 16 + NONCE_SIZE);
 
@@ -450,7 +450,7 @@ mod tests {
         let request = GenerateKeyRequest::new("wrong-key-id".to_string(), "AES_256".to_string());
         let result = KmsClient::generate_data_key(&backend, &request, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("wrong-key-id"));
+        assert!(result.expect_err("should be Err").to_string().contains("wrong-key-id"));
     }
 
     #[tokio::test]
@@ -492,7 +492,7 @@ mod tests {
         // Creating the pre-configured key should return KeyAlreadyExists
         let result = KmsClient::create_key(&backend, &key_id, "AES_256", None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("already exists"));
+        assert!(result.expect_err("should be Err").to_string().contains("already exists"));
     }
 
     #[tokio::test]
@@ -502,7 +502,7 @@ mod tests {
         // Creating any other key should return invalid operation (read-only)
         let result = KmsClient::create_key(&backend, "other-key", "AES_256", None).await;
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = result.expect_err("should be Err").to_string();
         assert!(err_msg.contains("read-only") || err_msg.contains("cannot create"));
     }
 
@@ -540,7 +540,7 @@ mod tests {
 
         let result = KmsClient::disable_key(&backend, &key_id, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("read-only"));
+        assert!(result.expect_err("should be Err").to_string().contains("read-only"));
     }
 
     #[tokio::test]
@@ -563,7 +563,7 @@ mod tests {
 
         let result = KmsClient::schedule_key_deletion(&backend, &key_id, 7, None).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("read-only"));
+        assert!(result.expect_err("should be Err").to_string().contains("read-only"));
     }
 
     #[tokio::test]

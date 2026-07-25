@@ -1613,9 +1613,7 @@ async fn apply_managed_encryption_material(
     let kms_key_to_use = match (encryption_type, kms_key_candidate.clone()) {
         (SSEType::SseS3, Some(kms_key_id)) => kms_key_id,
         (SSEType::SseS3, None) => {
-            tracing::debug!(
-                "SSE-S3: no KMS key configured, falling back to \"default\" key ID"
-            );
+            tracing::debug!("SSE-S3: no KMS key configured, falling back to \"default\" key ID");
             "default".to_string()
         }
         (SSEType::SseKms, Some(kms_key_id)) => kms_key_id,

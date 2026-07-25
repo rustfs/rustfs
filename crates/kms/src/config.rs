@@ -209,7 +209,7 @@ impl Default for LocalConfig {
 ///
 /// Uses a pre-configured AES-256 key to derive data encryption keys via
 /// HMAC-SHA256 + AES-256-GCM, matching the MinIO builtin/static KMS wire format.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct StaticConfig {
     /// Key identifier (name) for the single configured key
     pub key_id: String,
@@ -223,15 +223,6 @@ impl fmt::Debug for StaticConfig {
             .field("key_id", &self.key_id)
             .field("secret_key", &redacted_secret(&self.secret_key))
             .finish()
-    }
-}
-
-impl Default for StaticConfig {
-    fn default() -> Self {
-        Self {
-            key_id: String::new(),
-            secret_key: String::new(),
-        }
     }
 }
 
@@ -755,9 +746,7 @@ impl KmsConfig {
 
                 // Parse format: <key-id>:<base64-key>
                 let colon_pos = secret_str.find(':').ok_or_else(|| {
-                    KmsError::configuration_error(
-                        "Static KMS secret key must be in format <key-name>:<base64-key>",
-                    )
+                    KmsError::configuration_error("Static KMS secret key must be in format <key-name>:<base64-key>")
                 })?;
                 let key_id = secret_str[..colon_pos].to_string();
                 let secret_key = secret_str[colon_pos + 1..].to_string();

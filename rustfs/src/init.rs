@@ -381,9 +381,8 @@ fn build_static_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::
 
     // Read secret from file first, then fall back to env var
     let secret_str = if let Some(file_path) = rustfs_utils::get_env_opt_str(ENV_KMS_STATIC_SECRET_KEY_FILE) {
-        std::fs::read_to_string(&file_path).map_err(|e| {
-            Error::other(format!("Failed to read static KMS secret key file {file_path}: {e}"))
-        })?
+        std::fs::read_to_string(&file_path)
+            .map_err(|e| Error::other(format!("Failed to read static KMS secret key file {file_path}: {e}")))?
     } else {
         rustfs_utils::get_env_str(ENV_KMS_STATIC_SECRET_KEY, "")
     };
