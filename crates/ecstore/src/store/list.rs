@@ -55,6 +55,19 @@ impl ECStore {
             .await
     }
 
+    pub(crate) async fn list_object_versions_for_lifecycle(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        self.inner_list_object_versions_for_lifecycle(bucket, prefix, marker, version_marker, delimiter, max_keys)
+            .await
+    }
+
     pub(super) async fn handle_walk(
         self: Arc<Self>,
         rx: CancellationToken,

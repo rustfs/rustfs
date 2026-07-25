@@ -557,6 +557,29 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
+        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, false)
+            .await
+    }
+
+    pub(crate) async fn from_meta_cache_entries_sorted_versions_for_lifecycle(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+    ) -> Vec<ObjectInfo> {
+        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, true)
+            .await
+    }
+
+    async fn from_meta_cache_entries_sorted_versions_with_purge(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+        include_version_purge: bool,
+    ) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
         let mut prev_prefix = "";
@@ -604,7 +627,7 @@ impl ObjectInfo {
                 };
 
                 for fi in versions.iter() {
-                    if !fi.version_purge_status().is_empty() {
+                    if !include_version_purge && !fi.version_purge_status().is_empty() {
                         continue;
                     }
 
@@ -1062,6 +1085,67 @@ mod tests {
         assert!(objects[0].delete_marker);
         assert!(objects[0].is_latest);
         assert_eq!(objects[0].num_versions, 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_versions_listing_preserves_purge_pending_versions() {
+        let visible_version_id = Uuid::new_v4();
+        let purge_version_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(purge_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("version pending purge should be added");
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(visible_version_id),
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("visible version should be added");
+        fm.delete_version(&FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(purge_version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let public_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+        let lifecycle_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(&entries, "bucket", "", None, None).await;
+
+        assert_eq!(public_objects.len(), 1);
+        assert_eq!(public_objects[0].version_id, Some(visible_version_id));
+        assert_eq!(public_objects[0].num_versions, 2);
+        assert_eq!(lifecycle_objects.len(), 2);
+        assert!(
+            lifecycle_objects
+                .iter()
+                .any(|object| object.version_purge_status == VersionPurgeStatusType::Pending)
+        );
+        assert!(lifecycle_objects.iter().all(|object| object.num_versions == 2));
     }
 
     #[test]
