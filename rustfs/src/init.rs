@@ -394,11 +394,11 @@ fn build_static_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::
         )));
     }
 
-    let colon_pos = secret_str.find(':').ok_or_else(|| {
-        Error::other(format!(
-            "Static KMS secret key must be in format <key-name>:<base64-key>, got: {secret_str}"
-        ))
-    })?;
+    // Do not include the value in the error: a malformed value is likely the raw
+    // secret key itself, and this message ends up in startup logs.
+    let colon_pos = secret_str
+        .find(':')
+        .ok_or_else(|| Error::other("Static KMS secret key must be in format <key-name>:<base64-key>"))?;
     let key_id = secret_str[..colon_pos].to_string();
     let secret_key = secret_str[colon_pos + 1..].to_string();
 
