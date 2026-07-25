@@ -496,7 +496,7 @@ pub(crate) mod ecstore_rpc {
         LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
         sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest,
-        verify_tonic_rpc_signature,
+        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -1565,6 +1565,10 @@ pub(crate) fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &h
 
 pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     ecstore_rpc::verify_tonic_canonical_body_digest(request, canonical_body)
+}
+
+pub(crate) fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_mutation_body_digest(request, canonical_body)
 }
 
 #[cfg(test)]

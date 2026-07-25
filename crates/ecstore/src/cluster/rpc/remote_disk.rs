@@ -16,6 +16,7 @@ use crate::cluster::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
     node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
+use crate::cluster::rpc::http_auth::set_tonic_canonical_body_digest;
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, ReadStreamRequest, WalkDirStreamRequest,
     WriteStreamRequest,
@@ -98,6 +99,18 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
+
+/// Bind a mutating disk RPC to its canonical body: the digest lands in the request metadata, and
+/// the signing interceptor folds it (plus a replay-protected nonce) into the v2 signature scope
+/// (backlog#1327).
+fn attach_mutation_body_digest<T>(
+    request: &mut Request<T>,
+    canonical_body: std::result::Result<Vec<u8>, std::num::TryFromIntError>,
+    op: &'static str,
+) -> Result<()> {
+    let canonical_body = canonical_body.map_err(|_| Error::other(format!("{op} request length cannot be represented")))?;
+    set_tonic_canonical_body_digest(request, &canonical_body).map_err(Error::other)
+}
 
 fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
     volume_infos
@@ -1330,10 +1343,12 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(MakeVolumeRequest {
+                let mut request = Request::new(MakeVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                 });
+                let canonical_body = rustfs_protos::canonical_make_volume_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "make_volume")?;
 
                 let response = client.make_volume(request).await?.into_inner();
 
@@ -1367,10 +1382,12 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(MakeVolumesRequest {
+                let mut request = Request::new(MakeVolumesRequest {
                     disk: self.endpoint.to_string(),
                     volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
                 });
+                let canonical_body = rustfs_protos::canonical_make_volumes_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "make_volumes")?;
 
                 let response = client.make_volumes(request).await?.into_inner();
 
@@ -1480,11 +1497,13 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeleteVolumeRequest {
+                let mut request = Request::new(DeleteVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     force: force_delete,
                 });
+                let canonical_body = rustfs_protos::canonical_delete_volume_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete_volume")?;
 
                 let response = client.delete_volume(request).await?.into_inner();
 
@@ -1533,7 +1552,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeleteVersionRequest {
+                let mut request = Request::new(DeleteVersionRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -1543,6 +1562,8 @@ impl DiskAPI for RemoteDisk {
                     file_info_bin: file_info_bin.into(),
                     opts_bin: opts_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_delete_version_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
 
                 let response = client.delete_version(request).await?.into_inner();
 
@@ -1634,7 +1655,7 @@ impl DiskAPI for RemoteDisk {
             }
         };
 
-        let request = Request::new(DeleteVersionsRequest {
+        let mut request = Request::new(DeleteVersionsRequest {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             versions: versions_str,
@@ -1642,6 +1663,14 @@ impl DiskAPI for RemoteDisk {
             versions_bin,
             opts_bin: opts_bin.into(),
         });
+        let canonical_body = rustfs_protos::canonical_delete_versions_request_body(request.get_ref());
+        if let Err(err) = attach_mutation_body_digest(&mut request, canonical_body, "delete_versions") {
+            let mut errors = Vec::with_capacity(versions.len());
+            for _ in 0..versions.len() {
+                errors.push(Some(err.clone()));
+            }
+            return errors;
+        }
 
         // TODO: use Error not string
 
@@ -1710,11 +1739,13 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeletePathsRequest {
+                let mut request = Request::new(DeletePathsRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     paths: paths.clone(),
                 });
+                let canonical_body = rustfs_protos::canonical_delete_paths_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete_paths")?;
 
                 let response = client.delete_paths(request).await?.into_inner();
 
@@ -1753,13 +1784,15 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(WriteMetadataRequest {
+                let mut request = Request::new(WriteMetadataRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                     file_info,
                     file_info_bin: file_info_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_write_metadata_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
 
                 let response = client.write_metadata(request).await?.into_inner();
 
@@ -1831,7 +1864,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(UpdateMetadataRequest {
+                let mut request = Request::new(UpdateMetadataRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -1840,6 +1873,8 @@ impl DiskAPI for RemoteDisk {
                     file_info_bin: file_info_bin.into(),
                     opts_bin: opts_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_update_metadata_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "update_metadata")?;
 
                 let response = client.update_metadata(request).await?.into_inner();
 
@@ -2087,7 +2122,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(RenameDataRequest {
+                let mut request = Request::new(RenameDataRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
@@ -2096,6 +2131,8 @@ impl DiskAPI for RemoteDisk {
                     dst_path: dst_path.to_string(),
                     file_info_bin: file_info_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
 
                 let response = client.rename_data(request).await?.into_inner();
 
@@ -2352,13 +2389,15 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(RenameFileRequest {
+                let mut request = Request::new(RenameFileRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
                 });
+                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
 
                 let response = client.rename_file(request).await?.into_inner();
 
@@ -2395,7 +2434,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(RenamePartRequest {
+                let mut request = Request::new(RenamePartRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
@@ -2403,6 +2442,8 @@ impl DiskAPI for RemoteDisk {
                     dst_path: dst_path.to_string(),
                     meta,
                 });
+                let canonical_body = rustfs_protos::canonical_rename_part_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_part")?;
 
                 let response = client.rename_part(request).await?.into_inner();
 
@@ -2440,12 +2481,14 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeleteRequest {
+                let mut request = Request::new(DeleteRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
                     options,
                 });
+                let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
 
                 let response = client.delete(request).await?.into_inner();
 
@@ -2656,12 +2699,14 @@ impl DiskAPI for RemoteDisk {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
-                let request = Request::new(WriteAllRequest {
+                let mut request = Request::new(WriteAllRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                     data,
                 });
+                let canonical_body = rustfs_protos::canonical_write_all_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
                 let response = match client.write_all(request).await {
