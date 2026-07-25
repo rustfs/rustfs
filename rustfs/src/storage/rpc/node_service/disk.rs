@@ -18,6 +18,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use crate::storage::storage_api::verify_tonic_mutation_body_digest;
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
@@ -79,6 +80,24 @@ fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} named msgpack failed: {err}")))?;
     Ok(serializer.into_inner())
+}
+
+/// Enforce the signature-bound canonical body digest on a mutating disk RPC (backlog#1327).
+///
+/// Digest-bearing requests are verified against the canonical bytes rebuilt from the received
+/// wire fields — which cover both the msgpack `_bin` payloads and their JSON compatibility
+/// copies, so tampering with either encoding (or stripping `_bin` to force the JSON fallback
+/// decode) is rejected. Digestless requests fall back per
+/// `RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT` (default: accept + convergence counter).
+fn verify_disk_mutation_digest<T>(
+    request: &Request<T>,
+    canonical_body: std::result::Result<Vec<u8>, std::num::TryFromIntError>,
+    op: &'static str,
+) -> std::result::Result<(), Status> {
+    let canonical_body =
+        canonical_body.map_err(|_| Status::invalid_argument(format!("{op} request length cannot be represented")))?;
+    verify_tonic_mutation_body_digest(request, &canonical_body)
+        .map_err(|err| Status::permission_denied(format!("{op} authentication failed: {err}")))
 }
 
 /// JSON compatibility string for a dual-encoded response field. Returns an empty string only when
@@ -171,6 +190,11 @@ impl NodeService {
         &self,
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_volume_request_body(request.get_ref()),
+            "delete_volume",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.delete_volume(&request.volume, request.force).await {
@@ -325,6 +349,11 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionsRequest>,
     ) -> Result<Response<DeleteVersionsResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_versions_request_body(request.get_ref()),
+            "delete_versions",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let mut versions = Vec::with_capacity(request.versions.len());
@@ -380,6 +409,11 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_version_request_body(request.get_ref()),
+            "delete_version",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -544,6 +578,11 @@ impl NodeService {
         &self,
         request: Request<WriteMetadataRequest>,
     ) -> Result<Response<WriteMetadataResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_write_metadata_request_body(request.get_ref()),
+            "write_metadata",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -577,6 +616,11 @@ impl NodeService {
         &self,
         request: Request<UpdateMetadataRequest>,
     ) -> Result<Response<UpdateMetadataResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_update_metadata_request_body(request.get_ref()),
+            "update_metadata",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -648,6 +692,11 @@ impl NodeService {
         &self,
         request: Request<DeletePathsRequest>,
     ) -> Result<Response<DeletePathsResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_paths_request_body(request.get_ref()),
+            "delete_paths",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.delete_paths(&request.volume, &request.paths).await {
@@ -750,6 +799,11 @@ impl NodeService {
         &self,
         request: Request<MakeVolumeRequest>,
     ) -> Result<Response<MakeVolumeResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_make_volume_request_body(request.get_ref()),
+            "make_volume",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.make_volume(&request.volume).await {
@@ -774,6 +828,11 @@ impl NodeService {
         &self,
         request: Request<MakeVolumesRequest>,
     ) -> Result<Response<MakeVolumesResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_make_volumes_request_body(request.get_ref()),
+            "make_volumes",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.make_volumes(request.volumes.iter().map(|s| &**s).collect()).await {
@@ -798,6 +857,11 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_rename_data_request_body(request.get_ref()),
+            "rename_data",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -888,6 +952,11 @@ impl NodeService {
         &self,
         request: Request<RenameFileRequest>,
     ) -> Result<Response<RenameFileResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_rename_file_request_body(request.get_ref()),
+            "rename_file",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -915,6 +984,11 @@ impl NodeService {
         &self,
         request: Request<RenamePartRequest>,
     ) -> Result<Response<RenamePartResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_rename_part_request_body(request.get_ref()),
+            "rename_part",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -1083,6 +1157,7 @@ impl NodeService {
     }
 
     pub(super) async fn handle_delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
@@ -1113,6 +1188,7 @@ impl NodeService {
     }
 
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
+        verify_disk_mutation_digest(&request, rustfs_protos::canonical_write_all_request_body(request.get_ref()), "write_all")?;
         let request = request.into_inner();
         let data_len = request.data.len();
         let metrics = runtime_sources::current_internode_metrics();

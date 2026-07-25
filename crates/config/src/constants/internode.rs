@@ -136,6 +136,42 @@ pub const DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT: bool = false;
 // rolling upgrades until the fleet-wide v1-fallback counter reads zero.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT);
 
+/// Require a signature-bound canonical body digest on every mutating internode disk RPC
+/// (RenameData, DeleteVersion, DeleteVersions, WriteMetadata, UpdateMetadata, WriteAll, Delete,
+/// DeletePaths, RenameFile, RenamePart, DeleteVolume, MakeVolume, MakeVolumes), rejecting requests
+/// that authenticate without one (<https://github.com/rustfs/backlog/issues/1327>).
+///
+/// Defaults to `false` (fail-open): a mutating request without a body digest keeps authenticating
+/// through the method-bound v2 (or legacy) signature, so peers from releases that predate
+/// body-digest signing survive rolling upgrades unchanged. Requests that do carry a digest are
+/// always verified with no downgrade, strict or not — the digest value is part of the signed v2
+/// scope, so an on-path attacker cannot strip it without invalidating the signature. This is a
+/// rollout lever gated on the body-digest fallback counter
+/// (`rustfs_system_network_internode_body_digest_fallback_total`) reading zero across a release
+/// window fleet-wide. Single-env rollback. It is deliberately separate from
+/// [`ENV_INTERNODE_RPC_SIGNATURE_STRICT`]: the two enforcement flips converge on different
+/// counters and must not gate each other.
+pub const ENV_INTERNODE_RPC_BODY_DIGEST_STRICT: &str = "RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT";
+pub const DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT: bool = false;
+
+// Compile-time invariant: fail-open by default so digestless peers keep authenticating during
+// rolling upgrades until the fleet-wide body-digest fallback counter reads zero.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT);
+
+/// Capacity (distinct nonces) of the process-local internode RPC replay cache that enforces
+/// one-time consumption of body-bound v2 signatures.
+///
+/// The cache retains each nonce for the ~10-minute signature freshness envelope, so the steady
+/// state holds roughly `mutating RPS x 601s` entries; the default sustains ~1,700 body-bound
+/// mutating RPCs per second (about 120 MiB worst case, allocated only under sustained load).
+/// Overflow fails closed — legitimate signed traffic is the only thing that can fill the cache
+/// (replays are rejected before insertion, and an attacker cannot mint valid nonces without the
+/// shared secret) — and increments
+/// `rustfs_system_network_internode_replay_cache_overflow_total`, so a sustained non-zero overflow
+/// counter means this capacity is undersized for the node's peak mutation rate.
+pub const ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: &str = "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY";
+pub const DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: usize = 1_048_576;
+
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
 /// P3 observability).
 ///
@@ -310,6 +346,18 @@ mod tests {
     fn internode_signature_strict_env_name_is_stable() {
         // The fail-open default invariant is asserted at compile time next to the definition.
         assert_eq!(ENV_INTERNODE_RPC_SIGNATURE_STRICT, "RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT");
+    }
+
+    #[test]
+    fn internode_body_digest_strict_env_name_is_stable() {
+        // The fail-open default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_BODY_DIGEST_STRICT, "RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT");
+    }
+
+    #[test]
+    fn internode_replay_cache_capacity_defaults_and_env_name() {
+        assert_eq!(ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY");
+        assert_eq!(DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, 1_048_576);
     }
 
     #[test]

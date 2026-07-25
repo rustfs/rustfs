@@ -61,7 +61,6 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
-const MAX_REPLAY_PROTECTED_NONCES: usize = 65_536;
 const NS_SCANNER_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-ns-scanner-capability-v3";
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
 static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
@@ -69,6 +68,22 @@ static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
         rustfs_config::ENV_INTERNODE_RPC_SIGNATURE_STRICT,
         rustfs_config::DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT,
     )
+});
+static INTERNODE_RPC_BODY_DIGEST_STRICT: LazyLock<bool> = LazyLock::new(|| {
+    get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_BODY_DIGEST_STRICT,
+        rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
+    )
+});
+// Sized for peak legitimate body-bound mutation RPS x the retention window; overflow fails closed
+// and increments the replay-cache overflow counter. Clamped to at least 1 so a misconfigured zero
+// cannot disable replay protection by rejecting every body-bound request.
+static REPLAY_CACHE_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY,
+    )
+    .max(1)
 });
 static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
 
@@ -110,6 +125,10 @@ impl RpcNonceCache {
             return Err(std::io::Error::other("RPC request replay detected"));
         }
         if self.nonces.len() >= capacity {
+            // Fail closed and alert: only legitimately signed traffic can fill the cache, so a
+            // sustained overflow means RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY is undersized
+            // for this node's peak mutation rate and writes are being refused.
+            global_internode_metrics().record_replay_cache_overflow();
             return Err(std::io::Error::other("RPC replay cache capacity exceeded"));
         }
         self.nonces.insert(nonce);
@@ -334,7 +353,7 @@ fn check_and_record_nonce(nonce: Uuid, signed_at: i64) -> std::io::Result<()> {
     let expires_at = now
         .checked_add(REPLAY_CACHE_RETENTION)
         .ok_or_else(|| std::io::Error::other("RPC replay expiry overflow"))?;
-    cache.check_and_record(nonce, signed_at, now, wall_time, expires_at, MAX_REPLAY_PROTECTED_NONCES)
+    cache.check_and_record(nonce, signed_at, now, wall_time, expires_at, *REPLAY_CACHE_CAPACITY)
 }
 
 /// Build headers with authentication signature
@@ -445,6 +464,50 @@ pub fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>, canoni
         return Err(std::io::Error::other("RPC content SHA-256 mismatch"));
     }
     Ok(())
+}
+
+/// Verify a mutating disk RPC's canonical body digest with a rolling-upgrade fallback.
+///
+/// When the request carries a real (non-`UNSIGNED-PAYLOAD`) content SHA-256 it is verified exactly
+/// like [`verify_tonic_canonical_body_digest`]. The digest value is a member of the signed v2
+/// scope, so within the v2 lane it cannot be stripped or altered without invalidating the signature
+/// `check_auth` already enforced. When the request carries no digest — a peer that predates
+/// body-digest signing, or an attacker who downgraded the request to the legacy signature by
+/// dropping every v2 header — the request is accepted and counted on the body-digest fallback
+/// counter unless `RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT` is enabled. That switch is what actually
+/// closes on-path body tampering for covered handlers: it rejects every digestless mutation,
+/// including v1-downgraded ones. It converges independently of the signature-strict switch
+/// (<https://github.com/rustfs/backlog/issues/1327>).
+pub fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
+    verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, *INTERNODE_RPC_BODY_DIGEST_STRICT)
+}
+
+/// [`verify_tonic_mutation_body_digest`] with the strict gate injected as a parameter, so both
+/// rollout postures are unit-testable without racing on process-global environment variables.
+fn verify_tonic_mutation_body_digest_with_strictness<T>(
+    request: &tonic::Request<T>,
+    canonical_body: &[u8],
+    strict: bool,
+) -> std::io::Result<()> {
+    let digest = request
+        .metadata()
+        .get(RPC_CONTENT_SHA256_HEADER)
+        .and_then(|value| value.to_str().ok());
+    match digest {
+        Some(digest) if digest != UNSIGNED_PAYLOAD => verify_tonic_canonical_body_digest(request, canonical_body),
+        _ => {
+            // RUSTFS_COMPAT_TODO(disk-mutation-body-digest): accept digestless peers during rolling upgrades. Remove after the
+            // minimum supported RustFS peer version body-binds every mutating disk RPC.
+            if strict {
+                return Err(std::io::Error::other("RPC mutation requires a body-bound v2 signature"));
+            }
+            // Count only ACCEPTED digestless mutations: this counter is the convergence gate that
+            // must read zero fleet-wide across a release window before
+            // `RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT` may be enabled.
+            global_internode_metrics().record_body_digest_fallback();
+            Ok(())
+        }
+    }
 }
 
 fn has_v2_auth_headers(headers: &HeaderMap) -> bool {
@@ -1408,6 +1471,129 @@ mod tests {
             .expect("expired nonce should release capacity");
         assert!(!cache.nonces.contains(&nonce_a));
         assert!(cache.nonces.contains(&nonce_b));
+    }
+
+    // The `rpc_body_digest_fallback_counter` serial group covers every test that drives (or
+    // asserts on) the process-global body-digest fallback counter, so exact-delta assertions
+    // cannot race with each other.
+    #[test]
+    #[serial_test::serial(rpc_body_digest_fallback_counter)]
+    fn digestless_mutation_is_accepted_and_counted_while_strict_gate_is_off() {
+        let request = tonic::Request::new(());
+        let before = global_internode_metrics().snapshot().body_digest_fallback_total;
+
+        assert!(
+            verify_tonic_mutation_body_digest_with_strictness(&request, b"canonical-mutation-body", false).is_ok(),
+            "a digestless peer must keep mutating while the strict gate is off"
+        );
+
+        let after = global_internode_metrics().snapshot().body_digest_fallback_total;
+        assert_eq!(
+            after,
+            before + 1,
+            "an accepted digestless mutation must increment the body-digest fallback counter exactly once"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rpc_body_digest_fallback_counter)]
+    fn strict_mutation_gate_rejects_digestless_but_keeps_body_bound() {
+        let before = global_internode_metrics().snapshot().body_digest_fallback_total;
+
+        let digestless = tonic::Request::new(());
+        let error = verify_tonic_mutation_body_digest_with_strictness(&digestless, b"body", true)
+            .expect_err("strict mode must reject a mutation without a body digest");
+        assert_eq!(error.to_string(), "RPC mutation requires a body-bound v2 signature");
+
+        let mut unsigned = tonic::Request::new(());
+        unsigned
+            .metadata_mut()
+            .as_mut()
+            .insert(RPC_CONTENT_SHA256_HEADER, HeaderValue::from_static(UNSIGNED_PAYLOAD));
+        let error = verify_tonic_mutation_body_digest_with_strictness(&unsigned, b"body", true)
+            .expect_err("strict mode must reject an explicitly unsigned mutation payload");
+        assert_eq!(error.to_string(), "RPC mutation requires a body-bound v2 signature");
+
+        let mut bound = tonic::Request::new(());
+        set_tonic_canonical_body_digest(&mut bound, b"body").expect("digest metadata should encode");
+        bound
+            .metadata_mut()
+            .as_mut()
+            .insert(RPC_AUTH_VERSION_HEADER, HeaderValue::from_static(RPC_AUTH_VERSION_V2));
+        assert!(
+            verify_tonic_mutation_body_digest_with_strictness(&bound, b"body", true).is_ok(),
+            "strict mode must keep accepting body-bound mutations"
+        );
+        let tampered = verify_tonic_mutation_body_digest_with_strictness(&bound, b"tampered-body", true)
+            .expect_err("a tampered canonical body must fail even in strict mode");
+        assert_eq!(tampered.to_string(), "RPC content SHA-256 mismatch");
+
+        let after = global_internode_metrics().snapshot().body_digest_fallback_total;
+        assert_eq!(
+            after, before,
+            "neither strict rejections nor bound verifications are digestless fallbacks"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(rpc_body_digest_fallback_counter)]
+    fn mutation_digest_default_posture_is_fail_open_digestless_accept() {
+        // The public entry point resolves strictness from the environment, whose compile-time
+        // default is pinned to false in `rustfs_config`. A digestless peer therefore keeps
+        // mutating through the default build with no configuration at all.
+        let request = tonic::Request::new(());
+        assert!(
+            verify_tonic_mutation_body_digest_with_strictness(
+                &request,
+                b"canonical-mutation-body",
+                rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
+            )
+            .is_ok(),
+            "the default strict posture must accept digestless mutations"
+        );
+    }
+
+    #[test]
+    fn rename_data_mutation_contract_binds_method_nonce_and_body() {
+        ensure_test_rpc_secret();
+        let message = rustfs_protos::proto_gen::node_service::RenameDataRequest {
+            disk: "http://node-a:9000/data/rustfs0".to_string(),
+            src_volume: ".rustfs.sys/multipart".to_string(),
+            src_path: "uploads/object".to_string(),
+            file_info: "{\"volume\":\"bucket\"}".to_string(),
+            dst_volume: "bucket".to_string(),
+            dst_path: "object".to_string(),
+            file_info_bin: vec![0x81, 0xA1, 0x76, 0x01].into(),
+        };
+        let body = rustfs_protos::canonical_rename_data_request_body(&message).expect("small request should encode");
+        let mut request = tonic::Request::new(());
+        set_tonic_canonical_body_digest(&mut request, &body).expect("canonical body digest should be attached");
+        let content_sha256 = request
+            .metadata()
+            .get(RPC_CONTENT_SHA256_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "RenameData", content_sha256)
+            .expect("body-bound auth headers should build");
+        request.metadata_mut().as_mut().extend(headers.clone());
+
+        assert!(
+            verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/RenameData", &headers).is_ok(),
+            "the rename_data signature must bind destination, method, nonce, and body digest"
+        );
+        let replay = verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/RenameData", &headers)
+            .expect_err("reusing a consumed rename_data nonce must fail");
+        assert_eq!(replay.to_string(), "RPC request replay detected");
+        let transplant = verify_tonic_rpc_signature("node-a:9000", "/node_service.NodeService/DeleteVersion", &headers)
+            .expect_err("a rename_data signature must not authenticate a different method");
+        assert_eq!(transplant.to_string(), "Invalid RPC v2 signature");
+
+        assert!(verify_tonic_mutation_body_digest(&request, &body).is_ok());
+        let mut tampered = message;
+        tampered.file_info_bin = Vec::new().into();
+        let tampered_body = rustfs_protos::canonical_rename_data_request_body(&tampered).expect("small request should encode");
+        let stripped = verify_tonic_mutation_body_digest(&request, &tampered_body)
+            .expect_err("stripping the msgpack payload to force the JSON fallback decode must fail");
+        assert_eq!(stripped.to_string(), "RPC content SHA-256 mismatch");
     }
 
     #[test]

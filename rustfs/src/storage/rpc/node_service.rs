@@ -2393,6 +2393,238 @@ mod tests {
         request
     }
 
+    fn delete_request_message(options: &str) -> DeleteRequest {
+        DeleteRequest {
+            disk: "http://node-a:9000/data/rustfs0".to_string(),
+            volume: "bucket".to_string(),
+            path: "object".to_string(),
+            options: options.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_mutation_body_digest_gate_runs_before_disk_lookup() {
+        let service = make_server();
+
+        // A digestless mutation stays accepted through the default fail-open gate (rolling
+        // upgrade posture) and proceeds to the disk lookup.
+        let digestless = service
+            .delete(Request::new(delete_request_message("{}")))
+            .await
+            .expect("a digestless mutation must stay accepted while the strict gate is off");
+        assert!(!digestless.into_inner().success, "the unknown test disk cannot resolve");
+
+        // A digest bound to different request contents must be rejected before any disk work.
+        let mut tampered = Request::new(delete_request_message("{}"));
+        let other_body = rustfs_protos::canonical_delete_request_body(&delete_request_message("{\"recursive\":true}"))
+            .expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut tampered, &other_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut tampered);
+        let tampered = service
+            .delete(tampered)
+            .await
+            .expect_err("a tampered mutation must fail closed");
+        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
+
+        // A digest matching the received wire fields authenticates and proceeds to the disk lookup.
+        let mut signed = Request::new(delete_request_message("{}"));
+        let body = rustfs_protos::canonical_delete_request_body(signed.get_ref()).expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut signed, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut signed);
+        let signed = service
+            .delete(signed)
+            .await
+            .expect("a correctly body-bound mutation must pass the digest gate");
+        assert!(!signed.into_inner().success, "the unknown test disk cannot resolve");
+    }
+
+    /// Per-handler wiring check for every mutating disk RPC. A mismatched digest must be rejected
+    /// (catches a handler that omits its `verify_disk_mutation_digest` gate) and a correctly
+    /// body-bound digest must pass the gate (catches a handler wired to the wrong
+    /// `canonical_*_request_body`, which would reject legitimate traffic). Both failure modes are
+    /// realistic across these copy-pasted call sites and are otherwise invisible to the digestless
+    /// fail-open tests.
+    #[tokio::test]
+    async fn every_mutating_handler_enforces_its_body_digest() {
+        let service = make_server();
+        let disk = "http://node-a:9000/data/rustfs0".to_string();
+
+        macro_rules! assert_gated {
+            ($method:ident, $msg:expr, $canonical:path) => {{
+                let msg = $msg;
+
+                // Correct digest: the gate passes and the handler proceeds to the (unknown) disk
+                // lookup, so it must NOT fail with PermissionDenied.
+                let mut ok = Request::new(msg.clone());
+                let body = $canonical(ok.get_ref()).expect("canonical body should encode");
+                set_tonic_canonical_body_digest(&mut ok, &body).expect("digest metadata should encode");
+                mark_v2_authenticated(&mut ok);
+                if let Err(status) = service.$method(ok).await {
+                    assert_ne!(
+                        status.code(),
+                        tonic::Code::PermissionDenied,
+                        concat!(stringify!($method), ": a correctly body-bound request must pass the digest gate"),
+                    );
+                }
+
+                // Mismatched digest: the gate must reject before any disk work.
+                let mut bad = Request::new(msg);
+                set_tonic_canonical_body_digest(&mut bad, b"unrelated-canonical-body").expect("digest metadata should encode");
+                mark_v2_authenticated(&mut bad);
+                let err = service
+                    .$method(bad)
+                    .await
+                    .expect_err(concat!(stringify!($method), ": a tampered body must be rejected"));
+                assert_eq!(
+                    err.code(),
+                    tonic::Code::PermissionDenied,
+                    concat!(stringify!($method), " must fail closed on a body-digest mismatch"),
+                );
+            }};
+        }
+
+        assert_gated!(
+            rename_data,
+            RenameDataRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                file_info: "{}".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                file_info_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_gated!(
+            delete_version,
+            DeleteVersionRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                force_del_marker: false,
+                opts: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
+            delete_versions,
+            DeleteVersionsRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                versions: vec!["a".into()],
+                opts: "{}".into(),
+                versions_bin: vec![vec![0x80].into()],
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_delete_versions_request_body
+        );
+        assert_gated!(
+            write_metadata,
+            WriteMetadataRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_write_metadata_request_body
+        );
+        assert_gated!(
+            update_metadata,
+            UpdateMetadataRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                opts: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_update_metadata_request_body
+        );
+        assert_gated!(
+            write_all,
+            WriteAllRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                data: vec![0x01, 0x02].into(),
+            },
+            rustfs_protos::canonical_write_all_request_body
+        );
+        assert_gated!(
+            delete,
+            DeleteRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                options: "{}".into(),
+            },
+            rustfs_protos::canonical_delete_request_body
+        );
+        assert_gated!(
+            delete_paths,
+            DeletePathsRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                paths: vec!["a".into()],
+            },
+            rustfs_protos::canonical_delete_paths_request_body
+        );
+        assert_gated!(
+            rename_file,
+            RenameFileRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+            },
+            rustfs_protos::canonical_rename_file_request_body
+        );
+        assert_gated!(
+            rename_part,
+            RenamePartRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                meta: vec![0x03].into(),
+            },
+            rustfs_protos::canonical_rename_part_request_body
+        );
+        assert_gated!(
+            delete_volume,
+            DeleteVolumeRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                force: true,
+            },
+            rustfs_protos::canonical_delete_volume_request_body
+        );
+        assert_gated!(
+            make_volume,
+            MakeVolumeRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+            },
+            rustfs_protos::canonical_make_volume_request_body
+        );
+        assert_gated!(
+            make_volumes,
+            MakeVolumesRequest {
+                disk,
+                volumes: vec!["v".into()],
+            },
+            rustfs_protos::canonical_make_volumes_request_body
+        );
+    }
+
     #[tokio::test]
     async fn heal_control_requires_body_bound_auth_before_topology_validation() {
         let service = make_heal_control_server();
