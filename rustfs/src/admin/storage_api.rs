@@ -197,7 +197,7 @@ pub(crate) mod lifecycle {
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
         claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
         load_manual_transition_job_record, load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
-        manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired,
+        manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired, renew_manual_transition_job_lease,
         request_manual_transition_job_cancel, save_manual_transition_job_record, save_manual_transition_job_record_if_current,
     };
     pub(crate) type ManualTransitionCancelCheck =

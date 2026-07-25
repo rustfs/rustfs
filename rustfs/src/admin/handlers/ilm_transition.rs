@@ -23,8 +23,8 @@ use crate::admin::storage_api::lifecycle::{
     claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
     enqueue_transition_for_existing_objects_scoped, load_manual_transition_job_record,
     load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission, manual_transition_job_lease_expired,
-    manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired, request_manual_transition_job_cancel,
-    save_manual_transition_job_record, save_manual_transition_job_record_if_current,
+    manual_transition_queue_snapshot, manual_transition_scope_admission_lease_expired, renew_manual_transition_job_lease,
+    request_manual_transition_job_cancel, save_manual_transition_job_record, save_manual_transition_job_record_if_current,
 };
 use crate::admin::storage_api::runtime::ECStore;
 use crate::auth::{check_key_valid, get_session_token};
@@ -501,6 +501,8 @@ fn manual_transition_job_conflict_response(admission: ManualTransitionScopeAdmis
 fn map_manual_transition_job_load_error(err: StorageError, job_id: Uuid) -> S3Error {
     if err == StorageError::ConfigNotFound {
         s3_error!(NoSuchKey, "manual transition job not found: {}", job_id)
+    } else if err == StorageError::PreconditionFailed {
+        s3_error!(OperationAborted, "manual transition job record changed concurrently; retry the request")
     } else {
         S3Error::with_message(S3ErrorCode::InternalError, format!("manual transition job store failed: {err}"))
     }
@@ -546,12 +548,27 @@ async fn update_manual_transition_job_record_cas(
 
 fn manual_transition_durable_cancel_check(store: Arc<ECStore>, job_id: Uuid) -> ManualTransitionCancelCheck {
     let last_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let next_poll_at = Arc::new(Mutex::new(std::time::Instant::now()));
     Arc::new(move || {
         let store = store.clone();
         let last_cancelled = last_cancelled.clone();
+        let next_poll_at = next_poll_at.clone();
         Box::pin(async move {
             if last_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                 return true;
+            }
+            let should_poll = {
+                let mut next_poll_at = next_poll_at.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let now = std::time::Instant::now();
+                if now < *next_poll_at {
+                    false
+                } else {
+                    *next_poll_at = now + StdDuration::from_secs(1);
+                    true
+                }
+            };
+            if !should_poll {
+                return false;
             }
             match load_manual_transition_job_record(store, job_id).await {
                 Ok(record) if record.cancel_requested => {
@@ -636,15 +653,10 @@ fn spawn_manual_transition_job_heartbeat(store: Arc<ECStore>, job_id: Uuid, canc
             tokio::select! {
                 _ = cancel_token.cancelled() => return,
                 _ = interval.tick() => {
-                    let update = update_manual_transition_job_record_cas(store.clone(), job_id, |record| {
-                        if record.state == ManualTransitionJobState::Running {
-                            if record.cancel_requested {
-                                cancel_token.cancel();
-                            }
-                            record.renew_lease(manual_transition_queue_snapshot());
-                        }
-                    }).await;
-                    if let Err(err) = update {
+                    match renew_manual_transition_job_lease(store.clone(), job_id, manual_transition_queue_snapshot()).await {
+                        Ok(record) if record.cancel_requested => cancel_token.cancel(),
+                        Ok(_) => {}
+                        Err(err) => {
                         warn!(
                             event = EVENT_ADMIN_ILM_TRANSITION_STATE,
                             component = LOG_COMPONENT_ADMIN,
@@ -655,6 +667,7 @@ fn spawn_manual_transition_job_heartbeat(store: Arc<ECStore>, job_id: Uuid, canc
                             error = %err,
                             "failed to renew manual transition job lease"
                         );
+                        }
                     }
                 }
             }
@@ -663,7 +676,7 @@ fn spawn_manual_transition_job_heartbeat(store: Arc<ECStore>, job_id: Uuid, canc
 }
 
 enum StartManualTransitionJobResult {
-    Started(ManualTransitionJobRecord),
+    Started(Box<ManualTransitionJobRecord>),
     Conflict(ManualTransitionJobConflictResponse),
 }
 
@@ -684,7 +697,7 @@ async fn start_manual_transition_job(
                 record.fail("manual transition admission conflict");
             })
             .await;
-            return Ok(StartManualTransitionJobResult::Conflict(manual_transition_job_conflict_response(active)));
+            return Ok(StartManualTransitionJobResult::Conflict(manual_transition_job_conflict_response(*active)));
         }
         Err(err) => {
             let _ = update_manual_transition_job_record_cas(store.clone(), job_id, |record| {
@@ -713,7 +726,7 @@ async fn start_manual_transition_job(
         remove_active_manual_transition_job(job_id);
     });
 
-    Ok(StartManualTransitionJobResult::Started(record))
+    Ok(StartManualTransitionJobResult::Started(Box::new(record)))
 }
 
 pub struct ManualTransitionRunHandler {}
@@ -738,6 +751,7 @@ impl Operation for ManualTransitionRunHandler {
         if run_mode == ManualTransitionRunMode::Async {
             match start_manual_transition_job(store, bucket, options).await? {
                 StartManualTransitionJobResult::Started(record) => {
+                    let record = *record;
                     let status_endpoint = manual_transition_status_endpoint(record.job_id);
                     let response = ManualTransitionRunResponse {
                         state: "running",
@@ -1218,16 +1232,20 @@ mod tests {
         let cancel_block =
             extract_block_between_markers(src, "impl Operation for ManualTransitionJobCancelHandler", "#[cfg(test)]");
 
-        for block in [status_block, cancel_block] {
+        let status_load = status_block
+            .find("load_manual_transition_job_record")
+            .expect("status route must load the persisted job record");
+        let cancel_load = cancel_block
+            .find("request_manual_transition_job_cancel")
+            .expect("cancel route must update the persisted job record");
+
+        for (block, load) in [(status_block, status_load), (cancel_block, cancel_load)] {
             let auth = block
                 .find("authorize_manual_transition_request(&req).await?;")
                 .expect("job route must authorize with SetTierAction");
             let job_id = block
                 .find("manual_transition_job_id_from_params(&params)?;")
                 .expect("job route must validate the path job id");
-            let load = block
-                .find("load_manual_transition_job_record")
-                .expect("durable job routes must load the persisted job record");
 
             assert!(auth < job_id);
             assert!(job_id < load);

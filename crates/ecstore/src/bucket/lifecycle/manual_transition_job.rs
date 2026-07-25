@@ -318,7 +318,7 @@ impl ManualTransitionScopeAdmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManualTransitionScopeAdmissionClaim {
     Claimed,
-    Conflict(ManualTransitionScopeAdmission),
+    Conflict(Box<ManualTransitionScopeAdmission>),
 }
 
 pub fn manual_transition_scope_key(bucket: &str, options: &ManualTransitionRunOptions) -> String {
@@ -510,22 +510,28 @@ pub async fn claim_manual_transition_scope_admission(
     if active_job_reclaimable {
         return match save_manual_transition_scope_admission_if_current(api, admission, &etag).await {
             Ok(()) => Ok(ManualTransitionScopeAdmissionClaim::Claimed),
-            Err(Error::PreconditionFailed) => Ok(ManualTransitionScopeAdmissionClaim::Conflict(active)),
+            Err(Error::PreconditionFailed) => Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active))),
             Err(err) => Err(err),
         };
     }
 
-    Ok(ManualTransitionScopeAdmissionClaim::Conflict(active))
+    Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active)))
 }
 
 pub async fn request_manual_transition_job_cancel(api: Arc<ECStore>, job_id: Uuid) -> EcstoreResult<ManualTransitionJobRecord> {
-    let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-    if record.is_terminal() {
-        return Ok(record);
+    for _ in 0..4 {
+        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+        if record.is_terminal() || record.cancel_requested {
+            return Ok(record);
+        }
+        record.mark_cancel_requested();
+        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => return Ok(record),
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
     }
-    record.mark_cancel_requested();
-    save_manual_transition_job_record_if_current(api, &record, &etag).await?;
-    Ok(record)
+    Err(Error::PreconditionFailed)
 }
 
 pub async fn persist_manual_transition_job_progress(
@@ -537,15 +543,37 @@ pub async fn persist_manual_transition_job_progress(
     let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
     record.update_running_progress(report.clone(), queue_snapshot);
     save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await?;
+    renew_manual_transition_scope_admission_from_job(api, &record).await?;
+    Ok(record)
+}
+
+pub async fn renew_manual_transition_job_lease(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> EcstoreResult<ManualTransitionJobRecord> {
+    let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+    if record.state == ManualTransitionJobState::Running {
+        record.renew_lease(queue_snapshot);
+        save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await?;
+        renew_manual_transition_scope_admission_from_job(api, &record).await?;
+    }
+    Ok(record)
+}
+
+async fn renew_manual_transition_scope_admission_from_job(
+    api: Arc<ECStore>,
+    record: &ManualTransitionJobRecord,
+) -> EcstoreResult<()> {
     if let Ok((admission, admission_etag)) =
         load_manual_transition_scope_admission_with_etag(api.clone(), &record.scope_key).await
         && admission.job_id == record.job_id
         && admission.lease_id == record.lease_id
     {
-        let renewed_admission = ManualTransitionScopeAdmission::from_job(&record);
+        let renewed_admission = ManualTransitionScopeAdmission::from_job(record);
         save_manual_transition_scope_admission_if_current(api, &renewed_admission, &admission_etag).await?;
     }
-    Ok(record)
+    Ok(())
 }
 
 pub async fn delete_manual_transition_scope_admission_if_current(
