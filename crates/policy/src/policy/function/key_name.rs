@@ -112,6 +112,30 @@ impl KeyName {
         &Into::<&str>::into(self)[self.prefix()..]
     }
 
+    /// True when the value of this condition key must come from server-verified
+    /// state -- the authenticated identity, its validated claims, or the connection
+    /// itself -- rather than from raw request input.
+    ///
+    /// Callers assembling the policy condition map use this to refuse request-supplied
+    /// values for these keys. Without that check a caller could satisfy conditions such
+    /// as `aws:userid` or `jwt:groups` simply by sending a header of the same name.
+    ///
+    /// The `s3:` namespace is mixed: `s3:x-amz-*` keys mirror request headers by
+    /// design, while the rest (`s3:authType`, `s3:LocationConstraint`, ...) are
+    /// computed by the server.
+    pub fn is_server_derived(&self) -> bool {
+        match self {
+            KeyName::Aws(_) | KeyName::Jwt(_) | KeyName::Ldap(_) | KeyName::Sts(_) | KeyName::Svc(_) => true,
+            KeyName::S3(_) => !self.name().starts_with("x-amz-"),
+        }
+    }
+
+    /// Names (prefix stripped) of the well-known condition keys that request input
+    /// must never populate. See [`KeyName::is_server_derived`].
+    pub fn server_derived_key_names() -> impl Iterator<Item = &'static str> {
+        Self::COMMON_KEYS.iter().filter(|k| k.is_server_derived()).map(|k| k.name())
+    }
+
     pub fn var_name(&self) -> String {
         match self {
             KeyName::Aws(s) => format!("${{aws:{}}}", Into::<&str>::into(s)),

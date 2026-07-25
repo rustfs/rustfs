@@ -25,6 +25,7 @@ use futures::future;
 use serde::{Deserialize, Deserializer, Serialize, de, ser::SerializeSeq};
 
 use super::{func::InnerFunc, key_name::KeyName};
+use crate::policy::function::Quantifier;
 use crate::policy::variables::PolicyVariableResolver;
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
@@ -33,7 +34,7 @@ impl StringFunc {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn evaluate_with_resolver(
         &self,
-        for_all: bool,
+        quantifier: Quantifier,
         ignore_case: bool,
         like: bool,
         negate: bool,
@@ -41,10 +42,26 @@ impl StringFunc {
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for inner in self.0.iter() {
-            let result = if like {
-                inner.eval_like(for_all, values, resolver).await ^ negate
-            } else {
-                inner.eval(for_all, ignore_case, values, resolver).await ^ negate
+            // For `ForAllValues:`/`ForAnyValue:` the negation belongs to the per-value
+            // predicate, so it is pushed down into eval/eval_like. Without a qualifier
+            // the operator applies to the value set as a whole and the aggregate is
+            // negated here, which preserves AWS single-valued-key semantics.
+            let result = match quantifier {
+                Quantifier::None => {
+                    let matched = if like {
+                        inner.eval_like(quantifier, false, values, resolver).await
+                    } else {
+                        inner.eval(quantifier, ignore_case, false, values, resolver).await
+                    };
+                    matched ^ negate
+                }
+                Quantifier::ForAnyValue | Quantifier::ForAllValues => {
+                    if like {
+                        inner.eval_like(quantifier, negate, values, resolver).await
+                    } else {
+                        inner.eval(quantifier, ignore_case, negate, values, resolver).await
+                    }
+                }
             };
 
             if !result {
@@ -59,8 +76,9 @@ impl StringFunc {
 impl FuncKeyValue<StringFuncValue> {
     async fn eval(
         &self,
-        for_all: bool,
+        quantifier: Quantifier,
         ignore_case: bool,
+        negate: bool,
         values: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
@@ -106,18 +124,20 @@ impl FuncKeyValue<StringFuncValue> {
             .map(|x| if ignore_case { Cow::Owned(x.to_lowercase()) } else { x })
             .collect::<Set<_>>();
 
-        let ivalues = rvalues.intersection(&fvalues);
-
-        if for_all {
-            rvalues.is_empty() || rvalues.len() == ivalues.count()
-        } else {
-            ivalues.count() > 0
+        match quantifier {
+            // Unqualified: the operator applies to the value set as a whole. The caller
+            // negates the aggregate, so report the plain "some value matched" result.
+            Quantifier::None => rvalues.intersection(&fvalues).count() > 0,
+            // Qualified: quantify over the per-value predicate, negation included.
+            Quantifier::ForAllValues => rvalues.iter().all(|v| fvalues.contains(v) ^ negate),
+            Quantifier::ForAnyValue => rvalues.iter().any(|v| fvalues.contains(v) ^ negate),
         }
     }
 
     async fn eval_like(
         &self,
-        for_all: bool,
+        quantifier: Quantifier,
+        negate: bool,
         values: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
@@ -152,17 +172,32 @@ impl FuncKeyValue<StringFuncValue> {
                     })
                     .any(|x| wildcard::is_match(x, v));
 
-                if for_all {
-                    if !matched {
-                        return false;
+                // Unqualified evaluation reports the plain aggregate match and lets the
+                // caller negate it; the qualifiers fold negation into the per-value
+                // predicate so that ForAllValues/ForAnyValue keep their own meaning.
+                let holds = match quantifier {
+                    Quantifier::None => matched,
+                    Quantifier::ForAllValues | Quantifier::ForAnyValue => matched ^ negate,
+                };
+
+                match quantifier {
+                    Quantifier::ForAllValues => {
+                        if !holds {
+                            return false;
+                        }
                     }
-                } else if matched {
-                    return true;
+                    Quantifier::None | Quantifier::ForAnyValue => {
+                        if holds {
+                            return true;
+                        }
+                    }
                 }
             }
         }
 
-        for_all
+        // No request value settled it: ForAllValues is vacuously satisfied, the other
+        // two are not.
+        quantifier == Quantifier::ForAllValues
     }
 }
 
@@ -243,6 +278,7 @@ impl<'d> Deserialize<'d> for StringFuncValue {
 #[cfg(test)]
 mod tests {
     use super::{StringFunc, StringFuncValue};
+    use crate::policy::function::Quantifier;
     use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::{
         key::Key,
@@ -304,6 +340,9 @@ mod tests {
         }
     }
 
+    /// `for_all` selects `ForAllValues:`; otherwise the operator is unqualified.
+    /// Mirrors the dispatch in `StringFunc::evaluate_with_resolver` so the tests
+    /// exercise the same negation placement as production.
     fn test_eval(
         s: FuncKeyValue<StringFuncValue>,
         for_all: bool,
@@ -315,9 +354,12 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
             .collect();
-        let result = s.eval(for_all, ignore_case, &map, None);
 
-        pollster::block_on(result) ^ negate
+        if for_all {
+            pollster::block_on(s.eval(Quantifier::ForAllValues, ignore_case, negate, &map, None))
+        } else {
+            pollster::block_on(s.eval(Quantifier::None, ignore_case, false, &map, None)) ^ negate
+        }
     }
 
     #[test]
@@ -381,8 +423,9 @@ mod tests {
     #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("delimiter", vec!["/"])] => true ; "9")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["prod", "art"])] => false ; "10")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["art"])] => false ; "11")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![] => false ; "12")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("delimiter", vec!["/"])] => false ; "13")]
+    // ForAllValues is vacuously satisfied when the key is absent from the request.
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![] => true ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("delimiter", vec!["/"])] => true ; "13")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "14")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["art"])] => false ; "15")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![] => true ; "16")]
@@ -423,8 +466,9 @@ mod tests {
     #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("delimiter", vec!["/"])] => true ; "9")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["prod", "art"])] => false ; "10")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["art"])] => false ; "11")]
-    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![] => false ; "12")]
-    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("delimiter", vec!["/"])] => false ; "13")]
+    // ForAllValues is vacuously satisfied when the key is absent from the request.
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![] => true ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("delimiter", vec!["/"])] => true ; "13")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "14")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["art"])] => false ; "15")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![] => true ; "16")]
@@ -442,9 +486,12 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
             .collect();
-        let result = s.eval_like(for_all, &map, None);
 
-        pollster::block_on(result) ^ negate
+        if for_all {
+            pollster::block_on(s.eval_like(Quantifier::ForAllValues, negate, &map, None))
+        } else {
+            pollster::block_on(s.eval_like(Quantifier::None, false, &map, None)) ^ negate
+        }
     }
 
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
@@ -481,8 +528,9 @@ mod tests {
     #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-2"])] => false ; "10")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["prod", "art"])] => false ; "11")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["art"])] => false ; "12")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![] => false ; "13")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("delimiter", vec!["/"])] => false ; "14")]
+    // ForAllValues is vacuously satisfied when the key is absent from the request.
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![] => true ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("delimiter", vec!["/"])] => true ; "14")]
     #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "15")]
     #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["art"])] => false ; "16")]
     #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![] => true ; "17")]

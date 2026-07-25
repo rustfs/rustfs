@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 
 use super::key_name::KeyName;
 use super::{addr::AddrFunc, binary::BinaryFunc, bool_null::BoolFunc, date::DateFunc, number::NumberFunc, string::StringFunc};
+use crate::policy::function::Quantifier;
 
 #[derive(Clone, Deserialize, Debug)]
 pub enum Condition {
@@ -207,7 +208,7 @@ impl Condition {
 
     pub fn evaluate_with_resolver<'a>(
         &'a self,
-        for_all: bool,
+        quantifier: Quantifier,
         values: &'a HashMap<String, Vec<String>>,
         resolver: Option<&'a dyn PolicyVariableResolver>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
@@ -215,16 +216,46 @@ impl Condition {
             use Condition::*;
 
             let r = match self {
-                StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver).await,
-                StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver).await,
-                StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, resolver).await,
-                StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, resolver).await,
-                StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver).await,
-                StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver).await,
-                ArnLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver).await,
-                ArnNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver).await,
-                ArnEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver).await,
-                ArnNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver).await,
+                StringEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, false, values, resolver)
+                        .await
+                }
+                StringNotEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, true, values, resolver)
+                        .await
+                }
+                StringEqualsIgnoreCase(s) => {
+                    s.evaluate_with_resolver(quantifier, true, false, false, values, resolver)
+                        .await
+                }
+                StringNotEqualsIgnoreCase(s) => {
+                    s.evaluate_with_resolver(quantifier, true, false, true, values, resolver)
+                        .await
+                }
+                StringLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, false, values, resolver)
+                        .await
+                }
+                StringNotLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, true, values, resolver)
+                        .await
+                }
+                ArnLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, false, values, resolver)
+                        .await
+                }
+                ArnNotLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, true, values, resolver)
+                        .await
+                }
+                ArnEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, false, values, resolver)
+                        .await
+                }
+                ArnNotEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, true, values, resolver)
+                        .await
+                }
                 BinaryEquals(s) => s.evaluate(values),
                 IpAddress(s) => s.evaluate(values),
                 NotIpAddress(s) => s.evaluate(values),
@@ -247,7 +278,7 @@ impl Condition {
                     if !inner.has_any_key_in(values) {
                         return true;
                     }
-                    return inner.evaluate_with_resolver(for_all, values, resolver).await;
+                    return inner.evaluate_with_resolver(quantifier, values, resolver).await;
                 }
             };
 
@@ -375,7 +406,7 @@ mod tests {
 
         // "AES256" != "aws:kms" is true, so StringNotEquals should evaluate to true
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringNotEquals should be true when values differ"
         );
 
@@ -383,7 +414,7 @@ mod tests {
 
         // "aws:kms" != "aws:kms" is false, so StringNotEquals should evaluate to false
         assert!(
-            !cond.evaluate_with_resolver(false, &values, None).await,
+            !cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringNotEquals should be false when values match"
         );
     }
@@ -396,14 +427,14 @@ mod tests {
         values.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
 
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringEquals should be true when values match"
         );
 
         values.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
 
         assert!(
-            !cond.evaluate_with_resolver(false, &values, None).await,
+            !cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringEquals should be false when values differ"
         );
     }
@@ -417,7 +448,7 @@ mod tests {
         // Key absent: rvalues is empty, intersection is empty.
         // for_all=false: ivalues.count() > 0 → false. Negated → true.
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringNotEquals should be true when key is absent"
         );
     }
@@ -482,7 +513,7 @@ mod tests {
 
         let values = HashMap::new();
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "IfExists should return true when the key is absent"
         );
     }
@@ -496,14 +527,14 @@ mod tests {
         values.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
 
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "IfExists should delegate to inner and return true when values match"
         );
 
         values.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
 
         assert!(
-            !cond.evaluate_with_resolver(false, &values, None).await,
+            !cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "IfExists should delegate to inner and return false when values differ"
         );
     }

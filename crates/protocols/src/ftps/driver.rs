@@ -732,6 +732,12 @@ where
         let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
+        // MKD creates a bucket, so it has to clear the same authorization boundary as
+        // an S3 CreateBucket call.
+        authorize_operation(session_context, &S3Action::CreateBucket, &bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
         // Create bucket for directory
         match self
             .storage

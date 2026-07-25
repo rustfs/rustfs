@@ -731,6 +731,23 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             })
             .await;
 
+            // A bucket policy granting s3:ListBucket also covers listing versions. This
+            // fallback has to feed the same post-authorization gates as the direct grant
+            // below, otherwise a public bucket keeps serving anonymous
+            // ListObjectVersions after RestrictPublicBuckets is turned on.
+            let policy_allowed = policy_allowed
+                || (action == Action::S3Action(S3Action::ListBucketVersionsAction)
+                    && PolicySys::is_allowed(&BucketPolicyArgs {
+                        bucket: bucket.as_str(),
+                        action: Action::S3Action(S3Action::ListBucketAction),
+                        is_owner: false,
+                        account: "",
+                        groups: &None,
+                        conditions: &conditions,
+                        object: "",
+                    })
+                    .await);
+
             if policy_allowed {
                 deny_anonymous_table_data_plane_if_needed(action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
@@ -745,21 +762,6 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                         return Err(s3_error!(AccessDenied, "Access Denied"));
                     }
                 }
-                return Ok(());
-            }
-
-            if action == Action::S3Action(S3Action::ListBucketVersionsAction)
-                && PolicySys::is_allowed(&BucketPolicyArgs {
-                    bucket: bucket.as_str(),
-                    action: Action::S3Action(S3Action::ListBucketAction),
-                    is_owner: false,
-                    account: "",
-                    groups: &None,
-                    conditions: &conditions,
-                    object: "",
-                })
-                .await
-            {
                 return Ok(());
             }
         }

@@ -20,7 +20,7 @@ use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
-use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
+use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive, is_server_derived_condition_key};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
@@ -744,24 +744,8 @@ pub fn get_condition_values_with_query_and_client_info(
         clone_header.remove(*grant_header);
     }
 
-    for (key, _values) in clone_header.iter() {
-        if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
-            continue;
-        }
-        if let Some(existing_values) = args.get_mut(key.as_str()) {
-            existing_values.extend(clone_header.get_all(key).iter().map(|v| v.to_str().unwrap_or("").to_string()));
-        } else {
-            args.insert(
-                key.as_str().to_string(),
-                header
-                    .get_all(key)
-                    .iter()
-                    .map(|v| v.to_str().unwrap_or("").to_string())
-                    .collect(),
-            );
-        }
-    }
-
+    // Claims and group membership are part of the verified identity, so they are
+    // resolved before request headers are merged in below.
     if let Some(claims) = &cred.claims {
         for (k, v) in claims {
             if let Some(v_str) = v.as_str() {
@@ -786,7 +770,38 @@ pub fn get_condition_values_with_query_and_client_info(
         args.insert("groups".to_string(), groups.clone());
     }
 
+    // Every remaining header is attacker-controlled. A header must never contribute
+    // to a condition key that describes the caller's own identity or the connection,
+    // otherwise sending `userid: admin` (or any `jwt:`/`ldap:` claim name) would let a
+    // request satisfy a policy condition about itself. Reject those names outright --
+    // both the ones already populated above and the well-known identity keys that are
+    // absent for this credential, since an absent key is exactly what a spoofed header
+    // would fill in.
+    for key in clone_header.keys() {
+        if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
+            continue;
+        }
+        if is_reserved_condition_key(key.as_str(), &args) {
+            continue;
+        }
+        args.insert(
+            key.as_str().to_string(),
+            header
+                .get_all(key)
+                .iter()
+                .map(|v| v.to_str().unwrap_or("").to_string())
+                .collect(),
+        );
+    }
+
     args
+}
+
+/// Whether a request header is forbidden from contributing to policy condition key
+/// `key`, either because the server already derived that key from verified state or
+/// because it is a well-known identity/context key that only the server may populate.
+fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<String>>) -> bool {
+    server_derived.contains_key(key) || is_server_derived_condition_key(key)
 }
 
 /// Get request authentication type
@@ -1327,6 +1342,62 @@ mod tests {
         assert_eq!(conditions.get("username"), Some(&vec!["service-parent".to_string()]));
         // Service accounts with claims should be "AssumedRole" type
         assert_eq!(conditions.get("principaltype"), Some(&vec!["AssumedRole".to_string()]));
+    }
+
+    #[test]
+    fn test_identity_condition_keys_ignore_spoofed_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        // A caller naming its headers after identity condition keys must not be able
+        // to add or replace values the server derives from the credential.
+        headers.insert("userid", "admin".parse().unwrap());
+        headers.insert("username", "admin".parse().unwrap());
+        headers.insert("principaltype", "Account".parse().unwrap());
+        headers.insert("signatureversion", "AWS4-HMAC-SHA256".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("userid"), Some(&vec!["test-access-key".to_string()]));
+        assert_eq!(conditions.get("username"), Some(&vec!["test-access-key".to_string()]));
+        assert_eq!(conditions.get("principaltype"), Some(&vec!["User".to_string()]));
+        assert!(
+            !conditions
+                .get("signatureversion")
+                .is_some_and(|v| v.iter().any(|s| s == "AWS4-HMAC-SHA256")),
+            "an unsigned request must not gain a signatureversion from a header"
+        );
+    }
+
+    #[test]
+    fn test_claim_condition_keys_ignore_spoofed_headers() {
+        // The credential carries no groups/roles claims, so these keys are absent --
+        // precisely the case a spoofed header would otherwise fill in.
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("groups", "admins".parse().unwrap());
+        headers.insert("roles", "RustFS.ConsoleAdmin".parse().unwrap());
+        headers.insert("sub", "someone-else".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("groups"), None, "groups must come from the credential only");
+        assert_eq!(conditions.get("roles"), None, "roles must come from claims only");
+        assert_eq!(conditions.get("sub"), None, "jwt claim keys must come from claims only");
+    }
+
+    #[test]
+    fn test_request_headers_still_reach_conditions() {
+        // The reserved list must stay narrow: ordinary request headers, including the
+        // `s3:x-amz-*` condition keys, are still expected to be available to policies.
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        headers.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("x-amz-content-sha256"), Some(&vec!["UNSIGNED-PAYLOAD".to_string()]));
+        assert_eq!(conditions.get("x-amz-server-side-encryption"), Some(&vec!["AES256".to_string()]));
     }
 
     #[test]
