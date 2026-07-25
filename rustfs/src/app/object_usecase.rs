@@ -5435,6 +5435,7 @@ impl DefaultObjectUsecase {
         let expiration = resolve_put_object_expiration(bucket, &info).await;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION, lifecycle_expiration_start);
         let storage_class = response_storage_class(&info, &info.user_defined);
+        let cache_control = info.user_defined.get("cache-control").cloned();
         let content_disposition = info.user_defined.get("content-disposition").cloned();
 
         let metadata_filter_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -5447,6 +5448,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
+            cache_control,
             content_disposition,
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
@@ -12644,8 +12646,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_get_object_output_context_returns_content_disposition() {
+    async fn build_get_object_output_context_returns_standard_headers() {
         let mut metadata = HashMap::new();
+        metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
         metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
 
         let info = ObjectInfo {
@@ -12699,7 +12702,15 @@ mod tests {
             .await
             .expect("get object output context");
 
+        assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
         assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
+        assert!(
+            !context
+                .output
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.contains_key("cache-control"))
+        );
         assert!(
             !context
                 .output
