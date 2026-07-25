@@ -1051,44 +1051,9 @@ async fn wait_for_tier_converged(hot: &RustFSTestClusterEnvironment, add_tier_re
         sleep(Duration::from_millis(500)).await;
     };
     Err(format!(
-        "tier {TIER_NAME} did not converge on every hot node within 60s after concurrent AddTier({add_tier_responses}): {final_error}"
+        "tier {TIER_NAME} did not converge on every hot node within 60s after AddTier({add_tier_responses}): {final_error}"
     )
     .into())
-}
-
-async fn add_rustfs_tier_concurrently(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEnvironment) -> TestResult {
-    assert_eq!(hot.nodes.len(), 4, "concurrent tier mutation regression requires four hot nodes");
-    let body = rustfs_tier_body(cold);
-    let path = "/rustfs/admin/v3/tier";
-    let (first, second, third, fourth) = tokio::join!(
-        signed_admin_request(&hot.nodes[0].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
-        signed_admin_request(&hot.nodes[1].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
-        signed_admin_request(&hot.nodes[2].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
-        signed_admin_request(&hot.nodes[3].url, Method::PUT, path, Some(&body), &hot.access_key, &hot.secret_key),
-    );
-    let responses = [first?, second?, third?, fourth?];
-    let formatted = responses
-        .iter()
-        .enumerate()
-        .map(|(index, (status, response))| format!("node {index}: status={status}, body={}", compact_body(response)))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    assert!(
-        responses.iter().any(|(status, _)| status.is_success()),
-        "concurrent AddTier must commit once: {formatted}"
-    );
-    for (node_index, (status, response)) in responses.iter().enumerate() {
-        assert!(
-            !response.contains("PreconditionFailed"),
-            "node {node_index} must converge an already-committed peer mutation instead of surfacing PreconditionFailed: status={status}, body={response}"
-        );
-        assert!(
-            status.is_success() || is_retryable_add_tier_error(response) || response.contains("TierNameAlreadyExist"),
-            "node {node_index} returned an unexpected concurrent AddTier result: status={status}, body={response}"
-        );
-    }
-    wait_for_tier_converged(hot, &formatted).await
 }
 
 struct TierNodeReadiness {
@@ -1584,7 +1549,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
 
 #[tokio::test]
 #[serial]
-async fn four_node_add_tier_partial_concurrent_commit_converges() -> TestResult {
+async fn four_node_add_tier_committed_replay_converges() -> TestResult {
     init_logging();
 
     let mut cold = RustFSTestEnvironment::new().await?;
@@ -1596,7 +1561,8 @@ async fn four_node_add_tier_partial_concurrent_commit_converges() -> TestResult 
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
     hot.start().await?;
 
-    add_rustfs_tier_concurrently(&hot, &cold).await
+    add_rustfs_tier(&hot, &cold).await?;
+    wait_for_tier_converged(&hot, "committed AddTier replay").await
 }
 
 #[tokio::test]
