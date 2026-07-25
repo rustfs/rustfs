@@ -30,6 +30,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jiff::Zoned;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -51,6 +52,8 @@ pub struct LocalKmsClient {
     key_cache: RwLock<HashMap<String, MasterKeyInfo>>,
     /// Master encryption key for encrypting stored keys
     master_cipher: Option<Aes256Gcm>,
+    /// Legacy pre-beta.9 master cipher for reading pre-Argon2 key files
+    legacy_master_cipher: Option<Aes256Gcm>,
     /// DEK encryption implementation
     dek_crypto: AesDekCrypto,
 }
@@ -97,19 +100,21 @@ impl LocalKmsClient {
         }
 
         // Initialize master cipher if master key is provided
-        let master_cipher = if let Some(ref master_key) = config.master_key {
+        let (master_cipher, legacy_master_cipher) = if let Some(ref master_key) = config.master_key {
             let salt = Self::load_or_create_master_key_salt(&config).await?;
             let key = Self::derive_master_key(master_key, &salt)?;
-            Some(Aes256Gcm::new(&key))
+            let legacy_key = Self::derive_legacy_master_key(master_key)?;
+            (Some(Aes256Gcm::new(&key)), Some(Aes256Gcm::new(&legacy_key)))
         } else {
             warn!("No master key provided - local KMS key material will use explicit plaintext-dev-only storage");
-            None
+            (None, None)
         };
 
         Ok(Self {
             config,
             key_cache: RwLock::new(HashMap::new()),
             master_cipher,
+            legacy_master_cipher,
             dek_crypto: AesDekCrypto::new(),
         })
     }
@@ -130,6 +135,14 @@ impl LocalKmsClient {
             .map_err(|err| KmsError::cryptographic_error("argon2id_kdf", err.to_string()))?;
         let key = Key::<Aes256Gcm>::from(derived);
         Ok(key)
+    }
+
+    fn derive_legacy_master_key(master_key: &str) -> Result<Key<Aes256Gcm>> {
+        let mut hasher = Sha256::new();
+        hasher.update(master_key.as_bytes());
+        hasher.update(b"rustfs-kms-local");
+        Key::<Aes256Gcm>::try_from(hasher.finalize().as_slice())
+            .map_err(|_| KmsError::cryptographic_error("legacy_key", "Invalid key length"))
     }
 
     fn master_key_salt_path(config: &LocalConfig) -> PathBuf {
@@ -206,6 +219,9 @@ impl LocalKmsClient {
         // Decrypt key material if master cipher is available.
         let key_material = match effective_protection {
             StoredKeyProtection::EncryptedMasterKey => {
+                // RUSTFS_COMPAT_TODO(rustfs-5063): Remove after upgrades rewrite all pre-beta.9 key files.
+                // Pre-beta.9 files have no protection marker and use the legacy
+                // SHA-256 KDF, while later pre-marker files use Argon2.
                 let cipher = self.master_cipher.as_ref().ok_or_else(|| {
                     KmsError::configuration_error(format!(
                         "Local KMS key {key_id} is encrypted at rest and requires a configured master key"
@@ -219,9 +235,20 @@ impl LocalKmsClient {
                 nonce_array.copy_from_slice(&stored_key.nonce);
                 let nonce = Nonce::from(nonce_array);
 
-                cipher
-                    .decrypt(&nonce, encrypted_bytes.as_ref())
-                    .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
+                match cipher.decrypt(&nonce, encrypted_bytes.as_ref()) {
+                    Ok(key_material) => key_material,
+                    Err(current_error) if stored_key.at_rest_protection == StoredKeyProtection::LegacyUnspecified => {
+                        let legacy_cipher = self.legacy_master_cipher.as_ref().ok_or_else(|| {
+                            KmsError::configuration_error(format!(
+                                "Local KMS key {key_id} is encrypted at rest and requires a configured master key"
+                            ))
+                        })?;
+                        legacy_cipher
+                            .decrypt(&nonce, encrypted_bytes.as_ref())
+                            .map_err(|_| KmsError::cryptographic_error("decrypt", current_error.to_string()))?
+                    }
+                    Err(error) => return Err(KmsError::cryptographic_error("decrypt", error.to_string())),
+                }
             }
             StoredKeyProtection::PlaintextDevOnly | StoredKeyProtection::LegacyUnspecified => {
                 if self.master_cipher.is_some() && stored_key.at_rest_protection == StoredKeyProtection::PlaintextDevOnly {
@@ -1225,5 +1252,72 @@ mod tests {
             .await
             .expect("legacy encrypted record should remain readable");
         assert_eq!(key_info.key_id, "legacy-encrypted-key");
+    }
+
+    #[tokio::test]
+    async fn test_load_master_key_accepts_beta5_sha256_encrypted_record() {
+        let temp_dir = TempDir::new().expect("create beta.5 fixture directory");
+        let stored_key = serde_json::json!({
+            "key_id": "beta5-key",
+            "version": 1u32,
+            "algorithm": "AES_256",
+            "usage": "EncryptDecrypt",
+            "status": "Active",
+            "description": serde_json::Value::Null,
+            "metadata": HashMap::<String, String>::new(),
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "rotated_at": serde_json::Value::Null,
+            "created_by": "beta5-fixture",
+            "encrypted_key_material": "xjwGa4Lj4qzKg6XQl8s2btyFkPHPChMAkjqs268TFGyvFUv8WjDD5HQCUDLViZmt",
+            "nonce": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        });
+        fs::write(
+            temp_dir.path().join("beta5-key.key"),
+            serde_json::to_vec_pretty(&stored_key).expect("serialize beta.5 fixture"),
+        )
+        .await
+        .expect("write beta.5 fixture");
+        let mut explicit_protection = stored_key.clone();
+        let explicit_object = explicit_protection.as_object_mut().expect("beta.5 fixture is a JSON object");
+        explicit_object.insert("key_id".to_string(), serde_json::json!("beta5-explicit-key"));
+        explicit_object.insert("at_rest_protection".to_string(), serde_json::json!("encrypted-master-key"));
+        fs::write(
+            temp_dir.path().join("beta5-explicit-key.key"),
+            serde_json::to_vec_pretty(&explicit_protection).expect("serialize explicit-protection fixture"),
+        )
+        .await
+        .expect("write explicit-protection fixture");
+
+        let client = LocalKmsClient::new(LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: Some("beta5-test-master-key".to_string()),
+            file_permissions: Some(0o600),
+        })
+        .await
+        .expect("initialize local KMS for beta.5 fixture");
+
+        let material = client
+            .get_key_material("beta5-key")
+            .await
+            .expect("decrypt beta.5 SHA-256 protected key");
+        assert_eq!(material, vec![0x42; 32]);
+        let explicit_error = client
+            .get_key_material("beta5-explicit-key")
+            .await
+            .expect_err("explicit current protection must not fall back to the beta.5 KDF");
+        assert!(matches!(explicit_error, KmsError::CryptographicError { .. }));
+
+        let wrong_key_client = LocalKmsClient::new(LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: Some("wrong-beta5-master-key".to_string()),
+            file_permissions: Some(0o600),
+        })
+        .await
+        .expect("initialize local KMS with wrong beta.5 master key");
+        let error = wrong_key_client
+            .get_key_material("beta5-key")
+            .await
+            .expect_err("wrong beta.5 master key must not decrypt the fixture");
+        assert!(matches!(error, KmsError::CryptographicError { .. }));
     }
 }

@@ -14,6 +14,7 @@
 
 use crate::storage_api::error::contract::range::HTTPRangeError;
 use crate::storage_api::error::{QuotaError, StorageError};
+use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
 
 #[derive(Debug)]
@@ -227,6 +228,19 @@ impl From<StorageError> for ApiError {
             return ApiError {
                 code: S3ErrorCode::BadDigest,
                 message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                source: Some(Box::new(err)),
+            };
+        }
+
+        if let StorageError::Io(ref io_err) = err
+            && io_err
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<KmsUnavailableError>())
+                .is_some()
+        {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
                 source: Some(Box::new(err)),
             };
         }
@@ -462,6 +476,14 @@ mod tests {
         let source = api_error.source.as_ref().unwrap();
         let downcast_storage_error = source.downcast_ref::<StorageError>();
         assert!(downcast_storage_error.is_some());
+    }
+
+    #[test]
+    fn test_kms_service_unavailable_maps_to_retryable_error() {
+        let api_error = ApiError::from(StorageError::other(KmsUnavailableError));
+
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(api_error.message, "The service is unavailable. Please retry.");
     }
 
     #[test]
