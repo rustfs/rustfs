@@ -299,6 +299,11 @@ pub struct SRSvcAccDelete {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SRSvcAccReplicationEnvelope {
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRSvcAccChange {
     #[serde(rename = "crSvcAccCreate", skip_serializing_if = "Option::is_none")]
     pub create: Option<SRSvcAccCreate>,
@@ -306,6 +311,8 @@ pub struct SRSvcAccChange {
     pub update: Option<SRSvcAccUpdate>,
     #[serde(rename = "crSvcAccDelete", skip_serializing_if = "Option::is_none")]
     pub delete: Option<SRSvcAccDelete>,
+    #[serde(rename = "oidcServiceAccountEnvelope", skip_serializing_if = "Option::is_none")]
+    pub oidc_service_account_envelope: Option<SRSvcAccReplicationEnvelope>,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
 }

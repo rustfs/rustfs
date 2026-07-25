@@ -366,7 +366,7 @@ fn resolve_replication_pool_handle_with(context: Option<Arc<AppContext>>) -> Opt
     context.and_then(|context| context.replication_pool().handle())
 }
 
-fn resolve_replication_stats_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<ReplicationStats>> {
+pub(crate) fn resolve_replication_stats_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<ReplicationStats>> {
     context.and_then(|context| context.replication_stats().handle())
 }
 

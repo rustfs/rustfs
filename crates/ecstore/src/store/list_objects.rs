@@ -309,7 +309,8 @@ const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
-const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v1";
+const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 2;
+const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v2";
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
@@ -502,6 +503,7 @@ struct PersistentKeyOnlyIndexCache {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistentKeyOnlyIndex {
+    format_version: u8,
     bucket: Option<String>,
     generation: String,
     checkpoint_high_water_mark: u64,
@@ -1410,6 +1412,7 @@ fn parse_persistent_list_metadata_object(line: &str) -> Option<PersistentListMet
 }
 
 fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
+    let mut format_version = 0;
     let mut bucket = None;
     let mut generation = None;
     let mut checkpoint_high_water_mark = None;
@@ -1419,6 +1422,10 @@ fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
     for line in contents.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
+            continue;
+        }
+        if line == PERSISTENT_KEY_ONLY_INDEX_HEADER {
+            format_version = PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION;
             continue;
         }
         if let Some(object) = parse_persistent_list_metadata_object(line) {
@@ -1455,6 +1462,7 @@ fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
     let checkpoint_high_water_mark = checkpoint_high_water_mark.unwrap_or_else(|| u64::try_from(keys.len()).unwrap_or(u64::MAX));
 
     PersistentKeyOnlyIndex {
+        format_version,
         bucket,
         generation: generation.unwrap_or_else(|| LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION.to_owned()),
         checkpoint_high_water_mark,
@@ -1485,6 +1493,9 @@ fn persistent_key_only_index_matches_provider(
     bucket: &str,
     provider_state: &ListObjectsIndexProviderState,
 ) -> bool {
+    if index.format_version != PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION {
+        return false;
+    }
     if index.bucket.as_deref().is_some_and(|index_bucket| index_bucket != bucket) {
         return false;
     }
@@ -1579,6 +1590,7 @@ async fn write_persistent_key_only_index_with_metadata(
     tokio::fs::rename(&tmp_path, path).await.map_err(Error::Io)?;
 
     Ok(PersistentKeyOnlyIndex {
+        format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
         bucket: Some(bucket.to_owned()),
         generation: generation.to_owned(),
         checkpoint_high_water_mark,
@@ -6687,13 +6699,13 @@ mod test {
         ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
         ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
         NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus, PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER,
-        PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER, PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER,
-        PERSISTENT_KEY_ONLY_INDEX_HEADER, PersistentKeyOnlyIndex, PersistentListMetadataObject, RUSTFS_META_BUCKET,
-        VerifiedIndexCandidateStats, VersionMarker, current_list_objects_mutation_sequence,
-        encode_persistent_list_metadata_object, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
-        fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
-        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_marker_key, list_merged_entry_channel,
-        list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
+        PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
+        PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER, PersistentKeyOnlyIndex,
+        PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
+        current_list_objects_mutation_sequence, encode_persistent_list_metadata_object, enforce_latest_listing_write_quorum,
+        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
+        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_marker_key,
+        list_merged_entry_channel, list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
         list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
         list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
         list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
@@ -8041,6 +8053,7 @@ mod test {
     #[test]
     fn metadata_fast_requires_complete_metadata_snapshot() {
         let index = PersistentKeyOnlyIndex {
+            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
             bucket: Some("bucket".to_string()),
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,
@@ -8057,6 +8070,7 @@ mod test {
         assert!(!persistent_key_only_index_has_complete_metadata_snapshot(&index));
 
         let complete = PersistentKeyOnlyIndex {
+            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
             bucket: Some("bucket".to_string()),
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,
@@ -8402,6 +8416,7 @@ mod test {
     #[test]
     fn persistent_key_only_index_provider_match_rejects_configured_generation_mismatch() {
         let index = PersistentKeyOnlyIndex {
+            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
             bucket: Some("bucket".to_string()),
             generation: "generation-old".to_string(),
             checkpoint_high_water_mark: 42,
@@ -8423,8 +8438,49 @@ mod test {
     }
 
     #[test]
+    fn persistent_key_only_index_provider_match_rejects_legacy_format_without_configured_generation() {
+        let legacy = parse_persistent_key_only_index(&format!(
+            "# rustfs-listobjects-key-only-v1\n\
+             {PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER}bucket\n\
+             {PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER}generation-old\n\
+             {PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER}42\n\
+             # object\tbGVnYWN5\t1\t-\t-\tU1RBTkRBUkRfSUE=\n"
+        ));
+        let provider =
+            ListObjectsIndexProviderState::persistent_key_only(Some(PathBuf::from("/tmp/persistent-key-only.index")), None);
+
+        assert_eq!(legacy.format_version, 0);
+        assert!(!persistent_key_only_index_matches_provider(&legacy, "bucket", &provider));
+    }
+
+    #[test]
+    fn current_persistent_snapshot_preserves_an_effective_transition_tier_name() {
+        let object = PersistentListMetadataObject::from_object_info(&ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "transitioned".to_string(),
+            storage_class: Some("STANDARD_IA".to_string()),
+            ..Default::default()
+        });
+        let index = parse_persistent_key_only_index(&format!(
+            "{PERSISTENT_KEY_ONLY_INDEX_HEADER}\n\
+             {PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER}bucket\n\
+             {PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER}generation-current\n\
+             {PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER}42\n\
+             {}\n",
+            encode_persistent_list_metadata_object(&object)
+        ));
+        let provider =
+            ListObjectsIndexProviderState::persistent_key_only(Some(PathBuf::from("/tmp/persistent-key-only.index")), None);
+
+        assert_eq!(index.format_version, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION);
+        assert!(persistent_key_only_index_matches_provider(&index, "bucket", &provider));
+        assert_eq!(index.objects[0].to_object_info("bucket").storage_class.as_deref(), Some("STANDARD_IA"));
+    }
+
+    #[test]
     fn persistent_key_only_index_health_uses_snapshot_generation_and_checkpoint() {
         let index = PersistentKeyOnlyIndex {
+            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
             bucket: Some("bucket".to_string()),
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,
@@ -8450,6 +8506,7 @@ mod test {
     #[test]
     fn persistent_key_only_index_health_reports_lagging_mutation_checkpoint() {
         let index = PersistentKeyOnlyIndex {
+            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
             bucket: Some("bucket".to_string()),
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,
@@ -8476,6 +8533,7 @@ mod test {
     #[test]
     fn persistent_key_only_index_health_reports_degraded_journal() {
         let index = PersistentKeyOnlyIndex {
+            format_version: PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
             bucket: Some("bucket".to_string()),
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,

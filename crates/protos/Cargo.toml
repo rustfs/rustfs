@@ -54,3 +54,4 @@ doctest = false
 
 [dev-dependencies]
 serde_json = { workspace = true }
+temp-env = { workspace = true }

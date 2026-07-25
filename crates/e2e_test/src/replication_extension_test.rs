@@ -2113,11 +2113,31 @@ async fn build_replication_pair(
 async fn test_replication_check_succeeds_with_remote_target() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
-    let (_source_env, _target_env, source_bucket) = build_replication_pair(true).await?;
-    let response = run_replication_check(&_source_env, &source_bucket).await?;
+    let (source_env, target_env, source_bucket) = build_replication_pair(true).await?;
+    let response = run_replication_check(&source_env, &source_bucket).await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.text().await?.is_empty());
+    let payload: serde_json::Value = response.json().await?;
+    assert_eq!(payload["Status"], "OK");
+    assert_eq!(payload["ActiveMutation"], true);
+    assert_eq!(payload["Targets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(payload["Targets"][0]["Status"], "OK");
+    assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "OK");
+    assert_eq!(payload["Targets"][0]["Phases"]["DeleteMarker"]["Status"], "OK");
+    assert_eq!(payload["Targets"][0]["Phases"]["VersionDelete"]["Status"], "OK");
+    assert_eq!(payload["Targets"][0]["Phases"]["Cleanup"]["Status"], "OK");
+
+    let target_client = target_env.create_s3_client();
+    let versions = target_client
+        .list_object_versions()
+        .bucket("replication-check-dst")
+        .prefix(".rustfs.sys/replication-check/")
+        .send()
+        .await?;
+    assert!(
+        versions.versions().is_empty() && versions.delete_markers().is_empty(),
+        "successful check must remove every probe version and delete marker"
+    );
 
     Ok(())
 }
@@ -2159,9 +2179,19 @@ async fn test_replication_check_rejects_target_without_object_lock() -> Result<(
     let status = response.status();
     let body = response.text().await?;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
-    assert!(body.to_ascii_lowercase().contains("object lock"), "unexpected response: {body}");
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(payload["Status"], "FAILED");
+    assert_eq!(payload["Targets"][0]["Status"], "FAILED");
+    assert_eq!(payload["Targets"][0]["Phases"]["ObjectLock"]["Status"], "FAILED");
+    assert!(
+        payload["Targets"][0]["Phases"]["ObjectLock"]["Error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("object lock"),
+        "unexpected response: {body}"
+    );
+    assert_eq!(payload["Targets"][0]["Phases"]["Put"]["Status"], "SKIPPED");
 
     Ok(())
 }

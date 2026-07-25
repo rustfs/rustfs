@@ -46,6 +46,34 @@ pub const OUTPOSTS: &str = "OUTPOSTS";
 pub const SNOW: &str = "SNOW";
 pub const STANDARD_IA: &str = "STANDARD_IA";
 
+/// Version of the client-discoverable storage-class write contract.
+pub const CAPABILITY_CONTRACT_VERSION: u32 = 1;
+/// Storage classes whose write semantics RustFS implements.
+pub const SUPPORTED_WRITE_CLASSES: [&str; 2] = [STANDARD, RRS];
+/// Stable S3 error code returned for unsupported write classes.
+pub const UNSUPPORTED_WRITE_ERROR: &str = "InvalidStorageClass";
+/// Compatibility behavior applied to historical label-only object metadata.
+pub const LEGACY_LABEL_BEHAVIOR: &str = "normalized_to_effective_class";
+
+/// Returns whether a client may select this storage class for a write.
+pub fn is_supported_write_class(storage_class: &str) -> bool {
+    SUPPORTED_WRITE_CLASSES.contains(&storage_class)
+}
+
+/// Resolves the storage class that truthfully describes the stored object.
+///
+/// A completed lifecycle transition is a real storage tier and therefore keeps
+/// its tier name. For local objects, only RRS has distinct layout semantics;
+/// historical AWS class labels otherwise describe the effective STANDARD
+/// layout.
+pub fn effective_class<'a>(stored_class: Option<&'a str>, transitioned_tier: Option<&'a str>) -> &'a str {
+    if let Some(tier) = transitioned_tier.filter(|tier| !tier.is_empty()) {
+        return tier;
+    }
+
+    if stored_class == Some(RRS) { RRS } else { STANDARD }
+}
+
 // Standard constants for config info storage class
 pub const CLASS_STANDARD: &str = "standard";
 pub const CLASS_RRS: &str = "rrs";
@@ -510,6 +538,91 @@ mod tests {
 
     fn no_env_overrides() -> StorageClassEnvOverrides {
         StorageClassEnvOverrides::default()
+    }
+
+    #[test]
+    fn should_inline_preserves_exact_default_shard_boundaries() {
+        let config = Config::default();
+
+        for (case, shard_size, versioned, expected) in [
+            ("unversioned below", 128 * 1024 - 1, false, true),
+            ("unversioned exact", 128 * 1024, false, true),
+            ("unversioned above", 128 * 1024 + 1, false, false),
+            ("versioned below", 16 * 1024 - 1, true, true),
+            ("versioned exact", 16 * 1024, true, true),
+            ("versioned above", 16 * 1024 + 1, true, false),
+            ("negative", -1, false, false),
+        ] {
+            assert_eq!(
+                config.should_inline(shard_size, versioned),
+                expected,
+                "{case}: shard_size={shard_size}, versioned={versioned}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_inline_preserves_exact_default_ec_2_2_object_boundaries() {
+        let config = Config::default();
+        let erasure = crate::erasure::coding::Erasure::new(2, 2, 1024 * 1024);
+
+        for (case, object_size, versioned, expected_shard_size, expected) in [
+            ("unversioned below", 256 * 1024 - 1, false, 128 * 1024, true),
+            ("unversioned exact", 256 * 1024, false, 128 * 1024, true),
+            ("unversioned above", 256 * 1024 + 1, false, 128 * 1024 + 1, false),
+            ("versioned below", 32 * 1024 - 1, true, 16 * 1024, true),
+            ("versioned exact", 32 * 1024, true, 16 * 1024, true),
+            ("versioned above", 32 * 1024 + 1, true, 16 * 1024 + 1, false),
+        ] {
+            let shard_size = erasure.shard_file_size(object_size);
+            assert_eq!(shard_size, expected_shard_size, "{case}: object_size={object_size}");
+            assert_eq!(
+                config.should_inline(shard_size, versioned),
+                expected,
+                "{case}: object_size={object_size}, shard_size={shard_size}, versioned={versioned}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_capability_contract_only_accepts_implemented_layouts() {
+        assert_eq!(SUPPORTED_WRITE_CLASSES, [STANDARD, RRS]);
+        assert!(is_supported_write_class(STANDARD));
+        assert!(is_supported_write_class(RRS));
+
+        for label_only_class in [
+            DEEP_ARCHIVE,
+            EXPRESS_ONEZONE,
+            GLACIER,
+            GLACIER_IR,
+            INTELLIGENT_TIERING,
+            ONEZONE_IA,
+            OUTPOSTS,
+            SNOW,
+            STANDARD_IA,
+        ] {
+            assert!(
+                !is_supported_write_class(label_only_class),
+                "{label_only_class} must not be advertised as a supported write class"
+            );
+        }
+        assert!(!is_supported_write_class(""));
+        assert!(!is_supported_write_class("standard"));
+        assert!(!is_supported_write_class("UNKNOWN"));
+    }
+
+    #[test]
+    fn effective_class_normalizes_legacy_labels_and_preserves_real_tiers() {
+        assert_eq!(effective_class(None, None), STANDARD);
+        assert_eq!(effective_class(Some(STANDARD), None), STANDARD);
+        assert_eq!(effective_class(Some(RRS), None), RRS);
+        assert_eq!(effective_class(Some(STANDARD_IA), None), STANDARD);
+        assert_eq!(effective_class(Some(GLACIER), None), STANDARD);
+        assert_eq!(effective_class(Some("UNKNOWN"), None), STANDARD);
+
+        assert_eq!(effective_class(Some(STANDARD_IA), Some("WARM-TIER")), "WARM-TIER");
+        assert_eq!(effective_class(Some(STANDARD), Some(STANDARD_IA)), STANDARD_IA);
+        assert_eq!(effective_class(Some(RRS), Some("CUSTOM-RRS-TIER")), "CUSTOM-RRS-TIER");
     }
 
     #[test]

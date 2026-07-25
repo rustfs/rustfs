@@ -95,10 +95,15 @@ stage_env() {
       ;;
     p2)
       if [[ "${phase}" == "after" ]]; then
-        # Only enable after the msgpack json-fallback counter has read zero across a window.
-        printf '%s\n' 'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true'
+        # Only enable after the msgpack json-fallback counter has read zero across a window and
+        # the fleet confirmation gate has passed.
+        printf '%s\n' \
+          'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true' \
+          'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true'
       else
-        printf '%s\n' 'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false'
+        printf '%s\n' \
+          'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false' \
+          'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false'
       fi
       ;;
     p3)
@@ -155,10 +160,18 @@ case "${STAGE}" in
   p0|p1|p2)
     echo "-- NOTE: (re)start rustfs on all nodes with the env above before this measurement is valid."
     [[ -x "${TRANSPORT_BENCH}" ]] || { echo "ERROR: ${TRANSPORT_BENCH} not found/executable" >&2; exit 1; }
-    run "${TRANSPORT_BENCH}" --out-dir "${OUT_DIR}" "${PASSTHROUGH[@]}"
+    if ((${#PASSTHROUGH[@]} > 0)); then
+      run "${TRANSPORT_BENCH}" --out-dir "${OUT_DIR}" "${PASSTHROUGH[@]}"
+    else
+      run "${TRANSPORT_BENCH}" --out-dir "${OUT_DIR}"
+    fi
     ;;
   p3)
     [[ -x "${FAILOVER_BENCH}" ]] || { echo "ERROR: ${FAILOVER_BENCH} not found/executable" >&2; exit 1; }
-    OUT_DIR="${OUT_DIR}" run "${FAILOVER_BENCH}" "${PASSTHROUGH[@]}"
+    if ((${#PASSTHROUGH[@]} > 0)); then
+      OUT_DIR="${OUT_DIR}" run "${FAILOVER_BENCH}" "${PASSTHROUGH[@]}"
+    else
+      OUT_DIR="${OUT_DIR}" run "${FAILOVER_BENCH}"
+    fi
     ;;
 esac

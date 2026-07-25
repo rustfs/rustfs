@@ -53,6 +53,7 @@ const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
 const HEALTH_INFO: AdminActionRef = AdminActionRef::new("HealthInfoAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
+const INSPECT_DATA: AdminActionRef = AdminActionRef::new("InspectDataAction");
 const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
 const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
 const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
@@ -412,6 +413,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/scanner/status", SERVER_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/audit/target/list",
@@ -635,6 +637,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/site-replication/repair/status",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/profile", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/status", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/tls/status", PROFILING, RouteRiskLevel::High),
@@ -656,6 +664,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HEALTH_INFO,
         RouteRiskLevel::High,
     ),
+    admin(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA, RouteRiskLevel::High),
     // MinIO-compatible profiling / trace endpoints.
     admin(HttpMethod::Post, "/rustfs/admin/v3/profiling/start", PROFILING, RouteRiskLevel::High),
     admin(
@@ -1792,6 +1801,12 @@ mod tests {
     }
 
     #[test]
+    fn route_policy_requires_set_tier_for_manual_transition_run() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SERVER_INFO);
+    }
+
+    #[test]
     fn route_policy_keeps_contextual_auth_deferred() {
         assert_deferred(
             HttpMethod::Get,
@@ -1822,6 +1837,11 @@ mod tests {
     }
 
     #[test]
+    fn route_policy_requires_dedicated_inspect_action_for_encrypted_archive() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA);
+    }
+
+    #[test]
     fn route_policy_requires_operation_for_site_replication_diagnostics() {
         for path in [
             "/rustfs/admin/v3/site-replication/devnull",
@@ -1840,6 +1860,11 @@ mod tests {
     #[test]
     fn route_policy_requires_operation_for_site_replication_repair() {
         assert_action(HttpMethod::Put, "/rustfs/admin/v3/site-replication/repair", SITE_REPLICATION_OPERATION);
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/site-replication/repair/status",
+            SITE_REPLICATION_OPERATION,
+        );
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {

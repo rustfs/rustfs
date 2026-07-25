@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use super::*;
+use crate::multipart_listing::paginate_multipart_listing;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
+use std::collections::HashSet;
 
 fn map_multipart_namespace_lock_error(
     bucket: &str,
@@ -117,6 +119,8 @@ impl ECStore {
         }
 
         let mut uploads = Vec::new();
+        let mut common_prefixes = HashSet::new();
+        let mut source_truncated = false;
 
         for pool in self.pools.iter() {
             if self.is_suspended(pool.pool_idx).await {
@@ -133,25 +137,27 @@ impl ECStore {
                 )
                 .await?;
             uploads.extend(res.uploads);
+            common_prefixes.extend(res.common_prefixes);
+            source_truncated |= res.is_truncated;
         }
 
         // Each pool caps its own page at `max_uploads`, so the concatenation is
         // unordered across pools and may exceed the global cap. Re-sort, re-cap,
         // and derive the truncation markers so a bucket whose uploads span pools
         // pages correctly instead of being silently reported complete.
-        let (uploads, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(uploads, max_uploads);
+        let page = merge_multipart_upload_pages(uploads, common_prefixes.into_iter().collect(), max_uploads, source_truncated);
 
         Ok(ListMultipartsInfo {
             key_marker,
             upload_id_marker,
-            next_key_marker,
-            next_upload_id_marker,
+            next_key_marker: page.next_key_marker,
+            next_upload_id_marker: page.next_upload_id_marker,
             max_uploads,
-            is_truncated,
-            uploads,
+            is_truncated: page.is_truncated,
+            uploads: page.uploads,
+            common_prefixes: page.common_prefixes,
             prefix: prefix.to_owned(),
             delimiter: delimiter.to_owned(),
-            ..Default::default()
         })
     }
 
@@ -398,24 +404,12 @@ impl ECStore {
 /// from the first overflow element (used only as a probe, never returned) so a
 /// bucket whose uploads span pools can be paged without loss or duplication.
 fn merge_multipart_upload_pages(
-    mut uploads: Vec<MultipartInfo>,
+    uploads: Vec<MultipartInfo>,
+    common_prefixes: Vec<String>,
     max_uploads: usize,
-) -> (Vec<MultipartInfo>, bool, Option<String>, Option<String>) {
-    uploads.sort_by(|a, b| a.object.cmp(&b.object).then_with(|| a.upload_id.cmp(&b.upload_id)));
-
-    let is_truncated = uploads.len() > max_uploads;
-    uploads.truncate(max_uploads);
-
-    let (next_key_marker, next_upload_id_marker) = if is_truncated {
-        match uploads.last() {
-            Some(last) => (Some(last.object.clone()), Some(last.upload_id.clone())),
-            None => (None, None),
-        }
-    } else {
-        (None, None)
-    };
-
-    (uploads, is_truncated, next_key_marker, next_upload_id_marker)
+    source_truncated: bool,
+) -> crate::multipart_listing::MultipartListingPage {
+    paginate_multipart_listing(uploads, common_prefixes, None, None, max_uploads, source_truncated)
 }
 
 #[cfg(test)]
@@ -462,26 +456,30 @@ mod tests {
         // Union of two pools, unordered and exceeding the global cap.
         let uploads = vec![mp("b", "u1"), mp("a", "u2"), mp("a", "u1"), mp("c", "u1"), mp("b", "u2")];
 
-        let (page, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(uploads, 3);
+        let page = merge_multipart_upload_pages(uploads, Vec::new(), 3, false);
 
-        assert!(is_truncated);
-        assert_eq!(page.len(), 3);
-        let ordered: Vec<(&str, &str)> = page.iter().map(|u| (u.object.as_str(), u.upload_id.as_str())).collect();
+        assert!(page.is_truncated);
+        assert_eq!(page.uploads.len(), 3);
+        let ordered: Vec<(&str, &str)> = page
+            .uploads
+            .iter()
+            .map(|u| (u.object.as_str(), u.upload_id.as_str()))
+            .collect();
         assert_eq!(ordered, vec![("a", "u1"), ("a", "u2"), ("b", "u1")]);
-        assert_eq!(next_key_marker.as_deref(), Some("b"));
-        assert_eq!(next_upload_id_marker.as_deref(), Some("u1"));
+        assert_eq!(page.next_key_marker.as_deref(), Some("b"));
+        assert_eq!(page.next_upload_id_marker.as_deref(), Some("u1"));
     }
 
     #[test]
     fn merge_multipart_upload_pages_reports_complete_within_cap() {
         let uploads = vec![mp("b", "u1"), mp("a", "u1")];
 
-        let (page, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(uploads, 3);
+        let page = merge_multipart_upload_pages(uploads, Vec::new(), 3, false);
 
-        assert_eq!(page.len(), 2);
-        assert!(!is_truncated);
-        assert!(next_key_marker.is_none());
-        assert!(next_upload_id_marker.is_none());
+        assert_eq!(page.uploads.len(), 2);
+        assert!(!page.is_truncated);
+        assert!(page.next_key_marker.is_none());
+        assert!(page.next_upload_id_marker.is_none());
     }
 
     #[test]
@@ -509,21 +507,46 @@ mod tests {
                 merged.extend(pool_query(pool, key_marker.as_deref(), upload_id_marker.as_deref(), max_uploads));
             }
 
-            let (page, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(merged, max_uploads);
-            assert!(page.len() <= max_uploads);
-            collected.extend(page.iter().map(|u| (u.object.clone(), u.upload_id.clone())));
+            let page = merge_multipart_upload_pages(merged, Vec::new(), max_uploads, false);
+            assert!(page.uploads.len() <= max_uploads);
+            collected.extend(page.uploads.iter().map(|u| (u.object.clone(), u.upload_id.clone())));
 
-            if !is_truncated {
+            if !page.is_truncated {
                 break;
             }
-            key_marker = next_key_marker;
-            upload_id_marker = next_upload_id_marker;
+            key_marker = page.next_key_marker;
+            upload_id_marker = page.next_upload_id_marker;
         }
 
         assert_eq!(collected, expected, "pagination must return every upload exactly once, in sorted order");
         let mut deduped = collected.clone();
         deduped.dedup();
         assert_eq!(deduped.len(), collected.len(), "pagination must not duplicate uploads");
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_includes_common_prefixes() {
+        let page = merge_multipart_upload_pages(
+            vec![mp("logs/root.bin", "u1")],
+            vec!["logs/2026/".to_string(), "logs/2025/".to_string()],
+            2,
+            false,
+        );
+
+        assert!(page.is_truncated);
+        assert!(page.uploads.is_empty());
+        assert_eq!(page.common_prefixes, vec!["logs/2025/", "logs/2026/"]);
+        assert_eq!(page.next_key_marker.as_deref(), Some("logs/2026/"));
+        assert!(page.next_upload_id_marker.is_none());
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_preserves_pool_truncation() {
+        let page = merge_multipart_upload_pages(vec![mp("a", "u1")], Vec::new(), 1, true);
+
+        assert!(page.is_truncated);
+        assert_eq!(page.next_key_marker.as_deref(), Some("a"));
+        assert_eq!(page.next_upload_id_marker.as_deref(), Some("u1"));
     }
 
     async fn new_multipart_lock_test_store() -> ECStore {

@@ -26,8 +26,8 @@ pub(crate) use crate::runtime_sources::{
     current_bucket_monitor_handle, current_deployment_id, current_endpoints_handle, current_federated_identity_service,
     current_iam_handle, current_kms_runtime_service_manager, current_notification_system_for_context,
     current_object_data_cache_handle_for_context, current_object_store_handle_for_context, current_ready_iam_handle,
-    current_region, current_replication_pool_handle, current_replication_stats_handle, current_server_config_for_context,
-    current_token_signing_key,
+    current_region, current_replication_pool_handle, current_replication_stats_handle,
+    current_replication_stats_handle_for_context, current_server_config_for_context, current_token_signing_key,
 };
 #[cfg(test)]
 pub(crate) use crate::runtime_sources::{IamInterface, KmsInterface, ServerConfigInterface, StorageClassInterface};

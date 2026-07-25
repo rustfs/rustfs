@@ -17,7 +17,8 @@ use super::replication_filemeta_boundary::MrfReplicateEntry;
 
 pub use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus};
 pub(crate) use rustfs_replication::{
-    is_version_id_mismatch, resync_state_accepts_update, should_auto_resume_resync, should_count_head_proxy_failure,
+    is_version_id_mismatch, resync_state_accepts_update, sanitize_resync_error_detail, should_auto_resume_resync,
+    should_count_head_proxy_failure,
 };
 
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
