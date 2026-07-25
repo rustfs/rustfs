@@ -1745,14 +1745,7 @@ async fn apply_managed_decryption_material(
     // advertised SSE scheme and current KMS availability are write policy
     // and runtime state, neither of which identifies the historical provider.
     let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(&encrypted_data_key) {
-        // When a test-injected provider is registered via set_sse_dek_provider_for_test,
-        // use it instead of creating a fresh KmsSseDekProvider which cannot resolve
-        // a KMS service without an AppContext.
-        if let Some(cached) = GLOBAL_SSE_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
-            cached
-        } else {
-            Arc::new(KmsSseDekProvider::new().await?)
-        }
+        kms_envelope_sse_dek_provider().await?
     } else {
         get_local_sse_dek_provider().await?
     };
@@ -2176,8 +2169,50 @@ impl SseDekProvider for TestSseDekProvider {
 // Factory Function for SSE DEK Provider
 // ============================================================================
 
-/// Global SSE DEK provider cache
+/// Global SSE DEK provider cache.
+///
+/// Production code only ever stores the local (non-KMS) provider here, via
+/// `get_local_sse_dek_provider`. The KMS-envelope decrypt path must never read
+/// this cache: a local provider cached before KMS was dynamically enabled would
+/// otherwise be selected for KMS envelopes and fail to decrypt them.
 static GLOBAL_SSE_DEK_PROVIDER: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Test-only provider override installed via `set_sse_dek_provider_for_test`.
+///
+/// Kept separate from `GLOBAL_SSE_DEK_PROVIDER` so an explicitly injected
+/// provider is distinguishable from the production local-provider cache: the
+/// KMS-envelope decrypt path honors an injected provider (unit tests cannot
+/// build a `KmsSseDekProvider` without an AppContext) but must never fall back
+/// to whatever the local cache happens to hold.
+#[cfg(test)]
+static TEST_SSE_DEK_PROVIDER_OVERRIDE: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+#[cfg(test)]
+fn test_injected_sse_dek_provider() -> Option<Arc<dyn SseDekProvider>> {
+    TEST_SSE_DEK_PROVIDER_OVERRIDE
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+}
+
+/// Resolve the provider for a persisted RustFS KMS data-key envelope.
+///
+/// A KMS envelope is always decrypted by `KmsSseDekProvider`, which resolves
+/// the *current* encryption service on every call, so decryption keeps working
+/// across dynamic KMS enable/reconfigure. The local-provider cache in
+/// `GLOBAL_SSE_DEK_PROVIDER` is intentionally not consulted here: it is
+/// populated while KMS is not configured, and reusing it after KMS comes up
+/// would route KMS envelopes to the local `nonce:ciphertext` decoder, making
+/// those objects unreadable (see PR rustfs#5184 review).
+async fn kms_envelope_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError> {
+    #[cfg(test)]
+    if let Some(injected) = test_injected_sse_dek_provider() {
+        return Ok(injected);
+    }
+
+    Ok(Arc::new(KmsSseDekProvider::new().await?))
+}
 
 /// Get or initialize the global SSE DEK provider
 ///
@@ -2205,6 +2240,13 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
 }
 
 async fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError> {
+    // An explicitly injected test provider overrides both the cache and the
+    // environment-based selection below.
+    #[cfg(test)]
+    if let Some(injected) = test_injected_sse_dek_provider() {
+        return Ok(injected);
+    }
+
     // Check if already initialized
     if let Some(provider) = GLOBAL_SSE_DEK_PROVIDER
         .read()
@@ -2245,12 +2287,14 @@ pub fn reset_sse_dek_provider() {
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
         *slot = None;
     }
+    if let Ok(mut slot) = TEST_SSE_DEK_PROVIDER_OVERRIDE.write() {
+        *slot = None;
+    }
 }
 
 #[cfg(test)]
-#[cfg(feature = "rio-v2")]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
-    if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
+    if let Ok(mut slot) = TEST_SSE_DEK_PROVIDER_OVERRIDE.write() {
         *slot = Some(provider);
     }
 }
@@ -4200,6 +4244,120 @@ mod tests {
         };
         assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
 
+        reset_sse_dek_provider();
+    }
+
+    /// Regression: "local provider cached -> KMS dynamically enabled -> decrypt
+    /// KMS envelope" must never route the envelope to the cached local provider.
+    /// The cache is deliberately NOT reset before the envelope decrypt.
+    #[tokio::test]
+    async fn test_kms_envelope_ignores_cached_local_provider() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        // Simulate the transition sequence: a managed SSE operation ran before
+        // KMS came up and left the production local provider in the cache.
+        *super::GLOBAL_SSE_DEK_PROVIDER.write().expect("update SSE DEK provider cache") =
+            Some(Arc::new(TestSseDekProvider::new_with_key([7u8; 32])));
+
+        let kms_envelope = br#"{
+            "key_id": "test-key-id",
+            "master_key_id": "master-key-id",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode(kms_envelope)),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([0x14; 12])),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "test-key-id".to_string()),
+        ]);
+
+        // The cached local provider must not be selected for a KMS envelope.
+        // Unit tests have no AppContext-backed KMS service, so the only correct
+        // outcome is the retryable KMS-unavailable signal from
+        // KmsSseDekProvider::new. Routing to the cached local provider would
+        // instead surface a DEK format/decrypt error or bogus key material.
+        let error = match apply_managed_decryption_material("bucket", "object", &metadata).await {
+            Ok(_) => panic!("KMS envelope must not be decrypted by the cached local provider"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+
+        reset_sse_dek_provider();
+    }
+
+    /// A KMS envelope produced by a live KMS service must decrypt correctly
+    /// even while the local provider sits in the cache, proving envelope
+    /// routing is independent of whatever the cache holds.
+    #[tokio::test]
+    async fn test_kms_envelope_decrypts_with_kms_provider_despite_cached_local_provider() {
+        use rustfs_kms::config::KmsConfig;
+        use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+        use tempfile::TempDir;
+
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        let manager = rustfs_kms::init_global_kms_service_manager();
+        let key_dir = TempDir::new().expect("create KMS key directory");
+        manager
+            .reconfigure(KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .await
+            .expect("start test KMS service");
+        manager
+            .get_encryption_service()
+            .await
+            .expect("encryption service should exist")
+            .create_key(CreateKeyRequest {
+                key_name: Some("kms-transition".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("kms test key should be created");
+
+        let kms_provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+        let context = ObjectEncryptionContext::new("bucket".to_string(), "object".to_string());
+        let (data_key, encrypted_dek) = kms_provider
+            .generate_sse_dek(&context, "kms-transition")
+            .await
+            .expect("generate KMS-wrapped DEK");
+        assert!(
+            super::is_data_key_envelope(&encrypted_dek),
+            "generated DEK must be a KMS envelope"
+        );
+
+        // Pollute the local-provider cache the way a pre-KMS managed operation
+        // would, then register the KMS provider via the test injection hook
+        // (unit tests cannot resolve a KMS service through an AppContext). The
+        // cache is not reset before the decrypt.
+        *super::GLOBAL_SSE_DEK_PROVIDER.write().expect("update SSE DEK provider cache") =
+            Some(Arc::new(TestSseDekProvider::new_with_key([7u8; 32])));
+        super::set_sse_dek_provider_for_test(Arc::new(kms_provider));
+
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AES256.to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode(&encrypted_dek)),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(data_key.nonce)),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "kms-transition".to_string()),
+        ]);
+
+        let material = apply_managed_decryption_material("bucket", "object", &metadata)
+            .await
+            .expect("KMS envelope must decrypt via the KMS provider despite a cached local provider")
+            .expect("managed metadata should produce decryption material");
+        assert_eq!(material.key_bytes, data_key.plaintext_key);
+
+        manager.stop().await.expect("stop test KMS service");
         reset_sse_dek_provider();
     }
 
