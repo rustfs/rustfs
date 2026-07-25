@@ -64,7 +64,7 @@ impl ECStore {
         delimiter: Option<String>,
         max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        self.inner_list_object_versions_with_purge(bucket, prefix, marker, version_marker, delimiter, max_keys, true)
+        self.inner_list_object_versions_for_lifecycle(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
     }
 
