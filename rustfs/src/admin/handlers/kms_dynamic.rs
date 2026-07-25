@@ -128,6 +128,32 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn decode_persisted_kms_config(data: &[u8]) -> serde_json::Result<(KmsConfig, bool)> {
+    let mut config: KmsConfig = serde_json::from_slice(data)?;
+    let value: serde_json::Value = serde_json::from_slice(data)?;
+    let is_missing_development_flag = value
+        .as_object()
+        .is_some_and(|object| !object.contains_key("allow_insecure_dev_defaults"));
+    let mut uses_legacy_local_defaults = false;
+
+    if is_missing_development_flag
+        && matches!(&config.backend_config, rustfs_kms::BackendConfig::Local(_))
+        && config.validate().is_err()
+    {
+        // RUSTFS_COMPAT_TODO(rustfs-5063): Remove after pre-beta.9 configurations are rewritten with this field.
+        // Pre-beta.9 persisted Local KMS configurations predate the explicit
+        // development-default flag.
+        config.allow_insecure_dev_defaults = true;
+        if config.validate().is_ok() {
+            uses_legacy_local_defaults = true;
+        } else {
+            config.allow_insecure_dev_defaults = false;
+        }
+    }
+
+    Ok((config, uses_legacy_local_defaults))
+}
+
 /// Load KMS configuration from cluster storage
 #[instrument]
 pub async fn load_kms_config() -> Option<KmsConfig> {
@@ -145,8 +171,18 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
     };
 
     match read_admin_config(store, KMS_CONFIG_PATH).await {
-        Ok(data) => match serde_json::from_slice::<KmsConfig>(&data) {
-            Ok(config) => {
+        Ok(data) => match decode_persisted_kms_config(&data) {
+            Ok((config, is_legacy_local)) => {
+                if is_legacy_local {
+                    warn!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_legacy_local_config_loaded",
+                        storage_path = KMS_CONFIG_PATH,
+                        state = "legacy_config_accepted",
+                        "admin kms dynamic state"
+                    );
+                }
                 info!(
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_KMS,
@@ -921,8 +957,9 @@ impl Operation for ReconfigureKmsHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{kms_configure_actions, kms_service_control_actions};
+    use super::{decode_persisted_kms_config, kms_configure_actions, kms_service_control_actions};
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+    use tempfile::TempDir;
 
     fn assert_has_action(actions: &[Action], action: Action) {
         assert!(actions.contains(&action), "expected action list to contain {action:?}");
@@ -942,5 +979,68 @@ mod tests {
     fn kms_dynamic_actions_reject_server_info_fallback() {
         assert_lacks_action(&kms_configure_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
         assert_lacks_action(&kms_service_control_actions(), Action::AdminAction(AdminAction::ServerInfoAdminAction));
+    }
+
+    #[test]
+    fn persisted_beta5_local_config_retains_legacy_development_mode() {
+        let temp_dir = TempDir::new().expect("create legacy local KMS directory");
+        let config = rustfs_kms::KmsConfig::local(temp_dir.path().to_path_buf());
+        let mut value = serde_json::to_value(config).expect("serialize local KMS config");
+        value
+            .as_object_mut()
+            .expect("KMS config is a JSON object")
+            .remove("allow_insecure_dev_defaults");
+
+        let (config, migrated) = decode_persisted_kms_config(&serde_json::to_vec(&value).expect("serialize beta.5 config"))
+            .expect("decode beta.5 persisted config");
+        assert!(migrated);
+        assert!(config.allow_insecure_dev_defaults);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn persisted_local_config_with_explicit_secure_mode_stays_secure() {
+        let temp_dir = TempDir::new().expect("create secure local KMS directory");
+        let config = rustfs_kms::KmsConfig::local(temp_dir.path().to_path_buf());
+
+        let (config, migrated) = decode_persisted_kms_config(&serde_json::to_vec(&config).expect("serialize current config"))
+            .expect("decode current persisted config");
+        assert!(!migrated);
+        assert!(!config.allow_insecure_dev_defaults);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn persisted_config_rejects_duplicate_security_field() {
+        let temp_dir = TempDir::new().expect("create local KMS directory");
+        let config = rustfs_kms::KmsConfig::local(temp_dir.path().to_path_buf());
+        let serialized = serde_json::to_string(&config).expect("serialize current config");
+        let duplicate = serialized.replacen('{', r#"{"allow_insecure_dev_defaults":true,"#, 1);
+
+        assert!(decode_persisted_kms_config(duplicate.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn persisted_secure_local_config_without_legacy_field_stays_secure() {
+        #[cfg(unix)]
+        let key_dir = std::path::PathBuf::from("/var/lib/rustfs/kms");
+        #[cfg(windows)]
+        let key_dir = std::path::PathBuf::from(r"C:\rustfs-kms");
+        let mut config = rustfs_kms::KmsConfig::local(key_dir);
+        let rustfs_kms::BackendConfig::Local(local) = &mut config.backend_config else {
+            panic!("local constructor must create local backend config");
+        };
+        local.master_key = Some("configured-master-key".to_string());
+        let mut value = serde_json::to_value(config).expect("serialize secure local KMS config");
+        value
+            .as_object_mut()
+            .expect("KMS config is a JSON object")
+            .remove("allow_insecure_dev_defaults");
+
+        let (config, migrated) = decode_persisted_kms_config(&serde_json::to_vec(&value).expect("serialize old config"))
+            .expect("decode secure persisted config");
+        assert!(!migrated);
+        assert!(!config.allow_insecure_dev_defaults);
+        assert!(config.validate().is_ok());
     }
 }

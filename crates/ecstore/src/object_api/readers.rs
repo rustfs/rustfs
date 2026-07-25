@@ -25,7 +25,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
-use rustfs_kms::types::ObjectEncryptionContext;
+use rustfs_kms::{KmsUnavailableError, is_data_key_envelope, types::ObjectEncryptionContext};
 use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 use rustfs_utils::path::path_join_buf;
 #[cfg(feature = "rio-v2")]
@@ -1596,7 +1596,13 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
     let kms_context: Option<HashMap<String, String>> = None;
     let object_context = build_object_encryption_context(bucket, object, kms_context.as_ref());
 
-    let decrypted_key = if let Some(service) = crate::runtime::sources::object_encryption_service().await {
+    // Persisted wrapping format is the read-side source of truth. The
+    // advertised SSE scheme and current KMS availability are write policy
+    // and runtime state, neither of which identifies the historical provider.
+    let decrypted_key = if is_data_key_envelope(&encrypted_dek) {
+        let service = crate::runtime::sources::object_encryption_service()
+            .await
+            .ok_or_else(|| Error::other(KmsUnavailableError))?;
         #[cfg(feature = "rio-v2")]
         let data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
             service.decrypt_legacy_data_key(&encrypted_dek).await
@@ -2402,6 +2408,70 @@ mod tests {
             assert_eq!(material.base_nonce, base_nonce);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_managed_material_selects_provider_from_persisted_dek() {
+        use rustfs_kms::KmsConfig;
+        use tempfile::TempDir;
+
+        let key_dir = TempDir::new().expect("create KMS key directory");
+        let manager = rustfs_kms::init_global_kms_service_manager();
+        manager
+            .reconfigure(KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
+            .await
+            .expect("start test KMS service");
+
+        async_with_vars([("__RUSTFS_SSE_SIMPLE_CMK", Some(BASE64_STANDARD.encode([7u8; 32])))], async {
+            let data_key = [0x24; 32];
+            let base_nonce = [0x14; 12];
+            let encrypted_dek = encrypt_managed_dek_for_test(data_key, [7u8; 32]);
+            let metadata = HashMap::from([
+                (
+                    INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode(encrypted_dek.as_bytes()),
+                ),
+                (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(base_nonce)),
+                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "legacy-local-key".to_string()),
+            ]);
+
+            let material = resolve_managed_material("bucket", "object", &metadata)
+                .await
+                .expect("legacy local DEK should not be routed to the running KMS");
+            assert_eq!(material.key_bytes, data_key);
+            assert_eq!(material.base_nonce, base_nonce);
+        })
+        .await;
+
+        manager.stop().await.expect("stop test KMS service");
+
+        let kms_envelope = br#"{
+            "key_id": "test-key-id",
+            "master_key_id": "master-key-id",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+        let metadata = HashMap::from([
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), BASE64_STANDARD.encode(kms_envelope)),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([0x14; 12])),
+            (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "test-key-id".to_string()),
+        ]);
+        let error = match resolve_managed_material("bucket", "object", &metadata).await {
+            Ok(_) => panic!("KMS envelope must not fall back to the local provider"),
+            Err(error) => error,
+        };
+        let Error::Io(io_error) = error else {
+            panic!("KMS absence should retain its typed source");
+        };
+        assert!(
+            io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<KmsUnavailableError>())
+                .is_some()
+        );
     }
 
     #[cfg(feature = "rio-v2")]

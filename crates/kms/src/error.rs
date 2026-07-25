@@ -19,6 +19,11 @@ use thiserror::Error;
 /// Result type for KMS operations
 pub type Result<T> = std::result::Result<T, KmsError>;
 
+/// KMS runtime is unavailable for an encryption operation.
+#[derive(Error, Debug, Clone, Copy)]
+#[error("KMS encryption service is unavailable")]
+pub struct KmsUnavailableError;
+
 /// KMS error types covering all possible failure scenarios
 #[derive(Error, Debug, Clone)]
 pub enum KmsError {

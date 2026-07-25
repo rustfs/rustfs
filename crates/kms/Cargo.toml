@@ -44,6 +44,7 @@ argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
+sha2 = { workspace = true }
 zeroize = { workspace = true, features = ["derive"] }
 
 # Configuration and storage

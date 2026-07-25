@@ -9442,6 +9442,7 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "temp-env",
  "tempfile",
  "thiserror 2.0.19",
