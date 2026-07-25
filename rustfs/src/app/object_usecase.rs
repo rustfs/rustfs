@@ -1428,6 +1428,10 @@ struct GetObjectStreamingReader<R> {
     inner: R,
     bucket: String,
     key: String,
+    // request_id + optional content_range are only used for diagnostic correlation and
+    // failure bucketing; they do not alter stream behavior.
+    request_id: String,
+    content_range: Option<String>,
     expected: usize,
     emitted: usize,
     timeout: Duration,
@@ -1440,11 +1444,23 @@ struct GetObjectStreamingReader<R> {
 }
 
 impl<R> GetObjectStreamingReader<R> {
-    fn new(inner: R, bucket: &str, key: &str, expected: usize, timeout: Duration, lifecycle: GetObjectBodyLifecycle) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        inner: R,
+        bucket: &str,
+        key: &str,
+        request_id: &str,
+        content_range: Option<String>,
+        expected: usize,
+        timeout: Duration,
+        lifecycle: GetObjectBodyLifecycle,
+    ) -> Self {
         Self {
             inner,
             bucket: bucket.to_string(),
             key: key.to_string(),
+            request_id: request_id.to_string(),
+            content_range,
             expected,
             emitted: 0,
             timeout,
@@ -1459,6 +1475,46 @@ impl<R> GetObjectStreamingReader<R> {
 
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    // Classify transport/read failures before logging so operators can quickly
+    // distinguish truncated upstream bodies, corruption, quorum issues, and
+    // genuine downstream-close disconnects.
+    fn classify_read_error(err: &std::io::Error) -> &'static str {
+        if let Some(inner) = err.get_ref() {
+            if inner.is::<rustfs_rio::IncompleteBody>() {
+                return "short_eof";
+            }
+
+            if inner.is::<rustfs_rio::ChecksumMismatch>() {
+                return "bitrot";
+            }
+
+            let error_msg = inner.to_string().to_lowercase();
+            if error_msg.contains("bitrot") {
+                return "bitrot";
+            }
+            if error_msg.contains("read quorum")
+                || error_msg.contains("insufficient read quorum")
+                || error_msg.contains("erasure")
+            {
+                return "read_quorum";
+            }
+            if error_msg.contains("connection reset")
+                || error_msg.contains("broken pipe")
+                || error_msg.contains("downstream")
+                || error_msg.contains("remote closed")
+            {
+                return "downstream_closed";
+            }
+        }
+
+        match err.kind() {
+            std::io::ErrorKind::UnexpectedEof => "short_eof",
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
+            _ => "io",
+        }
     }
 
     fn finish_ok(&mut self) {
@@ -1490,16 +1546,18 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         );
                         if elapsed >= GET_OBJECT_STREAM_WARN_THRESHOLD {
                             warn!(
-                                event = EVENT_GET_OBJECT_STREAM_BODY,
-                                component = LOG_COMPONENT_APP,
-                                subsystem = LOG_SUBSYSTEM_OBJECT,
-                                bucket = %self.bucket,
-                                object = %self.key,
-                                expected = self.expected,
-                                emitted = self.emitted,
-                                elapsed_ms = elapsed.as_millis(),
-                                state = "first_byte_slow",
-                                "GetObject streaming body first byte was slow"
+                                    event = EVENT_GET_OBJECT_STREAM_BODY,
+                                    component = LOG_COMPONENT_APP,
+                                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                                    bucket = %self.bucket,
+                                    object = %self.key,
+                                    request_id = %self.request_id,
+                                    range = %self.content_range.as_deref().unwrap_or("full"),
+                                    expected = self.expected,
+                                    emitted = self.emitted,
+                                    elapsed_ms = elapsed.as_millis(),
+                                    state = "first_byte_slow",
+                                    "GetObject streaming body first byte was slow"
                             );
                         }
                     }
@@ -1514,6 +1572,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         subsystem = LOG_SUBSYSTEM_OBJECT,
                         bucket = %self.bucket,
                         object = %self.key,
+                        request_id = %self.request_id,
+                        range = %self.content_range.as_deref().unwrap_or("full"),
                         expected = self.expected,
                         emitted = self.emitted,
                         elapsed_ms = self.elapsed().as_millis(),
@@ -1530,7 +1590,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     // truncated data.
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "get object streaming body ended before the expected content length",
+                        rustfs_rio::IncompleteBody {
+                            remaining: self.expected.saturating_sub(self.emitted) as i64,
+                        },
                     )));
                 } else {
                     self.completed = true;
@@ -1540,6 +1602,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
+                let failure_reason = Self::classify_read_error(&err);
                 self.timer = None;
                 self.finish_err();
                 warn!(
@@ -1548,10 +1611,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     subsystem = LOG_SUBSYSTEM_OBJECT,
                     bucket = %self.bucket,
                     object = %self.key,
+                    request_id = %self.request_id,
+                    range = %self.content_range.as_deref().unwrap_or("full"),
                     expected = self.expected,
                     emitted = self.emitted,
                     elapsed_ms = self.elapsed().as_millis(),
                     state = "read_failed",
+                    failure_reason = failure_reason,
                     error = %err,
                     "GetObject streaming body read failed"
                 );
@@ -1576,6 +1642,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         subsystem = LOG_SUBSYSTEM_OBJECT,
                         bucket = %self.bucket,
                         object = %self.key,
+                        request_id = %self.request_id,
+                        range = %self.content_range.as_deref().unwrap_or("full"),
                         expected = self.expected,
                         emitted = self.emitted,
                         elapsed_ms = self.elapsed().as_millis(),
@@ -1614,6 +1682,8 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             subsystem = LOG_SUBSYSTEM_OBJECT,
             bucket = %self.bucket,
             object = %self.key,
+            request_id = %self.request_id,
+            range = %self.content_range.as_deref().unwrap_or("full"),
             expected = self.expected,
             emitted = self.emitted,
             elapsed_ms = self.elapsed().as_millis(),
@@ -2368,11 +2438,8 @@ fn apply_trailing_checksums(
 }
 
 /// Checksums resolved from stored (decrypted) metadata for a response. The five
-/// s3s-typed algorithms fill named fields; the AWS 2026-04 additional algorithms
-/// (XXHash3/64/128, SHA-512, MD5), which s3s has no typed `*Output` field for, land
-/// in `extra` and are emitted as raw response headers via
-/// [`inject_additional_checksum_headers`]. Built by [`classify_response_checksums`]
-/// so the typed/extra split lives in exactly one place.
+/// legacy algorithms fill named fields; the additional algorithms land in `extra`
+/// for raw-header response paths and DTOs that expose their newer typed fields.
 #[derive(Default)]
 pub(crate) struct ResponseChecksums {
     pub(crate) crc32: Option<String>,
@@ -2384,11 +2451,11 @@ pub(crate) struct ResponseChecksums {
     pub(crate) extra: Vec<(&'static str, String)>,
 }
 
-/// Split decrypted checksum (key, value) pairs into the five s3s-typed fields and the
-/// additional-algorithm `extra` headers. Single source of truth for every response
+/// Split decrypted checksum pairs into the five legacy fields and the additional
+/// algorithm values. Single source of truth for every response
 /// path (GetObject / HeadObject / GetObjectAttributes / CompleteMultipartUpload),
 /// replacing what used to be five copies of this match loop.
-pub(crate) fn classify_response_checksums<I>(pairs: I) -> ResponseChecksums
+pub(crate) fn classify_response_checksums<I>(pairs: I, is_multipart: bool) -> ResponseChecksums
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -2411,6 +2478,9 @@ where
                 }
             }
         }
+    }
+    if is_multipart && c.checksum_type.is_none() {
+        c.checksum_type = Some(ChecksumType::from("COMPOSITE".to_string()));
     }
     c
 }
@@ -2778,11 +2848,16 @@ fn apply_put_request_metadata(
 }
 
 fn response_storage_class(info: &ObjectInfo, metadata: &HashMap<String, String>) -> Option<StorageClass> {
-    info.storage_class
-        .clone()
-        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
-        .filter(|storage_class| !storage_class.is_empty() && storage_class != storageclass::STANDARD)
-        .map(StorageClass::from)
+    let stored_class = info
+        .storage_class
+        .as_deref()
+        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).map(String::as_str));
+    let transitioned_tier = (info.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE
+        && !info.transitioned_object.tier.is_empty())
+    .then_some(info.transitioned_object.tier.as_str());
+    let effective_class = storageclass::effective_class(stored_class, transitioned_tier);
+
+    (effective_class != storageclass::STANDARD).then(|| StorageClass::from(effective_class.to_string()))
 }
 
 fn response_storage_class_for_object_attributes(
@@ -2794,12 +2869,17 @@ fn response_storage_class_for_object_attributes(
         return None;
     }
 
-    info.storage_class
-        .clone()
-        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).cloned())
-        .or_else(|| Some(storageclass::STANDARD.to_string()))
-        .filter(|storage_class| !storage_class.is_empty())
-        .map(StorageClass::from)
+    let stored_class = info
+        .storage_class
+        .as_deref()
+        .or_else(|| metadata.get(AMZ_STORAGE_CLASS).map(String::as_str));
+    let transitioned_tier = (info.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE
+        && !info.transitioned_object.tier.is_empty())
+    .then_some(info.transitioned_object.tier.as_str());
+
+    Some(StorageClass::from(
+        storageclass::effective_class(stored_class, transitioned_tier).to_string(),
+    ))
 }
 
 async fn apply_put_request_object_lock_opts(
@@ -3212,9 +3292,12 @@ impl DefaultObjectUsecase {
         (optimal_buffer_size, GetObjectStreamStrategy::Standard)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_reader_blob<R>(
         reader: R,
         response_content_length: i64,
+        request_id: &str,
+        content_range: Option<&str>,
         stream_buffer_size: usize,
         stream_strategy: GetObjectStreamStrategy,
         bucket: &str,
@@ -3239,7 +3322,16 @@ impl DefaultObjectUsecase {
             );
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
-        let reader = GetObjectStreamingReader::new(reader, bucket, key, expected, get_object_disk_read_timeout(), lifecycle);
+        let reader = GetObjectStreamingReader::new(
+            reader,
+            bucket,
+            key,
+            request_id,
+            content_range.map(|content_range| content_range.to_string()),
+            expected,
+            get_object_disk_read_timeout(),
+            lifecycle,
+        );
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
@@ -4099,13 +4191,12 @@ impl DefaultObjectUsecase {
             && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
             && rs.is_none()
         {
-            let (decrypted_checksums, _is_multipart) =
-                info.decrypt_checksums(part_number.unwrap_or(0), headers).map_err(|e| {
-                    error!(error = %e, "GetObject checksum decryption failed");
-                    ApiError::from(e)
-                })?;
+            let (decrypted_checksums, is_multipart) = info.decrypt_checksums(part_number.unwrap_or(0), headers).map_err(|e| {
+                error!(error = %e, "GetObject checksum decryption failed");
+                ApiError::from(e)
+            })?;
 
-            return Ok(classify_response_checksums(decrypted_checksums));
+            return Ok(classify_response_checksums(decrypted_checksums, is_multipart));
         }
 
         Ok(ResponseChecksums::default())
@@ -4115,6 +4206,8 @@ impl DefaultObjectUsecase {
         final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
+        request_id: &str,
+        content_range: Option<&str>,
         optimal_buffer_size: usize,
         enable_readahead: bool,
         concurrent_requests: usize,
@@ -4163,6 +4256,8 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_reader_blob(
                 final_stream,
                 response_content_length,
+                request_id,
+                content_range,
                 stream_buffer_size,
                 stream_strategy,
                 bucket,
@@ -4238,6 +4333,8 @@ impl DefaultObjectUsecase {
         Ok(Self::build_reader_blob(
             final_stream,
             response_content_length,
+            request_id,
+            content_range,
             stream_buffer_size,
             stream_strategy,
             bucket,
@@ -4252,6 +4349,8 @@ impl DefaultObjectUsecase {
         final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
+        request_id: &str,
+        content_range: Option<&str>,
         optimal_buffer_size: usize,
         enable_readahead: bool,
         concurrent_requests: usize,
@@ -4286,6 +4385,8 @@ impl DefaultObjectUsecase {
                 final_stream,
                 info,
                 response_content_length,
+                request_id,
+                content_range,
                 optimal_buffer_size,
                 enable_readahead,
                 concurrent_requests,
@@ -4375,6 +4476,8 @@ impl DefaultObjectUsecase {
                     final_stream,
                     info,
                     response_content_length,
+                    request_id,
+                    content_range,
                     optimal_buffer_size,
                     enable_readahead,
                     concurrent_requests,
@@ -4434,6 +4537,8 @@ impl DefaultObjectUsecase {
             final_stream,
             info,
             response_content_length,
+            request_id,
+            content_range,
             optimal_buffer_size,
             enable_readahead,
             concurrent_requests,
@@ -5224,6 +5329,7 @@ impl DefaultObjectUsecase {
         last_modified: Option<Timestamp>,
         response_content_length: i64,
         content_range: Option<String>,
+        request_id: &str,
         server_side_encryption: Option<ServerSideEncryption>,
         sse_customer_algorithm: Option<SSECustomerAlgorithm>,
         sse_customer_key_md5: Option<SSECustomerKeyMD5>,
@@ -5264,6 +5370,8 @@ impl DefaultObjectUsecase {
             final_stream,
             &info,
             response_content_length,
+            request_id,
+            content_range.as_deref(),
             optimal_buffer_size,
             enable_readahead,
             concurrent_requests,
@@ -5475,6 +5583,7 @@ impl DefaultObjectUsecase {
                 last_modified,
                 response_content_length,
                 content_range,
+                &request_id,
                 server_side_encryption,
                 sse_customer_algorithm,
                 sse_customer_key_md5,
@@ -5616,7 +5725,7 @@ impl DefaultObjectUsecase {
         };
 
         let checksum = if requested(ObjectAttributes::CHECKSUM) {
-            let (checksums, _is_multipart) = info.decrypt_checksums(0, &req.headers).map_err(ApiError::from)?;
+            let (checksums, is_multipart) = info.decrypt_checksums(0, &req.headers).map_err(ApiError::from)?;
             // GetObjectAttributes returns checksums in the XML body, and s3s's Checksum
             // type has no field for the additional algorithms, so `extra` cannot be
             // surfaced here (unlike the header-based GET/HEAD paths) — an s3s limitation
@@ -5629,7 +5738,7 @@ impl DefaultObjectUsecase {
                 crc64nvme: checksum_crc64nvme,
                 checksum_type,
                 ..
-            } = classify_response_checksums(checksums);
+            } = classify_response_checksums(checksums, is_multipart);
 
             Some(Checksum {
                 checksum_crc32,
@@ -5638,6 +5747,7 @@ impl DefaultObjectUsecase {
                 checksum_sha256,
                 checksum_crc64nvme,
                 checksum_type,
+                ..Default::default()
             })
         } else {
             None
@@ -5664,7 +5774,7 @@ impl DefaultObjectUsecase {
             let is_truncated = end < info.parts.len();
 
             for part in &info.parts[start_at..end] {
-                let (checksums, _is_multipart) = info.decrypt_checksums(part.number, &req.headers).map_err(ApiError::from)?;
+                let (checksums, is_multipart) = info.decrypt_checksums(part.number, &req.headers).map_err(ApiError::from)?;
                 // Additional algorithms cannot be surfaced in the ObjectPart XML body
                 // (s3s has no field); same limitation as the object-level attributes above.
                 let ResponseChecksums {
@@ -5674,7 +5784,7 @@ impl DefaultObjectUsecase {
                     sha256: checksum_sha256,
                     crc64nvme: checksum_crc64nvme,
                     ..
-                } = classify_response_checksums(checksums);
+                } = classify_response_checksums(checksums, is_multipart);
 
                 let part_size = if part.actual_size > 0 {
                     part.actual_size
@@ -5692,6 +5802,7 @@ impl DefaultObjectUsecase {
                     checksum_crc64nvme,
                     part_number: i32::try_from(part.number).ok(),
                     size: Some(part_size),
+                    ..Default::default()
                 });
             }
 
@@ -5783,6 +5894,12 @@ impl DefaultObjectUsecase {
             checksum_algorithm,
             ..
         } = req.input.clone();
+        let requested_checksum_type = checksum_algorithm
+            .as_ref()
+            .map(|algorithm| rustfs_rio::ChecksumType::from_string(algorithm.as_str()));
+        if requested_checksum_type.is_some_and(|checksum_type| !checksum_type.is_set()) {
+            return Err(s3_error!(InvalidArgument, "Unsupported checksum algorithm"));
+        }
         let (src_bucket, src_key, version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
@@ -5814,6 +5931,17 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(InvalidStorageClass));
         }
+        let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
+        validate_sse_headers_for_write(
+            requested_sse.as_ref(),
+            requested_kms_key_id.as_ref(),
+            ssekms_context.as_ref(),
+            sse_customer_algorithm.as_ref(),
+            sse_customer_key.as_ref(),
+            sse_customer_key_md5.as_ref(),
+            true,
+        )?;
+        let has_explicit_ssec = sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some();
 
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
@@ -5940,6 +6068,9 @@ impl DefaultObjectUsecase {
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let mut effective_sse = requested_sse.or_else(|| {
+            if has_explicit_ssec {
+                return None;
+            }
             bucket_sse_config.as_ref().and_then(|(config, _)| {
                 config.rules.first().and_then(|rule| {
                     rule.apply_server_side_encryption_by_default
@@ -5953,6 +6084,9 @@ impl DefaultObjectUsecase {
             })
         });
         let mut effective_kms_key_id = requested_kms_key_id.or_else(|| {
+            if has_explicit_ssec {
+                return None;
+            }
             bucket_sse_config.as_ref().and_then(|(config, _)| {
                 config.rules.first().and_then(|rule| {
                     rule.apply_server_side_encryption_by_default
@@ -5986,12 +6120,9 @@ impl DefaultObjectUsecase {
         // rather than re-hashing every byte.
         let src_checksum = src_info.checksum.as_ref().and_then(|bytes| {
             let (pairs, _) = rustfs_rio::read_checksums(bytes.as_ref(), 0);
-            pairs.into_iter().find_map(|(k, v)| {
-                rustfs_rio::ChecksumType::from_string(&k)
-                    .is_s3s_typed()
-                    .then(|| rustfs_rio::Checksum::new_from_string(&k, &v))
-                    .flatten()
-            })
+            pairs
+                .into_iter()
+                .find_map(|(k, v)| rustfs_rio::Checksum::new_from_string(&k, &v))
         });
 
         // Validate copy source conditions
@@ -6115,12 +6246,9 @@ impl DefaultObjectUsecase {
         // none is requested, carry the source object's stored checksum over unchanged — the copy
         // does not alter the plaintext, so re-hashing would be wasted work and would flatten a
         // multipart composite value.
-        match checksum_algorithm.as_ref() {
-            Some(algo) => {
-                let ct = rustfs_rio::ChecksumType::from_string(algo.as_str());
-                if ct.is_set() {
-                    reader.add_calculated_checksum(ct).map_err(ApiError::from)?;
-                }
+        match requested_checksum_type {
+            Some(checksum_type) => {
+                reader.add_calculated_checksum(checksum_type).map_err(ApiError::from)?;
             }
             None => {
                 if let Some(cs) = src_checksum {
@@ -6134,7 +6262,7 @@ impl DefaultObjectUsecase {
             key: &key,
             server_side_encryption: effective_sse.clone(),
             ssekms_key_id: effective_kms_key_id.clone(),
-            ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
+            ssekms_context,
             sse_customer_algorithm: sse_customer_algorithm.clone(),
             sse_customer_key,
             sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -6211,11 +6339,26 @@ impl DefaultObjectUsecase {
         // / HeadObject do so the value is identical to a later checksum-mode HEAD/GET (#4996).
         let response_checksums = oi
             .decrypt_checksums(0, &req.headers)
-            .map(|(pairs, _)| classify_response_checksums(pairs))
+            .map(|(pairs, is_multipart)| classify_response_checksums(pairs, is_multipart))
             .unwrap_or_default();
 
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
+        let mut checksum_md5 = None;
+        let mut checksum_sha512 = None;
+        let mut checksum_xxhash3 = None;
+        let mut checksum_xxhash64 = None;
+        let mut checksum_xxhash128 = None;
+        for (name, value) in response_checksums.extra {
+            match name {
+                "x-amz-checksum-md5" => checksum_md5 = Some(value),
+                "x-amz-checksum-sha512" => checksum_sha512 = Some(value),
+                "x-amz-checksum-xxhash3" => checksum_xxhash3 = Some(value),
+                "x-amz-checksum-xxhash64" => checksum_xxhash64 = Some(value),
+                "x-amz-checksum-xxhash128" => checksum_xxhash128 = Some(value),
+                _ => {}
+            }
+        }
         let copy_object_result = CopyObjectResult {
             e_tag: oi.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
@@ -6224,6 +6367,11 @@ impl DefaultObjectUsecase {
             checksum_sha1: response_checksums.sha1,
             checksum_sha256: response_checksums.sha256,
             checksum_crc64nvme: response_checksums.crc64nvme,
+            checksum_md5,
+            checksum_sha512,
+            checksum_xxhash3,
+            checksum_xxhash64,
+            checksum_xxhash128,
             checksum_type: response_checksums.checksum_type,
         };
 
@@ -7112,10 +7260,10 @@ impl DefaultObjectUsecase {
             && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
             && rs.is_none()
         {
-            let (checksums, _is_multipart) = info
+            let (checksums, is_multipart) = info
                 .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
                 .map_err(ApiError::from)?;
-            classify_response_checksums(checksums)
+            classify_response_checksums(checksums, is_multipart)
         } else {
             ResponseChecksums::default()
         };
@@ -8099,24 +8247,30 @@ mod tests {
     #[test]
     fn classify_response_checksums_splits_typed_and_extra() {
         // Typed algorithms fill named fields; nothing spills into extra.
-        let c = classify_response_checksums(vec![
-            ("CRC32".to_string(), "AAAAAA==".to_string()),
-            ("SHA256".to_string(), "c2hhMjU2".to_string()),
-            ("CRC64NVME".to_string(), "Zm9vYmFyCg==".to_string()),
-        ]);
+        let c = classify_response_checksums(
+            vec![
+                ("CRC32".to_string(), "AAAAAA==".to_string()),
+                ("SHA256".to_string(), "c2hhMjU2".to_string()),
+                ("CRC64NVME".to_string(), "Zm9vYmFyCg==".to_string()),
+            ],
+            false,
+        );
         assert_eq!(c.crc32.as_deref(), Some("AAAAAA=="));
         assert_eq!(c.sha256.as_deref(), Some("c2hhMjU2"));
         assert_eq!(c.crc64nvme.as_deref(), Some("Zm9vYmFyCg=="));
         assert!(c.extra.is_empty(), "typed algorithms must not land in extra");
 
         // Additional algorithms land in extra keyed by their response-header name.
-        let c = classify_response_checksums(vec![
-            ("XXHASH3".to_string(), "eHhoMw==".to_string()),
-            ("XXHASH64".to_string(), "eHhoNjQ=".to_string()),
-            ("XXHASH128".to_string(), "eHhoMTI4".to_string()),
-            ("SHA512".to_string(), "c2hhNTEy".to_string()),
-            ("MD5".to_string(), "bWQ1".to_string()),
-        ]);
+        let c = classify_response_checksums(
+            vec![
+                ("XXHASH3".to_string(), "eHhoMw==".to_string()),
+                ("XXHASH64".to_string(), "eHhoNjQ=".to_string()),
+                ("XXHASH128".to_string(), "eHhoMTI4".to_string()),
+                ("SHA512".to_string(), "c2hhNTEy".to_string()),
+                ("MD5".to_string(), "bWQ1".to_string()),
+            ],
+            false,
+        );
         assert!(c.crc32.is_none() && c.sha256.is_none() && c.crc64nvme.is_none());
         let names: Vec<&str> = c.extra.iter().map(|(n, _)| *n).collect();
         for expected in [
@@ -8131,12 +8285,15 @@ mod tests {
         assert_eq!(c.extra.len(), 5);
 
         // The checksum-type marker is captured as the type, not mistaken for an algorithm.
-        let c = classify_response_checksums(vec![(AMZ_CHECKSUM_TYPE.to_string(), "COMPOSITE".to_string())]);
+        let c = classify_response_checksums(vec![(AMZ_CHECKSUM_TYPE.to_string(), "COMPOSITE".to_string())], false);
         assert!(c.checksum_type.is_some());
         assert!(c.extra.is_empty() && c.crc32.is_none());
 
+        let c = classify_response_checksums(vec![("CRC32".to_string(), "AAAAAA==-2".to_string())], true);
+        assert_eq!(c.checksum_type.as_ref().map(ChecksumType::as_str), Some("COMPOSITE"));
+
         // Empty input yields an all-default result.
-        let c = classify_response_checksums(Vec::<(String, String)>::new());
+        let c = classify_response_checksums(Vec::<(String, String)>::new(), false);
         assert!(c.crc32.is_none() && c.extra.is_empty() && c.checksum_type.is_none());
     }
 
@@ -9215,6 +9372,8 @@ mod tests {
             fallback_reader,
             &info,
             4,
+            "req-cold-fill",
+            None,
             128 * 1024,
             false,
             1,
@@ -10432,6 +10591,8 @@ mod tests {
             PendingReader,
             "test-bucket",
             "stalled-object",
+            "req-stalled-stream",
+            None,
             1,
             Duration::from_millis(1),
             GetObjectBodyLifecycle::disabled(),
@@ -10518,6 +10679,8 @@ mod tests {
             std::io::Cursor::new(b"hello".to_vec()),
             "test-bucket",
             "complete-object",
+            "req-complete-stream",
+            None,
             5,
             Duration::ZERO,
             GetObjectBodyLifecycle::tracked(guard),
@@ -10550,6 +10713,8 @@ mod tests {
             std::io::Cursor::new(b"short".to_vec()),
             "test-bucket",
             "truncated-object",
+            "req-short-eof",
+            None,
             10,
             Duration::ZERO,
             GetObjectBodyLifecycle::tracked(guard),
@@ -10560,6 +10725,11 @@ mod tests {
             .await
             .expect_err("short body under a larger Content-Length must fail the stream");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let incomplete_body = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustfs_rio::IncompleteBody>())
+            .expect("short eof should include remaining bytes as IncompleteBody");
+        assert_eq!(incomplete_body.remaining, 5);
         assert_eq!(out, b"short", "bytes read before the short EOF are still delivered");
 
         drop(reader);
@@ -10577,6 +10747,8 @@ mod tests {
             std::io::Cursor::new(b"short".to_vec()),
             "test-bucket",
             "dropped-object",
+            "req-dropped-stream",
+            None,
             10,
             Duration::ZERO,
             GetObjectBodyLifecycle::tracked(guard),
@@ -10763,6 +10935,8 @@ mod tests {
             reader,
             &info,
             18_i64 * 1024 * 1024 * 1024,
+            "req-large-object",
+            None,
             128 * 1024,
             true,
             1,
@@ -10799,6 +10973,8 @@ mod tests {
             reader,
             &info,
             18_i64 * 1024 * 1024 * 1024,
+            "req-large-encrypted-object",
+            None,
             128 * 1024,
             true,
             1,
@@ -10835,6 +11011,8 @@ mod tests {
             reader,
             &info,
             4,
+            "req-direct-memory-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -10895,6 +11073,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-cached-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -10956,6 +11136,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-rejects-size-mismatch-fill",
+            None,
             128 * 1024,
             false,
             1,
@@ -11016,6 +11198,8 @@ mod tests {
             first_reader,
             &info,
             5,
+            "req-cache-fill-first",
+            None,
             128 * 1024,
             false,
             1,
@@ -11042,6 +11226,8 @@ mod tests {
             second_reader,
             &info,
             5,
+            "req-cache-fill-second",
+            None,
             128 * 1024,
             false,
             1,
@@ -11107,6 +11293,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-rejects-buffered-size-mismatch",
+            None,
             128 * 1024,
             false,
             1,
@@ -11189,6 +11377,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-hook-served",
+            None,
             128 * 1024,
             false,
             1,
@@ -11247,6 +11437,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-hook-missed",
+            None,
             128 * 1024,
             false,
             1,
@@ -11307,6 +11499,8 @@ mod tests {
             first_reader,
             &info,
             5,
+            "req-materialize-first",
+            None,
             128 * 1024,
             false,
             1,
@@ -11333,6 +11527,8 @@ mod tests {
             second_reader,
             &info,
             5,
+            "req-materialize-second",
+            None,
             128 * 1024,
             false,
             1,
@@ -11393,6 +11589,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-mismatch",
+            None,
             128 * 1024,
             false,
             1,
@@ -11446,6 +11644,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-short",
+            None,
             128 * 1024,
             false,
             1,
@@ -11497,6 +11697,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-partial",
+            None,
             128 * 1024,
             false,
             1,
@@ -11537,6 +11739,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-short-buffered-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -11579,6 +11783,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-exact-buffered-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -11628,6 +11834,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-too-large",
+            None,
             128 * 1024,
             false,
             1,
@@ -11667,6 +11875,8 @@ mod tests {
             reader,
             &info,
             4,
+            "req-small-plain-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -12286,7 +12496,7 @@ mod tests {
     }
 
     #[test]
-    fn response_storage_class_omits_standard_and_keeps_non_default() {
+    fn response_storage_class_reports_effective_layout_and_preserves_transition_tier() {
         let metadata = HashMap::new();
         let standard_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD.to_string()),
@@ -12297,16 +12507,39 @@ mod tests {
 
         let mut metadata = HashMap::new();
         metadata.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string());
-        let infrequent_access_info = ObjectInfo {
+        let label_only_info = ObjectInfo {
             storage_class: Some(storageclass::STANDARD_IA.to_string()),
             user_defined: Arc::new(metadata.clone()),
             ..Default::default()
         };
+        assert!(
+            response_storage_class(&label_only_info, &metadata).is_none(),
+            "historical STANDARD_IA labels must report the effective implicit STANDARD layout"
+        );
+
+        let rrs_info = ObjectInfo {
+            storage_class: Some(storageclass::RRS.to_string()),
+            ..Default::default()
+        };
         assert_eq!(
-            response_storage_class(&infrequent_access_info, &metadata)
+            response_storage_class(&rrs_info, &HashMap::new())
                 .as_ref()
                 .map(StorageClass::as_str),
-            Some(storageclass::STANDARD_IA)
+            Some(storageclass::RRS)
+        );
+
+        let mut transitioned_info = label_only_info;
+        transitioned_info.transitioned_object.tier = "WARM-TIER".to_string();
+        assert!(
+            response_storage_class(&transitioned_info, &metadata).is_none(),
+            "a tier name without a completed transition must not override the effective local class"
+        );
+        transitioned_info.transitioned_object.status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        assert_eq!(
+            response_storage_class(&transitioned_info, &metadata)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some("WARM-TIER")
         );
 
         let mut metadata = HashMap::new();
@@ -12333,6 +12566,17 @@ mod tests {
 
         assert_eq!(
             response_storage_class_for_object_attributes(&info, &metadata, true)
+                .as_ref()
+                .map(StorageClass::as_str),
+            Some(storageclass::STANDARD)
+        );
+
+        let legacy_info = ObjectInfo {
+            storage_class: Some(storageclass::STANDARD_IA.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            response_storage_class_for_object_attributes(&legacy_info, &HashMap::new(), true)
                 .as_ref()
                 .map(StorageClass::as_str),
             Some(storageclass::STANDARD)
@@ -12393,6 +12637,7 @@ mod tests {
                 None,
                 0,
                 None,
+                "req-output-content-disposition",
                 None,
                 None,
                 None,
@@ -12575,7 +12820,7 @@ mod tests {
             })
             .bucket("test-bucket".to_string())
             .key("test-key".to_string())
-            .storage_class(Some(StorageClass::from_static(storageclass::STANDARD_IA)))
+            .storage_class(Some(StorageClass::from_static(storageclass::RRS)))
             .build()
             .unwrap();
 

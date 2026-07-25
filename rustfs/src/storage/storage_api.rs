@@ -699,6 +699,17 @@ impl StorageReplicationStatsHandle {
         self.inner.get_latest_replication_stats(bucket).await
     }
 
+    pub(crate) async fn aggregate_bucket_replication_stats(
+        &self,
+        bucket: &str,
+        stats: Vec<ecstore_bucket::replication::BucketStats>,
+        expected_node_count: u32,
+    ) -> ecstore_bucket::replication::BucketStats {
+        self.inner
+            .aggregate_bucket_replication_stats(bucket, stats, expected_node_count)
+            .await
+    }
+
     pub(crate) async fn site_metrics_snapshot(&self) -> ReplicationSiteMetricsSnapshot {
         let metrics = self.inner.get_sr_metrics_for_node().await;
         ReplicationSiteMetricsSnapshot {
@@ -1510,6 +1521,10 @@ where
 
 pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
     ecstore_set_disk::is_valid_storage_class(storage_class)
+}
+
+pub(crate) fn effective_storage_class<'a>(stored_class: Option<&'a str>, completed_transition_tier: Option<&'a str>) -> &'a str {
+    ecstore_config::storageclass::effective_class(stored_class, completed_transition_tier)
 }
 
 pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool

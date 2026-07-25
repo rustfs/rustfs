@@ -1209,9 +1209,28 @@ impl Node for NodeService {
 
     async fn get_bucket_stats(
         &self,
-        _request: Request<GetBucketStatsDataRequest>,
+        request: Request<GetBucketStatsDataRequest>,
     ) -> Result<Response<GetBucketStatsDataResponse>, Status> {
-        Err(unimplemented_rpc("get_bucket_stats"))
+        let bucket = request.into_inner().bucket;
+        if bucket.is_empty() {
+            return Err(Status::invalid_argument("bucket is required"));
+        }
+        let context = self.context.clone().or_else(runtime_sources::current_app_context);
+        let Some(stats) = runtime_sources::current_replication_stats_handle_for_context(context.as_deref()) else {
+            return Ok(Response::new(GetBucketStatsDataResponse {
+                success: false,
+                bucket_stats: Bytes::new(),
+                error_info: Some("replication statistics provider is unavailable".to_string()),
+            }));
+        };
+        let bucket_stats = stats.get_latest_replication_stats(&bucket).await;
+        let bucket_stats =
+            rmp_serde::to_vec_named(&bucket_stats).map_err(|_| Status::internal("failed to serialize replication statistics"))?;
+        Ok(Response::new(GetBucketStatsDataResponse {
+            success: true,
+            bucket_stats: bucket_stats.into(),
+            error_info: None,
+        }))
     }
 
     async fn get_sr_metrics(
@@ -1380,13 +1399,20 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
+        let Some(iam_sys) = self
+            .context
+            .as_ref()
+            .map(|context| context.iam().handle())
+            .or_else(runtime_sources::current_iam_handle)
+        else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        let resp = iam_sys.delete_service_account(&access_key, false).await;
+        // This legacy RPC is a cache notification. Reloading shared state keeps a
+        // delayed delete notification from removing a recreated service account.
+        let resp = iam_sys.load_service_account(&access_key).await;
         if let Err(err) = resp {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
@@ -1859,7 +1885,7 @@ mod tests {
         PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
         STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
         execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, make_heal_control_server,
-        make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server_for_context,
+        make_heal_control_server_with_cache, make_server, make_server_for_context, make_tier_mutation_control_server_for_context,
         remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
@@ -1871,6 +1897,14 @@ mod tests {
     };
     use bytes::Bytes;
     use rustfs_heal::heal::{manager::HealManager, storage::HealStorageAPI};
+    use rustfs_iam::{
+        store::{
+            Store as _,
+            object::{IAM_CONFIG_PREFIX, ObjectStore},
+        },
+        sys::NewServiceAccountOpts,
+    };
+    use rustfs_kms::KmsServiceManager;
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
@@ -4089,6 +4123,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_service_account_rpc_reloads_instead_of_deleting_shared_state() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("service-account RPC test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build isolated IAM");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            Arc::clone(&iam),
+            Arc::new(KmsServiceManager::new()),
+        ));
+        let service = make_server_for_context(Some(context));
+        let access_key = "RPCRELOADSERVICE01";
+        iam.new_service_account(
+            "parent-user",
+            None,
+            NewServiceAccountOpts {
+                access_key: access_key.to_string(),
+                secret_key: "rpcReloadServiceSecret123".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create service account");
+
+        let response = service
+            .delete_service_account(Request::new(DeleteServiceAccountRequest {
+                access_key: access_key.to_string(),
+            }))
+            .await
+            .expect("legacy notification RPC response")
+            .into_inner();
+
+        assert!(response.success, "cache reload notification must succeed");
+        assert!(
+            iam.get_service_account(access_key).await.is_ok(),
+            "legacy delete notification must not delete durable service-account state"
+        );
+    }
+
+    #[tokio::test]
     async fn test_load_user_empty_access_key() {
         let service = create_test_node_service();
 
@@ -4360,12 +4447,11 @@ mod tests {
                 .await,
             "download_profile_data",
         );
-        assert_unimplemented_status(
-            service
-                .get_bucket_stats(Request::new(GetBucketStatsDataRequest::default()))
-                .await,
-            "get_bucket_stats",
-        );
+        let bucket_stats_err = service
+            .get_bucket_stats(Request::new(GetBucketStatsDataRequest::default()))
+            .await
+            .expect_err("empty bucket statistics request should fail");
+        assert_eq!(bucket_stats_err.code(), tonic::Code::InvalidArgument);
         assert_unimplemented_status(
             service.get_sr_metrics(Request::new(GetSrMetricsDataRequest::default())).await,
             "get_sr_metrics",

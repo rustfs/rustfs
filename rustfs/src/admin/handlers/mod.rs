@@ -28,6 +28,8 @@ pub mod heal;
 pub mod health;
 pub(crate) mod iam_error;
 pub mod idp_compat;
+pub mod ilm_transition;
+pub mod inspect_archive;
 pub mod is_admin;
 pub mod kms;
 pub mod kms_dynamic;
@@ -118,6 +120,7 @@ mod tests {
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
         let _scanner_status_handler = scanner::ScannerStatusHandler {};
+        let _manual_transition_handler = ilm_transition::ManualTransitionRunHandler {};
         let _site_replication_add_handler = site_replication::SiteReplicationAddHandler {};
         let _site_replication_info_handler = site_replication::SiteReplicationInfoHandler {};
         let _site_replication_status_handler = site_replication::SiteReplicationStatusHandler {};

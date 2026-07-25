@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
+use crate::storage::storage_api::effective_storage_class;
 use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
     ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
 };
@@ -61,11 +62,11 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
         next_part_number_marker: res.next_part_number_marker.try_into().ok(),
         max_parts: res.max_parts.try_into().ok(),
         part_number_marker: res.part_number_marker.try_into().ok(),
-        storage_class: if res.storage_class.is_empty() {
-            None
-        } else {
-            Some(res.storage_class.into())
-        },
+        storage_class: Some(
+            effective_storage_class((!res.storage_class.is_empty()).then_some(res.storage_class.as_str()), None)
+                .to_string()
+                .into(),
+        ),
         ..Default::default()
     }
 }
@@ -163,6 +164,8 @@ pub(crate) fn build_list_multipart_uploads_output(
         delimiter: result.delimiter,
         key_marker: result.key_marker,
         upload_id_marker: result.upload_id_marker,
+        next_key_marker: result.next_key_marker,
+        next_upload_id_marker: result.next_upload_id_marker,
         max_uploads: Some(result.max_uploads as i32),
         is_truncated: Some(result.is_truncated),
         uploads: Some(
@@ -245,9 +248,9 @@ mod tests {
     }
 
     #[test]
-    fn test_list_parts_output_handles_empty_storage_class_and_overflow_markers() {
+    fn test_list_parts_output_normalizes_legacy_storage_class_and_handles_overflow_markers() {
         let input = ListPartsInfo {
-            storage_class: String::new(),
+            storage_class: "STANDARD_IA".to_string(),
             part_number_marker: usize::MAX,
             next_part_number_marker: usize::MAX,
             max_parts: usize::MAX,
@@ -262,13 +265,20 @@ mod tests {
         let output = build_list_parts_output(input);
         let parts = output.parts.as_ref().expect("parts should be present");
 
-        assert_eq!(output.storage_class, None);
+        assert_eq!(output.storage_class.as_ref().map(|value| value.as_str()), Some("STANDARD"));
         assert_eq!(output.part_number_marker, None);
         assert_eq!(output.next_part_number_marker, None);
         assert_eq!(output.max_parts, None);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number, None);
         assert_eq!(parts[0].size, None);
+
+        let output = build_list_parts_output(ListPartsInfo::default());
+        assert_eq!(
+            output.storage_class.as_ref().map(|value| value.as_str()),
+            Some("STANDARD"),
+            "legacy uploads without a stored class must report their effective STANDARD layout"
+        );
     }
 
     #[test]
@@ -277,6 +287,8 @@ mod tests {
             delimiter: Some("/".to_string()),
             key_marker: Some("key-marker".to_string()),
             upload_id_marker: Some("upload-id-marker".to_string()),
+            next_key_marker: Some("next-key-marker".to_string()),
+            next_upload_id_marker: Some("next-upload-id-marker".to_string()),
             max_uploads: 1000,
             is_truncated: true,
             uploads: vec![MultipartInfo {
@@ -299,6 +311,8 @@ mod tests {
         assert_eq!(output.delimiter.as_deref(), Some("/"));
         assert_eq!(output.key_marker.as_deref(), Some("key-marker"));
         assert_eq!(output.upload_id_marker.as_deref(), Some("upload-id-marker"));
+        assert_eq!(output.next_key_marker.as_deref(), Some("next-key-marker"));
+        assert_eq!(output.next_upload_id_marker.as_deref(), Some("next-upload-id-marker"));
         assert_eq!(output.max_uploads, Some(1000));
         assert_eq!(output.is_truncated, Some(true));
 

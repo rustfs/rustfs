@@ -246,6 +246,14 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     check_key_valid_with_context(session_token, access_key, None).await
 }
 
+fn has_root_access(sys_cred: &Credentials, cred: &Credentials) -> bool {
+    (constant_time_eq(&sys_cred.access_key, &cred.access_key) || constant_time_eq(&cred.parent_user, &sys_cred.access_key))
+        && !cred
+            .claims
+            .as_ref()
+            .is_some_and(|claims| claims.contains_key(SESSION_POLICY_NAME) || rustfs_iam::sys::is_rustfs_oidc_claims(claims))
+}
+
 /// Validate an access key, resolving the root credentials and IAM system from
 /// an explicit application context when one is given (backlog#1052 S6).
 ///
@@ -427,16 +435,7 @@ pub async fn check_key_valid_with_context(
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
 
-    let mut owner =
-        constant_time_eq(&sys_cred.access_key, &cred.access_key) || constant_time_eq(&cred.parent_user, &sys_cred.access_key);
-
-    // permitRootAccess
-    if let Some(claims) = &cred.claims
-        && claims.contains_key(SESSION_POLICY_NAME)
-    {
-        owner = false
-    }
-
+    let owner = has_root_access(&sys_cred, &cred);
     Ok((cred, owner))
 }
 
@@ -1078,6 +1077,26 @@ mod tests {
             name: Some("service-account".to_string()),
             description: Some("service account for auth tests".to_string()),
         }
+    }
+
+    #[test]
+    fn oidc_session_cannot_inherit_root_access_from_display_name() {
+        let sys_cred = Credentials {
+            access_key: "root-access-key".to_string(),
+            ..Default::default()
+        };
+        let oidc_cred = Credentials {
+            access_key: "temporary-access-key".to_string(),
+            parent_user: sys_cred.access_key.clone(),
+            claims: Some(HashMap::from([
+                ("iss".to_string(), json!("rustfs-oidc")),
+                ("oidc_provider".to_string(), json!("default")),
+                ("sub".to_string(), json!("subject-123")),
+            ])),
+            ..Default::default()
+        };
+
+        assert!(!has_root_access(&sys_cred, &oidc_cred));
     }
 
     #[test]

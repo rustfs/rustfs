@@ -46,6 +46,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const ADMIN_INFO_PATH: &str = "/rustfs/admin/v3/info";
+    const ADMIN_MANUAL_TRANSITION_PATH: &str =
+        "/rustfs/admin/v3/ilm/transition/run?bucket=auth-deny-manual-transition&maxObjects=1";
 
     /// Send a SigV4-signed request to `path` (optionally with a JSON `body`) and
     /// return `(status, body)`. Uses the `UNSIGNED_PAYLOAD` content hash so a
@@ -152,6 +154,52 @@ mod tests {
         assert!(
             body.contains("AccessDenied"),
             "admin gate rejection must carry the AccessDenied S3 error code, body: {body}"
+        );
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn non_admin_credential_denied_on_manual_transition_run() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let user_ak = "ilmtransitionlimited";
+        let user_sk = "ilmtransitionlimitedsecret";
+        create_limited_user(&env, user_ak, user_sk).await?;
+
+        let (root_status, root_body) = signed_request(
+            &env.url,
+            http::Method::POST,
+            ADMIN_MANUAL_TRANSITION_PATH,
+            None,
+            &env.access_key,
+            &env.secret_key,
+        )
+        .await?;
+        assert_eq!(
+            root_status,
+            reqwest::StatusCode::OK,
+            "root credential must reach the manual transition handler, body: {root_body}"
+        );
+        assert!(
+            root_body.contains("\"mode\":\"enqueue_only\""),
+            "root response should be the manual transition JSON contract, body: {root_body}"
+        );
+
+        let (status, body) =
+            signed_request(&env.url, http::Method::POST, ADMIN_MANUAL_TRANSITION_PATH, None, user_ak, user_sk).await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::FORBIDDEN,
+            "non-admin credential must get 403 on manual transition run, body: {body}"
+        );
+        assert!(
+            body.contains("AccessDenied"),
+            "manual transition rejection must carry the AccessDenied S3 error code, body: {body}"
         );
 
         env.stop_server();

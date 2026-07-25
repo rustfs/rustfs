@@ -67,9 +67,9 @@ fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std
     Ok(serializer.into_inner())
 }
 
-/// JSON compatibility string for a dual-encoded response field. Returns an empty string when
-/// msgpack-only mode is enabled (grpc-optimization P2-1) so the redundant JSON copy is not sent;
-/// otherwise the legacy JSON encoding. The paired `_bin` (msgpack) field is always sent.
+/// JSON compatibility string for a dual-encoded response field. Returns an empty string only when
+/// msgpack-only mode and its explicit fleet confirmation guard are both enabled; otherwise the
+/// legacy JSON encoding is retained for old peers. The paired `_bin` field is always sent.
 fn compat_response_json<T: serde::Serialize>(value: &T) -> std::result::Result<String, serde_json::Error> {
     if rustfs_protos::internode_rpc_msgpack_only() {
         return Ok(String::new());
@@ -1175,8 +1175,8 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
-        encode_read_multiple_response_payloads,
+        compat_response_json, decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads,
     };
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
@@ -1211,6 +1211,122 @@ mod tests {
             SamplePayload {
                 name: "compat".to_string(),
                 count: 7,
+            }
+        );
+    }
+
+    fn with_internode_msgpack_env<R>(vars: [(&'static str, Option<&'static str>); 2], f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(vars, || {
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            let result = f();
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            result
+        })
+    }
+
+    #[test]
+    fn compat_response_json_keeps_json_when_msgpack_only_lacks_fleet_confirmation() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let payload = SamplePayload {
+                    name: "legacy-json".to_string(),
+                    count: 9,
+                };
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(!json.is_empty(), "old JSON clients must remain compatible without fleet confirmation");
+                assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
+            },
+        );
+    }
+
+    #[test]
+    fn compat_response_json_omits_json_only_after_fleet_confirmation() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let payload = SamplePayload {
+                    name: "msgpack-only".to_string(),
+                    count: 10,
+                };
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(json.is_empty(), "msgpack-only may empty JSON only after explicit fleet confirmation");
+            },
+        );
+    }
+
+    #[test]
+    fn compat_response_json_restores_json_when_either_msgpack_only_gate_is_removed() {
+        let payload = SamplePayload {
+            name: "rollback".to_string(),
+            count: 12,
+        };
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(json.is_empty(), "both gates should enter msgpack-only response mode");
+            },
+        );
+
+        for vars in [
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("false")),
+            ],
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("false")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+        ] {
+            with_internode_msgpack_env(vars, || {
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(!json.is_empty(), "removing either gate should restore old-peer JSON compatibility");
+                assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
+            });
+        }
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_fails_closed_on_corrupt_non_empty_msgpack() {
+        let err = decode_msgpack_or_json::<SamplePayload>(b"not-msgpack", r#"{"name":"json","count":1}"#, "SamplePayload")
+            .expect_err("corrupt non-empty msgpack must not fall back to JSON");
+
+        assert!(err.to_string().contains("decode SamplePayload msgpack failed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_accepts_named_msgpack_and_legacy_json() {
+        let payload = SamplePayload {
+            name: "named".to_string(),
+            count: 11,
+        };
+        let named_msgpack = encode_msgpack_named(&payload, "SamplePayload").expect("named msgpack should encode");
+        let decoded_msgpack =
+            decode_msgpack_or_json::<SamplePayload>(&named_msgpack, "", "SamplePayload").expect("named msgpack should decode");
+        let decoded_json = decode_msgpack_or_json::<SamplePayload>(&[], r#"{"name":"legacy-json","count":12}"#, "SamplePayload")
+            .expect("legacy json should decode");
+
+        assert_eq!(decoded_msgpack, payload);
+        assert_eq!(
+            decoded_json,
+            SamplePayload {
+                name: "legacy-json".to_string(),
+                count: 12
             }
         );
     }
@@ -1253,6 +1369,52 @@ mod tests {
     }
 
     #[test]
+    fn encode_read_multiple_response_payloads_respects_msgpack_only_gate_and_rollback() {
+        let responses = vec![ReadMultipleResp {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            file: "gate".to_string(),
+            exists: true,
+            data: b"payload".to_vec(),
+            ..Default::default()
+        }];
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_read_multiple_response_payloads(&responses).expect("read multiple responses should encode");
+
+                assert_eq!(json_payloads, vec![String::new()]);
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let decoded = decode_msgpack_or_json::<ReadMultipleResp>(&msgpack_payloads[0], "", "ReadMultipleResp")
+                    .expect("msgpack read multiple response should decode");
+                assert_eq!(decoded.file, responses[0].file);
+            },
+        );
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("false")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_read_multiple_response_payloads(&responses).expect("read multiple responses should encode");
+
+                assert!(!json_payloads[0].is_empty(), "rollback should restore response JSON");
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let json_decoded: ReadMultipleResp =
+                    serde_json::from_str(&json_payloads[0]).expect("json read multiple response should decode");
+                assert_eq!(json_decoded.file, responses[0].file);
+            },
+        );
+    }
+
+    #[test]
     fn encode_batch_read_version_response_payloads_keeps_json_and_msgpack_in_sync() {
         let responses = vec![BatchReadVersionResp {
             index: 3,
@@ -1277,5 +1439,50 @@ mod tests {
         assert_eq!(json_decoded.index, responses[0].index);
         assert_eq!(msgpack_decoded.path, responses[0].path);
         assert_eq!(msgpack_decoded.error, responses[0].error);
+    }
+
+    #[test]
+    fn encode_batch_read_version_response_payloads_respects_msgpack_only_gate_and_rollback() {
+        let responses = vec![BatchReadVersionResp {
+            index: 4,
+            path: "object-b".to_string(),
+            version_id: "version-b".to_string(),
+            success: true,
+            ..Default::default()
+        }];
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+
+                assert_eq!(json_payloads, vec![String::new()]);
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let decoded = decode_msgpack_or_json::<BatchReadVersionResp>(&msgpack_payloads[0], "", "BatchReadVersionResp")
+                    .expect("msgpack batch read version response should decode");
+                assert_eq!(decoded.path, responses[0].path);
+            },
+        );
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("false")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+
+                assert!(!json_payloads[0].is_empty(), "rollback should restore response JSON");
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let json_decoded: BatchReadVersionResp =
+                    serde_json::from_str(&json_payloads[0]).expect("json batch read version response should decode");
+                assert_eq!(json_decoded.path, responses[0].path);
+            },
+        );
     }
 }

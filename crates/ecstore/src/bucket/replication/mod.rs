@@ -52,9 +52,9 @@ pub use replication_config_boundary::{
 pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
 pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;
 pub use replication_filemeta_boundary::{
-    REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState, ReplicationStatusType, ReplicationType,
-    VersionPurgeStatusType, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
-    version_purge_status_to_filemeta,
+    MrfOpKind, MrfReplicateEntry, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState,
+    ReplicationStatusType, ReplicationType, VersionPurgeStatusType, replication_state_to_filemeta,
+    replication_status_to_filemeta, replication_statuses_map, version_purge_status_to_filemeta,
 };
 pub(crate) use replication_filemeta_boundary::{
     replication_state_from_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
@@ -69,8 +69,8 @@ pub use replication_object_decision_boundary::{
     should_use_existing_delete_replication_source,
 };
 pub use replication_pool::{
-    DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
-    init_background_replication,
+    DurableMrfBacklog, DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
+    init_background_replication, read_durable_mrf_backlog,
 };
 pub use replication_queue_boundary::{
     DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,

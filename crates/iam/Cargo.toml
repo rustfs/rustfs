@@ -47,7 +47,7 @@ base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 tracing.workspace = true
 rustfs-madmin.workspace = true
-rustfs-utils = { workspace = true, features = ["path", "egress"] }
+rustfs-utils = { workspace = true, features = ["egress", "hash", "path"] }
 rustfs-io-metrics.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 pollster.workspace = true

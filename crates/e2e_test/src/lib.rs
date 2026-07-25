@@ -167,6 +167,10 @@ mod cluster_concurrency_test;
 #[cfg(test)]
 mod cluster_multidrive_pool_test;
 
+// backlog#1433: real 4-node EC boundary gate for inline storage and GET paths.
+#[cfg(test)]
+mod inline_fast_path_cluster_test;
+
 // PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
 #[cfg(test)]
 mod checksum_upload_test;
@@ -197,7 +201,13 @@ mod copy_object_version_restore_test;
 mod copy_object_checksum_test;
 
 #[cfg(test)]
+mod ssec_copy_test;
+
+#[cfg(test)]
 mod multipart_storage_class_test;
+
+#[cfg(test)]
+mod storage_class_capability_test;
 
 // S3 dummy-compat bucket API tests
 #[cfg(test)]

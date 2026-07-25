@@ -65,7 +65,7 @@ mod tests {
             .content_type("text/javascript; charset=utf-8")
             .expires(source_expires)
             .website_redirect_location("/source.html")
-            .storage_class(StorageClass::StandardIa)
+            .storage_class(StorageClass::ReducedRedundancy)
             .metadata("mtime", "1777992333")
             .metadata("stale", "must-be-removed")
             .body(ByteStream::from_static(content))
@@ -158,7 +158,7 @@ mod tests {
             .bucket(bucket)
             .key("assets/explicit-storage-class.js")
             .copy_source(format!("{bucket}/{key}"))
-            .storage_class(StorageClass::StandardIa)
+            .storage_class(StorageClass::ReducedRedundancy)
             .send()
             .await
             .expect("CopyObject with an explicit storage class failed");
@@ -169,7 +169,10 @@ mod tests {
             .send()
             .await
             .expect("HEAD failed after explicit storage class copy");
-        assert_eq!(explicit_storage_class_head.storage_class().map(StorageClass::as_str), Some("STANDARD_IA"));
+        assert_eq!(
+            explicit_storage_class_head.storage_class().map(StorageClass::as_str),
+            Some("REDUCED_REDUNDANCY")
+        );
 
         client
             .copy_object()

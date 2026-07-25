@@ -3676,6 +3676,8 @@ dependencies = [
  "hyper-util",
  "local-ip-address",
  "md5",
+ "opentelemetry-proto",
+ "prost 0.14.4",
  "rand 0.10.2",
  "rcgen",
  "reqwest",
@@ -8926,6 +8928,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-storage-api",
  "rustfs-targets",
+ "rustfs-test-utils",
  "rustfs-tls-runtime",
  "rustfs-trusted-proxies",
  "rustfs-utils",
@@ -9746,6 +9749,7 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
+ "temp-env",
  "tokio",
  "tonic",
  "tonic-prost",
@@ -10263,7 +10267,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10320,7 +10324,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.1"
-source = "git+https://github.com/s3s-project/s3s.git?rev=a5471625975f5014f7b28eee7e4d801f1b32f529#a5471625975f5014f7b28eee7e4d801f1b32f529"
+source = "git+https://github.com/s3s-project/s3s.git?rev=8136db4ac8253c0ccfd86f8216e00e0235747757#8136db4ac8253c0ccfd86f8216e00e0235747757"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -10365,6 +10369,7 @@ dependencies = [
  "transform-stream",
  "url",
  "urlencoding",
+ "xxhash-rust",
  "zeroize",
 ]
 

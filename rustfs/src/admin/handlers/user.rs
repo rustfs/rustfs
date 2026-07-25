@@ -1078,7 +1078,7 @@ impl Operation for ImportIam {
             if let Some(file_content) = file_content {
                 let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                for (ak, req) in svc_accts {
+                for (ak, mut req) in svc_accts {
                     if skipped.service_accounts.contains(&ak) {
                         continue;
                     }
@@ -1123,6 +1123,9 @@ impl Operation for ImportIam {
                         })?;
                     }
 
+                    if !owner {
+                        let _ = rustfs_iam::sys::remove_verified_federated_policy(&mut req.claims);
+                    }
                     let opts = NewServiceAccountOpts {
                         session_policy: sp,
                         access_key: ak.clone(),
