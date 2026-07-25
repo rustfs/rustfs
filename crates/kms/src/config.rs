@@ -1177,4 +1177,35 @@ mod tests {
             },
         );
     }
+
+    #[test]
+    fn test_from_env_reads_static_secret_file_and_sets_default_key() {
+        use base64::Engine as _;
+
+        let temp_dir = TempDir::new().expect("create temp dir for static KMS secret");
+        let secret_path = temp_dir.path().join("static-kms-secret");
+        let file_secret = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let env_secret = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        std::fs::write(&secret_path, format!("file-key:{file_secret}\n")).expect("write static KMS secret file");
+
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("static")),
+                (
+                    ENV_KMS_STATIC_SECRET_KEY_FILE,
+                    Some(secret_path.to_str().expect("secret path should be utf-8")),
+                ),
+                (ENV_KMS_STATIC_SECRET_KEY, Some(&format!("env-key:{env_secret}"))),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("static KMS config should load from secret file");
+
+                assert_eq!(config.backend, KmsBackend::Static);
+                assert_eq!(config.default_key_id.as_deref(), Some("file-key"));
+                let static_config = config.static_config().expect("static backend config");
+                assert_eq!(static_config.key_id, "file-key");
+                assert_eq!(static_config.secret_key, file_secret);
+            },
+        );
+    }
 }
