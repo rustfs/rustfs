@@ -59,51 +59,33 @@ use tokio::task::JoinSet;
 
 use super::core::io_primitives::*;
 
-#[derive(Clone, Copy)]
-pub(super) enum GetObjectOutputKind {
-    HttpResponse,
-    Internal,
+pub(super) struct GetObjectDownstreamWriter<W> {
+    inner: W,
 }
 
-struct GetObjectOutputWriter<'a, W> {
-    inner: &'a mut W,
-    output_kind: GetObjectOutputKind,
-}
-
-impl<'a, W> GetObjectOutputWriter<'a, W> {
-    fn new(inner: &'a mut W, output_kind: GetObjectOutputKind) -> Self {
-        Self { inner, output_kind }
+impl<W> GetObjectDownstreamWriter<W> {
+    pub(super) fn new(inner: W) -> Self {
+        Self { inner }
     }
 }
 
-fn map_get_object_output_error(output_kind: GetObjectOutputKind, err: std::io::Error) -> std::io::Error {
-    if matches!(output_kind, GetObjectOutputKind::HttpResponse) {
-        mark_get_object_downstream_closed(err)
-    } else {
-        err
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectOutputWriter<'_, W> {
+impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        let output_kind = self.output_kind;
-        Pin::new(&mut *self.inner)
+        Pin::new(&mut self.inner)
             .poll_write(cx, buf)
-            .map(|result| result.map_err(|err| map_get_object_output_error(output_kind, err)))
+            .map(|result| result.map_err(mark_get_object_downstream_closed))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let output_kind = self.output_kind;
-        Pin::new(&mut *self.inner)
+        Pin::new(&mut self.inner)
             .poll_flush(cx)
-            .map(|result| result.map_err(|err| map_get_object_output_error(output_kind, err)))
+            .map(|result| result.map_err(mark_get_object_downstream_closed))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let output_kind = self.output_kind;
-        Pin::new(&mut *self.inner)
+        Pin::new(&mut self.inner)
             .poll_shutdown(cx)
-            .map(|result| result.map_err(|err| map_get_object_output_error(output_kind, err)))
+            .map(|result| result.map_err(mark_get_object_downstream_closed))
     }
 }
 
@@ -634,7 +616,6 @@ impl SetDisks {
         offset: usize,
         length: i64,
         writer: &mut W,
-        output_kind: GetObjectOutputKind,
         fi: FileInfo,
         files: Vec<FileInfo>,
         disks: &[Option<DiskStore>],
@@ -1018,10 +999,9 @@ impl SetDisks {
             let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
-            let mut output_writer = GetObjectOutputWriter::new(writer, output_kind);
             let (written, err) = erasure
                 .decode_with_stripe_handles(
-                    &mut output_writer,
+                    writer,
                     readers,
                     part_offset,
                     part_length,
@@ -2018,7 +1998,6 @@ mod metadata_cache_tests {
             2,
             1,
             &mut output,
-            GetObjectOutputKind::Internal,
             valid_test_fileinfo(object),
             Vec::new(),
             &[],
@@ -2042,7 +2021,6 @@ mod metadata_cache_tests {
             usize::MAX,
             1,
             &mut output,
-            GetObjectOutputKind::Internal,
             overflow,
             Vec::new(),
             &[],
@@ -2064,7 +2042,6 @@ mod metadata_cache_tests {
             1,
             1,
             &mut output,
-            GetObjectOutputKind::Internal,
             valid_test_fileinfo(object),
             Vec::new(),
             &[],
@@ -2088,7 +2065,6 @@ mod metadata_cache_tests {
             0,
             1,
             &mut output,
-            GetObjectOutputKind::Internal,
             invalid_erasure,
             Vec::new(),
             &[],
@@ -2132,7 +2108,6 @@ mod metadata_cache_tests {
             0,
             1,
             &mut output,
-            GetObjectOutputKind::Internal,
             fi,
             Vec::new(),
             &[],
@@ -2979,27 +2954,11 @@ mod tests {
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
 
-    struct ClosedOutputWriter;
-
-    impl AsyncWrite for ClosedOutputWriter {
-        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
-            Poll::Ready(Err(std::io::Error::from(ErrorKind::BrokenPipe)))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
     #[tokio::test]
-    async fn output_writer_marks_closed_duplex_reader_as_downstream_close() {
-        let (reader, mut inner) = tokio::io::duplex(64);
+    async fn downstream_writer_marks_closed_duplex_reader_as_downstream_close() {
+        let (reader, inner) = tokio::io::duplex(64);
         drop(reader);
-        let mut writer = GetObjectOutputWriter::new(&mut inner, GetObjectOutputKind::HttpResponse);
+        let mut writer = GetObjectDownstreamWriter::new(inner);
         let err = writer
             .write_all(b"range payload")
             .await
@@ -3009,22 +2968,6 @@ mod tests {
             classify_disk_error(&DiskError::from(err)),
             GetObjectFailureReason::DownstreamClosed,
             "only the output adapter may classify a broken pipe as a downstream close"
-        );
-    }
-
-    #[tokio::test]
-    async fn output_writer_preserves_remote_broken_pipe_as_io_failure() {
-        let mut inner = ClosedOutputWriter;
-        let mut writer = GetObjectOutputWriter::new(&mut inner, GetObjectOutputKind::Internal);
-        let err = writer
-            .write_all(b"transition payload")
-            .await
-            .expect_err("closed remote writer must fail the output write");
-
-        assert_eq!(
-            classify_disk_error(&DiskError::from(err)),
-            GetObjectFailureReason::Io,
-            "remote transition writer failures must not be mistaken for HTTP client cancellation"
         );
     }
 
@@ -4122,7 +4065,6 @@ mod tests {
             0,
             part_data.len() as i64,
             &mut output,
-            GetObjectOutputKind::Internal,
             fi,
             files,
             &disks,

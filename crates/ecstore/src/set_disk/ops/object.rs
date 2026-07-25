@@ -21,7 +21,7 @@
 
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
-use crate::set_disk::read::GetObjectOutputKind;
+use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
@@ -524,7 +524,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 0,
                 object_info.size,
                 &mut output,
-                GetObjectOutputKind::Internal,
                 fi,
                 files,
                 &disks,
@@ -642,7 +641,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // task so it lives for the duration of the streaming read.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
-            let mut writer = wd;
+            let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
@@ -653,7 +652,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 offset,
                 length,
                 &mut writer,
-                GetObjectOutputKind::HttpResponse,
                 fi,
                 files,
                 &disks,
@@ -3379,7 +3377,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 0,
                 cloned_fi.size,
                 &mut writer,
-                GetObjectOutputKind::Internal,
                 cloned_fi,
                 meta_arr,
                 &online_disks,
