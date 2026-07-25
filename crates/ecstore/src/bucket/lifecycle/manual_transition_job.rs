@@ -37,6 +37,10 @@ pub const MAX_MANUAL_TRANSITION_JOB_RECORD_SIZE: usize = 64 * 1024;
 const MANUAL_TRANSITION_JOB_LEASE_SECONDS: i128 = 60;
 const MANUAL_TRANSITION_LEGACY_SCOPE_SCAN_LIMIT: i32 = 1000;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManualTransitionJobError {
     #[error("manual transition job is corrupt: {0}")]
@@ -75,6 +79,8 @@ pub struct ManualTransitionJobRecord {
     pub lease_id: Uuid,
     pub lease_expires_at_unix_nanos: i128,
     pub state: ManualTransitionJobState,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scan_completed: bool,
     pub cancel_requested: bool,
     pub created_at_unix_nanos: i128,
     pub updated_at_unix_nanos: i128,
@@ -103,6 +109,7 @@ impl ManualTransitionJobRecord {
             lease_id,
             lease_expires_at_unix_nanos: manual_transition_job_lease_expires_at(now),
             state: ManualTransitionJobState::Running,
+            scan_completed: false,
             cancel_requested: false,
             created_at_unix_nanos: now,
             updated_at_unix_nanos: now,
@@ -120,17 +127,11 @@ impl ManualTransitionJobRecord {
     }
 
     pub fn complete(&mut self, report: ManualTransitionRunReport, queue_snapshot: ManualTransitionQueueSnapshot) {
-        self.state = if report.cancelled {
-            ManualTransitionJobState::Cancelled
-        } else if report.was_truncated() || report.has_partial_enqueue() || report.tier_failure > 0 {
-            ManualTransitionJobState::Partial
-        } else {
-            ManualTransitionJobState::Completed
-        };
-        self.report = report;
+        self.scan_completed = true;
+        self.report.merge_scan_report_preserving_worker(&report);
         self.queue_snapshot = queue_snapshot;
         self.error = None;
-        self.mark_updated_terminal();
+        self.mark_terminal_if_worker_drained();
     }
 
     pub fn fail(&mut self, error: impl Into<String>) {
@@ -138,6 +139,24 @@ impl ManualTransitionJobRecord {
         self.report.tier_failure = self.report.tier_failure.saturating_add(1);
         self.error = Some(error.into());
         self.mark_updated_terminal();
+    }
+
+    pub fn record_worker_result(&mut self, result: ManualTransitionWorkerResult, queue_snapshot: ManualTransitionQueueSnapshot) {
+        if self.is_terminal() {
+            return;
+        }
+        match result {
+            ManualTransitionWorkerResult::Completed => {
+                self.report.transition_completed = self.report.transition_completed.saturating_add(1);
+            }
+            ManualTransitionWorkerResult::TierFailure => {
+                self.report.transition_failed = self.report.transition_failed.saturating_add(1);
+                self.report.tier_failure = self.report.tier_failure.saturating_add(1);
+            }
+        }
+        self.queue_snapshot = queue_snapshot;
+        self.updated_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        self.mark_terminal_if_worker_drained();
     }
 
     pub fn mark_cancel_requested(&mut self) {
@@ -178,9 +197,25 @@ impl ManualTransitionJobRecord {
         self.queue_snapshot = queue_snapshot;
     }
 
+    pub fn mark_unknown_if_worker_results_lost(&mut self, queue_snapshot: ManualTransitionQueueSnapshot) -> bool {
+        if self.state != ManualTransitionJobState::Running
+            || !self.scan_completed
+            || !self.report.worker_transition_pending()
+            || queue_snapshot.queued > 0
+            || queue_snapshot.active > 0
+        {
+            return false;
+        }
+        self.queue_snapshot = queue_snapshot;
+        self.state = ManualTransitionJobState::Unknown;
+        self.error = Some("manual transition worker result was not persisted before the transition queue drained".to_string());
+        self.mark_updated_terminal();
+        true
+    }
+
     pub fn update_running_progress(&mut self, report: ManualTransitionRunReport, queue_snapshot: ManualTransitionQueueSnapshot) {
         if self.state == ManualTransitionJobState::Running {
-            self.report = report;
+            self.report.merge_scan_report_preserving_worker(&report);
             self.renew_lease(queue_snapshot);
         }
     }
@@ -208,6 +243,24 @@ impl ManualTransitionJobRecord {
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
         self.updated_at_unix_nanos = now;
         self.completed_at_unix_nanos = Some(now);
+    }
+
+    fn mark_terminal_if_worker_drained(&mut self) {
+        if !self.scan_completed || self.report.worker_transition_pending() {
+            return;
+        }
+        self.state = if self.cancel_requested || self.report.cancelled {
+            ManualTransitionJobState::Cancelled
+        } else if self.report.was_truncated()
+            || self.report.has_partial_enqueue()
+            || self.report.tier_failure > 0
+            || self.report.transition_failed > 0
+        {
+            ManualTransitionJobState::Partial
+        } else {
+            ManualTransitionJobState::Completed
+        };
+        self.mark_updated_terminal();
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ManualTransitionJobError> {
@@ -273,6 +326,12 @@ impl ManualTransitionJobRecord {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualTransitionWorkerResult {
+    Completed,
+    TierFailure,
 }
 
 fn manual_transition_job_lease_expires_at(now_unix_nanos: i128) -> i128 {
@@ -696,6 +755,40 @@ pub async fn persist_manual_transition_job_progress(
     Ok(record)
 }
 
+pub async fn record_manual_transition_worker_result(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    result: ManualTransitionWorkerResult,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> EcstoreResult<ManualTransitionJobRecord> {
+    for _ in 0..4 {
+        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+        if record.is_terminal() {
+            return Ok(record);
+        }
+        record.record_worker_result(result, queue_snapshot);
+        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => {
+                if record.is_terminal() {
+                    delete_manual_transition_scope_admission_if_current(
+                        api.clone(),
+                        &record.scope_key,
+                        record.job_id,
+                        record.lease_id,
+                    )
+                    .await?;
+                } else {
+                    renew_manual_transition_scope_admission_from_job(api, &record).await?;
+                }
+                return Ok(record);
+            }
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Error::PreconditionFailed)
+}
+
 pub async fn renew_manual_transition_job_lease(
     api: Arc<ECStore>,
     job_id: Uuid,
@@ -703,9 +796,16 @@ pub async fn renew_manual_transition_job_lease(
 ) -> EcstoreResult<ManualTransitionJobRecord> {
     let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
     if record.state == ManualTransitionJobState::Running {
-        record.renew_lease(queue_snapshot);
+        let became_terminal = record.mark_unknown_if_worker_results_lost(queue_snapshot);
+        if !became_terminal {
+            record.renew_lease(queue_snapshot);
+        }
         save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await?;
-        renew_manual_transition_scope_admission_from_job(api, &record).await?;
+        if became_terminal {
+            delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id).await?;
+        } else {
+            renew_manual_transition_scope_admission_from_job(api, &record).await?;
+        }
     }
     Ok(record)
 }
@@ -799,6 +899,88 @@ mod tests {
         assert_eq!(decoded.state, ManualTransitionJobState::Cancelled);
         assert!(decoded.cancel_requested);
         assert_eq!(decoded.max_objects, Some(17));
+    }
+
+    #[test]
+    fn manual_transition_job_record_waits_for_worker_results() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                enqueued: 2,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+
+        assert!(record.scan_completed);
+        assert_eq!(record.state, ManualTransitionJobState::Running);
+        assert!(record.completed_at_unix_nanos.is_none());
+
+        record.record_worker_result(ManualTransitionWorkerResult::Completed, ManualTransitionQueueSnapshot::default());
+        assert_eq!(record.state, ManualTransitionJobState::Running);
+        assert_eq!(record.report.transition_completed, 1);
+
+        record.record_worker_result(ManualTransitionWorkerResult::TierFailure, ManualTransitionQueueSnapshot::default());
+        assert_eq!(record.state, ManualTransitionJobState::Partial);
+        assert_eq!(record.report.transition_completed, 1);
+        assert_eq!(record.report.transition_failed, 1);
+        assert_eq!(record.report.tier_failure, 1);
+        assert!(record.completed_at_unix_nanos.is_some());
+    }
+
+    #[test]
+    fn manual_transition_job_scan_progress_preserves_worker_counters() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.record_worker_result(ManualTransitionWorkerResult::TierFailure, ManualTransitionQueueSnapshot::default());
+
+        record.update_running_progress(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                scanned: 3,
+                enqueued: 1,
+                tier_failure: 2,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+
+        assert_eq!(record.report.scanned, 3);
+        assert_eq!(record.report.enqueued, 1);
+        assert_eq!(record.report.transition_failed, 1);
+        assert_eq!(record.report.tier_failure, 3);
+    }
+
+    #[test]
+    fn manual_transition_job_marks_unknown_when_worker_results_are_lost() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                enqueued: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot {
+                queued: 1,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(record.state, ManualTransitionJobState::Running);
+        assert!(!record.mark_unknown_if_worker_results_lost(ManualTransitionQueueSnapshot {
+            queued: 1,
+            ..Default::default()
+        }));
+
+        assert!(record.mark_unknown_if_worker_results_lost(ManualTransitionQueueSnapshot::default()));
+        assert_eq!(record.state, ManualTransitionJobState::Unknown);
+        assert!(record.error.as_deref().is_some_and(|err| err.contains("worker result")));
+        assert!(record.completed_at_unix_nanos.is_some());
     }
 
     #[test]
