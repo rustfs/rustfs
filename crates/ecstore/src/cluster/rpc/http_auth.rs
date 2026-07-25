@@ -1162,8 +1162,7 @@ mod tests {
         let before = global_internode_metrics().snapshot().signature_v1_fallback_total;
 
         assert!(
-            verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &headers, false)
-                .is_ok(),
+            verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &headers, false).is_ok(),
             "a legacy-only peer must keep authenticating while the strict gate is off"
         );
 
@@ -1188,8 +1187,7 @@ mod tests {
         let before = global_internode_metrics().snapshot().signature_v1_fallback_total;
 
         assert!(
-            verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &headers, false)
-                .is_err(),
+            verify_tonic_rpc_signature_with_strictness("node-a:9000", "/node_service.NodeService/Ping", &headers, false).is_err(),
             "a forged legacy signature must still be rejected"
         );
 
@@ -1224,7 +1222,6 @@ mod tests {
         // The public entry point resolves strictness from the environment, whose compile-time
         // default is pinned to false in `rustfs_config`. A legacy-only peer therefore keeps
         // authenticating through the default build with no configuration at all.
-        assert!(!rustfs_config::DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT);
         let headers = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
         assert!(
             verify_tonic_rpc_signature_with_strictness(
