@@ -110,6 +110,13 @@ fn manual_transition_already_running_error() -> S3Error {
     )
 }
 
+fn durable_manual_transition_jobs_not_implemented_error() -> S3Error {
+    S3Error::with_message(
+        S3ErrorCode::NotImplemented,
+        "durable manual transition jobs are not implemented; omit async/mode for enqueue_only",
+    )
+}
+
 fn acquire_manual_transition_admission(scope: ManualTransitionRunScope) -> S3Result<ManualTransitionRunAdmission> {
     let mut scopes = lock_active_manual_transition_scopes();
     if scopes.iter().any(|active| active.overlaps(&scope)) {
@@ -154,6 +161,16 @@ pub fn register_ilm_transition_route(r: &mut S3Router<AdminOperation>) -> std::i
         format!("{ADMIN_PREFIX}/v3/ilm/transition/run").as_str(),
         AdminOperation(&ManualTransitionRunHandler {}),
     )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/jobs/{{job_id}}").as_str(),
+        AdminOperation(&ManualTransitionJobStatusHandler {}),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/jobs/{{job_id}}").as_str(),
+        AdminOperation(&ManualTransitionJobCancelHandler {}),
+    )?;
     Ok(())
 }
 
@@ -185,10 +202,7 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
         return Err(s3_error!(InvalidArgument, "unsupported manual transition mode"));
     }
     if query.async_mode == Some(true) || mode == Some("async") {
-        return Err(S3Error::with_message(
-            S3ErrorCode::NotImplemented,
-            "durable manual transition jobs are not implemented; omit async/mode for enqueue_only",
-        ));
+        return Err(durable_manual_transition_jobs_not_implemented_error());
     }
 
     let max_objects = query.max_objects.unwrap_or(DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS);
@@ -341,6 +355,14 @@ fn response_state(report: &ManualTransitionRunReport) -> &'static str {
     }
 }
 
+fn validate_manual_transition_job_id(params: &Params<'_, '_>) -> S3Result<()> {
+    let job_id = params.get("job_id").unwrap_or("");
+    if job_id.is_empty() {
+        return Err(s3_error!(InvalidRequest, "manual transition job id is required"));
+    }
+    Ok(())
+}
+
 fn json_response(response: &ManualTransitionRunResponse) -> S3Result<S3Response<(StatusCode, Body)>> {
     let body = serde_json::to_vec(response).map_err(|err| {
         S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode manual transition response: {err}"))
@@ -406,9 +428,56 @@ impl Operation for ManualTransitionRunHandler {
     }
 }
 
+pub struct ManualTransitionJobStatusHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ManualTransitionJobStatusHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_manual_transition_request(&req).await?;
+        validate_manual_transition_job_id(&params)?;
+        Err(durable_manual_transition_jobs_not_implemented_error())
+    }
+}
+
+pub struct ManualTransitionJobCancelHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ManualTransitionJobCancelHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_manual_transition_request(&req).await?;
+        validate_manual_transition_job_id(&params)?;
+        Err(durable_manual_transition_jobs_not_implemented_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matchit::Router;
+
+    fn with_manual_transition_job_params<T>(path: &str, f: impl FnOnce(&Params<'_, '_>) -> T) -> T {
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/ilm/transition/jobs/{job_id}", ())
+            .expect("route should insert");
+
+        let matched = router.at(path).expect("route should match");
+        f(&matched.params)
+    }
+
+    fn manual_transition_job_request(method: Method, path: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: path.parse().expect("valid route"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
 
     #[test]
     fn manual_transition_query_defaults_to_bounded_run() {
@@ -449,11 +518,13 @@ mod tests {
             .expect_err("async durable jobs must not be silently accepted");
 
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.status_code(), Some(StatusCode::NOT_IMPLEMENTED));
 
         let err = parse_manual_transition_query(Some("bucket=data&mode=async"))
             .expect_err("mode=async must not fall back to enqueue_only");
 
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.status_code(), Some(StatusCode::NOT_IMPLEMENTED));
     }
 
     #[test]
@@ -654,6 +725,78 @@ mod tests {
 
         assert!(auth_block.contains("AdminAction::SetTierAction"));
         assert!(!auth_block.contains("AdminAction::ServerInfoAdminAction"));
+    }
+
+    #[test]
+    fn manual_transition_job_id_path_param_is_required() {
+        with_manual_transition_job_params("/rustfs/admin/v3/ilm/transition/jobs/job-123", |params| {
+            assert_eq!(params.get("job_id"), Some("job-123"));
+            validate_manual_transition_job_id(params)
+        })
+        .expect("job id should validate");
+
+        let err = validate_manual_transition_job_id(&Params::new()).expect_err("missing job id must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn manual_transition_job_status_and_cancel_fail_closed_until_durable_store_exists() {
+        let err = durable_manual_transition_jobs_not_implemented_error();
+
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.status_code(), Some(StatusCode::NOT_IMPLEMENTED));
+    }
+
+    #[tokio::test]
+    async fn manual_transition_job_handlers_reject_missing_credentials_before_status_contract() {
+        let status_err = ManualTransitionJobStatusHandler {}
+            .call(
+                manual_transition_job_request(Method::GET, "/rustfs/admin/v3/ilm/transition/jobs/job-123"),
+                Params::new(),
+            )
+            .await
+            .expect_err("status handler must reject unsigned requests");
+        assert_eq!(status_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(status_err.message(), Some("authentication required"));
+
+        let cancel_err = ManualTransitionJobCancelHandler {}
+            .call(
+                manual_transition_job_request(Method::DELETE, "/rustfs/admin/v3/ilm/transition/jobs/job-123"),
+                Params::new(),
+            )
+            .await
+            .expect_err("cancel handler must reject unsigned requests");
+        assert_eq!(cancel_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(cancel_err.message(), Some("authentication required"));
+    }
+
+    #[test]
+    fn manual_transition_job_handlers_authorize_validate_and_fail_closed() {
+        let src = include_str!("ilm_transition.rs");
+        let status_block = extract_block_between_markers(
+            src,
+            "impl Operation for ManualTransitionJobStatusHandler",
+            "pub struct ManualTransitionJobCancelHandler",
+        );
+        let cancel_block =
+            extract_block_between_markers(src, "impl Operation for ManualTransitionJobCancelHandler", "#[cfg(test)]");
+
+        for block in [status_block, cancel_block] {
+            let auth = block
+                .find("authorize_manual_transition_request(&req).await?;")
+                .expect("job route must authorize with SetTierAction");
+            let job_id = block
+                .find("validate_manual_transition_job_id(&params)?;")
+                .expect("job route must validate the path job id");
+            let not_implemented = block
+                .find("durable_manual_transition_jobs_not_implemented_error()")
+                .expect("durable job routes must remain fail-closed until the job store exists");
+
+            assert!(auth < job_id);
+            assert!(job_id < not_implemented);
+            assert!(!block.contains("ServerInfoAdminAction"));
+        }
     }
 
     #[test]
