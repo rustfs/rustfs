@@ -65,6 +65,8 @@ const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_in
 const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
+const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
+const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +157,8 @@ pub struct InternodeMetricsSnapshot {
     pub operation_stall_timeouts_total: u64,
     pub operation_write_shutdown_errors_total: u64,
     pub signature_v1_fallback_total: u64,
+    pub body_digest_fallback_total: u64,
+    pub replay_cache_overflow_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +177,8 @@ pub struct InternodeMetrics {
     operation_write_shutdown_errors_total: AtomicU64,
     msgpack_json_decode_error_total: AtomicU64,
     signature_v1_fallback_total: AtomicU64,
+    body_digest_fallback_total: AtomicU64,
+    replay_cache_overflow_total: AtomicU64,
 }
 
 impl InternodeMetrics {
@@ -396,6 +402,26 @@ impl InternodeMetrics {
         counter!(INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL).increment(1);
     }
 
+    /// Count a mutating internode disk RPC that was accepted without a signature-bound canonical
+    /// body digest (rolling-upgrade fallback, see
+    /// <https://github.com/rustfs/backlog/issues/1327>). Only accepted requests count. This counter
+    /// must read zero across a release window fleet-wide before
+    /// `RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT` may be enabled; after the strict flip digestless
+    /// mutations are rejected and the counter stays flat.
+    pub fn record_body_digest_fallback(&self) {
+        self.body_digest_fallback_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_BODY_DIGEST_FALLBACK_TOTAL).increment(1);
+    }
+
+    /// Count a body-bound internode RPC rejected because the replay-protection nonce cache was
+    /// full. Overflow fails closed, so a sustained non-zero rate means
+    /// `RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY` is undersized for this node's peak legitimate
+    /// mutation rate and writes are being refused — alert on this counter.
+    pub fn record_replay_cache_overflow(&self) {
+        self.replay_cache_overflow_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL).increment(1);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
@@ -443,6 +469,8 @@ impl InternodeMetrics {
             operation_stall_timeouts_total: self.operation_stall_timeouts_total.load(Ordering::Relaxed),
             operation_write_shutdown_errors_total: self.operation_write_shutdown_errors_total.load(Ordering::Relaxed),
             signature_v1_fallback_total: self.signature_v1_fallback_total.load(Ordering::Relaxed),
+            body_digest_fallback_total: self.body_digest_fallback_total.load(Ordering::Relaxed),
+            replay_cache_overflow_total: self.replay_cache_overflow_total.load(Ordering::Relaxed),
         }
     }
 
@@ -462,6 +490,8 @@ impl InternodeMetrics {
         self.operation_write_shutdown_errors_total.store(0, Ordering::Relaxed);
         self.msgpack_json_decode_error_total.store(0, Ordering::Relaxed);
         self.signature_v1_fallback_total.store(0, Ordering::Relaxed);
+        self.body_digest_fallback_total.store(0, Ordering::Relaxed);
+        self.replay_cache_overflow_total.store(0, Ordering::Relaxed);
     }
 }
 

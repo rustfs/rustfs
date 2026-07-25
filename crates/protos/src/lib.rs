@@ -423,6 +423,562 @@ pub fn canonical_scanner_activity_response_body(
     Ok(body)
 }
 
+/// Length-prefixed, domain-separated byte builder for the disk-mutation canonical bodies below.
+/// Every variable-length field is u64-length-prefixed and every list u64-count-prefixed, so
+/// distinct field values can never collide into the same canonical bytes.
+struct CanonicalBodyBuilder {
+    body: Vec<u8>,
+}
+
+impl CanonicalBodyBuilder {
+    fn new(domain: &'static [u8]) -> Self {
+        let mut body = Vec::with_capacity(domain.len() + 128);
+        body.extend_from_slice(domain);
+        Self { body }
+    }
+
+    fn push_bytes(&mut self, field: &[u8]) -> Result<(), std::num::TryFromIntError> {
+        self.body.extend_from_slice(&u64::try_from(field.len())?.to_be_bytes());
+        self.body.extend_from_slice(field);
+        Ok(())
+    }
+
+    fn push_str(&mut self, field: &str) -> Result<(), std::num::TryFromIntError> {
+        self.push_bytes(field.as_bytes())
+    }
+
+    fn push_bool(&mut self, field: bool) {
+        self.body.push(u8::from(field));
+    }
+
+    fn push_count(&mut self, count: usize) -> Result<(), std::num::TryFromIntError> {
+        self.body.extend_from_slice(&u64::try_from(count)?.to_be_bytes());
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.body
+    }
+}
+
+// Canonical request bodies for the mutating NodeService disk RPCs (backlog#1327 body-digest
+// binding). Each covers every semantic wire field — including both the msgpack `_bin` payload and
+// its JSON compatibility copy — so tampering with either encoding, or stripping `_bin` to force
+// the JSON fallback decode path, breaks the signature-bound digest.
+
+pub fn canonical_rename_data_request_body(
+    request: &proto_gen::node_service::RenameDataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-data-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.file_info)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.file_info_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_version_request_body(
+    request: &proto_gen::node_service::DeleteVersionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-version-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_bool(request.force_del_marker);
+    body.push_str(&request.opts)?;
+    body.push_bytes(&request.file_info_bin)?;
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_versions_request_body(
+    request: &proto_gen::node_service::DeleteVersionsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-versions-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_count(request.versions.len())?;
+    for version in &request.versions {
+        body.push_str(version)?;
+    }
+    body.push_str(&request.opts)?;
+    body.push_count(request.versions_bin.len())?;
+    for version_bin in &request.versions_bin {
+        body.push_bytes(version_bin)?;
+    }
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_write_metadata_request_body(
+    request: &proto_gen::node_service::WriteMetadataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-metadata-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_bytes(&request.file_info_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_update_metadata_request_body(
+    request: &proto_gen::node_service::UpdateMetadataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-update-metadata-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_str(&request.opts)?;
+    body.push_bytes(&request.file_info_bin)?;
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_write_all_request_body(
+    request: &proto_gen::node_service::WriteAllRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-all-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.data)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_request_body(
+    request: &proto_gen::node_service::DeleteRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.options)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_paths_request_body(
+    request: &proto_gen::node_service::DeletePathsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-paths-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_count(request.paths.len())?;
+    for path in &request.paths {
+        body.push_str(path)?;
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_rename_file_request_body(
+    request: &proto_gen::node_service::RenameFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_rename_part_request_body(
+    request: &proto_gen::node_service::RenamePartRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-part-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.meta)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_volume_request_body(
+    request: &proto_gen::node_service::DeleteVolumeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-volume-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    // Binding `force` is the point: an unbound recursive-delete flag lets an on-path attacker
+    // turn a refuse-if-nonempty delete into a recursive volume wipe (backlog#1327).
+    body.push_bool(request.force);
+    Ok(body.finish())
+}
+
+pub fn canonical_make_volume_request_body(
+    request: &proto_gen::node_service::MakeVolumeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-make-volume-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_make_volumes_request_body(
+    request: &proto_gen::node_service::MakeVolumesRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-make-volumes-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_count(request.volumes.len())?;
+    for volume in &request.volumes {
+        body.push_str(volume)?;
+    }
+    Ok(body.finish())
+}
+
+#[cfg(test)]
+mod disk_mutation_canonical_tests {
+    use super::proto_gen::node_service::{
+        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
+        MakeVolumesRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, UpdateMetadataRequest, WriteAllRequest,
+        WriteMetadataRequest,
+    };
+    use super::*;
+
+    fn assert_all_distinct(bodies: &[Vec<u8>]) {
+        for (i, a) in bodies.iter().enumerate() {
+            for (j, b) in bodies.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "canonical bodies {i} and {j} must differ");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_data_canonical_body_binds_every_field() {
+        let baseline = RenameDataRequest {
+            disk: "disk-a".into(),
+            src_volume: "src-vol".into(),
+            src_path: "src-path".into(),
+            file_info: "{\"v\":1}".into(),
+            dst_volume: "dst-vol".into(),
+            dst_path: "dst-path".into(),
+            file_info_bin: vec![0x81, 0x01].into(),
+        };
+        let mut bodies = vec![canonical_rename_data_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut RenameDataRequest| r.disk = "disk-b".into(),
+            |r: &mut RenameDataRequest| r.src_volume = "src-vol2".into(),
+            |r: &mut RenameDataRequest| r.src_path = "src-path2".into(),
+            |r: &mut RenameDataRequest| r.file_info = "{\"v\":2}".into(),
+            |r: &mut RenameDataRequest| r.dst_volume = "dst-vol2".into(),
+            |r: &mut RenameDataRequest| r.dst_path = "dst-path2".into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_data_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn rename_data_canonical_body_is_injective_across_field_boundaries() {
+        // Length prefixes must prevent moving bytes between adjacent fields from colliding.
+        let shifted_left = RenameDataRequest {
+            src_volume: "ab".into(),
+            src_path: "c".into(),
+            ..Default::default()
+        };
+        let shifted_right = RenameDataRequest {
+            src_volume: "a".into(),
+            src_path: "bc".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            canonical_rename_data_request_body(&shifted_left).unwrap(),
+            canonical_rename_data_request_body(&shifted_right).unwrap(),
+        );
+    }
+
+    #[test]
+    fn delete_version_canonical_body_binds_every_field() {
+        let baseline = DeleteVersionRequest {
+            disk: "disk-a".into(),
+            volume: "vol".into(),
+            path: "path".into(),
+            file_info: "{\"v\":1}".into(),
+            force_del_marker: false,
+            opts: "{}".into(),
+            file_info_bin: vec![0x81].into(),
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_delete_version_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut DeleteVersionRequest| r.disk = "disk-b".into(),
+            |r: &mut DeleteVersionRequest| r.volume = "vol2".into(),
+            |r: &mut DeleteVersionRequest| r.path = "path2".into(),
+            |r: &mut DeleteVersionRequest| r.file_info = "{\"v\":2}".into(),
+            |r: &mut DeleteVersionRequest| r.force_del_marker = true,
+            |r: &mut DeleteVersionRequest| r.opts = "{\"o\":1}".into(),
+            |r: &mut DeleteVersionRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut DeleteVersionRequest| r.opts_bin = Vec::new().into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_version_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn delete_versions_canonical_body_binds_lists_and_options() {
+        let baseline = DeleteVersionsRequest {
+            disk: "disk-a".into(),
+            volume: "vol".into(),
+            versions: vec!["v1".into(), "v2".into()],
+            opts: "{}".into(),
+            versions_bin: vec![vec![0x01].into(), vec![0x02].into()],
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_delete_versions_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut DeleteVersionsRequest| r.disk = "disk-b".into(),
+            |r: &mut DeleteVersionsRequest| r.volume = "vol2".into(),
+            |r: &mut DeleteVersionsRequest| r.versions = vec!["v1".into(), "v3".into()],
+            |r: &mut DeleteVersionsRequest| r.versions = vec!["v1v2".into()],
+            |r: &mut DeleteVersionsRequest| r.opts = "{\"o\":1}".into(),
+            |r: &mut DeleteVersionsRequest| r.versions_bin = vec![vec![0x01].into(), vec![0x03].into()],
+            |r: &mut DeleteVersionsRequest| r.versions_bin = vec![vec![0x01, 0x02].into()],
+            |r: &mut DeleteVersionsRequest| r.versions_bin = Vec::new(),
+            |r: &mut DeleteVersionsRequest| r.opts_bin = vec![0x81].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_versions_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn remaining_disk_mutation_canonical_bodies_bind_every_field() {
+        // Mutating each field in turn and asserting all bodies differ catches a dropped or
+        // duplicated `push_*` in these hand-written builders — an unbound field is tamperable.
+        let write_metadata = WriteMetadataRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            file_info: "{\"a\":1}".into(),
+            file_info_bin: vec![0x81].into(),
+        };
+        let mut bodies = vec![canonical_write_metadata_request_body(&write_metadata).unwrap()];
+        for mutate in [
+            |r: &mut WriteMetadataRequest| r.disk = "d2".into(),
+            |r: &mut WriteMetadataRequest| r.volume = "v2".into(),
+            |r: &mut WriteMetadataRequest| r.path = "p2".into(),
+            |r: &mut WriteMetadataRequest| r.file_info = "{\"a\":2}".into(),
+            |r: &mut WriteMetadataRequest| r.file_info_bin = vec![0x82].into(),
+        ] {
+            let mut request = write_metadata.clone();
+            mutate(&mut request);
+            bodies.push(canonical_write_metadata_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let update_metadata = UpdateMetadataRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            file_info: "{\"a\":1}".into(),
+            opts: "{\"o\":1}".into(),
+            file_info_bin: vec![0x81].into(),
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_update_metadata_request_body(&update_metadata).unwrap()];
+        for mutate in [
+            |r: &mut UpdateMetadataRequest| r.disk = "d2".into(),
+            |r: &mut UpdateMetadataRequest| r.volume = "v2".into(),
+            |r: &mut UpdateMetadataRequest| r.path = "p2".into(),
+            |r: &mut UpdateMetadataRequest| r.file_info = "{\"a\":2}".into(),
+            |r: &mut UpdateMetadataRequest| r.opts = "{\"o\":2}".into(),
+            |r: &mut UpdateMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut UpdateMetadataRequest| r.opts_bin = vec![0x81].into(),
+        ] {
+            let mut request = update_metadata.clone();
+            mutate(&mut request);
+            bodies.push(canonical_update_metadata_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let write_all = WriteAllRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            data: vec![0xAA, 0xBB].into(),
+        };
+        let mut bodies = vec![canonical_write_all_request_body(&write_all).unwrap()];
+        for mutate in [
+            |r: &mut WriteAllRequest| r.disk = "d2".into(),
+            |r: &mut WriteAllRequest| r.volume = "v2".into(),
+            |r: &mut WriteAllRequest| r.path = "p2".into(),
+            |r: &mut WriteAllRequest| r.data = vec![0xAA, 0xBC].into(),
+        ] {
+            let mut request = write_all.clone();
+            mutate(&mut request);
+            bodies.push(canonical_write_all_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let delete = DeleteRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            options: "{\"o\":1}".into(),
+        };
+        let mut bodies = vec![canonical_delete_request_body(&delete).unwrap()];
+        for mutate in [
+            |r: &mut DeleteRequest| r.disk = "d2".into(),
+            |r: &mut DeleteRequest| r.volume = "v2".into(),
+            |r: &mut DeleteRequest| r.path = "p2".into(),
+            |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+        ] {
+            let mut request = delete.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let delete_paths = DeletePathsRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            paths: vec!["a".into(), "b".into()],
+        };
+        let mut bodies = vec![canonical_delete_paths_request_body(&delete_paths).unwrap()];
+        for mutate in [
+            |r: &mut DeletePathsRequest| r.disk = "d2".into(),
+            |r: &mut DeletePathsRequest| r.volume = "v2".into(),
+            |r: &mut DeletePathsRequest| r.paths = vec!["a".into(), "c".into()],
+            |r: &mut DeletePathsRequest| r.paths = vec!["ab".into()],
+        ] {
+            let mut request = delete_paths.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_paths_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let rename_file = RenameFileRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+        };
+        let mut bodies = vec![canonical_rename_file_request_body(&rename_file).unwrap()];
+        for mutate in [
+            |r: &mut RenameFileRequest| r.disk = "d2".into(),
+            |r: &mut RenameFileRequest| r.src_volume = "sv2".into(),
+            |r: &mut RenameFileRequest| r.src_path = "sp2".into(),
+            |r: &mut RenameFileRequest| r.dst_volume = "dv2".into(),
+            |r: &mut RenameFileRequest| r.dst_path = "dp2".into(),
+        ] {
+            let mut request = rename_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let rename_part = RenamePartRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: vec![0x01].into(),
+        };
+        let mut bodies = vec![canonical_rename_part_request_body(&rename_part).unwrap()];
+        for mutate in [
+            |r: &mut RenamePartRequest| r.disk = "d2".into(),
+            |r: &mut RenamePartRequest| r.src_volume = "sv2".into(),
+            |r: &mut RenamePartRequest| r.src_path = "sp2".into(),
+            |r: &mut RenamePartRequest| r.dst_volume = "dv2".into(),
+            |r: &mut RenamePartRequest| r.dst_path = "dp2".into(),
+            |r: &mut RenamePartRequest| r.meta = vec![0x02].into(),
+        ] {
+            let mut request = rename_part.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_part_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn volume_mutation_canonical_bodies_bind_their_fields() {
+        let delete_volume = DeleteVolumeRequest {
+            disk: "http://node-a:9000/data/rustfs0".into(),
+            volume: "bucket".into(),
+            force: false,
+        };
+        // The force flag must be part of the signed body: false → true is a recursive wipe.
+        let mut recursive = delete_volume.clone();
+        recursive.force = true;
+        assert_ne!(
+            canonical_delete_volume_request_body(&delete_volume).unwrap(),
+            canonical_delete_volume_request_body(&recursive).unwrap(),
+        );
+        let mut retargeted = delete_volume.clone();
+        retargeted.volume = "victim".into();
+        assert_ne!(
+            canonical_delete_volume_request_body(&delete_volume).unwrap(),
+            canonical_delete_volume_request_body(&retargeted).unwrap(),
+        );
+
+        let make_volume = MakeVolumeRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+        };
+        let mut tampered = make_volume.clone();
+        tampered.volume = "v2".into();
+        assert_ne!(
+            canonical_make_volume_request_body(&make_volume).unwrap(),
+            canonical_make_volume_request_body(&tampered).unwrap(),
+        );
+
+        let make_volumes = MakeVolumesRequest {
+            disk: "d".into(),
+            volumes: vec!["a".into(), "b".into()],
+        };
+        let mut merged = make_volumes.clone();
+        merged.volumes = vec!["ab".into()];
+        assert_ne!(
+            canonical_make_volumes_request_body(&make_volumes).unwrap(),
+            canonical_make_volumes_request_body(&merged).unwrap(),
+        );
+    }
+
+    #[test]
+    fn disk_mutation_canonical_domains_are_distinct_per_message() {
+        // The same field values must never authenticate one RPC's request as another's.
+        let rename_file = RenameFileRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+        };
+        let rename_part = RenamePartRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: Vec::new().into(),
+        };
+        assert_ne!(
+            canonical_rename_file_request_body(&rename_file).unwrap(),
+            canonical_rename_part_request_body(&rename_part).unwrap(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod scanner_activity_tests {
     use super::{
