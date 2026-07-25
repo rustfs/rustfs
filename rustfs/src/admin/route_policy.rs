@@ -1813,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn route_policy_requires_set_tier_for_manual_transition_run() {
+    fn route_policy_requires_set_tier_for_manual_transition_routes() {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
         assert_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
