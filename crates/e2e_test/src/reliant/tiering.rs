@@ -647,3 +647,41 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualcontractcoldtieradmin".to_string();
+    cold.secret_key = "manualcontractcoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket("ilm7-manual-contract").send().await?;
+
+    let (status, body) = signed_admin_request(
+        &hot.url,
+        Method::POST,
+        "/rustfs/admin/v3/ilm/transition/run?bucket=ilm7-manual-contract",
+        None,
+        &hot.access_key,
+        &hot.secret_key,
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "manual transition contract call should still be OK");
+    let response: serde_json::Value = serde_json::from_str(&body)?;
+
+    assert!(response.get("state").is_some(), "response should include state field");
+    assert!(response.get("job_id").is_none() || response.get("job_id").is_some_and(|v| v.is_null()));
+    assert!(response.get("status").is_none() || response.get("status").is_some_and(|v| v.is_null()));
+    assert!(response.get("status_endpoint").is_none() || response.get("status_endpoint").is_some_and(|v| v.is_null()));
+    assert!(response.get("cancel").is_none() || response.get("cancel").is_some_and(|v| v.is_null()));
+
+    Ok(())
+}
