@@ -195,6 +195,8 @@ pub(crate) mod bucket_target_sys {
 pub(crate) mod lifecycle {
     pub(crate) type ManualTransitionRunOptions =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunOptions;
+    pub(crate) type ManualTransitionRunExecution =
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunExecution;
     pub(crate) type ManualTransitionRunReport = super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionRunReport;
 
     pub(crate) async fn enqueue_transition_for_existing_objects_scoped(
@@ -204,6 +206,21 @@ pub(crate) mod lifecycle {
     ) -> super::Result<ManualTransitionRunReport> {
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects_scoped(
             api, bucket, options,
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_transition_for_existing_objects_scoped_with_cancel(
+        api: std::sync::Arc<super::ECStore>,
+        bucket: &str,
+        options: ManualTransitionRunOptions,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> super::Result<ManualTransitionRunExecution> {
+        super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects_scoped_with_cancel(
+            api,
+            bucket,
+            options,
+            cancel_token,
         )
         .await
     }

@@ -488,7 +488,7 @@ pub(crate) mod ecstore_rpc {
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
-        gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
+        gen_signature_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
     };
 }
 
@@ -552,6 +552,8 @@ pub(crate) fn try_current_local_node_name() -> Option<String> {
     crate::storage::runtime_sources::try_current_local_node_name()
 }
 
+#[cfg(test)]
+pub(crate) use ecstore_rpc::gen_signature_headers;
 #[cfg(test)]
 pub(crate) use ecstore_rpc::gen_tonic_signature_headers;
 pub(crate) use ecstore_rpc::sign_tonic_rpc_response_proof;
