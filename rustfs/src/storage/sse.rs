@@ -2185,8 +2185,7 @@ static GLOBAL_SSE_DEK_PROVIDER: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>
 /// build a `KmsSseDekProvider` without an AppContext) but must never fall back
 /// to whatever the local cache happens to hold.
 #[cfg(test)]
-static TEST_SSE_DEK_PROVIDER_OVERRIDE: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>> =
-    LazyLock::new(|| RwLock::new(None));
+static TEST_SSE_DEK_PROVIDER_OVERRIDE: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>> = LazyLock::new(|| RwLock::new(None));
 
 #[cfg(test)]
 fn test_injected_sse_dek_provider() -> Option<Arc<dyn SseDekProvider>> {
@@ -4331,10 +4330,7 @@ mod tests {
             .generate_sse_dek(&context, "kms-transition")
             .await
             .expect("generate KMS-wrapped DEK");
-        assert!(
-            super::is_data_key_envelope(&encrypted_dek),
-            "generated DEK must be a KMS envelope"
-        );
+        assert!(super::is_data_key_envelope(&encrypted_dek), "generated DEK must be a KMS envelope");
 
         // Pollute the local-provider cache the way a pre-KMS managed operation
         // would, then register the KMS provider via the test injection hook
