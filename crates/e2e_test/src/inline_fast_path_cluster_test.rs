@@ -633,6 +633,35 @@ struct ReaderPathExpectation<'a> {
     expected_size_bucket: Option<&'a str>,
 }
 
+struct PartNumberReaderPathExpectation<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    expected_part: &'a [u8],
+    full_object_size: usize,
+    object_class: &'a str,
+    expected_path: &'a str,
+}
+
+impl<'a> PartNumberReaderPathExpectation<'a> {
+    fn new(
+        bucket: &'a str,
+        key: &'a str,
+        expected_part: &'a [u8],
+        full_object_size: usize,
+        object_class: &'a str,
+        expected_path: &'a str,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            expected_part,
+            full_object_size,
+            object_class,
+            expected_path,
+        }
+    }
+}
+
 impl<'a> ReaderPathExpectation<'a> {
     fn plain(object: ReaderObject<'a>, expected_path: &'a str) -> Self {
         Self::for_class(object, expected_path, PLAIN_SINGLE_PART)
@@ -804,13 +833,16 @@ async fn assert_reader_path(
 async fn assert_part_number_reader_path(
     collector: &OtlpMetricCollector,
     client: &Client,
-    bucket: &str,
-    key: &str,
-    expected_part: &[u8],
-    full_object_size: usize,
-    object_class: &str,
-    expected_path: &str,
+    expectation: PartNumberReaderPathExpectation<'_>,
 ) -> TestResult {
+    let PartNumberReaderPathExpectation {
+        bucket,
+        key,
+        expected_part,
+        full_object_size,
+        object_class,
+        expected_path,
+    } = expectation;
     let paths = [INLINE_DIRECT, LEGACY_DUPLEX, EMPTY, REMOTE_TRANSITION];
     let size_bucket = size_bucket(full_object_size);
     let mut before = BTreeMap::<&str, u64>::new();
@@ -1287,12 +1319,7 @@ async fn four_node_inline_fallback_controls() -> TestResult {
     assert_part_number_reader_path(
         &collector,
         &client,
-        bucket,
-        multipart_key,
-        &second_part,
-        multipart_body.len(),
-        MULTIPART,
-        LEGACY_DUPLEX,
+        PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
     )
     .await?;
 
@@ -1387,7 +1414,12 @@ async fn four_node_multipart_ignores_disk_compression_fallback() -> TestResult {
         ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), LEGACY_DUPLEX, MULTIPART),
     )
     .await?;
-    assert_part_number_reader_path(&collector, &client, bucket, key, &second_part, body.len(), MULTIPART, LEGACY_DUPLEX).await?;
+    assert_part_number_reader_path(
+        &collector,
+        &client,
+        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), MULTIPART, LEGACY_DUPLEX),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1426,12 +1458,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     assert_part_number_reader_path(
         &collector,
         &client,
-        bucket,
-        multipart_key,
-        &second_part,
-        multipart_body.len(),
-        MULTIPART,
-        LEGACY_DUPLEX,
+        PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
     )
     .await?;
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
@@ -1532,8 +1559,12 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
         ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), REMOTE_TRANSITION, REMOTE),
     )
     .await?;
-    assert_part_number_reader_path(&collector, &hot_client, bucket, key, &second_part, body.len(), REMOTE, REMOTE_TRANSITION)
-        .await?;
+    assert_part_number_reader_path(
+        &collector,
+        &hot_client,
+        PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), REMOTE, REMOTE_TRANSITION),
+    )
+    .await?;
 
     let encrypted_key = "transition/encrypted-sse.bin";
     let encrypted_body = payload(16 * KIB, 0xAB);
