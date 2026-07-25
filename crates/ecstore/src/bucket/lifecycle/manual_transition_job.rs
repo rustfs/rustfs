@@ -23,8 +23,10 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
 };
 use crate::bucket::lifecycle::config_boundary;
+use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result as EcstoreResult};
 use crate::object_api::ObjectOptions;
+use crate::storage_api_contracts::list::ListOperations as _;
 use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::store::ECStore;
 
@@ -33,6 +35,7 @@ pub const MANUAL_TRANSITION_JOB_RECORD_PREFIX: &str = "ilm/manual-transition/job
 pub const MANUAL_TRANSITION_SCOPE_RECORD_PREFIX: &str = "ilm/manual-transition/scopes";
 pub const MAX_MANUAL_TRANSITION_JOB_RECORD_SIZE: usize = 64 * 1024;
 const MANUAL_TRANSITION_JOB_LEASE_SECONDS: i128 = 60;
+const MANUAL_TRANSITION_LEGACY_SCOPE_SCAN_LIMIT: i32 = 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManualTransitionJobError {
@@ -354,6 +357,16 @@ pub fn manual_transition_scope_key(bucket: &str, options: &ManualTransitionRunOp
     let mut scope = String::new();
     scope.push_str(bucket);
     scope.push('\0');
+    // Durable admission v1 is bucket-level: a single CAS alias must cover prefix
+    // overlap and wildcard-tier conflicts without a non-atomic scope scan.
+    scope.push_str(if options.dry_run { "dry_run" } else { "run" });
+    hex_sha256(scope.as_bytes(), ToOwned::to_owned)
+}
+
+pub(crate) fn legacy_manual_transition_scope_key(bucket: &str, options: &ManualTransitionRunOptions) -> String {
+    let mut scope = String::new();
+    scope.push_str(bucket);
+    scope.push('\0');
     scope.push_str(&options.prefix);
     scope.push('\0');
     if let Some(tier) = &options.tier {
@@ -553,7 +566,7 @@ pub async fn claim_manual_transition_scope_admission(
     admission: &ManualTransitionScopeAdmission,
 ) -> EcstoreResult<ManualTransitionScopeAdmissionClaim> {
     match save_manual_transition_scope_admission_if_absent(api.clone(), admission).await {
-        Ok(()) => return Ok(ManualTransitionScopeAdmissionClaim::Claimed),
+        Ok(()) => return finish_manual_transition_scope_admission_claim(api, admission).await,
         Err(Error::PreconditionFailed) => {}
         Err(err) => return Err(err),
     }
@@ -572,14 +585,86 @@ pub async fn claim_manual_transition_scope_admission(
         }
     };
     if active_job_reclaimable {
-        return match save_manual_transition_scope_admission_if_current(api, admission, &etag).await {
-            Ok(()) => Ok(ManualTransitionScopeAdmissionClaim::Claimed),
+        return match save_manual_transition_scope_admission_if_current(api.clone(), admission, &etag).await {
+            Ok(()) => finish_manual_transition_scope_admission_claim(api, admission).await,
             Err(Error::PreconditionFailed) => Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active))),
             Err(err) => Err(err),
         };
     }
 
     Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active)))
+}
+
+async fn finish_manual_transition_scope_admission_claim(
+    api: Arc<ECStore>,
+    admission: &ManualTransitionScopeAdmission,
+) -> EcstoreResult<ManualTransitionScopeAdmissionClaim> {
+    if let Some(active) = find_active_legacy_manual_transition_scope_conflict(api.clone(), admission).await? {
+        delete_manual_transition_scope_admission_if_current(api, &admission.scope_key, admission.job_id, admission.lease_id)
+            .await?;
+        return Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active)));
+    }
+    Ok(ManualTransitionScopeAdmissionClaim::Claimed)
+}
+
+async fn find_active_legacy_manual_transition_scope_conflict(
+    api: Arc<ECStore>,
+    admission: &ManualTransitionScopeAdmission,
+) -> EcstoreResult<Option<ManualTransitionScopeAdmission>> {
+    let mut marker = None;
+    loop {
+        let page = api
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                MANUAL_TRANSITION_JOB_RECORD_PREFIX,
+                marker,
+                None,
+                MANUAL_TRANSITION_LEGACY_SCOPE_SCAN_LIMIT,
+                false,
+                None,
+                false,
+            )
+            .await?;
+        for object in page.objects {
+            let job_id =
+                manual_transition_job_id_from_record_object_name(&object.name).map_err(manual_transition_job_store_error)?;
+            if job_id == admission.job_id {
+                continue;
+            }
+            let record = match load_manual_transition_job_record(api.clone(), job_id).await {
+                Ok(record) => record,
+                Err(Error::ConfigNotFound) => continue,
+                Err(err) => return Err(err),
+            };
+            if record.scope_key == admission.scope_key {
+                continue;
+            }
+            let legacy_scope_key = legacy_manual_transition_scope_key(
+                &record.bucket,
+                &ManualTransitionRunOptions {
+                    prefix: record.prefix.clone(),
+                    tier: record.tier.clone(),
+                    dry_run: record.dry_run,
+                    ..Default::default()
+                },
+            );
+            if record.scope_key != legacy_scope_key {
+                continue;
+            }
+            if record.bucket == admission.bucket
+                && record.dry_run == admission.dry_run
+                && !record.is_terminal()
+                && !manual_transition_job_lease_expired(&record)
+            {
+                return Ok(Some(ManualTransitionScopeAdmission::from_job(&record)));
+            }
+        }
+        if !page.is_truncated {
+            return Ok(None);
+        }
+        marker = page.next_continuation_token;
+    }
 }
 
 pub async fn request_manual_transition_job_cancel(api: Arc<ECStore>, job_id: Uuid) -> EcstoreResult<ManualTransitionJobRecord> {
@@ -874,6 +959,46 @@ mod tests {
                 .expect("scope path should encode")
                 .starts_with(MANUAL_TRANSITION_SCOPE_RECORD_PREFIX)
         );
+    }
+
+    #[test]
+    fn manual_transition_scope_key_uses_bucket_level_admission_for_durable_v1() {
+        let broad = manual_transition_scope_key(
+            "bucket",
+            &ManualTransitionRunOptions {
+                prefix: "logs/".to_string(),
+                tier: None,
+                ..Default::default()
+            },
+        );
+        let nested = manual_transition_scope_key(
+            "bucket",
+            &ManualTransitionRunOptions {
+                prefix: "logs/2026/".to_string(),
+                tier: Some("warm".to_string()),
+                ..Default::default()
+            },
+        );
+        let disjoint = manual_transition_scope_key(
+            "bucket",
+            &ManualTransitionRunOptions {
+                prefix: "archive/".to_string(),
+                tier: Some("cold".to_string()),
+                ..Default::default()
+            },
+        );
+        let dry_run = manual_transition_scope_key(
+            "bucket",
+            &ManualTransitionRunOptions {
+                prefix: "logs/".to_string(),
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(broad, nested);
+        assert_eq!(broad, disjoint);
+        assert_ne!(broad, dry_run);
     }
 
     #[test]
