@@ -128,6 +128,19 @@ impl NamespaceLockGuard {
             Self::Fast(_) => false,
         }
     }
+
+    /// Resolves when a distributed guard loses refresh quorum.
+    ///
+    /// Local fast locks cannot lose distributed quorum, so their future remains pending.
+    pub async fn lock_lost_notified(&self) {
+        match self {
+            Self::Standard(guard) => {
+                let signal = guard.lock_lost();
+                signal.notified().await;
+            }
+            Self::Fast(_) => std::future::pending().await,
+        }
+    }
 }
 
 /// Namespace lock for managing locks by resource namespaces

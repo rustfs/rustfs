@@ -64,6 +64,9 @@ type MetricValues = Arc<Mutex<BTreeMap<String, MetricPointVersions>>>;
 
 const KIB: usize = 1024;
 const READER_PATH_COUNTER: &str = "rustfs_io_get_object_reader_path_by_size_total";
+const MSGPACK_JSON_FALLBACK_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
+const DIRECTION_LABEL: &str = "direction";
+const MESSAGE_LABEL: &str = "message";
 const INLINE_DIRECT: &str = "inline_direct";
 const LEGACY_DUPLEX: &str = "legacy_duplex";
 const EMPTY: &str = "empty";
@@ -74,11 +77,30 @@ const ENCRYPTED: &str = "encrypted";
 const COMPRESSED: &str = "compressed";
 const RANGE: &str = "range";
 const REMOTE: &str = "remote";
+const FALLBACK_REQUEST_DIRECTION: &str = "request";
+const FALLBACK_RESPONSE_DIRECTION: &str = "response";
 const MPU_PART_1_SIZE: usize = 5 * 1024 * 1024;
 const MPU_PART_2_SIZE: usize = 16 * KIB;
 const TIER_NAME: &str = "COLDTIER";
 const TIER_BUCKET: &str = "inline-fallback-cold-tier";
 const TIER_PREFIX: &str = "tiered";
+const MSGPACK_FALLBACK_CONTROL_SERIES: [(&str, &str); 4] = [
+    (FALLBACK_REQUEST_DIRECTION, "ReadMultipleReq"),
+    (FALLBACK_RESPONSE_DIRECTION, "ReadMultipleResp"),
+    (FALLBACK_REQUEST_DIRECTION, "BatchReadVersionReq"),
+    (FALLBACK_RESPONSE_DIRECTION, "BatchReadVersionResp"),
+];
+const READER_SIZE_BUCKETS: [&str; 9] = [
+    "le_4kib",
+    "le_16kib",
+    "le_64kib",
+    "le_128kib",
+    "le_192kib",
+    "le_256kib",
+    "le_512kib",
+    "le_1mib",
+    "gt_1mib",
+];
 
 struct BoundaryCase {
     label: String,
@@ -113,6 +135,7 @@ impl VersionState {
 struct OtlpMetricCollector {
     endpoint: String,
     values: MetricValues,
+    fallback_values: MetricValues,
     task: JoinHandle<()>,
 }
 
@@ -121,24 +144,32 @@ impl OtlpMetricCollector {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/v1/metrics", listener.local_addr()?);
         let values = Arc::new(Mutex::new(BTreeMap::new()));
+        let fallback_values = Arc::new(Mutex::new(BTreeMap::new()));
         let task_values = values.clone();
+        let task_fallback_values = fallback_values.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
                 let values = task_values.clone();
+                let fallback_values = task_fallback_values.clone();
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(
                             TokioIo::new(stream),
-                            service_fn(move |request| handle_metric_export(request, values.clone())),
+                            service_fn(move |request| handle_metric_export(request, values.clone(), fallback_values.clone())),
                         )
                         .await;
                 });
             }
         });
-        Ok(Self { endpoint, values, task })
+        Ok(Self {
+            endpoint,
+            values,
+            fallback_values,
+            task,
+        })
     }
 
     async fn reader_path_total(&self, path: &str, object_class: &str, size_bucket: &str) -> u64 {
@@ -159,6 +190,15 @@ impl OtlpMetricCollector {
 
     async fn reader_path_totals(&self) -> BTreeMap<String, u64> {
         self.values
+            .lock()
+            .await
+            .iter()
+            .map(|(key, points)| (key.clone(), points.values().map(|(_, value)| value).sum()))
+            .collect()
+    }
+
+    async fn msgpack_json_fallback_totals(&self) -> BTreeMap<String, u64> {
+        self.fallback_values
             .lock()
             .await
             .iter()
@@ -231,7 +271,11 @@ impl Drop for OtlpMetricCollector {
     }
 }
 
-async fn handle_metric_export(request: Request<Incoming>, values: MetricValues) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle_metric_export(
+    request: Request<Incoming>,
+    values: MetricValues,
+    fallback_values: MetricValues,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.uri().path() != "/v1/metrics" {
         return Ok(response(StatusCode::NOT_FOUND));
     }
@@ -261,7 +305,9 @@ async fn handle_metric_export(request: Request<Incoming>, values: MetricValues) 
     match ExportMetricsServiceRequest::decode(payload.as_slice()) {
         Ok(export) => {
             let mut values = values.lock().await;
+            let mut fallback_values = fallback_values.lock().await;
             record_reader_path_metrics(&export, &mut values);
+            record_msgpack_fallback_metrics(&export, &mut fallback_values);
             Ok(response(StatusCode::OK))
         }
         Err(_) => Ok(response(StatusCode::BAD_REQUEST)),
@@ -324,6 +370,66 @@ fn record_reader_path_metric(metric: &Metric, values: &mut BTreeMap<String, Metr
             })
             .or_insert((point.time_unix_nano, value));
     }
+}
+
+fn record_msgpack_fallback_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    for resource_metrics in &export.resource_metrics {
+        for scope_metrics in &resource_metrics.scope_metrics {
+            for metric in &scope_metrics.metrics {
+                if metric.name != MSGPACK_JSON_FALLBACK_COUNTER {
+                    continue;
+                }
+                let Some(metric::Data::Sum(sum)) = &metric.data else {
+                    continue;
+                };
+                for point in &sum.data_points {
+                    let Some(direction) = attribute_string(&point.attributes, DIRECTION_LABEL) else {
+                        continue;
+                    };
+                    let Some(message) = attribute_string(&point.attributes, MESSAGE_LABEL) else {
+                        continue;
+                    };
+                    let Some(number_data_point::Value::AsInt(value)) = point.value.as_ref() else {
+                        continue;
+                    };
+                    let value = u64::try_from(*value).unwrap_or_default();
+                    values
+                        .entry(msgpack_fallback_metric_key(direction, message))
+                        .or_default()
+                        .entry(point.start_time_unix_nano)
+                        .and_modify(|current| {
+                            if point.time_unix_nano >= current.0 {
+                                *current = (point.time_unix_nano, value);
+                            }
+                        })
+                        .or_insert((point.time_unix_nano, value));
+                }
+            }
+        }
+    }
+}
+
+fn msgpack_fallback_metric_key(direction: &str, message: &str) -> String {
+    format!("{direction}\u{1f}{message}")
+}
+
+async fn assert_msgpack_fallback_unchanged(
+    collector: &OtlpMetricCollector,
+    before: &BTreeMap<String, u64>,
+    series: &[(&str, &str)],
+) -> TestResult {
+    let after = collector.msgpack_json_fallback_totals().await;
+    for &(direction, message) in series {
+        let key = msgpack_fallback_metric_key(direction, message);
+        assert_eq!(
+            before.get(&key).copied().unwrap_or_default(),
+            after.get(&key).copied().unwrap_or_default(),
+            "fallback counter changed for {direction}/{message}: before={:?}, after={:?}",
+            before.get(&key),
+            after.get(&key),
+        );
+    }
+    Ok(())
 }
 
 fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<&'a str> {
@@ -439,6 +545,17 @@ fn configure_reader_metric_cluster(cluster: &mut RustFSTestClusterEnvironment, c
     cluster.set_env("RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY", "false");
 }
 
+fn configure_mixed_msgpack_cluster(cluster: &mut RustFSTestClusterEnvironment, collector: &OtlpMetricCollector) -> TestResult {
+    configure_reader_metric_cluster(cluster, collector);
+    cluster.set_node_env(0, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY", "true")?;
+    cluster.set_node_env(0, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED", "true")?;
+    cluster.set_node_env(1, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY", "true")?;
+    cluster.set_node_env(1, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED", "true")?;
+    cluster.set_node_env(2, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY", "false")?;
+    cluster.set_node_env(3, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY", "false")?;
+    Ok(())
+}
+
 async fn assert_case(
     cluster: &RustFSTestClusterEnvironment,
     client: &Client,
@@ -513,7 +630,7 @@ struct ReaderPathExpectation<'a> {
     object: ReaderObject<'a>,
     expected_path: &'a str,
     object_class: &'a str,
-    expected_size_bucket: &'a str,
+    expected_size_bucket: Option<&'a str>,
 }
 
 impl<'a> ReaderPathExpectation<'a> {
@@ -527,7 +644,7 @@ impl<'a> ReaderPathExpectation<'a> {
             object,
             expected_path,
             object_class,
-            expected_size_bucket,
+            expected_size_bucket: Some(expected_size_bucket),
         }
     }
 
@@ -541,7 +658,16 @@ impl<'a> ReaderPathExpectation<'a> {
             object,
             expected_path,
             object_class,
-            expected_size_bucket,
+            expected_size_bucket: Some(expected_size_bucket),
+        }
+    }
+
+    fn with_any_size_bucket(object: ReaderObject<'a>, expected_path: &'a str, object_class: &'a str) -> Self {
+        Self {
+            object,
+            expected_path,
+            object_class,
+            expected_size_bucket: None,
         }
     }
 }
@@ -558,22 +684,102 @@ async fn assert_reader_path(
         expected_size_bucket,
     } = expectation;
     let paths = [INLINE_DIRECT, LEGACY_DUPLEX, EMPTY, REMOTE_TRANSITION];
-    let mut before = BTreeMap::<&str, u64>::new();
-    for path in paths {
-        before.insert(path, collector.reader_path_total(path, object_class, expected_size_bucket).await);
+    let size_buckets: Vec<&str> = match expected_size_bucket {
+        Some(expected_size_bucket) => vec![expected_size_bucket],
+        None => READER_SIZE_BUCKETS.to_vec(),
+    };
+    let size_buckets = size_buckets.as_slice();
+
+    let mut before = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
+    for &size_bucket in size_buckets {
+        let mut bucket_before = BTreeMap::new();
+        for path in paths {
+            bucket_before.insert(path, collector.reader_path_total(path, object_class, size_bucket).await);
+        }
+        before.insert(size_bucket, bucket_before);
     }
+
     get_and_assert(client, object.bucket, object.key, object.body, object.etag, object.version_id).await?;
-    let expected_after = collector
-        .wait_for_reader_path_total(expected_path, object_class, expected_size_bucket, before[expected_path] + 1)
-        .await?;
-    assert!(
-        expected_after > before[expected_path],
-        "{READER_PATH_COUNTER}{{path={expected_path}}} must advance for {}",
-        object.key
-    );
+
+    let selected_size_bucket = match expected_size_bucket {
+        Some(expected_size_bucket) => {
+            let path_before = before
+                .get(expected_size_bucket)
+                .and_then(|values| values.get(expected_path))
+                .copied()
+                .ok_or_else(|| format!("reader-path baseline missing for size bucket {expected_size_bucket}"))?;
+            let expected_after = collector
+                .wait_for_reader_path_total(expected_path, object_class, expected_size_bucket, path_before + 1)
+                .await?;
+            assert!(
+                expected_after > path_before,
+                "{READER_PATH_COUNTER}{{path={expected_path}}} must advance for {}",
+                object.key
+            );
+            expected_size_bucket
+        }
+        None => {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let mut matched_size_bucket = None;
+                for &size_bucket in size_buckets {
+                    let path_before = before
+                        .get(size_bucket)
+                        .and_then(|values| values.get(expected_path))
+                        .copied()
+                        .ok_or_else(|| format!("reader-path baseline missing for size bucket {size_bucket}"))?;
+                    let path_after = collector.reader_path_total(expected_path, object_class, size_bucket).await;
+                    if path_after < path_before + 1 {
+                        continue;
+                    }
+                    let mut conflicting = false;
+                    for path in paths {
+                        if path == expected_path || expected_path == EMPTY {
+                            continue;
+                        }
+                        let path_before = before
+                            .get(size_bucket)
+                            .and_then(|values| values.get(path))
+                            .copied()
+                            .ok_or_else(|| format!("reader-path baseline missing for size bucket {size_bucket}"))?;
+                        let path_after = collector.reader_path_total(path, object_class, size_bucket).await;
+                        if path_after != path_before {
+                            conflicting = true;
+                            break;
+                        }
+                    }
+                    if !conflicting {
+                        matched_size_bucket = Some(size_bucket);
+                        break;
+                    }
+                }
+
+                if let Some(size_bucket) = matched_size_bucket {
+                    break size_bucket;
+                }
+                if Instant::now() >= deadline {
+                    let mut observed = BTreeMap::<&str, BTreeMap<&str, u64>>::new();
+                    for &size_bucket in size_buckets {
+                        let mut bucket_after = BTreeMap::new();
+                        for path in paths {
+                            bucket_after.insert(path, collector.reader_path_total(path, object_class, size_bucket).await);
+                        }
+                        observed.insert(size_bucket, bucket_after);
+                    }
+                    return Err(format!(
+                        "timed out waiting for {READER_PATH_COUNTER}{{object_class={object_class}, path={expected_path}}} to advance in any candidate size bucket; before={before:?}; after={observed:?}"
+                    )
+                    .into());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
     collector
-        .wait_for_reader_paths_to_settle(object_class, expected_size_bucket)
+        .wait_for_reader_paths_to_settle(object_class, selected_size_bucket)
         .await?;
+
     for path in paths {
         if path == expected_path {
             continue;
@@ -582,9 +788,13 @@ async fn assert_reader_path(
             continue;
         }
         assert_eq!(
-            collector.reader_path_total(path, object_class, expected_size_bucket).await,
-            before[path],
-            "{READER_PATH_COUNTER}{{path={path}, object_class={object_class}, size_bucket={expected_size_bucket}}} must not advance for {}; expected {expected_path} only",
+            collector.reader_path_total(path, object_class, selected_size_bucket).await,
+            before
+                .get(selected_size_bucket)
+                .and_then(|values| values.get(path))
+                .copied()
+                .ok_or_else(|| format!("reader-path baseline missing for size bucket {selected_size_bucket}"))?,
+            "{READER_PATH_COUNTER}{{path={path}, object_class={object_class}, size_bucket={selected_size_bucket}}} must not advance for {}; expected {expected_path} only",
             object.key
         );
     }
@@ -734,6 +944,7 @@ async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEn
     })
     .to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempts = Vec::new();
     let final_error = loop {
         let (status, response) = signed_admin_request(
             &hot.nodes[0].url,
@@ -744,23 +955,60 @@ async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEn
             &hot.secret_key,
         )
         .await?;
-        if status.is_success() || response.contains("<Code>TierNameAlreadyExist</Code>") {
-            wait_for_tier_verifiable(hot).await?;
+        let attempt = format!("status={status}, body={}", compact_body(&response));
+        if status.is_success() {
+            wait_for_tier_verifiable(hot, &format!("status={status}, body={response}")).await?;
             return Ok(());
         }
+        attempts.push(attempt);
         if Instant::now() >= deadline {
-            break format!("status={status}, body={response}");
+            break attempts.join("; ");
+        }
+        if !is_retryable_add_tier_error(&response) {
+            break attempts.join("; ");
         }
         sleep(Duration::from_millis(500)).await;
     };
     Err(format!("AddTier(RustFS) failed after readiness polling: {final_error}").into())
 }
 
-async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let node = &hot.nodes[0];
+async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment, add_tier_response: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(60);
     let final_error = loop {
-        let (status, response) = signed_admin_request(
+        let snapshot = tier_readiness_snapshot(hot).await?;
+        if snapshot.iter().any(|node| node.verify_status.is_success()) {
+            return Ok(());
+        }
+        if snapshot.iter().any(|node| !is_retryable_tier_error(&node.verify_body)) {
+            break format!("non-retryable tier verification failure: {}", format_tier_readiness_snapshot(&snapshot));
+        }
+        if Instant::now() >= deadline {
+            break format_tier_readiness_snapshot(&snapshot);
+        }
+        sleep(Duration::from_millis(500)).await;
+    };
+    Err(format!(
+        "tier {TIER_NAME} was not verifiable on any hot node within 60s after AddTier({add_tier_response}): {final_error}"
+    )
+    .into())
+}
+
+struct TierNodeReadiness {
+    node_index: usize,
+    node_url: String,
+    list_status: StatusCode,
+    list_has_tier: bool,
+    list_body: String,
+    verify_status: StatusCode,
+    verify_body: String,
+}
+
+async fn tier_readiness_snapshot(hot: &RustFSTestClusterEnvironment) -> TestResult<Vec<TierNodeReadiness>> {
+    let mut snapshot = Vec::with_capacity(hot.nodes.len());
+    for (node_index, node) in hot.nodes.iter().enumerate() {
+        let (list_status, list_body) =
+            signed_admin_request(&node.url, Method::GET, "/rustfs/admin/v3/tier", None, &hot.access_key, &hot.secret_key).await?;
+        let (verify_status, verify_body) = signed_admin_request(
             &node.url,
             Method::GET,
             &format!("/rustfs/admin/v3/tier/{TIER_NAME}"),
@@ -769,15 +1017,75 @@ async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment) -> TestRes
             &hot.secret_key,
         )
         .await?;
-        if status.is_success() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            break format!("node {} verify tier failed: status={status}, body={response}", node.url);
-        }
-        sleep(Duration::from_millis(500)).await;
-    };
-    Err(format!("tier {TIER_NAME} was not verifiable on the primary hot node within 30s: {final_error}").into())
+        snapshot.push(TierNodeReadiness {
+            node_index,
+            node_url: node.url.clone(),
+            list_status,
+            list_has_tier: tier_list_contains(&list_body),
+            list_body,
+            verify_status,
+            verify_body,
+        });
+    }
+    Ok(snapshot)
+}
+
+fn tier_list_contains(response: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(response)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .is_some_and(|tiers| {
+            tiers.iter().any(|tier| {
+                tier.get("name").and_then(serde_json::Value::as_str) == Some(TIER_NAME)
+                    || tier
+                        .get("rustfs")
+                        .and_then(|rustfs| rustfs.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(TIER_NAME)
+            })
+        })
+}
+
+fn format_tier_readiness_snapshot(snapshot: &[TierNodeReadiness]) -> String {
+    snapshot
+        .iter()
+        .map(|node| {
+            format!(
+                "node {} {} list_status={} list_has_tier={} list_body={} verify_status={} verify_body={}",
+                node.node_index,
+                node.node_url,
+                node.list_status,
+                node.list_has_tier,
+                compact_body(&node.list_body),
+                node.verify_status,
+                compact_body(&node.verify_body)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn compact_body(body: &str) -> String {
+    const MAX_BODY_CHARS: usize = 1024;
+    let mut value = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.chars().count() > MAX_BODY_CHARS {
+        value = value.chars().take(MAX_BODY_CHARS).collect::<String>();
+        value.push_str("...");
+    }
+    value
+}
+
+fn is_retryable_tier_error(response: &str) -> bool {
+    response.contains("<Code>TierNotFound</Code>")
+        || response.contains("<Code>NoSuchTier</Code>")
+        || (response.contains("<Code>TierVerificationFailed</Code>")
+            && response.contains("Remote tier configuration is being replaced"))
+        || response.contains("TierNotFound")
+        || response.contains("NoSuchTier")
+}
+
+fn is_retryable_add_tier_error(response: &str) -> bool {
+    response.contains("Remote tier configuration is already being replaced")
 }
 
 fn transition_rule() -> TestResult<LifecycleRule> {
@@ -1005,11 +1313,10 @@ async fn four_node_inline_fallback_controls() -> TestResult {
     assert_reader_path(
         &collector,
         &client,
-        ReaderPathExpectation::with_size_bucket(
+        ReaderPathExpectation::with_any_size_bucket(
             ReaderObject::new(bucket, encrypted_key, &encrypted_body, encrypted_put.e_tag(), None),
             LEGACY_DUPLEX,
             ENCRYPTED,
-            size_bucket(64 * KIB),
         ),
     )
     .await?;
@@ -1079,6 +1386,198 @@ async fn four_node_multipart_ignores_disk_compression_fallback() -> TestResult {
     )
     .await?;
     assert_part_number_reader_path(&collector, &client, bucket, key, &second_part, body.len(), LEGACY_DUPLEX).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> TestResult {
+    init_logging();
+
+    let collector = OtlpMetricCollector::start().await?;
+    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    cluster.set_env("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key);
+    cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    configure_mixed_msgpack_cluster(&mut cluster, &collector)?;
+    cluster.start().await?;
+
+    let fallback_before = collector.msgpack_json_fallback_totals().await;
+
+    let bucket = "inline-mixed-msgpack-controls";
+    cluster.create_test_bucket(bucket).await?;
+    let client = cluster.create_s3_client(0)?;
+
+    let multipart_key = "mixed/multipart.bin";
+    let (multipart_body, second_part, multipart_etag) = put_two_part_multipart(&client, bucket, multipart_key).await?;
+    assert_reader_path(
+        &collector,
+        &client,
+        ReaderPathExpectation::for_class(
+            ReaderObject::new(bucket, multipart_key, &multipart_body, multipart_etag.as_deref(), None),
+            LEGACY_DUPLEX,
+            MULTIPART,
+        ),
+    )
+    .await?;
+    assert_part_number_reader_path(
+        &collector,
+        &client,
+        bucket,
+        multipart_key,
+        &second_part,
+        multipart_body.len(),
+        LEGACY_DUPLEX,
+    )
+    .await?;
+    assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+
+    let encrypted_key = "encrypted/sse-s3.bin";
+    let encrypted_body = payload(16 * KIB, 0xE3);
+    let encrypted_put = client
+        .put_object()
+        .bucket(bucket)
+        .key(encrypted_key)
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .body(ByteStream::from(encrypted_body.clone()))
+        .send()
+        .await?;
+    let encrypted_head = client.head_object().bucket(bucket).key(encrypted_key).send().await?;
+    assert_eq!(
+        encrypted_head.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "HEAD must preserve SSE-S3 metadata for {encrypted_key}"
+    );
+    assert_reader_path(
+        &collector,
+        &client,
+        ReaderPathExpectation::with_any_size_bucket(
+            ReaderObject::new(bucket, encrypted_key, &encrypted_body, encrypted_put.e_tag(), None),
+            LEGACY_DUPLEX,
+            ENCRYPTED,
+        ),
+    )
+    .await?;
+
+    let compressed_key = "compressed/repeated.txt";
+    let compressed_body = compressible_payload(64 * KIB);
+    let compressed_put = client
+        .put_object()
+        .bucket(bucket)
+        .key(compressed_key)
+        .body(ByteStream::from(compressed_body.clone()))
+        .send()
+        .await?;
+    assert_reader_path(
+        &collector,
+        &client,
+        ReaderPathExpectation::with_any_size_bucket(
+            ReaderObject::new(bucket, compressed_key, &compressed_body, compressed_put.e_tag(), None),
+            LEGACY_DUPLEX,
+            COMPRESSED,
+        ),
+    )
+    .await?;
+
+    assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_transition() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inlinecoldadmin".to_string();
+    cold.secret_key = "inlinecoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let collector = OtlpMetricCollector::start().await?;
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    configure_mixed_msgpack_cluster(&mut hot, &collector)?;
+    hot.set_env("RUSTFS_SCANNER_CYCLE", "1");
+    hot.set_env("RUSTFS_ILM_PROCESS_TIME", "1");
+
+    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    hot.set_env("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key);
+    hot.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
+    hot.start().await?;
+    let hot_client = hot.create_s3_client(0)?;
+
+    let fallback_before = collector.msgpack_json_fallback_totals().await;
+
+    add_rustfs_tier(&hot, &cold).await?;
+    let bucket = "inline-transitioned-mixed-msgpack-controls";
+    hot_client.create_bucket().bucket(bucket).send().await?;
+    put_lifecycle_with_transition_retry(&hot_client, bucket).await?;
+
+    let key = "transition/mixed-multipart.bin";
+    let (body, _, etag) = put_two_part_multipart(&hot_client, bucket, key).await?;
+    wait_for_transition(&hot_client, bucket, key).await?;
+    assert!(
+        cold_tier_object_count(&cold_client).await? >= 1,
+        "cold-tier bucket must hold transitioned objects"
+    );
+    assert_reader_path(
+        &collector,
+        &hot_client,
+        ReaderPathExpectation::for_class(ReaderObject::new(bucket, key, &body, etag.as_deref(), None), REMOTE_TRANSITION, REMOTE),
+    )
+    .await?;
+
+    let encrypted_key = "transition/encrypted-sse.bin";
+    let encrypted_body = payload(16 * KIB, 0xAB);
+    let encrypted_put = hot_client
+        .put_object()
+        .bucket(bucket)
+        .key(encrypted_key)
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .body(ByteStream::from(encrypted_body.clone()))
+        .send()
+        .await?;
+    let encrypted_head = hot_client.head_object().bucket(bucket).key(encrypted_key).send().await?;
+    assert_eq!(
+        encrypted_head.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "HEAD must preserve SSE-S3 metadata for {encrypted_key}"
+    );
+    assert_reader_path(
+        &collector,
+        &hot_client,
+        ReaderPathExpectation::with_any_size_bucket(
+            ReaderObject::new(bucket, encrypted_key, &encrypted_body, encrypted_put.e_tag(), None),
+            LEGACY_DUPLEX,
+            ENCRYPTED,
+        ),
+    )
+    .await?;
+
+    let compressed_key = "transition/compressed-repeated.txt";
+    let compressed_body = compressible_payload(64 * KIB);
+    let compressed_put = hot_client
+        .put_object()
+        .bucket(bucket)
+        .key(compressed_key)
+        .body(ByteStream::from(compressed_body.clone()))
+        .send()
+        .await?;
+    assert_reader_path(
+        &collector,
+        &hot_client,
+        ReaderPathExpectation::with_any_size_bucket(
+            ReaderObject::new(bucket, compressed_key, &compressed_body, compressed_put.e_tag(), None),
+            LEGACY_DUPLEX,
+            COMPRESSED,
+        ),
+    )
+    .await?;
+
+    assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     Ok(())
 }

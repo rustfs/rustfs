@@ -47,7 +47,6 @@ use super::storage_api::bucket_usecase::contract::bucket::{
 use super::storage_api::bucket_usecase::contract::list::{
     ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _,
 };
-use super::storage_api::bucket_usecase::data_usage::remove_bucket_usage_from_backend;
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::bucket_usecase::object_utils::to_s3s_etag;
@@ -120,13 +119,18 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fmt::Display,
+    future::Future,
     io::Write,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
-use tracing::{debug, error, info, instrument, warn};
+use tokio::sync::{Semaphore, TryAcquireError};
+use tracing::{Instrument as _, debug, error, info, instrument, warn};
 
 const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_BUCKET: &str = "bucket";
+const BUCKET_OPERATION_CONCURRENCY: usize = 8;
+static BUCKET_OPERATION_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(BUCKET_OPERATION_CONCURRENCY)));
 use urlencoding::encode;
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -1087,6 +1091,40 @@ pub struct DefaultBucketUsecase {
     context: Option<Arc<AppContext>>,
 }
 
+async fn await_bucket_usecase_on_fresh_task<T, F>(operation: &'static str, future: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = S3Result<T>> + Send + 'static,
+{
+    await_bucket_usecase_on_fresh_task_with_admission(operation, Arc::clone(&BUCKET_OPERATION_ADMISSION), future).await
+}
+
+async fn await_bucket_usecase_on_fresh_task_with_admission<T, F>(
+    operation: &'static str,
+    admission: Arc<Semaphore>,
+    future: F,
+) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = S3Result<T>> + Send + 'static,
+{
+    let permit = admission.try_acquire_owned().map_err(|err| match err {
+        TryAcquireError::NoPermits => {
+            S3Error::with_message(S3ErrorCode::SlowDown, format!("{operation} concurrency limit reached; retry later"))
+        }
+        TryAcquireError::Closed => S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} admission closed")),
+    })?;
+    tokio::spawn(
+        async move {
+            let _permit = permit;
+            future.await
+        }
+        .in_current_span(),
+    )
+    .await
+    .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} task failed: {err}")))?
+}
+
 impl DefaultBucketUsecase {
     #[cfg(test)]
     pub fn without_context() -> Self {
@@ -1121,6 +1159,11 @@ impl DefaultBucketUsecase {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+        let usecase = self.clone();
+        await_bucket_usecase_on_fresh_task("bucket creation", async move { usecase.execute_create_bucket_inner(req).await }).await
+    }
+
+    async fn execute_create_bucket_inner(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
         let requester_is_owner = match req_info_ref(&req) {
             Ok(r) => r.is_owner,
@@ -1179,7 +1222,15 @@ impl DefaultBucketUsecase {
     }
 
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_delete_bucket(&self, mut req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+    pub async fn execute_delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let usecase = self.clone();
+        await_bucket_usecase_on_fresh_task("bucket deletion", async move { usecase.execute_delete_bucket_inner(req).await }).await
+    }
+
+    async fn execute_delete_bucket_inner(
+        &self,
+        mut req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketRemoved, S3Operation::DeleteBucket);
         let input = req.input.clone();
 
@@ -1218,12 +1269,8 @@ impl DefaultBucketUsecase {
         // Invalidate bucket validation cache
         crate::storage::invalidate_bucket_validation_cache(&input.bucket);
 
-        // Re-evaluate lifecycle/replication after bucket removal and keep an
-        // absent-bucket dirty marker until a complete usage snapshot is durable.
+        // Re-evaluate lifecycle and replication after bucket removal.
         rustfs_scanner::record_scanner_maintenance_change(&input.bucket);
-        if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
-            warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");
-        }
 
         if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
@@ -2633,6 +2680,155 @@ mod tests {
         ServerSideEncryptionConfiguration, Tag, Transition, TransitionStorageClass,
     };
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn bucket_usecase_task_finishes_post_commit_hooks_after_parent_cancellation() {
+        let admission = Arc::new(Semaphore::new(1));
+        let committed = Arc::new(Notify::new());
+        let committed_wait = committed.notified();
+        let release_hook = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let finished_wait = finished.notified();
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let committed_for_task = committed.clone();
+        let release_hook_for_task = release_hook.clone();
+        let finished_for_task = finished.clone();
+        let hook_ran_for_task = hook_ran.clone();
+        let parent = tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+            "test bucket operation",
+            admission.clone(),
+            async move {
+                committed_for_task.notify_one();
+                release_hook_for_task.notified().await;
+                hook_ran_for_task.store(true, Ordering::SeqCst);
+                finished_for_task.notify_one();
+                Ok(())
+            },
+        ));
+        committed_wait.await;
+
+        parent.abort();
+        let _ = parent.await;
+        release_hook.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), finished_wait)
+            .await
+            .expect("the post-commit hook should finish after request cancellation");
+
+        assert!(
+            hook_ran.load(Ordering::SeqCst),
+            "the fresh task must own both the storage mutation and its post-commit hooks"
+        );
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn saturated_bucket_usecase_admission_does_not_start_work() {
+        let admission = Arc::new(Semaphore::new(1));
+        let held = admission
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test admission should remain open");
+        let started = Arc::new(AtomicBool::new(false));
+        let started_for_task = started.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async move {
+                started_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await
+        .expect("saturated admission must fail within the bounded timeout");
+        drop(held);
+
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "saturated admission must not start a detached bucket operation"
+        );
+        assert_eq!(result.expect_err("saturated admission must fail fast").code(), &S3ErrorCode::SlowDown);
+    }
+
+    #[tokio::test]
+    async fn bucket_usecase_admission_rejects_excess_detached_tasks() {
+        let admission = Arc::new(Semaphore::new(BUCKET_OPERATION_CONCURRENCY));
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(BUCKET_OPERATION_CONCURRENCY);
+
+        for _ in 0..BUCKET_OPERATION_CONCURRENCY {
+            let admission_for_task = admission.clone();
+            let release_for_task = release.clone();
+            let started_for_task = started.clone();
+            tasks.push(tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+                "test bucket operation",
+                admission_for_task,
+                async move {
+                    started_for_task.fetch_add(1, Ordering::SeqCst);
+                    let _release = release_for_task
+                        .acquire()
+                        .await
+                        .expect("test release gate should remain open");
+                    Ok(())
+                },
+            )));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) != BUCKET_OPERATION_CONCURRENCY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all admitted operations should start");
+
+        let ninth_started = Arc::new(AtomicBool::new(false));
+        let ninth_started_for_task = ninth_started.clone();
+        let ninth_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission.clone(), async move {
+                ninth_started_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await
+        .expect("an excess bucket transaction must fail within the bounded timeout");
+        assert!(
+            !ninth_started.load(Ordering::SeqCst),
+            "the ninth bucket transaction must not start when admission is saturated"
+        );
+        assert_eq!(
+            ninth_result.expect_err("the ninth bucket transaction must fail fast").code(),
+            &S3ErrorCode::SlowDown
+        );
+
+        release.add_permits(BUCKET_OPERATION_CONCURRENCY);
+        for task in tasks {
+            task.await
+                .expect("bucket transaction parent should join")
+                .expect("bucket transaction should succeed");
+        }
+
+        await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async { Ok(()) })
+            .await
+            .expect("admission must recover after active transactions finish");
+    }
+
+    #[tokio::test]
+    async fn bucket_usecase_task_maps_panics_to_internal_errors() {
+        async fn panicking_bucket_operation() -> S3Result<()> {
+            panic!("injected bucket task panic");
+        }
+
+        let result = await_bucket_usecase_on_fresh_task("test bucket operation", panicking_bucket_operation()).await;
+
+        let err = result.expect_err("a bucket task panic must be returned as an error");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert!(err.message().is_some_and(|message| message.contains("task failed")));
+    }
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -2660,6 +2856,25 @@ mod tests {
         let rest = &source[start + start_marker.len()..];
         let end = rest.find("\n    pub async fn ").unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    #[test]
+    fn bucket_create_and_delete_use_admitted_fresh_tasks() {
+        let source = include_str!("bucket_usecase.rs");
+        for (method, operation, inner_method) in [
+            ("execute_create_bucket", "bucket creation", "execute_create_bucket_inner"),
+            ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner"),
+        ] {
+            let body = usecase_method_source(source, method);
+            assert!(
+                body.contains(&format!("await_bucket_usecase_on_fresh_task(\"{operation}\"")),
+                "{method} must use bounded detached-task admission"
+            );
+            assert!(
+                body.contains(&format!("{inner_method}(req).await")),
+                "{method} must run its mutation inside the admitted task"
+            );
+        }
     }
 
     #[test]

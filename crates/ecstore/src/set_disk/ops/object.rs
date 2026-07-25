@@ -21,6 +21,7 @@
 
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
@@ -31,6 +32,7 @@ use crate::bucket::lifecycle::{
         save_transition_transaction_record,
     },
 };
+use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
@@ -639,7 +641,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // task so it lives for the duration of the streaming read.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
-            let mut writer = wd;
+            let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
@@ -664,24 +666,43 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             .await
             {
                 let reason = classify_storage_error(&e);
-                record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
-                error!(
-                    event = EVENT_SET_DISK_WRITE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                    bucket,
-                    object,
-                    pool_index,
-                    set_index,
-                    offset,
-                    requested_length = length,
-                    skip_verify_bitrot = skip_verify,
-                    state = "read_pipeline_failed",
-                    stage = GET_STAGE_EMIT,
-                    reason = reason.as_str(),
-                    error = ?e,
-                    "Set disk object read pipeline failed"
-                );
+                if reason == GetObjectFailureReason::DownstreamClosed {
+                    debug!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        state = "downstream_closed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline stopped after downstream closed"
+                    );
+                } else {
+                    record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
+                    error!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        skip_verify_bitrot = skip_verify,
+                        state = "read_pipeline_failed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline failed"
+                    );
+                }
             };
         });
 
@@ -980,11 +1001,7 @@ impl SetDisks {
                 let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
 
-            let mod_time = if let Some(mod_time) = opts.mod_time {
-                Some(mod_time)
-            } else {
-                Some(OffsetDateTime::now_utc())
-            };
+            let mod_time = opts.mod_time;
 
             // Drop any disk whose shard did not fully commit (offline at writer
             // setup, short write, or a write/shutdown error) so its truncated or
@@ -1052,6 +1069,45 @@ impl SetDisks {
 
             if !opts.no_lock && object_lock_guard.is_none() {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+            }
+
+            // Generate ordinary PUT timestamps under the commit lock so version
+            // ordering follows durable commit ordering when writers queued on
+            // the same object. Internal callers with an explicit timestamp keep
+            // their supplied value.
+            if opts.mod_time.is_none() {
+                let commit_time = Some(OffsetDateTime::now_utc());
+                for pfi in &mut parts_metadatas {
+                    pfi.mod_time = commit_time;
+                    for part in &mut pfi.parts {
+                        part.mod_time = commit_time;
+                    }
+                }
+            }
+
+            if let Some(expected) = opts.expected_current_version_id.as_deref() {
+                let current = self
+                    .get_object_info(
+                        bucket,
+                        object,
+                        &ObjectOptions {
+                            no_lock: true,
+                            metadata_cache_safe: false,
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                            StorageError::PreconditionFailed
+                        } else {
+                            err
+                        }
+                    })?;
+                if current.version_id.map(|version| version.to_string()).as_deref() != Some(expected) {
+                    return Err(StorageError::PreconditionFailed);
+                }
             }
 
             // Phase 2 (backlog#899): fence the commit on lock loss. If the refresh
@@ -2302,6 +2358,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             )
         };
 
+        if let Some(expected) = dst_opts.expected_current_version_id.as_deref() {
+            let current = self
+                .get_object_info(
+                    dst_bucket,
+                    dst_object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        StorageError::PreconditionFailed
+                    } else {
+                        err
+                    }
+                })?;
+            if current.version_id.map(|version| version.to_string()).as_deref() != Some(expected) {
+                return Err(StorageError::PreconditionFailed);
+            }
+        }
+
         self.invalidate_get_object_metadata_cache(dst_bucket, dst_object).await;
 
         if dst_opts.http_preconditions.is_some()
@@ -2944,6 +3025,34 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             self.invalidate_all_get_object_metadata_cache();
             return Ok(ObjectInfo::default());
+        }
+
+        if let Some(expected) = opts.expected_current_version_id.as_deref() {
+            let current = self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        StorageError::PreconditionFailed
+                    } else {
+                        err
+                    }
+                })?;
+            if !current.delete_marker
+                || current.version_id.map(|version| version.to_string()).as_deref() != Some(expected)
+                || opts.version_id.as_deref() != Some(expected)
+            {
+                return Err(StorageError::PreconditionFailed);
+            }
         }
 
         // TODO: Lifecycle

@@ -768,6 +768,7 @@ pub struct Metrics {
     last_scan_cycle_replication_checks: AtomicU64,
     last_scan_cycle_usage_saves: AtomicU64,
     failed_scan_cycles: AtomicU64,
+    superseded_scan_cycles: AtomicU64,
     partial_scan_cycles_unknown: AtomicU64,
     partial_scan_cycles_runtime: AtomicU64,
     partial_scan_cycles_objects: AtomicU64,
@@ -833,10 +834,12 @@ const SCAN_CYCLE_RESULT_UNKNOWN: u8 = 0;
 const SCAN_CYCLE_RESULT_SUCCESS: u8 = 1;
 const SCAN_CYCLE_RESULT_ERROR: u8 = 2;
 const SCAN_CYCLE_RESULT_PARTIAL: u8 = 3;
+const SCAN_CYCLE_RESULT_SUPERSEDED: u8 = 4;
 const SCAN_CYCLE_RESULT_UNKNOWN_LABEL: &str = "unknown";
 const SCAN_CYCLE_RESULT_SUCCESS_LABEL: &str = "success";
 const SCAN_CYCLE_RESULT_ERROR_LABEL: &str = "error";
 const SCAN_CYCLE_RESULT_PARTIAL_LABEL: &str = "partial";
+const SCAN_CYCLE_RESULT_SUPERSEDED_LABEL: &str = "superseded";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScanCyclePartialReason {
@@ -1208,6 +1211,8 @@ pub struct ScannerMetricsReport {
     pub last_cycle_usage_saves: u64,
     pub failed_cycles: u64,
     #[serde(default)]
+    pub superseded_cycles: u64,
+    #[serde(default)]
     pub partial_cycles_unknown: u64,
     #[serde(default)]
     pub partial_cycles_runtime: u64,
@@ -1310,6 +1315,7 @@ fn scan_cycle_result_label(result: u8) -> &'static str {
         SCAN_CYCLE_RESULT_SUCCESS => SCAN_CYCLE_RESULT_SUCCESS_LABEL,
         SCAN_CYCLE_RESULT_ERROR => SCAN_CYCLE_RESULT_ERROR_LABEL,
         SCAN_CYCLE_RESULT_PARTIAL => SCAN_CYCLE_RESULT_PARTIAL_LABEL,
+        SCAN_CYCLE_RESULT_SUPERSEDED => SCAN_CYCLE_RESULT_SUPERSEDED_LABEL,
         _ => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
     }
 }
@@ -1633,6 +1639,11 @@ pub fn emit_scan_cycle_partial_with_source(
     metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_PARTIAL_LABEL).increment(1);
 }
 
+pub fn emit_scan_cycle_superseded(duration: Duration) {
+    global_metrics().record_scan_cycle_superseded(duration);
+    metrics::counter!(OTEL_SCANNER_CYCLES, "result" => SCAN_CYCLE_RESULT_SUPERSEDED_LABEL).increment(1);
+}
+
 pub fn emit_scan_bucket_drive_complete(success: bool, bucket: &str, disk: &str, duration: Duration) {
     let result = if success { "success" } else { "error" };
     metrics::counter!(
@@ -1726,6 +1737,7 @@ impl Metrics {
             last_scan_cycle_replication_checks: AtomicU64::new(0),
             last_scan_cycle_usage_saves: AtomicU64::new(0),
             failed_scan_cycles: AtomicU64::new(0),
+            superseded_scan_cycles: AtomicU64::new(0),
             partial_scan_cycles_unknown: AtomicU64::new(0),
             partial_scan_cycles_runtime: AtomicU64::new(0),
             partial_scan_cycles_objects: AtomicU64::new(0),
@@ -2349,6 +2361,18 @@ impl Metrics {
             .store(duration_millis_saturated(duration), Ordering::Relaxed);
     }
 
+    pub fn record_scan_cycle_superseded(&self, duration: Duration) {
+        self.record_scanner_cycle_end_time();
+        self.superseded_scan_cycles.fetch_add(1, Ordering::Relaxed);
+        self.last_scan_cycle_result
+            .store(SCAN_CYCLE_RESULT_SUPERSEDED, Ordering::Relaxed);
+        self.last_scan_cycle_partial_reason
+            .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
+        self.last_scan_cycle_partial_source.store(0, Ordering::Relaxed);
+        self.last_scan_cycle_duration_millis
+            .store(duration_millis_saturated(duration), Ordering::Relaxed);
+    }
+
     pub fn record_scan_cycle_partial(&self, duration: Duration, reason: ScanCyclePartialReason) {
         self.record_scan_cycle_partial_with_source(duration, reason, None);
     }
@@ -2802,6 +2826,7 @@ impl Metrics {
         m.last_cycle_replication_repair =
             self.scanner_replication_repair_work_counter_snapshots(&self.last_scan_cycle_replication_repair_work);
         m.failed_cycles = self.failed_scan_cycles.load(Ordering::Relaxed);
+        m.superseded_cycles = self.superseded_scan_cycles.load(Ordering::Relaxed);
         m.partial_cycles_unknown = self.partial_scan_cycles_unknown.load(Ordering::Relaxed);
         m.partial_cycles_runtime = self.partial_scan_cycles_runtime.load(Ordering::Relaxed);
         m.partial_cycles_objects = self.partial_scan_cycles_objects.load(Ordering::Relaxed);
@@ -2950,19 +2975,15 @@ pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> 
 
 /// Register a new disk in the global path tracker and return two callbacks:
 /// one to update the current path and one to deregister the disk when done.
-pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
+pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
     let tracker = Arc::new(CurrentPathTracker::new(initial.to_string()));
     let disk_name = disk.to_string();
 
-    let tracker_clone = Arc::clone(&tracker);
-    let disk_insert = disk_name.clone();
-    tokio::spawn(async move {
-        global_metrics()
-            .current_paths
-            .write()
-            .await
-            .insert(disk_insert, tracker_clone);
-    });
+    global_metrics()
+        .current_paths
+        .write()
+        .await
+        .insert(disk_name.clone(), Arc::clone(&tracker));
 
     let update_fn: UpdateCurrentPathFn = {
         let tracker = Arc::clone(&tracker);
@@ -2990,23 +3011,28 @@ pub fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, 
 // CloseDiskGuard
 // ---------------------------------------------------------------------------
 
-pub struct CloseDiskGuard(CloseDiskFn);
+pub struct CloseDiskGuard(Option<CloseDiskFn>);
 
 impl CloseDiskGuard {
     pub fn new(close_disk: CloseDiskFn) -> Self {
-        Self(close_disk)
+        Self(Some(close_disk))
     }
 
-    pub async fn close(&self) {
-        self.0().await;
+    pub async fn close(&mut self) {
+        let Some(close_disk) = self.0.clone() else {
+            return;
+        };
+        close_disk().await;
+        self.0 = None;
     }
 }
 
 impl Drop for CloseDiskGuard {
     fn drop(&mut self) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let close_fn = self.0.clone();
-            handle.spawn(async move { close_fn().await });
+        if let Some(close_disk) = self.0.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(close_disk());
         }
         // If there is no runtime we are in a test or shutdown path; skip cleanup.
     }
@@ -3015,6 +3041,61 @@ impl Drop for CloseDiskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn close_disk_guard_runs_cleanup_when_an_early_return_drops_it() {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let closed_tx = Arc::new(std::sync::Mutex::new(Some(closed_tx)));
+        let close_disk: CloseDiskFn = {
+            let closed_tx = Arc::clone(&closed_tx);
+            Arc::new(move || {
+                let closed_tx = closed_tx.lock().expect("close callback lock").take();
+                Box::pin(async move {
+                    if let Some(closed_tx) = closed_tx {
+                        let _ = closed_tx.send(());
+                    }
+                })
+            })
+        };
+
+        let guard = CloseDiskGuard::new(close_disk);
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), closed_rx)
+            .await
+            .expect("drop cleanup should run")
+            .expect("drop cleanup should signal");
+    }
+
+    #[tokio::test]
+    async fn close_disk_guard_runs_explicit_cleanup_once() {
+        let close_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let close_disk: CloseDiskFn = {
+            let close_count = Arc::clone(&close_count);
+            Arc::new(move || {
+                close_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(std::future::ready(()))
+            })
+        };
+
+        let mut guard = CloseDiskGuard::new(close_disk);
+        guard.close().await;
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert_eq!(close_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn current_path_updater_registers_before_return() {
+        let disk = format!("test-disk-{}", uuid::Uuid::new_v4());
+        let (_update_path, close_disk) = current_path_updater(&disk, "bucket-a").await;
+
+        assert!(global_metrics().current_paths.read().await.contains_key(&disk));
+
+        close_disk().await;
+        assert!(!global_metrics().current_paths.read().await.contains_key(&disk));
+    }
 
     #[tokio::test]
     async fn report_counts_active_scan_paths() {
@@ -3848,6 +3929,21 @@ mod tests {
         assert_eq!(report.last_cycle_result_code, SCAN_CYCLE_RESULT_ERROR as u64);
         assert_eq!(report.last_cycle_duration_seconds, 1.5);
         assert_eq!(report.failed_cycles, 1);
+    }
+
+    #[tokio::test]
+    async fn report_tracks_superseded_cycle_without_failed_increment() {
+        let metrics = Metrics::new();
+        metrics.record_scan_cycle_superseded(Duration::from_millis(750));
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.last_cycle_result, SCAN_CYCLE_RESULT_SUPERSEDED_LABEL);
+        assert_eq!(report.last_cycle_result_code, u64::from(SCAN_CYCLE_RESULT_SUPERSEDED));
+        assert_eq!(report.last_cycle_duration_seconds, 0.75);
+        assert_eq!(report.failed_cycles, 0);
+        assert_eq!(report.superseded_cycles, 1);
+        assert_eq!(report.partial_cycles, 0);
     }
 
     #[tokio::test]

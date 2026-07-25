@@ -231,6 +231,13 @@ impl DiskError {
         }
     }
 
+    pub fn is_internode_http_status(&self, status: u16) -> bool {
+        matches!(
+            self.internode_http_error_kind(),
+            Some(InternodeHttpErrorKind::HttpStatus(actual)) if actual.as_u16() == status
+        )
+    }
+
     // /// If all errors are of the same fatal disk error type, returns the corresponding error.
     // /// Otherwise, returns Ok.
     // pub fn check_disk_fatal_errs(errs: &[Option<Error>]) -> Result<()> {
@@ -979,6 +986,17 @@ mod tests {
 
         assert!(disk_error.contains_io_error_kind(std::io::ErrorKind::BrokenPipe));
         assert!(!disk_error.contains_io_error_kind(std::io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn test_internode_http_status_classification() {
+        let too_many_requests = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::TOO_MANY_REQUESTS),
+        ));
+
+        assert!(too_many_requests.is_internode_http_status(429));
+        assert!(!too_many_requests.is_internode_http_status(500));
+        assert!(!DiskError::FileNotFound.is_internode_http_status(429));
     }
 
     #[test]
