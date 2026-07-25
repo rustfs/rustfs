@@ -62,6 +62,8 @@ pub(crate) const RUNTIME_CAPABILITIES_ROUTE_SUFFIX: &str = "/v4/runtime/capabili
 const SITE_REPLICATION_INFO_ROUTE: &str = "/rustfs/admin/v3/site-replication/info";
 const SITE_REPLICATION_EDIT_ROUTE: &str = "/rustfs/admin/v3/site-replication/edit";
 const SITE_REPLICATION_RESYNC_ROUTE: &str = "/rustfs/admin/v3/site-replication/resync/op";
+const SITE_REPLICATION_REPAIR_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair";
+const SITE_REPLICATION_REPAIR_STATUS_ROUTE: &str = "/rustfs/admin/v3/site-replication/repair/status";
 
 macro_rules! log_system_request_rejected {
     ($operation:expr, $reason:expr) => {
@@ -631,19 +633,59 @@ pub struct RuntimeCapabilitiesSummary {
     pub site_replication_edit: CapabilityStatus,
     #[serde(default)]
     pub site_replication_resync: CapabilityStatus,
+    #[serde(default)]
+    pub site_replication_repair: CapabilityStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
     pub diagnostic_probes: DiagnosticProbeCapabilities,
+    pub inspect_archive: super::inspect_archive::InspectArchiveCapability,
     pub storage_classes: StorageClassCapabilities,
+    pub site_replication_repair: SiteReplicationRepairCapabilities,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<CapabilityStatus>,
     pub observability: crate::admin::storage_api::cluster::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SiteReplicationRepairCapabilities {
+    pub contract_version: u32,
+    pub status: CapabilityStatus,
+    pub modes: [&'static str; 2],
+    pub execute_route: &'static str,
+    pub status_route: &'static str,
+    pub preflight_token_contract: &'static str,
+    pub operation_id_format: &'static str,
+    pub max_retained_successful_operations: usize,
+    pub disabled_by_default: bool,
+}
+
+impl SiteReplicationRepairCapabilities {
+    fn current() -> Self {
+        let execute = admin_route_capability(HttpMethod::Put, SITE_REPLICATION_REPAIR_ROUTE);
+        let status = admin_route_capability(HttpMethod::Get, SITE_REPLICATION_REPAIR_STATUS_ROUTE);
+        let supported = execute.state == CapabilityState::Supported && status.state == CapabilityState::Supported;
+        Self {
+            contract_version: 1,
+            status: if supported {
+                CapabilityStatus::supported().with_reason("durable dry-run, execute, and status contracts are registered")
+            } else {
+                CapabilityStatus::unsupported().with_reason("one or more durable repair routes are unavailable")
+            },
+            modes: ["dry-run", "execute"],
+            execute_route: SITE_REPLICATION_REPAIR_ROUTE,
+            status_route: SITE_REPLICATION_REPAIR_STATUS_ROUTE,
+            preflight_token_contract: "hmac-sha256-v1",
+            operation_id_format: "uuid",
+            max_retained_successful_operations: 32,
+            disabled_by_default: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -767,6 +809,7 @@ pub(crate) async fn build_runtime_capabilities_response()
     let observability = observability_provider.observability_snapshot().await?;
     let workload_admission = workload_admission_registry_snapshot();
     let cluster_snapshot_discovery = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
+    let local_drive_count = crate::storage::all_local_disk().await.len();
 
     let (topology, topology_status) = if let Some(endpoint_pools) = current_endpoints_handle() {
         let topology_provider = EndpointTopologySnapshotProvider::new(endpoint_pools);
@@ -785,7 +828,9 @@ pub(crate) async fn build_runtime_capabilities_response()
     Ok(RuntimeCapabilitiesResponse {
         summary,
         diagnostic_probes: DiagnosticProbeCapabilities::current(),
+        inspect_archive: super::inspect_archive::InspectArchiveCapability::current(local_drive_count),
         storage_classes: StorageClassCapabilities::current(),
+        site_replication_repair: SiteReplicationRepairCapabilities::current(),
         cluster_snapshot_path: usecase.cluster_snapshot_route().to_string(),
         cluster_snapshot_summary: cluster_snapshot_discovery.summary,
         observability,
@@ -862,6 +907,7 @@ fn build_runtime_capabilities_summary(
         site_replication_info: admin_route_capability(HttpMethod::Get, SITE_REPLICATION_INFO_ROUTE),
         site_replication_edit: admin_route_capability(HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE),
         site_replication_resync: admin_route_capability(HttpMethod::Put, SITE_REPLICATION_RESYNC_ROUTE),
+        site_replication_repair: SiteReplicationRepairCapabilities::current().status,
     }
 }
 
@@ -994,9 +1040,10 @@ impl Operation for DataUsageInfoHandler {
 mod tests {
     use super::{
         OBSERVABILITY_SUMMARY_RESOLVED, RuntimeCapabilitiesHandler, SITE_REPLICATION_EDIT_ROUTE, SITE_REPLICATION_INFO_ROUTE,
-        SITE_REPLICATION_RESYNC_ROUTE, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
-        admin_route_capability_from_inventory, build_runtime_capabilities_response, build_runtime_capabilities_summary,
-        data_usage_info_gate_actions, runtime_capabilities_gate_actions, system_admin_discovery,
+        SITE_REPLICATION_REPAIR_ROUTE, SITE_REPLICATION_REPAIR_STATUS_ROUTE, SITE_REPLICATION_RESYNC_ROUTE, ServerInfoResponse,
+        TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED, admin_route_capability_from_inventory,
+        build_runtime_capabilities_response, build_runtime_capabilities_summary, data_usage_info_gate_actions,
+        runtime_capabilities_gate_actions, system_admin_discovery,
     };
     use crate::admin::router::Operation;
     use crate::admin::runtime_sources::DefaultAdminUsecase;
@@ -1048,6 +1095,16 @@ mod tests {
         assert_eq!(response.summary.site_replication_info.state, CapabilityState::Supported);
         assert_eq!(response.summary.site_replication_edit.state, CapabilityState::Supported);
         assert_eq!(response.summary.site_replication_resync.state, CapabilityState::Supported);
+        assert_eq!(response.summary.site_replication_repair.state, CapabilityState::Supported);
+        assert_eq!(response.site_replication_repair.contract_version, 1);
+        assert_eq!(response.site_replication_repair.status.state, CapabilityState::Supported);
+        assert_eq!(response.site_replication_repair.modes, ["dry-run", "execute"]);
+        assert_eq!(response.site_replication_repair.execute_route, SITE_REPLICATION_REPAIR_ROUTE);
+        assert_eq!(response.site_replication_repair.status_route, SITE_REPLICATION_REPAIR_STATUS_ROUTE);
+        assert_eq!(response.site_replication_repair.preflight_token_contract, "hmac-sha256-v1");
+        assert_eq!(response.site_replication_repair.operation_id_format, "uuid");
+        assert_eq!(response.site_replication_repair.max_retained_successful_operations, 32);
+        assert!(!response.site_replication_repair.disabled_by_default);
         assert_eq!(response.diagnostic_probes.contract_version, 1);
         assert_eq!(response.diagnostic_probes.health_info.status.state, CapabilityState::Supported);
         assert_eq!(response.diagnostic_probes.observed_drive_metrics.mode, "observed_storage_metrics");
@@ -1084,6 +1141,14 @@ mod tests {
         assert_eq!(value["summary"]["site_replication_info"]["state"], "supported");
         assert_eq!(value["summary"]["site_replication_edit"]["state"], "supported");
         assert_eq!(value["summary"]["site_replication_resync"]["state"], "supported");
+        assert_eq!(value["summary"]["site_replication_repair"]["state"], "supported");
+        assert_eq!(value["site_replication_repair"]["contract_version"], 1);
+        assert_eq!(value["site_replication_repair"]["status"]["state"], "supported");
+        assert_eq!(value["site_replication_repair"]["modes"], json!(["dry-run", "execute"]));
+        assert_eq!(value["site_replication_repair"]["execute_route"], SITE_REPLICATION_REPAIR_ROUTE);
+        assert_eq!(value["site_replication_repair"]["status_route"], SITE_REPLICATION_REPAIR_STATUS_ROUTE);
+        assert_eq!(value["site_replication_repair"]["max_retained_successful_operations"], 32);
+        assert_eq!(value["site_replication_repair"]["disabled_by_default"], false);
         assert_eq!(value["diagnostic_probes"]["client_devnull"]["status"]["state"], "supported");
         assert_eq!(
             value["diagnostic_probes"]["client_devnull"]["max_bytes"],
@@ -1109,6 +1174,8 @@ mod tests {
             (HttpMethod::Get, SITE_REPLICATION_INFO_ROUTE),
             (HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE),
             (HttpMethod::Put, SITE_REPLICATION_RESYNC_ROUTE),
+            (HttpMethod::Put, SITE_REPLICATION_REPAIR_ROUTE),
+            (HttpMethod::Get, SITE_REPLICATION_REPAIR_STATUS_ROUTE),
         ] {
             assert_eq!(
                 admin_route_capability_from_inventory(
@@ -1167,6 +1234,7 @@ mod tests {
         assert_eq!(summary.site_replication_info.state, CapabilityState::Unknown);
         assert_eq!(summary.site_replication_edit.state, CapabilityState::Unknown);
         assert_eq!(summary.site_replication_resync.state, CapabilityState::Unknown);
+        assert_eq!(summary.site_replication_repair.state, CapabilityState::Unknown);
     }
 
     #[tokio::test]

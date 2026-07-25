@@ -1209,9 +1209,28 @@ impl Node for NodeService {
 
     async fn get_bucket_stats(
         &self,
-        _request: Request<GetBucketStatsDataRequest>,
+        request: Request<GetBucketStatsDataRequest>,
     ) -> Result<Response<GetBucketStatsDataResponse>, Status> {
-        Err(unimplemented_rpc("get_bucket_stats"))
+        let bucket = request.into_inner().bucket;
+        if bucket.is_empty() {
+            return Err(Status::invalid_argument("bucket is required"));
+        }
+        let context = self.context.clone().or_else(runtime_sources::current_app_context);
+        let Some(stats) = runtime_sources::current_replication_stats_handle_for_context(context.as_deref()) else {
+            return Ok(Response::new(GetBucketStatsDataResponse {
+                success: false,
+                bucket_stats: Bytes::new(),
+                error_info: Some("replication statistics provider is unavailable".to_string()),
+            }));
+        };
+        let bucket_stats = stats.get_latest_replication_stats(&bucket).await;
+        let bucket_stats =
+            rmp_serde::to_vec_named(&bucket_stats).map_err(|_| Status::internal("failed to serialize replication statistics"))?;
+        Ok(Response::new(GetBucketStatsDataResponse {
+            success: true,
+            bucket_stats: bucket_stats.into(),
+            error_info: None,
+        }))
     }
 
     async fn get_sr_metrics(
@@ -4428,12 +4447,11 @@ mod tests {
                 .await,
             "download_profile_data",
         );
-        assert_unimplemented_status(
-            service
-                .get_bucket_stats(Request::new(GetBucketStatsDataRequest::default()))
-                .await,
-            "get_bucket_stats",
-        );
+        let bucket_stats_err = service
+            .get_bucket_stats(Request::new(GetBucketStatsDataRequest::default()))
+            .await
+            .expect_err("empty bucket statistics request should fail");
+        assert_eq!(bucket_stats_err.code(), tonic::Code::InvalidArgument);
         assert_unimplemented_status(
             service.get_sr_metrics(Request::new(GetSrMetricsDataRequest::default())).await,
             "get_sr_metrics",

@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::metadata::{BucketMetadata, load_bucket_metadata};
+use super::metadata::{BUCKET_TARGETS_FILE, BucketMetadata, load_bucket_metadata};
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::load_bucket_metadata_parse;
 use crate::bucket::utils::is_meta_bucketname;
+use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::heal::HealOperations as _;
+use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::store::ECStore;
 use futures::future::join_all;
 use rustfs_common::heal_channel::HealOpts;
@@ -221,9 +223,33 @@ pub(crate) async fn remove_bucket_metadata_in(ctx: &crate::runtime::instance::In
 
 pub async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let _targets_guard = if config_file == BUCKET_TARGETS_FILE {
+        Some(acquire_bucket_targets_transaction_lock(bucket).await?)
+    } else {
+        None
+    };
     let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
 
     bucket_meta_sys.update(bucket, config_file, data).await
+}
+
+pub async fn update_bucket_targets_under_transaction_lock(bucket: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
+    bucket_meta_sys.update(bucket, BUCKET_TARGETS_FILE, data).await
+}
+
+pub async fn acquire_bucket_targets_transaction_lock(bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let api = bucket_meta_sys_lock.read().await.object_store();
+    let lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &bucket_targets_transaction_lock_key(bucket))
+        .await?;
+    Ok(lock.get_write_lock(crate::set_disk::get_lock_acquire_timeout()).await?)
+}
+
+fn bucket_targets_transaction_lock_key(bucket: &str) -> String {
+    format!("bucket-targets/{bucket}/transaction.lock")
 }
 
 pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {

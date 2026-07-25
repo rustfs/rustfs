@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_replication::{MrfOpKind, MrfReplicateEntry};
+pub use rustfs_replication::{MrfOpKind, MrfReplicateEntry};
 pub(crate) use rustfs_replication::{
     REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL_DELETE, ReplicateTargetDecision, ReplicatedInfos,
     ReplicatedTargetInfo, ReplicationAction, ReplicationWorkerOperation, ResyncDecision, get_replication_state,

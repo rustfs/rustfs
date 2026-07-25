@@ -82,7 +82,7 @@ pub use runtime::{
 pub use stats::{
     ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, ExponentialMovingAverage, FailStats,
     FailedMetric, InQueueMetric, InQueueStats, LatencyStats, ProxyMetric, ProxyStatsCache, QueueCache, QueueNode, QueueStats,
-    SRMetricsSummary, XferStats,
+    ReplicationMetricScope, SRMetricsSummary, XferStats,
 };
 pub use storage_api::{DeletedObject, ObjectToDelete};
 pub use tagging::{ReplicationTagFilter, decode_tags_to_map};

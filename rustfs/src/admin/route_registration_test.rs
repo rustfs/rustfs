@@ -169,6 +169,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/info"),
         admin_route(Method::GET, "/v3/inspect-data"),
         admin_route(Method::POST, "/v3/inspect-data"),
+        admin_route(Method::POST, "/v4/inspect/archive"),
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
         admin_route(Method::GET, "/v3/metrics"),
@@ -279,6 +280,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/site-replication/resync/op"),
         admin_route(Method::PUT, "/v3/site-replication/state/edit"),
         admin_route(Method::PUT, "/v3/site-replication/repair"),
+        admin_route(Method::GET, "/v3/site-replication/repair/status"),
         admin_route(Method::GET, "/debug/pprof/profile"),
         admin_route(Method::GET, "/debug/pprof/status"),
         admin_route(Method::POST, "/v3/profiling/start"),
@@ -1205,6 +1207,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/resync/op"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/state/edit"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/repair"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/repair/status"));
     assert_route(&router, Method::GET, &admin_path("/debug/pprof/profile"));
     assert_route(&router, Method::GET, &admin_path("/debug/tls/status"));
 

@@ -156,6 +156,7 @@ async_zip = { workspace = true, default-features = false, features = ["tokio", "
 base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] }
 base64-simd.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 const-str = { workspace = true, features = ["std", "proc"] }

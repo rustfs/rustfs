@@ -22,6 +22,8 @@ pub(crate) const PROFILE_MEMORY_PATH: &str = "/profile/memory";
 /// Favicon path to handle browser requests for the favicon.
 /// This path serves the favicon.ico file.
 pub(crate) const FAVICON_PATH: &str = "/favicon.ico";
+pub(crate) const APPLE_TOUCH_ICON_PATH: &str = "/apple-touch-icon.png";
+pub(crate) const APPLE_TOUCH_ICON_PRECOMPOSED_PATH: &str = "/apple-touch-icon-precomposed.png";
 
 /// Predefined health check path for RustFS server.
 /// This path is used to check the health status of the server.
