@@ -29,6 +29,10 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use http::header::{CONTENT_TYPE, HOST};
+use rustfs_signer::constants::UNSIGNED_PAYLOAD;
+use rustfs_signer::sign_v4;
+use s3s::Body;
 use serde_json;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -67,6 +71,49 @@ pub fn sse_customer_key_md5_base64(key: &str) -> String {
     BASE64.encode(md5::compute(key).0)
 }
 
+pub async fn kms_admin_request(
+    base_url: &str,
+    method: http::Method,
+    path_and_query: &str,
+    body: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{base_url}{path_and_query}");
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("KMS admin URL missing authority")?.to_string();
+    let mut builder = http::Request::builder()
+        .method(method.clone())
+        .uri(uri)
+        .header(HOST, authority)
+        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if body.is_some() {
+        builder = builder.header(CONTENT_TYPE, "application/json");
+    }
+
+    let content_len = match body {
+        Some(value) => i64::try_from(value.len())?,
+        None => 0,
+    };
+    let signed = sign_v4(builder.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
+
+    let mut request = local_http_client().request(method.clone(), &url);
+    for (name, value) in signed.headers() {
+        request = request.header(name, value);
+    }
+    if let Some(value) = body {
+        request = request.body(value.to_owned());
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if !status.is_success() {
+        return Err(format!("{method} {path_and_query} failed with {status}: {response_body}").into());
+    }
+    Ok(response_body)
+}
+
 // KMS-specific helper functions
 /// Configure KMS backend via admin API
 pub async fn configure_kms(
@@ -75,8 +122,19 @@ pub async fn configure_kms(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{base_url}/rustfs/admin/v3/kms/configure");
-    awscurl_post(&url, config_json, access_key, secret_key).await?;
+    let response = kms_admin_request(
+        base_url,
+        http::Method::POST,
+        "/rustfs/admin/v3/kms/configure",
+        Some(config_json),
+        access_key,
+        secret_key,
+    )
+    .await?;
+    let response: serde_json::Value = serde_json::from_str(&response)?;
+    if response["success"] != true {
+        return Err(format!("KMS configuration failed: {}", response["message"].as_str().unwrap_or("unknown error")).into());
+    }
     info!("KMS configured successfully");
     Ok(())
 }
@@ -87,8 +145,19 @@ pub async fn start_kms(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{base_url}/rustfs/admin/v3/kms/start");
-    awscurl_post(&url, "{}", access_key, secret_key).await?;
+    let response = kms_admin_request(
+        base_url,
+        http::Method::POST,
+        "/rustfs/admin/v3/kms/start",
+        Some("{}"),
+        access_key,
+        secret_key,
+    )
+    .await?;
+    let response: serde_json::Value = serde_json::from_str(&response)?;
+    if response["success"] != true {
+        return Err(format!("KMS start failed: {}", response["message"].as_str().unwrap_or("unknown error")).into());
+    }
     info!("KMS started successfully");
     Ok(())
 }
@@ -99,8 +168,8 @@ pub async fn get_kms_status(
     access_key: &str,
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{base_url}/rustfs/admin/v3/kms/status");
-    let status = awscurl_get(&url, access_key, secret_key).await?;
+    let status =
+        kms_admin_request(base_url, http::Method::GET, "/rustfs/admin/v3/kms/status", None, access_key, secret_key).await?;
     info!("KMS status retrieved: {}", status);
     Ok(status)
 }
@@ -508,7 +577,8 @@ impl VaultTestEnvironment {
             },
             "mount_path": VAULT_TRANSIT_PATH,
             "default_key_id": VAULT_KEY_NAME,
-            "skip_tls_verify": true
+            "skip_tls_verify": true,
+            "allow_insecure_dev_defaults": true
         })
         .to_string();
 
@@ -801,7 +871,8 @@ impl LocalKMSTestEnvironment {
             "backend_type": "Local",
             "key_dir": self.kms_keys_dir,
             "file_permissions": 0o600,
-            "default_key_id": default_key_id
+            "default_key_id": default_key_id,
+            "allow_insecure_dev_defaults": true
         })
         .to_string();
 

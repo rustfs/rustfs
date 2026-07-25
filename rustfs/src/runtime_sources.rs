@@ -44,9 +44,11 @@ pub(crate) use context::{
     resolve_outbound_tls_generation as current_outbound_tls_generation, resolve_outbound_tls_state as current_outbound_tls_state,
     resolve_performance_metrics as current_performance_metrics, resolve_ready_iam_handle as current_ready_iam_handle,
     resolve_region as current_region, resolve_replication_pool_handle as current_replication_pool_handle,
-    resolve_replication_stats_handle as current_replication_stats_handle, resolve_runtime_port as current_runtime_port,
-    resolve_s3select_db as current_s3select_db, resolve_scanner_metrics_report as current_scanner_metrics_report,
-    resolve_server_config as current_server_config, resolve_server_config_for_context as current_server_config_for_context,
+    resolve_replication_stats_handle as current_replication_stats_handle,
+    resolve_replication_stats_handle_with as current_replication_stats_handle_for_context,
+    resolve_runtime_port as current_runtime_port, resolve_s3select_db as current_s3select_db,
+    resolve_scanner_metrics_report as current_scanner_metrics_report, resolve_server_config as current_server_config,
+    resolve_server_config_for_context as current_server_config_for_context,
     resolve_tier_config_handle as current_tier_config_handle, resolve_token_signing_key as current_token_signing_key,
 };
 

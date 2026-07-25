@@ -67,8 +67,8 @@ pub use queue::{
 };
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
-    decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update, should_auto_resume_resync,
-    should_count_head_proxy_failure,
+    decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update, sanitize_resync_error_detail,
+    should_auto_resume_resync, should_count_head_proxy_failure,
 };
 pub use rule::ReplicationRuleExt;
 pub use runtime::{
@@ -82,7 +82,7 @@ pub use runtime::{
 pub use stats::{
     ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, ExponentialMovingAverage, FailStats,
     FailedMetric, InQueueMetric, InQueueStats, LatencyStats, ProxyMetric, ProxyStatsCache, QueueCache, QueueNode, QueueStats,
-    SRMetricsSummary, XferStats,
+    ReplicationMetricScope, SRMetricsSummary, XferStats,
 };
 pub use storage_api::{DeletedObject, ObjectToDelete};
 pub use tagging::{ReplicationTagFilter, decode_tags_to_map};

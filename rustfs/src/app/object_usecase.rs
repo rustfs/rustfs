@@ -1428,6 +1428,10 @@ struct GetObjectStreamingReader<R> {
     inner: R,
     bucket: String,
     key: String,
+    // request_id + optional content_range are only used for diagnostic correlation and
+    // failure bucketing; they do not alter stream behavior.
+    request_id: String,
+    content_range: Option<String>,
     expected: usize,
     emitted: usize,
     timeout: Duration,
@@ -1440,11 +1444,23 @@ struct GetObjectStreamingReader<R> {
 }
 
 impl<R> GetObjectStreamingReader<R> {
-    fn new(inner: R, bucket: &str, key: &str, expected: usize, timeout: Duration, lifecycle: GetObjectBodyLifecycle) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        inner: R,
+        bucket: &str,
+        key: &str,
+        request_id: &str,
+        content_range: Option<String>,
+        expected: usize,
+        timeout: Duration,
+        lifecycle: GetObjectBodyLifecycle,
+    ) -> Self {
         Self {
             inner,
             bucket: bucket.to_string(),
             key: key.to_string(),
+            request_id: request_id.to_string(),
+            content_range,
             expected,
             emitted: 0,
             timeout,
@@ -1459,6 +1475,46 @@ impl<R> GetObjectStreamingReader<R> {
 
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    // Classify transport/read failures before logging so operators can quickly
+    // distinguish truncated upstream bodies, corruption, quorum issues, and
+    // genuine downstream-close disconnects.
+    fn classify_read_error(err: &std::io::Error) -> &'static str {
+        if let Some(inner) = err.get_ref() {
+            if inner.is::<rustfs_rio::IncompleteBody>() {
+                return "short_eof";
+            }
+
+            if inner.is::<rustfs_rio::ChecksumMismatch>() {
+                return "bitrot";
+            }
+
+            let error_msg = inner.to_string().to_lowercase();
+            if error_msg.contains("bitrot") {
+                return "bitrot";
+            }
+            if error_msg.contains("read quorum")
+                || error_msg.contains("insufficient read quorum")
+                || error_msg.contains("erasure")
+            {
+                return "read_quorum";
+            }
+            if error_msg.contains("connection reset")
+                || error_msg.contains("broken pipe")
+                || error_msg.contains("downstream")
+                || error_msg.contains("remote closed")
+            {
+                return "downstream_closed";
+            }
+        }
+
+        match err.kind() {
+            std::io::ErrorKind::UnexpectedEof => "short_eof",
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => "range_or_length_invalid",
+            _ => "io",
+        }
     }
 
     fn finish_ok(&mut self) {
@@ -1490,16 +1546,18 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         );
                         if elapsed >= GET_OBJECT_STREAM_WARN_THRESHOLD {
                             warn!(
-                                event = EVENT_GET_OBJECT_STREAM_BODY,
-                                component = LOG_COMPONENT_APP,
-                                subsystem = LOG_SUBSYSTEM_OBJECT,
-                                bucket = %self.bucket,
-                                object = %self.key,
-                                expected = self.expected,
-                                emitted = self.emitted,
-                                elapsed_ms = elapsed.as_millis(),
-                                state = "first_byte_slow",
-                                "GetObject streaming body first byte was slow"
+                                    event = EVENT_GET_OBJECT_STREAM_BODY,
+                                    component = LOG_COMPONENT_APP,
+                                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                                    bucket = %self.bucket,
+                                    object = %self.key,
+                                    request_id = %self.request_id,
+                                    range = %self.content_range.as_deref().unwrap_or("full"),
+                                    expected = self.expected,
+                                    emitted = self.emitted,
+                                    elapsed_ms = elapsed.as_millis(),
+                                    state = "first_byte_slow",
+                                    "GetObject streaming body first byte was slow"
                             );
                         }
                     }
@@ -1514,6 +1572,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         subsystem = LOG_SUBSYSTEM_OBJECT,
                         bucket = %self.bucket,
                         object = %self.key,
+                        request_id = %self.request_id,
+                        range = %self.content_range.as_deref().unwrap_or("full"),
                         expected = self.expected,
                         emitted = self.emitted,
                         elapsed_ms = self.elapsed().as_millis(),
@@ -1530,7 +1590,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     // truncated data.
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "get object streaming body ended before the expected content length",
+                        rustfs_rio::IncompleteBody {
+                            remaining: self.expected.saturating_sub(self.emitted) as i64,
+                        },
                     )));
                 } else {
                     self.completed = true;
@@ -1540,6 +1602,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
+                let failure_reason = Self::classify_read_error(&err);
                 self.timer = None;
                 self.finish_err();
                 warn!(
@@ -1548,10 +1611,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     subsystem = LOG_SUBSYSTEM_OBJECT,
                     bucket = %self.bucket,
                     object = %self.key,
+                    request_id = %self.request_id,
+                    range = %self.content_range.as_deref().unwrap_or("full"),
                     expected = self.expected,
                     emitted = self.emitted,
                     elapsed_ms = self.elapsed().as_millis(),
                     state = "read_failed",
+                    failure_reason = failure_reason,
                     error = %err,
                     "GetObject streaming body read failed"
                 );
@@ -1576,6 +1642,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         subsystem = LOG_SUBSYSTEM_OBJECT,
                         bucket = %self.bucket,
                         object = %self.key,
+                        request_id = %self.request_id,
+                        range = %self.content_range.as_deref().unwrap_or("full"),
                         expected = self.expected,
                         emitted = self.emitted,
                         elapsed_ms = self.elapsed().as_millis(),
@@ -1614,6 +1682,8 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             subsystem = LOG_SUBSYSTEM_OBJECT,
             bucket = %self.bucket,
             object = %self.key,
+            request_id = %self.request_id,
+            range = %self.content_range.as_deref().unwrap_or("full"),
             expected = self.expected,
             emitted = self.emitted,
             elapsed_ms = self.elapsed().as_millis(),
@@ -3222,9 +3292,12 @@ impl DefaultObjectUsecase {
         (optimal_buffer_size, GetObjectStreamStrategy::Standard)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_reader_blob<R>(
         reader: R,
         response_content_length: i64,
+        request_id: &str,
+        content_range: Option<&str>,
         stream_buffer_size: usize,
         stream_strategy: GetObjectStreamStrategy,
         bucket: &str,
@@ -3249,7 +3322,16 @@ impl DefaultObjectUsecase {
             );
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
-        let reader = GetObjectStreamingReader::new(reader, bucket, key, expected, get_object_disk_read_timeout(), lifecycle);
+        let reader = GetObjectStreamingReader::new(
+            reader,
+            bucket,
+            key,
+            request_id,
+            content_range.map(|content_range| content_range.to_string()),
+            expected,
+            get_object_disk_read_timeout(),
+            lifecycle,
+        );
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
@@ -4124,6 +4206,8 @@ impl DefaultObjectUsecase {
         final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
+        request_id: &str,
+        content_range: Option<&str>,
         optimal_buffer_size: usize,
         enable_readahead: bool,
         concurrent_requests: usize,
@@ -4172,6 +4256,8 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_reader_blob(
                 final_stream,
                 response_content_length,
+                request_id,
+                content_range,
                 stream_buffer_size,
                 stream_strategy,
                 bucket,
@@ -4247,6 +4333,8 @@ impl DefaultObjectUsecase {
         Ok(Self::build_reader_blob(
             final_stream,
             response_content_length,
+            request_id,
+            content_range,
             stream_buffer_size,
             stream_strategy,
             bucket,
@@ -4261,6 +4349,8 @@ impl DefaultObjectUsecase {
         final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
+        request_id: &str,
+        content_range: Option<&str>,
         optimal_buffer_size: usize,
         enable_readahead: bool,
         concurrent_requests: usize,
@@ -4295,6 +4385,8 @@ impl DefaultObjectUsecase {
                 final_stream,
                 info,
                 response_content_length,
+                request_id,
+                content_range,
                 optimal_buffer_size,
                 enable_readahead,
                 concurrent_requests,
@@ -4384,6 +4476,8 @@ impl DefaultObjectUsecase {
                     final_stream,
                     info,
                     response_content_length,
+                    request_id,
+                    content_range,
                     optimal_buffer_size,
                     enable_readahead,
                     concurrent_requests,
@@ -4443,6 +4537,8 @@ impl DefaultObjectUsecase {
             final_stream,
             info,
             response_content_length,
+            request_id,
+            content_range,
             optimal_buffer_size,
             enable_readahead,
             concurrent_requests,
@@ -5233,6 +5329,7 @@ impl DefaultObjectUsecase {
         last_modified: Option<Timestamp>,
         response_content_length: i64,
         content_range: Option<String>,
+        request_id: &str,
         server_side_encryption: Option<ServerSideEncryption>,
         sse_customer_algorithm: Option<SSECustomerAlgorithm>,
         sse_customer_key_md5: Option<SSECustomerKeyMD5>,
@@ -5273,6 +5370,8 @@ impl DefaultObjectUsecase {
             final_stream,
             &info,
             response_content_length,
+            request_id,
+            content_range.as_deref(),
             optimal_buffer_size,
             enable_readahead,
             concurrent_requests,
@@ -5484,6 +5583,7 @@ impl DefaultObjectUsecase {
                 last_modified,
                 response_content_length,
                 content_range,
+                &request_id,
                 server_side_encryption,
                 sse_customer_algorithm,
                 sse_customer_key_md5,
@@ -9272,6 +9372,8 @@ mod tests {
             fallback_reader,
             &info,
             4,
+            "req-cold-fill",
+            None,
             128 * 1024,
             false,
             1,
@@ -10489,6 +10591,8 @@ mod tests {
             PendingReader,
             "test-bucket",
             "stalled-object",
+            "req-stalled-stream",
+            None,
             1,
             Duration::from_millis(1),
             GetObjectBodyLifecycle::disabled(),
@@ -10575,6 +10679,8 @@ mod tests {
             std::io::Cursor::new(b"hello".to_vec()),
             "test-bucket",
             "complete-object",
+            "req-complete-stream",
+            None,
             5,
             Duration::ZERO,
             GetObjectBodyLifecycle::tracked(guard),
@@ -10607,6 +10713,8 @@ mod tests {
             std::io::Cursor::new(b"short".to_vec()),
             "test-bucket",
             "truncated-object",
+            "req-short-eof",
+            None,
             10,
             Duration::ZERO,
             GetObjectBodyLifecycle::tracked(guard),
@@ -10617,6 +10725,11 @@ mod tests {
             .await
             .expect_err("short body under a larger Content-Length must fail the stream");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let incomplete_body = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustfs_rio::IncompleteBody>())
+            .expect("short eof should include remaining bytes as IncompleteBody");
+        assert_eq!(incomplete_body.remaining, 5);
         assert_eq!(out, b"short", "bytes read before the short EOF are still delivered");
 
         drop(reader);
@@ -10634,6 +10747,8 @@ mod tests {
             std::io::Cursor::new(b"short".to_vec()),
             "test-bucket",
             "dropped-object",
+            "req-dropped-stream",
+            None,
             10,
             Duration::ZERO,
             GetObjectBodyLifecycle::tracked(guard),
@@ -10820,6 +10935,8 @@ mod tests {
             reader,
             &info,
             18_i64 * 1024 * 1024 * 1024,
+            "req-large-object",
+            None,
             128 * 1024,
             true,
             1,
@@ -10856,6 +10973,8 @@ mod tests {
             reader,
             &info,
             18_i64 * 1024 * 1024 * 1024,
+            "req-large-encrypted-object",
+            None,
             128 * 1024,
             true,
             1,
@@ -10892,6 +11011,8 @@ mod tests {
             reader,
             &info,
             4,
+            "req-direct-memory-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -10952,6 +11073,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-cached-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -11013,6 +11136,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-rejects-size-mismatch-fill",
+            None,
             128 * 1024,
             false,
             1,
@@ -11073,6 +11198,8 @@ mod tests {
             first_reader,
             &info,
             5,
+            "req-cache-fill-first",
+            None,
             128 * 1024,
             false,
             1,
@@ -11099,6 +11226,8 @@ mod tests {
             second_reader,
             &info,
             5,
+            "req-cache-fill-second",
+            None,
             128 * 1024,
             false,
             1,
@@ -11164,6 +11293,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-rejects-buffered-size-mismatch",
+            None,
             128 * 1024,
             false,
             1,
@@ -11246,6 +11377,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-hook-served",
+            None,
             128 * 1024,
             false,
             1,
@@ -11304,6 +11437,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-hook-missed",
+            None,
             128 * 1024,
             false,
             1,
@@ -11364,6 +11499,8 @@ mod tests {
             first_reader,
             &info,
             5,
+            "req-materialize-first",
+            None,
             128 * 1024,
             false,
             1,
@@ -11390,6 +11527,8 @@ mod tests {
             second_reader,
             &info,
             5,
+            "req-materialize-second",
+            None,
             128 * 1024,
             false,
             1,
@@ -11450,6 +11589,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-mismatch",
+            None,
             128 * 1024,
             false,
             1,
@@ -11503,6 +11644,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-short",
+            None,
             128 * 1024,
             false,
             1,
@@ -11554,6 +11697,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-partial",
+            None,
             128 * 1024,
             false,
             1,
@@ -11594,6 +11739,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-short-buffered-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -11636,6 +11783,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-exact-buffered-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -11685,6 +11834,8 @@ mod tests {
             reader,
             &info,
             5,
+            "req-materialize-too-large",
+            None,
             128 * 1024,
             false,
             1,
@@ -11724,6 +11875,8 @@ mod tests {
             reader,
             &info,
             4,
+            "req-small-plain-object",
+            None,
             128 * 1024,
             false,
             1,
@@ -12484,6 +12637,7 @@ mod tests {
                 None,
                 0,
                 None,
+                "req-output-content-disposition",
                 None,
                 None,
                 None,

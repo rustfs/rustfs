@@ -4073,11 +4073,11 @@ pub fn should_heal_object_on_disk(
     }
 
     if !meta.is_canonical_delete_marker() && !meta.is_remote() {
-        let err_vec = [CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT];
-        for part_err in parts_errs.iter() {
-            if err_vec.contains(part_err) {
-                return (true, false, Some(DiskError::PartMissingOrCorrupt));
-            }
+        if parts_errs.contains(&CHECK_PART_FILE_CORRUPT) {
+            return (true, false, Some(DiskError::FileCorrupt));
+        }
+        if parts_errs.contains(&CHECK_PART_FILE_NOT_FOUND) {
+            return (true, false, Some(DiskError::PartMissingOrCorrupt));
         }
     }
     (false, false, None)
@@ -6866,8 +6866,9 @@ mod tests {
         assert!(!should_heal);
 
         // Test with part corruption
-        let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
+        let (should_heal, _, reason) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
+        assert_eq!(reason, Some(DiskError::FileCorrupt));
     }
 
     #[tokio::test]

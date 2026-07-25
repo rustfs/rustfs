@@ -1050,19 +1050,35 @@ impl SetDisks {
 
                 if has_err {
                     let reason = classify_disk_error(&de_err);
-                    error!(
-                        bucket,
-                        object,
-                        part_index = current_part,
-                        part_number,
-                        part_offset,
-                        part_length,
-                        bytes_written = written,
-                        stage = GET_STAGE_DECODE,
-                        reason = reason.as_str(),
-                        error = ?de_err,
-                        "Erasure decode failed during GetObject"
-                    );
+                    if reason == GetObjectFailureReason::DownstreamClosed {
+                        warn!(
+                            bucket,
+                            object,
+                            part_index = current_part,
+                            part_number,
+                            part_offset,
+                            part_length,
+                            bytes_written = written,
+                            stage = GET_STAGE_DECODE,
+                            reason = reason.as_str(),
+                            error = ?de_err,
+                            "GetObject downstream closed during erasure decode"
+                        );
+                    } else {
+                        error!(
+                            bucket,
+                            object,
+                            part_index = current_part,
+                            part_number,
+                            part_offset,
+                            part_length,
+                            bytes_written = written,
+                            stage = GET_STAGE_DECODE,
+                            reason = reason.as_str(),
+                            error = ?de_err,
+                            "Erasure decode failed during GetObject"
+                        );
+                    }
                     record_get_object_pipeline_failure(GET_STAGE_DECODE, reason);
                     return Err(de_err.into());
                 }

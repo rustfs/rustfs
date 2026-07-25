@@ -340,6 +340,15 @@ pub(crate) mod replication {
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;
     pub(crate) type TargetReplicationResyncStatus = super::ecstore_bucket::replication::TargetReplicationResyncStatus;
+    pub(crate) type DurableMrfBacklog = super::ecstore_bucket::replication::DurableMrfBacklog;
+    #[cfg(test)]
+    pub(crate) type MrfReplicateEntry = super::ecstore_bucket::replication::MrfReplicateEntry;
+    #[cfg(test)]
+    pub(crate) type MrfOpKind = super::ecstore_bucket::replication::MrfOpKind;
+
+    pub(crate) async fn read_durable_mrf_backlog(api: std::sync::Arc<super::ECStore>) -> DurableMrfBacklog {
+        super::ecstore_bucket::replication::read_durable_mrf_backlog(api).await
+    }
 
     pub(crate) fn resync_opts(
         bucket: &str,

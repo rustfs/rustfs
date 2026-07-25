@@ -13,7 +13,9 @@
 // limitations under the License.
 
 pub use rustfs_replication::BucketStats;
+#[cfg(test)]
+pub(crate) use rustfs_replication::FailStats;
 pub(crate) use rustfs_replication::{
     ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, InQueueMetric, ProxyMetric, ProxyStatsCache, QueueCache,
-    SRMetricsSummary, XferStats,
+    ReplicationMetricScope, SRMetricsSummary, XferStats,
 };

@@ -27,6 +27,18 @@ pub const RESYNC_META_VERSION: u16 = 1;
 const MSGP_TIME_EXT_TYPE: i8 = 5;
 const MSGP_TIME_LEN: u8 = 12;
 pub const WIRE_ZERO_TIME_UNIX: i64 = -62_135_596_800;
+const RESYNC_ERROR_DETAIL_MAX_CHARS: usize = 512;
+const RESYNC_ERROR_REDACTED: &str = "[redacted sensitive resync error detail]";
+const RESYNC_ERROR_TRUNCATED_SUFFIX: &str = "... (truncated)";
+const RESYNC_ERROR_SENSITIVE_MARKERS: &[&str] = &[
+    "authorization",
+    "bearer",
+    "credential",
+    "secret",
+    "token",
+    "signature",
+    "password",
+];
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -178,7 +190,8 @@ impl TargetReplicationResyncStatus {
         rmp::encode::write_str(wr, "obj")?;
         rmp::encode::write_str(wr, &self.object)?;
         rmp::encode::write_str(wr, "err")?;
-        rmp::encode::write_str(wr, self.error.as_deref().unwrap_or_default())?;
+        let error = self.error.as_deref().and_then(sanitize_resync_error_detail);
+        rmp::encode::write_str(wr, error.as_deref().unwrap_or_default())?;
         Ok(())
     }
 
@@ -206,13 +219,61 @@ impl TargetReplicationResyncStatus {
                 "obj" => out.object = read_msgp_str(rd)?,
                 "err" => {
                     let error = read_msgp_str(rd)?;
-                    out.error = (!error.is_empty()).then_some(error);
+                    out.error = sanitize_resync_error_detail(&error);
                 }
                 _ => skip_msgp_value(rd)?,
             }
         }
         Ok(out)
     }
+}
+
+pub fn sanitize_resync_error_detail(detail: &str) -> Option<String> {
+    let mut normalized = String::new();
+    let mut char_count = 0usize;
+    let mut truncated = false;
+    'words: for word in detail.split_whitespace() {
+        if !normalized.is_empty() {
+            if char_count == RESYNC_ERROR_DETAIL_MAX_CHARS {
+                truncated = true;
+                break;
+            }
+            normalized.push(' ');
+            char_count += 1;
+        }
+        for ch in word.chars() {
+            if char_count == RESYNC_ERROR_DETAIL_MAX_CHARS {
+                truncated = true;
+                break 'words;
+            }
+            normalized.push(ch);
+            char_count += 1;
+        }
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let is_service_code = normalized.len() <= 128
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !is_service_code
+        && (RESYNC_ERROR_SENSITIVE_MARKERS.iter().any(|marker| lower.contains(marker))
+            || (lower.contains("://") && lower.contains('@')))
+    {
+        return Some(RESYNC_ERROR_REDACTED.to_string());
+    }
+
+    if !truncated {
+        return Some(normalized);
+    }
+
+    let keep = RESYNC_ERROR_DETAIL_MAX_CHARS.saturating_sub(RESYNC_ERROR_TRUNCATED_SUFFIX.chars().count());
+    let mut summary: String = normalized.chars().take(keep).collect();
+    summary.push_str(RESYNC_ERROR_TRUNCATED_SUFFIX);
+    Some(summary)
 }
 
 pub fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
@@ -313,7 +374,11 @@ impl BucketReplicationResyncStatus {
     }
 
     pub fn unmarshal_legacy_msg(data: &[u8]) -> Result<Self> {
-        Ok(rmp_serde::from_slice(data)?)
+        let mut status: Self = rmp_serde::from_slice(data)?;
+        for target in status.targets_map.values_mut() {
+            target.error = target.error.as_deref().and_then(sanitize_resync_error_detail);
+        }
+        Ok(status)
     }
 }
 
@@ -642,6 +707,91 @@ mod tests {
         assert_eq!(got.targets_map["arn:replication:a"].resync_status, ResyncStatusType::ResyncStarted);
         assert_eq!(got.targets_map["arn:replication:a"].replicated_count, 7);
         assert_eq!(got.targets_map["arn:replication:a"].error.as_deref(), Some("durable failure"));
+    }
+
+    #[test]
+    fn resync_error_detail_is_bounded_and_unicode_safe() {
+        let detail = format!("{}尾", "x".repeat(RESYNC_ERROR_DETAIL_MAX_CHARS + 32));
+
+        let sanitized = sanitize_resync_error_detail(&detail).expect("non-empty detail should remain");
+
+        assert_eq!(sanitized.chars().count(), RESYNC_ERROR_DETAIL_MAX_CHARS);
+        assert!(sanitized.ends_with(RESYNC_ERROR_TRUNCATED_SUFFIX));
+        assert!(!sanitized.contains('尾'));
+    }
+
+    #[test]
+    fn resync_error_detail_redacts_credentials_and_headers() {
+        for detail in [
+            "Authorization: Bearer status-secret",
+            "request failed with secret_key=status-secret",
+            "x-amz-security-token=status-secret",
+            "https://user:status-secret@example.test",
+        ] {
+            assert_eq!(
+                sanitize_resync_error_detail(detail).as_deref(),
+                Some(RESYNC_ERROR_REDACTED),
+                "sensitive detail should be replaced: {detail}"
+            );
+        }
+        assert_eq!(sanitize_resync_error_detail("ExpiredToken").as_deref(), Some("ExpiredToken"));
+    }
+
+    #[test]
+    fn resync_file_sanitizes_legacy_error_on_decode() {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:replication:a".to_string(),
+            TargetReplicationResyncStatus {
+                resync_id: "rid-legacy".to_string(),
+                resync_status: ResyncStatusType::ResyncFailed,
+                error: Some("Authorization: Bearer persisted-secret".to_string()),
+                ..Default::default()
+            },
+        );
+        let legacy_payload = rmp_serde::to_vec(&status).expect("legacy status should encode");
+        let direct =
+            BucketReplicationResyncStatus::unmarshal_legacy_msg(&legacy_payload).expect("legacy status should decode directly");
+        let mut data = Vec::new();
+        data.extend_from_slice(&RESYNC_META_FORMAT.to_le_bytes());
+        data.extend_from_slice(&RESYNC_META_VERSION.to_le_bytes());
+        data.extend_from_slice(&legacy_payload);
+
+        let decoded = decode_resync_file(&data).expect("legacy status should decode");
+
+        assert_eq!(direct.targets_map["arn:replication:a"].error.as_deref(), Some(RESYNC_ERROR_REDACTED));
+        assert_eq!(decoded.targets_map["arn:replication:a"].error.as_deref(), Some(RESYNC_ERROR_REDACTED));
+    }
+
+    #[test]
+    fn resync_file_retains_error_for_restartable_and_failed_states() {
+        let mut status = BucketReplicationResyncStatus::new();
+        for (arn, resync_status) in [
+            ("arn:replication:pending", ResyncStatusType::ResyncPending),
+            ("arn:replication:ongoing", ResyncStatusType::ResyncStarted),
+            ("arn:replication:failed", ResyncStatusType::ResyncFailed),
+        ] {
+            status.targets_map.insert(
+                arn.to_string(),
+                TargetReplicationResyncStatus {
+                    resync_id: format!("{arn}-run"),
+                    resync_status,
+                    failed_count: 1,
+                    error: Some("AccessDenied".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let data = encode_resync_file(&status).expect("resync status should encode");
+        let decoded = decode_resync_file(&data).expect("resync status should decode after restart");
+
+        for arn in ["arn:replication:pending", "arn:replication:ongoing", "arn:replication:failed"] {
+            assert_eq!(decoded.targets_map[arn].error.as_deref(), Some("AccessDenied"));
+        }
+        assert!(should_auto_resume_resync(decoded.targets_map["arn:replication:pending"].resync_status));
+        assert!(should_auto_resume_resync(decoded.targets_map["arn:replication:ongoing"].resync_status));
+        assert!(!should_auto_resume_resync(decoded.targets_map["arn:replication:failed"].resync_status));
     }
 
     #[test]

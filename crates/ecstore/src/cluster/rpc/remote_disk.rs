@@ -3018,15 +3018,32 @@ mod tests {
 
     #[test]
     fn compat_json_dual_writes_by_default() {
-        let resp = sample_read_multiple_resp("file", b"data");
-        let json = compat_json(&resp).expect("compat_json should encode");
-        assert!(!json.is_empty());
-        assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+                assert!(!json.is_empty());
+                assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+            },
+        );
+    }
+
+    fn with_internode_msgpack_env<R>(vars: [(&'static str, Option<&'static str>); 2], f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(vars, || {
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            let result = f();
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            result
+        })
     }
 
     #[test]
     fn compat_json_keeps_json_when_msgpack_only_lacks_fleet_confirmation() {
-        temp_env::with_vars(
+        with_internode_msgpack_env(
             [
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
@@ -3043,7 +3060,7 @@ mod tests {
 
     #[test]
     fn compat_json_omits_json_only_after_fleet_confirmation() {
-        temp_env::with_vars(
+        with_internode_msgpack_env(
             [
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
                 (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
@@ -3055,6 +3072,41 @@ mod tests {
                 assert!(json.is_empty(), "msgpack-only may empty JSON only after explicit fleet confirmation");
             },
         );
+    }
+
+    #[test]
+    fn compat_json_restores_json_when_either_msgpack_only_gate_is_removed() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(json.is_empty(), "both gates should enter msgpack-only send mode");
+            },
+        );
+
+        for vars in [
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("false")),
+            ],
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("false")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+        ] {
+            with_internode_msgpack_env(vars, || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(!json.is_empty(), "removing either gate should restore old-peer JSON compatibility");
+                assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+            });
+        }
     }
 
     #[test]

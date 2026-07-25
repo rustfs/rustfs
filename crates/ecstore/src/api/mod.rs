@@ -149,18 +149,19 @@ pub mod bucket {
 
     pub mod replication {
         pub use crate::bucket::replication::{
-            BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, MustReplicateOptions,
-            ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationConfig,
-            ReplicationConfigurationExt, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource,
-            ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO, ReplicationOperation, ReplicationPoolTrait,
-            ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge, ReplicationState, ReplicationStats,
-            ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError, ReplicationType, ResyncOpts,
-            ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType, delete_replication_state_from_config,
-            delete_replication_version_id, get_global_replication_pool, get_global_replication_stats,
-            init_background_replication, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
-            replication_target_arns, should_remove_replication_target, should_schedule_delete_replication,
-            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
-            validate_replication_config_target_arns, version_purge_status_to_filemeta,
+            BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool,
+            MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,
+            ReplicateObjectInfo, ReplicationConfig, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
+            ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
+            ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
+            ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
+            ReplicationType, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType,
+            delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
+            get_global_replication_stats, init_background_replication, read_durable_mrf_backlog, replication_state_to_filemeta,
+            replication_status_to_filemeta, replication_statuses_map, replication_target_arns, should_remove_replication_target,
+            should_schedule_delete_replication, should_use_existing_delete_replication_info,
+            should_use_existing_delete_replication_source, validate_replication_config_target_arns,
+            version_purge_status_to_filemeta,
         };
     }
 
