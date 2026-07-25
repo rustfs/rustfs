@@ -33,6 +33,7 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_EXPIRY_COMPUTED: &str = "lifecycle_expiry_computed";
 const EVENT_LIFECYCLE_DEBUG_DAY_SECS: &str = "lifecycle_debug_day_secs";
+const EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED: &str = "lifecycle_noncurrent_expiry_skipped";
 const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at least one rule";
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
 const _ERR_XML_NOT_WELL_FORMED: &str =
@@ -593,7 +594,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
                 if !obj.is_latest && rule.noncurrent_version_expiration.is_some() && obj.successor_mod_time.is_none() {
                     debug!(
-                        event = "lifecycle_noncurrent_expiry_skipped",
+                        event = EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                         object = %obj.name,
@@ -2063,6 +2064,42 @@ mod tests {
         assert_eq!(event.action, IlmAction::DeleteVersionAction);
         assert_eq!(event.rule_id, "noncurrent-expire");
         assert_eq!(event.due, Some(expected_expiry_time(base_time, 1)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_skips_noncurrent_expiration_without_successor() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-expire".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            successor_mod_time: None,
+            is_latest: false,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, base_time + Duration::days(2), 0).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
     }
 
     #[tokio::test]
