@@ -123,8 +123,10 @@ target/bench/internode-transport/
 Captured while running the first real A/B on a 4-node ansible cluster; needed before any live run:
 
 - **RPC secret is mandatory on current `main`.** Internode RPC fails closed: default creds
-  (`RUSTFS_SECRET_KEY=rustfsadmin`) with no `RUSTFS_RPC_SECRET` → `No valid auth token` → the cluster
-  never reaches `storage_quorum`. Set a **non-default** `RUSTFS_RPC_SECRET`, identical on every node.
+  (`RUSTFS_SECRET_KEY=rustfsadmin`) with no `RUSTFS_RPC_SECRET` → the node aborts startup immediately
+  with `store init aborted: endpoints include remote nodes but RPC authentication secret is not
+  configured` (builds before the preflight instead showed `No valid auth token` and never reached
+  `storage_quorum`). Set a **non-default** `RUSTFS_RPC_SECRET`, identical on every node.
 - **systemd start timeout.** The install unit is `Type=notify`; READY only fires after quorum, which on
   freshly-purged disks exceeds a 30 s `TimeoutStartSec` → crash loop. Use a drop-in `TimeoutStartSec=infinity`.
 - **Server-side metrics need OTLP.** RustFS has no Prometheus pull endpoint (`/admin/v3/metrics` is NDJSON,
