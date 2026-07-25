@@ -1030,6 +1030,32 @@ async fn wait_for_tier_verifiable(hot: &RustFSTestClusterEnvironment, tier_name:
     .into())
 }
 
+async fn wait_for_tier_converged(hot: &RustFSTestClusterEnvironment, tier_name: &str, add_tier_responses: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let final_error = loop {
+        let snapshot = tier_readiness_snapshot(hot, tier_name).await?;
+        if snapshot
+            .iter()
+            .all(|node| node.list_status.is_success() && node.list_has_tier && node.verify_status.is_success())
+        {
+            return Ok(());
+        }
+        if snapshot.iter().any(|node| {
+            !node.list_status.is_success() || (!node.verify_status.is_success() && !is_retryable_tier_error(&node.verify_body))
+        }) {
+            break format_tier_readiness_snapshot(&snapshot);
+        }
+        if Instant::now() >= deadline {
+            break format_tier_readiness_snapshot(&snapshot);
+        }
+        sleep(Duration::from_millis(500)).await;
+    };
+    Err(format!(
+        "tier {tier_name} did not converge on every hot node within 60s after AddTier({add_tier_responses}): {final_error}"
+    )
+    .into())
+}
+
 struct TierNodeReadiness {
     node_index: usize,
     node_url: String,
@@ -1519,6 +1545,25 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_add_tier_committed_replay_converges() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inlineconcurrentcoldadmin".to_string();
+    cold.secret_key = "inlineconcurrentcoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    cold.create_s3_client().create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.start().await?;
+
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
+    wait_for_tier_converged(&hot, &tier_name, "committed AddTier replay").await
 }
 
 #[tokio::test]

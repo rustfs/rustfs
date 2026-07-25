@@ -1631,24 +1631,29 @@ impl PeerRestClient {
     }
 
     pub async fn load_transition_tier_config(&self) -> Result<()> {
-        self.finalize_result(
-            async {
-                let mut client = self.get_client().await?;
-                let request = Request::new(LoadTransitionTierConfigRequest {});
+        let result = self.load_transition_tier_config_inner().await;
+        if let Err(err) = &result
+            && Self::is_network_like_error(err)
+        {
+            self.prepare_retry().await;
+            return self.finalize_result(self.load_transition_tier_config_inner().await).await;
+        }
+        self.finalize_result(result).await
+    }
 
-                let response = client.load_transition_tier_config(request).await?.into_inner();
-                if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(Error::other(""));
-                }
+    async fn load_transition_tier_config_inner(&self) -> Result<()> {
+        let mut client = self.get_client().await?;
+        let request = Request::new(LoadTransitionTierConfigRequest {});
 
-                Ok(())
+        let response = client.load_transition_tier_config(request).await?.into_inner();
+        if !response.success {
+            if let Some(msg) = response.error_info {
+                return Err(Error::other(msg));
             }
-            .await,
-        )
-        .await
+            return Err(Error::other(""));
+        }
+
+        Ok(())
     }
 }
 
