@@ -4136,6 +4136,105 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
 }
 
 #[cfg(test)]
+mod get_object_downstream_close_accounting_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::diagnostics::get::{GET_STAGE_DECODE, GET_STAGE_EMIT, GetObjectFailureReason};
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::test_metrics::CapturingRecorder;
+    use std::time::Duration;
+
+    #[test]
+    #[serial_test::serial]
+    fn dropped_legacy_reader_does_not_record_emit_downstream_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let (decode_failures, emit_failures) = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = "get-downstream-close-accounting";
+                let object = "object.bin";
+                let payload = b"downstream-close-accounting-".repeat(10_000);
+                let options = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+
+                set_disks
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let mut put_reader = PutObjReader::from_vec(payload.clone());
+                set_disks
+                    .put_object(bucket, object, &mut put_reader, &options)
+                    .await
+                    .expect("object should be written");
+
+                let range = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 0,
+                    end: payload.len() as i64 - 1,
+                });
+                let reader = set_disks
+                    .get_object_reader(bucket, object, range, HeaderMap::new(), &options)
+                    .await
+                    .expect("legacy reader should open");
+                drop(reader);
+
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let decode_failures = recorder.counter_value(
+                            "rustfs_io_get_object_pipeline_failures_total",
+                            &[
+                                ("path", "legacy_duplex"),
+                                ("stage", GET_STAGE_DECODE),
+                                ("reason", GetObjectFailureReason::DownstreamClosed.as_str()),
+                            ],
+                        );
+                        if decode_failures > 0 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("dropped reader should reach the downstream-close producer path");
+
+                (
+                    recorder.counter_value(
+                        "rustfs_io_get_object_pipeline_failures_total",
+                        &[
+                            ("path", "legacy_duplex"),
+                            ("stage", GET_STAGE_DECODE),
+                            ("reason", GetObjectFailureReason::DownstreamClosed.as_str()),
+                        ],
+                    ),
+                    recorder.counter_value(
+                        "rustfs_io_get_object_pipeline_failures_total",
+                        &[
+                            ("path", "legacy_duplex"),
+                            ("stage", GET_STAGE_EMIT),
+                            ("reason", GetObjectFailureReason::DownstreamClosed.as_str()),
+                        ],
+                    ),
+                )
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert!(decode_failures > 0, "the producer must expose the downstream close at decode");
+        assert_eq!(emit_failures, 0, "downstream closure must not be counted as an emit failure");
+    }
+}
+
+#[cfg(test)]
 mod metadata_mutation_generation_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
