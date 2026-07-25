@@ -33,7 +33,6 @@ use rustfs_filemeta::FileInfo;
 
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
 const DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT: usize = 10_000;
-const BACKGROUND_WALKDIR_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
 const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -41,6 +40,21 @@ const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, crate::error::Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+fn recovery_walk_options(limit: usize, marker: Option<String>) -> WalkOptions {
+    WalkOptions {
+        include_free_versions: true,
+        limit,
+        marker,
+        // Total walk time scales with bucket size, so it is left unbounded
+        // (Duration::ZERO disables the wall-clock budget). Per-call progress
+        // stalls stay bounded by the drive-level stall budget inherited from
+        // `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`.
+        walkdir_timeout: Some(Duration::ZERO),
+        walkdir_stall_timeout: None,
+        ..Default::default()
+    }
+}
 
 #[cfg(test)]
 pub(super) enum RecoveryWalkTestAction {
@@ -406,20 +420,8 @@ pub(super) async fn list_tier_free_versions(
                     }
                 }
 
-                api.walk(
-                    cancel,
-                    &bucket_name,
-                    "",
-                    tx,
-                    WalkOptions {
-                        include_free_versions: true,
-                        limit: walk_scan_limit,
-                        marker: object_marker,
-                        ..Default::default()
-                    }
-                    .with_walkdir_timeouts(BACKGROUND_WALKDIR_TIMEOUT),
-                )
-                .await
+                api.walk(cancel, &bucket_name, "", tx, recovery_walk_options(walk_scan_limit, object_marker))
+                    .await
             }
         });
 
@@ -693,6 +695,16 @@ mod tests {
             recovery_walk_scan_limit(DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT),
             DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT + 1
         );
+    }
+
+    #[test]
+    fn recovery_walk_disables_total_timeout_and_inherits_stall_timeout() {
+        let opts = recovery_walk_options(123, Some("marker".to_string()));
+
+        assert_eq!(opts.limit, 123);
+        assert_eq!(opts.marker.as_deref(), Some("marker"));
+        assert_eq!(opts.walkdir_timeout, Some(Duration::ZERO));
+        assert_eq!(opts.walkdir_stall_timeout, None);
     }
 
     #[test]
