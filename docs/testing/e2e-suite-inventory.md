@@ -34,8 +34,8 @@
 | connection_cap_test | 2 |  |
 | console_smoke_test | 1 | ✅ |
 | content_encoding_test | 3 | ✅ |
-| copy_object_checksum_test | 3 |  |
-| copy_object_metadata_test | 1 | ✅ |
+| copy_object_checksum_test | 7 |  |
+| copy_object_metadata_test | 4 | ✅ |
 | copy_object_tagging_test | 2 | ✅ |
 | copy_object_version_restore_test | 2 |  |
 | copy_source_invalid_date_test | 1 | ✅ |
@@ -61,6 +61,7 @@
 | list_objects_v2_pagination_test | 12 | ✅ |
 | mc_mirror_small_bucket_test | 1 |  |
 | multipart_auth_test | 109 |  |
+| multipart_storage_class_test | 3 | ✅ |
 | namespace_lock_quorum_test | 2 |  |
 | negative_sigv4_test | 6 | ✅ |
 | notification_webhook_test | 2 | ✅ |
@@ -71,17 +72,19 @@
 | protocols | 16 |  |
 | quota_test | 14 |  |
 | reliability_disk_fault_test | 3 |  |
-| reliant | 10 | 4 ✅ |
+| reliant | 10 | 5 ✅ |
 | replication_extension_test | 47 | 20 ✅ +27 🌙 |
 | security_boundary_test | 4 |  |
+| ssec_copy_test | 2 | ✅ |
 | server_startup_failfast_test | 1 |  |
 | snowball_auto_extract_test | 6 |  |
 | special_chars_test | 14 | ✅ |
 | stale_multipart_cleanup_cluster_test | 1 |  |
+| storage_class_capability_test | 4 | ✅ |
 | tls_gen | 3 |  |
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
 `notification_webhook_test` also has 1 ignored store-and-forward regression tracked by rustfs#4852; ignored tests are excluded from the active counts above.
 
-**Total listed: 469 tests across 64 modules · PR smoke subset: 116 tests / 29 modules** (27 full modules + 4 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-23.
+**Total listed: 485 tests across 67 modules · PR smoke subset: 129 tests / 32 modules** (30 full modules + 5 `reliant` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 27 tests** · generated 2026-07-24.

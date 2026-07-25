@@ -313,18 +313,24 @@ impl InQueueMetric {
     pub fn merge(&self, other: &InQueueMetric) -> Self {
         Self {
             curr: InQueueStats {
-                bytes: self.curr.bytes + other.curr.bytes,
-                count: self.curr.count + other.curr.count,
+                bytes: self.curr.bytes.saturating_add(other.curr.bytes),
+                count: self.curr.count.saturating_add(other.curr.count),
                 now_bytes: AtomicI64::new(
-                    self.curr.now_bytes.load(Ordering::Relaxed) + other.curr.now_bytes.load(Ordering::Relaxed),
+                    self.curr
+                        .now_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_add(other.curr.now_bytes.load(Ordering::Relaxed)),
                 ),
                 now_count: AtomicI64::new(
-                    self.curr.now_count.load(Ordering::Relaxed) + other.curr.now_count.load(Ordering::Relaxed),
+                    self.curr
+                        .now_count
+                        .load(Ordering::Relaxed)
+                        .saturating_add(other.curr.now_count.load(Ordering::Relaxed)),
                 ),
             },
             avg: InQueueStats {
-                bytes: (self.avg.bytes + other.avg.bytes) / 2,
-                count: (self.avg.count + other.avg.count) / 2,
+                bytes: self.avg.bytes.saturating_add(other.avg.bytes) / 2,
+                count: self.avg.count.saturating_add(other.avg.count) / 2,
                 ..Default::default()
             },
             max: InQueueStats {
@@ -333,8 +339,8 @@ impl InQueueMetric {
                 ..Default::default()
             },
             last_minute: InQueueStats {
-                bytes: self.last_minute.bytes + other.last_minute.bytes,
-                count: self.last_minute.count + other.last_minute.count,
+                bytes: self.last_minute.bytes.saturating_add(other.last_minute.bytes),
+                count: self.last_minute.count.saturating_add(other.last_minute.count),
                 ..Default::default()
             },
             samples: VecDeque::new(),
@@ -495,8 +501,8 @@ impl FailStats {
 
     pub fn add_size<E>(&mut self, size: i64, _err: Option<&E>) {
         let observed_at = Instant::now();
-        self.count += 1;
-        self.size += size;
+        self.count = self.count.saturating_add(1);
+        self.size = self.size.saturating_add(size);
         self.recent.push_back(FailureSample { observed_at, size });
         self.prune(observed_at);
     }
@@ -527,8 +533,8 @@ impl FailStats {
 
     pub fn merge(&self, other: &FailStats) -> Self {
         Self {
-            count: self.count + other.count,
-            size: self.size + other.size,
+            count: self.count.saturating_add(other.count),
+            size: self.size.saturating_add(other.size),
             recent: VecDeque::new(),
         }
     }
@@ -588,6 +594,10 @@ pub struct BucketReplicationStat {
     pub xfer_rate_sml: XferStats,
     pub bandwidth_limit_bytes_per_sec: i64,
     pub current_bandwidth_bytes_per_sec: f64,
+    #[serde(default)]
+    pub latency_scope: ReplicationMetricScope,
+    #[serde(default)]
+    pub bandwidth_scope: ReplicationMetricScope,
 }
 
 impl BucketReplicationStat {
@@ -602,6 +612,22 @@ impl BucketReplicationStat {
             self.xfer_rate_sml.add_size(size, duration);
         }
     }
+
+    pub fn set_node_local_bandwidth(&mut self, limit_bytes_per_sec: i64, current_bytes_per_sec: f64) {
+        self.bandwidth_limit_bytes_per_sec = limit_bytes_per_sec;
+        self.current_bandwidth_bytes_per_sec = current_bytes_per_sec;
+        self.bandwidth_scope = ReplicationMetricScope::NodeLocal;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationMetricScope {
+    #[default]
+    Unavailable,
+    NodeLocal,
+    ClusterAggregated,
+    PartialCluster,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -632,6 +658,16 @@ pub struct BucketReplicationStats {
     pub resync_canceled_count: i64,
     #[serde(default)]
     pub resync_duration_ms: i64,
+    #[serde(default)]
+    pub provider_available: bool,
+    #[serde(default)]
+    pub cluster_complete: bool,
+    #[serde(default)]
+    pub observed_node_count: u32,
+    #[serde(default)]
+    pub expected_node_count: u32,
+    #[serde(default)]
+    pub queue_scope: ReplicationMetricScope,
 }
 
 impl BucketReplicationStats {
@@ -662,7 +698,18 @@ impl BucketReplicationStats {
     }
 
     pub fn clone_stats(&self) -> Self {
-        self.clone()
+        let mut snapshot = self.clone();
+        for stat in snapshot.stats.values_mut() {
+            stat.failed = stat.fail_stats.to_metric();
+        }
+        snapshot
+    }
+
+    pub fn mark_node_local_provider_available(&mut self) {
+        self.provider_available = true;
+        self.cluster_complete = true;
+        self.observed_node_count = 1;
+        self.expected_node_count = 1;
     }
 
     pub fn record_resync_status(&mut self, status: ResyncStatusType, duration: Option<Duration>) {
@@ -789,6 +836,27 @@ mod tests {
         assert_eq!(last_minute.size, 96);
         assert_eq!(last_hour.count, 2);
         assert_eq!(last_hour.size, 96);
+    }
+
+    #[test]
+    fn fail_stats_saturate_instead_of_wrapping() {
+        let mut stats = FailStats {
+            count: i64::MAX,
+            size: i64::MAX,
+            ..Default::default()
+        };
+
+        stats.add_size(1, None::<&()>);
+        let merged = stats.merge(&FailStats {
+            count: 1,
+            size: 1,
+            ..Default::default()
+        });
+
+        assert_eq!(stats.count, i64::MAX);
+        assert_eq!(stats.size, i64::MAX);
+        assert_eq!(merged.count, i64::MAX);
+        assert_eq!(merged.size, i64::MAX);
     }
 
     #[test]

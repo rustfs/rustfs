@@ -868,8 +868,8 @@ pub(crate) mod options {
     pub(crate) use crate::storage::storage_api::options_consumer::{
         copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime,
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, parse_copy_source_range, put_opts,
-        validate_archive_content_encoding,
+        get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+        parse_copy_source_range, put_opts, validate_archive_content_encoding,
     };
 }
 
@@ -896,9 +896,9 @@ pub(crate) mod set_disk {
 }
 
 pub(crate) mod storage_class {
-    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::STANDARD;
     #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::STANDARD_IA;
+    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{RRS, STANDARD_IA};
+    pub(crate) use crate::storage::storage_api::ecstore_config::storageclass::{STANDARD, effective_class};
 }
 
 pub(crate) mod timeout_wrapper {
@@ -1020,9 +1020,7 @@ pub(crate) mod multipart_usecase {
         }
     }
 
-    pub(crate) use super::{
-        access, bucket, compression, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse,
-    };
+    pub(crate) use super::{access, bucket, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse};
     pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectOptions, StoragePutObjReader};
 }
 

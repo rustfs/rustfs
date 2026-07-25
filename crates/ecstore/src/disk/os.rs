@@ -452,6 +452,49 @@ pub async fn is_empty_dir(path: impl AsRef<Path>) -> bool {
     read_dir(path.as_ref(), 1).await.is_ok_and(|v| v.is_empty())
 }
 
+const READ_DIR_PROBE_RAW_LIMIT: usize = 256;
+
+pub(crate) struct ReadDirProbe {
+    pub entries: Vec<String>,
+    pub complete: bool,
+}
+
+pub(crate) fn read_dir_probe(path: impl AsRef<Path>, entry_limit: usize) -> io::Result<ReadDirProbe> {
+    let mut dir = std::fs::read_dir(path)?;
+    let mut entries = Vec::with_capacity(entry_limit.min(READ_DIR_PROBE_RAW_LIMIT));
+    for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
+        let Some(entry) = dir.next() else {
+            return Ok(ReadDirProbe { entries, complete: true });
+        };
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+        if file_type.is_file() {
+            entries.push(name);
+        } else if file_type.is_dir() {
+            entries.push(format!("{name}{SLASH_SEPARATOR}"));
+        } else {
+            continue;
+        }
+
+        if entries.len() == entry_limit {
+            return Ok(ReadDirProbe {
+                entries,
+                complete: false,
+            });
+        }
+    }
+
+    Ok(ReadDirProbe {
+        entries,
+        complete: false,
+    })
+}
+
 // read_dir  count read limit. when count == 0 unlimit.
 /// Return file names in the directory.
 #[tracing::instrument(level = "debug", skip_all)]
@@ -740,6 +783,22 @@ mod tests {
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
         (logs, guard)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_dir_probe_bounds_unsupported_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        for index in 0..=READ_DIR_PROBE_RAW_LIMIT {
+            symlink("missing", temp_dir.path().join(format!("ignored-link-{index:04}"))).expect("create symlink");
+        }
+
+        let probe = read_dir_probe(temp_dir.path(), 1).expect("probe directory");
+
+        assert!(probe.entries.is_empty());
+        assert!(!probe.complete, "a bounded probe must not claim that an oversized directory is complete");
     }
 
     #[test]

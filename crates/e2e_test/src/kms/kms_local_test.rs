@@ -625,6 +625,9 @@ async fn test_multipart_upload_with_sse_c(
         .bucket(bucket)
         .key(object_key)
         .upload_id(upload_id)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&key_b64)
+        .sse_customer_key_md5(&key_md5)
         .multipart_upload(completed_multipart_upload)
         .send()
         .await?;

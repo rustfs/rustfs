@@ -39,6 +39,12 @@ pub(crate) fn current_object_store_handle_for_context(context: Option<&AppContex
     root_runtime_sources::current_object_store_handle_for_context(context)
 }
 
+pub(crate) fn current_replication_stats_handle_for_context(
+    context: Option<&AppContext>,
+) -> Option<Arc<crate::storage::storage_api::ReplicationStats>> {
+    root_runtime_sources::current_replication_stats_handle_for_context(context.map(|context| Arc::new(context.clone())))
+}
+
 pub(crate) fn current_buffer_config() -> RustFSBufferConfig {
     root_runtime_sources::current_buffer_config().unwrap_or_default()
 }

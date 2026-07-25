@@ -414,22 +414,44 @@ pub struct EncryptionRequest<'a> {
 }
 
 impl EncryptionRequest<'_> {
-    pub fn check_upload_part_customer_key_md5(
-        &self,
-        user_defined: &HashMap<String, String>,
-        customer_key_md5: Option<SSECustomerKeyMD5>,
-    ) -> Result<(), ApiError> {
-        if let Some(customer_key_md5) = customer_key_md5 {
-            // if customer_key_md5 is provided, check if it matches the metadata
-            let customer_key_md5_from_metadata = user_defined.get("x-amz-server-side-encryption-customer-key-md5");
-            if let Some(customer_key_md5_from_metadata) = customer_key_md5_from_metadata
-                && customer_key_md5_from_metadata != customer_key_md5.as_str()
-            {
-                return Err(ApiError::from(StorageError::other("Customer key MD5 mismatch")));
-            }
+    pub fn validate_multipart_ssec(&self, user_defined: &HashMap<String, String>) -> Result<(), ApiError> {
+        let stored_algorithm = user_defined.get("x-amz-server-side-encryption-customer-algorithm");
+        let stored_key_md5 = user_defined.get("x-amz-server-side-encryption-customer-key-md5");
+        let session_uses_ssec = stored_algorithm.is_some() || stored_key_md5.is_some();
+        let request_uses_ssec =
+            self.sse_customer_algorithm.is_some() || self.sse_customer_key.is_some() || self.sse_customer_key_md5.is_some();
+
+        if !session_uses_ssec {
+            return if request_uses_ssec {
+                Err(ssec_invalid_request(
+                    "SSE-C parameters cannot be used for a multipart upload that was not initiated with SSE-C.",
+                ))
+            } else {
+                Ok(())
+            };
         }
 
-        Ok(())
+        let (Some(algorithm), Some(key), Some(key_md5)) = (
+            self.sse_customer_algorithm.as_ref(),
+            self.sse_customer_key.as_ref(),
+            self.sse_customer_key_md5.as_ref(),
+        ) else {
+            return Err(ssec_invalid_request(
+                "Missing SSE-C parameters. Algorithm, customer key and customer key MD5 are all required.",
+            ));
+        };
+
+        let validated = validate_ssec_params(SsecParams {
+            algorithm: algorithm.to_string(),
+            key: key.to_string(),
+            key_md5: key_md5.to_string(),
+        })?;
+        if stored_algorithm.map(String::as_str) != Some(validated.algorithm.as_str()) {
+            return Err(ssec_invalid_request(
+                "The provided encryption parameters did not match the multipart upload.",
+            ));
+        }
+        verify_ssec_key_match(&validated.key_md5, stored_key_md5)
     }
 }
 
@@ -654,12 +676,9 @@ fn map_ssec_get_object_reader_error_message(err: &StorageError) -> Option<String
         "SSE-C key does not match object metadata" => Some(
             "The provided encryption parameters did not match the ones used originally to encrypt the object.".to_string(),
         ),
-        _ => detail.strip_prefix("unsupported SSE-C algorithm ").map(|algorithm| {
-            format!(
-                "Unsupported SSE-C algorithm: {}. Only {} is supported.",
-                algorithm, DEFAULT_SSE_ALGORITHM
-            )
-        }),
+        _ => detail
+            .strip_prefix("unsupported SSE-C algorithm ")
+            .map(|_| format!("Unsupported SSE-C algorithm. Only {DEFAULT_SSE_ALGORITHM} is supported.")),
     }
 }
 
@@ -1280,7 +1299,7 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
         request.sse_customer_algorithm.as_ref(),
         request.sse_customer_key.as_ref(),
         request.sse_customer_key_md5.as_ref(),
-        false,
+        true,
     )?;
 
     let sse_type = prepare_sse_configuration_v2(
@@ -2233,14 +2252,17 @@ pub fn is_managed_sse(server_side_encryption: &ServerSideEncryption) -> bool {
     matches!(server_side_encryption.as_str(), "AES256" | "aws:kms")
 }
 
-/// Strip managed encryption metadata from object metadata
+/// Strip source encryption metadata before constructing metadata for a copy destination.
 ///
-/// Removes all managed SSE-related headers before returning object metadata to client.
-/// This is necessary because encryption is transparent to S3 clients.
+/// Encryption metadata describes the physical source representation and must never be
+/// inherited by a plaintext destination or by a destination using a different key.
 pub fn strip_managed_encryption_metadata(metadata: &mut HashMap<String, String>) {
-    const KEYS: [&str; 16] = [
+    const KEYS: [&str; 19] = [
         "x-amz-server-side-encryption",
         "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+        SSEC_ORIGINAL_SIZE_HEADER,
         INTERNAL_ENCRYPTION_IV_HEADER,
         "x-rustfs-encryption-tag",
         INTERNAL_ENCRYPTION_KEY_HEADER,
@@ -2378,8 +2400,7 @@ fn normalize_managed_metadata(metadata: &HashMap<String, String>) -> HashMap<Str
 pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, ApiError> {
     if !SUPPORT_SSE_ALGORITHMS.contains(&params.algorithm.as_str()) {
         return Err(ssec_invalid_request(&format!(
-            "Unsupported SSE-C algorithm: {}. Only {} is supported.",
-            params.algorithm, DEFAULT_SSE_ALGORITHM
+            "Unsupported SSE-C algorithm. Only {DEFAULT_SSE_ALGORITHM} is supported."
         )));
     }
 
@@ -2397,7 +2418,6 @@ pub fn validate_ssec_params(params: SsecParams) -> Result<ValidatedSsecParams, A
 
     let computed_md5 = BASE64_STANDARD.encode(md5::compute(&key_bytes).0);
     if computed_md5 != params.key_md5 {
-        error!("SSE-C key MD5 mismatch: expected '{}', got '{}'", params.key_md5, computed_md5);
         return Err(ssec_invalid_request(
             "The calculated MD5 hash of the key did not match the hash that was provided.",
         ));
@@ -2863,7 +2883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sse_prepare_encryption_allows_ssec_headers_without_customer_key() {
+    async fn test_sse_prepare_encryption_rejects_ssec_headers_without_customer_key() {
         let bucket = "test-bucket";
         let key = "test-key";
         let sse_key_md5 = BASE64_STANDARD.encode(md5::compute([42u8; 32]).0);
@@ -2879,14 +2899,10 @@ mod tests {
             sse_customer_key_md5: Some(sse_key_md5),
         };
 
-        let material = sse_prepare_encryption(request)
+        let error = sse_prepare_encryption(request)
             .await
-            .expect("prepare should accept ssec headers");
-        assert!(material.is_some());
-        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"))
-            .expect("ssec metadata should be generated");
-        assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
-        assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
+            .expect_err("multipart preparation must require possession of the customer key");
+        assert_eq!(error.code, S3ErrorCode::InvalidRequest);
     }
 
     // ------------------------------------------------------------------------
@@ -3441,6 +3457,9 @@ mod tests {
     fn test_strip_managed_encryption_metadata() {
         let mut metadata = HashMap::new();
         metadata.insert("x-amz-server-side-encryption".to_string(), "aws:kms".to_string());
+        metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), "source-key-md5".to_string());
+        metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), "123".to_string());
         metadata.insert("x-rustfs-encryption-key".to_string(), "encrypted_key".to_string());
         metadata.insert(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(), "sealed".to_string());
         metadata.insert("content-type".to_string(), "text/plain".to_string());
@@ -3448,6 +3467,9 @@ mod tests {
         strip_managed_encryption_metadata(&mut metadata);
 
         assert!(!metadata.contains_key("x-amz-server-side-encryption"));
+        assert!(!metadata.contains_key("x-amz-server-side-encryption-customer-algorithm"));
+        assert!(!metadata.contains_key("x-amz-server-side-encryption-customer-key-md5"));
+        assert!(!metadata.contains_key(SSEC_ORIGINAL_SIZE_HEADER));
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(!metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER));
         assert!(metadata.contains_key("content-type"));
@@ -3650,51 +3672,89 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_upload_part_customer_key_md5_comparison_is_case_sensitive() {
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "x-amz-server-side-encryption-customer-key-md5".to_string(),
-            "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/==".to_string(),
-        );
-
-        let request = EncryptionRequest {
+    fn multipart_ssec_request(key_byte: u8) -> EncryptionRequest<'static> {
+        let key_bytes = [key_byte; 32];
+        EncryptionRequest {
             bucket: "bucket",
             key: "object",
             server_side_encryption: None,
             ssekms_key_id: None,
             ssekms_context: None,
-            sse_customer_algorithm: None,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(BASE64_STANDARD.encode(key_bytes)),
+            sse_customer_key_md5: Some(BASE64_STANDARD.encode(md5::compute(key_bytes).0)),
             content_size: 1,
-        };
+        }
+    }
 
-        let mismatch = "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789+/==".to_string();
-        let result = request.check_upload_part_customer_key_md5(&metadata, Some(mismatch));
-        assert!(result.is_err());
+    fn multipart_ssec_metadata(key_byte: u8) -> HashMap<String, String> {
+        let key_bytes = [key_byte; 32];
+        HashMap::from([
+            ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+            (
+                "x-amz-server-side-encryption-customer-key-md5".to_string(),
+                BASE64_STANDARD.encode(md5::compute(key_bytes).0),
+            ),
+        ])
     }
 
     #[test]
-    fn test_upload_part_customer_key_md5_exact_match() {
-        let mut metadata = HashMap::new();
-        let md5 = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/==".to_string();
-        metadata.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), md5.clone());
+    fn test_validate_multipart_ssec_exact_match() {
+        assert!(
+            multipart_ssec_request(42)
+                .validate_multipart_ssec(&multipart_ssec_metadata(42))
+                .is_ok()
+        );
+    }
 
-        let request = EncryptionRequest {
-            bucket: "bucket",
-            key: "object",
-            server_side_encryption: None,
-            ssekms_key_id: None,
-            ssekms_context: None,
+    #[test]
+    fn test_validate_multipart_ssec_rejects_wrong_key_without_leaking_it() {
+        let request = multipart_ssec_request(43);
+        let encoded_key = request.sse_customer_key.clone().expect("fixture key");
+        let encoded_md5 = request.sse_customer_key_md5.clone().expect("fixture MD5");
+
+        let error = request
+            .validate_multipart_ssec(&multipart_ssec_metadata(42))
+            .expect_err("wrong key must fail");
+
+        assert_eq!(error.code, S3ErrorCode::InvalidRequest);
+        assert!(!error.message.contains(&encoded_key));
+        assert!(!error.message.contains(&encoded_md5));
+    }
+
+    #[test]
+    fn test_validate_multipart_ssec_rejects_missing_or_unexpected_parameters() {
+        let no_ssec = EncryptionRequest {
             sse_customer_algorithm: None,
             sse_customer_key: None,
             sse_customer_key_md5: None,
-            content_size: 1,
+            ..multipart_ssec_request(42)
         };
-
-        let result = request.check_upload_part_customer_key_md5(&metadata, Some(md5));
-        assert!(result.is_ok());
+        assert_eq!(
+            no_ssec
+                .validate_multipart_ssec(&multipart_ssec_metadata(42))
+                .expect_err("SSE-C session requires all parameters")
+                .code,
+            S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            multipart_ssec_request(42)
+                .validate_multipart_ssec(&HashMap::new())
+                .expect_err("plaintext session rejects SSE-C parameters")
+                .code,
+            S3ErrorCode::InvalidRequest
+        );
+        let incomplete_session = HashMap::from([(
+            "x-amz-server-side-encryption-customer-key-md5".to_string(),
+            multipart_ssec_request(42).sse_customer_key_md5.expect("fixture MD5"),
+        )]);
+        assert_eq!(
+            multipart_ssec_request(42)
+                .validate_multipart_ssec(&incomplete_session)
+                .expect_err("incomplete stored SSE-C metadata must fail closed")
+                .code,
+            S3ErrorCode::InvalidRequest
+        );
     }
 
     // ============================================================================

@@ -4073,11 +4073,11 @@ pub fn should_heal_object_on_disk(
     }
 
     if !meta.is_canonical_delete_marker() && !meta.is_remote() {
-        let err_vec = [CHECK_PART_FILE_NOT_FOUND, CHECK_PART_FILE_CORRUPT];
-        for part_err in parts_errs.iter() {
-            if err_vec.contains(part_err) {
-                return (true, false, Some(DiskError::PartMissingOrCorrupt));
-            }
+        if parts_errs.contains(&CHECK_PART_FILE_CORRUPT) {
+            return (true, false, Some(DiskError::FileCorrupt));
+        }
+        if parts_errs.contains(&CHECK_PART_FILE_NOT_FOUND) {
+            return (true, false, Some(DiskError::PartMissingOrCorrupt));
         }
     }
     (false, false, None)
@@ -4408,20 +4408,7 @@ pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_m
 
 /// Validates if the given storage class is supported
 pub fn is_valid_storage_class(storage_class: &str) -> bool {
-    matches!(
-        storage_class,
-        storageclass::STANDARD
-            | storageclass::RRS
-            | storageclass::DEEP_ARCHIVE
-            | storageclass::EXPRESS_ONEZONE
-            | storageclass::GLACIER
-            | storageclass::GLACIER_IR
-            | storageclass::INTELLIGENT_TIERING
-            | storageclass::ONEZONE_IA
-            | storageclass::OUTPOSTS
-            | storageclass::SNOW
-            | storageclass::STANDARD_IA
-    )
+    storageclass::is_supported_write_class(storage_class)
 }
 
 /// Returns true if the storage class is a cold storage tier that requires special handling
@@ -6879,8 +6866,9 @@ mod tests {
         assert!(!should_heal);
 
         // Test with part corruption
-        let (should_heal, _, _) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
+        let (should_heal, _, reason) = should_heal_object_on_disk(&None, &[CHECK_PART_FILE_CORRUPT], &meta, &latest_meta);
         assert!(should_heal);
+        assert_eq!(reason, Some(DiskError::FileCorrupt));
     }
 
     #[tokio::test]
@@ -7796,23 +7784,10 @@ mod tests {
 
     #[test]
     fn test_is_valid_storage_class() {
-        // Test valid storage classes
         assert!(is_valid_storage_class(storageclass::STANDARD));
         assert!(is_valid_storage_class(storageclass::RRS));
-        assert!(is_valid_storage_class(storageclass::DEEP_ARCHIVE));
-        assert!(is_valid_storage_class(storageclass::EXPRESS_ONEZONE));
-        assert!(is_valid_storage_class(storageclass::GLACIER));
-        assert!(is_valid_storage_class(storageclass::GLACIER_IR));
-        assert!(is_valid_storage_class(storageclass::INTELLIGENT_TIERING));
-        assert!(is_valid_storage_class(storageclass::ONEZONE_IA));
-        assert!(is_valid_storage_class(storageclass::OUTPOSTS));
-        assert!(is_valid_storage_class(storageclass::SNOW));
-        assert!(is_valid_storage_class(storageclass::STANDARD_IA));
-
-        // Test invalid storage classes
+        assert!(!is_valid_storage_class(storageclass::STANDARD_IA));
         assert!(!is_valid_storage_class("INVALID"));
-        assert!(!is_valid_storage_class(""));
-        assert!(!is_valid_storage_class("standard")); // lowercase
     }
 
     #[test]

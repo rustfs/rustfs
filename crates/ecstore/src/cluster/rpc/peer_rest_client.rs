@@ -22,6 +22,7 @@ use crate::storage_api_contracts::internode::{
     SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
 };
 use crate::{
+    bucket::replication::BucketStats,
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     layout::endpoints::EndpointServerPools,
     runtime::sources as runtime_sources,
@@ -38,14 +39,15 @@ use rustfs_madmin::{
 };
 use rustfs_protos::proto_gen::node_service::{
     BackgroundHealStatusRequest, CancelDecommissionRequest, ClearDecommissionRequest, DeleteBucketMetadataRequest,
-    DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest,
-    GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
-    GetSysConfigRequest, GetSysErrorsRequest, HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest,
-    LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
-    LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest,
-    ReloadSiteReplicationConfigRequest, ScannerActivityRequest, ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest,
-    StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
-    TierMutationControlResponse, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetBucketStatsDataRequest, GetBucketStatsDataResponse,
+    GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest,
+    GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
+    HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
+    LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
+    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ScannerActivityRequest,
+    ScannerActivityResponse, ServerInfoRequest, SignalServiceRequest, StartDecommissionRequest, StartProfilingRequest,
+    StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
+    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
@@ -78,6 +80,26 @@ const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
 const PEER_REST_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SCANNER_ACTIVITY_MAX_MESSAGE_SIZE: usize = 1024;
+const REPLICATION_STATS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+fn decode_bucket_stats_response(response: GetBucketStatsDataResponse) -> Result<BucketStats> {
+    if !response.success {
+        return Err(Error::other(
+            response
+                .error_info
+                .unwrap_or_else(|| "peer replication statistics provider is unavailable".to_string()),
+        ));
+    }
+    if response.bucket_stats.len() > REPLICATION_STATS_MAX_MESSAGE_SIZE {
+        return Err(Error::other("peer replication statistics response exceeds size limit"));
+    }
+    let mut buf = Deserializer::new(Cursor::new(response.bucket_stats));
+    let stats = BucketStats::deserialize(&mut buf).map_err(Error::from)?;
+    if !stats.replication_stats.provider_available {
+        return Err(Error::other("peer replication statistics provider is unavailable"));
+    }
+    Ok(stats)
+}
 
 fn validate_signal_service_protocol(sig: u64, sub_sys: &str, protocol_version: u32) -> Result<()> {
     if sig == SERVICE_SIGNAL_RELOAD_DYNAMIC
@@ -912,9 +934,26 @@ impl PeerRestClient {
         Err(Error::NotImplemented)
     }
 
-    pub async fn get_bucket_stats(&self) -> Result<()> {
-        warn!("get_bucket_stats is not implemented in PeerRestClient");
-        Err(Error::NotImplemented)
+    pub async fn get_bucket_stats(&self, bucket: &str) -> Result<BucketStats> {
+        let response = self
+            .finalize_result(
+                async {
+                    let mut client = self
+                        .get_client()
+                        .await?
+                        .max_decoding_message_size(REPLICATION_STATS_MAX_MESSAGE_SIZE);
+                    let response = client
+                        .get_bucket_stats(Request::new(GetBucketStatsDataRequest {
+                            bucket: bucket.to_string(),
+                        }))
+                        .await?
+                        .into_inner();
+                    Ok(response)
+                }
+                .await,
+            )
+            .await?;
+        decode_bucket_stats_response(response)
     }
 
     pub async fn get_sr_metrics(&self) -> Result<()> {
@@ -1621,6 +1660,50 @@ mod tests {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn replication_stats_response_decodes_valid_empty_provider() {
+        let mut stats = BucketStats::default();
+        stats.replication_stats.provider_available = true;
+        let payload = rmp_serde::to_vec_named(&stats).expect("bucket statistics should encode");
+
+        let decoded = decode_bucket_stats_response(GetBucketStatsDataResponse {
+            success: true,
+            bucket_stats: payload.into(),
+            error_info: None,
+        })
+        .expect("valid bucket statistics should decode");
+
+        assert!(decoded.replication_stats.provider_available);
+        assert!(decoded.replication_stats.stats.is_empty());
+    }
+
+    #[test]
+    fn replication_stats_response_rejects_unavailable_malformed_and_oversized_payloads() {
+        let unavailable = decode_bucket_stats_response(GetBucketStatsDataResponse {
+            success: false,
+            bucket_stats: Bytes::new(),
+            error_info: Some("provider unavailable".to_string()),
+        })
+        .expect_err("unavailable provider must not become a zero snapshot");
+        assert!(unavailable.to_string().contains("provider unavailable"));
+
+        let malformed = decode_bucket_stats_response(GetBucketStatsDataResponse {
+            success: true,
+            bucket_stats: Bytes::from_static(b"not-msgpack"),
+            error_info: None,
+        })
+        .expect_err("malformed peer statistics must fail closed");
+        assert!(!malformed.to_string().is_empty());
+
+        let oversized = decode_bucket_stats_response(GetBucketStatsDataResponse {
+            success: true,
+            bucket_stats: Bytes::from(vec![0; REPLICATION_STATS_MAX_MESSAGE_SIZE + 1]),
+            error_info: None,
+        })
+        .expect_err("oversized peer statistics must fail closed");
+        assert!(oversized.to_string().contains("size limit"));
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs {

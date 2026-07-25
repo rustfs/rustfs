@@ -201,3 +201,9 @@ by environment variable. Phase 2 (rustfs/backlog#938) adds the per-bucket
 override described above, configured through the admin API and stored in
 bucket metadata. `mc admin` integration for the per-bucket tier is a
 follow-up.
+
+## Related Recovery Guides
+
+- [No-parity bitrot recovery](no-parity-bitrot-recovery.md) explains how to
+  diagnose historical no-parity objects whose raw `part.N` files are present
+  but fail bitrot validation.

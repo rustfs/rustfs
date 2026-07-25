@@ -449,6 +449,8 @@ mod tests {
     use crate::storage::s3_api::common::rustfs_owner;
     use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
     use crate::storage::storage_api::s3_api_consumer::bucket::contract::bucket::BucketInfo;
+    use rustfs_filemeta::FileInfo;
+    use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
     use time::OffsetDateTime;
@@ -652,6 +654,67 @@ mod tests {
         assert_eq!(output.key_count, Some(3));
         assert_eq!(output.contents.as_ref().map(std::vec::Vec::len), Some(1));
         assert_eq!(output.common_prefixes.as_ref().map(std::vec::Vec::len), Some(2));
+    }
+
+    #[test]
+    fn list_responses_report_standard_for_legacy_label_only_file_metadata() {
+        let version_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("fixture version ID should be valid");
+        let file_info = FileInfo {
+            name: "legacy-object".to_string(),
+            version_id: Some(version_id),
+            metadata: std::collections::HashMap::from([(AMZ_STORAGE_CLASS.to_string(), "STANDARD_IA".to_string())]),
+            ..Default::default()
+        };
+        let object_info = ObjectInfo::from_file_info(&file_info, "bucket", "legacy-object", true);
+
+        let list_output = build_list_objects_v2_output(
+            ListObjectsV2Info {
+                objects: vec![object_info.clone()],
+                ..Default::default()
+            },
+            false,
+            1000,
+            "bucket".to_string(),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            list_output
+                .contents
+                .as_ref()
+                .and_then(|objects| objects.first())
+                .and_then(|object| object.storage_class.as_ref())
+                .map(|storage_class| storage_class.as_str()),
+            Some("STANDARD")
+        );
+
+        let versions_output = build_list_object_versions_output(
+            ListObjectVersionsInfo {
+                objects: vec![object_info],
+                ..Default::default()
+            },
+            "bucket".to_string(),
+            &ListObjectVersionsParams {
+                prefix: String::new(),
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1000,
+            },
+            None,
+        );
+        assert_eq!(
+            versions_output
+                .versions
+                .as_ref()
+                .and_then(|versions| versions.first())
+                .and_then(|version| version.storage_class.as_ref())
+                .map(|storage_class| storage_class.as_str()),
+            Some("STANDARD")
+        );
     }
 
     #[test]

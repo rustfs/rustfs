@@ -30,7 +30,7 @@ use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, HeaderValue, Uri, header::CONTENT_LENGTH};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_lock::{LockMode, ObjectKey, get_global_lock_manager};
@@ -42,12 +42,16 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_NDJSON: &str = "application/x-ndjson";
+pub(crate) const CLIENT_DEVNULL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const CLIENT_DEVNULL_MAX_DURATION: Duration = Duration::from_secs(30);
+pub(crate) const CLIENT_DEVNULL_MAX_CONCURRENCY: usize = 4;
+static CLIENT_DEVNULL_ADMISSION: Semaphore = Semaphore::const_new(CLIENT_DEVNULL_MAX_CONCURRENCY);
 
 /// Cap on how many locks a single `top/locks` response enumerates, matching the
 /// MinIO default page size and bounding response size on busy clusters.
@@ -811,18 +815,75 @@ impl Operation for SpeedtestHandler {
 /// number (mirrors MinIO's `ClientDevNull`).
 pub struct SpeedtestClientDevnullHandler {}
 
+fn validate_client_devnull_content_length(headers: &HeaderMap) -> S3Result<()> {
+    let Some(content_length) = headers.get(CONTENT_LENGTH) else {
+        return Ok(());
+    };
+    let content_length = content_length
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| s3_error!(InvalidRequest, "invalid Content-Length for client devnull stream"))?;
+    if content_length > CLIENT_DEVNULL_MAX_BYTES {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "client devnull stream exceeds the {}-byte limit",
+            CLIENT_DEVNULL_MAX_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn acquire_client_devnull_permit() -> S3Result<SemaphorePermit<'static>> {
+    CLIENT_DEVNULL_ADMISSION.try_acquire().map_err(|_| {
+        s3_error!(
+            SlowDown,
+            "client devnull concurrency limit of {} is exhausted",
+            CLIENT_DEVNULL_MAX_CONCURRENCY
+        )
+    })
+}
+
+async fn drain_client_devnull(input: Body, max_bytes: u64, max_duration: Duration) -> S3Result<u64> {
+    tokio::time::timeout(max_duration, async move {
+        let mut input = input;
+        let mut total = 0u64;
+        while let Some(chunk) = input.next().await {
+            let chunk = chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
+            let chunk_len = u64::try_from(chunk.len())
+                .map_err(|_| s3_error!(InternalError, "devnull stream chunk length exceeds supported range"))?;
+            total = total
+                .checked_add(chunk_len)
+                .ok_or_else(|| s3_error!(EntityTooLarge, "client devnull stream exceeds the configured byte limit"))?;
+            if total > max_bytes {
+                return Err(s3_error!(EntityTooLarge, "client devnull stream exceeds the {}-byte limit", max_bytes));
+            }
+        }
+        Ok(total)
+    })
+    .await
+    .map_err(|_| {
+        s3_error!(
+            RequestTimeout,
+            "client devnull stream exceeded the {}-second limit",
+            max_duration.as_secs()
+        )
+    })?
+}
+
+async fn drain_client_devnull_with_production_limits(input: Body) -> S3Result<u64> {
+    drain_client_devnull(input, CLIENT_DEVNULL_MAX_BYTES, CLIENT_DEVNULL_MAX_DURATION).await
+}
+
 #[async_trait::async_trait]
 impl Operation for SpeedtestClientDevnullHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize(&req, AdminAction::HealthInfoAdminAction).await?;
+        validate_client_devnull_content_length(&req.headers)?;
+        let _permit = acquire_client_devnull_permit()?;
 
         let started = std::time::Instant::now();
-        let mut input = req.input;
-        let mut total: u64 = 0;
-        while let Some(chunk) = input.next().await {
-            let chunk = chunk.map_err(|e| s3_error!(InvalidRequest, "failed to read devnull stream: {}", e))?;
-            total += chunk.len() as u64;
-        }
+        let total = drain_client_devnull_with_production_limits(req.input).await?;
         let elapsed = started.elapsed();
 
         let response = SpeedtestResponse {
@@ -916,6 +977,99 @@ mod tests {
             .await
             .expect_err("must reject anonymous requests");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn client_devnull_enforces_byte_limit_while_streaming() {
+        let err = drain_client_devnull(Body::from(vec![0u8; 5]), 4, Duration::from_secs(1))
+            .await
+            .expect_err("stream over the byte limit must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
+    }
+
+    #[tokio::test]
+    async fn client_devnull_enforces_duration_limit() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(1);
+        let stream: DynByteStream = Box::pin(ByteChannelStream {
+            inner: ReceiverStream::new(rx),
+        });
+        let body = Body::from(stream);
+
+        let err = drain_client_devnull(body, 4, Duration::ZERO)
+            .await
+            .expect_err("stalled stream must time out");
+        assert_eq!(err.code(), &S3ErrorCode::RequestTimeout);
+        assert!(
+            tx.send(Ok(Bytes::from_static(b"late"))).await.is_err(),
+            "timeout must drop the request body and cancel its upstream receiver"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_devnull_production_limits_enforce_advertised_timeout() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(1);
+        let stream: DynByteStream = Box::pin(ByteChannelStream {
+            inner: ReceiverStream::new(rx),
+        });
+        let task = tokio::spawn(drain_client_devnull_with_production_limits(Body::from(stream)));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(CLIENT_DEVNULL_MAX_DURATION + Duration::from_millis(1)).await;
+
+        let err = task
+            .await
+            .expect("production drain task must not panic")
+            .expect_err("stalled production stream must time out at the advertised limit");
+        assert_eq!(err.code(), &S3ErrorCode::RequestTimeout);
+        assert!(
+            tx.send(Ok(Bytes::from_static(b"late"))).await.is_err(),
+            "production timeout must drop the request body and cancel its upstream receiver"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_devnull_reports_exact_bounded_byte_count() {
+        let total = drain_client_devnull(Body::from(vec![0u8; 4]), 4, Duration::from_secs(1))
+            .await
+            .expect("stream at the byte limit should succeed");
+
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn client_devnull_rejects_invalid_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("not-a-number"));
+
+        let err = validate_client_devnull_content_length(&headers)
+            .expect_err("malformed content length must fail before reading the stream");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn client_devnull_rejects_oversized_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&(CLIENT_DEVNULL_MAX_BYTES + 1).to_string()).expect("valid header"),
+        );
+
+        let err = validate_client_devnull_content_length(&headers)
+            .expect_err("oversized content length must fail before reading the stream");
+        assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
+    }
+
+    #[test]
+    fn client_devnull_admission_fails_fast_and_recovers() {
+        let permits = (0..CLIENT_DEVNULL_MAX_CONCURRENCY)
+            .map(|_| acquire_client_devnull_permit().expect("admission slot"))
+            .collect::<Vec<_>>();
+        let err = acquire_client_devnull_permit().expect_err("exhausted admission must fail");
+        assert_eq!(err.code(), &S3ErrorCode::SlowDown);
+
+        drop(permits);
+        let _permit = acquire_client_devnull_permit().expect("released admission slots must be reusable");
     }
 
     #[test]

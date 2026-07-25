@@ -13,8 +13,12 @@
 // limitations under the License.
 
 use rustfs_credentials::Credentials;
+use rustfs_utils::HashAlgorithm;
 use serde_json::Value;
 use std::collections::HashMap;
+
+pub const OIDC_VIRTUAL_PARENT_CLAIM: &str = "x-rustfs-internal-oidc-parent";
+const OIDC_VIRTUAL_PARENT_PREFIX: &str = "openid=";
 
 #[derive(Debug, Clone)]
 pub struct FederatedClaims {
@@ -52,6 +56,27 @@ pub struct FederatedAuthorization {
 impl FederatedAuthorization {
     pub fn has_authorization_context(&self) -> bool {
         !self.policies.is_empty() || !self.groups.is_empty()
+    }
+
+    pub fn oidc_virtual_parent(&self) -> Option<String> {
+        let issuer = self.claims.raw.get("iss")?.as_str()?;
+        let subject = self.claims.sub.as_str();
+        if issuer.is_empty() || subject.is_empty() {
+            return None;
+        }
+
+        let subject_len = u64::try_from(subject.len()).ok()?;
+        let issuer_len = u64::try_from(issuer.len()).ok()?;
+        let mut source = Vec::with_capacity(16 + subject.len() + issuer.len());
+        source.extend_from_slice(&subject_len.to_be_bytes());
+        source.extend_from_slice(subject.as_bytes());
+        source.extend_from_slice(&issuer_len.to_be_bytes());
+        source.extend_from_slice(issuer.as_bytes());
+        let digest = HashAlgorithm::SHA256.hash_encode(&source);
+        Some(format!(
+            "{OIDC_VIRTUAL_PARENT_PREFIX}{}",
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(digest.as_ref())
+        ))
     }
 }
 
@@ -99,7 +124,10 @@ mod tests {
     fn authorization(policies: Vec<String>, groups: Vec<String>) -> FederatedAuthorization {
         FederatedAuthorization {
             provider_id: "standard_oidc".to_string(),
-            claims: claims("", "", "subject"),
+            claims: FederatedClaims {
+                raw: HashMap::from([("iss".to_string(), Value::String("https://idp.example.test".to_string()))]),
+                ..claims("", "", "subject")
+            },
             policies,
             groups,
             roles_claim_key: None,
@@ -120,5 +148,62 @@ mod tests {
         assert!(!authorization(Vec::new(), Vec::new()).has_authorization_context());
         assert!(authorization(vec!["consoleAdmin".to_string()], Vec::new()).has_authorization_context());
         assert!(authorization(Vec::new(), vec!["RustFS.ConsoleAdmin".to_string()]).has_authorization_context());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_is_stable_and_issuer_scoped() {
+        let first = authorization(Vec::new(), Vec::new());
+        let mut second = first.clone();
+        second
+            .claims
+            .raw
+            .insert("iss".to_string(), Value::String("https://other-idp.example.test".to_string()));
+
+        assert_eq!(
+            first.oidc_virtual_parent().as_deref(),
+            Some("openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I")
+        );
+        assert!(rustfs_policy::auth::contains_reserved_chars(
+            first.oidc_virtual_parent().as_deref().expect("virtual parent")
+        ));
+        assert_ne!(first.oidc_virtual_parent(), second.oidc_virtual_parent());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_requires_verified_identity_parts() {
+        let mut missing_issuer = authorization(Vec::new(), Vec::new());
+        missing_issuer.claims.raw.clear();
+        let mut missing_subject = authorization(Vec::new(), Vec::new());
+        missing_subject.claims.sub.clear();
+
+        assert!(missing_issuer.oidc_virtual_parent().is_none());
+        assert!(missing_subject.oidc_virtual_parent().is_none());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_preserves_exact_subject() {
+        let plain = authorization(Vec::new(), Vec::new());
+        let mut padded = plain.clone();
+        padded.claims.sub = format!(" {} ", plain.claims.sub);
+
+        assert_ne!(plain.oidc_virtual_parent(), padded.oidc_virtual_parent());
+    }
+
+    #[test]
+    fn oidc_virtual_parent_encoding_is_unambiguous() {
+        let mut first = authorization(Vec::new(), Vec::new());
+        first.claims.sub = "subject".to_string();
+        first.claims.raw.insert(
+            "iss".to_string(),
+            Value::String("https://issuer.example/path:https://other.example".to_string()),
+        );
+        let mut second = authorization(Vec::new(), Vec::new());
+        second.claims.sub = "subject:https://issuer.example/path".to_string();
+        second
+            .claims
+            .raw
+            .insert("iss".to_string(), Value::String("https://other.example".to_string()));
+
+        assert_ne!(first.oidc_virtual_parent(), second.oidc_virtual_parent());
     }
 }

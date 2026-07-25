@@ -29,7 +29,9 @@ use tokio::sync::RwLock;
 use vaultrs::{
     api::transit::{
         KeyType,
-        requests::{CreateKeyRequestBuilder, DecryptDataRequestBuilder, EncryptDataRequestBuilder},
+        requests::{
+            CreateKeyRequestBuilder, DecryptDataRequestBuilder, EncryptDataRequestBuilder, UpdateKeyConfigurationRequestBuilder,
+        },
     },
     client::{VaultClient, VaultClientSettingsBuilder},
     kv2,
@@ -687,6 +689,15 @@ impl KmsBackend for VaultTransitKmsBackend {
 
         let deletion_date = if request.force_immediate.unwrap_or(false) {
             if key_metadata.key_state == KeyState::PendingDeletion {
+                if !self.client.read_transit_key(&key_id).await?.deletion_allowed {
+                    let mut update_builder = UpdateKeyConfigurationRequestBuilder::default();
+                    update_builder.deletion_allowed(true);
+                    key::update(&self.client.client, &self.client.config.mount_path, &key_id, Some(&mut update_builder))
+                        .await
+                        .map_err(|e| {
+                            KmsError::backend_error(format!("Failed to allow deletion of Vault Transit key {key_id}: {e}"))
+                        })?;
+                }
                 key::delete(&self.client.client, &self.client.config.mount_path, &key_id)
                     .await
                     .map_err(|e| KmsError::backend_error(format!("Failed to delete Vault Transit key {key_id}: {e}")))?;
