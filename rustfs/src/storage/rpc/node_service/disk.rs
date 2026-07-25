@@ -21,8 +21,9 @@ use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_MSGPACK_DIRECTION_REQUEST, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
@@ -41,14 +42,27 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
 ) -> std::result::Result<T, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer)
-            .map_err(|err| DiskError::other(format!("decode {value_name} msgpack failed: {err}")));
+        return T::deserialize(&mut deserializer).map_err(|err| {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                value_name,
+                INTERNODE_MSGPACK_CODEC_MSGPACK,
+            );
+            DiskError::other(format!("decode {value_name} msgpack failed: {err}"))
+        });
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, value_name);
-    serde_json::from_str(json).map_err(|err| DiskError::other(format!("decode {value_name} failed: {err}")))
+    serde_json::from_str(json).map_err(|err| {
+        global_internode_metrics().record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_REQUEST,
+            value_name,
+            INTERNODE_MSGPACK_CODEC_JSON,
+        );
+        DiskError::other(format!("decode {value_name} failed: {err}"))
+    })
 }
 
 fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
@@ -1191,6 +1205,7 @@ mod tests {
     };
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
+    use rustfs_io_metrics::internode_metrics::global_internode_metrics;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1314,18 +1329,24 @@ mod tests {
 
     #[test]
     fn decode_msgpack_or_json_fails_closed_on_corrupt_non_empty_msgpack() {
+        let before = global_internode_metrics().msgpack_json_decode_error_total_for_test();
         let err = decode_msgpack_or_json::<SamplePayload>(b"not-msgpack", r#"{"name":"json","count":1}"#, "SamplePayload")
             .expect_err("corrupt non-empty msgpack must not fall back to JSON");
+        let after = global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         assert!(err.to_string().contains("decode SamplePayload msgpack failed"), "unexpected error: {err}");
+        assert!(after > before, "corrupt msgpack should increment decode-error metrics");
     }
 
     #[test]
     fn decode_msgpack_or_json_reports_corrupt_json_item_when_msgpack_absent() {
+        let before = global_internode_metrics().msgpack_json_decode_error_total_for_test();
         let err = decode_msgpack_or_json::<SamplePayload>(&[], "{not-json", "SamplePayload")
             .expect_err("corrupt json item should fail in fallback branch");
+        let after = global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         assert!(err.to_string().contains("decode SamplePayload failed"), "unexpected error: {err}");
+        assert!(after > before, "corrupt fallback JSON should increment decode-error metrics");
     }
 
     #[test]

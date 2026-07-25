@@ -70,11 +70,13 @@ const MANUAL_DUE_BUCKET: &str = "ilm7-manual-due";
 const MANUAL_DRY_RUN_BUCKET: &str = "ilm7-manual-dry-run";
 const MANUAL_NOT_DUE_BUCKET: &str = "ilm7-manual-not-due";
 const MANUAL_QUEUE_PRESSURE_BUCKET: &str = "ilm7-manual-queue-pressure";
+const MANUAL_ASYNC_STATUS_BUCKET: &str = "ilm7-manual-async-status";
 const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
 const MANUAL_DRY_RUN_KEY: &str = "manual-dry-run/report.bin";
 const MANUAL_NOT_DUE_KEY: &str = "manual-not-due/report.bin";
+const MANUAL_ASYNC_STATUS_KEY: &str = "manual-async-status/report.bin";
 const CONTENT_TYPE: &str = "application/x-ilm7";
 const USER_META_KEY: &str = "ilm7-origin";
 const USER_META_VAL: &str = "hermetic-transition";
@@ -350,6 +352,16 @@ struct ManualTransitionRunReport {
     truncated_by_duration: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct ManualTransitionJobStatusResponse {
+    job_id: String,
+    status_endpoint: String,
+    status: String,
+    cancel_requested: bool,
+    failure_reason: Option<String>,
+    report: ManualTransitionRunReport,
+}
+
 async fn manual_transition_run(
     hot: &RustFSTestEnvironment,
     bucket: &str,
@@ -377,6 +389,66 @@ async fn manual_transition_run_with_max(
         return Err(format!("manual transition run failed: status={status}, body={body}").into());
     }
     Ok(serde_json::from_str(&body)?)
+}
+
+async fn manual_transition_async_run(
+    hot: &RustFSTestEnvironment,
+    bucket: &str,
+    prefix: &str,
+    dry_run: bool,
+    max_objects: u64,
+) -> Result<ManualTransitionRunResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let bucket = urlencoding::encode(bucket);
+    let prefix = urlencoding::encode(prefix);
+    let tier = urlencoding::encode(TIER_NAME);
+    let path = format!(
+        "/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects={max_objects}&mode=async"
+    );
+    let (status, body) = signed_admin_request(&hot.url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "async manual transition response: {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn manual_transition_job_status(
+    hot: &RustFSTestEnvironment,
+    status_endpoint: &str,
+) -> Result<ManualTransitionJobStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (status, body) =
+        signed_admin_request(&hot.url, Method::GET, status_endpoint, None, &hot.access_key, &hot.secret_key).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "manual transition job status response: {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn manual_transition_job_cancel(
+    hot: &RustFSTestEnvironment,
+    status_endpoint: &str,
+) -> Result<ManualTransitionJobStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (status, body) =
+        signed_admin_request(&hot.url, Method::DELETE, status_endpoint, None, &hot.access_key, &hot.secret_key).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "manual transition job cancel response: {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn wait_for_manual_transition_job_terminal(
+    hot: &RustFSTestEnvironment,
+    status_endpoint: &str,
+    deadline: StdDuration,
+) -> Result<ManualTransitionJobStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
+    loop {
+        let status = manual_transition_job_status(hot, status_endpoint).await?;
+        if matches!(status.status.as_str(), "completed" | "partial" | "cancelled" | "failed" | "unknown") {
+            return Ok(status);
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "manual transition job at {status_endpoint} did not reach a terminal state within {}s; last={status:#?}",
+                deadline.as_secs()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(250)).await;
+    }
 }
 
 /// Number of objects currently stored in the cold-tier bucket.
@@ -657,6 +729,86 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(not_due.report.skipped_queue_timeout, 0);
     assert!(!not_due.report.truncated_by_duration);
     assert_remains_not_transitioned(&hot_client, MANUAL_NOT_DUE_BUCKET, MANUAL_NOT_DUE_KEY, StdDuration::from_secs(2)).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_async_job_status_polling() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualasynccoldtieradmin".to_string();
+    cold.secret_key = "manualasynccoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(MANUAL_ASYNC_STATUS_BUCKET).send().await?;
+    put_lifecycle_transition_rule(&hot_client, MANUAL_ASYNC_STATUS_BUCKET, "manual-async-status", "manual-async-status/", 1)
+        .await?;
+    put_single_part_object(
+        &hot_client,
+        MANUAL_ASYNC_STATUS_BUCKET,
+        MANUAL_ASYNC_STATUS_KEY,
+        b"manual async status not-yet-due dry-run object",
+    )
+    .await?;
+
+    let before_dry_run_remote_count = cold_tier_object_count(&cold_client).await?;
+    let accepted = manual_transition_async_run(&hot, MANUAL_ASYNC_STATUS_BUCKET, "manual-async-status/", true, 10).await?;
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.mode, "durable_job");
+    assert_eq!(accepted.report.bucket, MANUAL_ASYNC_STATUS_BUCKET);
+    assert_eq!(accepted.report.prefix, "manual-async-status/");
+    assert!(accepted.report.dry_run);
+    assert_eq!(accepted.report.scanned, 0);
+    assert_eq!(accepted.report.eligible, 0);
+    let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
+    let status_endpoint = accepted
+        .status_endpoint
+        .as_deref()
+        .ok_or("async response must include status_endpoint")?;
+    assert!(
+        status_endpoint.ends_with(job_id),
+        "status endpoint must embed job id: endpoint={status_endpoint}, job_id={job_id}"
+    );
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
+    assert_eq!(terminal.job_id, job_id);
+    assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.status, "completed", "terminal job response: {terminal:#?}");
+    assert!(!terminal.cancel_requested);
+    assert_eq!(terminal.failure_reason, None);
+    assert_eq!(terminal.report.bucket, MANUAL_ASYNC_STATUS_BUCKET);
+    assert_eq!(terminal.report.prefix, "manual-async-status/");
+    assert_eq!(terminal.report.tier.as_deref(), Some(TIER_NAME));
+    assert!(terminal.report.dry_run);
+    assert!(terminal.report.lifecycle_config_found);
+    assert_eq!(terminal.report.scanned, 1, "terminal job response: {terminal:#?}");
+    assert_eq!(terminal.report.eligible, 0, "terminal job response: {terminal:#?}");
+    assert_eq!(terminal.report.dry_run_eligible, 0, "terminal job response: {terminal:#?}");
+    assert_eq!(terminal.report.enqueued, 0, "terminal job response: {terminal:#?}");
+    assert_eq!(terminal.report.skipped_not_transition, 1, "terminal job response: {terminal:#?}");
+    assert_eq!(terminal.report.skipped_queue_full, 0);
+    assert_eq!(terminal.report.skipped_queue_closed, 0);
+    assert_eq!(terminal.report.skipped_queue_timeout, 0);
+    assert!(!terminal.report.truncated_by_limit);
+    assert!(!terminal.report.truncated_by_duration);
+
+    let after_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
+    assert_eq!(after_cancel.status, "completed");
+    assert!(!after_cancel.cancel_requested);
+    assert_eq!(
+        cold_tier_object_count(&cold_client).await?,
+        before_dry_run_remote_count,
+        "not-yet-due async dry-run job must not write to cold tier"
+    );
+    assert_not_transitioned(&hot_client, MANUAL_ASYNC_STATUS_BUCKET, MANUAL_ASYNC_STATUS_KEY).await?;
 
     Ok(())
 }
