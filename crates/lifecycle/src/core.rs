@@ -591,6 +591,18 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     continue;
                 }
 
+                if !obj.is_latest && rule.noncurrent_version_expiration.is_some() && obj.successor_mod_time.is_none() {
+                    debug!(
+                        event = "lifecycle_noncurrent_expiry_skipped",
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        object = %obj.name,
+                        reason = "missing_successor_mod_time",
+                        "Skipped noncurrent expiration for incomplete version chain"
+                    );
+                    continue;
+                }
+
                 if !obj.is_latest
                     && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
                     && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
