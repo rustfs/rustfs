@@ -28,7 +28,6 @@ use crate::{
     },
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
-    storage::request_context::spawn_traced,
 };
 use http::{HeaderMap, StatusCode, Uri};
 use hyper::Method;
@@ -89,22 +88,15 @@ fn wasabi_payload_name(config: &TierConfig) -> S3Result<String> {
 
 fn spawn_transition_tier_config_propagation(action: &'static str) {
     if let Some(notification_sys) = current_notification_system() {
-        spawn_traced(async move {
-            for peer_result in notification_sys.load_transition_tier_config().await {
-                if let Some(err) = peer_result.err {
-                    warn!(
-                        event = EVENT_ADMIN_TIER_STATE,
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_TIER,
-                        action = action,
-                        host = if peer_result.host.is_empty() { "<unknown>" } else { peer_result.host.as_str() },
-                        result = "propagation_failed",
-                        error = %err,
-                        "admin tier state"
-                    );
-                }
-            }
-        });
+        debug!(
+            event = EVENT_ADMIN_TIER_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_TIER,
+            action,
+            result = "propagation_started",
+            "admin tier state"
+        );
+        notification_sys.spawn_transition_tier_config_reload_workers();
     }
 }
 

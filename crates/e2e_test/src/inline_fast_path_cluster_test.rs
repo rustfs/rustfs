@@ -966,6 +966,15 @@ fn unique_tier_name() -> String {
 }
 
 async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEnvironment, tier_name: &str) -> TestResult {
+    let response = submit_rustfs_tier(hot, cold, tier_name).await?;
+    wait_for_tier_verifiable(hot, tier_name, &response).await
+}
+
+async fn submit_rustfs_tier(
+    hot: &RustFSTestClusterEnvironment,
+    cold: &RustFSTestEnvironment,
+    tier_name: &str,
+) -> TestResult<String> {
     let body = serde_json::json!({
         "type": "rustfs",
         "rustfs": {
@@ -994,8 +1003,7 @@ async fn add_rustfs_tier(hot: &RustFSTestClusterEnvironment, cold: &RustFSTestEn
         .await?;
         let attempt = format!("status={status}, body={}", compact_body(&response));
         if status.is_success() {
-            wait_for_tier_verifiable(hot, tier_name, &format!("status={status}, body={response}")).await?;
-            return Ok(());
+            return Ok(format!("status={status}, body={response}"));
         }
         attempts.push(attempt);
         if Instant::now() >= deadline {
@@ -1549,7 +1557,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
 
 #[tokio::test]
 #[serial]
-async fn four_node_add_tier_committed_replay_converges() -> TestResult {
+async fn four_node_add_tier_converges() -> TestResult {
     init_logging();
 
     let mut cold = RustFSTestEnvironment::new().await?;
@@ -1563,7 +1571,29 @@ async fn four_node_add_tier_committed_replay_converges() -> TestResult {
 
     let tier_name = unique_tier_name();
     add_rustfs_tier(&hot, &cold, &tier_name).await?;
-    wait_for_tier_converged(&hot, &tier_name, "committed AddTier replay").await
+    wait_for_tier_converged(&hot, &tier_name, "AddTier convergence").await
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_add_tier_converges_after_offline_node_restart_without_second_mutation() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inlineofflinecoldadmin".to_string();
+    cold.secret_key = "inlineofflinecoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    cold.create_s3_client().create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.start().await?;
+
+    let tier_name = unique_tier_name();
+    hot.stop_node(3)?;
+    let add_tier_response = submit_rustfs_tier(&hot, &cold, &tier_name).await?;
+    hot.start_node(3).await?;
+
+    wait_for_tier_converged(&hot, &tier_name, &add_tier_response).await
 }
 
 #[tokio::test]
