@@ -2104,6 +2104,48 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn eval_inner_noncurrent_expiration_one_day_respects_due_boundary() {
+        let successor_time = datetime!(2025-06-15 12:00:00 UTC);
+        let due = expected_expiry_time(successor_time, 1);
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-one-day".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(successor_time - Duration::seconds(1)),
+            successor_mod_time: Some(successor_time),
+            is_latest: false,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let before_due = lc.eval_inner(&opts, due - Duration::seconds(1), 0).await;
+        let at_due = lc.eval_inner(&opts, due, 0).await;
+
+        assert_eq!(before_due.action, IlmAction::NoneAction);
+        assert_eq!(at_due.action, IlmAction::DeleteVersionAction);
+        assert_eq!(at_due.rule_id, "noncurrent-one-day");
+        assert_eq!(at_due.due, Some(due));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn eval_inner_expires_noncurrent_version_immediately_when_zero_days() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
