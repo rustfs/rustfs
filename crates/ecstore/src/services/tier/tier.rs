@@ -6134,6 +6134,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intent_advance_treats_matching_committed_cas_race_as_idempotent() {
+        let store = Arc::new(CasConfigStore::default());
+        let mutation_id = uuid::Uuid::from_u128(34);
+        let prepared = prepared_remove_intent("COLD-A", mutation_id);
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &prepared)
+            .await
+            .expect("prepared intent fixture should persist");
+
+        let committed = committed_remove_intent("COLD-A", mutation_id, "etag-new");
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("record object should build");
+        store
+            .rewrite_on_next_if_match(object, committed.encode().expect("committed intent fixture should encode"))
+            .await;
+
+        let (observed, applied) = crate::services::tier::tier_mutation_intent::advance_tier_mutation_intent_record_idempotent(
+            store,
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("etag-new".to_string()),
+        )
+        .await
+        .expect("same-state CAS race should be idempotent");
+
+        assert!(!applied);
+        assert_eq!(observed.state, TierMutationIntentState::Committed);
+        assert_eq!(observed.committed_config_etag.as_deref(), Some("etag-new"));
+    }
+
+    #[tokio::test]
     async fn committed_mutation_recovery_requires_every_peer_to_commit() {
         let mutation_id = uuid::Uuid::from_u128(17);
         let intent = committed_remove_intent("COLD-A", mutation_id, "etag-new");
@@ -8225,6 +8255,7 @@ mod tests {
     struct CasConfigStore {
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
         legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
+        if_match_race_rewrite: tokio::sync::Mutex<Option<(String, Vec<u8>)>>,
         next_etag: AtomicUsize,
         fail_put: AtomicBool,
         truncate_reference_page_without_marker: AtomicBool,
@@ -8238,6 +8269,7 @@ mod tests {
             Self {
                 objects: tokio::sync::Mutex::new(HashMap::new()),
                 legacy_state: tokio::sync::Mutex::new(None),
+                if_match_race_rewrite: tokio::sync::Mutex::new(None),
                 next_etag: AtomicUsize::new(0),
                 fail_put: AtomicBool::new(false),
                 truncate_reference_page_without_marker: AtomicBool::new(false),
@@ -8261,6 +8293,10 @@ mod tests {
                 .lock()
                 .await
                 .insert(object, (data, "reference-proof-etag".to_string()));
+        }
+
+        async fn rewrite_on_next_if_match(&self, object: String, data: Vec<u8>) {
+            *self.if_match_race_rewrite.lock().await = Some((object, data));
         }
 
         fn omit_truncated_reference_marker(&self) {
@@ -8323,7 +8359,23 @@ mod tests {
             }
             let mut payload = Vec::new();
             tokio::io::AsyncReadExt::read_to_end(&mut data.stream, &mut payload).await?;
+            let race_rewrite = if opts
+                .http_preconditions
+                .as_ref()
+                .and_then(HTTPPreconditions::if_match_value)
+                .is_some()
+            {
+                self.if_match_race_rewrite.lock().await.take()
+            } else {
+                None
+            };
             let mut objects = self.objects.lock().await;
+            if let Some((target, data)) = race_rewrite
+                && target == object
+            {
+                let etag = format!("etag-{}", self.next_etag.fetch_add(1, Ordering::SeqCst) + 1);
+                objects.insert(object.to_string(), (data, etag));
+            }
             match objects.get(object) {
                 Some((_, etag)) => opts.precondition_check(&ObjectInfo {
                     etag: Some(etag.clone()),
