@@ -112,6 +112,7 @@ const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
 const EVENT_LIFECYCLE_TRANSITION_COMPENSATION: &str = "lifecycle_transition_compensation";
 const EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP: &str = "lifecycle_stale_multipart_cleanup";
 const EVENT_LIFECYCLE_SCAN_SKIPPED: &str = "lifecycle_scan_skipped";
+const EVENT_LIFECYCLE_EVALUATION_FAILED: &str = "lifecycle_evaluation_failed";
 const EVENT_LIFECYCLE_TIER_AUDIT: &str = "lifecycle_tier_audit";
 const EVENT_LIFECYCLE_TIER_OPERATION_FAILED: &str = "lifecycle_tier_operation_failed";
 const EVENT_LIFECYCLE_DELETE_FAILED: &str = "lifecycle_delete_failed";
@@ -2647,12 +2648,25 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     let mut object_infos = Vec::new();
 
     loop {
-        let Ok(page) = api
+        let page = match api
             .clone()
             .list_object_versions_for_lifecycle(&oi.bucket, &oi.name, marker.clone(), version_marker.clone(), None, 1000)
             .await
-        else {
-            return;
+        {
+            Ok(page) => page,
+            Err(err) => {
+                warn!(
+                    event = EVENT_LIFECYCLE_EVALUATION_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    error = %err,
+                    reason = "list_versions_failed",
+                    "Failed to load lifecycle version group"
+                );
+                return;
+            }
         };
 
         object_infos.extend(page.objects.into_iter().filter(|object| object.name == oi.name));
@@ -2677,12 +2691,27 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         .iter()
         .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
-    let Ok(events) = Evaluator::new(Arc::new(lifecycle))
+    let events = match Evaluator::new(Arc::new(lifecycle))
         .with_lock_retention(lock_config)
         .eval(&object_opts)
         .await
-    else {
-        return;
+    {
+        Ok(events) => events,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_EVALUATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                expected_version_count = oi.num_versions,
+                observed_version_count = object_infos.len(),
+                error = %err,
+                reason = "version_group_evaluation_failed",
+                "Failed to evaluate lifecycle version group"
+            );
+            return;
+        }
     };
 
     let mut to_delete_objs = Vec::new();
@@ -3099,10 +3128,16 @@ async fn enqueue_expiry_for_existing_object_group(
         Ok(events) => events,
         Err(err) => {
             warn!(
+                event = EVENT_LIFECYCLE_EVALUATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                 bucket = context.bucket,
                 object = %object_infos[0].name,
+                expected_version_count = object_infos[0].num_versions,
+                observed_version_count = object_infos.len(),
                 error = %err,
-                "failed to evaluate lifecycle events for existing object versions"
+                reason = "version_group_evaluation_failed",
+                "Failed to evaluate lifecycle version group"
             );
             return;
         }
