@@ -1500,13 +1500,6 @@ impl<R> GetObjectStreamingReader<R> {
             {
                 return "read_quorum";
             }
-            if error_msg.contains("connection reset")
-                || error_msg.contains("broken pipe")
-                || error_msg.contains("downstream")
-                || error_msg.contains("remote closed")
-            {
-                return "downstream_closed";
-            }
         }
 
         match err.kind() {

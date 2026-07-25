@@ -17,6 +17,27 @@
 pub const WALK_DIR_STREAM_COMPLETION_QUERY: &str = "walk_dir_stream_completion";
 pub const WALK_DIR_STREAM_COMPLETION_V1: &str = "error-v1";
 pub const WALK_DIR_BODY_SHA256_QUERY: &str = "walk_dir_body_sha256";
+pub const NS_SCANNER_BODY_SHA256_QUERY: &str = "ns_scanner_body_sha256";
+pub const NS_SCANNER_CAPABILITY_CHALLENGE_QUERY: &str = "ns_scanner_challenge";
+pub const NS_SCANNER_CYCLE_QUERY: &str = "ns_scanner_cycle";
+pub const NS_SCANNER_LEADER_EPOCH_QUERY: &str = "ns_scanner_leader_epoch";
+pub const NS_SCANNER_REQUEST_ID_QUERY: &str = "ns_scanner_request_id";
+pub const NS_SCANNER_SERVER_EPOCH_QUERY: &str = "ns_scanner_server_epoch";
+pub const NS_SCANNER_SESSION_ID_QUERY: &str = "ns_scanner_session_id";
+pub const NS_SCANNER_SESSION_SEQUENCE_QUERY: &str = "ns_scanner_session_sequence";
+pub const NS_SCANNER_PROTOCOL_VERSION_QUERY: &str = "ns_scanner_protocol";
+pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
+pub const SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION: u32 = 0;
+pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 4;
+pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 5;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NsScannerCapabilityResponse {
+    pub version: u16,
+    pub server_epoch: uuid::Uuid,
+    pub proof: Vec<u8>,
+}
 
 pub mod admin;
 pub mod bucket;

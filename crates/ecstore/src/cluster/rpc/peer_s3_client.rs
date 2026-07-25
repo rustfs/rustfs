@@ -49,6 +49,20 @@ use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
+#[derive(Clone, Debug)]
+pub struct ScannerBucketListing {
+    pub buckets: Vec<BucketInfo>,
+    pub set_buckets: Vec<ScannerSetBucketListing>,
+    pub topology_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScannerSetBucketListing {
+    pub pool_index: usize,
+    pub set_index: usize,
+    pub buckets: Vec<BucketInfo>,
+}
+
 fn pool_participant_errors(clients: &[Client], errors: &[Option<Error>], pool_idx: usize) -> Vec<Option<Error>> {
     clients
         .iter()
@@ -216,6 +230,10 @@ impl S3PeerSys {
         Ok(())
     }
     pub async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        Ok(self.list_bucket_for_scanner(opts).await?.buckets)
+    }
+
+    pub async fn list_bucket_for_scanner(&self, opts: &BucketOptions) -> Result<ScannerBucketListing> {
         let mut futures = Vec::with_capacity(self.clients.len());
         for cli in self.clients.iter() {
             futures.push(cli.list_bucket(opts));
@@ -239,9 +257,12 @@ impl S3PeerSys {
         }
 
         let mut result_map: HashMap<&String, BucketInfo> = HashMap::new();
+        let mut topology_complete = true;
         for i in 0..self.pools_count {
             let per_pool_errs = pool_participant_errors(&self.clients, &errors, i);
             let quorum = pool_write_quorum(per_pool_errs.len());
+            topology_complete &=
+                !per_pool_errs.is_empty() && per_pool_errs.iter().all(|participant_error| participant_error.is_none());
 
             if let Some(pool_err) = reduce_pool_write_quorum_errs(&per_pool_errs) {
                 tracing::error!("list_bucket per_pool_errs: {per_pool_errs:?}");
@@ -261,20 +282,17 @@ impl S3PeerSys {
                     }
 
                     for bucket in buckets.iter() {
-                        if result_map.contains_key(&bucket.name) {
-                            continue;
-                        }
-
                         // incr bucket_map count create if not exists
                         let count = bucket_map.entry(&bucket.name).or_insert(0usize);
                         *count += 1;
 
                         if *count >= quorum {
-                            result_map.insert(&bucket.name, bucket.clone());
+                            result_map.entry(&bucket.name).or_insert_with(|| bucket.clone());
                         }
                     }
                 }
             }
+            topology_complete &= bucket_map.values().all(|count| *count >= quorum);
             // TODO: MRF
         }
 
@@ -282,7 +300,11 @@ impl S3PeerSys {
 
         buckets.sort_by_key(|b| b.name.clone());
 
-        Ok(buckets)
+        Ok(ScannerBucketListing {
+            buckets,
+            set_buckets: Vec::new(),
+            topology_complete,
+        })
     }
     pub async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         let mut futures = Vec::with_capacity(self.clients.len());
@@ -1643,6 +1665,86 @@ mod tests {
 
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].name, bucket.name);
+    }
+
+    #[tokio::test]
+    async fn scanner_bucket_listing_marks_quorum_result_incomplete_when_a_peer_is_missing() {
+        let bucket = BucketInfo {
+            name: "bucket-hidden-by-quorum".to_string(),
+            ..Default::default()
+        };
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_list_bucket(&[0], Ok(vec![bucket])),
+                test_peer_with_list_bucket(&[0], Ok(Vec::new())),
+                test_peer_with_list_bucket(&[0], Ok(Vec::new())),
+                test_peer_with_list_bucket(&[0], Err(Error::DiskAccessDenied)),
+            ],
+            pools_count: 1,
+        };
+
+        let listing = peer_sys
+            .list_bucket_for_scanner(&BucketOptions::default())
+            .await
+            .expect("peer quorum should still produce a scanner candidate listing");
+
+        assert!(listing.buckets.is_empty());
+        assert!(!listing.topology_complete);
+    }
+
+    #[tokio::test]
+    async fn scanner_bucket_listing_marks_divergent_successful_peers_incomplete() {
+        let bucket = BucketInfo {
+            name: "bucket-below-quorum".to_string(),
+            ..Default::default()
+        };
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_list_bucket(&[0], Ok(vec![bucket.clone()])),
+                test_peer_with_list_bucket(&[0], Ok(vec![bucket])),
+                test_peer_with_list_bucket(&[0], Ok(Vec::new())),
+                test_peer_with_list_bucket(&[0], Ok(Vec::new())),
+            ],
+            pools_count: 1,
+        };
+
+        let listing = peer_sys
+            .list_bucket_for_scanner(&BucketOptions::default())
+            .await
+            .expect("successful peer responses should still produce a scanner candidate listing");
+
+        assert!(listing.buckets.is_empty());
+        assert!(!listing.topology_complete);
+    }
+
+    #[tokio::test]
+    async fn scanner_bucket_listing_checks_same_bucket_in_every_pool() {
+        let bucket = BucketInfo {
+            name: "shared-bucket".to_string(),
+            ..Default::default()
+        };
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_list_bucket(&[0], Ok(vec![bucket.clone()])),
+                test_peer_with_list_bucket(&[0], Ok(vec![bucket.clone()])),
+                test_peer_with_list_bucket(&[0], Ok(vec![bucket.clone()])),
+                test_peer_with_list_bucket(&[0], Ok(vec![bucket.clone()])),
+                test_peer_with_list_bucket(&[1], Ok(vec![bucket.clone()])),
+                test_peer_with_list_bucket(&[1], Ok(vec![bucket.clone()])),
+                test_peer_with_list_bucket(&[1], Ok(Vec::new())),
+                test_peer_with_list_bucket(&[1], Ok(Vec::new())),
+            ],
+            pools_count: 2,
+        };
+
+        let listing = peer_sys
+            .list_bucket_for_scanner(&BucketOptions::default())
+            .await
+            .expect("a bucket visible in one pool should remain a scan candidate");
+
+        assert_eq!(listing.buckets.len(), 1);
+        assert_eq!(listing.buckets[0].name, bucket.name);
+        assert!(!listing.topology_complete);
     }
 
     #[tokio::test]

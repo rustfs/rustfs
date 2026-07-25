@@ -3862,6 +3862,24 @@ impl SetDisks {
         Ok(removed)
     }
 
+    fn write_precondition_lookup_error(
+        error: StorageError,
+        http_preconditions: &HTTPPreconditions,
+        bucket: &str,
+        object: &str,
+    ) -> Option<StorageError> {
+        match error {
+            StorageError::VersionNotFound(_, _, _) | StorageError::ObjectNotFound(_, _) => {
+                if http_preconditions.if_match_value().is_some() {
+                    Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string()))
+                } else {
+                    None
+                }
+            }
+            error => Some(error),
+        }
+    }
+
     pub(in crate::set_disk) async fn check_write_precondition(
         &self,
         bucket: &str,
@@ -3892,19 +3910,8 @@ impl SetDisks {
                 }
             }
 
-            Err(StorageError::VersionNotFound(_, _, _))
-            | Err(StorageError::ObjectNotFound(_, _))
-            | Err(StorageError::ErasureReadQuorum) => {
-                // When the object is not found,
-                // - if If-Match is set, we should return 404 NotFound
-                // - if If-None-Match is set, we should be able to proceed with the request
-                if http_preconditions.if_match_value().is_some() {
-                    return Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string()));
-                }
-            }
-
-            Err(e) => {
-                return Some(e);
+            Err(error) => {
+                return Self::write_precondition_lookup_error(error, &http_preconditions, bucket, object);
             }
         }
 
@@ -4406,6 +4413,41 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn write_precondition_lookup_errors_fail_closed_unless_absence_is_known() {
+        let create_only = HTTPPreconditions {
+            if_none_match: Some("*".to_string()),
+            ..Default::default()
+        };
+        let replace_only = HTTPPreconditions {
+            if_match: Some("etag".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            SetDisks::write_precondition_lookup_error(StorageError::ErasureReadQuorum, &create_only, "bucket", "object",),
+            Some(StorageError::ErasureReadQuorum)
+        ));
+        assert!(
+            SetDisks::write_precondition_lookup_error(
+                StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
+                &create_only,
+                "bucket",
+                "object",
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            SetDisks::write_precondition_lookup_error(
+                StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
+                &replace_only,
+                "bucket",
+                "object",
+            ),
+            Some(StorageError::ObjectNotFound(_, _))
+        ));
+    }
 
     fn metadata_test_fileinfo(object: &str) -> FileInfo {
         let mut fi = FileInfo::new(object, 2, 2);

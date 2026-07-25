@@ -698,13 +698,24 @@ impl NodeService {
                 Ok(volume_infos) => {
                     let volume_infos = volume_infos
                         .into_iter()
-                        .filter_map(|volume_info| serde_json::to_string(&volume_info).ok())
-                        .collect();
-                    Ok(Response::new(ListVolumesResponse {
-                        success: true,
-                        volume_infos,
-                        error: None,
-                    }))
+                        .enumerate()
+                        .map(|(index, volume_info)| {
+                            serde_json::to_string(&volume_info)
+                                .map_err(|err| DiskError::other(format!("encode list volumes entry {index} failed: {err}")))
+                        })
+                        .collect::<std::result::Result<Vec<_>, DiskError>>();
+                    match volume_infos {
+                        Ok(volume_infos) => Ok(Response::new(ListVolumesResponse {
+                            success: true,
+                            volume_infos,
+                            error: None,
+                        })),
+                        Err(err) => Ok(Response::new(ListVolumesResponse {
+                            success: false,
+                            volume_infos: Vec::new(),
+                            error: Some(err.into()),
+                        })),
+                    }
                 }
                 Err(err) => Ok(Response::new(ListVolumesResponse {
                     success: false,
@@ -1307,6 +1318,14 @@ mod tests {
             .expect_err("corrupt non-empty msgpack must not fall back to JSON");
 
         assert!(err.to_string().contains("decode SamplePayload msgpack failed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_reports_corrupt_json_item_when_msgpack_absent() {
+        let err = decode_msgpack_or_json::<SamplePayload>(&[], "{not-json", "SamplePayload")
+            .expect_err("corrupt json item should fail in fallback branch");
+
+        assert!(err.to_string().contains("decode SamplePayload failed"), "unexpected error: {err}");
     }
 
     #[test]

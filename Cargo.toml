@@ -196,7 +196,7 @@ blake2 = "=0.11.0-rc.6"
 chacha20poly1305 = { version = "=0.11.0" }
 crc-fast = "1.10.0"
 hmac = { version = "0.13.0" }
-jsonwebtoken = { version = "10.4.0" }
+jsonwebtoken = { version = "11.0.0" }
 openidconnect = { default-features = false, version = "4.0" }
 pbkdf2 = "0.13.0"
 rsa = { version = "=0.10.0-rc.18" }
@@ -225,11 +225,11 @@ arc-swap = "1.9.2"
 astral-tokio-tar = "0.6.4"
 atoi = "3.1.0"
 atomic_enum = "0.3.0"
-aws-config = { version = "1.10.0" }
+aws-config = { version = "1.10.1" }
 aws-credential-types = { version = "1.3.0" }
-aws-sdk-s3 = { default-features = false, version = "1.139.0" }
+aws-sdk-s3 = { default-features = false, version = "1.140.0" }
 aws-smithy-http-client = { default-features = false, version = "1.2.0" }
-aws-smithy-runtime-api = { version = "1.13.0" }
+aws-smithy-runtime-api = { version = "1.14.0" }
 aws-smithy-types = { version = "1.6.1" }
 base64 = "0.23.0"
 base64-simd = "0.8.0"

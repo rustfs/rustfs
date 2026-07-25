@@ -14,8 +14,8 @@
 
 use crate::disk::error::DiskError;
 use crate::error::StorageError;
-use std::io;
 use std::time::Instant;
+use std::{error::Error as StdError, fmt, io};
 
 pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING: &str = "codec_streaming";
 pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE: &str = "codec_streaming_legacy_engine";
@@ -207,9 +207,42 @@ pub(crate) fn classify_disk_error(err: &DiskError) -> GetObjectFailureReason {
     }
 }
 
-pub(crate) fn classify_io_error(err: &io::Error) -> GetObjectFailureReason {
+#[derive(Debug)]
+struct GetObjectDownstreamClosed {
+    source: io::Error,
+}
+
+impl fmt::Display for GetObjectDownstreamClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GetObject output closed: {}", self.source)
+    }
+}
+
+impl StdError for GetObjectDownstreamClosed {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(crate) fn mark_get_object_downstream_closed(err: io::Error) -> io::Error {
     match err.kind() {
-        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => GetObjectFailureReason::DownstreamClosed,
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+            io::Error::new(err.kind(), GetObjectDownstreamClosed { source: err })
+        }
+        _ => err,
+    }
+}
+
+pub(crate) fn classify_io_error(err: &io::Error) -> GetObjectFailureReason {
+    let mut source = err.get_ref().map(|source| source as &(dyn StdError + 'static));
+    while let Some(error) = source {
+        if error.is::<GetObjectDownstreamClosed>() {
+            return GetObjectFailureReason::DownstreamClosed;
+        }
+        source = error.source();
+    }
+
+    match err.kind() {
         io::ErrorKind::TimedOut => GetObjectFailureReason::Timeout,
         io::ErrorKind::UnexpectedEof => GetObjectFailureReason::ShortRead,
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => GetObjectFailureReason::RangeOrLengthInvalid,
@@ -260,6 +293,16 @@ mod tests {
             classify_storage_error(&StorageError::InvalidRangeSpec("bad range".to_string())),
             GetObjectFailureReason::RangeOrLengthInvalid
         );
+
+        let internal_broken_pipe = StorageError::Io(io::Error::from(io::ErrorKind::BrokenPipe));
+        assert_eq!(classify_storage_error(&internal_broken_pipe), GetObjectFailureReason::Io);
+
+        let downstream_closed = StorageError::Io(mark_get_object_downstream_closed(io::Error::from(io::ErrorKind::BrokenPipe)));
+        assert_eq!(
+            classify_storage_error(&downstream_closed),
+            GetObjectFailureReason::DownstreamClosed,
+            "the legacy duplex producer must suppress only explicitly tagged output closes"
+        );
     }
 
     #[test]
@@ -277,8 +320,8 @@ mod tests {
     #[test]
     fn classifies_io_errors_for_get_pipeline() {
         let cases = [
-            (io::ErrorKind::BrokenPipe, GetObjectFailureReason::DownstreamClosed),
-            (io::ErrorKind::ConnectionReset, GetObjectFailureReason::DownstreamClosed),
+            (io::ErrorKind::BrokenPipe, GetObjectFailureReason::Io),
+            (io::ErrorKind::ConnectionReset, GetObjectFailureReason::Io),
             (io::ErrorKind::TimedOut, GetObjectFailureReason::Timeout),
             (io::ErrorKind::UnexpectedEof, GetObjectFailureReason::ShortRead),
             (io::ErrorKind::InvalidInput, GetObjectFailureReason::RangeOrLengthInvalid),
@@ -289,6 +332,18 @@ mod tests {
         for (kind, expected) in cases {
             let err = io::Error::from(kind);
             assert_eq!(classify_io_error(&err), expected, "kind={kind:?}");
+        }
+    }
+
+    #[test]
+    fn classifies_marked_output_close_as_downstream_closed() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            let err = mark_get_object_downstream_closed(io::Error::from(kind));
+            assert_eq!(classify_io_error(&err), GetObjectFailureReason::DownstreamClosed, "kind={kind:?}");
         }
     }
 

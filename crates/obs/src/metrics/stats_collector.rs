@@ -1135,6 +1135,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
         last_cycle_replication_checks: metrics.last_cycle_replication_checks,
         last_cycle_usage_saves: metrics.last_cycle_usage_saves,
         failed_cycles: metrics.failed_cycles,
+        superseded_cycles: metrics.superseded_cycles,
         partial_cycles: metrics.partial_cycles,
         partial_cycles_unknown: metrics.partial_cycles_unknown,
         partial_cycles_runtime: metrics.partial_cycles_runtime,

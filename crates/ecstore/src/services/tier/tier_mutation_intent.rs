@@ -32,6 +32,7 @@ pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-inten
 pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
 pub(crate) const TIER_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/records";
 pub(crate) const TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/coordinators";
+const TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS: usize = 3;
 pub(crate) type TierMutationDigest = [u8; 32];
 
 pub(crate) type Result<T> = std::result::Result<T, TierMutationIntentError>;
@@ -555,15 +556,22 @@ async fn advance_tier_mutation_intent_record_idempotent_at_prefix<S>(
 where
     S: EcstoreObjectIO,
 {
-    let (mut intent, current_etag) =
-        load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await?;
-    let advanced = intent
-        .advance_idempotent(next, committed_config_etag)
-        .map_err(tier_mutation_intent_store_error)?;
-    if advanced {
-        save_tier_mutation_intent_record_if_current_with_prefix(api, prefix, &intent, &current_etag).await?;
+    for attempt in 0..TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS {
+        let (mut intent, current_etag) =
+            load_tier_mutation_intent_record_with_etag_at_prefix(api.clone(), prefix, mutation_id).await?;
+        let advanced = intent
+            .advance_idempotent(next, committed_config_etag.clone())
+            .map_err(tier_mutation_intent_store_error)?;
+        if !advanced {
+            return Ok((intent, false));
+        }
+        match save_tier_mutation_intent_record_if_current_with_prefix(api.clone(), prefix, &intent, &current_etag).await {
+            Ok(()) => return Ok((intent, true)),
+            Err(Error::PreconditionFailed) if attempt + 1 < TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS => continue,
+            Err(err) => return Err(err),
+        }
     }
-    Ok((intent, advanced))
+    Err(Error::PreconditionFailed)
 }
 
 pub(crate) async fn list_tier_mutation_intent_records<S>(

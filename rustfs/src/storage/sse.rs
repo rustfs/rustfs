@@ -2216,6 +2216,13 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
 }
 
 async fn get_local_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError> {
+    // An explicitly injected test provider overrides both the cache and the
+    // environment-based selection below.
+    #[cfg(test)]
+    if let Some(injected) = test_injected_sse_dek_provider() {
+        return Ok(injected);
+    }
+
     // Check if already initialized
     if let Some(provider) = GLOBAL_SSE_DEK_PROVIDER
         .read()
@@ -2274,7 +2281,6 @@ pub fn reset_sse_dek_provider() {
 }
 
 #[cfg(test)]
-#[cfg(feature = "rio-v2")]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
     if let Ok(mut slot) = GLOBAL_KMS_DEK_PROVIDER.write() {
         *slot = Some(provider.clone());

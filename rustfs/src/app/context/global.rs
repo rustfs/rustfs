@@ -354,6 +354,14 @@ impl AppContext {
         self.storage_class = storage_class;
         self
     }
+
+    pub(crate) fn with_test_notification_system_interface(
+        mut self,
+        notification_system: Arc<dyn NotificationSystemInterface>,
+    ) -> Self {
+        self.notification_system = notification_system;
+        self
+    }
 }
 
 static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();

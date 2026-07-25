@@ -106,7 +106,8 @@ pub(crate) mod server {
 
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{
-            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, gen_tonic_signature_headers,
+            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, gen_signature_headers,
+            gen_tonic_signature_headers,
         };
 
         pub(crate) mod ecfs {
@@ -197,7 +198,8 @@ pub(crate) mod startup {
         }
 
         pub(crate) use crate::storage::storage_api::{
-            ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
+            ECStore, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata,
+            try_migrate_iam_config,
         };
     }
 

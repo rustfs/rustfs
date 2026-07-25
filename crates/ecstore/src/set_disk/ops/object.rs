@@ -21,6 +21,7 @@
 
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
@@ -31,6 +32,7 @@ use crate::bucket::lifecycle::{
         save_transition_transaction_record,
     },
 };
+use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
@@ -639,7 +641,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // task so it lives for the duration of the streaming read.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
-            let mut writer = wd;
+            let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
@@ -664,24 +666,43 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             .await
             {
                 let reason = classify_storage_error(&e);
-                record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
-                error!(
-                    event = EVENT_SET_DISK_WRITE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                    bucket,
-                    object,
-                    pool_index,
-                    set_index,
-                    offset,
-                    requested_length = length,
-                    skip_verify_bitrot = skip_verify,
-                    state = "read_pipeline_failed",
-                    stage = GET_STAGE_EMIT,
-                    reason = reason.as_str(),
-                    error = ?e,
-                    "Set disk object read pipeline failed"
-                );
+                if reason == GetObjectFailureReason::DownstreamClosed {
+                    debug!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        state = "downstream_closed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline stopped after downstream closed"
+                    );
+                } else {
+                    record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
+                    error!(
+                        event = EVENT_SET_DISK_WRITE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        pool_index,
+                        set_index,
+                        offset,
+                        requested_length = length,
+                        skip_verify_bitrot = skip_verify,
+                        state = "read_pipeline_failed",
+                        stage = GET_STAGE_EMIT,
+                        reason = reason.as_str(),
+                        error = ?e,
+                        "Set disk object read pipeline failed"
+                    );
+                }
             };
         });
 
