@@ -121,6 +121,8 @@ mod tests {
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
         let _scanner_status_handler = scanner::ScannerStatusHandler {};
         let _manual_transition_handler = ilm_transition::ManualTransitionRunHandler {};
+        let _manual_transition_status_handler = ilm_transition::ManualTransitionJobStatusHandler {};
+        let _manual_transition_cancel_handler = ilm_transition::ManualTransitionJobCancelHandler {};
         let _site_replication_add_handler = site_replication::SiteReplicationAddHandler {};
         let _site_replication_info_handler = site_replication::SiteReplicationInfoHandler {};
         let _site_replication_status_handler = site_replication::SiteReplicationStatusHandler {};

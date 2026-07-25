@@ -16,9 +16,13 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
+use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
+use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::lifecycle::{
     ManualTransitionRunOptions, ManualTransitionRunReport, enqueue_transition_for_existing_objects_scoped,
+    enqueue_transition_for_existing_objects_scoped_with_cancel,
 };
+use crate::admin::storage_api::runtime::ECStore;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
@@ -32,8 +36,13 @@ use rustfs_utils::{
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS: u64 = 10_000;
@@ -42,8 +51,11 @@ const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_ILM_TRANSITION: &str = "ilm_transition";
 const EVENT_ADMIN_ILM_TRANSITION_STATE: &str = "admin_ilm_transition_state";
+const MANUAL_TRANSITION_JOB_SCHEMA_VERSION: u8 = 1;
+const MANUAL_TRANSITION_JOB_CONFIG_PREFIX: &str = "ilm/transition/jobs";
 
 static ACTIVE_MANUAL_TRANSITION_SCOPES: OnceLock<Mutex<Vec<ManualTransitionRunScope>>> = OnceLock::new();
+static MANUAL_TRANSITION_JOBS: OnceLock<Mutex<HashMap<String, ManualTransitionJobRuntime>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManualTransitionRunScope {
@@ -139,6 +151,21 @@ struct ManualTransitionRunQuery {
     max_duration_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualTransitionRunMode {
+    EnqueueOnly,
+    Async,
+}
+
+impl ManualTransitionRunMode {
+    fn response_mode(self) -> &'static str {
+        match self {
+            Self::EnqueueOnly => "enqueue_only",
+            Self::Async => "durable_job",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ManualTransitionRunResponse {
     state: &'static str,
@@ -148,16 +175,71 @@ struct ManualTransitionRunResponse {
     report: ManualTransitionRunReport,
 }
 
+#[derive(Debug, Clone)]
+struct ManualTransitionJobRuntime {
+    record: ManualTransitionJobRecord,
+    cancel_token: CancellationToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ManualTransitionJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Partial,
+    Cancelled,
+    Failed,
+    Unknown,
+}
+
+impl ManualTransitionJobStatus {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Partial | Self::Cancelled | Self::Failed | Self::Unknown)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManualTransitionJobRecord {
+    schema_version: u8,
+    job_id: String,
+    status_endpoint: String,
+    status: ManualTransitionJobStatus,
+    bucket: String,
+    prefix: String,
+    tier: Option<String>,
+    dry_run: bool,
+    max_objects: Option<u64>,
+    max_duration_seconds: Option<u64>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    cancel_requested: bool,
+    failure_reason: Option<String>,
+    report: ManualTransitionRunReport,
+}
+
 pub fn register_ilm_transition_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
         format!("{ADMIN_PREFIX}/v3/ilm/transition/run").as_str(),
         AdminOperation(&ManualTransitionRunHandler {}),
     )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/jobs/{{job_id}}").as_str(),
+        AdminOperation(&ManualTransitionJobStatusHandler {}),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{ADMIN_PREFIX}/v3/ilm/transition/jobs/{{job_id}}").as_str(),
+        AdminOperation(&ManualTransitionJobCancelHandler {}),
+    )?;
     Ok(())
 }
 
-fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, ManualTransitionRunOptions)> {
+fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, ManualTransitionRunOptions, ManualTransitionRunMode)> {
     let query: ManualTransitionRunQuery = match query {
         Some(query) => serde_urlencoded::from_bytes(query.as_bytes())
             .map_err(|_| s3_error!(InvalidArgument, "invalid manual transition query"))?,
@@ -184,12 +266,11 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
     if mode.is_some_and(|mode| mode != "enqueue_only" && mode != "async") {
         return Err(s3_error!(InvalidArgument, "unsupported manual transition mode"));
     }
-    if query.async_mode == Some(true) || mode == Some("async") {
-        return Err(S3Error::with_message(
-            S3ErrorCode::NotImplemented,
-            "durable manual transition jobs are not implemented; omit async/mode for enqueue_only",
-        ));
-    }
+    let run_mode = if query.async_mode == Some(true) || mode == Some("async") {
+        ManualTransitionRunMode::Async
+    } else {
+        ManualTransitionRunMode::EnqueueOnly
+    };
 
     let max_objects = query.max_objects.unwrap_or(DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS);
     if max_objects == 0 || max_objects > MAX_MANUAL_TRANSITION_OBJECTS {
@@ -213,6 +294,7 @@ fn parse_manual_transition_query(query: Option<&str>) -> S3Result<(String, Manua
             max_objects: Some(max_objects),
             max_duration: query.max_duration_seconds.map(std::time::Duration::from_secs),
         },
+        run_mode,
     ))
 }
 
@@ -341,7 +423,7 @@ fn response_state(report: &ManualTransitionRunReport) -> &'static str {
     }
 }
 
-fn json_response(response: &ManualTransitionRunResponse) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn json_response<T: Serialize>(status: StatusCode, response: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
     let body = serde_json::to_vec(response).map_err(|err| {
         S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode manual transition response: {err}"))
     })?;
@@ -349,7 +431,223 @@ fn json_response(response: &ManualTransitionRunResponse) -> S3Result<S3Response<
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, content_type);
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
+    Ok(S3Response::with_headers((status, Body::from(body)), headers))
+}
+
+fn manual_transition_job_registry() -> &'static Mutex<HashMap<String, ManualTransitionJobRuntime>> {
+    MANUAL_TRANSITION_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_manual_transition_jobs() -> MutexGuard<'static, HashMap<String, ManualTransitionJobRuntime>> {
+    match manual_transition_job_registry().lock() {
+        Ok(jobs) => jobs,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn manual_transition_job_status_endpoint(job_id: &str) -> String {
+    format!("{ADMIN_PREFIX}/v3/ilm/transition/jobs/{job_id}")
+}
+
+fn manual_transition_job_config_path(job_id: &str) -> String {
+    format!("{MANUAL_TRANSITION_JOB_CONFIG_PREFIX}/{job_id}.json")
+}
+
+fn parse_manual_transition_job_id(job_id: &str) -> S3Result<String> {
+    Uuid::parse_str(job_id).map_err(|_| s3_error!(InvalidArgument, "invalid manual transition job id"))?;
+    Ok(job_id.to_string())
+}
+
+fn manual_transition_timestamp(now: OffsetDateTime) -> String {
+    now.format(&Rfc3339).unwrap_or_else(|_| now.unix_timestamp().to_string())
+}
+
+fn initial_manual_transition_report(bucket: &str, options: &ManualTransitionRunOptions) -> ManualTransitionRunReport {
+    ManualTransitionRunReport {
+        bucket: bucket.to_string(),
+        prefix: options.prefix.clone(),
+        tier: options.tier.clone(),
+        dry_run: options.dry_run,
+        ..Default::default()
+    }
+}
+
+fn manual_transition_status_from_report(report: &ManualTransitionRunReport) -> ManualTransitionJobStatus {
+    if report.was_truncated() || report.has_partial_enqueue() {
+        ManualTransitionJobStatus::Partial
+    } else {
+        ManualTransitionJobStatus::Completed
+    }
+}
+
+fn new_manual_transition_job_record(
+    job_id: String,
+    bucket: &str,
+    options: &ManualTransitionRunOptions,
+    created_at: OffsetDateTime,
+) -> ManualTransitionJobRecord {
+    ManualTransitionJobRecord {
+        schema_version: MANUAL_TRANSITION_JOB_SCHEMA_VERSION,
+        status_endpoint: manual_transition_job_status_endpoint(&job_id),
+        job_id,
+        status: ManualTransitionJobStatus::Queued,
+        bucket: bucket.to_string(),
+        prefix: options.prefix.clone(),
+        tier: options.tier.clone(),
+        dry_run: options.dry_run,
+        max_objects: options.max_objects,
+        max_duration_seconds: options.max_duration.map(|duration| duration.as_secs()),
+        created_at: manual_transition_timestamp(created_at),
+        started_at: None,
+        finished_at: None,
+        cancel_requested: false,
+        failure_reason: None,
+        report: initial_manual_transition_report(bucket, options),
+    }
+}
+
+fn insert_manual_transition_job(record: ManualTransitionJobRecord, cancel_token: CancellationToken) {
+    let mut jobs = lock_manual_transition_jobs();
+    jobs.insert(record.job_id.clone(), ManualTransitionJobRuntime { record, cancel_token });
+}
+
+fn update_manual_transition_job_record(
+    job_id: &str,
+    update: impl FnOnce(&mut ManualTransitionJobRecord),
+) -> Option<ManualTransitionJobRecord> {
+    let mut jobs = lock_manual_transition_jobs();
+    let runtime = jobs.get_mut(job_id)?;
+    update(&mut runtime.record);
+    Some(runtime.record.clone())
+}
+
+fn in_memory_manual_transition_job_record(job_id: &str) -> Option<ManualTransitionJobRecord> {
+    lock_manual_transition_jobs()
+        .get(job_id)
+        .map(|runtime| runtime.record.clone())
+}
+
+fn request_manual_transition_job_cancel(job_id: &str) -> Option<ManualTransitionJobRecord> {
+    let mut jobs = lock_manual_transition_jobs();
+    let runtime = jobs.get_mut(job_id)?;
+    if !runtime.record.status.is_terminal() {
+        runtime.record.cancel_requested = true;
+        runtime.cancel_token.cancel();
+    }
+    Some(runtime.record.clone())
+}
+
+fn remove_manual_transition_job(job_id: &str) {
+    let mut jobs = lock_manual_transition_jobs();
+    jobs.remove(job_id);
+}
+
+async fn save_manual_transition_job_record(store: Arc<ECStore>, record: &ManualTransitionJobRecord) -> S3Result<()> {
+    let data = serde_json::to_vec(record).map_err(|err| {
+        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode manual transition job: {err}"))
+    })?;
+    save_admin_config(store, &manual_transition_job_config_path(&record.job_id), data)
+        .await
+        .map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to persist manual transition job: {err}"))
+        })
+}
+
+async fn read_manual_transition_job_record(store: Arc<ECStore>, job_id: &str) -> S3Result<Option<ManualTransitionJobRecord>> {
+    match read_admin_config(store, &manual_transition_job_config_path(job_id)).await {
+        Ok(data) => serde_json::from_slice(&data).map(Some).map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to decode manual transition job: {err}"))
+        }),
+        Err(StorageError::ConfigNotFound) => Ok(None),
+        Err(err) => Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("failed to read manual transition job: {err}"),
+        )),
+    }
+}
+
+async fn load_manual_transition_job_record(store: Arc<ECStore>, job_id: &str) -> S3Result<ManualTransitionJobRecord> {
+    if let Some(record) = in_memory_manual_transition_job_record(job_id) {
+        return Ok(record);
+    }
+    let Some(mut record) = read_manual_transition_job_record(store, job_id).await? else {
+        return Err(s3_error!(NoSuchKey, "manual transition job not found"));
+    };
+    if !record.status.is_terminal() {
+        record.status = ManualTransitionJobStatus::Unknown;
+        record.finished_at = Some(manual_transition_timestamp(OffsetDateTime::now_utc()));
+        record.failure_reason = Some("manual transition job owner is not active on this node".to_string());
+    }
+    Ok(record)
+}
+
+async fn persist_manual_transition_job_update(store: Arc<ECStore>, record: &ManualTransitionJobRecord) -> bool {
+    if let Err(err) = save_manual_transition_job_record(store, record).await {
+        error!(
+            event = EVENT_ADMIN_ILM_TRANSITION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_ILM_TRANSITION,
+            operation = "manual_transition_job",
+            job_id = %record.job_id,
+            error = %err,
+            "failed to persist manual transition job update"
+        );
+        return false;
+    }
+    true
+}
+
+fn spawn_manual_transition_job(
+    store: Arc<ECStore>,
+    bucket: String,
+    options: ManualTransitionRunOptions,
+    job_id: String,
+    cancel_token: CancellationToken,
+    admission_guard: ManualTransitionRunAdmission,
+) {
+    tokio::spawn(async move {
+        let started_record = update_manual_transition_job_record(&job_id, |record| {
+            record.status = ManualTransitionJobStatus::Running;
+            record.started_at = Some(manual_transition_timestamp(OffsetDateTime::now_utc()));
+        });
+        if let Some(record) = started_record.as_ref() {
+            persist_manual_transition_job_update(store.clone(), record).await;
+        }
+
+        let result = enqueue_transition_for_existing_objects_scoped_with_cancel(
+            store.clone(),
+            &bucket,
+            options,
+            Some(cancel_token.clone()),
+        )
+        .await;
+        let finished_at = manual_transition_timestamp(OffsetDateTime::now_utc());
+        let finished_record = update_manual_transition_job_record(&job_id, |record| {
+            record.finished_at = Some(finished_at);
+            match result {
+                Ok(execution) => {
+                    record.report = execution.report;
+                    record.status = if execution.cancelled || record.cancel_requested || cancel_token.is_cancelled() {
+                        ManualTransitionJobStatus::Cancelled
+                    } else {
+                        manual_transition_status_from_report(&record.report)
+                    };
+                    record.failure_reason = None;
+                }
+                Err(err) => {
+                    record.status = ManualTransitionJobStatus::Failed;
+                    record.failure_reason = Some(err.to_string());
+                }
+            }
+        });
+        if let Some(record) = finished_record.as_ref()
+            && persist_manual_transition_job_update(store, record).await
+            && record.status.is_terminal()
+        {
+            remove_manual_transition_job(&job_id);
+        }
+        drop(admission_guard);
+    });
 }
 
 pub struct ManualTransitionRunHandler {}
@@ -360,7 +658,7 @@ impl Operation for ManualTransitionRunHandler {
         let request_id = admin_request_id(&req.headers).unwrap_or_default().to_string();
         let remote_addr = admin_remote_addr(&req).unwrap_or_default();
         let actor = authorize_manual_transition_request(&req).await?;
-        let (bucket, options) = match parse_manual_transition_query(req.uri.query()) {
+        let (bucket, options, run_mode) = match parse_manual_transition_query(req.uri.query()) {
             Ok(parsed) => parsed,
             Err(err) => {
                 log_manual_transition_rejected("invalid_query_parameters", &request_id, &actor, &remote_addr);
@@ -374,13 +672,31 @@ impl Operation for ManualTransitionRunHandler {
         let max_objects = options.max_objects;
         let max_duration_seconds = options.max_duration.map(|duration| duration.as_secs());
         let scope = ManualTransitionRunScope::new(&bucket, &options);
-        let _admission = match acquire_manual_transition_admission(scope) {
+        let admission = match acquire_manual_transition_admission(scope) {
             Ok(admission) => admission,
             Err(err) => {
                 log_manual_transition_rejected("already_running", &request_id, &actor, &remote_addr);
                 return Err(err);
             }
         };
+
+        if run_mode == ManualTransitionRunMode::Async {
+            let job_id = Uuid::new_v4().to_string();
+            let record = new_manual_transition_job_record(job_id.clone(), &bucket, &options, OffsetDateTime::now_utc());
+            save_manual_transition_job_record(store.clone(), &record).await?;
+            let cancel_token = CancellationToken::new();
+            insert_manual_transition_job(record.clone(), cancel_token.clone());
+            spawn_manual_transition_job(store, bucket, options, job_id.clone(), cancel_token, admission);
+            let response = ManualTransitionRunResponse {
+                state: "accepted",
+                mode: run_mode.response_mode(),
+                job_id: Some(job_id),
+                status_endpoint: Some(record.status_endpoint),
+                report: record.report,
+            };
+
+            return json_response(StatusCode::ACCEPTED, &response);
+        }
 
         let report = match enqueue_transition_for_existing_objects_scoped(store, &bucket, options).await {
             Ok(report) => report,
@@ -402,7 +718,59 @@ impl Operation for ManualTransitionRunHandler {
             report,
         };
 
-        json_response(&response)
+        json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct ManualTransitionJobStatusHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ManualTransitionJobStatusHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let _actor = authorize_manual_transition_request(&req).await?;
+        let job_id = parse_manual_transition_job_id(
+            params
+                .get("job_id")
+                .ok_or_else(|| s3_error!(InvalidRequest, "manual transition job id is required"))?,
+        )?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(s3_error!(InternalError, "object store is not initialized"));
+        };
+        let record = load_manual_transition_job_record(store, &job_id).await?;
+        json_response(StatusCode::OK, &record)
+    }
+}
+
+pub struct ManualTransitionJobCancelHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ManualTransitionJobCancelHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let _actor = authorize_manual_transition_request(&req).await?;
+        let job_id = parse_manual_transition_job_id(
+            params
+                .get("job_id")
+                .ok_or_else(|| s3_error!(InvalidRequest, "manual transition job id is required"))?,
+        )?;
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
+            return Err(s3_error!(InternalError, "object store is not initialized"));
+        };
+        let record = if let Some(record) = request_manual_transition_job_cancel(&job_id) {
+            record
+        } else {
+            let Some(mut record) = read_manual_transition_job_record(store.clone(), &job_id).await? else {
+                return Err(s3_error!(NoSuchKey, "manual transition job not found"));
+            };
+            if !record.status.is_terminal() {
+                record.status = ManualTransitionJobStatus::Unknown;
+                record.cancel_requested = true;
+                record.finished_at = Some(manual_transition_timestamp(OffsetDateTime::now_utc()));
+                record.failure_reason = Some("manual transition job owner is not active on this node".to_string());
+                save_manual_transition_job_record(store, &record).await?;
+            }
+            record
+        };
+        json_response(StatusCode::OK, &record)
     }
 }
 
@@ -412,11 +780,12 @@ mod tests {
 
     #[test]
     fn manual_transition_query_defaults_to_bounded_run() {
-        let (bucket, options) =
+        let (bucket, options, run_mode) =
             parse_manual_transition_query(Some("bucket=data&prefix=logs/&marker=logs/a&versionMarker=v1&tier=warm"))
                 .expect("valid query should parse");
 
         assert_eq!(bucket, "data");
+        assert_eq!(run_mode, ManualTransitionRunMode::EnqueueOnly);
         assert_eq!(options.prefix, "logs/");
         assert_eq!(options.marker.as_deref(), Some("logs/a"));
         assert_eq!(options.version_marker.as_deref(), Some("v1"));
@@ -428,32 +797,34 @@ mod tests {
 
     #[test]
     fn manual_transition_query_accepts_duration_budget() {
-        let (_bucket, options) =
+        let (_bucket, options, run_mode) =
             parse_manual_transition_query(Some("bucket=data&maxDurationSeconds=30")).expect("valid query should parse");
 
+        assert_eq!(run_mode, ManualTransitionRunMode::EnqueueOnly);
         assert_eq!(options.max_duration, Some(std::time::Duration::from_secs(30)));
     }
 
     #[test]
     fn manual_transition_query_accepts_explicit_enqueue_only_mode() {
-        let (_bucket, options) = parse_manual_transition_query(Some("bucket=data&mode=enqueue_only&async=false"))
+        let (_bucket, options, run_mode) = parse_manual_transition_query(Some("bucket=data&mode=enqueue_only&async=false"))
             .expect("explicit enqueue_only mode should remain compatible");
 
+        assert_eq!(run_mode, ManualTransitionRunMode::EnqueueOnly);
         assert!(!options.dry_run);
         assert_eq!(options.max_objects, Some(DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS));
     }
 
     #[test]
-    fn manual_transition_query_rejects_unimplemented_durable_mode() {
-        let err = parse_manual_transition_query(Some("bucket=data&async=true"))
-            .expect_err("async durable jobs must not be silently accepted");
+    fn manual_transition_query_accepts_explicit_async_mode() {
+        let (_bucket, _options, run_mode) =
+            parse_manual_transition_query(Some("bucket=data&async=true")).expect("async mode should parse");
 
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(run_mode, ManualTransitionRunMode::Async);
 
-        let err = parse_manual_transition_query(Some("bucket=data&mode=async"))
-            .expect_err("mode=async must not fall back to enqueue_only");
+        let (_bucket, _options, run_mode) =
+            parse_manual_transition_query(Some("bucket=data&mode=async")).expect("mode=async should parse");
 
-        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(run_mode, ManualTransitionRunMode::Async);
     }
 
     #[test]
@@ -479,11 +850,11 @@ mod tests {
 
     #[test]
     fn manual_transition_scope_ignores_resume_and_budget_parameters() {
-        let (bucket, first) = parse_manual_transition_query(Some(
+        let (bucket, first, _run_mode) = parse_manual_transition_query(Some(
             "bucket=data&prefix=logs/&tier=warm&marker=logs/a&versionMarker=v1&maxObjects=10",
         ))
         .expect("first query should parse");
-        let (_, second) = parse_manual_transition_query(Some(
+        let (_, second, _run_mode) = parse_manual_transition_query(Some(
             "bucket=data&prefix=logs/&tier=WARM&marker=logs/z&versionMarker=v9&maxObjects=20",
         ))
         .expect("second query should parse");
@@ -496,9 +867,9 @@ mod tests {
 
     #[test]
     fn manual_transition_scope_distinguishes_dry_run_mode() {
-        let (bucket, real) =
+        let (bucket, real, _run_mode) =
             parse_manual_transition_query(Some("bucket=data&prefix=logs/&tier=warm")).expect("real query should parse");
-        let (_, dry_run) = parse_manual_transition_query(Some("bucket=data&prefix=logs/&tier=warm&dryRun=true"))
+        let (_, dry_run, _run_mode) = parse_manual_transition_query(Some("bucket=data&prefix=logs/&tier=warm&dryRun=true"))
             .expect("dry-run query should parse");
 
         assert_ne!(
@@ -509,7 +880,7 @@ mod tests {
 
     #[test]
     fn manual_transition_admission_rejects_same_scope_until_guard_drops() {
-        let (bucket, options) =
+        let (bucket, options, _run_mode) =
             parse_manual_transition_query(Some("bucket=admission-test&prefix=logs/&tier=warm")).expect("query should parse");
         let scope = ManualTransitionRunScope::new(&bucket, &options);
         let first = acquire_manual_transition_admission(scope.clone()).expect("first admission should succeed");
@@ -536,7 +907,7 @@ mod tests {
 
     #[test]
     fn manual_transition_admission_rejects_overlapping_prefix_or_tier() {
-        let (bucket, options) =
+        let (bucket, options, _run_mode) =
             parse_manual_transition_query(Some("bucket=admission-overlap-test&prefix=logs/")).expect("query should parse");
         let scope = ManualTransitionRunScope::new(&bucket, &options);
         let active = acquire_manual_transition_admission(scope).expect("first admission should succeed");
@@ -648,6 +1019,53 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_record_omits_raw_resume_markers() {
+        let (bucket, options, run_mode) =
+            parse_manual_transition_query(Some("bucket=data&prefix=logs/&async=true")).expect("async query should parse");
+        let mut record = new_manual_transition_job_record(
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            &bucket,
+            &options,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        record.status = ManualTransitionJobStatus::Partial;
+        record.report.next_marker = Some("private/object".to_string());
+        record.report.next_version_idmarker = Some("null".to_string());
+
+        assert_eq!(run_mode, ManualTransitionRunMode::Async);
+        assert_eq!(
+            record.status_endpoint,
+            "/rustfs/admin/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111"
+        );
+
+        let value = serde_json::to_value(record).expect("job record should serialize");
+        assert!(value.pointer("/report/next_marker").is_none());
+        assert!(value.pointer("/report/next_version_idmarker").is_none());
+    }
+
+    #[test]
+    fn manual_transition_job_id_rejects_non_uuid_path_segment() {
+        let err = parse_manual_transition_job_id("../config").expect_err("path-like job ids must be rejected");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn manual_transition_cancel_marks_active_job_and_token() {
+        let (bucket, options, _run_mode) =
+            parse_manual_transition_query(Some("bucket=data&prefix=logs/&async=true")).expect("async query should parse");
+        let job_id = Uuid::new_v4().to_string();
+        let cancel_token = CancellationToken::new();
+        let record = new_manual_transition_job_record(job_id.clone(), &bucket, &options, OffsetDateTime::UNIX_EPOCH);
+        insert_manual_transition_job(record, cancel_token.clone());
+
+        let cancelled = request_manual_transition_job_cancel(&job_id).expect("active job should be found");
+
+        assert!(cancelled.cancel_requested);
+        assert!(cancel_token.is_cancelled());
+    }
+
+    #[test]
     fn manual_transition_handler_requires_set_tier_action() {
         let src = include_str!("ilm_transition.rs");
         let auth_block = extract_block_between_markers(src, "async fn authorize_manual_transition_request", "fn response_state");
@@ -677,6 +1095,16 @@ mod tests {
         assert!(log_block.contains("skipped_queue_full"));
         assert!(!log_block.contains("next_marker"));
         assert!(!log_block.contains("next_version_idmarker"));
+    }
+
+    #[test]
+    fn manual_transition_background_job_uses_cancelable_scanner_entrypoint() {
+        let src = include_str!("ilm_transition.rs");
+        let job_block =
+            extract_block_between_markers(src, "fn spawn_manual_transition_job", "pub struct ManualTransitionRunHandler");
+
+        assert!(job_block.contains("enqueue_transition_for_existing_objects_scoped_with_cancel"));
+        assert!(job_block.contains("CancellationToken"));
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
