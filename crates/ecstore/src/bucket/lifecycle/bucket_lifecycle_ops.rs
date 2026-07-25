@@ -3835,6 +3835,25 @@ pub async fn eval_action_from_lifecycle(
     }
 
     if lifecycle_action_blocked_by_replication(event.action, oi) {
+        let reason = if oi.version_purge_status.is_pending() {
+            "version_purge_pending"
+        } else if oi.replication_status == ReplicationStatusType::Failed {
+            "replication_failed"
+        } else {
+            "replication_pending"
+        };
+        debug!(
+            event = EVENT_LIFECYCLE_SCAN_SKIPPED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            object = %oi.name,
+            version_id = ?oi.version_id,
+            action = ?event.action,
+            replication_status = ?oi.replication_status,
+            version_purge_status = ?oi.version_purge_status,
+            reason,
+            "Skipped lifecycle action because replication is not terminal"
+        );
         return lifecycle::Event::default();
     }
 
