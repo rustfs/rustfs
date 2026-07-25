@@ -749,13 +749,13 @@ async fn start_manual_transition_job(
     spawn_manual_transition_job_heartbeat(store, job_id, scan_cancel_token, heartbeat_shutdown_token);
     tokio::spawn(async move {
         let result = enqueue_transition_for_existing_objects_scoped(run_store.clone(), &bucket, run_options).await;
-        if let Some(final_record) = finalize_manual_transition_job(run_store.clone(), job_id, result).await {
-            if final_record.is_terminal() {
-                release_manual_transition_admission(run_store, &final_record);
-                job_scan_cancel_token.cancel();
-                job_heartbeat_shutdown_token.cancel();
-                remove_active_manual_transition_job(job_id);
-            }
+        if let Some(final_record) = finalize_manual_transition_job(run_store.clone(), job_id, result).await
+            && final_record.is_terminal()
+        {
+            release_manual_transition_admission(run_store, &final_record);
+            job_scan_cancel_token.cancel();
+            job_heartbeat_shutdown_token.cancel();
+            remove_active_manual_transition_job(job_id);
         }
     });
 
