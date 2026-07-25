@@ -1162,8 +1162,8 @@ fn record_lock_held_release(lock_type: LockType) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF, LockAcquireFailureKind,LockLostSignal, 
-        is_remote_lock_rpc_failure, should_warn_lock_failure,
+        DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF, LockAcquireFailureKind,
+        LockLostSignal, is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
     use rand::{SeedableRng as _, TryRng, rngs::StdRng};
@@ -1198,7 +1198,7 @@ mod tests {
         }
 
         fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
-            for chunk in dst.chunks_mut(size_of::<u64>()) {
+            for chunk in dst.chunks_mut(std::mem::size_of::<u64>()) {
                 chunk.copy_from_slice(&self.0.to_ne_bytes()[..chunk.len()]);
             }
             Ok(())
