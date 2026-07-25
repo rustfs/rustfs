@@ -1001,11 +1001,7 @@ impl SetDisks {
                 let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
 
-            let mod_time = if let Some(mod_time) = opts.mod_time {
-                Some(mod_time)
-            } else {
-                Some(OffsetDateTime::now_utc())
-            };
+            let mod_time = opts.mod_time;
 
             // Drop any disk whose shard did not fully commit (offline at writer
             // setup, short write, or a write/shutdown error) so its truncated or
@@ -1073,6 +1069,45 @@ impl SetDisks {
 
             if !opts.no_lock && object_lock_guard.is_none() {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+            }
+
+            // Generate ordinary PUT timestamps under the commit lock so version
+            // ordering follows durable commit ordering when writers queued on
+            // the same object. Internal callers with an explicit timestamp keep
+            // their supplied value.
+            if opts.mod_time.is_none() {
+                let commit_time = Some(OffsetDateTime::now_utc());
+                for pfi in &mut parts_metadatas {
+                    pfi.mod_time = commit_time;
+                    for part in &mut pfi.parts {
+                        part.mod_time = commit_time;
+                    }
+                }
+            }
+
+            if let Some(expected) = opts.expected_current_version_id.as_deref() {
+                let current = self
+                    .get_object_info(
+                        bucket,
+                        object,
+                        &ObjectOptions {
+                            no_lock: true,
+                            metadata_cache_safe: false,
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                            StorageError::PreconditionFailed
+                        } else {
+                            err
+                        }
+                    })?;
+                if current.version_id.map(|version| version.to_string()).as_deref() != Some(expected) {
+                    return Err(StorageError::PreconditionFailed);
+                }
             }
 
             // Phase 2 (backlog#899): fence the commit on lock loss. If the refresh
@@ -2323,6 +2358,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             )
         };
 
+        if let Some(expected) = dst_opts.expected_current_version_id.as_deref() {
+            let current = self
+                .get_object_info(
+                    dst_bucket,
+                    dst_object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        StorageError::PreconditionFailed
+                    } else {
+                        err
+                    }
+                })?;
+            if current.version_id.map(|version| version.to_string()).as_deref() != Some(expected) {
+                return Err(StorageError::PreconditionFailed);
+            }
+        }
+
         self.invalidate_get_object_metadata_cache(dst_bucket, dst_object).await;
 
         if dst_opts.http_preconditions.is_some()
@@ -2965,6 +3025,34 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             self.invalidate_all_get_object_metadata_cache();
             return Ok(ObjectInfo::default());
+        }
+
+        if let Some(expected) = opts.expected_current_version_id.as_deref() {
+            let current = self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                        StorageError::PreconditionFailed
+                    } else {
+                        err
+                    }
+                })?;
+            if !current.delete_marker
+                || current.version_id.map(|version| version.to_string()).as_deref() != Some(expected)
+                || opts.version_id.as_deref() != Some(expected)
+            {
+                return Err(StorageError::PreconditionFailed);
+            }
         }
 
         // TODO: Lifecycle

@@ -337,6 +337,7 @@ pub enum MetricName {
     ScannerLastCycleReplicationChecks,
     ScannerLastCycleUsageSaves,
     ScannerFailedCycles,
+    ScannerSupersededCycles,
     ScannerPartialCycles,
     ScannerPartialCyclesByReason,
 
@@ -745,6 +746,7 @@ impl MetricName {
             Self::ScannerLastCycleReplicationChecks => "last_cycle_replication_checks".to_string(),
             Self::ScannerLastCycleUsageSaves => "last_cycle_usage_saves".to_string(),
             Self::ScannerFailedCycles => "failed_cycles".to_string(),
+            Self::ScannerSupersededCycles => "superseded_cycles".to_string(),
             Self::ScannerPartialCycles => "partial_cycles".to_string(),
             Self::ScannerPartialCyclesByReason => "partial_cycles_by_reason".to_string(),
 

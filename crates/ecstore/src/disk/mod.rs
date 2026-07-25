@@ -52,7 +52,7 @@ use local::LocalDisk;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
@@ -453,6 +453,20 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
+    pub async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner_server_epoch().await,
+        }
+    }
+
+    pub async fn open_ns_scanner_stream(&self, request: NsScannerOpenRequest) -> Result<FileReader> {
+        match self {
+            Disk::Remote(remote_disk) => remote_disk.open_ns_scanner_stream(request).await,
+            Disk::Local(_) => Err(Error::other("namespace scanner stream requires a remote disk")),
+        }
+    }
+
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         match self {
             Disk::Local(local_disk) => local_disk.runtime_state(),
@@ -496,6 +510,18 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
         }
     }
+}
+
+#[derive(Debug)]
+pub struct NsScannerOpenRequest {
+    pub request_id: Uuid,
+    pub server_epoch: Uuid,
+    pub session_id: Uuid,
+    pub session_sequence: u64,
+    pub next_cycle: u64,
+    pub leader_epoch: u64,
+    pub body: Vec<u8>,
+    pub stall_timeout: Option<Duration>,
 }
 
 impl Disk {
