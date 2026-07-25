@@ -934,6 +934,9 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     struct CompatPayloadField {
@@ -1297,6 +1300,8 @@ mod tests {
 
     #[test]
     fn internode_rpc_msgpack_only_reuses_cached_env_until_reset() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         reset_internode_rpc_msgpack_only_cache();
 
         temp_env::with_vars(
@@ -1326,6 +1331,8 @@ mod tests {
 
     #[test]
     fn internode_rpc_msgpack_only_requires_request_and_fleet_confirmation() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         for (requested, fleet_confirmed, expected) in [
             (None, None, false),
             (Some("true"), None, false),
