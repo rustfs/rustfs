@@ -107,12 +107,13 @@ pub mod bucket {
 
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
-            BucketMetadataSys, delete, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
-            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
+            BucketMetadataSys, acquire_bucket_targets_transaction_lock, delete, get, get_accelerate_config, get_bucket_policy,
+            get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_public_access_block_config, get_quota_config, get_replication_config,
             get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
             init_bucket_metadata_sys, list_bucket_targets, remove_bucket_metadata, set_bucket_metadata, update,
+            update_bucket_targets_under_transaction_lock,
         };
     }
 
@@ -158,8 +159,8 @@ pub mod bucket {
             ReplicationType, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType,
             delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
             get_global_replication_stats, init_background_replication, read_durable_mrf_backlog, replication_state_to_filemeta,
-            replication_status_to_filemeta, replication_statuses_map, replication_target_arns, should_remove_replication_target,
-            should_schedule_delete_replication, should_use_existing_delete_replication_info,
+            replication_status_to_filemeta, replication_statuses_map, replication_target_arns, resync_start_conflict_id,
+            should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
             should_use_existing_delete_replication_source, validate_replication_config_target_arns,
             version_purge_status_to_filemeta,
         };

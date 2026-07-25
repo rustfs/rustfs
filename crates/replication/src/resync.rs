@@ -277,7 +277,7 @@ pub fn sanitize_resync_error_detail(detail: &str) -> Option<String> {
 }
 
 pub fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
-    state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
+    state.resync_id.is_empty() || state.resync_id == opts.resync_id
 }
 
 pub fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
@@ -650,6 +650,13 @@ mod tests {
         assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
         assert!(resync_state_accepts_update(&current, &matching));
         assert!(!resync_state_accepts_update(&current, &stale));
+        assert!(!resync_state_accepts_update(
+            &current,
+            &ResyncOpts {
+                resync_id: String::new(),
+                ..matching
+            }
+        ));
     }
 
     #[test]
