@@ -1001,11 +1001,7 @@ impl SetDisks {
                 let _ = user_defined.remove(AMZ_STORAGE_CLASS);
             }
 
-            let mod_time = if let Some(mod_time) = opts.mod_time {
-                Some(mod_time)
-            } else {
-                Some(OffsetDateTime::now_utc())
-            };
+            let mod_time = opts.mod_time;
 
             // Drop any disk whose shard did not fully commit (offline at writer
             // setup, short write, or a write/shutdown error) so its truncated or
@@ -1073,6 +1069,20 @@ impl SetDisks {
 
             if !opts.no_lock && object_lock_guard.is_none() {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+            }
+
+            // Generate ordinary PUT timestamps under the commit lock so version
+            // ordering follows durable commit ordering when writers queued on
+            // the same object. Internal callers with an explicit timestamp keep
+            // their supplied value.
+            if opts.mod_time.is_none() {
+                let commit_time = Some(OffsetDateTime::now_utc());
+                for pfi in &mut parts_metadatas {
+                    pfi.mod_time = commit_time;
+                    for part in &mut pfi.parts {
+                        part.mod_time = commit_time;
+                    }
+                }
             }
 
             if let Some(expected) = opts.expected_current_version_id.as_deref() {
