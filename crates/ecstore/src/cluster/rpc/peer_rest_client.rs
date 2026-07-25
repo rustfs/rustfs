@@ -1631,29 +1631,121 @@ impl PeerRestClient {
     }
 
     pub async fn load_transition_tier_config(&self) -> Result<()> {
-        let result = self.load_transition_tier_config_inner().await;
-        if let Err(err) = &result
-            && Self::is_network_like_error(err)
-        {
-            self.prepare_retry().await;
-            return self.finalize_result(self.load_transition_tier_config_inner().await).await;
+        match self.load_transition_tier_config_outcome().await {
+            TierConfigReloadOutcome::Success => Ok(()),
+            TierConfigReloadOutcome::TransientReconnect(err) | TierConfigReloadOutcome::TransientRetrySameChannel(err) => {
+                self.finalize_result(Err(err)).await
+            }
+            TierConfigReloadOutcome::Terminal(err) => Err(err),
         }
-        self.finalize_result(result).await
     }
 
-    async fn load_transition_tier_config_inner(&self) -> Result<()> {
-        let mut client = self.get_client().await?;
-        let request = Request::new(LoadTransitionTierConfigRequest {});
+    pub(crate) async fn load_transition_tier_config_outcome(&self) -> TierConfigReloadOutcome {
+        let outcome = self.load_transition_tier_config_single_attempt_outcome().await;
+        if outcome.is_transient() {
+            return self.load_transition_tier_config_once_outcome().await;
+        }
+        outcome
+    }
 
-        let response = client.load_transition_tier_config(request).await?.into_inner();
+    pub(crate) async fn load_transition_tier_config_single_attempt_outcome(&self) -> TierConfigReloadOutcome {
+        let outcome = self.load_transition_tier_config_once_outcome().await;
+        if outcome.requires_reconnect() {
+            self.prepare_retry().await;
+        }
+        outcome
+    }
+
+    pub(crate) async fn load_transition_tier_config_once_outcome(&self) -> TierConfigReloadOutcome {
+        let mut client = match self.get_client().await {
+            Ok(client) => client,
+            Err(err) => return tier_config_reload_connection_outcome(err),
+        };
+        let mut request = Request::new(LoadTransitionTierConfigRequest {});
+        request.set_timeout(rustfs_protos::heal_control_execution_timeout());
+
+        let response = match client.load_transition_tier_config(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => return tier_config_reload_status_outcome(status),
+        };
         if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(Error::other(""));
+            return tier_config_reload_remote_failure(response.error_info);
         }
 
-        Ok(())
+        TierConfigReloadOutcome::Success
+    }
+}
+
+pub(crate) enum TierConfigReloadOutcome {
+    Success,
+    TransientReconnect(Error),
+    TransientRetrySameChannel(Error),
+    Terminal(Error),
+}
+
+impl TierConfigReloadOutcome {
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::TransientReconnect(_) | Self::TransientRetrySameChannel(_))
+    }
+
+    fn requires_reconnect(&self) -> bool {
+        matches!(self, Self::TransientReconnect(_))
+    }
+}
+
+fn tier_config_reload_connection_outcome(err: Error) -> TierConfigReloadOutcome {
+    if is_tier_config_reload_connection_failure(&err) {
+        TierConfigReloadOutcome::TransientReconnect(err)
+    } else {
+        TierConfigReloadOutcome::Terminal(err)
+    }
+}
+
+fn is_tier_config_reload_connection_failure(err: &Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    if message
+        .split_once("can not get client, err:")
+        .is_some_and(|(_, local_error)| local_error.contains("unavailable"))
+    {
+        return true;
+    }
+    [
+        "temporarily offline",
+        "transport error",
+        "error trying to connect",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "broken pipe",
+        "not connected",
+        "unexpected eof",
+        "timed out",
+        "deadline has elapsed",
+        "tcp connect error",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn tier_config_reload_remote_failure(error_info: Option<String>) -> TierConfigReloadOutcome {
+    let error_info = error_info.unwrap_or_default();
+    if matches!(error_info.as_str(), "errServerNotInitialized" | "ServerNotInitialized") {
+        TierConfigReloadOutcome::TransientRetrySameChannel(Error::other(error_info))
+    } else {
+        TierConfigReloadOutcome::Terminal(Error::other(error_info))
+    }
+}
+
+fn tier_config_reload_status_outcome(status: tonic::Status) -> TierConfigReloadOutcome {
+    use tonic::Code;
+
+    if matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded) {
+        TierConfigReloadOutcome::TransientReconnect(status.into())
+    } else if status.code() == Code::Unknown && status.message().starts_with("Service was not ready:") {
+        TierConfigReloadOutcome::TransientRetrySameChannel(status.into())
+    } else {
+        TierConfigReloadOutcome::Terminal(status.into())
     }
 }
 
@@ -2057,6 +2149,73 @@ mod tests {
         assert!(PeerRestClient::is_network_like_error(&Error::other("transport error")));
         assert!(PeerRestClient::is_network_like_error(&Error::other("connection refused")));
         assert!(!PeerRestClient::is_network_like_error(&Error::NotImplemented));
+    }
+
+    #[test]
+    fn tier_config_reload_outcome_keeps_tonic_and_remote_errors_typed() {
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::unavailable("peer offline")),
+            TierConfigReloadOutcome::TransientReconnect(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::deadline_exceeded("peer timeout")),
+            TierConfigReloadOutcome::TransientReconnect(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::permission_denied("bad signature")),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::unknown("Service was not ready: test client")),
+            TierConfigReloadOutcome::TransientRetrySameChannel(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::unknown("peer response unknown")),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_status_outcome(tonic::Status::cancelled("request cancelled")),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_remote_failure(Some("backend unavailable".to_string())),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_remote_failure(Some("errServerNotInitialized".to_string())),
+            TierConfigReloadOutcome::TransientRetrySameChannel(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_connection_outcome(Error::other("backend unavailable")),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_connection_outcome(Error::other("can not get client, err: connection unavailable")),
+            TierConfigReloadOutcome::TransientReconnect(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_single_attempt_clears_offline_gate_without_redial() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        let outcome = client.load_transition_tier_config_single_attempt_outcome().await;
+
+        assert!(matches!(outcome, TierConfigReloadOutcome::TransientReconnect(_)));
+        assert!(!client.offline.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tier_config_reload_readiness_retry_does_not_require_reconnect() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        let outcome = tier_config_reload_status_outcome(tonic::Status::unknown("Service was not ready: startup"));
+
+        assert!(matches!(outcome, TierConfigReloadOutcome::TransientRetrySameChannel(_)));
+        assert!(!outcome.requires_reconnect());
+        assert!(client.offline.load(Ordering::Acquire));
     }
 
     #[tokio::test]

@@ -37,6 +37,7 @@ pub use http_auth::{
 #[cfg(test)]
 pub(crate) use internode_data_transport::TcpHttpInternodeDataTransport;
 pub use internode_data_transport::build_internode_data_transport_from_env;
+pub(crate) use peer_rest_client::TierConfigReloadOutcome;
 pub use peer_rest_client::{
     PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity,

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity};
+use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity, TierConfigReloadOutcome};
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
@@ -34,7 +34,8 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -44,6 +45,8 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
 const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
 const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const TIER_CONFIG_RELOAD_RETRY_BASE: Duration = Duration::from_millis(100);
+const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -55,6 +58,16 @@ struct PeerAdminCache {
     /// cached `online` snapshot from being served indefinitely while a peer is
     /// actually down (rustfs/backlog#1049 P2).
     last_server_success: Option<SystemTime>,
+}
+
+#[derive(Default)]
+struct TierConfigReloadWorkers {
+    peers: HashMap<String, bool>,
+}
+
+enum TierConfigReloadFinish {
+    Completed,
+    Pending,
 }
 
 impl PeerAdminCache {
@@ -97,6 +110,7 @@ pub struct NotificationSys {
     pub all_peer_clients: Vec<Option<PeerRestClient>>,
     peer_topology_hosts: Vec<String>,
     peer_admin_caches: Vec<Mutex<PeerAdminCache>>,
+    tier_config_reload_workers: Arc<Mutex<TierConfigReloadWorkers>>,
 }
 
 impl NotificationSys {
@@ -108,6 +122,7 @@ impl NotificationSys {
             all_peer_clients,
             peer_topology_hosts,
             peer_admin_caches,
+            tier_config_reload_workers: Default::default(),
         }
     }
 }
@@ -1127,6 +1142,124 @@ impl NotificationSys {
         join_all(futures).await
     }
 
+    /// Starts one immediate configuration reload worker per peer. Concurrent
+    /// tier mutations share the existing worker for that peer.
+    pub fn spawn_transition_tier_config_reload_workers(self: &Arc<Self>) {
+        self.spawn_transition_tier_config_reload_workers_with_cancel_token(runtime_sources::background_services_cancel_token());
+    }
+
+    fn spawn_transition_tier_config_reload_workers_with_cancel_token(self: &Arc<Self>, cancel_token: Option<CancellationToken>) {
+        let Some(cancel_token) = cancel_token else {
+            warn!(
+                event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                action = "reload_transition_tier_config",
+                result = "background_service_unavailable",
+                "notification peer propagation"
+            );
+            return;
+        };
+        for (peer_index, client) in self.peer_clients.iter().enumerate() {
+            let Some(client) = client.clone() else {
+                warn!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "reload_transition_tier_config",
+                    peer_index,
+                    result = "peer_unreachable",
+                    "notification peer propagation"
+                );
+                continue;
+            };
+            let host = client.grid_host.clone();
+            if !self.reserve_tier_config_reload_worker(&host) {
+                debug!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "reload_transition_tier_config",
+                    host,
+                    result = "coalesced",
+                    "notification peer propagation"
+                );
+                continue;
+            }
+            let sys = Arc::clone(self);
+            let cancel_token = cancel_token.clone();
+            tokio::spawn(async move {
+                run_tier_config_reload_worker(sys, host, cancel_token, move || {
+                    let client = client.clone();
+                    async move { client.load_transition_tier_config_single_attempt_outcome().await }
+                })
+                .await;
+            });
+        }
+    }
+
+    fn reserve_tier_config_reload_worker(&self, host: &str) -> bool {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        match workers.peers.get_mut(host) {
+            Some(pending) => {
+                *pending = true;
+                false
+            }
+            None => {
+                workers.peers.insert(host.to_string(), false);
+                true
+            }
+        }
+    }
+
+    fn take_tier_config_reload_pending(&self, host: &str) -> bool {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        let Some(pending) = workers.peers.get_mut(host) else {
+            return false;
+        };
+        let pending_reload = *pending;
+        *pending = false;
+        pending_reload
+    }
+
+    fn finish_tier_config_reload_worker(&self, host: &str) -> TierConfigReloadFinish {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        let Some(pending) = workers.peers.get_mut(host) else {
+            return TierConfigReloadFinish::Completed;
+        };
+        if *pending {
+            *pending = false;
+            return TierConfigReloadFinish::Pending;
+        }
+        workers.peers.remove(host);
+        TierConfigReloadFinish::Completed
+    }
+
+    fn cancel_tier_config_reload_worker(&self, host: &str) {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        workers.peers.remove(host);
+    }
+
+    fn tier_config_reload_worker_active(&self, host: &str) -> bool {
+        self.tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned")
+            .peers
+            .contains_key(host)
+    }
+
     pub async fn prepare_tier_mutation(&self, mutation_id: Uuid, canonical_payload: Bytes) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter().cloned() {
@@ -1170,6 +1303,113 @@ impl NotificationSys {
         }
         join_all(futures).await
     }
+}
+
+async fn run_tier_config_reload_worker<F, Fut>(
+    sys: Arc<NotificationSys>,
+    host: String,
+    cancel_token: CancellationToken,
+    mut reload: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = TierConfigReloadOutcome>,
+{
+    let mut retry_attempt = 0;
+    loop {
+        if cancel_token.is_cancelled() {
+            sys.cancel_tier_config_reload_worker(&host);
+            return;
+        }
+        let result = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                sys.cancel_tier_config_reload_worker(&host);
+                return;
+            }
+            result = reload() => result,
+        };
+
+        match result {
+            TierConfigReloadOutcome::Success => match sys.finish_tier_config_reload_worker(&host) {
+                TierConfigReloadFinish::Completed => {
+                    debug!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        result = "success",
+                        "notification peer propagation"
+                    );
+                    return;
+                }
+                TierConfigReloadFinish::Pending => retry_attempt = 0,
+            },
+            TierConfigReloadOutcome::Terminal(_) => match sys.finish_tier_config_reload_worker(&host) {
+                TierConfigReloadFinish::Completed => {
+                    warn!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        outcome = "terminal",
+                        "tier configuration reload stopped after a terminal outcome"
+                    );
+                    return;
+                }
+                TierConfigReloadFinish::Pending => retry_attempt = 0,
+            },
+            TierConfigReloadOutcome::TransientReconnect(_) | TierConfigReloadOutcome::TransientRetrySameChannel(_) => {
+                let delay = tier_config_reload_retry_delay(retry_attempt);
+                retry_attempt = retry_attempt.saturating_add(1);
+                if sys.take_tier_config_reload_pending(&host) {
+                    retry_attempt = 0;
+                    continue;
+                }
+                if retry_attempt == 1 {
+                    warn!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        retry_attempt,
+                        retry_delay_ms = delay.as_millis(),
+                        outcome = "transient",
+                        "tier configuration reload failed; retrying"
+                    );
+                } else if retry_attempt.is_power_of_two() {
+                    debug!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        retry_attempt,
+                        retry_delay_ms = delay.as_millis(),
+                        outcome = "transient",
+                        "tier configuration reload retry failed"
+                    );
+                }
+
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        sys.cancel_tier_config_reload_worker(&host);
+                        return;
+                    }
+                    _ = sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+fn tier_config_reload_retry_delay(retry_attempt: u32) -> Duration {
+    let multiplier = 1_u32 << retry_attempt.min(6);
+    TIER_CONFIG_RELOAD_RETRY_BASE
+        .checked_mul(multiplier)
+        .unwrap_or(TIER_CONFIG_RELOAD_RETRY_CAP)
+        .min(TIER_CONFIG_RELOAD_RETRY_CAP)
 }
 
 async fn scanner_activity_with_timeout<F>(timeout_duration: Duration, host: &str, activity: F) -> Result<ScannerPeerActivity>
@@ -1722,6 +1962,7 @@ mod tests {
             ))],
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
         };
 
         let client = sys
@@ -1766,6 +2007,7 @@ mod tests {
             all_peer_clients: Vec::new(),
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1786,6 +2028,7 @@ mod tests {
             all_peer_clients: vec![None, None],
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1803,6 +2046,7 @@ mod tests {
             all_peer_clients: Vec::new(),
             peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1824,6 +2068,7 @@ mod tests {
             all_peer_clients: vec![None],
             peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1841,6 +2086,7 @@ mod tests {
             all_peer_clients: vec![None, None],
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let servers = sys.server_info().await;
@@ -1899,6 +2145,7 @@ mod tests {
             peer_clients: Vec::new(),
             all_peer_clients: Vec::new(),
             peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
             peer_topology_hosts: Vec::new(),
         };
         let missing = sys
@@ -1972,6 +2219,7 @@ mod tests {
             all_peer_clients: Vec::new(),
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1985,6 +2233,205 @@ mod tests {
         assert!(msg.contains("peer[0]"));
     }
 
+    #[test]
+    fn tier_config_reload_retry_delay_is_exponentially_capped() {
+        assert_eq!(tier_config_reload_retry_delay(0), Duration::from_millis(100));
+        assert_eq!(tier_config_reload_retry_delay(1), Duration::from_millis(200));
+        assert_eq!(tier_config_reload_retry_delay(5), Duration::from_millis(3200));
+        assert_eq!(tier_config_reload_retry_delay(6), TIER_CONFIG_RELOAD_RETRY_CAP);
+        assert_eq!(tier_config_reload_retry_delay(u32::MAX), TIER_CONFIG_RELOAD_RETRY_CAP);
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_retries_only_network_failures() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    TierConfigReloadOutcome::TransientReconnect(Error::other("connection refused"))
+                } else {
+                    TierConfigReloadOutcome::Success
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_converges_after_readiness_unknown() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    TierConfigReloadOutcome::TransientRetrySameChannel(Error::other("Service was not ready: test client"))
+                } else {
+                    TierConfigReloadOutcome::Success
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_stops_on_terminal_failure() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { TierConfigReloadOutcome::Terminal(Error::NotImplemented) }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_reloads_once_after_success_with_pending_mutation() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let sys_for_reload = Arc::clone(&sys);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sys = Arc::clone(&sys_for_reload);
+            async move {
+                if attempt == 0 {
+                    assert!(!sys.reserve_tier_config_reload_worker("node-a:9000"));
+                    TierConfigReloadOutcome::Success
+                } else {
+                    TierConfigReloadOutcome::Success
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[test]
+    fn tier_config_reload_none_peer_does_not_start_a_worker() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        });
+
+        sys.spawn_transition_tier_config_reload_workers_with_cancel_token(Some(CancellationToken::new()));
+
+        assert!(
+            sys.tier_config_reload_workers
+                .lock()
+                .expect("tier config reload worker state must not be poisoned")
+                .peers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tier_config_reload_without_background_token_does_not_reserve_a_worker() {
+        let client = PeerRestClient::new(
+            "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
+            "http://127.0.0.1:9000".to_string(),
+        );
+        let sys = Arc::new(NotificationSys {
+            peer_clients: vec![Some(client)],
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        });
+
+        sys.spawn_transition_tier_config_reload_workers_with_cancel_token(None);
+
+        assert!(
+            sys.tier_config_reload_workers
+                .lock()
+                .expect("tier config reload worker state must not be poisoned")
+                .peers
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_cancellation_during_transient_backoff_releases_state() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let cancel_token = CancellationToken::new();
+        let cancel_for_reload = cancel_token.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), cancel_token, move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let cancel_token = cancel_for_reload.clone();
+            async move {
+                if attempt == 0 {
+                    cancel_token.cancel();
+                }
+                TierConfigReloadOutcome::TransientReconnect(Error::other("connection refused"))
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
     #[tokio::test]
     async fn load_transition_tier_config_reports_unreachable_peers() {
         let sys = NotificationSys {
@@ -1992,6 +2439,7 @@ mod tests {
             all_peer_clients: Vec::new(),
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let results = sys.load_transition_tier_config().await;
@@ -2008,6 +2456,7 @@ mod tests {
             all_peer_clients: Vec::new(),
             peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
         let mutation_id = Uuid::from_u128(1);
 
