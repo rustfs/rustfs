@@ -10,13 +10,16 @@ use datafusion::arrow::{
     json::{WriterBuilder as JsonWriterBuilder, writer::LineDelimited},
     record_batch::RecordBatch,
 };
+use datafusion::common::DataFusionError;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use http::{StatusCode, header::RANGE};
 use rustfs_s3select_api::{
-    QueryError,
+    QueryError, S3SelectPolicyError,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
+use rustfs_s3select_query::instance::s3_select_query_timeout;
 use s3s::dto::{
     CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
     JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,
@@ -26,6 +29,7 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, timeout_at};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
@@ -60,6 +64,8 @@ pub async fn execute_select_object_content(
     validate_scan_range_for_object_size(&input.request, metadata.size)?;
 
     let input = Arc::new(input);
+    let query_timeout = s3_select_query_timeout();
+    let query_deadline = Instant::now() + query_timeout;
     let db = current_s3select_db((*input).clone(), false)
         .await
         .map_err(map_query_error_to_s3)?;
@@ -72,71 +78,103 @@ pub async fn execute_select_object_content(
         .into_record_batch_stream()
         .map_err(map_query_error_to_s3)?;
 
-    let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(8);
+    let (tx, rx) = mpsc::channel::<S3Result<SelectObjectContentEvent>>(9);
+    let terminal_permit = tx
+        .clone()
+        .try_reserve_owned()
+        .map_err(|_| s3_error!(InternalError, "can't reserve Select terminal event capacity"))?;
     spawn_traced(async move {
-        let mut encoder = SelectOutputEncoder::new(validation.output_format);
-        let mut progress = SelectProgress::default();
-        let mut output = output;
-
-        if tx
-            .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        while let Some(result) = output.next().await {
-            let batch = match result {
-                Ok(batch) => batch,
-                Err(err) => {
-                    let _ = tx.send(Err(map_query_error_to_s3(err.into()))).await;
-                    return;
-                }
-            };
-
-            match encoder.encode_batch(&batch) {
-                Ok(payloads) => {
-                    for payload in payloads {
-                        progress.add_returned(payload.len());
-                        if tx
-                            .send(Ok(SelectObjectContentEvent::Records(RecordsEvent { payload: Some(payload) })))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if validation.progress_enabled
-                            && tx
-                                .send(Ok(SelectObjectContentEvent::Progress(ProgressEvent {
-                                    details: Some(progress.to_progress()),
-                                })))
-                                .await
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    return;
-                }
-            }
-        }
-
-        let stats = SelectObjectContentEvent::Stats(StatsEvent {
-            details: Some(progress.to_stats()),
-        });
-        if tx.send(Ok(stats)).await.is_err() {
-            return;
-        }
-        let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
+        send_select_events_until_deadline(output, tx, terminal_permit, validation, query_deadline, query_timeout.as_secs()).await;
     });
 
     Ok(S3Response::new(SelectObjectContentOutput {
         payload: Some(SelectObjectContentEventStream::new(ReceiverStream::new(rx))),
     }))
+}
+
+async fn send_select_events_until_deadline(
+    output: SendableRecordBatchStream,
+    tx: mpsc::Sender<S3Result<SelectObjectContentEvent>>,
+    terminal_permit: mpsc::OwnedPermit<S3Result<SelectObjectContentEvent>>,
+    validation: SelectValidation,
+    deadline: Instant,
+    timeout_seconds: u64,
+) {
+    if timeout_at(deadline, send_select_events(output, &tx, validation))
+        .await
+        .is_err()
+    {
+        terminal_permit.send(Err(map_query_error_to_s3(
+            S3SelectPolicyError::QueryTimeout {
+                seconds: timeout_seconds,
+            }
+            .into(),
+        )));
+    }
+}
+
+async fn send_select_events(
+    mut output: SendableRecordBatchStream,
+    tx: &mpsc::Sender<S3Result<SelectObjectContentEvent>>,
+    validation: SelectValidation,
+) {
+    let mut encoder = SelectOutputEncoder::new(validation.output_format);
+    let mut progress = SelectProgress::default();
+
+    if tx
+        .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    while let Some(result) = output.next().await {
+        let batch = match result {
+            Ok(batch) => batch,
+            Err(err) => {
+                let _ = tx.send(Err(map_query_error_to_s3(err.into()))).await;
+                return;
+            }
+        };
+
+        match encoder.encode_batch(&batch) {
+            Ok(payloads) => {
+                for payload in payloads {
+                    progress.add_returned(payload.len());
+                    if tx
+                        .send(Ok(SelectObjectContentEvent::Records(RecordsEvent { payload: Some(payload) })))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if validation.progress_enabled
+                        && tx
+                            .send(Ok(SelectObjectContentEvent::Progress(ProgressEvent {
+                                details: Some(progress.to_progress()),
+                            })))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+        }
+    }
+
+    let stats = SelectObjectContentEvent::Stats(StatsEvent {
+        details: Some(progress.to_stats()),
+    });
+    if tx.send(Ok(stats)).await.is_err() {
+        return;
+    }
+    let _ = tx.send(Ok(SelectObjectContentEvent::End(EndEvent::default()))).await;
 }
 
 fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectContentInput) -> S3Result<SelectValidation> {
@@ -487,11 +525,31 @@ fn clamp_i64(value: u64) -> i64 {
 }
 
 fn map_query_error_to_s3(err: QueryError) -> S3Error {
+    if let Some(policy_error) = err.s3_select_policy_error() {
+        let message = policy_error.to_string();
+        return match policy_error {
+            S3SelectPolicyError::UnsupportedSqlStructure { .. } => {
+                S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message)
+            }
+            S3SelectPolicyError::QueryConcurrencyLimit => S3Error::with_message(S3ErrorCode::SlowDown, message),
+            S3SelectPolicyError::QueryTimeout { .. } => S3Error::with_message(S3ErrorCode::Busy, message),
+            _ => S3Error::with_message(S3ErrorCode::InternalError, message),
+        };
+    }
     let message = err.to_string();
     match err {
         QueryError::Parser { .. } => parse_select_failure(message),
         QueryError::MultiStatement { .. } => S3Error::with_message(S3ErrorCode::UnsupportedSqlStructure, message),
         QueryError::NotImplemented { .. } => S3Error::with_message(S3ErrorCode::NotImplemented, message),
+        QueryError::Datafusion { source } if is_resource_exhausted(source.as_ref()) => {
+            S3Error::with_message(S3ErrorCode::Busy, message)
+        }
+        QueryError::Datafusion { source } if is_unexpected_eof(source.as_ref()) => {
+            S3Error::with_message(S3ErrorCode::InternalError, message)
+        }
+        QueryError::Datafusion { source } if is_invalid_object_size(source.as_ref()) => {
+            S3Error::with_message(S3ErrorCode::InternalError, message)
+        }
         QueryError::Datafusion { .. } if looks_like_invalid_scan_range(&message) => {
             S3Error::with_message(S3ErrorCode::InvalidRequestParameter, INVALID_SCAN_RANGE_MESSAGE.to_string())
         }
@@ -518,6 +576,42 @@ fn map_query_error_to_s3(err: QueryError) -> S3Error {
 
 fn looks_like_bucket_not_found(message: &str) -> bool {
     message.contains("NoSuchBucket") || message.contains("bucket not found") || message.contains("BucketNotFound")
+}
+
+const MAX_ERROR_SOURCE_DEPTH: usize = 16;
+
+fn error_chain_any(
+    mut err: &(dyn std::error::Error + 'static),
+    predicate: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    for _ in 0..MAX_ERROR_SOURCE_DEPTH {
+        if predicate(err) {
+            return true;
+        }
+        let Some(source) = err.source() else {
+            return false;
+        };
+        err = source;
+    }
+    false
+}
+
+fn is_resource_exhausted(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_any(err, |err| {
+        err.downcast_ref::<DataFusionError>()
+            .is_some_and(|err| matches!(err, DataFusionError::ResourcesExhausted(_)))
+    })
+}
+
+fn is_unexpected_eof(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_any(err, |err| {
+        err.downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::UnexpectedEof)
+    })
+}
+
+fn is_invalid_object_size(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_any(err, |err| err.downcast_ref::<std::num::TryFromIntError>().is_some())
 }
 
 fn looks_like_object_not_found(message: &str) -> bool {
@@ -548,9 +642,26 @@ fn is_json_document(json: &JSONInput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::sql::sqlparser::parser::ParserError;
+    use datafusion::{
+        arrow::datatypes::Schema, physical_plan::stream::RecordBatchStreamAdapter, sql::sqlparser::parser::ParserError,
+    };
     use http::HeaderMap;
     use s3s::dto::{CSVInput, ParquetInput, ScanRange};
+
+    #[derive(Debug)]
+    struct CyclicError;
+
+    impl std::fmt::Display for CyclicError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("cyclic error")
+        }
+    }
+
+    impl std::error::Error for CyclicError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self)
+        }
+    }
 
     fn base_input() -> SelectObjectContentInput {
         SelectObjectContentInput {
@@ -609,6 +720,106 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::Custom("ParseSelectFailure".into()));
         assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
         assert_eq!(err.message(), Some("sql parser error: syntax error"));
+    }
+
+    #[test]
+    fn map_query_policy_errors_to_s3_errors() {
+        let unsupported = map_query_error_to_s3(
+            S3SelectPolicyError::UnsupportedSqlStructure {
+                message: "JOIN is not supported".to_string(),
+            }
+            .into(),
+        );
+        let saturated = map_query_error_to_s3(S3SelectPolicyError::QueryConcurrencyLimit.into());
+        let timed_out = map_query_error_to_s3(S3SelectPolicyError::QueryTimeout { seconds: 300 }.into());
+        let stream_timed_out = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::External(Box::new(S3SelectPolicyError::QueryTimeout { seconds: 300 }))),
+        });
+        let exhausted = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(DataFusionError::ResourcesExhausted("memory limit".to_string())),
+            }))),
+        });
+        let truncated = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated object stream")),
+            }))),
+        });
+        let invalid_object_size = map_query_error_to_s3(QueryError::Datafusion {
+            source: Box::new(DataFusionError::ObjectStore(Box::new(datafusion::object_store::Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(u64::try_from(-1_i64).expect_err("negative size must fail conversion")),
+            }))),
+        });
+
+        assert_eq!(unsupported.code(), &S3ErrorCode::UnsupportedSqlStructure);
+        assert_eq!(unsupported.message(), Some("Unsupported S3 Select SQL structure: JOIN is not supported"));
+        assert_eq!(saturated.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(saturated.message(), Some("S3 Select query concurrency limit reached"));
+        assert_eq!(timed_out.code(), &S3ErrorCode::Busy);
+        assert_eq!(timed_out.message(), Some("S3 Select query exceeded the 300-second execution limit"));
+        assert_eq!(stream_timed_out.code(), &S3ErrorCode::Busy);
+        assert_eq!(
+            stream_timed_out.message(),
+            Some("S3 Select query exceeded the 300-second execution limit")
+        );
+        assert_eq!(exhausted.code(), &S3ErrorCode::Busy);
+        assert_eq!(truncated.code(), &S3ErrorCode::InternalError);
+        assert_eq!(invalid_object_size.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn error_source_matching_stops_at_the_depth_bound() {
+        let err = CyclicError;
+
+        assert!(!is_resource_exhausted(&err));
+        assert!(!is_unexpected_eof(&err));
+        assert!(!is_invalid_object_size(&err));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn producer_deadline_cancels_backpressured_send() {
+        let output = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            futures::stream::pending::<Result<RecordBatch, DataFusionError>>(),
+        ));
+        let (tx, mut rx) = mpsc::channel(2);
+        let terminal_permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("test channel should reserve terminal capacity");
+        tx.send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
+            .await
+            .expect("test channel should accept the prefilled event");
+        let validation = SelectValidation {
+            output_format: SelectOutputFormat::Csv(CSVOutput::default()),
+            progress_enabled: false,
+        };
+
+        let producer = tokio::spawn(send_select_events_until_deadline(
+            output,
+            tx,
+            terminal_permit,
+            validation,
+            Instant::now() + std::time::Duration::from_secs(1),
+            300,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        producer.await.expect("producer should finish without draining the channel");
+        assert!(matches!(rx.recv().await, Some(Ok(SelectObjectContentEvent::Cont(_)))));
+        let timeout_error = rx
+            .recv()
+            .await
+            .expect("producer should send a terminal timeout error")
+            .expect_err("terminal event should be an error");
+        assert_eq!(timeout_error.code(), &S3ErrorCode::Busy);
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]
