@@ -3892,7 +3892,7 @@ impl ECStore {
             .await
     }
 
-    async fn inner_list_object_versions_with_purge(
+    pub(crate) async fn inner_list_object_versions_with_purge(
         self: Arc<Self>,
         bucket: &str,
         prefix: &str,

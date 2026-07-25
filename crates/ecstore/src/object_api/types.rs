@@ -822,7 +822,10 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
+    use rustfs_filemeta::{
+        FileInfo, FileMeta, MetaCacheEntry, ReplicationState as FileMetaReplicationState, TRANSITION_COMPLETE,
+        version_purge_statuses_map,
+    };
 
     fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
         ObjectInfo {
@@ -1085,6 +1088,67 @@ mod tests {
         assert!(objects[0].delete_marker);
         assert!(objects[0].is_latest);
         assert_eq!(objects[0].num_versions, 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_versions_listing_preserves_purge_pending_versions() {
+        let visible_version_id = Uuid::new_v4();
+        let purge_version_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(purge_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("version pending purge should be added");
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(visible_version_id),
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("visible version should be added");
+        fm.delete_version(&FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(purge_version_id),
+            replication_state_internal: Some(FileMetaReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let public_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+        let lifecycle_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(&entries, "bucket", "", None, None).await;
+
+        assert_eq!(public_objects.len(), 1);
+        assert_eq!(public_objects[0].version_id, Some(visible_version_id));
+        assert_eq!(public_objects[0].num_versions, 2);
+        assert_eq!(lifecycle_objects.len(), 2);
+        assert!(
+            lifecycle_objects
+                .iter()
+                .any(|object| object.version_purge_status == VersionPurgeStatusType::Pending)
+        );
+        assert!(lifecycle_objects.iter().all(|object| object.num_versions == 2));
     }
 
     #[test]
