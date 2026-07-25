@@ -26,6 +26,7 @@ checked_files=(
   "rustfs/src/admin/handlers/system.rs"
   "rustfs/src/storage/rpc/http_service.rs"
   "rustfs/src/storage/rpc/node_service.rs"
+  "crates/kms/src/config.rs"
   "crates/audit/src/pipeline.rs"
   "crates/audit/src/system.rs"
   "crates/audit/src/global.rs"
@@ -654,6 +655,23 @@ for pattern in "${forbidden_patterns[@]}"; do
     exit 1
   fi
 done
+
+# Secret material must never be interpolated into log or error strings.
+# Error messages are log content: they propagate via `?` and are printed by
+# startup/error logging far from the construction site, and a value that fails
+# secret-format parsing is typically the raw secret itself (PR #5222/#5243:
+# `got: {secret_str}` would have echoed a bare base64 KMS key into startup
+# logs). Parse-failure hints must name the env var and expected format only.
+# Heuristic: flag inline format interpolation of secret-named identifiers.
+# Uppercase const names (env-var names like ENV_KMS_STATIC_SECRET_KEY) do not
+# match by design; test assertion messages only print on local test failure.
+secret_interpolation='\{[a-z_]*(secret|password|passwd|private_key)[a-z_]*(:[^}]*)?\}'
+secret_hits="$(rg -n -- "$secret_interpolation" "${checked_files[@]}" | rg -v 'assert' || true)"
+if [[ -n "$secret_hits" ]]; then
+  echo "❌ logging guardrail violation: secret-named variable interpolated into a format/log/error string" >&2
+  echo "$secret_hits" >&2
+  exit 1
+fi
 
 systemd_unit="deploy/build/rustfs.service"
 if rg -n '^Standard(Output|Error)=append:.*rustfs.*\.log$' "$systemd_unit" >/dev/null; then

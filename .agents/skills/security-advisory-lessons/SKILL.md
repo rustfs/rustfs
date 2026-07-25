@@ -99,6 +99,8 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 ### Logging and debug output
 - Logs must never include access keys beyond safe identifiers, secret keys, session tokens, JWT claims, HMAC secrets, expected signatures, license secrets, or raw response bodies containing credentials.
 - Treat `Debug` implementations, `?value` tracing, merged config dumps, and dependency-level HTTP body logging as leak surfaces.
+- Error and panic messages are log content: they propagate through `?` and get printed by `error!`/startup logging far from where they were constructed. Never interpolate a raw config or credential value into an error string.
+- A value that fails secret-format parsing is usually the secret itself (e.g. a bare base64 key missing its `<name>:` prefix), so a parse-failure hint must name the env var or file and the expected format, never echo the input. Redacting `Debug` impls does not cover this channel.
 - Add log-capture tests or targeted unit tests for redaction wrappers when changing credential structs or response bodies.
 
 ### RPC, parsing, and panic safety
@@ -139,6 +141,7 @@ Use these prompts while reviewing a diff:
 - Does a public/default/empty config change security behavior from fail-closed to fail-open?
 - Is any attacker-controlled value later used as a path, policy condition, credential identity, log field, URL, Origin, or response body?
 - Does this response contain stored replication, remote target, or service credentials that need redaction or stricter authorization?
+- Does any error constructor or `format!` interpolate a variable that can hold secret material, including a config parse error that echoes the raw input?
 - Does an IAM export/import path expose or trust plaintext credential secrets beyond the caller's intended authority?
 - Can this STS/OIDC path issue credentials without SigV4, trusted issuer validation, allowlisted redirects, or trusted-proxy host/scheme handling?
 - Can a service-account or STS token omit `exp`, forge `sessionPolicy`, or use a principal-controlled key as signing authority?
