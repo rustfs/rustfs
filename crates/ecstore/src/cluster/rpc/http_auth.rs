@@ -36,6 +36,7 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use rustfs_credentials::{DEFAULT_SECRET_KEY, RPC_SECRET_REQUIRED_MESSAGE};
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+use rustfs_utils::get_env_bool;
 use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::{HashSet, VecDeque};
@@ -61,6 +62,12 @@ const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
 const MAX_REPLAY_PROTECTED_NONCES: usize = 65_536;
 pub const TONIC_RPC_PREFIX: &str = "/node_service.NodeService";
+static INTERNODE_RPC_SIGNATURE_STRICT: LazyLock<bool> = LazyLock::new(|| {
+    get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_SIGNATURE_STRICT,
+        rustfs_config::DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT,
+    )
+});
 static RPC_SECRET_RESOLUTION_LOG_ONCE: Once = Once::new();
 
 #[derive(Default)]
@@ -419,10 +426,7 @@ fn has_v2_auth_headers(headers: &HeaderMap) -> bool {
 /// [`rustfs_config::ENV_INTERNODE_RPC_SIGNATURE_STRICT`] and
 /// <https://github.com/rustfs/backlog/issues/1327>.
 fn internode_rpc_signature_strict() -> bool {
-    rustfs_utils::get_env_bool(
-        rustfs_config::ENV_INTERNODE_RPC_SIGNATURE_STRICT,
-        rustfs_config::DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT,
-    )
+    *INTERNODE_RPC_SIGNATURE_STRICT
 }
 
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
