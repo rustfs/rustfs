@@ -1625,6 +1625,26 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_record_persists_restart_unknown_state() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.mark_unknown_if_unowned();
+
+        let encoded = record.encode().expect("unknown restart job should encode");
+        let decoded = ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("unknown restart job should decode");
+
+        assert_eq!(decoded.state, ManualTransitionJobState::Unknown);
+        assert!(decoded.is_terminal());
+        assert!(decoded.completed_at_unix_nanos.is_some());
+        assert!(
+            decoded
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown after restart"))
+        );
+    }
+
+    #[test]
     fn manual_transition_job_record_failure_counts_tier_failure() {
         let options = ManualTransitionRunOptions::default();
         let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
