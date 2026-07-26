@@ -28,6 +28,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_entrypoint_credentials.sh
 	./scripts/test_internode_grpc_ab_bench.sh
 	./scripts/test_object_batch_bench_enhanced.sh
+	./scripts/test_exact_1mib_handoff_abba.sh
 	./scripts/test_pinned_paired_abba_bench.sh
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh
 	python3 ./scripts/check_object_data_cache_follower_samples.py --self-test
