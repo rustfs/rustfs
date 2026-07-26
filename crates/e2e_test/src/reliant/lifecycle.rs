@@ -38,7 +38,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, BucketVersioningStatus, ExpirationStatus, LifecycleExpiration, LifecycleRule,
-    LifecycleRuleFilter, VersioningConfiguration,
+    LifecycleRuleFilter, NoncurrentVersionExpiration, VersioningConfiguration,
 };
 use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
@@ -98,7 +98,10 @@ async fn put_object_with_backdated_mtime(
 /// still succeeds. Any other error is surfaced.
 async fn object_is_gone(client: &Client, bucket: &str, key: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     match client.get_object().bucket(bucket).key(key).send().await {
-        Ok(_) => Ok(false),
+        Ok(output) => {
+            output.body.collect().await?;
+            Ok(false)
+        }
         Err(e) => {
             if let Some(service_error) = e.as_service_error() {
                 if service_error.is_no_such_key() {
@@ -132,12 +135,59 @@ async fn wait_for_object_expired(client: &Client, bucket: &str, key: &str, deadl
     }
 }
 
+async fn version_is_absent_from_listing(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let versions = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
+    Ok(!versions.versions().iter().any(|v| v.version_id() == Some(version_id)))
+}
+
+async fn wait_for_version_expired(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    deadline: StdDuration,
+) -> TestResult {
+    let start = std::time::Instant::now();
+    loop {
+        if version_is_absent_from_listing(client, bucket, key, version_id).await? {
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "object version {bucket}/{key}?versionId={version_id} was not expired by the lifecycle scanner within {}s",
+                deadline.as_secs()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+    }
+}
+
 /// Build a prefix-scoped `Days`-based expiration rule.
 fn expiration_rule(id: &str, prefix: &str, days: i32) -> Result<LifecycleRule, Box<dyn std::error::Error + Send + Sync>> {
     let rule = LifecycleRule::builder()
         .id(id)
         .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
         .expiration(LifecycleExpiration::builder().days(days).build())
+        .status(ExpirationStatus::Enabled)
+        .build()?;
+    Ok(rule)
+}
+
+fn noncurrent_expiration_rule(
+    id: &str,
+    prefix: &str,
+    days: i32,
+) -> Result<LifecycleRule, Box<dyn std::error::Error + Send + Sync>> {
+    let rule = LifecycleRule::builder()
+        .id(id)
+        .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+        .noncurrent_version_expiration(NoncurrentVersionExpiration::builder().noncurrent_days(days).build())
         .status(ExpirationStatus::Enabled)
         .build()?;
     Ok(rule)
@@ -277,9 +327,94 @@ async fn test_lifecycle_versioned_current_version_expiry_creates_delete_marker()
     Ok(())
 }
 
+/// `NoncurrentVersionExpiration NoncurrentDays=1` on a versioned bucket,
+/// accelerated with `RUSTFS_ILM_DEBUG_DAY_SECS`. Proves the scanner purges the
+/// noncurrent data version from `ListObjectVersions` while preserving the
+/// latest version as the normal readable object and without creating a delete
+/// marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lifecycle_noncurrent_version_expiry_removes_only_old_version() -> TestResult {
+    let mut env = RustFSTestEnvironment::new().await?;
+    let mut extra_env = fast_lifecycle_env();
+    extra_env.push(("RUSTFS_ILM_DEBUG_DAY_SECS", "2"));
+    env.start_rustfs_server_with_env(vec![], &extra_env).await?;
+
+    let client = env.create_s3_client();
+    let bucket = "ilm3-noncurrent";
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let key = "versioned/noncurrent.txt";
+    let first_put = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"old payload"))
+        .send()
+        .await?;
+    let old_version_id = first_put
+        .version_id()
+        .map(str::to_string)
+        .expect("first versioned PUT returns a version id");
+
+    let second_put = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"latest payload"))
+        .send()
+        .await?;
+    let latest_version_id = second_put
+        .version_id()
+        .map(str::to_string)
+        .expect("second versioned PUT returns a version id");
+
+    assert!(
+        !version_is_absent_from_listing(&client, bucket, key, &old_version_id).await?,
+        "old noncurrent version must be readable before lifecycle is installed"
+    );
+
+    put_expiration_config(&client, bucket, noncurrent_expiration_rule("expire-noncurrent", "versioned/", 1)?).await?;
+
+    wait_for_version_expired(&client, bucket, key, &old_version_id, StdDuration::from_secs(90)).await?;
+
+    let latest = client.get_object().bucket(bucket).key(key).send().await?;
+    assert_eq!(latest.version_id(), Some(latest_version_id.as_str()));
+    assert_eq!(latest.body.collect().await?.into_bytes().as_ref(), b"latest payload");
+
+    let versions = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
+    let data_versions = versions.versions();
+    assert!(
+        data_versions
+            .iter()
+            .any(|v| v.version_id() == Some(latest_version_id.as_str())),
+        "latest data version {latest_version_id} must remain, got: {data_versions:?}"
+    );
+    assert!(
+        !data_versions.iter().any(|v| v.version_id() == Some(old_version_id.as_str())),
+        "old noncurrent version {old_version_id} must be removed, got: {data_versions:?}"
+    );
+    assert!(
+        versions.delete_markers().is_empty(),
+        "noncurrent version expiry must not create delete markers, got: {:?}",
+        versions.delete_markers()
+    );
+
+    Ok(())
+}
+
 /// `Days=0` expiration is invalid per S3 semantics (`Days` must be a positive
 /// integer >= 1). A `PutBucketLifecycleConfiguration` carrying a zero-day rule
-/// must be rejected with `InvalidArgument` (HTTP 400) — see crates/lifecycle
+/// must be rejected with `InvalidArgument` (HTTP 400) - see crates/lifecycle
 /// `validate()` and the PutBucketLifecycleConfiguration handler. This is the
 /// self-managed counterpart of the localhost-only
 /// `test_bucket_lifecycle_rejects_zero_days` unit test.
