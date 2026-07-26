@@ -35,6 +35,7 @@ WARP_BIN="warp"
 PYTHON_BIN="python3"
 OUT_DIR=""
 DIAGNOSTIC_METRICS_URL="http://127.0.0.1:8889/metrics"
+DEFAULT_DIAGNOSTIC_OBS_ENDPOINT="http://127.0.0.1:4318"
 DIAGNOSTIC_METRICS_SETTLE_SECS="${RUSTFS_DIAGNOSTIC_METRICS_SETTLE_SECS:-2}"
 DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS:-5}"
 DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS:-1}"
@@ -96,8 +97,10 @@ Diagnostics:
   --diagnostic-metrics-connect-timeout-secs <n>
   --diagnostic-metrics-max-time-secs <n>
   --diagnostic-metrics-filter-regex <regex>
-  --diagnostic-obs-endpoint <url>
-  --diagnostic-obs-metric-endpoint <url>
+  --diagnostic-obs-endpoint <url>         RUSTFS_OBS_ENDPOINT passed to RustFS
+                                          (default: http://127.0.0.1:4318)
+  --diagnostic-obs-metric-endpoint <url>  RUSTFS_OBS_METRIC_ENDPOINT passed to RustFS
+                                          (default: <obs-endpoint>/v1/metrics)
   --diagnostic-obs-meter-interval <secs>
   --diagnostic-obs-service-name-prefix <name>
 
@@ -197,6 +200,12 @@ validate_non_negative_int "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS" "--diagnostic
 validate_positive_int "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS" "--diagnostic-metrics-connect-timeout-secs"
 validate_positive_int "$DIAGNOSTIC_METRICS_MAX_TIME_SECS" "--diagnostic-metrics-max-time-secs"
 validate_positive_int "$DIAGNOSTIC_OBS_METER_INTERVAL" "--diagnostic-obs-meter-interval"
+if [[ -z "$DIAGNOSTIC_OBS_ENDPOINT" ]]; then
+  DIAGNOSTIC_OBS_ENDPOINT="$DEFAULT_DIAGNOSTIC_OBS_ENDPOINT"
+fi
+if [[ -z "$DIAGNOSTIC_OBS_METRIC_ENDPOINT" ]]; then
+  DIAGNOSTIC_OBS_METRIC_ENDPOINT="${DIAGNOSTIC_OBS_ENDPOINT%/}/v1/metrics"
+fi
 
 IFS=',' read -r -a outer_sizes <<< "$OUTER_READER_STREAM_BUFFER_SIZES"
 IFS=',' read -r -a profile_orders <<< "$PROFILE_ORDERS"
@@ -264,6 +273,9 @@ codec_min_size=${CODEC_MIN_SIZE}
 handoff_attribution=true
 diagnostic_metrics=true
 diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
+diagnostic_obs_endpoint=${DIAGNOSTIC_OBS_ENDPOINT}
+diagnostic_obs_metric_endpoint=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
+diagnostic_obs_meter_interval=${DIAGNOSTIC_OBS_METER_INTERVAL}
 stage_metrics_artifacts=service_metrics_summary.csv,service_metrics_round_summary.csv,service_metrics_stage_distribution.csv,service_metrics_round_percentiles.csv
 body_header_parity_artifacts=compat_summary.csv,response_headers_legacy.json,response_headers_codec_legacy.json,body_sha256_legacy.txt,body_sha256_codec_legacy.txt
 performance_conclusion=not_encoded_by_harness_collect_raw_abba_stage_metrics_first
@@ -322,6 +334,8 @@ run_cell() {
     --diagnostic-metrics-connect-timeout-secs "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS"
     --diagnostic-metrics-max-time-secs "$DIAGNOSTIC_METRICS_MAX_TIME_SECS"
     --diagnostic-metrics-filter-regex "$DIAGNOSTIC_METRICS_FILTER_REGEX"
+    --diagnostic-obs-endpoint "$DIAGNOSTIC_OBS_ENDPOINT"
+    --diagnostic-obs-metric-endpoint "$DIAGNOSTIC_OBS_METRIC_ENDPOINT"
     --diagnostic-obs-meter-interval "$DIAGNOSTIC_OBS_METER_INTERVAL"
     --diagnostic-obs-service-name-prefix "${DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX}-${profile_order}-${outer_size}"
     --address "$ADDRESS"
@@ -343,12 +357,6 @@ run_cell() {
     --python-bin "$PYTHON_BIN"
     --resource-sample-interval-secs "$RESOURCE_SAMPLE_INTERVAL_SECS"
   )
-  if [[ -n "$DIAGNOSTIC_OBS_ENDPOINT" ]]; then
-    cmd+=(--diagnostic-obs-endpoint "$DIAGNOSTIC_OBS_ENDPOINT")
-  fi
-  if [[ -n "$DIAGNOSTIC_OBS_METRIC_ENDPOINT" ]]; then
-    cmd+=(--diagnostic-obs-metric-endpoint "$DIAGNOSTIC_OBS_METRIC_ENDPOINT")
-  fi
   if [[ -n "$WARP_OBJECTS" ]]; then
     cmd+=(--warp-objects "$WARP_OBJECTS")
   fi
