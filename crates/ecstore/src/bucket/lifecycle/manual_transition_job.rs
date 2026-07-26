@@ -1116,6 +1116,31 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_record_queue_pressure_report_is_partial() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        let queue_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 1,
+            queue_full: 1,
+            ..Default::default()
+        };
+
+        record.complete(
+            ManualTransitionRunReport {
+                skipped_queue_full: 1,
+                ..Default::default()
+            },
+            queue_snapshot,
+        );
+
+        assert_eq!(record.state, ManualTransitionJobState::Partial);
+        assert_eq!(record.report.skipped_queue_full, 1);
+        assert_eq!(record.queue_snapshot.queue_capacity, 1);
+        assert_eq!(record.queue_snapshot.queue_full, 1);
+        assert!(record.error.is_none());
+    }
+
+    #[test]
     fn manual_transition_scope_key_is_stable_and_sanitized() {
         let first = manual_transition_scope_key(
             "bucket",
