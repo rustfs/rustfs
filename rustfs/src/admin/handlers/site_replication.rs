@@ -103,7 +103,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -149,6 +149,7 @@ const SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH: &str =
 const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit?refresh-targets=true";
 const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
+const SITE_REPLICATION_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
 const RUSTFS_ADMIN_V3_PREFIX: &str = "/rustfs/admin/v3";
 const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 const MINIO_SITE_REPLICATION_JOIN_PATH: &str = "/minio/admin/v3/site-replication/join";
@@ -2518,6 +2519,200 @@ async fn ensure_site_replicator_service_account(parent_user: &str, rotate_secret
     Ok((access_key, secret_key))
 }
 
+/// Recover the shared site-replication secret from any bucket target.
+///
+/// Every site-replication bucket target stores the `site-replicator-0` credentials in
+/// `BUCKET_TARGETS_FILE`, which is not encrypted with the root credentials. That makes it
+/// the one local copy that survives a root-credential change, so it can reseed the IAM
+/// account when the IAM record itself became unreadable.
+async fn site_replicator_secret_from_bucket_targets(access_key: &str) -> Option<String> {
+    let store = current_object_store_handle()?;
+    let buckets = store.list_bucket(&BucketOptions::default()).await.ok()?;
+
+    for bucket in buckets {
+        let Ok(targets) = metadata_sys::list_bucket_targets(&bucket.name).await else {
+            continue;
+        };
+        for target in targets.targets {
+            if target.target_type != BucketTargetType::ReplicationService {
+                continue;
+            }
+            let Some(credentials) = target.credentials else {
+                continue;
+            };
+            if credentials.access_key == access_key && !credentials.secret_key.is_empty() {
+                return Some(credentials.secret_key);
+            }
+        }
+    }
+
+    None
+}
+
+/// Reconcile the local `site-replicator-0` account against the persisted site-replication
+/// state, repairing the two drifts that no other code path can undo.
+///
+/// `update_service_account` cannot rewrite `parent_user`, so once the account is bound to a
+/// parent that a root-credential change invalidated, every later `replicate add` takes the
+/// update branch and preserves the stale binding forever. Worse, IAM records encrypted with
+/// the previous root secret fail to decrypt and surface as "no such account", which silently
+/// disables every control-plane push while `replicate info` still reports the site enabled.
+/// Both used to require deleting and recreating the account by hand.
+pub async fn reconcile_site_replicator_service_account() -> S3Result<()> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let state = load_site_replication_state().await?;
+    if !state.enabled() || state.service_account_access_key != SITE_REPLICATOR_SERVICE_ACCOUNT {
+        return Ok(());
+    }
+
+    let Some(iam_sys) = current_iam_handle() else {
+        return Err(s3_error!(InvalidRequest, "iam not init"));
+    };
+
+    let parent_user = state.service_account_parent.clone();
+    if parent_user.is_empty() {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "service_account_parent_unknown",
+            "admin site replication state"
+        );
+        return Ok(());
+    }
+
+    let access_key = SITE_REPLICATOR_SERVICE_ACCOUNT;
+    let (secret_key, reason) = match iam_sys.get_site_replicator_service_account_secret(access_key).await {
+        Ok(secret) => {
+            // Never rebuild on an unread parent: `unwrap_or_default` here would compare an
+            // empty string against a real parent and recreate a healthy account on every boot.
+            let Ok((credentials, _)) = iam_sys.get_service_account(access_key).await else {
+                return Ok(());
+            };
+            if credentials.parent_user == parent_user {
+                return Ok(());
+            }
+            (secret, "stale_parent")
+        }
+        Err(err) => {
+            let Some(secret) = site_replicator_secret_from_bucket_targets(access_key).await else {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "service_account_unrecoverable",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                return Ok(());
+            };
+            (secret, "account_unreadable")
+        }
+    };
+
+    // The recreate below is delete-then-create (the access key is fixed), so a parent that
+    // cannot back a service account would leave this site with no replication account at
+    // all — strictly worse than the drift being repaired. Refuse to start that sequence.
+    if !rustfs_iam::is_root_access_key(&parent_user) && iam_sys.get_user_info(&parent_user).await.is_err() {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "service_account_parent_missing",
+            reason,
+            parent = %parent_user,
+            "admin site replication state"
+        );
+        return Ok(());
+    }
+
+    // `parent_user` is immutable through `update_service_account`, so rebinding means
+    // replacing the record. The peers keep the same access key and secret, so their
+    // in-flight requests still authenticate once the new record lands.
+    let session_policy = site_replicator_service_account_policy()?;
+    iam_sys
+        .delete_service_account(access_key, false)
+        .await
+        .map_err(ApiError::from)?;
+    if let Err(err) = iam_sys
+        .new_service_account(
+            &parent_user,
+            None,
+            NewServiceAccountOpts {
+                session_policy: Some(session_policy),
+                access_key: access_key.to_string(),
+                secret_key,
+                name: None,
+                description: None,
+                expiration: None,
+                allow_site_replicator_account: true,
+                claims: None,
+            },
+        )
+        .await
+    {
+        // The old record is already gone, so this site now has no replication account at
+        // all — strictly worse than the drift being repaired. Say so loudly: recovery is
+        // `mc admin replicate add` from any peer.
+        error!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "service_account_repair_failed",
+            reason,
+            error = %err,
+            "site replication service account was removed but could not be recreated; \
+             re-run `mc admin replicate add` to restore replication from this site"
+        );
+        return Err(ApiError::from(err).into());
+    }
+
+    warn!(
+        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+        result = "service_account_repaired",
+        reason,
+        parent = %parent_user,
+        "admin site replication state"
+    );
+
+    Ok(())
+}
+
+/// Rebuild every replicated bucket's outbound rules and targets from the current peer set.
+///
+/// A bucket whose `site-repl-*` rule was overwritten by a peer's config points at this very
+/// deployment and replicates nothing. Nothing else revisits an existing bucket — the rule
+/// builders only run on bucket creation, peer bucket-ops and metadata pushes — so without a
+/// pass here an upgraded site keeps the broken rules until someone recreates the bucket.
+/// Reconciliation is a no-op write-wise when the rules already match.
+pub async fn reconcile_site_replication_buckets() -> S3Result<()> {
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(());
+    };
+    let Some(store) = current_object_store_handle() else {
+        return Ok(());
+    };
+    let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+
+    for bucket in buckets {
+        if let Err(err) = ensure_site_replication_bucket_setup_with_runtime(&bucket.name, &runtime).await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %bucket.name,
+                result = "startup_bucket_reconcile_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn site_replication_peer_wire_path(path: &str) -> String {
     let (path_only, query) = path
         .split_once('?')
@@ -4134,7 +4329,7 @@ fn canonical_status_json(value: &Value) -> Value {
     }
 }
 
-fn site_replication_rule_complete(rule: &ReplicationRule) -> bool {
+fn site_replication_rule_complete(rule: &ReplicationRule, owner_deployment_id: &str) -> bool {
     let delete_marker_enabled = rule
         .delete_marker_replication
         .as_ref()
@@ -4155,16 +4350,29 @@ fn site_replication_rule_complete(rule: &ReplicationRule) -> bool {
             replica_modifications.status == ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED)
         });
 
+    // A rule whose destination ARN names the site that holds it can never replicate:
+    // `reconcile_site_replication_bucket_targets` skips the local peer, so no bucket
+    // target backs that ARN and every object is dropped. Two sites holding byte-identical
+    // configs used to satisfy this check while exactly one of them could push.
+    let points_at_remote_site = replication_target_arn_deployment_id(&rule.destination.bucket)
+        .is_some_and(|deployment_id| deployment_id != owner_deployment_id);
+
     rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
         && rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED)
+        && points_at_remote_site
         && delete_marker_enabled
         && delete_enabled
         && existing_object_enabled
         && replica_modifications_enabled
 }
 
-fn site_replication_config_mismatch<'a>(values: impl Iterator<Item = Option<&'a String>>, total_sites: usize) -> (usize, bool) {
-    let values = values.flatten().collect::<Vec<_>>();
+fn site_replication_config_mismatch<'a>(
+    values: impl Iterator<Item = (&'a str, Option<&'a String>)>,
+    total_sites: usize,
+) -> (usize, bool) {
+    let values = values
+        .filter_map(|(deployment_id, value)| value.map(|value| (deployment_id, value)))
+        .collect::<Vec<_>>();
     let present = values.len();
     if present == 0 {
         return (0, false);
@@ -4174,15 +4382,20 @@ fn site_replication_config_mismatch<'a>(values: impl Iterator<Item = Option<&'a 
     }
 
     let expected_rules = total_sites.saturating_sub(1);
-    let replicated = values.iter().all(|raw| {
+    let replicated = values.iter().all(|(deployment_id, raw)| {
         // `raw` is the wire form produced by build_sr_info, i.e. base64-encoded XML
         // (raw_config_to_base64). Decode it before XML-parsing — parsing the base64 text
         // directly always fails, which would falsely report every replicated bucket as
         // out-of-sync ("0/N Buckets in sync"). decode_bucket_meta_wire_value falls back to
         // the raw bytes when the value is not base64, so plain-XML callers still work.
         let xml = decode_bucket_meta_wire_value(raw);
-        deserialize::<ReplicationConfiguration>(&xml)
-            .is_ok_and(|config| config.rules.len() == expected_rules && config.rules.iter().all(site_replication_rule_complete))
+        deserialize::<ReplicationConfiguration>(&xml).is_ok_and(|config| {
+            config.rules.len() == expected_rules
+                && config
+                    .rules
+                    .iter()
+                    .all(|rule| site_replication_rule_complete(rule, deployment_id))
+        })
     });
 
     (present, !replicated)
@@ -4234,10 +4447,13 @@ fn merge_bucket_status_info(status: &mut SRStatusInfo, site_infos: &BTreeMap<Str
             total_sites,
         );
         let (_, replication_mismatch) = site_replication_config_mismatch(
-            site_infos.values().map(|info| {
-                info.buckets
-                    .get(bucket_name)
-                    .and_then(|bucket| bucket.replication_config.as_ref())
+            site_infos.iter().map(|(deployment_id, info)| {
+                (
+                    deployment_id.as_str(),
+                    info.buckets
+                        .get(bucket_name)
+                        .and_then(|bucket| bucket.replication_config.as_ref()),
+                )
             }),
             total_sites,
         );
@@ -6070,6 +6286,56 @@ fn prune_removed_site_replication_bucket_targets(
     (BucketTargets { targets }, removed)
 }
 
+fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
+    rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
+}
+
+/// Merge a peer's replication config into the local one.
+///
+/// `site-repl-*` rules encode the *sender's* outbound direction — their destination ARN
+/// names the receiver — so applying a peer's rule set verbatim replaces the receiver's
+/// reverse rule with one pointing at itself. No bucket target can satisfy that ARN
+/// (`reconcile_site_replication_bucket_targets` skips the local peer), so the receiver
+/// silently stops replicating back: the one-directional symptom. Only operator-authored
+/// rules travel between sites; each site owns its own `site-repl-*` rules.
+fn merge_incoming_replication_config(
+    incoming: Option<ReplicationConfiguration>,
+    local: Option<ReplicationConfiguration>,
+) -> Option<ReplicationConfiguration> {
+    let incoming_role = incoming.as_ref().map(|config| config.role.clone()).unwrap_or_default();
+    // Operator rules first, then the local site rules — the same order
+    // `ensure_site_replication_bucket_replication_config_with_runtime` produces, so its
+    // no-op check matches and the bucket metadata is written once per broadcast, not twice.
+    let mut rules: Vec<ReplicationRule> = incoming
+        .into_iter()
+        .flat_map(|config| config.rules)
+        .filter(|rule| !is_site_replication_rule(rule))
+        .collect();
+    rules.extend(
+        local
+            .into_iter()
+            .flat_map(|config| config.rules)
+            .filter(is_site_replication_rule),
+    );
+
+    if rules.is_empty() {
+        return None;
+    }
+
+    for (index, rule) in rules.iter_mut().enumerate() {
+        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
+    }
+
+    // A site-replication ARN in `role` is the sender's, and `site_replication_target_arns_by_peer`
+    // reads it — carrying it over would pin the receiver's targets to the sender's identity.
+    let role = match replication_target_arn_deployment_id(&incoming_role) {
+        Some(_) => String::new(),
+        None => incoming_role,
+    };
+
+    Some(ReplicationConfiguration { role, rules })
+}
+
 fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
     if let Some(rule_id) = rule.id.as_deref() {
         if let Some(deployment_id) = rule_id.strip_prefix("site-repl-")
@@ -6155,14 +6421,26 @@ fn build_site_replication_config(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
+    existing: Option<&ReplicationConfiguration>,
 ) -> S3Result<Option<ReplicationConfiguration>> {
+    // Reuse the ARN already recorded for a peer so the rule keeps pointing at the same
+    // bucket target `reconcile_site_replication_bucket_targets` keys off (a MinIO-era
+    // `arn:minio:...` target would otherwise be orphaned by a freshly minted ARN).
+    let configured_arns = site_replication_target_arns_by_peer(existing);
     let mut rules = Vec::new();
     for peer in state.peers.values() {
         if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             continue;
         }
 
-        let Some(target) = site_replication_bucket_target_for_peer(bucket, state, peer, service_account_secret_key, None)? else {
+        let Some(target) = site_replication_bucket_target_for_peer(
+            bucket,
+            state,
+            peer,
+            service_account_secret_key,
+            configured_arns.get(&peer.deployment_id).cloned(),
+        )?
+        else {
             continue;
         };
         rules.push(build_site_replication_rule(
@@ -6194,6 +6472,8 @@ async fn ensure_site_replication_bucket_targets_with_runtime(
         Err(StorageError::ConfigNotFound) => BucketTargets::default(),
         Err(err) => return Err(ApiError::from(err).into()),
     };
+    let existing_json = serde_json::to_vec(&existing)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}")))?;
 
     let updated =
         reconcile_site_replication_bucket_targets(existing, bucket, state, local_peer, config, service_account_secret_key)?;
@@ -6203,6 +6483,12 @@ async fn ensure_site_replication_bucket_targets_with_runtime(
 
     let json_targets = serde_json::to_vec(&updated)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}")))?;
+    // Rewriting identical targets would churn bucket metadata and rebuild every remote S3
+    // client — noticeable now that startup reconciles all buckets, not just the one bucket
+    // an operation touched.
+    if json_targets == existing_json {
+        return Ok(());
+    }
     metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
         .await
         .map_err(ApiError::from)?;
@@ -6241,55 +6527,42 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
 ) -> S3Result<()> {
-    // Fix 6: reconcile rather than early-returning when any config already exists.
-    // The old code bailed on Ok(_), so the second site joined a replicated bucket and
-    // ended up with NO rule pointing back to the first site. Objects on that site could
-    // never travel back, producing the "one-directional" replication symptom.
-    let Some(desired) = build_site_replication_config(bucket, state, local_peer, service_account_secret_key)? else {
-        return Ok(());
-    };
-
-    // Load the existing rules (may be empty if never configured).
-    let mut existing_rules = match metadata_sys::get_replication_config(bucket).await {
-        Ok((existing, _)) => existing.rules,
-        Err(StorageError::ConfigNotFound) => Vec::new(),
+    let existing = match metadata_sys::get_replication_config(bucket).await {
+        Ok((existing, _)) => Some(existing),
+        Err(StorageError::ConfigNotFound) => None,
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
-    // Collect the IDs of existing site-repl-* rules so we don't duplicate them.
-    let existing_rule_ids: HashSet<String> = existing_rules
-        .iter()
-        .filter_map(|r| r.id.as_deref())
-        .filter(|id| id.starts_with("site-repl-"))
-        .map(String::from)
-        .collect();
+    let Some(desired) = build_site_replication_config(bucket, state, local_peer, service_account_secret_key, existing.as_ref())?
+    else {
+        return Ok(());
+    };
 
-    let mut added = false;
-    for rule in desired.rules {
-        let rule_id = rule.id.as_deref().unwrap_or("");
-        if !existing_rule_ids.contains(rule_id) {
-            existing_rules.push(rule);
-            added = true;
-        }
+    // `site-repl-*` rules are derived state owned by this site: rebuild them from the
+    // current peer set on every pass instead of preserving whatever is on disk. A rule
+    // left over from a removed peer — or one whose destination ARN names this very
+    // deployment, which no bucket target can ever satisfy — must not survive, otherwise
+    // objects are queued against an ARN that resolves to nothing.
+    let existing_rules = existing.map(|config| config.rules).unwrap_or_default();
+    let mut rules: Vec<ReplicationRule> = existing_rules
+        .iter()
+        .filter(|rule| !is_site_replication_rule(rule))
+        .cloned()
+        .collect();
+    rules.extend(desired.rules);
+    for (index, rule) in rules.iter_mut().enumerate() {
+        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
     }
 
-    if !added {
-        // All desired rules are already present — nothing to write.
+    if rules == existing_rules {
         return Ok(());
     }
 
-    // Re-assign contiguous priorities to avoid conflicts with any preserved rules.
-    for (i, rule) in existing_rules.iter_mut().enumerate() {
-        rule.priority = Some((i + 1) as i32);
-    }
-
-    let config = ReplicationConfiguration {
+    let data = serialize(&ReplicationConfiguration {
         role: String::new(),
-        rules: existing_rules,
-    };
-
-    let data = serialize(&config)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
+        rules,
+    })
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
     metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data)
         .await
         .map_err(ApiError::from)?;
@@ -6421,6 +6694,52 @@ pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) ->
 /// kick a resync toward every remote peer so pre-existing objects back-fill. Returns a list of
 /// human-readable per-bucket failure messages (empty on full success) so the caller can surface
 /// them to the operator instead of silently reporting success; a failure never aborts the caller.
+/// Probe every remote peer from the joining site before reporting the join a success.
+///
+/// A peer's endpoint is whatever that peer derived from the `Host` header of the admin
+/// request that created the topology, so the initiator can record an address only it can
+/// reach — a console-port rewrite, a NAT address, a LAN-only host. The initiator's own
+/// probes all succeed in that case, and the reverse direction then fails silently forever
+/// because nothing else pushes from here until an object is written. Report it in the add
+/// response instead of rejecting the join: an operator may legitimately be opening the
+/// return path afterwards.
+async fn probe_reverse_peer_reachability(state: &SiteReplicationState, local_peer: &PeerInfo) -> SiteReplicationErrorSummary {
+    let mut errors = SiteReplicationErrorSummary::default();
+    let secret_key = match site_replicator_service_account_secret(&state.service_account_access_key).await {
+        Ok(secret) => secret,
+        Err(err) => {
+            errors.push(format!("reverse reachability probe skipped: {err}"));
+            return errors;
+        }
+    };
+
+    for peer in state.peers.values() {
+        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
+            continue;
+        }
+        let connection = match runtime_peer_connection(peer) {
+            Ok(connection) => connection,
+            Err(err) => {
+                errors.push(format!("{} is not reachable from this site: {err}", peer.endpoint));
+                continue;
+            }
+        };
+        if let Err(err) = send_peer_admin_request(
+            &connection,
+            SITE_REPLICATION_DEVNULL_PATH,
+            &state.service_account_access_key,
+            &secret_key,
+            &serde_json::json!({}),
+        )
+        .await
+        {
+            errors.push(format!("{} is not reachable from this site: {err}", peer.endpoint));
+        }
+    }
+
+    errors
+}
+
 async fn backfill_existing_buckets_after_add(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
@@ -7045,16 +7364,40 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         }
     }
 
-    if item.r#type == "replication-config" {
-        item.replication_config
-            .as_ref()
-            .map(|raw| {
-                let data = decode_bucket_meta_wire_value(raw);
-                deserialize::<s3s::dto::ReplicationConfiguration>(&data)
-            })
-            .transpose()
-            .map_err(|e| s3_error!(InvalidRequest, "invalid replication config: {e}"))?;
-    }
+    // Nothing to write and nothing on disk to clear: the common case for a site joining a
+    // replicated bucket, where every incoming rule is the sender's own. Skipping the write
+    // avoids stamping an empty config over a bucket that never had one;
+    // `ensure_site_replication_bucket_setup` below still installs this site's own rules.
+    let mut skip_config_write = false;
+    let merged_replication_config =
+        if item.r#type == "replication-config" {
+            let incoming = item
+                .replication_config
+                .as_ref()
+                .map(|raw| {
+                    let data = decode_bucket_meta_wire_value(raw);
+                    deserialize::<ReplicationConfiguration>(&data)
+                })
+                .transpose()
+                .map_err(|e| s3_error!(InvalidRequest, "invalid replication config: {e}"))?;
+            let local = match metadata_sys::get_replication_config(&item.bucket).await {
+                Ok((config, _)) => Some(config),
+                Err(StorageError::ConfigNotFound) => None,
+                Err(err) => return Err(ApiError::from(err).into()),
+            };
+            let local_absent = local.is_none();
+            match merge_incoming_replication_config(incoming, local) {
+                Some(config) => Some(serialize(&config).map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}"))
+                })?),
+                None => {
+                    skip_config_write = local_absent;
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     let data = match item.r#type.as_str() {
         "policy" => item
@@ -7071,25 +7414,29 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         "version-config" => decode_bucket_meta_wire_option(item.versioning),
         "object-lock-config" => decode_bucket_meta_wire_option(item.object_lock_config),
         "sse-config" => decode_bucket_meta_wire_option(item.sse_config),
-        "replication-config" => decode_bucket_meta_wire_option(item.replication_config),
+        "replication-config" => merged_replication_config,
         "lc-config" => decode_bucket_meta_wire_option(item.expiry_lc_config),
         "cors-config" => decode_bucket_meta_wire_option(item.cors),
         _ => unreachable!(),
     };
 
-    if let Some(data) = data {
-        metadata_sys::update(&item.bucket, config_file, data)
-            .await
-            .map_err(ApiError::from)?;
-    } else {
-        metadata_sys::delete(&item.bucket, config_file)
-            .await
-            .map_err(ApiError::from)?;
+    if !skip_config_write {
+        if let Some(data) = data {
+            metadata_sys::update(&item.bucket, config_file, data)
+                .await
+                .map_err(ApiError::from)?;
+        } else {
+            metadata_sys::delete(&item.bucket, config_file)
+                .await
+                .map_err(ApiError::from)?;
+        }
     }
     drop(targets_guard);
 
     if item.r#type == "replication-config" {
-        ensure_site_replication_bucket_targets(&item.bucket).await?;
+        // Rebuild the local outbound rules too: a site that joined an already-replicated
+        // bucket receives this item before it has any `site-repl-*` rule of its own.
+        ensure_site_replication_bucket_setup(&item.bucket).await?;
     }
 
     if item.r#type == "version-config"
@@ -7936,7 +8283,8 @@ impl Operation for SRPeerJoinHandler {
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start. Per-bucket
         // failures are logged (BUG2) so a reverse-direction back-fill gap is observable.
-        let backfill_errors = backfill_existing_buckets_after_add(&state, &local_peer, bootstrap_token.as_deref()).await;
+        let mut backfill_errors = probe_reverse_peer_reachability(&state, &local_peer).await;
+        backfill_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, bootstrap_token.as_deref()).await);
         if !backfill_errors.is_empty() {
             warn!(
                 event = EVENT_ADMIN_SITE_REPLICATION_STATE,
@@ -10627,10 +10975,38 @@ mod tests {
         let site_b_xml = String::from_utf8(serialize(&site_b_config).expect("site replication XML should serialize"))
             .expect("site replication XML should be UTF-8");
 
-        assert!(site_replication_rule_complete(&site_a_config.rules[0]));
+        assert!(site_replication_rule_complete(&site_a_config.rules[0], "site-a"));
         assert_eq!(
-            site_replication_config_mismatch(vec![Some(&site_a_xml), Some(&site_b_xml)].into_iter(), 2),
+            site_replication_config_mismatch(vec![("site-a", Some(&site_a_xml)), ("site-b", Some(&site_b_xml))].into_iter(), 2),
             (2, false)
+        );
+    }
+
+    // The one-directional regression: a `replication-config` broadcast overwrote the receiver's
+    // rules with the sender's, leaving both sites holding byte-identical XML whose destination
+    // ARN names the receiver. Only one site could push, yet the status check counted rules and
+    // reported "in sync" — the operator's single health signal agreed with the broken state.
+    #[test]
+    fn test_site_replication_config_mismatch_rejects_rule_pointing_at_owning_site() {
+        let shared_config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![build_site_replication_rule(
+                "arn:rustfs:replication::site-b:test-replication",
+                1,
+                "site-repl-site-b",
+            )],
+        };
+        let shared_xml = String::from_utf8(serialize(&shared_config).expect("site replication XML should serialize"))
+            .expect("site replication XML should be UTF-8");
+
+        assert!(
+            !site_replication_rule_complete(&shared_config.rules[0], "site-b"),
+            "a rule whose destination ARN names its own site can never replicate"
+        );
+        assert_eq!(
+            site_replication_config_mismatch(vec![("site-a", Some(&shared_xml)), ("site-b", Some(&shared_xml))].into_iter(), 2),
+            (2, true),
+            "identical configs mean site-b points at itself and cannot push"
         );
     }
 
@@ -12330,6 +12706,121 @@ mod tests {
         assert_eq!(deployment_id.as_deref(), Some("remote-dep"));
     }
 
+    fn site_repl_config(peer: &str) -> ReplicationConfiguration {
+        ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![build_site_replication_rule(
+                &format!("arn:rustfs:replication::{peer}:photos"),
+                1,
+                &format!("site-repl-{peer}"),
+            )],
+        }
+    }
+
+    fn operator_rule(id: &str) -> ReplicationRule {
+        ReplicationRule {
+            id: Some(id.to_string()),
+            ..build_site_replication_rule("arn:aws:s3:::backup", 1, id)
+        }
+    }
+
+    // The one-directional bug: the joined site applied the initiator's replication config
+    // verbatim, so its own `site-repl-<initiator>` rule was replaced by a rule pointing at
+    // itself. No bucket target backs that ARN, so every object was dropped without a log.
+    #[test]
+    fn test_merge_incoming_replication_config_keeps_local_reverse_rule() {
+        let merged = merge_incoming_replication_config(Some(site_repl_config("home")), Some(site_repl_config("office")))
+            .expect("merge should keep the local rule");
+
+        assert_eq!(merged.rules.len(), 1);
+        assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
+        assert_eq!(merged.rules[0].destination.bucket, "arn:rustfs:replication::office:photos");
+    }
+
+    // A peer deleting its replication config must not delete the receiver's reverse rule
+    // either — the delete travels as `replication-config` with no payload.
+    #[test]
+    fn test_merge_incoming_replication_config_survives_peer_delete() {
+        let merged = merge_incoming_replication_config(None, Some(site_repl_config("office")))
+            .expect("local site rules must survive a peer delete");
+
+        assert_eq!(merged.rules.len(), 1);
+        assert_eq!(merged.rules[0].id.as_deref(), Some("site-repl-office"));
+    }
+
+    #[test]
+    fn test_merge_incoming_replication_config_replicates_operator_rules() {
+        let mut incoming = site_repl_config("home");
+        incoming.rules.push(operator_rule("nightly-backup"));
+        incoming.role = "arn:rustfs:replication::home:photos".to_string();
+
+        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")))
+            .expect("merge should produce rules");
+
+        let ids: Vec<_> = merged.rules.iter().filter_map(|rule| rule.id.as_deref()).collect();
+        assert_eq!(ids, vec!["nightly-backup", "site-repl-office"]);
+        assert_eq!(merged.rules[0].priority, Some(1));
+        assert_eq!(merged.rules[1].priority, Some(2));
+        assert!(
+            merged.role.is_empty(),
+            "a site-replication ARN in `role` belongs to the sender and must not be adopted"
+        );
+    }
+
+    #[test]
+    fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
+        assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None).is_none());
+    }
+
+    // Rules and targets are keyed off the same ARN. Minting a fresh one while
+    // `reconcile_site_replication_bucket_targets` preserves a MinIO-era `arn:minio:...`
+    // target would leave the rule pointing at an ARN no target satisfies.
+    #[test]
+    fn test_build_site_replication_config_reuses_configured_arn() {
+        let mut state = SiteReplicationState {
+            service_account_access_key: "site-replicator-0".to_string(),
+            ..Default::default()
+        };
+        state.peers.insert(
+            "local".to_string(),
+            PeerInfo {
+                deployment_id: "local".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+        );
+        state.peers.insert(
+            "remote".to_string(),
+            PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", "http://remote.example.com:9000")
+            },
+        );
+        let existing = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![build_site_replication_rule(
+                "arn:minio:replication::remote:photos",
+                1,
+                "site-repl-remote",
+            )],
+        };
+
+        let config = build_site_replication_config(
+            "photos",
+            &state,
+            &PeerInfo {
+                deployment_id: "local".to_string(),
+                ..peer("local", "https://local.example.com")
+            },
+            "runtime-iam-secret",
+            Some(&existing),
+        )
+        .expect("build site replication config")
+        .expect("a remote peer yields one rule");
+
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].destination.bucket, "arn:minio:replication::remote:photos");
+    }
+
     #[test]
     fn test_reconcile_site_replication_bucket_targets_upserts_remote_peer_targets() {
         let mut state = SiteReplicationState {
@@ -13303,31 +13794,32 @@ mod tests {
     fn test_derive_sync_state_from_replication_completeness() {
         // A peer that is reachable and has complete replication rules for all other peers
         // should be Enable; one that is reachable but has an incomplete config should be Disable.
-        let repl_complete_xml = {
+        let site_config_xml = |peer: &str| {
             let config = ReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
-                    "arn:rustfs:replication::dep-b:bucket",
+                    &format!("arn:rustfs:replication::{peer}:bucket"),
                     1,
-                    "site-repl-dep-b",
+                    &format!("site-repl-{peer}"),
                 )],
             };
             String::from_utf8(serialize(&config).unwrap()).unwrap()
         };
+        let dep_a_xml = site_config_xml("dep-b");
+        let dep_b_xml = site_config_xml("dep-a");
 
         // Peer that has complete config for 2-site setup
-        assert!(site_replication_rule_complete(&build_site_replication_rule(
-            "arn:rustfs:replication::dep-b:bucket",
-            1,
-            "site-repl-dep-b"
-        )));
+        assert!(site_replication_rule_complete(
+            &build_site_replication_rule("arn:rustfs:replication::dep-b:bucket", 1, "site-repl-dep-b"),
+            "dep-a"
+        ));
         assert_eq!(
-            site_replication_config_mismatch(vec![Some(&repl_complete_xml), Some(&repl_complete_xml)].into_iter(), 2),
+            site_replication_config_mismatch(vec![("dep-a", Some(&dep_a_xml)), ("dep-b", Some(&dep_b_xml))].into_iter(), 2),
             (2, false),
             "complete rules on both sites → no mismatch"
         );
         assert_eq!(
-            site_replication_config_mismatch(vec![Some(&repl_complete_xml)].into_iter(), 2),
+            site_replication_config_mismatch(vec![("dep-a", Some(&dep_a_xml)), ("dep-b", None)].into_iter(), 2),
             (1, true),
             "config only on one of two sites → mismatch"
         );
@@ -13339,34 +13831,37 @@ mod tests {
     // bucket as out-of-sync ("0/N Buckets in sync"). This test feeds the real base64 wire form.
     #[test]
     fn test_site_replication_config_mismatch_accepts_base64_wire_form() {
-        let xml = {
+        let site_config_xml = |peer: &str| {
             let config = ReplicationConfiguration {
                 role: String::new(),
                 rules: vec![build_site_replication_rule(
-                    "arn:rustfs:replication::dep-b:bucket",
+                    &format!("arn:rustfs:replication::{peer}:bucket"),
                     1,
-                    "site-repl-dep-b",
+                    &format!("site-repl-{peer}"),
                 )],
             };
             String::from_utf8(serialize(&config).unwrap()).unwrap()
         };
-        let b64 = BASE64_STANDARD.encode(xml.as_bytes());
+        let dep_a_xml = site_config_xml("dep-b");
+        let dep_b_xml = site_config_xml("dep-a");
+        let dep_a_b64 = BASE64_STANDARD.encode(dep_a_xml.as_bytes());
+        let dep_b_b64 = BASE64_STANDARD.encode(dep_b_xml.as_bytes());
 
         // Both sites present the complete config in base64 wire form → NOT a mismatch.
         assert_eq!(
-            site_replication_config_mismatch(vec![Some(&b64), Some(&b64)].into_iter(), 2),
+            site_replication_config_mismatch(vec![("dep-a", Some(&dep_a_b64)), ("dep-b", Some(&dep_b_b64))].into_iter(), 2),
             (2, false),
             "base64-encoded complete configs on both sites must not be reported as a mismatch"
         );
         // The tolerant decode keeps plain-XML callers working too.
         assert_eq!(
-            site_replication_config_mismatch(vec![Some(&xml), Some(&xml)].into_iter(), 2),
+            site_replication_config_mismatch(vec![("dep-a", Some(&dep_a_xml)), ("dep-b", Some(&dep_b_xml))].into_iter(), 2),
             (2, false),
             "raw-XML wire form still parses via the base64 fallback"
         );
         // A base64 config present on only one of two sites is still a mismatch.
         assert_eq!(
-            site_replication_config_mismatch(vec![Some(&b64)].into_iter(), 2),
+            site_replication_config_mismatch(vec![("dep-a", Some(&dep_a_b64)), ("dep-b", None)].into_iter(), 2),
             (1, true),
             "config present on only one site is a mismatch regardless of encoding"
         );

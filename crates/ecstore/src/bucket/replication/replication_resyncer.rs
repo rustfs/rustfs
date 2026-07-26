@@ -2098,14 +2098,20 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
 
     for arn in tgt_arns {
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &arn).await else {
-            debug!(
+            // A configured rule whose ARN resolves to no target means this object is
+            // dropped for good, so it warrants a warning rather than a debug line: every
+            // other failure below this point logs at error. This is a misconfiguration
+            // path, not steady state, and the per-object event beside it already costs
+            // more than the log record.
+            warn!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                 bucket = %bucket,
+                object = %object,
                 arn = %arn,
                 reason = "target_client_missing",
-                "Skipping replication object target"
+                "Replication rule has no bucket target for its destination ARN; object not replicated"
             );
             send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),

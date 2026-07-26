@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::site_replication::{reconcile_site_replication_buckets, reconcile_site_replicator_service_account};
 use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot};
 use crate::{
     config::Config,
@@ -79,6 +80,17 @@ pub(crate) async fn init_startup_runtime_services(
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
     let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx).await?;
+    // Needs both IAM and bucket metadata, and must not block startup: a site that cannot
+    // repair its replication wiring still serves S3. Account first — the bucket pass signs
+    // its targets with that account's secret.
+    if matches!(iam_bootstrap, IamBootstrapDisposition::ReadyInline(_)) {
+        if let Err(err) = reconcile_site_replicator_service_account().await {
+            tracing::warn!(error = %err, "site replication service account reconcile failed");
+        }
+        if let Err(err) = reconcile_site_replication_buckets().await {
+            tracing::warn!(error = %err, "site replication bucket reconcile failed");
+        }
+    }
     init_auth_integrations().await?;
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
