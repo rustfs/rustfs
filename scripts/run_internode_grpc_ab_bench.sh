@@ -29,11 +29,11 @@ PASSTHROUGH=()
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/run_internode_grpc_ab_bench.sh --stage <p0|p1|p2|p3> --phase <before|after> [options] [-- <bench args>]
+  scripts/run_internode_grpc_ab_bench.sh --stage <p0|p1|p2|p3> --phase <before|after|request-only|canary|rollback> [options] [-- <bench args>]
 
 Required:
   --stage <p0|p1|p2|p3>     Which optimization stage to A/B.
-  --phase <before|after>    baseline (feature off) or enabled (feature on).
+  --phase <phase>           baseline or enabled phase. p0/p1/p3 accept before|after; p2 also accepts request-only|canary|rollback.
 
 Options:
   --out-root <dir>          Artifact root. Default: target/bench/internode-transport
@@ -67,7 +67,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${STAGE}" && -n "${PHASE}" ]] || { echo "ERROR: --stage and --phase are required" >&2; usage; exit 2; }
-case "${PHASE}" in before|after) ;; *) echo "ERROR: --phase must be before|after" >&2; exit 2 ;; esac
+case "${PHASE}" in before|after|request-only|canary|rollback) ;; *) echo "ERROR: --phase must be before, after, request-only, canary, or rollback" >&2; exit 2 ;; esac
+if [[ "${STAGE}" != "p2" ]]; then
+  case "${PHASE}" in
+    before|after) ;;
+    *) echo "ERROR: --phase ${PHASE} is only valid for --stage p2" >&2; exit 2 ;;
+  esac
+fi
 
 # Emit the RUSTFS_INTERNODE_* env for the stage/phase as `KEY=VALUE` lines. Empty output means
 # "cluster defaults" (nothing to set). "before" = feature disabled, "after" = feature enabled.
@@ -94,12 +100,17 @@ stage_env() {
       fi
       ;;
     p2)
-      if [[ "${phase}" == "after" ]]; then
+      if [[ "${phase}" == "after" || "${phase}" == "canary" ]]; then
         # Only enable after the msgpack json-fallback counter has read zero across a window and
         # the fleet confirmation gate has passed.
         printf '%s\n' \
           'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true' \
           'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true'
+      elif [[ "${phase}" == "request-only" ]]; then
+        # Requesting msgpack-only without fleet confirmation must keep the compatibility JSON fields.
+        printf '%s\n' \
+          'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true' \
+          'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false'
       else
         printf '%s\n' \
           'RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false' \
@@ -130,7 +141,11 @@ ENV_FILE="${OUT_DIR}/server-env.sh"
 
 {
   echo "# RustFS server env for internode stage ${STAGE} / phase ${PHASE}."
-  echo "# Source this on EVERY rustfs node before starting the server, then run the bench."
+  if [[ "${STAGE}" == "p2" && "${PHASE}" == "canary" ]]; then
+    echo "# Source this only on the selected canary RustFS node before starting that node; keep the rest on p2/before or p2/request-only env."
+  else
+    echo "# Source this on EVERY rustfs node before starting the server, then run the bench."
+  fi
   if [[ -n "${ENV_LINES}" ]]; then
     while IFS= read -r line; do echo "export ${line}"; done <<<"${ENV_LINES}"
   else

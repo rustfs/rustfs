@@ -68,6 +68,7 @@ their issue closes.
 | `run_four_node_cluster_failover_bench.sh` | dev-tool | Four-node cluster failover benchmark | `docker/compose/README.md`; internode runbook |
 | `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner (warp/s3bench) | internode + scanner runbooks |
 | `run_object_batch_bench_enhanced.sh` | dev-tool | Enhanced batch benchmark runner; hub used by the smoke rigs | hotpath runbook |
+| `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
 | `run_get_codec_streaming_smoke.sh` | dev-tool | Local GET benchmark harness for the codec streaming read path | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
 | `run_gt1g_get_http_matrix.sh` | dev-tool | >1 GiB GET HTTP matrix | `docs/testing/ecstore-validation-suite-design.md` |
