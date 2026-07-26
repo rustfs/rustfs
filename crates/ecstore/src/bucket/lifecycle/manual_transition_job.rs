@@ -249,7 +249,10 @@ impl ManualTransitionJobRecord {
         if !self.scan_completed || self.report.worker_transition_pending() {
             return;
         }
-        self.state = if self.cancel_requested || self.report.cancelled {
+        if self.cancel_requested {
+            self.report.cancelled = true;
+        }
+        self.state = if self.report.cancelled {
             ManualTransitionJobState::Cancelled
         } else if self.report.was_truncated()
             || self.report.has_partial_enqueue()
@@ -290,16 +293,20 @@ impl ManualTransitionJobRecord {
         if !is_sha256_checksum(&persisted.content_sha256) {
             return Err(ManualTransitionJobError::Corrupt("content checksum is not a sha256 checksum"));
         }
-        let job_bytes = serde_json::to_vec(&persisted.job)?;
+        let mut job = persisted.job;
+        let job_bytes = serde_json::to_vec(&job)?;
         let actual_checksum = hex_sha256(&job_bytes, ToOwned::to_owned);
         if persisted.content_sha256 != actual_checksum {
             return Err(ManualTransitionJobError::ChecksumMismatch);
         }
-        if persisted.job.job_id != expected_job_id {
+        if job.job_id != expected_job_id {
             return Err(ManualTransitionJobError::Corrupt("job_id does not match record key"));
         }
-        persisted.job.validate()?;
-        Ok(persisted.job)
+        if job.state == ManualTransitionJobState::Cancelled && job.cancel_requested {
+            job.report.cancelled = true;
+        }
+        job.validate()?;
+        Ok(job)
     }
 
     fn validate(&self) -> Result<(), ManualTransitionJobError> {
@@ -929,6 +936,47 @@ mod tests {
         assert_eq!(record.report.transition_failed, 1);
         assert_eq!(record.report.tier_failure, 1);
         assert!(record.completed_at_unix_nanos.is_some());
+    }
+
+    #[test]
+    fn manual_transition_job_record_marks_report_cancelled_after_worker_drain() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                enqueued: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        record.mark_cancel_requested();
+        record.record_worker_result(ManualTransitionWorkerResult::TierFailure, ManualTransitionQueueSnapshot::default());
+
+        assert_eq!(record.state, ManualTransitionJobState::Cancelled);
+        assert!(record.cancel_requested);
+        assert!(record.report.cancelled);
+        assert_eq!(record.report.transition_failed, 1);
+        assert_eq!(record.report.tier_failure, 1);
+    }
+
+    #[test]
+    fn manual_transition_job_record_decode_normalizes_legacy_cancelled_report() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.mark_cancel_requested();
+        record.state = ManualTransitionJobState::Cancelled;
+        record.completed_at_unix_nanos = Some(OffsetDateTime::now_utc().unix_timestamp_nanos());
+        record.report.cancelled = false;
+        let encoded = record.encode().expect("legacy-shaped cancelled job should encode");
+
+        let decoded =
+            ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("legacy-shaped cancelled job should decode");
+
+        assert_eq!(decoded.state, ManualTransitionJobState::Cancelled);
+        assert!(decoded.cancel_requested);
+        assert!(decoded.report.cancelled);
     }
 
     #[test]
