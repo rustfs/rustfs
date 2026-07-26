@@ -91,7 +91,7 @@ fn manual_transition_record_marks_unknown_when_cursor_would_skip_pending_page() 
     record.report = ManualTransitionRunReport {
         bucket: "manual-pending-page-bucket".to_string(),
         prefix: options.prefix.clone(),
-        tier: options.tier.clone(),
+        tier: options.tier,
         scanned: 1000,
         eligible: 2,
         enqueued: 2,
