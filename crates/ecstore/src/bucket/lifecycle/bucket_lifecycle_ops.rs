@@ -7890,6 +7890,55 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn manual_transition_admission_reclaims_stale_scope_records() {
+        let (_paths, ecstore) = setup_test_env().await;
+
+        for stale_case in ["missing-job", "terminal-job"] {
+            let bucket = format!("manual-stale-admission-{stale_case}");
+            let options = ManualTransitionRunOptions {
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                ..Default::default()
+            };
+            let mut stale = ManualTransitionJobRecord::new(Uuid::new_v4(), &bucket, &options, "old-owner");
+            if stale_case == "terminal-job" {
+                stale.complete(
+                    ManualTransitionRunReport {
+                        bucket: bucket.clone(),
+                        ..Default::default()
+                    },
+                    ManualTransitionQueueSnapshot::default(),
+                );
+                save_manual_transition_job_record(ecstore.clone(), &stale)
+                    .await
+                    .expect("terminal stale job record should save");
+            }
+            save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&stale))
+                .await
+                .expect("stale scope admission should save");
+
+            let replacement = ManualTransitionJobRecord::new(Uuid::new_v4(), &bucket, &options, "new-owner");
+            save_manual_transition_job_record(ecstore.clone(), &replacement)
+                .await
+                .expect("replacement job record should save");
+
+            let claim =
+                claim_manual_transition_scope_admission(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&replacement))
+                    .await
+                    .expect("replacement claim should resolve");
+
+            assert_eq!(claim, ManualTransitionScopeAdmissionClaim::Claimed);
+            let loaded = load_manual_transition_scope_admission(ecstore.clone(), &replacement.scope_key)
+                .await
+                .expect("replacement scope admission should load");
+            assert_eq!(loaded.job_id, replacement.job_id);
+            assert_eq!(loaded.lease_id, replacement.lease_id);
+            assert_eq!(loaded.owner_id, "new-owner");
+        }
+    }
+
+    #[tokio::test]
     async fn existing_object_lifecycle_allows_expired_marker_after_replication_completed() {
         let lc = expired_delete_marker_lifecycle();
         let object = delete_marker_object(ReplicationStatusType::Completed, VersionPurgeStatusType::Complete);
