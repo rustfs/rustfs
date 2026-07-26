@@ -4603,15 +4603,16 @@ mod tests {
         jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
-        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
-        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
-        persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint, recover_manual_transition_job,
-        recover_manual_transition_jobs, recover_manual_transition_jobs_once, replication_state_for_delete,
-        resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
-        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
-        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
-        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
-        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
+        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink,
+        manual_transition_version_marker, mark_delete_opts_skip_decommissioned_on_remote_success,
+        merge_stale_multipart_candidate, persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint,
+        recover_manual_transition_job, recover_manual_transition_jobs, recover_manual_transition_jobs_once,
+        replication_state_for_delete, resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity,
+        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
+        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
+        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
+        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
+        wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -7661,6 +7662,154 @@ mod tests {
         let (marker, version_marker) =
             decode_manual_transition_continuation_token(token).expect("checkpoint token should decode");
         assert_eq!(marker.as_deref(), Some("logs/page-end"));
+        assert_eq!(version_marker.as_deref(), Some("null"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_page_checkpoint_persists_durable_job_progress() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-checkpoint-{}", Uuid::new_v4().simple());
+        let prefix = "logs/";
+        let options = ManualTransitionRunOptions {
+            prefix: prefix.to_string(),
+            tier: Some("WARM".to_string()),
+            dry_run: true,
+            max_objects: Some(100),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &options, "old-owner");
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("expired job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("expired scope admission should save");
+        let checkpoint_options = ManualTransitionRunOptions {
+            progress_sink: Some(manual_transition_recovery_progress_sink(ecstore.clone(), job_id)),
+            ..options
+        };
+        let report = ManualTransitionRunReport {
+            bucket: bucket.clone(),
+            prefix: prefix.to_string(),
+            tier: Some("WARM".to_string()),
+            lifecycle_config_found: true,
+            scanned: 37,
+            eligible: 11,
+            enqueued: 5,
+            ..Default::default()
+        };
+
+        persist_manual_transition_page_checkpoint(
+            &checkpoint_options,
+            &report,
+            Some("logs/page-end".to_string()),
+            Some("null".to_string()),
+        )
+        .await
+        .expect("page checkpoint should persist through the durable job progress sink");
+
+        let loaded = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("checkpointed job should reload");
+        assert_eq!(loaded.state, ManualTransitionJobState::Running);
+        assert_eq!(loaded.report.scanned, 37);
+        assert_eq!(loaded.report.eligible, 11);
+        assert_eq!(loaded.report.enqueued, 5);
+        assert!(loaded.lease_expires_at_unix_nanos > 0);
+        let token = loaded
+            .report
+            .continuation_token
+            .as_deref()
+            .expect("durable checkpoint should persist the opaque resume token");
+        let (marker, version_marker) =
+            decode_manual_transition_continuation_token(token).expect("durable checkpoint token should decode");
+        assert_eq!(marker.as_deref(), Some("logs/page-end"));
+        assert_eq!(version_marker.as_deref(), Some("null"));
+
+        let admission = load_manual_transition_scope_admission(ecstore.clone(), &record.scope_key)
+            .await
+            .expect("checkpoint should keep the scope admission aligned with the renewed job lease");
+        assert_eq!(admission.job_id, job_id);
+        assert_eq!(admission.lease_id, loaded.lease_id);
+        assert_eq!(admission.lease_expires_at_unix_nanos, loaded.lease_expires_at_unix_nanos);
+
+        create_test_bucket(&ecstore, &bucket).await;
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>manual-checkpoint</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <Prefix>{prefix}</Prefix>
+    </Filter>
+    <Transition>
+      <Days>1</Days>
+      <StorageClass>WARM</StorageClass>
+    </Transition>
+  </Rule>
+</LifecycleConfiguration>"#
+        );
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("manual transition lifecycle metadata should be stored");
+        for index in 0..=1000 {
+            let object = format!("{prefix}obj-{index:04}");
+            let mut reader = PutObjReader::from_vec(b"manual checkpoint payload".to_vec());
+            ecstore
+                .put_object(
+                    &bucket,
+                    &object,
+                    &mut reader,
+                    &ObjectOptions {
+                        mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(2)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("manual transition checkpoint object should be created");
+        }
+
+        let production_path_options = ManualTransitionRunOptions {
+            prefix: prefix.to_string(),
+            tier: Some("WARM".to_string()),
+            dry_run: true,
+            progress_sink: Some(manual_transition_recovery_progress_sink(ecstore.clone(), job_id)),
+            ..Default::default()
+        };
+        let final_report = enqueue_transition_for_existing_objects_scoped(ecstore.clone(), &bucket, production_path_options)
+            .await
+            .expect("manual transition scan should cross a durable page checkpoint");
+        assert_eq!(final_report.scanned, 1001);
+
+        let checkpointed = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("production checkpointed job should reload");
+        assert_eq!(checkpointed.state, ManualTransitionJobState::Running);
+        assert_eq!(checkpointed.report.scanned, 1000);
+        assert_eq!(checkpointed.report.eligible, 1000);
+        assert_eq!(checkpointed.report.dry_run_eligible, 1000);
+        let token = checkpointed
+            .report
+            .continuation_token
+            .as_deref()
+            .expect("production page rollover should persist a durable resume token");
+        let (marker, version_marker) =
+            decode_manual_transition_continuation_token(token).expect("production checkpoint token should decode");
+        let expected_marker = format!("{prefix}obj-0999");
+        let marker = marker
+            .as_deref()
+            .expect("production checkpoint should persist an object marker");
+        let marker_suffix = marker
+            .strip_prefix(&expected_marker)
+            .expect("production checkpoint should stop at the first page boundary");
+        assert!(
+            marker_suffix.is_empty() || marker_suffix.starts_with("[rustfs_cache:v2,"),
+            "unexpected production checkpoint marker suffix: {marker_suffix}"
+        );
         assert_eq!(version_marker.as_deref(), Some("null"));
     }
 
