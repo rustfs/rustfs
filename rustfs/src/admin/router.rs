@@ -26,6 +26,7 @@ use super::storage_api::error::StorageError;
 use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::admin::handlers::sts::is_sts_query_request;
 use crate::admin::runtime_sources::{
     ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
     current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
@@ -2769,15 +2770,7 @@ where
         }
 
         // AssumeRole
-        if method == Method::POST
-            && path == "/"
-            && headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.split(';').next().unwrap_or("").trim().to_lowercase())
-                .map(|ct| ct == "application/x-www-form-urlencoded")
-                .unwrap_or(false)
-        {
+        if is_sts_query_request(method, uri, headers) {
             return true;
         }
 
@@ -2827,22 +2820,7 @@ where
         // The handler dispatches on the Action parameter: AssumeRole will reject if
         // credentials are missing, AssumeRoleWithWebIdentity will validate the JWT.
         // Require application/x-www-form-urlencoded Content-Type to narrow the bypass.
-        if req.method == Method::POST
-            && path == "/"
-            && req.credentials.is_none()
-            && req
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| {
-                    ct.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                })
-                .unwrap_or(false)
-        {
+        if req.credentials.is_none() && is_sts_query_request(&req.method, &req.uri, &req.headers) {
             return Ok(());
         }
 

@@ -407,6 +407,8 @@ pub(crate) enum PathCategory {
     InternodeRpc,
     /// Health/probe paths — skip compression (tiny responses)
     Probe,
+    /// STS Query API — response compatibility is applied outside compression.
+    StsQueryApi,
 }
 
 impl PathCategory {
@@ -544,7 +546,14 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let category = PathCategory::classify(req.uri().path());
+        let category = if req.method() == http::Method::POST
+            && req.uri().path() == "/"
+            && req.extensions().get::<crate::server::layer::StsQueryRequest>().is_some()
+        {
+            PathCategory::StsQueryApi
+        } else {
+            PathCategory::classify(req.uri().path())
+        };
         InjectCategoryFut {
             inner: self.inner.call(req),
             category,
@@ -785,5 +794,6 @@ mod tests {
         assert!(!PathCategory::Console.should_evaluate_compression());
         assert!(!PathCategory::InternodeRpc.should_evaluate_compression());
         assert!(!PathCategory::Probe.should_evaluate_compression());
+        assert!(!PathCategory::StsQueryApi.should_evaluate_compression());
     }
 }

@@ -14,6 +14,7 @@
 
 use super::runtime_sources;
 use crate::admin::console::is_console_path;
+use crate::admin::handlers::sts::is_sts_query_request;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
@@ -29,9 +30,10 @@ use crate::storage_api::server::layer::request_context::{
     RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
 };
 use bytes::Bytes;
+use futures::future::Either;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
@@ -601,12 +603,14 @@ where
     }
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let is_sts_query =
+            req.method() == Method::POST && req.uri().path() == "/" && req.extensions().get::<StsQueryRequest>().is_some();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let response = inner.call(req).await?;
             let (parts, body) = response.into_parts();
-            let should_fix = parts.status == StatusCode::FORBIDDEN && is_xml_response(&parts.headers);
+            let should_fix = !is_sts_query && parts.status == StatusCode::FORBIDDEN && is_xml_response(&parts.headers);
 
             let response = match body {
                 HybridBody::Rest { rest_body } => {
@@ -626,6 +630,71 @@ where
 
             Ok(response)
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct StsQueryApiCompatLayer;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StsQueryRequest;
+
+impl<S> Layer<S> for StsQueryApiCompatLayer {
+    type Service = StsQueryApiCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StsQueryApiCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct StsQueryApiCompatService<S> {
+    inner: S,
+}
+
+type StsBoxError = Box<dyn std::error::Error + Send + Sync>;
+type StsBoxBody = tower_http::body::UnsyncBoxBody<Bytes, StsBoxError>;
+
+impl<S, RequestBody> Service<HttpRequest<RequestBody>> for StsQueryApiCompatService<S>
+where
+    S: Service<HttpRequest<RequestBody>, Response = Response<StsBoxBody>> + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: From<StsBoxError> + Send + 'static,
+{
+    type Response = Response<StsBoxBody>;
+    type Error = S::Error;
+    type Future = Either<S::Future, Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<RequestBody>) -> Self::Future {
+        if !is_sts_query_request(req.method(), req.uri(), req.headers()) {
+            return Either::Left(self.inner.call(req));
+        }
+
+        req.extensions_mut().insert(StsQueryRequest);
+        let (request_id, request_id_header) = sts_response_request_id(&req);
+        let future = self.inner.call(req);
+
+        Either::Right(Box::pin(async move {
+            let response = future.await?;
+            let (mut parts, body) = response.into_parts();
+            parts.headers.insert(AMZ_REQUEST_ID, request_id_header);
+
+            let (body, changed) = convert_sts_query_response(body, parts.status, &request_id).await?;
+            if changed {
+                parts.headers.remove(http::header::CONTENT_LENGTH);
+                parts
+                    .headers
+                    .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+            }
+            let body = tower_http::body::UnsyncBoxBody::new(Full::from(body).map_err(|error| -> StsBoxError { match error {} }));
+            let response = Response::from_parts(parts, body);
+
+            Ok(response)
+        }))
     }
 }
 
@@ -1338,6 +1407,90 @@ fn is_xml_response(headers: &HeaderMap) -> bool {
     }
 }
 
+fn sts_response_request_id<B>(req: &HttpRequest<B>) -> (String, HeaderValue) {
+    let request_id = req
+        .extensions()
+        .get::<RequestContext>()
+        .map(|context| context.request_id.as_str())
+        .unwrap_or("sts-request-id")
+        .to_owned();
+
+    match HeaderValue::from_str(&request_id) {
+        Ok(header) => (request_id, header),
+        Err(_) => ("sts-request-id".to_owned(), HeaderValue::from_static("sts-request-id")),
+    }
+}
+
+async fn convert_sts_query_response<RestBody>(
+    body: RestBody,
+    status: StatusCode,
+    request_id: &str,
+) -> Result<(Bytes, bool), RestBody::Error>
+where
+    RestBody: Body<Data = Bytes>,
+{
+    let bytes = BodyExt::collect(body).await?.to_bytes();
+    let Ok(xml) = String::from_utf8(bytes.to_vec()) else {
+        return Ok((bytes, false));
+    };
+
+    let converted = if status.is_success() {
+        add_sts_response_metadata(xml, request_id)
+    } else {
+        Some(wrap_sts_error_response(&xml, status, request_id))
+    };
+
+    match converted {
+        Some(xml) => Ok((Bytes::from(xml), true)),
+        None => Ok((bytes, false)),
+    }
+}
+
+fn add_sts_response_metadata(mut xml: String, request_id: &str) -> Option<String> {
+    if xml.contains("<ResponseMetadata>") {
+        return None;
+    }
+
+    let closing_tag = ["</AssumeRoleResponse>", "</AssumeRoleWithWebIdentityResponse>"]
+        .into_iter()
+        .find(|tag| xml.contains(tag))?;
+    let index = xml.rfind(closing_tag)?;
+    xml.insert_str(
+        index,
+        &format!("<ResponseMetadata><RequestId>{}</RequestId></ResponseMetadata>", xml_escape(request_id)),
+    );
+    Some(xml)
+}
+
+fn wrap_sts_error_response(xml: &str, status: StatusCode, request_id: &str) -> String {
+    let parsed = quick_xml::de::from_str::<SerializedS3Error>(xml).ok();
+    let (code, message) = parsed
+        .as_ref()
+        .map(|error| (error.code.as_str(), error.message.as_deref().unwrap_or(&error.code)))
+        .unwrap_or_else(|| sts_error_for_status(status));
+    let error_type = if status.is_server_error() { "Receiver" } else { "Sender" };
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+         <Error><Type>{error_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>\
+         <RequestId>{request_id}</RequestId></ErrorResponse>",
+        code = xml_escape(code),
+        message = xml_escape(message),
+        request_id = xml_escape(request_id),
+    )
+}
+
+fn sts_error_for_status(status: StatusCode) -> (&'static str, &'static str) {
+    match status {
+        StatusCode::BAD_REQUEST => ("InvalidRequest", "Invalid Request"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ("AccessDenied", "Access Denied"),
+        StatusCode::TOO_MANY_REQUESTS => ("TooManyRequests", "Request rate limit exceeded"),
+        StatusCode::SERVICE_UNAVAILABLE => ("ServiceUnavailable", "Service Unavailable"),
+        _ => ("InternalError", "Internal Server Error"),
+    }
+}
+
 async fn fix_object_attributes_etag_in_xml<RestBody>(body: RestBody) -> Result<RestBody, RestBody::Error>
 where
     RestBody: Body<Data = Bytes> + From<Bytes>,
@@ -1780,6 +1933,7 @@ fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer};
     use crate::server::{FAVICON_PATH, LICENSE, RemoteAddr, VERSION};
     use futures::future::{Ready, ready};
     use http::Request;
@@ -2882,6 +3036,187 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(bytes, input);
+    }
+
+    #[derive(Clone)]
+    struct FixedStsResponse {
+        status: StatusCode,
+        body: Bytes,
+    }
+
+    impl<RequestBody: Send + 'static> Service<Request<RequestBody>> for FixedStsResponse {
+        type Response = Response<StsBoxBody>;
+        type Error = StsBoxError;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<RequestBody>) -> Self::Future {
+            let body = tower_http::body::UnsyncBoxBody::new(
+                Full::from(self.body.clone()).map_err(|error| -> StsBoxError { match error {} }),
+            );
+            ready(Ok(Response::builder()
+                .status(self.status)
+                .header(http::header::CONTENT_TYPE, "application/xml")
+                .header(http::header::CONTENT_LENGTH, self.body.len())
+                .body(body)
+                .expect("fixed STS response")))
+        }
+    }
+
+    async fn call_sts_compat_layer(status: StatusCode, body: &'static [u8]) -> (HeaderMap, String) {
+        let mut service = StsQueryApiCompatLayer.layer(FixedStsResponse {
+            status,
+            body: Bytes::from_static(body),
+        });
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(())
+            .expect("STS request");
+        request.extensions_mut().insert(RequestContext {
+            request_id: "server-request-id".to_string(),
+            x_amz_request_id: "untrusted-upstream-id".to_string(),
+            trace_id: None,
+            span_id: None,
+            start_time: Instant::now(),
+        });
+
+        let response = service.call(request).await.expect("STS compatibility response");
+        let headers = response.headers().clone();
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .expect("collect STS response")
+            .to_bytes();
+        (headers, String::from_utf8(body.to_vec()).expect("STS response should be UTF-8 XML"))
+    }
+
+    #[tokio::test]
+    async fn sts_compat_layer_uses_canonical_request_id_for_success_header_and_xml() {
+        let (headers, body) =
+            call_sts_compat_layer(StatusCode::OK, b"<AssumeRoleResponse><AssumeRoleResult/></AssumeRoleResponse>").await;
+
+        assert_eq!(
+            headers.get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+            Some("server-request-id")
+        );
+        assert!(!headers.contains_key(http::header::CONTENT_LENGTH));
+        assert!(body.contains("<ResponseMetadata><RequestId>server-request-id</RequestId></ResponseMetadata>"));
+        assert!(!body.contains("untrusted-upstream-id"));
+    }
+
+    #[tokio::test]
+    async fn sts_compat_layer_uses_same_request_id_for_error_header_and_xml() {
+        let (headers, body) = call_sts_compat_layer(
+            StatusCode::FORBIDDEN,
+            b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        )
+        .await;
+
+        assert_eq!(
+            headers.get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+            Some("server-request-id")
+        );
+        assert!(body.contains("<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">"));
+        assert!(body.contains("<RequestId>server-request-id</RequestId>"));
+    }
+
+    #[test]
+    fn sts_success_response_gets_response_metadata() {
+        let xml = String::from(
+            "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+             <AssumeRoleResult><Credentials/></AssumeRoleResult></AssumeRoleResponse>",
+        );
+        let converted = add_sts_response_metadata(xml, "request-123").expect("AssumeRole response should be converted");
+
+        assert!(converted.contains("<Credentials/>"));
+        assert!(converted.contains("<ResponseMetadata><RequestId>request-123</RequestId></ResponseMetadata>"));
+        assert!(converted.ends_with("</AssumeRoleResponse>"));
+    }
+
+    #[test]
+    fn sts_error_response_uses_query_api_envelope() {
+        let converted = wrap_sts_error_response(
+            "<Error><Code>AccessDenied</Code><Message>Access &amp; Denied</Message></Error>",
+            StatusCode::FORBIDDEN,
+            "request-456",
+        );
+
+        assert!(converted.contains("<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">"));
+        assert!(converted.contains("<Type>Sender</Type>"));
+        assert!(converted.contains("<Code>AccessDenied</Code>"));
+        assert!(converted.contains("<Message>Access &amp; Denied</Message>"));
+        assert!(converted.contains("<RequestId>request-456</RequestId>"));
+    }
+
+    #[tokio::test]
+    async fn sts_compat_layer_wraps_non_xml_short_circuit_errors() {
+        let (headers, body) = call_sts_compat_layer(StatusCode::SERVICE_UNAVAILABLE, b"Service not ready: waiting for iam").await;
+
+        assert_eq!(
+            headers.get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+            Some("server-request-id")
+        );
+        assert!(body.contains("<Type>Receiver</Type>"));
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(body.contains("<Message>Service Unavailable</Message>"));
+        assert!(body.contains("<RequestId>server-request-id</RequestId>"));
+        assert!(!body.contains("waiting for iam"));
+    }
+
+    #[tokio::test]
+    async fn sts_compat_layer_prevents_pre_conversion_compression() {
+        let xml = format!(
+            "<AssumeRoleResponse><AssumeRoleResult>{}</AssumeRoleResult></AssumeRoleResponse>",
+            "x".repeat(2048)
+        );
+        let mut service = tower::ServiceBuilder::new()
+            .layer(StsQueryApiCompatLayer)
+            .layer(tower_http::catch_panic::CatchPanicLayer::new())
+            .layer(
+                tower_http::compression::CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(
+                    HttpCompressionConfig {
+                        enabled: true,
+                        extensions: Vec::new(),
+                        mime_patterns: vec!["application/xml".to_owned()],
+                        min_size: 0,
+                    },
+                )),
+            )
+            .layer(PathCategoryInjectionLayer)
+            .service(FixedStsResponse {
+                status: StatusCode::OK,
+                body: Bytes::from(xml),
+            });
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/")
+            .header(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(http::header::ACCEPT_ENCODING, "gzip")
+            .body(())
+            .expect("STS request");
+        request.extensions_mut().insert(RequestContext {
+            request_id: "server-request-id".to_string(),
+            x_amz_request_id: String::new(),
+            trace_id: None,
+            span_id: None,
+            start_time: Instant::now(),
+        });
+
+        let response = service.call(request).await.expect("STS compatibility response");
+        assert!(
+            !response.headers().contains_key(http::header::CONTENT_ENCODING),
+            "STS XML must stay uncompressed until the compatibility envelope is complete"
+        );
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .expect("collect STS response")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("STS response should be UTF-8 XML");
+        assert!(body.contains("<ResponseMetadata><RequestId>server-request-id</RequestId></ResponseMetadata>"));
     }
 
     #[tokio::test]
