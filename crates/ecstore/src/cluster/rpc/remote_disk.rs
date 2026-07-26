@@ -1131,19 +1131,31 @@ fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer).map_err(|err| {
-            crate::cluster::rpc::runtime_sources::record_response_msgpack_decode_error(value_name);
-            Error::from(err)
-        });
+        return match T::deserialize(&mut deserializer) {
+            Ok(value) => {
+                crate::cluster::rpc::runtime_sources::record_response_msgpack_decode(value_name);
+                Ok(value)
+            }
+            Err(err) => {
+                crate::cluster::rpc::runtime_sources::record_response_msgpack_decode_error(value_name);
+                Err(Error::from(err))
+            }
+        };
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     crate::cluster::rpc::runtime_sources::record_response_json_fallback(value_name);
-    serde_json::from_str(json).map_err(|err| {
-        crate::cluster::rpc::runtime_sources::record_response_json_decode_error(value_name);
-        Error::from(err)
-    })
+    match serde_json::from_str(json) {
+        Ok(value) => {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode(value_name);
+            Ok(value)
+        }
+        Err(err) => {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode_error(value_name);
+            Err(Error::from(err))
+        }
+    }
 }
 
 /// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
@@ -1195,6 +1207,7 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
             crate::cluster::rpc::runtime_sources::record_response_json_decode_error("ReadMultipleResp");
             Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}"))
         })?;
+        crate::cluster::rpc::runtime_sources::record_response_json_decode("ReadMultipleResp");
         read_multiple_resps.push(resp);
     }
 
@@ -1245,6 +1258,7 @@ fn decode_batch_read_version_response_items(
             crate::cluster::rpc::runtime_sources::record_response_json_decode_error("BatchReadVersionResp");
             Error::other(format!("decode BatchReadVersionResp json item {index} from {endpoint} failed: {err}"))
         })?;
+        crate::cluster::rpc::runtime_sources::record_response_json_decode("BatchReadVersionResp");
         if resp.success {
             validate_decoded_file_info(&resp.file_info)?;
         }
@@ -3120,12 +3134,15 @@ mod tests {
             read_multiple_resps_bin: vec![encode_msgpack(&msgpack_resp).expect("msgpack response should encode").into()],
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         let decoded = decode_read_multiple_response_items(response, &endpoint).expect("msgpack response should decode");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].file, "msgpack");
         assert_eq!(decoded[0].data, b"binary");
+        assert!(after > before, "successful response msgpack decode should increment traffic metrics");
     }
 
     #[test]
@@ -3138,12 +3155,15 @@ mod tests {
             read_multiple_resps_bin: Vec::new(),
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         let decoded = decode_read_multiple_response_items(response, &endpoint).expect("json response should decode");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].file, "json");
         assert_eq!(decoded[0].data, b"fallback");
+        assert!(after > before, "successful response JSON decode should increment traffic metrics");
     }
 
     #[test]

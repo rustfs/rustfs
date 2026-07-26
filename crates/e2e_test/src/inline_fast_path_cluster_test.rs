@@ -67,6 +67,7 @@ type MetricValues = Arc<Mutex<BTreeMap<String, MetricPointVersions>>>;
 
 const KIB: usize = 1024;
 const READER_PATH_COUNTER: &str = "rustfs_io_get_object_reader_path_by_size_total";
+const MSGPACK_JSON_DECODE_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_total";
 const MSGPACK_JSON_FALLBACK_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const MSGPACK_JSON_DECODE_ERROR_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const DIRECTION_LABEL: &str = "direction";
@@ -142,6 +143,7 @@ impl VersionState {
 struct OtlpMetricCollector {
     endpoint: String,
     values: MetricValues,
+    decode_values: MetricValues,
     fallback_values: MetricValues,
     decode_error_values: MetricValues,
     task: JoinHandle<()>,
@@ -152,9 +154,11 @@ impl OtlpMetricCollector {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/v1/metrics", listener.local_addr()?);
         let values = Arc::new(Mutex::new(BTreeMap::new()));
+        let decode_values = Arc::new(Mutex::new(BTreeMap::new()));
         let fallback_values = Arc::new(Mutex::new(BTreeMap::new()));
         let decode_error_values = Arc::new(Mutex::new(BTreeMap::new()));
         let task_values = values.clone();
+        let task_decode_values = decode_values.clone();
         let task_fallback_values = fallback_values.clone();
         let task_decode_error_values = decode_error_values.clone();
         let task = tokio::spawn(async move {
@@ -163,6 +167,7 @@ impl OtlpMetricCollector {
                     break;
                 };
                 let values = task_values.clone();
+                let decode_values = task_decode_values.clone();
                 let fallback_values = task_fallback_values.clone();
                 let decode_error_values = task_decode_error_values.clone();
                 tokio::spawn(async move {
@@ -173,6 +178,7 @@ impl OtlpMetricCollector {
                                 handle_metric_export(
                                     request,
                                     values.clone(),
+                                    decode_values.clone(),
                                     fallback_values.clone(),
                                     decode_error_values.clone(),
                                 )
@@ -185,6 +191,7 @@ impl OtlpMetricCollector {
         Ok(Self {
             endpoint,
             values,
+            decode_values,
             fallback_values,
             decode_error_values,
             task,
@@ -218,6 +225,15 @@ impl OtlpMetricCollector {
 
     async fn msgpack_json_fallback_totals(&self) -> BTreeMap<String, u64> {
         self.fallback_values
+            .lock()
+            .await
+            .iter()
+            .map(|(key, points)| (key.clone(), points.values().map(|(_, value)| value).sum()))
+            .collect()
+    }
+
+    async fn msgpack_json_decode_totals(&self) -> BTreeMap<String, u64> {
+        self.decode_values
             .lock()
             .await
             .iter()
@@ -302,6 +318,7 @@ impl Drop for OtlpMetricCollector {
 async fn handle_metric_export(
     request: Request<Incoming>,
     values: MetricValues,
+    decode_values: MetricValues,
     fallback_values: MetricValues,
     decode_error_values: MetricValues,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -334,9 +351,11 @@ async fn handle_metric_export(
     match ExportMetricsServiceRequest::decode(payload.as_slice()) {
         Ok(export) => {
             let mut values = values.lock().await;
+            let mut decode_values = decode_values.lock().await;
             let mut fallback_values = fallback_values.lock().await;
             let mut decode_error_values = decode_error_values.lock().await;
             record_reader_path_metrics(&export, &mut values);
+            record_msgpack_decode_metrics(&export, &mut decode_values);
             record_msgpack_fallback_metrics(&export, &mut fallback_values);
             record_msgpack_decode_error_metrics(&export, &mut decode_error_values);
             Ok(response(StatusCode::OK))
@@ -415,6 +434,19 @@ fn msgpack_fallback_metric_key(direction: &str, message: &str) -> String {
     format!("{direction}\u{1f}{message}")
 }
 
+fn record_msgpack_decode_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    record_msgpack_counter_metrics(export, MSGPACK_JSON_DECODE_COUNTER, values, |attributes| {
+        let direction = attribute_string(attributes, DIRECTION_LABEL)?;
+        let message = attribute_string(attributes, MESSAGE_LABEL)?;
+        let codec = attribute_string(attributes, CODEC_LABEL)?;
+        Some(msgpack_decode_metric_key(direction, message, codec))
+    });
+}
+
+fn msgpack_decode_metric_key(direction: &str, message: &str, codec: &str) -> String {
+    format!("{direction}\u{1f}{message}\u{1f}{codec}")
+}
+
 fn record_msgpack_decode_error_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
     record_msgpack_counter_metrics(export, MSGPACK_JSON_DECODE_ERROR_COUNTER, values, |attributes| {
         let direction = attribute_string(attributes, DIRECTION_LABEL)?;
@@ -488,6 +520,33 @@ async fn assert_msgpack_fallback_unchanged(
     Ok(())
 }
 
+async fn assert_msgpack_decode_observed(
+    collector: &OtlpMetricCollector,
+    before: &BTreeMap<String, u64>,
+    series: &[(&str, &str)],
+) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let after = collector.msgpack_json_decode_totals().await;
+        let missing = series
+            .iter()
+            .filter_map(|(direction, message)| {
+                let key = msgpack_decode_metric_key(direction, message, MSGPACK_CODEC_MSGPACK);
+                let before_value = before.get(&key).copied().unwrap_or_default();
+                let after_value = after.get(&key).copied().unwrap_or_default();
+                (after_value <= before_value).then_some(format!("{direction}/{message}/{}", MSGPACK_CODEC_MSGPACK))
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for msgpack decode traffic on {missing:?}; totals={after:?}").into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn assert_msgpack_decode_errors_unchanged(
     collector: &OtlpMetricCollector,
     before: &BTreeMap<String, u64>,
@@ -519,6 +578,42 @@ fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<
             _ => None,
         }
     })
+}
+
+#[test]
+fn records_msgpack_decode_metric_with_codec_label() {
+    let export = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: MSGPACK_JSON_DECODE_COUNTER.to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![
+                                metric_attribute(DIRECTION_LABEL, FALLBACK_RESPONSE_DIRECTION),
+                                metric_attribute(MESSAGE_LABEL, "ReadMultipleResp"),
+                                metric_attribute(CODEC_LABEL, MSGPACK_CODEC_MSGPACK),
+                            ],
+                            start_time_unix_nano: 7,
+                            time_unix_nano: 11,
+                            value: Some(number_data_point::Value::AsInt(5)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut values = BTreeMap::new();
+
+    record_msgpack_decode_metrics(&export, &mut values);
+
+    let key = msgpack_decode_metric_key(FALLBACK_RESPONSE_DIRECTION, "ReadMultipleResp", MSGPACK_CODEC_MSGPACK);
+    assert_eq!(values.get(&key).and_then(|points| points.get(&7)).copied(), Some((11, 5)));
 }
 
 #[test]
@@ -1701,6 +1796,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     configure_mixed_msgpack_cluster(&mut cluster, &collector)?;
     cluster.start().await?;
 
+    let decode_before = collector.msgpack_json_decode_totals().await;
     let fallback_before = collector.msgpack_json_fallback_totals().await;
     let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
@@ -1726,6 +1822,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
         PartNumberReaderPathExpectation::new(bucket, multipart_key, &second_part, multipart_body.len(), MULTIPART, LEGACY_DUPLEX),
     )
     .await?;
+    assert_msgpack_decode_observed(&collector, &decode_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
     assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
@@ -2041,6 +2138,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     hot.start().await?;
     let hot_client = hot.create_s3_client(0)?;
 
+    let decode_before = collector.msgpack_json_decode_totals().await;
     let fallback_before = collector.msgpack_json_fallback_totals().await;
     let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
@@ -2069,6 +2167,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
         PartNumberReaderPathExpectation::new(bucket, key, &second_part, body.len(), REMOTE, REMOTE_TRANSITION),
     )
     .await?;
+    assert_msgpack_decode_observed(&collector, &decode_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     let encrypted_key = "transition/encrypted-sse.bin";
     let encrypted_body = payload(16 * KIB, 0xAB);

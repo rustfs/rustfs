@@ -51,6 +51,7 @@ gitignored — attach the paired directories to the PR / issue.
 | `rustfs_system_network_internode_operation_payload_bytes` | payload size distribution (P0/P1 sizing) |
 | `rustfs_system_network_internode_operation_large_payloads_total` | large unary RPCs sharing the channel (P1 target) |
 | `rustfs_system_network_internode_dial_avg_time_nanos`, `..._dial_errors_total` | connect cost (P3 prewarm) |
+| `rustfs_system_network_internode_msgpack_json_decode_total{direction,message,codec}` | must be **>0** for each expected P2 series before zero fallback/error readings are meaningful |
 | `rustfs_system_network_internode_msgpack_json_fallback_total{direction,message}` | must be **0** before enabling both msgpack-only gates (P2) |
 | `rustfs_system_network_internode_msgpack_json_decode_error_total{direction,message,codec}` | must be **0** before enabling both msgpack-only gates (P2) |
 | `rustfs_cluster_servers_offline_total` | offline detection correctness (P3 bypass) |
@@ -89,7 +90,7 @@ column, everything else at defaults. Roll a restart between runs.
   `>4 MiB` multi-version `xl.meta` no longer fails `out_of_range`.
 - **P1** — mixed workload (large `ReadAll` + high-frequency `Refresh`). Acceptance gate from
   the design doc: **lock p99 down ≥ 20%** with `RUSTFS_INTERNODE_CHANNEL_ISOLATION=true`.
-- **P2** — observe `msgpack_json_fallback_total` and `msgpack_json_decode_error_total` across a release window; both must stay **0** before flipping both `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true` (see the msgpack convergence runbook). Codec allocation via a `dhat`/`heaptrack` micro-run.
+- **P2** — observe `msgpack_json_decode_total`, `msgpack_json_fallback_total`, and `msgpack_json_decode_error_total` across a release window; every expected `codec="msgpack"` decode series must be **>0**, while fallback and decode-error series must stay **0** before flipping both `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true` (see the msgpack convergence runbook). Codec allocation via a `dhat`/`heaptrack` micro-run.
 - **P3** — cold-start: first cross-node op latency should drop ~one connect RTT with prewarm.
   Failover: `run_four_node_cluster_failover_bench.sh`, kill a node with
   `RUSTFS_INTERNODE_OFFLINE_BYPASS=true`; expect faster failover and a correct
@@ -107,9 +108,7 @@ the gate verdict (pass/fail + measured delta) in the paired directory's `summary
 | **P3 cold-start** | `run_internode_transport_baseline.sh` (fresh cluster, first cross-node op) | first cross-node op latency **drops ~one connect RTT** with `RUSTFS_INTERNODE_PREWARM=true`. | `..._dial_avg_time_nanos`, first-op `..._operation_duration_ms` |
 | **P3 offline** | dedicated *sustained-offline + survivor cross-node access* experiment (the standard four-node failover bench is **not** sensitive to the bypass — quorum holds, `recovery_seconds=0`) | with `RUSTFS_INTERNODE_OFFLINE_BYPASS=true`, survivor cross-node op latency to the downed peer **fast-fails** instead of hanging the dial timeout; `rustfs_cluster_servers_offline_total` = **1** while down, back to **0** after recovery. | `rustfs_cluster_servers_offline_total`, survivor cross-node `..._operation_duration_ms`, `..._dial_errors_total` |
 
-> **P2 is not a throughput gate.** Its acceptance is operational: `msgpack_json_fallback_total`
-> must read **0** across a full release window before both msgpack-only env gates are enabled (see
-> the msgpack convergence runbook). Do not benchmark P2 as before/after throughput.
+> **P2 is not a throughput gate.** Its acceptance is operational: every expected `msgpack_json_decode_total{codec="msgpack"}` series must have non-zero traffic, while `msgpack_json_fallback_total` and `msgpack_json_decode_error_total` must read **0** across a full release window before both msgpack-only env gates are enabled (see the msgpack convergence runbook). Do not benchmark P2 as before/after throughput.
 
 Artifact layout per stage (attach both halves + the diff):
 
