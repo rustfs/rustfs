@@ -114,6 +114,10 @@ const EVENT_LIFECYCLE_TRANSITION_COMPENSATION: &str = "lifecycle_transition_comp
 const EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP: &str = "lifecycle_stale_multipart_cleanup";
 const EVENT_LIFECYCLE_SCAN_SKIPPED: &str = "lifecycle_scan_skipped";
 const EVENT_LIFECYCLE_EVALUATION_FAILED: &str = "lifecycle_evaluation_failed";
+const EVENT_LIFECYCLE_EXPIRED_DETECTED: &str = "lifecycle_expired_detected";
+const EVENT_LIFECYCLE_NOT_ENQUEUED: &str = "lifecycle_not_enqueued";
+const EVENT_LIFECYCLE_DELETE_DISPATCHED: &str = "lifecycle_delete_dispatched";
+const EVENT_LIFECYCLE_DELETE_COMPLETED: &str = "lifecycle_delete_completed";
 const EVENT_LIFECYCLE_TIER_AUDIT: &str = "lifecycle_tier_audit";
 const EVENT_LIFECYCLE_TIER_OPERATION_FAILED: &str = "lifecycle_tier_operation_failed";
 const EVENT_LIFECYCLE_DELETE_FAILED: &str = "lifecycle_delete_failed";
@@ -308,6 +312,100 @@ struct ExpiryStats {
     workers: AtomicI64,
 }
 
+#[cfg(test)]
+type LifecycleObservabilityObserver = Box<dyn Fn(&'static str, &'static str, Option<&'static str>) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static LIFECYCLE_OBSERVABILITY_OBSERVER: Mutex<Option<LifecycleObservabilityObserver>> = Mutex::new(None);
+
+#[cfg(test)]
+struct LifecycleObservabilityObserverGuard;
+
+#[cfg(test)]
+impl Drop for LifecycleObservabilityObserverGuard {
+    fn drop(&mut self) {
+        let mut observer = LIFECYCLE_OBSERVABILITY_OBSERVER
+            .lock()
+            .expect("lifecycle observability observer lock should not poison");
+        *observer = None;
+    }
+}
+
+#[cfg(test)]
+fn set_lifecycle_observability_observer(
+    observer_fn: impl Fn(&'static str, &'static str, Option<&'static str>) + Send + Sync + 'static,
+) -> LifecycleObservabilityObserverGuard {
+    let mut observer = LIFECYCLE_OBSERVABILITY_OBSERVER
+        .lock()
+        .expect("lifecycle observability observer lock should not poison");
+    *observer = Some(Box::new(observer_fn));
+    LifecycleObservabilityObserverGuard
+}
+
+fn observe_lifecycle_observability_event(_event: &'static str, _state: &'static str, _reason: Option<&'static str>) {
+    #[cfg(test)]
+    if let Some(observer) = LIFECYCLE_OBSERVABILITY_OBSERVER
+        .lock()
+        .expect("lifecycle observability observer lock should not poison")
+        .as_ref()
+    {
+        observer(_event, _state, _reason);
+    }
+}
+
+struct LifecycleExpiryTrace<'a> {
+    bucket: &'a str,
+    object: Option<&'a str>,
+    version_id: Option<Uuid>,
+    event: &'a lifecycle::Event,
+    src: &'a LcEventSrc,
+    version_count: u64,
+}
+
+impl<'a> LifecycleExpiryTrace<'a> {
+    fn for_object(oi: &'a ObjectInfo, event: &'a lifecycle::Event, src: &'a LcEventSrc, version_count: u64) -> Self {
+        Self {
+            bucket: &oi.bucket,
+            object: Some(&oi.name),
+            version_id: oi.version_id,
+            event,
+            src,
+            version_count,
+        }
+    }
+
+    fn for_batch(bucket: &'a str, event: &'a lifecycle::Event, src: &'a LcEventSrc, version_count: u64) -> Self {
+        Self {
+            bucket,
+            object: None,
+            version_id: None,
+            event,
+            src,
+            version_count,
+        }
+    }
+
+    fn emit(&self, event_name: &'static str, state: &'static str, reason: Option<&'static str>) {
+        observe_lifecycle_observability_event(event_name, state, reason);
+        debug!(
+            event = event_name,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            bucket = %self.bucket,
+            object = self.object.unwrap_or_default(),
+            version_id = ?self.version_id,
+            action = ?self.event.action,
+            rule_id = %self.event.rule_id,
+            due = ?self.event.due,
+            source = ?self.src,
+            version_count = self.version_count,
+            state,
+            reason = reason.unwrap_or_default(),
+            "Lifecycle expiry observability event"
+        );
+    }
+}
+
 #[allow(dead_code)]
 impl ExpiryStats {
     pub fn missed_tasks(&self) -> i64 {
@@ -466,6 +564,7 @@ struct NewerNoncurrentTask {
     bucket: String,
     versions: Vec<ObjectToDelete>,
     event: lifecycle::Event,
+    src: LcEventSrc,
 }
 
 impl ExpiryOp for NewerNoncurrentTask {
@@ -577,6 +676,8 @@ impl ExpiryState {
     }
 
     pub fn enqueue_by_days(&mut self, oi: &ObjectInfo, event: &lifecycle::Event, src: &LcEventSrc) -> bool {
+        let trace = LifecycleExpiryTrace::for_object(oi, event, src, 1);
+        trace.emit(EVENT_LIFECYCLE_EXPIRED_DETECTED, "detected", None);
         let task = ExpiryTask {
             obj_info: oi.clone(),
             event: event.clone(),
@@ -587,12 +688,14 @@ impl ExpiryState {
             self.stats.increment_missed_expiry_tasks();
             record_scanner_lifecycle_enqueue_result(src, 1, false);
             self.stats.record_scanner_expiry_state();
+            trace.emit(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("worker_unavailable"));
             return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
         let queued = self.send_expiry_task(wrkr, Box::new(task));
         if !queued {
             self.stats.increment_missed_expiry_tasks();
+            trace.emit(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("queue_full"));
         }
         record_scanner_lifecycle_enqueue_result(src, 1, queued);
         self.stats.record_scanner_expiry_state();
@@ -610,23 +713,28 @@ impl ExpiryState {
             return true;
         }
         let version_count = u64::try_from(versions.len()).unwrap_or(u64::MAX);
+        let trace = LifecycleExpiryTrace::for_batch(bucket, &lc_event, src, version_count);
+        trace.emit(EVENT_LIFECYCLE_EXPIRED_DETECTED, "detected", None);
 
         let task = NewerNoncurrentTask {
             bucket: String::from(bucket),
             versions,
-            event: lc_event,
+            event: lc_event.clone(),
+            src: src.clone(),
         };
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
             self.stats.increment_missed_expiry_tasks();
             record_scanner_lifecycle_enqueue_result(src, version_count, false);
             self.stats.record_scanner_expiry_state();
+            trace.emit(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("worker_unavailable"));
             return false;
         }
         let wrkr = wrkr.expect("worker channel should exist after None check");
         let queued = self.send_expiry_task(wrkr, Box::new(task));
         if !queued {
             self.stats.increment_missed_expiry_tasks();
+            trace.emit(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("queue_full"));
         }
         record_scanner_lifecycle_enqueue_result(src, version_count, queued);
         self.stats.record_scanner_expiry_state();
@@ -722,15 +830,30 @@ impl ExpiryState {
                     if v.as_any().is::<ExpiryTask>() {
                         let v = v.as_any().downcast_ref::<ExpiryTask>().expect("ExpiryTask downcast failed");
                         //debug!("lifecycle expiry worker received task: {:?}", v.obj_info);
-                        if !v.obj_info.transitioned_object.status.is_empty() {
-                            apply_expiry_on_transitioned_object(api.clone(), &v.obj_info, &v.event, &v.src).await;
+                        let trace = LifecycleExpiryTrace::for_object(&v.obj_info, &v.event, &v.src, 1);
+                        trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
+                        let deleted = if !v.obj_info.transitioned_object.status.is_empty() {
+                            apply_expiry_on_transitioned_object(api.clone(), &v.obj_info, &v.event, &v.src).await
                         } else {
-                            apply_expiry_on_non_transitioned_objects(api.clone(), &v.obj_info, &v.event, &v.src).await;
+                            apply_expiry_on_non_transitioned_objects(api.clone(), &v.obj_info, &v.event, &v.src).await
+                        };
+                        if deleted {
+                            trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
+                        } else {
+                            trace.emit(
+                                EVENT_LIFECYCLE_DELETE_FAILED,
+                                "delete_failed",
+                                Some("delete_operation_failed"),
+                            );
                         }
                     }
                     else if v.as_any().is::<NewerNoncurrentTask>() {
                         let v = v.as_any().downcast_ref::<NewerNoncurrentTask>().expect("NewerNoncurrentTask downcast failed");
+                        let version_count = u64::try_from(v.versions.len()).unwrap_or(u64::MAX);
+                        let trace = LifecycleExpiryTrace::for_batch(&v.bucket, &v.event, &v.src, version_count);
+                        trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
                         crate::client::object_handlers_common::delete_object_versions(&api, &v.bucket, &v.versions, v.event.clone()).await;
+                        trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
                     }
                     else if v.as_any().is::<Jentry>() {
                         let v = v.as_any().downcast_ref::<Jentry>().expect("Jentry downcast failed");
@@ -4341,11 +4464,11 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, FreeVersionTask, ManualTransitionQueueSnapshot, ManualTransitionRunOptions,
-        ManualTransitionRunReport, StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
-        TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule,
-        TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
-        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EXPIRED_DETECTED, EVENT_LIFECYCLE_NOT_ENQUEUED, ExpiryState,
+        FreeVersionTask, ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
+        StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
+        TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject,
+        VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report,
         eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
@@ -4355,7 +4478,7 @@ mod tests {
         persist_manual_transition_page_checkpoint, recover_manual_transition_jobs, recover_manual_transition_jobs_once,
         replication_state_for_delete, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
         resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
-        select_restore_s3_location, set_recovered_free_version_enqueue_observer,
+        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
         should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
         transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
     };
@@ -5263,6 +5386,14 @@ mod tests {
     #[serial]
     async fn expiry_enqueue_reports_missed_without_worker_channel() {
         let before = global_metrics().report().await.lifecycle_expiry;
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observer_events = Arc::clone(&observed);
+        let _observer = set_lifecycle_observability_observer(move |event, state, reason| {
+            observer_events
+                .lock()
+                .expect("observability test events should not poison")
+                .push((event, state, reason));
+        });
         let state = ExpiryState::new();
         let mut state = state.write().await;
         let object = ObjectInfo {
@@ -5281,6 +5412,9 @@ mod tests {
         assert_eq!(state.stats.missed_tasks(), 1);
         let after = global_metrics().report().await.lifecycle_expiry;
         assert!(after.scanner_missed >= before.scanner_missed.saturating_add(1));
+        let observed = observed.lock().expect("observability test events should not poison");
+        assert!(observed.contains(&(EVENT_LIFECYCLE_EXPIRED_DETECTED, "detected", None)));
+        assert!(observed.contains(&(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("worker_unavailable"))));
     }
 
     #[tokio::test]
@@ -5352,7 +5486,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expiry_enqueue_reports_missed_when_worker_queue_full() {
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observer_events = Arc::clone(&observed);
+        let _observer = set_lifecycle_observability_observer(move |event, state, reason| {
+            observer_events
+                .lock()
+                .expect("observability test events should not poison")
+                .push((event, state, reason));
+        });
         let state = ExpiryState::new_with_unconsumed_worker_channel(1);
         let mut state = state.write().await;
         let object = ObjectInfo {
@@ -5372,6 +5515,15 @@ mod tests {
         assert!(!second);
         assert_eq!(state.stats.pending_tasks(), 1);
         assert_eq!(state.stats.missed_tasks(), 1);
+        let observed = observed.lock().expect("observability test events should not poison");
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(event, state, _)| *event == EVENT_LIFECYCLE_EXPIRED_DETECTED && *state == "detected")
+                .count(),
+            2
+        );
+        assert!(observed.contains(&(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("queue_full"))));
     }
 
     #[tokio::test]
