@@ -468,6 +468,12 @@ pub struct ScannerLifecycleExpirySnapshot {
     pub scanner_queued: u64,
     #[serde(rename = "scanner_missed", default)]
     pub scanner_missed: u64,
+    #[serde(rename = "scanner_blocked", default)]
+    pub scanner_blocked: u64,
+    #[serde(rename = "scanner_not_enqueued", default)]
+    pub scanner_not_enqueued: u64,
+    #[serde(rename = "delete_failed", default)]
+    pub delete_failed: u64,
 }
 
 impl ScannerLifecycleExpirySnapshot {
@@ -479,6 +485,9 @@ impl ScannerLifecycleExpirySnapshot {
         self.queue_missed = self.queue_missed.saturating_add(other.queue_missed);
         self.scanner_queued = self.scanner_queued.saturating_add(other.scanner_queued);
         self.scanner_missed = self.scanner_missed.saturating_add(other.scanner_missed);
+        self.scanner_blocked = self.scanner_blocked.saturating_add(other.scanner_blocked);
+        self.scanner_not_enqueued = self.scanner_not_enqueued.saturating_add(other.scanner_not_enqueued);
+        self.delete_failed = self.delete_failed.saturating_add(other.delete_failed);
     }
 }
 
@@ -1508,6 +1517,9 @@ mod tests {
                 queue_missed: 3,
                 scanner_queued: 5,
                 scanner_missed: 2,
+                scanner_blocked: 4,
+                scanner_not_enqueued: 1,
+                delete_failed: 1,
             },
             lifecycle_transition: ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 8,
@@ -1541,6 +1553,9 @@ mod tests {
                 queue_missed: 2,
                 scanner_queued: 6,
                 scanner_missed: 4,
+                scanner_blocked: 7,
+                scanner_not_enqueued: 5,
+                delete_failed: 2,
             },
             lifecycle_transition: ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 4,
@@ -1567,6 +1582,9 @@ mod tests {
         assert_eq!(scanner.lifecycle_expiry.queue_missed, 5);
         assert_eq!(scanner.lifecycle_expiry.scanner_queued, 11);
         assert_eq!(scanner.lifecycle_expiry.scanner_missed, 6);
+        assert_eq!(scanner.lifecycle_expiry.scanner_blocked, 11);
+        assert_eq!(scanner.lifecycle_expiry.scanner_not_enqueued, 6);
+        assert_eq!(scanner.lifecycle_expiry.delete_failed, 3);
         assert_eq!(scanner.lifecycle_transition.current_queue_capacity, 12);
         assert_eq!(scanner.lifecycle_transition.current_queued, 5);
         assert_eq!(scanner.lifecycle_transition.current_active, 3);
