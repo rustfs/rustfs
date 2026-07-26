@@ -192,6 +192,9 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             queue_missed: metrics.lifecycle_expiry.queue_missed,
             scanner_queued: metrics.lifecycle_expiry.scanner_queued,
             scanner_missed: metrics.lifecycle_expiry.scanner_missed,
+            scanner_blocked: metrics.lifecycle_expiry.scanner_blocked,
+            scanner_not_enqueued: metrics.lifecycle_expiry.scanner_not_enqueued,
+            delete_failed: metrics.lifecycle_expiry.delete_failed,
         },
         usage_freshness: MadminScannerUsageFreshnessSnapshot {
             dirty_pending_buckets: metrics.usage_freshness.dirty_pending_buckets,
@@ -646,6 +649,9 @@ mod test {
                 queue_missed: 3,
                 scanner_queued: 6,
                 scanner_missed: 2,
+                scanner_blocked: 4,
+                scanner_not_enqueued: 2,
+                delete_failed: 1,
             },
             lifecycle_transition: rustfs_common::metrics::ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 16,
@@ -672,6 +678,9 @@ mod test {
         assert_eq!(scanner.lifecycle_expiry.queue_missed, 3);
         assert_eq!(scanner.lifecycle_expiry.scanner_queued, 6);
         assert_eq!(scanner.lifecycle_expiry.scanner_missed, 2);
+        assert_eq!(scanner.lifecycle_expiry.scanner_blocked, 4);
+        assert_eq!(scanner.lifecycle_expiry.scanner_not_enqueued, 2);
+        assert_eq!(scanner.lifecycle_expiry.delete_failed, 1);
         assert_eq!(scanner.lifecycle_transition.current_queue_capacity, 16);
         assert_eq!(scanner.lifecycle_transition.current_queued, 5);
         assert_eq!(scanner.lifecycle_transition.current_active, 2);
