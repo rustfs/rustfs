@@ -1741,10 +1741,19 @@ mod tests {
                 ..Default::default()
             },
         );
+        let other_bucket = manual_transition_scope_key(
+            "bucket-b",
+            &ManualTransitionRunOptions {
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(broad, nested);
         assert_eq!(broad, disjoint);
         assert_ne!(broad, dry_run);
+        assert_ne!(broad, other_bucket);
     }
 
     #[test]
