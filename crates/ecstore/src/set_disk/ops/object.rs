@@ -2671,7 +2671,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
-        let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
+        // Instance-scoped, not the ambient facade (backlog#1052) — see
+        // new_ns_lock. The same applies to the versioning and bucket-metadata
+        // lookups below: resolving them through the first published
+        // instance's context would let a second in-process store delete with
+        // the wrong versioning semantics or skip the object-lock gate.
+        let dist_erasure = self.ctx.is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
         if opts.no_lock {
@@ -2716,7 +2721,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        let ver_cfg = BucketVersioningSys::get(bucket).await.unwrap_or_default();
+        let ver_cfg = BucketVersioningSys::get_in(&self.ctx, bucket).await.unwrap_or_default();
 
         // backlog#929 (HP-8): the per-object stat below exists solely to feed
         // check_object_lock_delete (#4297). Resolve the bucket lock
@@ -2724,7 +2729,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // for buckets without Object Lock; unknown metadata fails closed and
         // keeps the stat, so the #4297 protection is preserved verbatim for
         // every object-lock-enabled bucket.
-        let object_lock_checks_required = object_lock_delete_check_required(metadata_sys::get(bucket).await.ok().as_deref());
+        let object_lock_checks_required =
+            object_lock_delete_check_required(metadata_sys::get_in(&self.ctx, bucket).await.ok().as_deref());
 
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
 
@@ -4098,11 +4104,57 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         hermetic_set_disks_with_lockers(disk_count, pool_index, default_parity_count, Vec::new()).await
     }
 
+    /// Like [`hermetic_set_disks`], but binds the set to an isolated instance
+    /// context pinned to plain erasure. `#[serial]` tests elsewhere flip the
+    /// shared bootstrap context to DistErasure (`SetupTypeGuard`) while
+    /// non-serial hermetic tests run; on the shared context such a window
+    /// reroutes locking onto the empty dist locker list ("No lock clients
+    /// available") and the batch-delete gate onto the dist path. Only suitable
+    /// for tests that never touch context-resolved services registered on the
+    /// ambient context (tier config manager, expiry state, ...), because the
+    /// isolated context starts every one of those cells fresh.
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks_isolated(
+        disk_count: usize,
+    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+        hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, disk_count / 2).await
+    }
+
+    /// Pool-parameterized variant of [`hermetic_set_disks_isolated`] with the
+    /// same isolation contract.
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks_for_pool_with_default_parity_isolated(
+        disk_count: usize,
+        pool_index: usize,
+        default_parity_count: usize,
+    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+        let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        isolated_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+            .await;
+        hermetic_set_disks_with_lockers_and_ctx(disk_count, pool_index, default_parity_count, Vec::new(), isolated_ctx).await
+    }
+
     pub(in crate::set_disk::ops) async fn hermetic_set_disks_with_lockers(
         disk_count: usize,
         pool_index: usize,
         default_parity_count: usize,
         lockers: Vec<Arc<dyn LockClient>>,
+    ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+        hermetic_set_disks_with_lockers_and_ctx(
+            disk_count,
+            pool_index,
+            default_parity_count,
+            lockers,
+            crate::runtime::instance::bootstrap_ctx(),
+        )
+        .await
+    }
+
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks_with_lockers_and_ctx(
+        disk_count: usize,
+        pool_index: usize,
+        default_parity_count: usize,
+        lockers: Vec<Arc<dyn LockClient>>,
+        instance_ctx: Arc<crate::runtime::instance::InstanceContext>,
     ) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
@@ -4119,7 +4171,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             disks.push(Some(disk));
         }
 
-        let set_disks = SetDisks::new(
+        let set_disks = SetDisks::new_with_instance_ctx(
             "hermetic-ops-test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
             disk_count,
@@ -4129,6 +4181,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
             endpoints,
             format,
             lockers,
+            instance_ctx,
         )
         .await;
 
@@ -4237,7 +4290,7 @@ mod get_object_downstream_close_accounting_tests {
 
 #[cfg(test)]
 mod metadata_mutation_generation_tests {
-    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::disk::DiskAPI as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
@@ -6587,7 +6640,7 @@ mod transition_source_identity_matrix_tests {
 
 #[cfg(test)]
 mod heterogeneous_pool_put_tests {
-    use super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity;
+    use super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity;
     use super::*;
     use crate::config::storageclass::lookup_config_for_pools_without_env;
     use crate::disk::{DiskAPI as _, ReadOptions};
@@ -6647,7 +6700,7 @@ mod put_object_tmp_cleanup_tests {
     //! response path), while a failed PUT must still clean its tmp shards
     //! inline before returning.
 
-    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::disk::DiskAPI as _;
     use std::time::Duration;
@@ -6749,7 +6802,7 @@ mod put_object_tags_early_stop_regression_tests {
     //! with early-stop enabled, the tag must land on EVERY online disk's xl.meta,
     //! not a read-quorum subset.
 
-    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::disk::{DiskAPI as _, ReadOptions};
 
@@ -6811,7 +6864,8 @@ mod delete_objects_lock_gating_tests {
     //! locked-stat path and prove the #4297 delete protection is intact end to
     //! end, while per-key result mapping of mixed batches stays stable.
 
-    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
+    use super::hermetic_set_disks_support::hermetic_set_disks_with_lockers_and_ctx;
     use super::*;
     use crate::disk::DiskAPI as _;
 
@@ -6941,6 +6995,63 @@ mod delete_objects_lock_gating_tests {
             .get_object_info(bucket, "plain", &ObjectOptions::default())
             .await
             .expect_err("plain object must be deleted");
+    }
+
+    /// Pins the dist-erasure resolution SOURCE for the batch-delete lock gate
+    /// (adversarial review): the decision must come from the set's own
+    /// instance context. With a DistErasure context and no dist lockers the
+    /// batch must fail closed on lock acquisition; ambient resolution
+    /// (non-dist in this process) would take local locks and let the delete
+    /// through.
+    #[tokio::test]
+    async fn delete_objects_dist_gate_uses_set_instance_context() {
+        let dist_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        dist_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+            .await;
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers_and_ctx(4, 0, 2, Vec::new(), dist_ctx).await;
+        let bucket = "dist-gate-ctx-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        // The put must bypass locking: with a DistErasure context and no
+        // lockers, every namespace lock acquisition fails closed by design.
+        let mut reader = PutObjReader::from_vec(vec![5u8; 256]);
+        set_disks
+            .put_object(
+                bucket,
+                "obj",
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("object should be written without locks");
+
+        let objects = vec![ObjectToDelete {
+            object_name: "obj".to_string(),
+            ..Default::default()
+        }];
+        let (_deleted, errs) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+
+        assert!(
+            errs[0].is_some(),
+            "the dist gate resolved from the set's own context must fail closed on an empty locker list"
+        );
+        set_disks
+            .get_object_info(
+                bucket,
+                "obj",
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("object must survive the failed batch delete");
     }
 
     #[tokio::test]

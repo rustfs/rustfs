@@ -4596,12 +4596,19 @@ mod tests {
     }
 
     async fn make_test_set_disks(lockers: Vec<Arc<dyn LockClient>>) -> Arc<SetDisks> {
+        make_test_set_disks_with_ctx(lockers, bootstrap_ctx()).await
+    }
+
+    async fn make_test_set_disks_with_ctx(
+        lockers: Vec<Arc<dyn LockClient>>,
+        instance_ctx: Arc<InstanceContext>,
+    ) -> Arc<SetDisks> {
         let endpoints = vec![
             Endpoint::try_from("http://127.0.0.1:9000/data").expect("first endpoint should parse"),
             Endpoint::try_from("http://127.0.0.1:9001/data").expect("second endpoint should parse"),
         ];
 
-        SetDisks::new(
+        SetDisks::new_with_instance_ctx(
             "test-owner".to_string(),
             Arc::new(RwLock::new(vec![None, None])),
             2,
@@ -4611,8 +4618,51 @@ mod tests {
             endpoints,
             FormatV3::new(1, 2),
             lockers,
+            instance_ctx,
         )
         .await
+    }
+
+    /// Pins the dist-erasure resolution SOURCE for `new_ns_lock` (adversarial
+    /// review): the lock strategy must come from the set's own instance
+    /// context, never the ambient facade — otherwise another in-process
+    /// instance (or a concurrent test's ambient DistErasure window) reroutes
+    /// this set's locking onto the wrong strategy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_ns_lock_resolves_dist_from_set_instance_context() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let locker: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+
+        let dist_ctx = Arc::new(InstanceContext::new());
+        dist_ctx.update_erasure_type(SetupType::DistErasure).await;
+        let dist_set = make_test_set_disks_with_ctx(vec![locker.clone()], dist_ctx).await;
+        let dist_guard = dist_set
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_read_lock(Duration::from_millis(500))
+            .await
+            .expect("dist read lock should succeed with one healthy locker");
+        assert!(
+            matches!(dist_guard, NamespaceLockGuard::Standard(_)),
+            "a DistErasure instance context must select the distributed lock strategy"
+        );
+        drop(dist_guard);
+
+        let local_ctx = Arc::new(InstanceContext::new());
+        local_ctx.update_erasure_type(SetupType::Erasure).await;
+        let local_set = make_test_set_disks_with_ctx(vec![locker], local_ctx).await;
+        let local_guard = local_set
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_read_lock(Duration::from_millis(500))
+            .await
+            .expect("local read lock should succeed");
+        assert!(
+            matches!(local_guard, NamespaceLockGuard::Fast(_)),
+            "a plain-erasure instance context must select the local lock strategy"
+        );
     }
 
     struct SetupTypeGuard {
