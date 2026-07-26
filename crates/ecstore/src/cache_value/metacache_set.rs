@@ -267,6 +267,23 @@ impl Clone for ListPathRawOptions {
     }
 }
 
+fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
+    WalkDirOptions {
+        bucket: opts.bucket.clone(),
+        base_dir: opts.path.clone(),
+        recursive: opts.recursive,
+        incl_deleted: opts.incl_deleted,
+        report_notfound: opts.report_not_found,
+        filter_prefix: opts.filter_prefix.clone(),
+        forward_to: opts.forward_to.clone(),
+        limit: opts.per_disk_limit,
+        skip_total_timeout: opts.skip_walkdir_total_timeout,
+        timeout_ms: opts.walkdir_timeout.map(duration_millis),
+        stall_timeout_ms: opts.walkdir_stall_timeout.map(duration_millis),
+        ..Default::default()
+    }
+}
+
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
@@ -373,20 +390,7 @@ async fn list_path_raw_inner(
                 None
             };
 
-            let wakl_opts = WalkDirOptions {
-                bucket: opts_clone.bucket.clone(),
-                base_dir: opts_clone.path.clone(),
-                recursive: opts_clone.recursive,
-                incl_deleted: opts_clone.incl_deleted,
-                report_notfound: opts_clone.report_not_found,
-                filter_prefix: opts_clone.filter_prefix.clone(),
-                forward_to: opts_clone.forward_to.clone(),
-                limit: opts_clone.per_disk_limit,
-                skip_total_timeout: opts_clone.skip_walkdir_total_timeout,
-                timeout_ms: opts_clone.walkdir_timeout.map(duration_millis),
-                stall_timeout_ms: opts_clone.walkdir_stall_timeout.map(duration_millis),
-                ..Default::default()
-            };
+            let wakl_opts = walk_dir_options(&opts_clone);
 
             let mut need_fallback = false;
             let mut last_err = None;
@@ -559,27 +563,7 @@ async fn list_path_raw_inner(
                 }
 
                 let fallback_walk_started = std::time::Instant::now();
-                match disk
-                    .as_ref()
-                    .walk_dir(
-                        WalkDirOptions {
-                            bucket: opts_clone.bucket.clone(),
-                            base_dir: opts_clone.path.clone(),
-                            recursive: opts_clone.recursive,
-                            incl_deleted: opts_clone.incl_deleted,
-                            report_notfound: opts_clone.report_not_found,
-                            filter_prefix: opts_clone.filter_prefix.clone(),
-                            forward_to: opts_clone.forward_to.clone(),
-                            limit: opts_clone.per_disk_limit,
-                            skip_total_timeout: opts_clone.skip_walkdir_total_timeout,
-                            timeout_ms: opts_clone.walkdir_timeout.map(duration_millis),
-                            stall_timeout_ms: opts_clone.walkdir_stall_timeout.map(duration_millis),
-                            ..Default::default()
-                        },
-                        &mut wr,
-                    )
-                    .await
-                {
+                match disk.as_ref().walk_dir(walk_dir_options(&opts_clone), &mut wr).await {
                     Ok(_r) => {
                         rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_fallback",
@@ -1089,6 +1073,19 @@ mod tests {
         // Any real error must keep the failure at ERROR severity.
         assert!(!is_benign_not_found_listing_failure(&[DiskError::VolumeNotFound, DiskError::Timeout,]));
         assert!(!is_benign_not_found_listing_failure(&[DiskError::DiskNotFound]));
+    }
+
+    #[test]
+    fn walk_dir_options_preserve_zero_total_and_inherited_stall_timeouts() {
+        let options = walk_dir_options(&ListPathRawOptions {
+            walkdir_timeout: Some(Duration::ZERO),
+            walkdir_stall_timeout: None,
+            ..Default::default()
+        });
+
+        assert_eq!(options.timeout_ms, Some(0));
+        assert_eq!(options.stall_timeout_ms, None);
+        assert!(!options.skip_total_timeout);
     }
 
     #[tokio::test]

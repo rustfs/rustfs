@@ -39,7 +39,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{KeyValue, any_value::Value as AnyValue};
-use opentelemetry_proto::tonic::metrics::v1::{Metric, metric, number_data_point};
+use opentelemetry_proto::tonic::metrics::v1::{
+    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+};
 use prost::Message;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
@@ -66,8 +68,10 @@ type MetricValues = Arc<Mutex<BTreeMap<String, MetricPointVersions>>>;
 const KIB: usize = 1024;
 const READER_PATH_COUNTER: &str = "rustfs_io_get_object_reader_path_by_size_total";
 const MSGPACK_JSON_FALLBACK_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
+const MSGPACK_JSON_DECODE_ERROR_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const DIRECTION_LABEL: &str = "direction";
 const MESSAGE_LABEL: &str = "message";
+const CODEC_LABEL: &str = "codec";
 const INLINE_DIRECT: &str = "inline_direct";
 const LEGACY_DUPLEX: &str = "legacy_duplex";
 const EMPTY: &str = "empty";
@@ -80,6 +84,8 @@ const RANGE: &str = "range";
 const REMOTE: &str = "remote";
 const FALLBACK_REQUEST_DIRECTION: &str = "request";
 const FALLBACK_RESPONSE_DIRECTION: &str = "response";
+const MSGPACK_CODEC_MSGPACK: &str = "msgpack";
+const MSGPACK_CODEC_JSON: &str = "json";
 const MPU_PART_1_SIZE: usize = 5 * 1024 * 1024;
 const MPU_PART_2_SIZE: usize = 16 * KIB;
 const TIER_BUCKET: &str = "inline-fallback-cold-tier";
@@ -90,6 +96,7 @@ const MSGPACK_FALLBACK_CONTROL_SERIES: [(&str, &str); 4] = [
     (FALLBACK_REQUEST_DIRECTION, "BatchReadVersionReq"),
     (FALLBACK_RESPONSE_DIRECTION, "BatchReadVersionResp"),
 ];
+const MSGPACK_DECODE_ERROR_CODECS: [&str; 2] = [MSGPACK_CODEC_MSGPACK, MSGPACK_CODEC_JSON];
 const READER_SIZE_BUCKETS: [&str; 9] = [
     "le_4kib",
     "le_16kib",
@@ -136,6 +143,7 @@ struct OtlpMetricCollector {
     endpoint: String,
     values: MetricValues,
     fallback_values: MetricValues,
+    decode_error_values: MetricValues,
     task: JoinHandle<()>,
 }
 
@@ -145,8 +153,10 @@ impl OtlpMetricCollector {
         let endpoint = format!("http://{}/v1/metrics", listener.local_addr()?);
         let values = Arc::new(Mutex::new(BTreeMap::new()));
         let fallback_values = Arc::new(Mutex::new(BTreeMap::new()));
+        let decode_error_values = Arc::new(Mutex::new(BTreeMap::new()));
         let task_values = values.clone();
         let task_fallback_values = fallback_values.clone();
+        let task_decode_error_values = decode_error_values.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -154,11 +164,19 @@ impl OtlpMetricCollector {
                 };
                 let values = task_values.clone();
                 let fallback_values = task_fallback_values.clone();
+                let decode_error_values = task_decode_error_values.clone();
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(
                             TokioIo::new(stream),
-                            service_fn(move |request| handle_metric_export(request, values.clone(), fallback_values.clone())),
+                            service_fn(move |request| {
+                                handle_metric_export(
+                                    request,
+                                    values.clone(),
+                                    fallback_values.clone(),
+                                    decode_error_values.clone(),
+                                )
+                            }),
                         )
                         .await;
                 });
@@ -168,6 +186,7 @@ impl OtlpMetricCollector {
             endpoint,
             values,
             fallback_values,
+            decode_error_values,
             task,
         })
     }
@@ -199,6 +218,15 @@ impl OtlpMetricCollector {
 
     async fn msgpack_json_fallback_totals(&self) -> BTreeMap<String, u64> {
         self.fallback_values
+            .lock()
+            .await
+            .iter()
+            .map(|(key, points)| (key.clone(), points.values().map(|(_, value)| value).sum()))
+            .collect()
+    }
+
+    async fn msgpack_json_decode_error_totals(&self) -> BTreeMap<String, u64> {
+        self.decode_error_values
             .lock()
             .await
             .iter()
@@ -275,6 +303,7 @@ async fn handle_metric_export(
     request: Request<Incoming>,
     values: MetricValues,
     fallback_values: MetricValues,
+    decode_error_values: MetricValues,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.uri().path() != "/v1/metrics" {
         return Ok(response(StatusCode::NOT_FOUND));
@@ -306,8 +335,10 @@ async fn handle_metric_export(
         Ok(export) => {
             let mut values = values.lock().await;
             let mut fallback_values = fallback_values.lock().await;
+            let mut decode_error_values = decode_error_values.lock().await;
             record_reader_path_metrics(&export, &mut values);
             record_msgpack_fallback_metrics(&export, &mut fallback_values);
+            record_msgpack_decode_error_metrics(&export, &mut decode_error_values);
             Ok(response(StatusCode::OK))
         }
         Err(_) => Ok(response(StatusCode::BAD_REQUEST)),
@@ -373,20 +404,45 @@ fn record_reader_path_metric(metric: &Metric, values: &mut BTreeMap<String, Metr
 }
 
 fn record_msgpack_fallback_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    record_msgpack_counter_metrics(export, MSGPACK_JSON_FALLBACK_COUNTER, values, |attributes| {
+        let direction = attribute_string(attributes, DIRECTION_LABEL)?;
+        let message = attribute_string(attributes, MESSAGE_LABEL)?;
+        Some(msgpack_fallback_metric_key(direction, message))
+    });
+}
+
+fn msgpack_fallback_metric_key(direction: &str, message: &str) -> String {
+    format!("{direction}\u{1f}{message}")
+}
+
+fn record_msgpack_decode_error_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    record_msgpack_counter_metrics(export, MSGPACK_JSON_DECODE_ERROR_COUNTER, values, |attributes| {
+        let direction = attribute_string(attributes, DIRECTION_LABEL)?;
+        let message = attribute_string(attributes, MESSAGE_LABEL)?;
+        let codec = attribute_string(attributes, CODEC_LABEL)?;
+        Some(msgpack_decode_error_metric_key(direction, message, codec))
+    });
+}
+
+fn record_msgpack_counter_metrics<F>(
+    export: &ExportMetricsServiceRequest,
+    counter_name: &str,
+    values: &mut BTreeMap<String, MetricPointVersions>,
+    metric_key: F,
+) where
+    F: Fn(&[KeyValue]) -> Option<String>,
+{
     for resource_metrics in &export.resource_metrics {
         for scope_metrics in &resource_metrics.scope_metrics {
             for metric in &scope_metrics.metrics {
-                if metric.name != MSGPACK_JSON_FALLBACK_COUNTER {
+                if metric.name != counter_name {
                     continue;
                 }
                 let Some(metric::Data::Sum(sum)) = &metric.data else {
                     continue;
                 };
                 for point in &sum.data_points {
-                    let Some(direction) = attribute_string(&point.attributes, DIRECTION_LABEL) else {
-                        continue;
-                    };
-                    let Some(message) = attribute_string(&point.attributes, MESSAGE_LABEL) else {
+                    let Some(key) = metric_key(&point.attributes) else {
                         continue;
                     };
                     let Some(number_data_point::Value::AsInt(value)) = point.value.as_ref() else {
@@ -394,7 +450,7 @@ fn record_msgpack_fallback_metrics(export: &ExportMetricsServiceRequest, values:
                     };
                     let value = u64::try_from(*value).unwrap_or_default();
                     values
-                        .entry(msgpack_fallback_metric_key(direction, message))
+                        .entry(key)
                         .or_default()
                         .entry(point.start_time_unix_nano)
                         .and_modify(|current| {
@@ -409,8 +465,8 @@ fn record_msgpack_fallback_metrics(export: &ExportMetricsServiceRequest, values:
     }
 }
 
-fn msgpack_fallback_metric_key(direction: &str, message: &str) -> String {
-    format!("{direction}\u{1f}{message}")
+fn msgpack_decode_error_metric_key(direction: &str, message: &str, codec: &str) -> String {
+    format!("{direction}\u{1f}{message}\u{1f}{codec}")
 }
 
 async fn assert_msgpack_fallback_unchanged(
@@ -432,6 +488,27 @@ async fn assert_msgpack_fallback_unchanged(
     Ok(())
 }
 
+async fn assert_msgpack_decode_errors_unchanged(
+    collector: &OtlpMetricCollector,
+    before: &BTreeMap<String, u64>,
+    series: &[(&str, &str)],
+) -> TestResult {
+    let after = collector.msgpack_json_decode_error_totals().await;
+    for &(direction, message) in series {
+        for &codec in &MSGPACK_DECODE_ERROR_CODECS {
+            let key = msgpack_decode_error_metric_key(direction, message, codec);
+            assert_eq!(
+                before.get(&key).copied().unwrap_or_default(),
+                after.get(&key).copied().unwrap_or_default(),
+                "decode-error counter changed for {direction}/{message}/{codec}: before={:?}, after={:?}",
+                before.get(&key),
+                after.get(&key),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<&'a str> {
     attributes.iter().find_map(|attribute| {
         if attribute.key != wanted_key {
@@ -442,6 +519,52 @@ fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<
             _ => None,
         }
     })
+}
+
+#[test]
+fn records_msgpack_decode_error_metric_with_codec_label() {
+    let export = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: MSGPACK_JSON_DECODE_ERROR_COUNTER.to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![
+                                metric_attribute(DIRECTION_LABEL, FALLBACK_REQUEST_DIRECTION),
+                                metric_attribute(MESSAGE_LABEL, "ReadMultipleReq"),
+                                metric_attribute(CODEC_LABEL, MSGPACK_CODEC_JSON),
+                            ],
+                            start_time_unix_nano: 7,
+                            time_unix_nano: 11,
+                            value: Some(number_data_point::Value::AsInt(3)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut values = BTreeMap::new();
+
+    record_msgpack_decode_error_metrics(&export, &mut values);
+
+    let key = msgpack_decode_error_metric_key(FALLBACK_REQUEST_DIRECTION, "ReadMultipleReq", MSGPACK_CODEC_JSON);
+    assert_eq!(values.get(&key).and_then(|points| points.get(&7)).copied(), Some((11, 3)));
+}
+
+fn metric_attribute(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+            value: Some(AnyValue::StringValue(value.to_string())),
+        }),
+        ..Default::default()
+    }
 }
 
 fn boundary_cases(state: VersionState) -> Vec<BoundaryCase> {
@@ -1159,6 +1282,66 @@ fn is_retryable_add_tier_error(response: &str) -> bool {
     response.contains("Remote tier configuration is already being replaced")
 }
 
+async fn start_manual_transition_job(hot: &RustFSTestClusterEnvironment, bucket: &str) -> TestResult<String> {
+    let path = format!("/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&async=true&dryRun=true&maxObjects=1");
+    let (status, response) =
+        signed_admin_request(&hot.nodes[0].url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "async manual transition run must be accepted: {}",
+        compact_body(&response)
+    );
+    let value: serde_json::Value = serde_json::from_str(&response)?;
+    assert_eq!(
+        value["state"].as_str(),
+        Some("accepted"),
+        "manual transition run state changed: {response}"
+    );
+    assert_eq!(
+        value["mode"].as_str(),
+        Some("durable_job"),
+        "manual transition run mode changed: {response}"
+    );
+    value["job_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("manual transition run response omitted job_id: {response}").into())
+}
+
+async fn wait_for_manual_transition_job_terminal(
+    hot: &RustFSTestClusterEnvironment,
+    node_index: usize,
+    job_id: &str,
+    retry_missing: bool,
+) -> TestResult<serde_json::Value> {
+    let path = format!("/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, response) =
+            signed_admin_request(&hot.nodes[node_index].url, Method::GET, &path, None, &hot.access_key, &hot.secret_key).await?;
+        if retry_missing && status == StatusCode::NOT_FOUND && Instant::now() < deadline {
+            sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "manual transition job status read failed: {}",
+            compact_body(&response)
+        );
+        let value: serde_json::Value = serde_json::from_str(&response)?;
+        match value["status"].as_str() {
+            Some("running") if Instant::now() < deadline => sleep(Duration::from_millis(200)).await,
+            Some("running") => {
+                return Err(format!("manual transition job {job_id} stayed running for 30s: {response}").into());
+            }
+            Some(_) => return Ok(value),
+            None => return Err(format!("manual transition job status response omitted status: {response}").into()),
+        }
+    }
+}
+
 fn transition_rule(tier_name: &str) -> TestResult<LifecycleRule> {
     Ok(LifecycleRule::builder()
         .id("inline-fallback-transition")
@@ -1478,6 +1661,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     cluster.start().await?;
 
     let fallback_before = collector.msgpack_json_fallback_totals().await;
+    let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
     let bucket = "inline-mixed-msgpack-controls";
     cluster.create_test_bucket(bucket).await?;
@@ -1502,6 +1686,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     )
     .await?;
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     let encrypted_key = "encrypted/sse-s3.bin";
     let encrypted_body = payload(16 * KIB, 0xE3);
@@ -1551,6 +1736,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     .await?;
 
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     Ok(())
 }
@@ -1598,6 +1784,62 @@ async fn four_node_add_tier_converges_after_offline_node_restart_without_second_
 
 #[tokio::test]
 #[serial]
+async fn four_node_manual_transition_job_status_survives_node_restart() -> TestResult {
+    init_logging();
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.start().await?;
+
+    let hot_client = hot.create_s3_client(0)?;
+    let bucket = format!("manual-transition-job-{}", Uuid::new_v4().simple());
+    hot_client.create_bucket().bucket(&bucket).send().await?;
+
+    let job_id = start_manual_transition_job(&hot, &bucket).await?;
+    let terminal = wait_for_manual_transition_job_terminal(&hot, 0, &job_id, false).await?;
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("completed"),
+        "dry-run manual transition job should complete: {terminal}"
+    );
+    assert_eq!(terminal["job_id"].as_str(), Some(job_id.as_str()));
+    assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(terminal["dry_run"].as_bool(), Some(true));
+
+    hot.stop_node(3)?;
+    hot.start_node(3).await?;
+    let after_restart = wait_for_manual_transition_job_terminal(&hot, 3, &job_id, true).await?;
+    assert_eq!(after_restart["status"], terminal["status"], "terminal job status changed after restart");
+    assert_eq!(after_restart["job_id"].as_str(), Some(job_id.as_str()));
+    assert_eq!(after_restart["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(after_restart["dry_run"].as_bool(), Some(true));
+
+    let missing_job_id = Uuid::new_v4();
+    let (missing_status, missing_body) = signed_admin_request(
+        &hot.nodes[3].url,
+        Method::GET,
+        &format!("/rustfs/admin/v3/ilm/transition/jobs/{missing_job_id}"),
+        None,
+        &hot.access_key,
+        &hot.secret_key,
+    )
+    .await?;
+    assert_eq!(
+        missing_status,
+        StatusCode::NOT_FOUND,
+        "unknown manual transition job must remain a 404 after restart: {}",
+        compact_body(&missing_body)
+    );
+    assert!(
+        missing_body.contains("<Code>NoSuchKey</Code>") || missing_body.contains("NoSuchKey"),
+        "unknown manual transition job should return NoSuchKey, body: {}",
+        compact_body(&missing_body)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_transition() -> TestResult {
     init_logging();
 
@@ -1621,6 +1863,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     let hot_client = hot.create_s3_client(0)?;
 
     let fallback_before = collector.msgpack_json_fallback_totals().await;
+    let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
     let tier_name = unique_tier_name();
     add_rustfs_tier(&hot, &cold, &tier_name).await?;
@@ -1696,6 +1939,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     .await?;
 
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     Ok(())
 }

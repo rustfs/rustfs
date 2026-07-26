@@ -120,6 +120,7 @@ mod tests {
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
         let _scanner_status_handler = scanner::ScannerStatusHandler {};
+        let _ilm_expiry_status_handler = scanner::IlmExpiryStatusHandler {};
         let _manual_transition_handler = ilm_transition::ManualTransitionRunHandler {};
         let _manual_transition_status_handler = ilm_transition::ManualTransitionJobStatusHandler {};
         let _manual_transition_cancel_handler = ilm_transition::ManualTransitionJobCancelHandler {};

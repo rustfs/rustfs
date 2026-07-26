@@ -10,7 +10,7 @@ optimization stage (grpc-optimization P0–P3). Every stage is env-gated, so "be
 
 ## One-click driver
 
-`scripts/run_internode_grpc_ab_bench.sh --stage <p0|p1|p2|p3> --phase <before|after> [-- <bench args>]`
+`scripts/run_internode_grpc_ab_bench.sh --stage <p0|p1|p2|p3> --phase <before|after|request-only|canary|rollback> [-- <bench args>]`
 wraps the env matrix below: it writes the stage/phase **server** env to
 `<out-dir>/server-env.sh`, then runs the right underlying bench into
 `target/bench/internode-transport/<stage>-<phase>/`.
@@ -21,11 +21,13 @@ scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase before -- --access-key
 scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase after  -- --access-key AK --secret-key SK --metrics-url http://node1:9000/metrics
 # P3 failover A/B (docker four-node):
 scripts/run_internode_grpc_ab_bench.sh --stage p3 --phase after
+# P2 rollout gates (env preview for request-only rehearsal, canary, and rollback):
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase request-only --dry-run
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase canary --dry-run
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase rollback --dry-run
 ```
 
-`RUSTFS_INTERNODE_*` are **server** env: for the load-driven stages (p0/p1/p2) source the emitted
-`server-env.sh` on every node and restart rustfs *before* the run — the driver cannot mutate an
-already-running server. Use `--dry-run` to preview the env and command.
+`RUSTFS_INTERNODE_*` are **server** env: for the load-driven stages (p0/p1/p2) source the emitted `server-env.sh` on every node and restart rustfs *before* the run — the driver cannot mutate an already-running server. The P2 `canary` phase is the exception: source it only on the selected canary node after the release-window counters and fleet-support checks pass, and keep the rest of the fleet on `before` or `request-only` while observing fallback/decode-error counters. Use `--dry-run` to preview the env and command.
 
 ## Harness
 
@@ -115,6 +117,7 @@ Artifact layout per stage (attach both halves + the diff):
 target/bench/internode-transport/
   p0-before/  p0-after/     # server-env.sh + object-bench summaries + metric deltas
   p1-before/  p1-after/     # + lock p99 delta (the ≥20% gate)
+  p2-before/  p2-request-only/  p2-canary/  p2-after/  p2-rollback/  # env gate artifacts + fallback/decode-error observations
   p3-before/  p3-after/     # cold-start + sustained-offline experiment + offline gauge trace
 ```
 
