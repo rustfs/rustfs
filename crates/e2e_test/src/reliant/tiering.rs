@@ -74,6 +74,7 @@ const MANUAL_ASYNC_STATUS_BUCKET: &str = "ilm7-manual-async-status";
 const MANUAL_CONTINUATION_BUCKET: &str = "ilm7-manual-continuation";
 const MANUAL_ASYNC_LIMIT_BUCKET: &str = "ilm7-manual-async-limit";
 const MANUAL_ASYNC_CONFLICT_BUCKET: &str = "ilm7-manual-async-conflict";
+const MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET: &str = "ilm7-manual-async-same-scope-conflict";
 const MANUAL_TIER_FAILURE_BUCKET: &str = "ilm7-manual-tier-failure";
 const MANUAL_WORKER_FAILURE_BUCKET: &str = "ilm7-manual-worker-failure";
 const MANUAL_ACTIVE_CANCEL_BUCKET: &str = "ilm7-manual-active-cancel";
@@ -82,6 +83,7 @@ const MANUAL_CONTINUATION_PREFIX: &str = "manual-continuation/";
 const MANUAL_ASYNC_LIMIT_PREFIX: &str = "manual-async-limit/";
 const MANUAL_ASYNC_CONFLICT_PREFIX: &str = "manual-async-conflict/";
 const MANUAL_ASYNC_CONFLICT_NESTED_PREFIX: &str = "manual-async-conflict/nested/";
+const MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX: &str = "manual-async-same-scope-conflict/";
 const MANUAL_TIER_FAILURE_PREFIX: &str = "manual-tier-failure/";
 const MANUAL_WORKER_FAILURE_PREFIX: &str = "manual-worker-failure/";
 const MANUAL_ACTIVE_CANCEL_PREFIX: &str = "manual-active-cancel/";
@@ -1070,6 +1072,128 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     );
     assert_eq!(terminal.report.transition_failed, 0, "terminal conflict winner response: {terminal:#?}");
     assert_eq!(terminal.report.tier_failure, 0, "terminal conflict winner response: {terminal:#?}");
+    assert!(cold_tier_object_count(&cold_client).await? <= 50);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_async_same_scope_conflict_reports_active_job() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualasyncsameconflictcoldadmin".to_string();
+    cold.secret_key = "manualasyncsameconflictcoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client
+        .create_bucket()
+        .bucket(MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET)
+        .send()
+        .await?;
+    for idx in 0..50 {
+        let key = format!("{MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX}obj-{idx:02}");
+        put_single_part_object(
+            &hot_client,
+            MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET,
+            &key,
+            b"async same-scope conflict payload",
+        )
+        .await?;
+    }
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET,
+        "manual-async-same-scope-conflict",
+        MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX,
+        0,
+    )
+    .await?;
+
+    let (first, second) = tokio::join!(
+        manual_transition_async_run_raw(
+            &hot,
+            MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET,
+            MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX,
+            false,
+            50
+        ),
+        manual_transition_async_run_raw(
+            &hot,
+            MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET,
+            MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX,
+            false,
+            50
+        )
+    );
+    let responses = [first?, second?];
+    let accepted = responses
+        .iter()
+        .find(|(status, _)| *status == reqwest::StatusCode::ACCEPTED)
+        .ok_or("one concurrent same-scope async run must be accepted")?;
+    let conflict = responses
+        .iter()
+        .find(|(status, _)| *status == reqwest::StatusCode::CONFLICT)
+        .ok_or("one concurrent same-scope async run must report conflict")?;
+
+    let accepted: ManualTransitionRunResponse = serde_json::from_str(&accepted.1)?;
+    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict.1)?;
+    let job_id = accepted
+        .job_id
+        .as_deref()
+        .ok_or("accepted same-scope async response must include job_id")?;
+    let status_endpoint = accepted
+        .status_endpoint
+        .as_deref()
+        .ok_or("accepted same-scope async response must include status_endpoint")?;
+
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.mode, "durable_job");
+    assert_eq!(accepted.report.bucket, MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET);
+    assert_eq!(accepted.report.prefix, MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX);
+    assert_eq!(conflict.state, "conflict");
+    assert_eq!(conflict.mode, "durable_job");
+    assert_eq!(conflict.active_job_id, job_id);
+    assert_eq!(conflict.status_endpoint, status_endpoint);
+    assert_eq!(conflict.cancel_endpoint, status_endpoint);
+    assert!(!conflict.scope_key.is_empty());
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
+    assert_eq!(terminal.job_id, job_id);
+    assert_eq!(
+        terminal.status, "completed",
+        "terminal same-scope conflict winner response: {terminal:#?}"
+    );
+    assert_eq!(terminal.report.bucket, MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET);
+    assert_eq!(terminal.report.prefix, MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX);
+    assert_eq!(terminal.report.scanned, 50, "terminal same-scope conflict winner response: {terminal:#?}");
+    assert_eq!(
+        terminal.report.eligible, 50,
+        "terminal same-scope conflict winner response: {terminal:#?}"
+    );
+    assert_eq!(
+        terminal.report.enqueued + terminal.report.skipped_already_in_flight,
+        50,
+        "terminal same-scope conflict winner response: {terminal:#?}"
+    );
+    assert_eq!(
+        terminal.report.transition_completed, terminal.report.enqueued,
+        "terminal same-scope conflict winner must wait for all queued transitions: {terminal:#?}"
+    );
+    assert_eq!(
+        terminal.report.transition_failed, 0,
+        "terminal same-scope conflict winner response: {terminal:#?}"
+    );
+    assert_eq!(
+        terminal.report.tier_failure, 0,
+        "terminal same-scope conflict winner response: {terminal:#?}"
+    );
     assert!(cold_tier_object_count(&cold_client).await? <= 50);
 
     Ok(())
