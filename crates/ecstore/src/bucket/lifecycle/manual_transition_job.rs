@@ -42,6 +42,7 @@ pub const MAX_MANUAL_TRANSITION_TASK_RECORD_SIZE: usize = 16 * 1024;
 pub const MAX_MANUAL_TRANSITION_WORKER_RESULT_RECORD_SIZE: usize = 8 * 1024;
 const MANUAL_TRANSITION_JOB_LEASE_SECONDS: i128 = 60;
 const MANUAL_TRANSITION_LEGACY_SCOPE_SCAN_LIMIT: i32 = 1000;
+const MANUAL_TRANSITION_TASK_SCAN_LIMIT: i32 = 1000;
 const MANUAL_TRANSITION_WORKER_RESULT_SCAN_LIMIT: i32 = 1000;
 
 fn is_false(value: &bool) -> bool {
@@ -163,6 +164,21 @@ impl ManualTransitionJobRecord {
         true
     }
 
+    pub fn mark_unknown_for_task_journal_error(
+        &mut self,
+        error: impl Into<String>,
+        queue_snapshot: ManualTransitionQueueSnapshot,
+    ) -> bool {
+        if self.state != ManualTransitionJobState::Running || !self.scan_completed {
+            return false;
+        }
+        self.queue_snapshot = queue_snapshot;
+        self.state = ManualTransitionJobState::Unknown;
+        self.error = Some(format!("manual transition task journal is corrupt: {}", error.into()));
+        self.mark_updated_terminal();
+        true
+    }
+
     pub fn cancel_after_recovery(&mut self, queue_snapshot: ManualTransitionQueueSnapshot) {
         if self.state == ManualTransitionJobState::Running && self.cancel_requested {
             self.scan_completed = true;
@@ -192,11 +208,18 @@ impl ManualTransitionJobRecord {
         self.mark_terminal_if_worker_drained();
     }
 
-    fn apply_worker_result_counts(&mut self, completed: u64, failed: u64, queue_snapshot: ManualTransitionQueueSnapshot) -> bool {
+    fn apply_worker_result_counts(
+        &mut self,
+        completed: u64,
+        failed: u64,
+        task_queued: u64,
+        queue_snapshot: ManualTransitionQueueSnapshot,
+    ) -> bool {
         if self.is_terminal() {
             return false;
         }
-        if completed.saturating_add(failed) > self.report.enqueued {
+        let enqueued = self.report.enqueued.max(task_queued);
+        if completed.saturating_add(failed) > enqueued {
             self.queue_snapshot = queue_snapshot;
             self.state = ManualTransitionJobState::Unknown;
             self.error = Some("manual transition worker result journal exceeds enqueued count".to_string());
@@ -205,10 +228,14 @@ impl ManualTransitionJobRecord {
         }
         let transition_completed = self.report.transition_completed.max(completed);
         let transition_failed = self.report.transition_failed.max(failed);
-        if transition_completed == self.report.transition_completed && transition_failed == self.report.transition_failed {
+        if enqueued == self.report.enqueued
+            && transition_completed == self.report.transition_completed
+            && transition_failed == self.report.transition_failed
+        {
             return false;
         }
         let scan_tier_failure = self.report.tier_failure.saturating_sub(self.report.transition_failed);
+        self.report.enqueued = enqueued;
         self.report.transition_completed = transition_completed;
         self.report.transition_failed = transition_failed;
         self.report.tier_failure = scan_tier_failure.saturating_add(transition_failed);
@@ -806,6 +833,22 @@ fn manual_transition_worker_result_task_key_from_object_name(
     Ok(task_key.to_string())
 }
 
+fn manual_transition_task_key_from_object_name(job_id: Uuid, object_name: &str) -> Result<String, ManualTransitionJobError> {
+    let prefix = manual_transition_task_object_prefix(job_id)?;
+    let rest = object_name
+        .strip_prefix(&prefix)
+        .ok_or(ManualTransitionJobError::Corrupt("task record object prefix is invalid"))?
+        .strip_prefix('/')
+        .ok_or(ManualTransitionJobError::Corrupt("task record object path is invalid"))?;
+    let task_key = rest
+        .strip_suffix(".json")
+        .ok_or(ManualTransitionJobError::Corrupt("task record suffix is invalid"))?;
+    if task_key.contains('/') || !is_sha256_checksum(task_key) {
+        return Err(ManualTransitionJobError::Corrupt("task record task_key is invalid"));
+    }
+    Ok(task_key.to_string())
+}
+
 pub fn manual_transition_job_id_from_record_object_name(object_name: &str) -> Result<Uuid, ManualTransitionJobError> {
     let Some(rest) = object_name.strip_prefix(MANUAL_TRANSITION_JOB_RECORD_PREFIX) else {
         return Err(ManualTransitionJobError::Corrupt("job record object prefix is invalid"));
@@ -969,6 +1012,59 @@ pub async fn load_manual_transition_task_record(
     ManualTransitionTaskRecord::decode(job_id, task_key, &data).map_err(manual_transition_job_store_error)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ManualTransitionTaskJournalStats {
+    queued: u64,
+}
+
+enum ManualTransitionTaskJournal {
+    Stats(ManualTransitionTaskJournalStats),
+    Corrupt(String),
+}
+
+async fn scan_manual_transition_task_journal(api: Arc<ECStore>, job_id: Uuid) -> EcstoreResult<ManualTransitionTaskJournal> {
+    let prefix = manual_transition_task_object_prefix(job_id).map_err(manual_transition_job_store_error)?;
+    let mut marker = None;
+    let mut stats = ManualTransitionTaskJournalStats::default();
+    loop {
+        let page = api
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                &prefix,
+                marker,
+                None,
+                MANUAL_TRANSITION_TASK_SCAN_LIMIT,
+                false,
+                None,
+                false,
+            )
+            .await?;
+        for object in page.objects {
+            let task_key = match manual_transition_task_key_from_object_name(job_id, &object.name) {
+                Ok(task_key) => task_key,
+                Err(err) => return Ok(ManualTransitionTaskJournal::Corrupt(err.to_string())),
+            };
+            let object_name = manual_transition_task_object_name(job_id, &task_key).map_err(manual_transition_job_store_error)?;
+            let data = match config_boundary::read_config(api.clone(), &object_name).await {
+                Ok(data) => data,
+                Err(err) => return Err(err),
+            };
+            if let Err(err) = ManualTransitionTaskRecord::decode(job_id, &task_key, &data) {
+                return Ok(ManualTransitionTaskJournal::Corrupt(err.to_string()));
+            }
+            stats.queued = stats.queued.saturating_add(1);
+        }
+        if !page.is_truncated {
+            return Ok(ManualTransitionTaskJournal::Stats(stats));
+        }
+        let Some(next_marker) = page.next_continuation_token else {
+            return Err(Error::other("manual transition task journal page is truncated without a next marker"));
+        };
+        marker = Some(next_marker);
+    }
+}
+
 pub async fn load_manual_transition_worker_result_stats(
     api: Arc<ECStore>,
     job_id: Uuid,
@@ -1037,6 +1133,12 @@ pub async fn reconcile_manual_transition_worker_results(
     job_id: Uuid,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
+    let task_stats = match scan_manual_transition_task_journal(api.clone(), job_id).await? {
+        ManualTransitionTaskJournal::Stats(stats) => stats,
+        ManualTransitionTaskJournal::Corrupt(error) => {
+            return mark_manual_transition_job_unknown_for_task_journal_error(api, job_id, error, queue_snapshot).await;
+        }
+    };
     let stats = match scan_manual_transition_worker_result_journal(api.clone(), job_id).await? {
         ManualTransitionWorkerResultJournal::Stats(stats) => stats,
         ManualTransitionWorkerResultJournal::Corrupt(error) => {
@@ -1045,7 +1147,7 @@ pub async fn reconcile_manual_transition_worker_results(
     };
     for _ in 0..4 {
         let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        let changed = record.apply_worker_result_counts(stats.completed, stats.failed, queue_snapshot);
+        let changed = record.apply_worker_result_counts(stats.completed, stats.failed, task_stats.queued, queue_snapshot);
         if !changed {
             return Ok(record);
         }
@@ -1062,6 +1164,30 @@ pub async fn reconcile_manual_transition_worker_results(
                 } else {
                     renew_manual_transition_scope_admission_from_job(api, &record).await?;
                 }
+                return Ok(record);
+            }
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Error::PreconditionFailed)
+}
+
+async fn mark_manual_transition_job_unknown_for_task_journal_error(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    error: String,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> EcstoreResult<ManualTransitionJobRecord> {
+    for _ in 0..4 {
+        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+        if !record.mark_unknown_for_task_journal_error(error.clone(), queue_snapshot) {
+            return Ok(record);
+        }
+        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => {
+                delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id)
+                    .await?;
                 return Ok(record);
             }
             Err(Error::PreconditionFailed) => continue,
@@ -1356,11 +1482,7 @@ pub async fn renew_manual_transition_job_lease(
 ) -> EcstoreResult<ManualTransitionJobRecord> {
     let (mut record, mut etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
     if record.state == ManualTransitionJobState::Running {
-        if record.scan_completed
-            && record.report.worker_transition_pending()
-            && queue_snapshot.queued == 0
-            && queue_snapshot.active == 0
-        {
+        if record.scan_completed && queue_snapshot.queued == 0 && queue_snapshot.active == 0 {
             record = reconcile_manual_transition_worker_results(api.clone(), job_id, queue_snapshot).await?;
             if record.is_terminal() || !record.report.worker_transition_pending() {
                 return Ok(record);
