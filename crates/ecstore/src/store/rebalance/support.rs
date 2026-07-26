@@ -72,7 +72,13 @@ pub(super) fn resolve_rebalance_delete_from_all_pools_result(
     bucket: &str,
     object: &str,
 ) -> Result<ObjectInfo> {
-    result.map_err(|err| Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}")))
+    result.map_err(|err| {
+        if err == Error::PreconditionFailed {
+            err
+        } else {
+            Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}"))
+        }
+    })
 }
 
 fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
@@ -80,7 +86,11 @@ fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
 }
 
 fn rebalance_delete_pool_error(pool_idx: usize, bucket: &str, object: &str, err: Error) -> Error {
-    Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
+    if err == Error::PreconditionFailed {
+        err
+    } else {
+        Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
+    }
 }
 
 pub(super) fn resolve_rebalance_delete_from_all_pools_results(
@@ -167,4 +177,32 @@ pub(super) fn resolve_latest_object_info_candidates(
     }
 
     Err(pool_lookup_not_found_error(bucket, object, opts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebalance_delete_result_preserves_precondition_failed() {
+        let err = resolve_rebalance_delete_from_all_pools_result(Err(Error::PreconditionFailed), "bucket", "object")
+            .expect_err("precondition failure should remain structured");
+
+        assert_eq!(err, Error::PreconditionFailed);
+    }
+
+    #[test]
+    fn rebalance_delete_pool_result_preserves_precondition_failed() {
+        let err = resolve_rebalance_delete_from_all_pools_results(
+            vec![RebalanceDeletePoolResult {
+                pool_idx: 0,
+                result: Err(Error::PreconditionFailed),
+            }],
+            "bucket",
+            "object",
+        )
+        .expect_err("precondition failure should remain structured");
+
+        assert_eq!(err, Error::PreconditionFailed);
+    }
 }

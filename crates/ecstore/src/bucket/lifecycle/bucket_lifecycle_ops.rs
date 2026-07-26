@@ -22,12 +22,13 @@ use crate::bucket::lifecycle::lifecycle::{
     self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
 use crate::bucket::lifecycle::manual_transition_job::{
-    MANUAL_TRANSITION_JOB_RECORD_PREFIX, ManualTransitionJobRecord, ManualTransitionScopeAdmission,
+    MANUAL_TRANSITION_JOB_RECORD_PREFIX, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
     ManualTransitionScopeAdmissionClaim, ManualTransitionWorkerResult, claim_manual_transition_scope_admission,
     delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
     load_manual_transition_job_record_with_etag, manual_transition_job_id_from_record_object_name,
-    manual_transition_job_lease_expired, persist_manual_transition_job_progress, record_manual_transition_worker_result,
-    renew_manual_transition_job_lease, save_manual_transition_job_record_if_current,
+    manual_transition_job_lease_expired, manual_transition_worker_result_task_key, persist_manual_transition_job_progress,
+    reconcile_manual_transition_worker_results, record_manual_transition_worker_result, renew_manual_transition_job_lease,
+    save_manual_transition_job_record_if_current,
 };
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
@@ -1097,6 +1098,7 @@ struct TransitionTask {
     src: LcEventSrc,
     event: lifecycle::Event,
     manual_job_id: Option<Uuid>,
+    manual_result_key: Option<String>,
 }
 
 impl ExpiryOp for TransitionTask {
@@ -1425,6 +1427,8 @@ impl TransitionState {
             src: src.clone(),
             event: event.clone(),
             manual_job_id,
+            manual_result_key: manual_job_id
+                .map(|_| manual_transition_worker_result_task_key(&oi.bucket, &oi.name, oi.version_id)),
         };
         if is_immediate_transition_source(src) {
             let outcome = match self.transition_tx.try_send(Some(task)) {
@@ -1603,10 +1607,11 @@ impl TransitionState {
                             transition_object(api.clone(), &task.obj_info, LcAuditEvent::new(task.event.clone(), task.src.clone()))
                                 .await
                         {
-                            if let Some(job_id) = task.manual_job_id {
+                            if let (Some(job_id), Some(result_key)) = (task.manual_job_id, task.manual_result_key.as_deref()) {
                                 record_manual_transition_worker_result_for_task(
                                     api.clone(),
                                     job_id,
+                                    result_key,
                                     ManualTransitionWorkerResult::TierFailure,
                                 )
                                 .await;
@@ -1628,10 +1633,11 @@ impl TransitionState {
                             }
                             emit_transition_failed_event(obj_info_for_event);
                         } else {
-                            if let Some(job_id) = task.manual_job_id {
+                            if let (Some(job_id), Some(result_key)) = (task.manual_job_id, task.manual_result_key.as_deref()) {
                                 record_manual_transition_worker_result_for_task(
                                     api.clone(),
                                     job_id,
+                                    result_key,
                                     ManualTransitionWorkerResult::Completed,
                                 )
                                 .await;
@@ -1741,8 +1747,15 @@ impl TransitionState {
     }
 }
 
-async fn record_manual_transition_worker_result_for_task(api: Arc<ECStore>, job_id: Uuid, result: ManualTransitionWorkerResult) {
-    if let Err(err) = record_manual_transition_worker_result(api, job_id, result, manual_transition_queue_snapshot()).await {
+async fn record_manual_transition_worker_result_for_task(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    result_key: &str,
+    result: ManualTransitionWorkerResult,
+) {
+    if let Err(err) =
+        record_manual_transition_worker_result(api, job_id, result_key, result, manual_transition_queue_snapshot()).await
+    {
         warn!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -1794,6 +1807,7 @@ fn spawn_manual_transition_job_recovery_once(api: Arc<ECStore>) -> Option<JoinHa
                             scanned = stats.scanned,
                             resumed = stats.resumed,
                             cancelled = stats.cancelled,
+                            unknown = stats.unknown,
                             skipped = stats.skipped,
                             failed = stats.failed,
                             truncated = stats.truncated,
@@ -1823,6 +1837,7 @@ pub struct ManualTransitionJobRecoveryStats {
     pub scanned: u64,
     pub resumed: u64,
     pub cancelled: u64,
+    pub unknown: u64,
     pub skipped: u64,
     pub failed: u64,
     pub next_marker: Option<String>,
@@ -1833,6 +1848,7 @@ pub struct ManualTransitionJobRecoveryStats {
 enum ManualTransitionJobRecoveryOutcome {
     Resumed,
     Cancelled,
+    Unknown,
     Skipped,
 }
 
@@ -1845,6 +1861,7 @@ async fn recover_manual_transition_jobs(api: Arc<ECStore>, limit: usize) -> Resu
         total.scanned = total.scanned.saturating_add(stats.scanned);
         total.resumed = total.resumed.saturating_add(stats.resumed);
         total.cancelled = total.cancelled.saturating_add(stats.cancelled);
+        total.unknown = total.unknown.saturating_add(stats.unknown);
         total.skipped = total.skipped.saturating_add(stats.skipped);
         total.failed = total.failed.saturating_add(stats.failed);
 
@@ -1908,9 +1925,10 @@ pub async fn recover_manual_transition_jobs_once(
                 continue;
             }
         };
-        match recover_manual_transition_job(api.clone(), job_id).await {
+        match recover_manual_transition_job(api.clone(), job_id, manual_transition_queue_snapshot()).await {
             Ok(ManualTransitionJobRecoveryOutcome::Resumed) => stats.resumed = stats.resumed.saturating_add(1),
             Ok(ManualTransitionJobRecoveryOutcome::Cancelled) => stats.cancelled = stats.cancelled.saturating_add(1),
+            Ok(ManualTransitionJobRecoveryOutcome::Unknown) => stats.unknown = stats.unknown.saturating_add(1),
             Ok(ManualTransitionJobRecoveryOutcome::Skipped) => stats.skipped = stats.skipped.saturating_add(1),
             Err(err) => {
                 stats.failed = stats.failed.saturating_add(1);
@@ -1930,8 +1948,12 @@ pub async fn recover_manual_transition_jobs_once(
     Ok(stats)
 }
 
-async fn recover_manual_transition_job(api: Arc<ECStore>, job_id: Uuid) -> Result<ManualTransitionJobRecoveryOutcome, Error> {
-    let (mut record, etag) = match load_manual_transition_job_record_with_etag(api.clone(), job_id).await {
+async fn recover_manual_transition_job(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> Result<ManualTransitionJobRecoveryOutcome, Error> {
+    let (mut record, mut etag) = match load_manual_transition_job_record_with_etag(api.clone(), job_id).await {
         Ok(record) => record,
         Err(Error::ConfigNotFound) => return Ok(ManualTransitionJobRecoveryOutcome::Skipped),
         Err(err) => return Err(err),
@@ -1940,10 +1962,37 @@ async fn recover_manual_transition_job(api: Arc<ECStore>, job_id: Uuid) -> Resul
         return Ok(ManualTransitionJobRecoveryOutcome::Skipped);
     }
 
+    let recovery_unknown_snapshot = ManualTransitionQueueSnapshot::default();
+    if record.scan_completed && record.report.worker_transition_pending() {
+        let reconciled = reconcile_manual_transition_worker_results(api.clone(), job_id, recovery_unknown_snapshot).await?;
+        if reconciled.is_terminal() {
+            release_manual_transition_recovery_admission(api, &reconciled).await;
+            return match reconciled.state {
+                ManualTransitionJobState::Cancelled => Ok(ManualTransitionJobRecoveryOutcome::Cancelled),
+                ManualTransitionJobState::Unknown => Ok(ManualTransitionJobRecoveryOutcome::Unknown),
+                _ => Ok(ManualTransitionJobRecoveryOutcome::Resumed),
+            };
+        }
+        if reconciled != record {
+            (record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+        }
+    }
+
+    if record.mark_unknown_if_worker_results_lost(recovery_unknown_snapshot)
+        || record.mark_unknown_if_recovery_would_skip_pending_page(recovery_unknown_snapshot)
+    {
+        return match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => {
+                release_manual_transition_recovery_admission(api, &record).await;
+                Ok(ManualTransitionJobRecoveryOutcome::Unknown)
+            }
+            Err(Error::PreconditionFailed) => Ok(ManualTransitionJobRecoveryOutcome::Skipped),
+            Err(err) => Err(err),
+        };
+    }
+
     if record.cancel_requested {
-        let mut report = record.report.clone();
-        report.cancelled = true;
-        record.complete(report, manual_transition_queue_snapshot());
+        record.cancel_after_recovery(queue_snapshot);
         return match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
             Ok(()) => {
                 release_manual_transition_recovery_admission(api, &record).await;
@@ -1954,7 +2003,7 @@ async fn recover_manual_transition_job(api: Arc<ECStore>, job_id: Uuid) -> Resul
         };
     }
 
-    record.claim_recovery_lease(manual_transition_recovery_owner_id(), manual_transition_queue_snapshot());
+    record.claim_recovery_lease(manual_transition_recovery_owner_id(), queue_snapshot);
     let recovery_lease_id = record.lease_id;
     match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
         Ok(()) => {}
@@ -4544,10 +4593,11 @@ mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EXPIRED_DETECTED, EVENT_LIFECYCLE_NOT_ENQUEUED, ExpiryState,
-        FreeVersionTask, ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
-        StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
-        TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject,
-        VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        FreeVersionTask, ManualTransitionJobRecoveryOutcome, ManualTransitionQueueSnapshot, ManualTransitionRunOptions,
+        ManualTransitionRunReport, StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
+        TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL, TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule,
+        TransitionEnqueueOutcome, TransitionState, TransitionedObject, VersionReplicationScan,
+        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
         jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
@@ -4555,13 +4605,13 @@ mod tests {
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
         manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
-        persist_manual_transition_page_checkpoint, recover_manual_transition_jobs, recover_manual_transition_jobs_once,
-        replication_state_for_delete, resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity,
-        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
-        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
-        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
-        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
-        wait_for_tier_free_version_recovery,
+        persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint, recover_manual_transition_job,
+        recover_manual_transition_jobs, recover_manual_transition_jobs_once, replication_state_for_delete,
+        resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
+        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
+        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
+        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
+        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -4569,11 +4619,18 @@ mod tests {
     use crate::bucket::lifecycle::bucket_lifecycle_ops::{
         decode_manual_transition_continuation_token, encode_manual_transition_continuation_token,
     };
+    use crate::bucket::lifecycle::config_boundary;
     use crate::bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
-        claim_manual_transition_scope_admission, legacy_manual_transition_scope_key, load_manual_transition_job_record,
-        load_manual_transition_scope_admission, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
-        save_manual_transition_job_record, save_manual_transition_scope_admission_if_absent,
+        ManualTransitionWorkerResult, ManualTransitionWorkerResultRecord, claim_manual_transition_scope_admission,
+        delete_manual_transition_scope_admission_if_current, legacy_manual_transition_scope_key,
+        load_manual_transition_job_record, load_manual_transition_scope_admission,
+        load_manual_transition_scope_admission_with_etag, manual_transition_scope_record_object_name,
+        manual_transition_worker_result_object_name, manual_transition_worker_result_task_key,
+        reconcile_manual_transition_worker_results, record_manual_transition_worker_result, renew_manual_transition_job_lease,
+        request_manual_transition_job_cancel, save_manual_transition_job_record,
+        save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
+        save_manual_transition_worker_result_if_absent,
     };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
@@ -7326,6 +7383,36 @@ mod tests {
         assert!(!report.has_partial_enqueue());
     }
 
+    #[test]
+    fn manual_transition_complete_preserves_worker_failure_summary() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-worker-summary-bucket", &options, "owner-a");
+
+        record.record_worker_result(ManualTransitionWorkerResult::Completed, ManualTransitionQueueSnapshot::default());
+        record.record_worker_result(ManualTransitionWorkerResult::TierFailure, ManualTransitionQueueSnapshot::default());
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "manual-worker-summary-bucket".to_string(),
+                scanned: 3,
+                eligible: 2,
+                enqueued: 2,
+                tier_failure: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+
+        assert_eq!(record.state, ManualTransitionJobState::Partial);
+        assert!(record.scan_completed);
+        assert_eq!(record.report.scanned, 3);
+        assert_eq!(record.report.eligible, 2);
+        assert_eq!(record.report.enqueued, 2);
+        assert_eq!(record.report.transition_completed, 1);
+        assert_eq!(record.report.transition_failed, 1);
+        assert_eq!(record.report.tier_failure, 2);
+        assert!(record.completed_at_unix_nanos.is_some());
+    }
+
     #[tokio::test]
     async fn manual_transition_counts_already_transitioned_object() {
         let lc = latest_transition_lifecycle();
@@ -7358,6 +7445,53 @@ mod tests {
         assert_eq!(report.skipped_queue_closed, 0);
         assert_eq!(report.skipped_queue_timeout, 0);
         assert!(report.has_partial_enqueue());
+    }
+
+    #[test]
+    fn manual_transition_job_record_closed_and_timeout_reports_are_partial() {
+        let options = ManualTransitionRunOptions::default();
+
+        for (bucket, outcome, skipped_queue_closed, skipped_queue_timeout, queue_snapshot) in [
+            (
+                "manual-queue-closed-bucket",
+                TransitionEnqueueOutcome::QueueClosed,
+                1,
+                0,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 1,
+                    workers: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "manual-queue-timeout-bucket",
+                TransitionEnqueueOutcome::QueueSendTimedOut,
+                0,
+                1,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 1,
+                    workers: 1,
+                    queue_send_timeout: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut report = ManualTransitionRunReport::new(bucket, &options);
+            report.record_enqueue_outcome(outcome);
+            assert!(report.has_partial_enqueue());
+
+            let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), bucket, &options, "owner");
+            record.complete(report, queue_snapshot);
+
+            assert_eq!(record.state, ManualTransitionJobState::Partial);
+            assert_eq!(record.report.enqueued, 0);
+            assert_eq!(record.report.skipped_queue_full, 0);
+            assert_eq!(record.report.skipped_queue_closed, skipped_queue_closed);
+            assert_eq!(record.report.skipped_queue_timeout, skipped_queue_timeout);
+            assert_eq!(record.queue_snapshot.queue_send_timeout, queue_snapshot.queue_send_timeout);
+            assert!(record.completed_at_unix_nanos.is_some());
+            assert!(record.error.is_none());
+        }
     }
 
     #[test]
@@ -7609,6 +7743,203 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn manual_transition_recovery_marks_unknown_when_cursor_would_skip_pending_work() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                .expect("resume token should encode");
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            continuation_token: Some(continuation_token.clone()),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, "manual-recovery-pending-page-bucket", &options, "old-owner");
+        record.report.continuation_token = Some(continuation_token);
+        record.report.enqueued = 2;
+        record.report.transition_completed = 1;
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("expired job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("expired scope admission should save");
+
+        let outcome = recover_manual_transition_job(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("manual transition recovery should process pending cursor jobs");
+
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Unknown);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown job should load");
+        assert_eq!(recovered.state, ManualTransitionJobState::Unknown);
+        assert_eq!(recovered.report.enqueued, 2);
+        assert_eq!(recovered.report.transition_completed, 1);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("page/task journal"))
+        );
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "unknown recovery must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_recovery_marks_unknown_for_cursor_pending_work_when_queue_is_busy() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                .expect("resume token should encode");
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            continuation_token: Some(continuation_token.clone()),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, "manual-recovery-busy-queue-bucket", &options, "old-owner");
+        record.report.continuation_token = Some(continuation_token);
+        record.report.enqueued = 2;
+        record.report.transition_completed = 1;
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("expired job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("expired scope admission should save");
+
+        let outcome = recover_manual_transition_job(
+            ecstore.clone(),
+            job_id,
+            ManualTransitionQueueSnapshot {
+                queued: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("busy queue recovery should fail closed for pending cursor jobs");
+
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Unknown);
+        let loaded = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown job should remain loadable");
+        assert_eq!(loaded.state, ManualTransitionJobState::Unknown);
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "unknown recovery must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_recovery_marks_unknown_before_cancel_for_cursor_pending_work() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                .expect("resume token should encode");
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            continuation_token: Some(continuation_token.clone()),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, "manual-recovery-cancel-pending-bucket", &options, "old-owner");
+        record.report.continuation_token = Some(continuation_token);
+        record.report.enqueued = 2;
+        record.report.transition_completed = 1;
+        record.lease_expires_at_unix_nanos = 0;
+        record.mark_cancel_requested();
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("expired cancelled job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("expired cancelled scope admission should save");
+
+        let outcome = recover_manual_transition_job(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("manual transition recovery should fail closed before cancelled pending cursor jobs");
+
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Unknown);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown cancelled job should load");
+        assert_eq!(recovered.state, ManualTransitionJobState::Unknown);
+        assert!(recovered.cancel_requested);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("page/task journal"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_recovery_marks_unknown_when_completed_scan_lost_worker_results() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            ..Default::default()
+        };
+        let mut record =
+            ManualTransitionJobRecord::new(job_id, "manual-recovery-lost-worker-result-bucket", &options, "old-owner");
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: record.bucket.clone(),
+                prefix: record.prefix.clone(),
+                enqueued: 2,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("expired job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("expired scope admission should save");
+
+        let outcome = recover_manual_transition_job(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("manual transition recovery should process completed scans with lost worker results");
+
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Unknown);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown job should load");
+        assert_eq!(recovered.state, ManualTransitionJobState::Unknown);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("worker result"))
+        );
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "unknown recovery must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn manual_transition_recovery_drains_multiple_record_pages() {
         let (_paths, ecstore) = setup_test_env().await;
         let mut job_ids = Vec::new();
@@ -7658,11 +7989,18 @@ mod tests {
     async fn manual_transition_recovery_completes_expired_cancelled_record() {
         let (_paths, ecstore) = setup_test_env().await;
         let job_id = Uuid::new_v4();
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                .expect("resume token should encode");
         let options = ManualTransitionRunOptions {
             prefix: "logs/".to_string(),
+            continuation_token: Some(continuation_token.clone()),
             ..Default::default()
         };
         let mut record = ManualTransitionJobRecord::new(job_id, "manual-recovery-cancel-bucket", &options, "old-owner");
+        record.report.continuation_token = Some(continuation_token);
+        record.report.enqueued = 2;
+        record.report.transition_completed = 2;
         record.lease_expires_at_unix_nanos = 0;
         record.mark_cancel_requested();
         save_manual_transition_job_record(ecstore.clone(), &record)
@@ -7677,6 +8015,7 @@ mod tests {
             .expect("manual transition recovery should process cancelled jobs");
 
         assert_eq!(stats.cancelled, 1);
+        assert_eq!(stats.unknown, 0);
         assert_eq!(stats.resumed, 0);
         assert_eq!(stats.failed, 0);
         let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
@@ -7691,6 +8030,303 @@ mod tests {
                 Err(Error::ConfigNotFound)
             ),
             "cancelled recovery must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_worker_result_duplicate_marker_is_noop() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-worker-result-{}", job_id.simple());
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &options, "worker-owner");
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: bucket.clone(),
+                enqueued: 2,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("worker result job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("worker result admission should save");
+
+        let first_key = manual_transition_worker_result_task_key(&bucket, "logs/a", None);
+        let first = record_manual_transition_worker_result(
+            ecstore.clone(),
+            job_id,
+            &first_key,
+            ManualTransitionWorkerResult::Completed,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("first worker result should persist");
+        assert_eq!(first.state, ManualTransitionJobState::Running);
+        assert_eq!(first.report.transition_completed, 1);
+        assert_eq!(first.report.transition_failed, 0);
+
+        let duplicate = record_manual_transition_worker_result(
+            ecstore.clone(),
+            job_id,
+            &first_key,
+            ManualTransitionWorkerResult::Completed,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("duplicate worker result should be idempotent");
+        assert_eq!(duplicate.state, ManualTransitionJobState::Running);
+        assert_eq!(duplicate.report.transition_completed, 1);
+        assert_eq!(duplicate.report.transition_failed, 0);
+
+        let second_key = manual_transition_worker_result_task_key(&bucket, "logs/b", None);
+        let final_record = record_manual_transition_worker_result(
+            ecstore.clone(),
+            job_id,
+            &second_key,
+            ManualTransitionWorkerResult::TierFailure,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("second distinct worker result should persist");
+
+        assert_eq!(final_record.state, ManualTransitionJobState::Partial);
+        assert_eq!(final_record.report.transition_completed, 1);
+        assert_eq!(final_record.report.transition_failed, 1);
+        assert_eq!(final_record.report.tier_failure, 1);
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "terminal worker result must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_worker_result_reconcile_applies_marker_and_releases_admission() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-worker-reconcile-{}", job_id.simple());
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &options, "worker-owner");
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: bucket.clone(),
+                enqueued: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("worker reconcile job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("worker reconcile admission should save");
+
+        let task_key = manual_transition_worker_result_task_key(&bucket, "logs/a", None);
+        let marker = ManualTransitionWorkerResultRecord::new(job_id, &task_key, ManualTransitionWorkerResult::Completed);
+        assert!(
+            save_manual_transition_worker_result_if_absent(ecstore.clone(), &marker)
+                .await
+                .expect("worker result marker should save"),
+            "new worker result marker must be created once"
+        );
+        assert!(
+            !save_manual_transition_worker_result_if_absent(ecstore.clone(), &marker)
+                .await
+                .expect("duplicate worker result marker should not fail"),
+            "duplicate worker result marker must be reported as existing"
+        );
+        let duplicate_noop = record_manual_transition_worker_result(
+            ecstore.clone(),
+            job_id,
+            &task_key,
+            ManualTransitionWorkerResult::Completed,
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("duplicate worker result should not apply journal counts");
+        assert_eq!(duplicate_noop.state, ManualTransitionJobState::Running);
+        assert_eq!(duplicate_noop.report.transition_completed, 0);
+        assert_eq!(duplicate_noop.report.transition_failed, 0);
+
+        let reconciled =
+            reconcile_manual_transition_worker_results(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+                .await
+                .expect("worker result marker should reconcile into job record");
+
+        assert_eq!(reconciled.state, ManualTransitionJobState::Completed);
+        assert_eq!(reconciled.report.transition_completed, 1);
+        assert_eq!(reconciled.report.transition_failed, 0);
+        assert_eq!(reconciled.report.tier_failure, 0);
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "terminal reconcile must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_worker_result_heartbeat_applies_marker_before_record_update() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-worker-heartbeat-{}", job_id.simple());
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &ManualTransitionRunOptions::default(), "worker-owner");
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: bucket.clone(),
+                enqueued: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("worker heartbeat job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("worker heartbeat admission should save");
+        let task_key = manual_transition_worker_result_task_key(&bucket, "logs/a", None);
+        let marker = ManualTransitionWorkerResultRecord::new(job_id, &task_key, ManualTransitionWorkerResult::Completed);
+        assert!(
+            save_manual_transition_worker_result_if_absent(ecstore.clone(), &marker)
+                .await
+                .expect("worker result marker should save"),
+            "new worker result marker must be created"
+        );
+
+        let renewed = renew_manual_transition_job_lease(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("heartbeat should reconcile marker before unknown fallback");
+
+        assert_eq!(renewed.state, ManualTransitionJobState::Completed);
+        assert_eq!(renewed.report.transition_completed, 1);
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "terminal heartbeat reconcile must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_worker_result_recovery_applies_marker_before_record_update() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-worker-recovery-{}", job_id.simple());
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &ManualTransitionRunOptions::default(), "old-owner");
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: bucket.clone(),
+                enqueued: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("worker recovery job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("worker recovery admission should save");
+        let task_key = manual_transition_worker_result_task_key(&bucket, "logs/a", None);
+        let marker = ManualTransitionWorkerResultRecord::new(job_id, &task_key, ManualTransitionWorkerResult::Completed);
+        assert!(
+            save_manual_transition_worker_result_if_absent(ecstore.clone(), &marker)
+                .await
+                .expect("worker result marker should save"),
+            "new worker result marker must be created"
+        );
+
+        let outcome = recover_manual_transition_job(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("recovery should reconcile marker before unknown fallback");
+
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Resumed);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("reconciled job should load");
+        assert_eq!(recovered.state, ManualTransitionJobState::Completed);
+        assert_eq!(recovered.report.transition_completed, 1);
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "terminal recovery reconcile must release the scope admission"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_worker_result_recovery_marks_unknown_for_corrupt_marker() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = format!("manual-worker-corrupt-{}", job_id.simple());
+        let mut record = ManualTransitionJobRecord::new(job_id, &bucket, &ManualTransitionRunOptions::default(), "old-owner");
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: bucket.clone(),
+                enqueued: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("corrupt marker job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("corrupt marker admission should save");
+        let task_key = manual_transition_worker_result_task_key(&bucket, "logs/a", None);
+        let marker = ManualTransitionWorkerResultRecord::new(job_id, &task_key, ManualTransitionWorkerResult::Completed);
+        let encoded = marker.encode().expect("worker result marker should encode");
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).expect("worker result marker should be json");
+        value["record"]["result"] = serde_json::Value::String("tier_failure".to_string());
+        let object = manual_transition_worker_result_object_name(job_id, &task_key).expect("worker result object should encode");
+        config_boundary::save_config(
+            ecstore.clone(),
+            &object,
+            serde_json::to_vec(&value).expect("corrupt marker should encode"),
+        )
+        .await
+        .expect("corrupt worker result marker should save");
+
+        let outcome = recover_manual_transition_job(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("recovery should fail closed on corrupt marker");
+
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Unknown);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown job should load");
+        assert_eq!(recovered.state, ManualTransitionJobState::Unknown);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("worker result journal is corrupt"))
+        );
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "corrupt marker unknown recovery must release the scope admission"
         );
     }
 
@@ -7756,6 +8392,86 @@ mod tests {
 
         assert_eq!(after_terminal_cancel.state, ManualTransitionJobState::Completed);
         assert!(!after_terminal_cancel.cancel_requested);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_progress_checkpoint_survives_reload_and_recovery() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = "manual-progress-checkpoint-bucket";
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                .expect("resume token should encode");
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, bucket, &options, "owner-a");
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("running scope admission should save");
+
+        let checkpointed = persist_manual_transition_job_progress(
+            ecstore.clone(),
+            job_id,
+            &ManualTransitionRunReport {
+                bucket: bucket.to_string(),
+                prefix: "logs/".to_string(),
+                scanned: 2,
+                eligible: 2,
+                enqueued: 2,
+                continuation_token: Some(continuation_token.clone()),
+                truncated_by_limit: true,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("running progress checkpoint should persist");
+
+        assert_eq!(checkpointed.report.continuation_token.as_deref(), Some(continuation_token.as_str()));
+        assert_eq!(checkpointed.report.enqueued, 2);
+
+        let reloaded = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("checkpointed job should reload");
+        assert_eq!(reloaded.report.continuation_token.as_deref(), Some(continuation_token.as_str()));
+        assert_eq!(reloaded.report.scanned, 2);
+        assert_eq!(reloaded.report.enqueued, 2);
+
+        let mut expired = reloaded.clone();
+        expired.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &expired)
+            .await
+            .expect("checkpointed job owner loss should persist");
+
+        let outcome = recover_manual_transition_job(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("recovery should fail closed when checkpointed page has pending worker results");
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Unknown);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown checkpointed job should reload");
+        assert_eq!(recovered.state, ManualTransitionJobState::Unknown);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("page/task journal")),
+            "unknown checkpoint recovery must retain page/task journal context: {recovered:#?}"
+        );
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "unknown checkpoint recovery must release scope admission"
+        );
     }
 
     #[tokio::test]
@@ -7856,6 +8572,99 @@ mod tests {
             ),
             "conflicted bucket-level admission must be released"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_scope_release_preserves_replaced_admission() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            ..Default::default()
+        };
+        let first = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-release-race-bucket", &options, "first-owner");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&first))
+            .await
+            .expect("first scope admission should save");
+        let (_loaded, etag) = load_manual_transition_scope_admission_with_etag(ecstore.clone(), &first.scope_key)
+            .await
+            .expect("first scope admission should load with an ETag");
+
+        let second = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-release-race-bucket", &options, "second-owner");
+        save_manual_transition_scope_admission_if_current(
+            ecstore.clone(),
+            &ManualTransitionScopeAdmission::from_job(&second),
+            &etag,
+        )
+        .await
+        .expect("second scope admission should replace first admission");
+
+        let object = manual_transition_scope_record_object_name(&first.scope_key).expect("scope admission path should encode");
+        let stale_delete = config_boundary::delete_config_if_match(ecstore.clone(), &object, &etag)
+            .await
+            .expect_err("stale ETag must not delete a replaced scope admission");
+        assert_eq!(stale_delete, Error::PreconditionFailed);
+
+        let released =
+            delete_manual_transition_scope_admission_if_current(ecstore.clone(), &first.scope_key, first.job_id, first.lease_id)
+                .await
+                .expect("stale release should not fail");
+
+        assert!(!released);
+        let current = load_manual_transition_scope_admission(ecstore, &first.scope_key)
+            .await
+            .expect("replaced scope admission should remain");
+        assert_eq!(current.job_id, second.job_id);
+        assert_eq!(current.lease_id, second.lease_id);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_admission_reclaims_stale_scope_records() {
+        let (_paths, ecstore) = setup_test_env().await;
+
+        for stale_case in ["missing-job", "terminal-job"] {
+            let bucket = format!("manual-stale-admission-{stale_case}");
+            let options = ManualTransitionRunOptions {
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                ..Default::default()
+            };
+            let mut stale = ManualTransitionJobRecord::new(Uuid::new_v4(), &bucket, &options, "old-owner");
+            if stale_case == "terminal-job" {
+                stale.complete(
+                    ManualTransitionRunReport {
+                        bucket: bucket.clone(),
+                        ..Default::default()
+                    },
+                    ManualTransitionQueueSnapshot::default(),
+                );
+                save_manual_transition_job_record(ecstore.clone(), &stale)
+                    .await
+                    .expect("terminal stale job record should save");
+            }
+            save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&stale))
+                .await
+                .expect("stale scope admission should save");
+
+            let replacement = ManualTransitionJobRecord::new(Uuid::new_v4(), &bucket, &options, "new-owner");
+            save_manual_transition_job_record(ecstore.clone(), &replacement)
+                .await
+                .expect("replacement job record should save");
+
+            let claim =
+                claim_manual_transition_scope_admission(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&replacement))
+                    .await
+                    .expect("replacement claim should resolve");
+
+            assert_eq!(claim, ManualTransitionScopeAdmissionClaim::Claimed);
+            let loaded = load_manual_transition_scope_admission(ecstore.clone(), &replacement.scope_key)
+                .await
+                .expect("replacement scope admission should load");
+            assert_eq!(loaded.job_id, replacement.job_id);
+            assert_eq!(loaded.lease_id, replacement.lease_id);
+            assert_eq!(loaded.owner_id, "new-owner");
+        }
     }
 
     #[tokio::test]
