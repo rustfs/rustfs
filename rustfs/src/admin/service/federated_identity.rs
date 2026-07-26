@@ -311,6 +311,11 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
 mod tests {
     use super::*;
     use rustfs_iam::federation::{FederatedAuthorization, FederatedClaims};
+    use rustfs_iam::store::{Store, UserType, object::IAM_CONFIG_PREFIX};
+    use rustfs_kms::KmsServiceManager;
+    use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+    use serial_test::serial;
+    use std::sync::Arc;
 
     fn transaction() -> FederatedSessionTransaction {
         FederatedSessionTransaction {
@@ -389,6 +394,68 @@ mod tests {
         assert!(replicated.parent_policy_mapping.trim().is_empty());
         assert!(MappedPolicy::new(&replicated.parent_policy_mapping).to_slice().is_empty());
         assert_eq!(replicated.api_version.as_deref(), Some(SITE_REPL_API_VERSION));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn binding_uses_sts_policy_when_regular_mapping_collides() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        if current_ready_iam_handle().is_err() {
+            let env = rustfs_test_utils::TestECStoreEnv::builder()
+                .prefix("federated_binding_sts_policy")
+                .disk_count(1)
+                .init_bucket_metadata(false)
+                .build()
+                .await;
+            ObjectStore::new(Arc::clone(&env.ecstore))
+                .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+                .await
+                .expect("build test IAM");
+            crate::app::context::publish_global_app_context(Arc::new(
+                crate::runtime_sources::AppContext::with_default_interfaces(env.ecstore, iam, Arc::new(KmsServiceManager::new())),
+            ));
+        }
+
+        let iam = current_ready_iam_handle().expect("test IAM should be ready");
+        let mut transaction = transaction();
+        transaction.authorization.claims.sub = "binding-sts-policy-subject".to_string();
+        transaction.authorization.policies = vec!["readwrite".to_string()];
+        let parent = transaction
+            .authorization
+            .oidc_virtual_parent()
+            .expect("test authorization should have a virtual parent");
+        iam.create_user(
+            &parent,
+            &AddOrUpdateUserReq {
+                secret_key: "regular-user-secret".to_string(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create colliding regular user");
+        iam.policy_db_set(&parent, UserType::Reg, false, "readonly")
+            .await
+            .expect("store colliding regular policy mapping");
+        iam.policy_db_set(&parent, UserType::Sts, false, "writeonly")
+            .await
+            .expect("store STS policy mapping");
+
+        let credentials = DefaultFederatedSessionBinding
+            .bind(&transaction)
+            .await
+            .expect("production binding should issue credentials");
+        let signing_key = current_token_signing_key().expect("test signing key should be initialized");
+        let claims = rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, &signing_key)
+            .expect("issued session token should verify");
+
+        assert_eq!(claims.get("policy"), Some(&serde_json::json!("writeonly")));
     }
 
     #[test]
