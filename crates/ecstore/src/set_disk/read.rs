@@ -5127,6 +5127,14 @@ mod tests {
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
                 );
 
+                let mut compressed_without_object_metadata = compressed.clone();
+                compressed_without_object_metadata.user_defined = Arc::default();
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &compressed_without_object_metadata, &compressed_fi, true)
+                        .decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
+                );
+
                 let small_fi = codec_streaming_test_fileinfo(0, 1);
                 let small_object_info = codec_streaming_test_object_info(&small_fi);
                 assert_eq!(

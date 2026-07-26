@@ -1648,7 +1648,7 @@ fn classify_get_codec_streaming_object_class(
     if object_info.is_encrypted() {
         return GetCodecStreamingObjectClass::Encrypted;
     }
-    if object_info.is_compressed() {
+    if object_info.is_compressed() || fi.is_compressed() {
         return GetCodecStreamingObjectClass::Compressed;
     }
     if object_info.is_remote() {
