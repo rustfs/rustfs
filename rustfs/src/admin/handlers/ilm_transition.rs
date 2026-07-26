@@ -1258,8 +1258,8 @@ mod tests {
         record.complete(
             ManualTransitionRunReport {
                 bucket: "bucket".to_string(),
-                prefix: options.prefix.clone(),
-                tier: options.tier.clone(),
+                prefix: options.prefix,
+                tier: options.tier,
                 skipped_queue_full: 3,
                 skipped_queue_timeout: 5,
                 ..Default::default()

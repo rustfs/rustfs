@@ -1951,6 +1951,25 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
     assert_eq!(after_restart["bucket"].as_str(), Some(bucket.as_str()));
     assert_eq!(after_restart["dry_run"].as_bool(), Some(true));
 
+    let job_endpoint = format!("/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
+    let (cancel_status, cancel_body) =
+        signed_admin_request(&hot.nodes[3].url, Method::DELETE, &job_endpoint, None, &hot.access_key, &hot.secret_key).await?;
+    assert_eq!(
+        cancel_status,
+        StatusCode::OK,
+        "terminal manual transition job cancel after restart failed: {}",
+        compact_body(&cancel_body)
+    );
+    let cancel_value: serde_json::Value = serde_json::from_str(&cancel_body)?;
+    assert_eq!(
+        cancel_value["status"], after_restart["status"],
+        "terminal status changed after restart cancel"
+    );
+    assert_eq!(cancel_value["job_id"].as_str(), Some(job_id.as_str()));
+    assert_eq!(cancel_value["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(cancel_value["dry_run"].as_bool(), Some(true));
+    assert_eq!(cancel_value["cancel_requested"].as_bool(), Some(true));
+
     let missing_job_id = Uuid::new_v4();
     let (missing_status, missing_body) = signed_admin_request(
         &hot.nodes[3].url,
@@ -2003,14 +2022,13 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
     let prefix = "transition/distributed-admission/";
     hot_client.create_bucket().bucket(&bucket).send().await?;
     put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
-    for index in 0..64 {
+    for index in 0u8..64 {
         let key = format!("{prefix}object-{index:02}.bin");
-        let seed = u8::try_from(index)?;
         hot_client
             .put_object()
             .bucket(&bucket)
             .key(key)
-            .body(ByteStream::from(payload(64 * KIB, seed)))
+            .body(ByteStream::from(payload(64 * KIB, index)))
             .send()
             .await?;
     }
@@ -2083,11 +2101,11 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
         Some("partial"),
         "small transition queue should surface terminal backpressure: {terminal}"
     );
+    let skipped_queue_full = terminal["report"]["skipped_queue_full"]
+        .as_u64()
+        .ok_or_else(|| format!("terminal status omitted report.skipped_queue_full: {terminal}"))?;
     assert!(
-        terminal["report"]["skipped_queue_full"]
-            .as_u64()
-            .ok_or_else(|| format!("terminal status omitted report.skipped_queue_full: {terminal}"))?
-            > 0,
+        skipped_queue_full > 0,
         "terminal status should include queue-full backpressure counters: {terminal}"
     );
     let queue_snapshot = terminal["queue_snapshot"]

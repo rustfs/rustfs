@@ -1424,12 +1424,14 @@ async fn test_manual_transition_async_different_buckets_admit_concurrently() -> 
 
     for bucket in [MANUAL_ASYNC_PARALLEL_BUCKET_A, MANUAL_ASYNC_PARALLEL_BUCKET_B] {
         hot_client.create_bucket().bucket(bucket).send().await?;
-        put_lifecycle_transition_rule(&hot_client, bucket, "manual-async-parallel", MANUAL_ASYNC_PARALLEL_PREFIX, 0).await?;
+        put_lifecycle_transition_rule(&hot_client, bucket, "manual-async-parallel", MANUAL_ASYNC_PARALLEL_PREFIX, 1).await?;
         for idx in 0..MANUAL_ASYNC_PARALLEL_OBJECTS {
             let key = format!("{MANUAL_ASYNC_PARALLEL_PREFIX}obj-{idx:02}");
             put_single_part_object(&hot_client, bucket, &key, b"async parallel bucket payload").await?;
         }
     }
+
+    let before_remote_count = cold_tier_object_count(&cold_client).await?;
 
     let (first, second) = tokio::join!(
         manual_transition_async_run_raw(
@@ -1519,8 +1521,8 @@ async fn test_manual_transition_async_different_buckets_admit_concurrently() -> 
     assert_eq!(second_terminal.report.transition_failed, 0);
     assert_eq!(
         cold_tier_object_count(&cold_client).await?,
-        0,
-        "parallel dry-run jobs must not create remote tier objects"
+        before_remote_count,
+        "parallel dry-run jobs must not create additional remote tier objects"
     );
 
     Ok(())
