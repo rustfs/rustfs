@@ -266,7 +266,7 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
             FederatedSessionBindingError::InvalidRequest("verified OIDC identity is missing issuer or subject".to_string())
         })?;
         let selected_policy_names = match iam_store
-            .policy_db_get(&parent_user, &Some(authorization.groups.clone()))
+            .sts_policy_db_get(&parent_user, &Some(authorization.groups.clone()))
             .await
             .map_err(|_| FederatedSessionBindingError::Internal("failed to resolve OIDC policy mapping".to_string()))?
         {
@@ -348,14 +348,14 @@ mod tests {
     }
 
     #[test]
-    fn issued_credentials_and_replication_item_preserve_existing_shape() {
+    fn issued_credentials_and_replication_item_use_minio_parent_shape() {
         let transaction = transaction();
         let secret = "federated-session-test-signing-secret";
         let selected_policy_names = vec!["readonly".to_string()];
 
         let credentials =
             issue_credentials(&transaction, &selected_policy_names, Some(secret)).expect("credential issuance should succeed");
-        assert_eq!(credentials.parent_user, "openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I");
+        assert_eq!(credentials.parent_user, "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA");
         assert_eq!(credentials.groups, Some(vec!["devs".to_string()]));
 
         let claims = rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, secret)
@@ -364,11 +364,11 @@ mod tests {
         assert_eq!(claims.get("oidc_provider"), Some(&serde_json::json!("default")));
         assert_eq!(
             claims.get("parent"),
-            Some(&serde_json::json!("openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I"))
+            Some(&serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA"))
         );
         assert_eq!(
             claims.get(OIDC_VIRTUAL_PARENT_CLAIM),
-            Some(&serde_json::json!("openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I"))
+            Some(&serde_json::json!("TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA"))
         );
         assert_eq!(claims.get("policy"), Some(&serde_json::json!("readonly")));
         assert_eq!(claims.get("groups"), Some(&serde_json::json!(["devs"])));
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(replicated.access_key, credentials.access_key);
         assert_eq!(replicated.secret_key, credentials.secret_key);
         assert_eq!(replicated.session_token, credentials.session_token);
-        assert_eq!(replicated.parent_user, "openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I");
+        assert_eq!(replicated.parent_user, "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA");
         assert_eq!(replicated.parent_policy_mapping, OIDC_STS_REQUIRES_VIRTUAL_PARENT_RECEIVER_POLICY);
         assert!(replicated.parent_policy_mapping.trim().is_empty());
         assert!(MappedPolicy::new(&replicated.parent_policy_mapping).to_slice().is_empty());
