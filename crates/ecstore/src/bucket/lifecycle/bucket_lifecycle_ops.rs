@@ -4137,20 +4137,27 @@ pub async fn eval_action_from_lifecycle(
     );
 
     let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
+    let object_locked = object_lock_boundary::is_object_locked_by_metadata(&oi.user_defined, oi.delete_marker);
 
     match event.action {
-        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction if lock_enabled => {
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction if lock_enabled || object_locked => {
             return lifecycle::Event::default();
         }
-        IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction => {
-            if oi.version_id.is_none() {
+        IlmAction::DeleteAction
+        | IlmAction::DeleteRestoredAction
+        | IlmAction::DeleteVersionAction
+        | IlmAction::DeleteRestoredVersionAction => {
+            if matches!(event.action, IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction)
+                && oi.version_id.is_none()
+            {
                 return lifecycle::Event::default();
             }
             // Lifecycle operations should never bypass governance retention
-            if lock_enabled
-                && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
-                    .await
-                    .is_some()
+            if object_locked
+                || (lock_enabled
+                    && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
+                        .await
+                        .is_some())
             {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
@@ -4599,6 +4606,7 @@ mod tests {
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
         RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
     };
+    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -7136,6 +7144,16 @@ mod tests {
         }
     }
 
+    fn current_object_with_metadata(
+        replication_status: ReplicationStatusType,
+        user_defined: HashMap<String, String>,
+    ) -> ObjectInfo {
+        ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..current_object(replication_status)
+        }
+    }
+
     #[test]
     fn lifecycle_replication_blocks_only_pending_failed_or_pending_purge() {
         assert!(lifecycle_replication_blocks_action(&delete_marker_object(
@@ -7735,6 +7753,41 @@ mod tests {
         let event = eval_action_from_lifecycle(&lc, None, &object).await;
 
         assert_eq!(event.action, IlmAction::DeleteAction);
+    }
+
+    #[tokio::test]
+    async fn existing_object_lifecycle_skips_current_expiration_for_explicit_legal_hold() {
+        let lc = latest_expiration_lifecycle();
+        let object = current_object_with_metadata(
+            ReplicationStatusType::Completed,
+            HashMap::from([(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string())]),
+        );
+
+        let event = eval_action_from_lifecycle(&lc, None, &object).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn existing_object_lifecycle_skips_current_expiration_for_explicit_retention() {
+        let lc = latest_expiration_lifecycle();
+        let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("future retain-until date should format");
+        let object = current_object_with_metadata(
+            ReplicationStatusType::Completed,
+            HashMap::from([
+                (
+                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+                ),
+                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+            ]),
+        );
+
+        let event = eval_action_from_lifecycle(&lc, None, &object).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
     }
 
     #[tokio::test]
