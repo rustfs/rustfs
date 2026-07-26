@@ -335,21 +335,27 @@ fn s3_http_server_config(config: &Config) -> Config {
 }
 
 fn console_http_server_config(config: &Config) -> Option<Config> {
-    if config.console_enable && !config.console_address.is_empty() {
+    if let Some(console_address) = console_listener_address(config) {
         let mut console_config = config.clone();
-        console_config.address = console_config.console_address.clone();
+        console_config.address = console_address.to_string();
+        console_config.console_address = console_address.to_string();
         Some(console_config)
     } else {
         None
     }
 }
 
-fn validate_console_listener_address(config: &Config, s3_addr: SocketAddr) -> Result<()> {
-    if !config.console_enable || config.console_address.trim().is_empty() {
-        return Ok(());
-    }
+fn console_listener_address(config: &Config) -> Option<&str> {
+    let console_address = config.console_address.trim();
+    (config.console_enable && !console_address.is_empty()).then_some(console_address)
+}
 
-    let console_addr = parse_and_resolve_address(config.console_address.as_str())
+fn validate_console_listener_address(config: &Config, s3_addr: SocketAddr) -> Result<()> {
+    let Some(console_address) = console_listener_address(config) else {
+        return Ok(());
+    };
+
+    let console_addr = parse_and_resolve_address(console_address)
         .map_err(|err| Error::other(format!("console address '{}': {err}", config.console_address)))?;
 
     if listener_addresses_overlap(s3_addr, console_addr) {
@@ -411,6 +417,20 @@ mod tests {
     }
 
     #[test]
+    fn console_http_server_config_trims_console_address() {
+        let mut config = Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-data".to_string()]);
+        config.console_enable = true;
+        config.console_address = " 127.0.0.1:9001 ".to_string();
+
+        let Some(console_config) = console_http_server_config(&config) else {
+            panic!("enabled console should build config");
+        };
+
+        assert_eq!(console_config.address, "127.0.0.1:9001");
+        assert_eq!(console_config.console_address, "127.0.0.1:9001");
+    }
+
+    #[test]
     fn console_http_server_config_skips_disabled_or_empty_console() {
         let mut config = Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-data".to_string()]);
         config.console_enable = false;
@@ -419,6 +439,9 @@ mod tests {
 
         config.console_enable = true;
         config.console_address.clear();
+        assert!(console_http_server_config(&config).is_none());
+
+        config.console_address = "   ".to_string();
         assert!(console_http_server_config(&config).is_none());
     }
 
@@ -441,7 +464,7 @@ mod tests {
     fn validate_console_listener_address_rejects_wildcard_same_port() {
         let mut config = Config::new("127.0.0.1:9001", vec!["/tmp/rustfs-data".to_string()]);
         config.console_enable = true;
-        config.console_address = ":9001".to_string();
+        config.console_address = " :9001 ".to_string();
 
         let err = validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
             .expect_err("wildcard console listener covers the S3 endpoint port");
@@ -471,6 +494,10 @@ mod tests {
         config.console_address.clear();
         validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
             .expect("empty console address should skip console listener");
+
+        config.console_address = "   ".to_string();
+        validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
+            .expect("blank console address should skip console listener");
     }
 
     #[test]
