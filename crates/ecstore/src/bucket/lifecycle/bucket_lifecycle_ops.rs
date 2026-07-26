@@ -4594,11 +4594,12 @@ mod tests {
     use crate::bucket::lifecycle::config_boundary;
     use crate::bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
-        claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
-        legacy_manual_transition_scope_key, load_manual_transition_job_record, load_manual_transition_scope_admission,
-        load_manual_transition_scope_admission_with_etag, manual_transition_scope_record_object_name,
-        renew_manual_transition_job_lease, request_manual_transition_job_cancel, save_manual_transition_job_record,
-        save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
+        ManualTransitionWorkerResult, claim_manual_transition_scope_admission, legacy_manual_transition_scope_key,
+        delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
+        load_manual_transition_scope_admission, load_manual_transition_scope_admission_with_etag,
+        manual_transition_scope_record_object_name, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
+        save_manual_transition_job_record, save_manual_transition_scope_admission_if_absent,
+        save_manual_transition_scope_admission_if_current,
     };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
@@ -7349,6 +7350,36 @@ mod tests {
         assert_eq!(report.enqueued, 0);
         assert_eq!(report.tier_failure, 1);
         assert!(!report.has_partial_enqueue());
+    }
+
+    #[test]
+    fn manual_transition_complete_preserves_worker_failure_summary() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-worker-summary-bucket", &options, "owner-a");
+
+        record.record_worker_result(ManualTransitionWorkerResult::Completed, ManualTransitionQueueSnapshot::default());
+        record.record_worker_result(ManualTransitionWorkerResult::TierFailure, ManualTransitionQueueSnapshot::default());
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "manual-worker-summary-bucket".to_string(),
+                scanned: 3,
+                eligible: 2,
+                enqueued: 2,
+                tier_failure: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+
+        assert_eq!(record.state, ManualTransitionJobState::Partial);
+        assert!(record.scan_completed);
+        assert_eq!(record.report.scanned, 3);
+        assert_eq!(record.report.eligible, 2);
+        assert_eq!(record.report.enqueued, 2);
+        assert_eq!(record.report.transition_completed, 1);
+        assert_eq!(record.report.transition_failed, 1);
+        assert_eq!(record.report.tier_failure, 2);
+        assert!(record.completed_at_unix_nanos.is_some());
     }
 
     #[tokio::test]
