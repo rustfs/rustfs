@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::site_replication::{reconcile_site_replication_buckets, reconcile_site_replicator_service_account};
+use crate::admin::handlers::site_replication::{
+    reconcile_site_replication_buckets, reconcile_site_replicator_service_account, spawn_site_replication_reconcile_task,
+};
 use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot};
 use crate::{
     config::Config,
@@ -90,6 +92,7 @@ pub(crate) async fn init_startup_runtime_services(
         if let Err(err) = reconcile_site_replication_buckets().await {
             tracing::warn!(error = %err, "site replication bucket reconcile failed");
         }
+        spawn_site_replication_reconcile_task(ctx.clone());
     }
     init_auth_integrations().await?;
     init_notification_runtime(endpoint_pools, buckets).await?;

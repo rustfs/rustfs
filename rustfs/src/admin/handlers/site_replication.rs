@@ -150,6 +150,7 @@ const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-rep
 const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
 const SITE_REPLICATION_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
+const SITE_REPLICATION_RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
 const RUSTFS_ADMIN_V3_PREFIX: &str = "/rustfs/admin/v3";
 const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 const MINIO_SITE_REPLICATION_JOIN_PATH: &str = "/minio/admin/v3/site-replication/join";
@@ -369,6 +370,17 @@ impl SiteReplicationLifecycleGuard {
         Self {
             _guard: SITE_REPLICATION_LIFECYCLE_LOCK.lock().await,
         }
+    }
+
+    /// Non-blocking variant for background work that must never interleave with an
+    /// add/remove/endpoint-refresh: those run in phases, and rebuilding rules between two of
+    /// them would resurrect exactly what the operation just tore down. Skipping a round is
+    /// free — the next tick picks it up.
+    fn try_acquire() -> Option<Self> {
+        SITE_REPLICATION_LIFECYCLE_LOCK
+            .try_lock()
+            .ok()
+            .map(|guard| Self { _guard: guard })
     }
 }
 
@@ -2713,6 +2725,53 @@ pub async fn reconcile_site_replication_buckets() -> S3Result<()> {
     Ok(())
 }
 
+/// Re-run the site-replication reconcile on a timer.
+///
+/// Startup alone leaves a site broken until the next restart, and the events that rebuild
+/// rules (bucket creation, peer bucket-ops, metadata pushes) only ever touch one bucket.
+/// Both reconcilers are no-ops once the wiring matches — the bucket pass compares the
+/// serialized targets and rule set before writing — so a healthy deployment reads and
+/// writes nothing.
+pub fn spawn_site_replication_reconcile_task(ctx: tokio_util::sync::CancellationToken) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SITE_REPLICATION_RECONCILE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick fires immediately and startup has just reconciled; skip it.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = ctx.cancelled() => break,
+                _ = ticker.tick() => {
+                    let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+                        continue;
+                    };
+                    if let Err(err) = reconcile_site_replicator_service_account().await {
+                        warn!(
+                            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                            result = "periodic_service_account_reconcile_failed",
+                            error = ?err,
+                            "admin site replication state"
+                        );
+                    }
+                    if let Err(err) = reconcile_site_replication_buckets().await {
+                        warn!(
+                            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                            result = "periodic_bucket_reconcile_failed",
+                            error = ?err,
+                            "admin site replication state"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn site_replication_peer_wire_path(path: &str) -> String {
     let (path_only, query) = path
         .split_once('?')
@@ -4034,6 +4093,8 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
             entry.quota_config_updated_at = maybe_time(metadata.quota_config_updated_at);
             entry.expiry_lc_config_updated_at = maybe_time(metadata.lifecycle_config_updated_at);
             entry.cors_config_updated_at = maybe_time(metadata.cors_config_updated_at);
+            entry.replication_targets_online =
+                Some(site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await);
         }
 
         info.buckets.insert(bucket.name, entry);
@@ -4446,7 +4507,7 @@ fn merge_bucket_status_info(status: &mut SRStatusInfo, site_infos: &BTreeMap<Str
                 .map(|info| info.buckets.get(bucket_name).and_then(|bucket| bucket.versioning.as_ref())),
             total_sites,
         );
-        let (_, replication_mismatch) = site_replication_config_mismatch(
+        let (_, rules_mismatch) = site_replication_config_mismatch(
             site_infos.iter().map(|(deployment_id, info)| {
                 (
                     deployment_id.as_str(),
@@ -4457,6 +4518,16 @@ fn merge_bucket_status_info(status: &mut SRStatusInfo, site_infos: &BTreeMap<Str
             }),
             total_sites,
         );
+        // Well-formed rules on a site that cannot reach the peer behind them replicate
+        // nothing, so a site reporting an offline target is out of sync regardless of how
+        // its rule set reads. Peers that do not report the field are left out of the verdict.
+        let targets_offline = site_infos.values().any(|info| {
+            info.buckets
+                .get(bucket_name)
+                .and_then(|bucket| bucket.replication_targets_online)
+                == Some(false)
+        });
+        let replication_mismatch = rules_mismatch || targets_offline;
         let (quota_count, quota_mismatch) = string_config_mismatch(
             site_infos
                 .values()
@@ -6288,6 +6359,31 @@ fn prune_removed_site_replication_bucket_targets(
 
 fn is_site_replication_rule(rule: &ReplicationRule) -> bool {
     rule.id.as_deref().is_some_and(|id| id.starts_with("site-repl-"))
+}
+
+/// Whether every `site-repl-*` rule on this bucket resolves to a live remote target.
+///
+/// The rule set alone cannot answer this: a rule can be perfectly formed while the endpoint
+/// recorded for its peer is one this site cannot reach, so `update_all_targets` never built
+/// a client for it and `replicate_object` drops every object against that ARN. Reads the
+/// already-resolved client map rather than rebuilding clients, so it stays cheap enough for
+/// the status path.
+async fn site_replication_targets_online(bucket: &str, replication_config_xml: &[u8]) -> bool {
+    let Ok(config) = deserialize::<ReplicationConfiguration>(replication_config_xml) else {
+        return true;
+    };
+
+    for rule in config.rules.iter().filter(|rule| is_site_replication_rule(rule)) {
+        if BucketTargetSys::get()
+            .get_remote_target_client_by_arn(bucket, &rule.destination.bucket)
+            .await
+            .is_none()
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Merge a peer's replication config into the local one.
@@ -10979,6 +11075,83 @@ mod tests {
         assert_eq!(
             site_replication_config_mismatch(vec![("site-a", Some(&site_a_xml)), ("site-b", Some(&site_b_xml))].into_iter(), 2),
             (2, false)
+        );
+    }
+
+    // A site whose rules are well-formed but whose peer endpoint it cannot reach builds no
+    // target client, so it replicates nothing while its rule set still reads as correct.
+    // Rule-shape checking alone cannot see that, so the reporting site says so directly.
+    #[test]
+    fn test_merge_bucket_status_reports_offline_targets_as_mismatch() {
+        // Both sites carry a correct, peer-specific rule set: rule-shape checking alone
+        // sees a healthy pair. Only the reported target health distinguishes them.
+        let site_info = |peer: &str, targets_online: Option<bool>| {
+            let xml = String::from_utf8(serialize(&site_repl_config(peer)).unwrap()).unwrap();
+            let mut info = SRInfo::default();
+            info.buckets.insert(
+                "photos".to_string(),
+                SRBucketInfo {
+                    bucket: "photos".to_string(),
+                    replication_config: Some(xml),
+                    replication_targets_online: targets_online,
+                    ..Default::default()
+                },
+            );
+            info
+        };
+
+        let mut status = SRStatusInfo::default();
+        let site_infos = BTreeMap::from([
+            ("site-a".to_string(), site_info("site-b", Some(true))),
+            ("site-b".to_string(), site_info("site-a", Some(false))),
+        ]);
+        merge_bucket_status_info(&mut status, &site_infos, &SRStatusOptions::default());
+
+        let summary = status
+            .bucket_stats
+            .get("photos")
+            .and_then(|per_site| per_site.get("site-a"))
+            .expect("bucket stats should carry a per-site summary");
+        assert!(
+            summary.replication_cfg_mismatch,
+            "a peer reporting an offline replication target must not read as in sync"
+        );
+    }
+
+    // A peer that predates the field reports nothing; that is unknown, not a fault, and must
+    // not flip every bucket to out-of-sync during a mixed-version upgrade.
+    #[test]
+    fn test_merge_bucket_status_treats_absent_target_health_as_unknown() {
+        let site_info = |peer: &str| {
+            let xml = String::from_utf8(serialize(&site_repl_config(peer)).unwrap()).unwrap();
+            let mut info = SRInfo::default();
+            info.buckets.insert(
+                "photos".to_string(),
+                SRBucketInfo {
+                    bucket: "photos".to_string(),
+                    replication_config: Some(xml),
+                    replication_targets_online: None,
+                    ..Default::default()
+                },
+            );
+            info
+        };
+
+        let mut status = SRStatusInfo::default();
+        let site_infos = BTreeMap::from([
+            ("site-a".to_string(), site_info("site-b")),
+            ("site-b".to_string(), site_info("site-a")),
+        ]);
+        merge_bucket_status_info(&mut status, &site_infos, &SRStatusOptions::default());
+
+        let summary = status
+            .bucket_stats
+            .get("photos")
+            .and_then(|per_site| per_site.get("site-a"))
+            .expect("bucket stats should carry a per-site summary");
+        assert!(
+            !summary.replication_cfg_mismatch,
+            "peers that do not report target health must not be treated as broken"
         );
     }
 
