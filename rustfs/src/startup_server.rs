@@ -335,7 +335,7 @@ fn s3_http_server_config(config: &Config) -> Config {
 }
 
 fn console_http_server_config(config: &Config) -> Option<Config> {
-    if config.console_enable && !config.console_address.is_empty() {
+    if config.console_enable && !config.console_address.trim().is_empty() {
         let mut console_config = config.clone();
         console_config.address = console_config.console_address.clone();
         Some(console_config)
@@ -420,6 +420,9 @@ mod tests {
         config.console_enable = true;
         config.console_address.clear();
         assert!(console_http_server_config(&config).is_none());
+
+        config.console_address = "   ".to_string();
+        assert!(console_http_server_config(&config).is_none());
     }
 
     #[test]
@@ -471,6 +474,10 @@ mod tests {
         config.console_address.clear();
         validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
             .expect("empty console address should skip console listener");
+
+        config.console_address = "   ".to_string();
+        validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
+            .expect("blank console address should skip console listener");
     }
 
     #[test]
