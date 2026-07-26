@@ -872,6 +872,8 @@ impl ECStore {
         let idx = if opts.data_movement && opts.version_id.is_some() {
             self.select_data_movement_pool_idx(bucket, &object, data.size(), opts, false)
                 .await?
+        } else if opts.no_lock {
+            self.get_pool_idx_no_lock(bucket, &object, data.size()).await?
         } else {
             self.get_pool_idx(bucket, &object, data.size()).await?
         };
@@ -931,7 +933,7 @@ impl ECStore {
         let cp_src_dst_same = path_join_buf(&[src_bucket, &src_object]) == path_join_buf(&[dst_bucket, &dst_object]);
 
         let mut dst_opts = dst_opts.clone();
-        let _dst_lock_guard = if cp_src_dst_same {
+        let _dst_lock_guard = if cp_src_dst_same && dst_opts.expected_current_version_id.is_none() {
             self.acquire_object_write_lock_if_needed("copy_object", dst_bucket, &dst_object, &mut dst_opts)
                 .await?
         } else {
@@ -967,6 +969,7 @@ impl ECStore {
                     no_lock: dst_opts.no_lock,
                     mod_time: dst_opts.mod_time,
                     http_preconditions: dst_opts.http_preconditions.clone(),
+                    expected_current_version_id: dst_opts.expected_current_version_id.clone(),
                     ..Default::default()
                 };
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
@@ -996,6 +999,7 @@ impl ECStore {
                         no_lock: dst_opts.no_lock,
                         mod_time: dst_opts.mod_time,
                         http_preconditions: dst_opts.http_preconditions.clone(),
+                        expected_current_version_id: dst_opts.expected_current_version_id.clone(),
                         ..Default::default()
                     };
                     return self.pools[pool_idx]
@@ -1022,6 +1026,7 @@ impl ECStore {
             no_lock: dst_opts.no_lock,
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
+            expected_current_version_id: dst_opts.expected_current_version_id.clone(),
             ..Default::default()
         };
 
@@ -1085,9 +1090,12 @@ impl ECStore {
             return Ok(ObjectInfo::default());
         }
 
-        let _object_lock_guard = self
-            .acquire_object_write_lock_if_needed("delete_object", bucket, object, &mut opts)
-            .await?;
+        let _object_lock_guard = if opts.expected_current_version_id.is_none() {
+            self.acquire_object_write_lock_if_needed("delete_object", bucket, object, &mut opts)
+                .await?
+        } else {
+            None
+        };
 
         if opts.delete_prefix {
             self.delete_prefix(bucket, object, &opts).await?;

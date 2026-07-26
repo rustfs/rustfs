@@ -19,6 +19,7 @@ use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
 use rustfs_config::server_config::KVS;
+use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -27,6 +28,7 @@ const EVENT_DECOMMISSION_RESUME_RETRY: &str = "decommission_resume_retry";
 const EVENT_DECOMMISSION_RESUME_FAILED: &str = "decommission_resume_failed";
 const EVENT_STORE_FORMAT_RETRY: &str = "store_format_retry";
 const EVENT_ECSTORE_INIT_STATUS: &str = "ecstore_init_status";
+const EVENT_STORE_RPC_SECRET_PREFLIGHT_FAILED: &str = "store_rpc_secret_preflight_failed";
 
 fn pool_first_endpoint_is_local(pool: &crate::layout::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
@@ -47,6 +49,48 @@ fn resolve_startup_pool_defaults_with(
     validate(endpoint_pools)?;
     let drive_counts = startup_pool_drive_counts(endpoint_pools);
     drive_counts.into_iter().map(ec_drives_no_config).collect()
+}
+
+/// Fail fast when the topology spans remote nodes but no internode RPC secret
+/// resolves. Every remote format read would otherwise fail client-side with
+/// "No valid auth token" and startup would retry for minutes before dying with
+/// a misleading "erasure read quorum" error (issues #4939, #5153).
+fn preflight_startup_rpc_secret(endpoint_pools: &EndpointServerPools) -> Result<()> {
+    preflight_startup_rpc_secret_with(endpoint_pools, try_get_rpc_token)
+}
+
+fn preflight_startup_rpc_secret_with(
+    endpoint_pools: &EndpointServerPools,
+    resolve_rpc_token: impl FnOnce() -> std::io::Result<String>,
+) -> Result<()> {
+    let has_remote_endpoint = endpoint_pools
+        .as_ref()
+        .iter()
+        .flat_map(|pool| pool.endpoints.as_ref().iter())
+        .any(|endpoint| !endpoint.is_local);
+
+    if !has_remote_endpoint {
+        return Ok(());
+    }
+
+    match resolve_rpc_token() {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // The message prefix must stay aligned with the runtime log in
+            // cluster/rpc/http_auth.rs: the log-analyzer `rpc-secret-resolution`
+            // rule anchors on it, and this preflight aborts before that log
+            // would ever be emitted.
+            error!(
+                event = EVENT_STORE_RPC_SECRET_PREFLIGHT_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                "RPC auth secret resolution failed: {err}; {RPC_SECRET_REQUIRED_OPERATOR_MESSAGE}"
+            );
+            Err(Error::other(format!(
+                "store init aborted: endpoints include remote nodes but {err}; {RPC_SECRET_REQUIRED_OPERATOR_MESSAGE}"
+            )))
+        }
+    }
 }
 
 fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
@@ -217,6 +261,8 @@ impl ECStore {
         // payload writes use the runtime storage-class snapshot published later
         // from config before the store is marked ready.
         let default_pool_parities = resolve_startup_pool_defaults(&endpoint_pools)?;
+
+        preflight_startup_rpc_secret(&endpoint_pools)?;
 
         let mut deployment_id = None;
 
@@ -522,9 +568,10 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, load_pool_meta_for_startup, pool_first_endpoint_is_local,
-        resolve_startup_pool_defaults_with, resolve_store_init_stage_result, save_validated_pool_meta_for_startup,
-        should_auto_start_rebalance_after_init, should_auto_start_rebalance_after_recovered_meta,
-        should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with, resolve_store_init_stage_result,
+        save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
+        should_auto_start_rebalance_after_recovered_meta, should_resume_local_decommission,
+        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
     use crate::{
@@ -534,12 +581,28 @@ mod tests {
                 TIER_DELETE_JOURNAL_PREFIX, persist_tier_delete_journal_entry, recover_tier_delete_journal_entries,
             },
             tier_sweeper::Jentry,
+            transition_transaction::{
+                TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionCleanupDecision, TransitionCleanupProof, TransitionRemoteVersion,
+                TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit,
+                TransitionTransactionState, load_transition_transaction_record, recover_transition_transaction_records,
+                save_transition_transaction_record,
+            },
         },
+        client::transition_api::ReaderImpl,
+        config::com,
         disk::RUSTFS_META_BUCKET,
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
         services::tier::{
-            test_util::{MockWarmBackend, TransitionCleanupStoreBarrier, register_mock_tier},
-            tier::TierConfigMgr,
+            test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
+            tier::{TIER_CONFIG_FILE, TierConfigMgr},
+            tier_mutation_intent::{
+                TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
+                TierMutationIntentTarget, advance_tier_mutation_intent_record_idempotent, delete_tier_mutation_intent_record,
+                list_tier_mutation_intent_records, load_tier_mutation_intent_record, load_tier_mutation_intent_record_with_etag,
+                save_tier_mutation_intent_record, save_tier_mutation_intent_record_if_current,
+            },
+            tier_mutation_peer::{TierMutationPeerError, TierMutationPeerState, handle_tier_mutation_peer_request},
+            warm_backend::{TransitionCandidateProbe, WarmBackend},
         },
         storage_api_contracts::{
             bucket::{BucketOperations as _, MakeBucketOptions},
@@ -558,6 +621,8 @@ mod tests {
     };
     use http::HeaderMap;
     use rustfs_config::server_config::KVS;
+    #[cfg(feature = "test-util")]
+    use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use std::{
         future::Future,
         io::Cursor,
@@ -836,6 +901,123 @@ mod tests {
         );
     }
 
+    fn rpc_preflight_pools(pools: Vec<Vec<Endpoint>>) -> EndpointServerPools {
+        EndpointServerPools::from(
+            pools
+                .into_iter()
+                .enumerate()
+                .map(|(pool_index, endpoints)| PoolEndpoints {
+                    legacy: false,
+                    set_count: 1,
+                    drives_per_set: endpoints.len(),
+                    endpoints: Endpoints::from(endpoints),
+                    cmd_line: format!("pool-{pool_index}"),
+                    platform: String::new(),
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn parsed_local_endpoint() -> Endpoint {
+        let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/data").expect("local endpoint should parse");
+        endpoint.is_local = true;
+        endpoint
+    }
+
+    fn parsed_remote_endpoint() -> Endpoint {
+        let mut endpoint = Endpoint::try_from("http://10.0.0.2:9000/data").expect("remote endpoint should parse");
+        endpoint.is_local = false;
+        endpoint
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_aborts_for_remote_endpoints_without_secret() {
+        // The remote endpoint intentionally sits behind a local one: the
+        // preflight must scan every endpoint, not just the first.
+        let pools = rpc_preflight_pools(vec![vec![parsed_local_endpoint(), parsed_remote_endpoint()]]);
+
+        let err = preflight_startup_rpc_secret_with(&pools, || {
+            Err(std::io::Error::other(rustfs_credentials::RPC_SECRET_REQUIRED_MESSAGE))
+        })
+        .expect_err("remote endpoints without an RPC secret must abort startup before the format retry loop");
+
+        let message = err.to_string();
+        assert!(message.contains("store init aborted"), "unexpected error: {message}");
+        assert!(
+            message.contains(rustfs_credentials::RPC_SECRET_REQUIRED_MESSAGE),
+            "error must state the resolution failure: {message}"
+        );
+        assert!(
+            message.contains(rustfs_credentials::RPC_SECRET_REQUIRED_OPERATOR_MESSAGE),
+            "error must carry the operator remediation guidance: {message}"
+        );
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_aborts_for_remote_endpoint_in_later_pool() {
+        // The remote endpoint hides in a later, otherwise-local pool: a
+        // first-pool shortcut (the `first_local` shape) must not pass.
+        let pools = rpc_preflight_pools(vec![vec![parsed_local_endpoint()], vec![parsed_remote_endpoint()]]);
+
+        let err = preflight_startup_rpc_secret_with(&pools, || {
+            Err(std::io::Error::other(rustfs_credentials::RPC_SECRET_REQUIRED_MESSAGE))
+        })
+        .expect_err("a remote endpoint in a later pool must abort startup without an RPC secret");
+
+        let message = err.to_string();
+        assert!(message.contains("store init aborted"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_skips_resolution_for_local_only_endpoints() {
+        preflight_startup_rpc_secret_with(&rpc_preflight_pools(vec![vec![parsed_local_endpoint()]]), || {
+            panic!("single-node topology must not resolve an RPC secret")
+        })
+        .expect("local-only topology must start without an RPC secret");
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_accepts_remote_endpoints_with_resolved_secret() {
+        preflight_startup_rpc_secret_with(&rpc_preflight_pools(vec![vec![parsed_remote_endpoint()]]), || {
+            Ok("resolved-secret".to_string())
+        })
+        .expect("a resolvable RPC secret must not block startup");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn test_new_with_instance_ctx_aborts_before_format_retry_loop_without_rpc_secret() {
+        // Guard: under a shared-process `cargo test` run another test may have
+        // already pinned the process-global RPC secret (ensure_test_rpc_secret),
+        // which would let init proceed past the preflight into remote disk
+        // init. A failing probe pins nothing, so it cannot poison later tests;
+        // under nextest's process-per-test model (CI) the guard never fires.
+        if rustfs_credentials::try_get_rpc_token().is_ok() {
+            return;
+        }
+
+        let mut remote_endpoint = parsed_remote_endpoint();
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(0);
+
+        let err = crate::store::ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            rpc_preflight_pools(vec![vec![remote_endpoint]]),
+            CancellationToken::new(),
+            Arc::new(crate::runtime::instance::InstanceContext::new()),
+        )
+        .await
+        .expect_err("distributed init without an RPC secret must abort before the format retry loop");
+
+        let message = err.to_string();
+        assert!(message.contains("store init aborted"), "unexpected error: {message}");
+        assert!(
+            message.contains(rustfs_credentials::RPC_SECRET_REQUIRED_OPERATOR_MESSAGE),
+            "abort must carry the operator remediation guidance: {message}"
+        );
+    }
+
     fn endpoint_pools_with_drive_counts(counts: &[usize]) -> EndpointServerPools {
         EndpointServerPools::from(
             counts
@@ -985,6 +1167,25 @@ mod tests {
             .list_objects_v2(RUSTFS_META_BUCKET, TIER_DELETE_JOURNAL_PREFIX, None, None, 100, false, None, false)
             .await
             .expect("tier delete journal should be listable")
+            .objects
+            .len()
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn transition_transaction_record_count(store: Arc<crate::store::ECStore>) -> usize {
+        store
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TRANSITION_TRANSACTION_RECORD_PREFIX,
+                None,
+                None,
+                100,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("transition transaction records should be listable")
             .objects
             .len()
     }
@@ -1206,6 +1407,559 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_round_trips_through_config_store() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-record", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: "COLD-A".to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("tier mutation intent record should persist");
+        let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record should load");
+
+        assert_eq!(loaded, intent);
+
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record delete should be idempotent");
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("tier mutation intent record delete should tolerate missing records");
+        let err = load_tier_mutation_intent_record(store, mutation_id)
+            .await
+            .expect_err("deleted tier mutation intent record should not load");
+        assert!(matches!(err, Error::ConfigNotFound));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_scan_retains_good_records_and_counts_bad_records() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan", &[4])).await;
+        let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: tier_name.to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        let first_id = uuid::Uuid::parse_str("12345678-1234-5678-9abc-def012345678").expect("first uuid should parse");
+        let second_id = uuid::Uuid::parse_str("22345678-1234-5678-9abc-def012345678").expect("second uuid should parse");
+        let first = build_intent(first_id, "COLD-A");
+        let second = build_intent(second_id, "COLD-B");
+        save_tier_mutation_intent_record(store.clone(), &first)
+            .await
+            .expect("first tier mutation intent record should persist");
+        save_tier_mutation_intent_record(store.clone(), &second)
+            .await
+            .expect("second tier mutation intent record should persist");
+        com::save_config(
+            store.clone(),
+            &format!("{TIER_MUTATION_INTENT_RECORD_PREFIX}/00/00/33345678123456789abcdef012345678.json"),
+            b"{}".to_vec(),
+        )
+        .await
+        .expect("malformed-shard intent record should persist");
+        com::save_config(
+            store.clone(),
+            &format!("{TIER_MUTATION_INTENT_RECORD_PREFIX}/44/44/44445678123456789abcdef012345678.json"),
+            b"{".to_vec(),
+        )
+        .await
+        .expect("corrupt-json intent record should persist");
+
+        let scan = list_tier_mutation_intent_records(store, 100, None)
+            .await
+            .expect("tier mutation intent records should scan");
+        let mut loaded_ids: Vec<_> = scan.intents.into_iter().map(|intent| intent.mutation_id).collect();
+        loaded_ids.sort();
+
+        assert_eq!(scan.scanned, 4);
+        assert_eq!(scan.failed, 2);
+        assert_eq!(loaded_ids, vec![first_id, second_id]);
+        assert!(!scan.truncated);
+        assert_eq!(scan.next_marker, None);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_advance_is_idempotent_in_config_store() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-advance", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: "COLD-A".to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("prepared tier mutation intent record should persist");
+        let (loaded_before_advance, stale_etag) = load_tier_mutation_intent_record_with_etag(store.clone(), mutation_id)
+            .await
+            .expect("prepared tier mutation intent record should load with etag");
+        assert_eq!(loaded_before_advance, intent);
+        assert!(!stale_etag.is_empty());
+
+        let (committed, first_advanced) = advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("new-etag".to_string()),
+        )
+        .await
+        .expect("first commit should advance the record");
+        assert!(first_advanced);
+        assert_eq!(committed.state, TierMutationIntentState::Committed);
+        assert_eq!(committed.revision, 2);
+        assert_eq!(committed.committed_config_etag.as_deref(), Some("new-etag"));
+
+        let (retried, retry_advanced) = advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("new-etag".to_string()),
+        )
+        .await
+        .expect("same commit retry should be idempotent");
+        assert!(!retry_advanced);
+        assert_eq!(retried, committed);
+
+        let conflict = advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("other-etag".to_string()),
+        )
+        .await
+        .expect_err("conflicting commit retry should fail closed");
+        assert!(matches!(conflict, Error::Io(_)));
+        assert!(conflict.to_string().contains("committed config etag does not match"));
+
+        let mut stale_conflict = intent;
+        stale_conflict
+            .advance_idempotent(TierMutationIntentState::Committed, Some("other-etag".to_string()))
+            .expect("stale conflicting intent should advance locally");
+        let stale_save = save_tier_mutation_intent_record_if_current(store.clone(), &stale_conflict, &stale_etag)
+            .await
+            .expect_err("stale etag must fail closed instead of overwriting the committed record");
+        assert!(matches!(stale_save, Error::PreconditionFailed));
+
+        let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("conflicting retry must not overwrite the durable record");
+        assert_eq!(loaded, committed);
+
+        let abort_id = uuid::Uuid::new_v4();
+        let abort_intent = TierMutationIntent {
+            mutation_id: abort_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [4; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: "COLD-B".to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        save_tier_mutation_intent_record(store.clone(), &abort_intent)
+            .await
+            .expect("prepared abort intent record should persist");
+
+        let (aborted, first_abort_advanced) =
+            advance_tier_mutation_intent_record_idempotent(store.clone(), abort_id, TierMutationIntentState::Aborted, None)
+                .await
+                .expect("first abort should advance the record");
+        assert!(first_abort_advanced);
+        assert_eq!(aborted.state, TierMutationIntentState::Aborted);
+        assert_eq!(aborted.revision, 2);
+        assert_eq!(aborted.committed_config_etag, None);
+
+        let (aborted_retry, retry_abort_advanced) =
+            advance_tier_mutation_intent_record_idempotent(store, abort_id, TierMutationIntentState::Aborted, None)
+                .await
+                .expect("same abort retry should be idempotent");
+        assert!(!retry_abort_advanced);
+        assert_eq!(aborted_retry, aborted);
+    }
+
+    #[cfg(feature = "test-util")]
+    fn tier_mutation_peer_test_intent(
+        mutation_id: uuid::Uuid,
+        tier_name: &str,
+        candidate_digest: [u8; 32],
+    ) -> TierMutationIntent {
+        TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest,
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: tier_name.to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-peer-handler", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [3; 32]);
+        let prepare_payload = intent.encode().expect("prepare intent should encode");
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+
+        let prepared = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("first prepare should create the peer intent");
+        assert!(prepared.applied);
+        assert_eq!(prepared.state, TierMutationPeerState::Prepared);
+        let blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("prepared peer mutation should block new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            blocked.message.contains("being replaced"),
+            "prepared peer mutation should reuse the existing blocked-tier error: {blocked}"
+        );
+
+        let retried_prepare = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("same prepare retry should be idempotent");
+        assert!(!retried_prepare.applied);
+        assert_eq!(retried_prepare.state, TierMutationPeerState::Prepared);
+        let retried_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A").await {
+            Ok(_) => panic!("prepared retry should keep blocking new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            retried_blocked.message.contains("being replaced"),
+            "prepared retry should keep the existing blocked-tier error: {retried_blocked}"
+        );
+
+        let committed = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"new-etag",
+        )
+        .await
+        .expect("commit should advance the prepared peer intent");
+        assert!(committed.applied);
+        assert_eq!(committed.state, TierMutationPeerState::Committed);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+                .await
+                .expect("committed peer mutation should clear the prepared runtime block"),
+        );
+
+        let retried_commit = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"new-etag",
+        )
+        .await
+        .expect("same commit retry should be idempotent");
+        assert!(!retried_commit.applied);
+        assert_eq!(retried_commit.state, TierMutationPeerState::Committed);
+
+        let delayed_prepare_retry = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("delayed duplicate prepare should report the durable committed state");
+        assert!(!delayed_prepare_retry.applied);
+        assert_eq!(delayed_prepare_retry.state, TierMutationPeerState::Committed);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+                .await
+                .expect("delayed committed prepare retry must not recreate a runtime block"),
+        );
+
+        let loaded = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("committed peer intent should remain durable");
+        assert_eq!(loaded.state, TierMutationIntentState::Committed);
+        assert_eq!(loaded.committed_config_etag.as_deref(), Some("new-etag"));
+
+        store
+            .tier_config_mgr()
+            .read()
+            .await
+            .save_tiering_config(store.clone())
+            .await
+            .expect("tier config should persist for cleaned intent commit proof");
+        let tier_config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("tier config object info should load");
+        let tier_config_etag = tier_config_info.etag.expect("tier config should carry an ETag");
+        delete_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("committed peer intent cleanup should persist");
+        let cleaned_commit_retry = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            tier_config_etag.as_bytes(),
+        )
+        .await
+        .expect("commit retry after durable cleanup should be idempotently terminal");
+        assert!(!cleaned_commit_retry.applied);
+        assert_eq!(cleaned_commit_retry.state, TierMutationPeerState::Committed);
+        let mismatched_cleaned_commit = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"not-the-current-etag",
+        )
+        .await
+        .expect_err("missing intent without a matching committed config ETag must fail closed");
+        assert!(matches!(mismatched_cleaned_commit, TierMutationPeerError::Store(Error::ConfigNotFound)));
+
+        let abort_id = uuid::Uuid::new_v4();
+        let abort_intent = tier_mutation_peer_test_intent(abort_id, "COLD-B", [4; 32]);
+        let abort_prepare_payload = abort_intent.encode().expect("abort prepare intent should encode");
+        register_mock_tier(&store.tier_config_mgr(), "COLD-B").await;
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            abort_id,
+            &abort_prepare_payload,
+        )
+        .await
+        .expect("abort target prepare should create the peer intent");
+        let abort_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
+            Ok(_) => panic!("abort target prepare should block new tier operation leases"),
+            Err(err) => err,
+        };
+        assert!(
+            abort_blocked.message.contains("being replaced"),
+            "abort target prepare should reuse the existing blocked-tier error: {abort_blocked}"
+        );
+
+        let aborted = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            abort_id,
+            b"",
+        )
+        .await
+        .expect("abort should advance the prepared peer intent");
+        assert!(aborted.applied);
+        assert_eq!(aborted.state, TierMutationPeerState::Aborted);
+        drop(
+            TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B")
+                .await
+                .expect("aborted peer mutation should clear the prepared runtime block"),
+        );
+
+        let retried_abort = handle_tier_mutation_peer_request(
+            store,
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            abort_id,
+            b"",
+        )
+        .await
+        .expect("same abort retry should be idempotent");
+        assert!(!retried_abort.applied);
+        assert_eq!(retried_abort.state, TierMutationPeerState::Aborted);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_handler_rejects_conflicting_prepare_without_overwrite() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-peer-conflict", &[4])).await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [3; 32]);
+        let prepare_payload = intent.encode().expect("prepare intent should encode");
+        handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &prepare_payload,
+        )
+        .await
+        .expect("first prepare should create the peer intent");
+
+        let conflicting = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [4; 32]);
+        let conflicting_payload = conflicting.encode().expect("conflicting intent should encode");
+        let conflict = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &conflicting_payload,
+        )
+        .await
+        .expect_err("conflicting prepare must fail closed");
+        assert!(matches!(conflict, TierMutationPeerError::ConflictingIntent));
+
+        let loaded = load_tier_mutation_intent_record(store, mutation_id)
+            .await
+            .expect("conflicting prepare must not overwrite the first record");
+        assert_eq!(loaded.candidate_digest, [3; 32]);
+        assert_eq!(loaded.state, TierMutationIntentState::Prepared);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_intent_record_scan_paginates_exact_limit() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan-page", &[4])).await;
+        let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            mutation_id,
+            revision: 1,
+            kind: TierMutationIntentKind::Edit,
+            state: TierMutationIntentState::Prepared,
+            old_config_etag: Some("old-etag".to_string()),
+            committed_config_etag: None,
+            candidate_digest: [3; 32],
+            affected_targets: vec![TierMutationIntentTarget {
+                tier_name: tier_name.to_string(),
+                old_backend_identity: Some([1; 32]),
+                new_backend_identity: Some([2; 32]),
+            }],
+            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+        };
+        let intent_ids = vec![
+            uuid::Uuid::parse_str("11345678-1234-5678-9abc-def012345678").expect("first uuid should parse"),
+            uuid::Uuid::parse_str("22345678-1234-5678-9abc-def012345678").expect("second uuid should parse"),
+            uuid::Uuid::parse_str("33345678-1234-5678-9abc-def012345678").expect("third uuid should parse"),
+        ];
+        for (index, mutation_id) in intent_ids.iter().copied().enumerate() {
+            let intent = build_intent(mutation_id, &format!("COLD-{index}"));
+            save_tier_mutation_intent_record(store.clone(), &intent)
+                .await
+                .expect("tier mutation intent record should persist");
+        }
+
+        let exact_page = list_tier_mutation_intent_records(store.clone(), 3, None)
+            .await
+            .expect("exact full page should scan");
+        assert_eq!(exact_page.scanned, 3);
+        assert_eq!(exact_page.intents.len(), 3);
+        assert_eq!(exact_page.failed, 0);
+        assert!(!exact_page.truncated);
+        assert_eq!(exact_page.next_marker, None);
+
+        let first_page = list_tier_mutation_intent_records(store.clone(), 2, None)
+            .await
+            .expect("first page should scan");
+        assert_eq!(first_page.scanned, 2);
+        assert_eq!(first_page.intents.len(), 2);
+        assert_eq!(first_page.failed, 0);
+        assert!(first_page.truncated);
+        assert!(first_page.next_marker.is_some());
+
+        let second_page = list_tier_mutation_intent_records(store, 2, first_page.next_marker)
+            .await
+            .expect("second page should scan");
+        let mut loaded_ids: Vec<_> = first_page
+            .intents
+            .into_iter()
+            .chain(second_page.intents.into_iter())
+            .map(|intent| intent.mutation_id)
+            .collect();
+        loaded_ids.sort();
+
+        assert_eq!(second_page.scanned, 1);
+        assert_eq!(second_page.failed, 0);
+        assert!(!second_page.truncated);
+        assert_eq!(second_page.next_marker, None);
+        assert_eq!(loaded_ids, intent_ids);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn cancelled_transition_cleanup_journals_to_its_own_instance_store() {
         struct ResolverReset(Arc<std::sync::Mutex<Option<std::sync::Weak<crate::store::ECStore>>>>);
 
@@ -1260,7 +2014,7 @@ mod tests {
         let tier_name = "CROSSCTXA";
         let backend = register_mock_tier(&ctx_a.tier_config_mgr(), tier_name).await;
         backend.set_put_remote_version(Some(uuid::Uuid::new_v4().to_string())).await;
-        backend.set_reject_non_empty_remote_versions(true);
+        backend.reject_next_non_empty_remote_version_validation();
         let remove_barrier = backend.arm_failing_remove_barrier().await;
 
         let bucket = "transition-cleanup-context-a";
@@ -1325,5 +2079,886 @@ mod tests {
             "store A recovery should delete the exact remote candidate"
         );
         assert!(!Arc::ptr_eq(&ctx_a, &ctx_b), "the regression requires two distinct instance contexts");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_deletes_uploaded_remote_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-recovery", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXRECOVERY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let candidate = bytes::Bytes::from_static(b"orphan candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(transaction.remote_object.clone(), remote_version)],
+            "recovery must delete the exact uploaded candidate"
+        );
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_retries_cleanup_pending_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-cleanup", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUP";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        let uploaded_fence = transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        transaction
+            .mark_cleanup_pending(
+                uploaded_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let candidate = bytes::Bytes::from_static(b"cleanup pending candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(transaction.remote_object.clone(), remote_version)],
+            "cleanup pending recovery must retry the exact remote candidate delete"
+        );
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_retries_cleanup_pending_unversioned_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "transition-transaction-cleanup-unversioned",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUPUNVERSIONED";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: None,
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Unversioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        let uploaded_fence = transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::unversioned()),
+            )
+            .expect("transaction should enter uploaded state");
+        transaction
+            .mark_cleanup_pending(
+                uploaded_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        backend.set_put_remote_version(Some(String::new())).await;
+        let candidate = bytes::Bytes::from_static(b"cleanup pending unversioned candidate");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![(transaction.remote_object.clone(), String::new())],
+            "unversioned cleanup must not send a synthetic remote version"
+        );
+        assert_eq!(backend.exact_remove_count(), 0);
+        assert_eq!(backend.object_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_keeps_cleanup_pending_record_when_delete_fails() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-cleanup-fail", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUPFAIL";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Versioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        let uploaded_fence = transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version)),
+            )
+            .expect("transaction should enter uploaded state");
+        transaction
+            .mark_cleanup_pending(
+                uploaded_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        let candidate = bytes::Bytes::from_static(b"cleanup pending candidate retained after failure");
+        backend
+            .put(
+                &transaction.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        backend.set_remove_failure(true);
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should keep scanning after cleanup failure");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 0, 1));
+        assert_eq!(
+            transition_transaction_record_count(store.clone()).await,
+            1,
+            "failed cleanup must keep the cleanup-pending transaction for retry"
+        );
+        assert_eq!(backend.remove_versions().await, Vec::<(String, String)>::new());
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 1);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_keeps_cleanup_pending_local_commit() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "transition-transaction-cleanup-committed",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCLEANUPCOMMITTED";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let bucket = "transition-transaction-cleanup-committed-bucket";
+        let object = "object.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"cleanup pending local commit record cleanup".repeat(1024));
+        let original = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.to_string(),
+                etag: original.etag.clone().expect("source object should have etag"),
+                ..Default::default()
+            },
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+        store
+            .transition_object(bucket, object, &opts)
+            .await
+            .expect("transition should commit");
+        let committed = store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("committed object info should be readable");
+        let mut remote_parts = committed.transitioned_object.name.rsplit('/');
+        let write_id = uuid::Uuid::parse_str(remote_parts.next().expect("remote object should contain write id"))
+            .expect("write id should parse");
+        let transaction_id = uuid::Uuid::parse_str(remote_parts.next().expect("remote object should contain transaction id"))
+            .expect("transaction id should parse");
+        let source = TransitionSourceIdentity {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: None,
+            data_dir: uuid::Uuid::new_v4(),
+            mod_time_unix_nanos: original
+                .mod_time
+                .expect("source object should have mod_time")
+                .unix_timestamp_nanos()
+                .try_into()
+                .expect("test timestamp should fit i64"),
+            size: original.size,
+            etag: original.etag.expect("source object should have etag"),
+            version_mode: TransitionSourceVersionMode::Unversioned,
+        };
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id,
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id,
+            source,
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::known_from_put_response(
+                    committed.transitioned_object.version_id.clone(),
+                )),
+            )
+            .expect("transaction should enter uploaded state");
+        let local_commit_fence = transaction
+            .advance(transaction.fence(), TransitionTransactionState::LocalCommitStarted, None)
+            .expect("transaction should enter local commit state");
+        transaction
+            .mark_cleanup_pending(
+                local_commit_fence,
+                TransitionCleanupProof {
+                    transaction_id: transaction.transaction_id,
+                    write_id: transaction.write_id,
+                    remote_object: transaction.remote_object.clone(),
+                    remote_version: transaction.remote_version.clone(),
+                    backend_fingerprint: transaction.backend_fingerprint,
+                    decision: TransitionCleanupDecision::SourceReconciledUnchanged {
+                        observed_source: transaction.source.clone(),
+                    },
+                },
+            )
+            .expect("transaction should enter cleanup pending state");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.object_count().await,
+            1,
+            "cleanup pending recovery must keep the remote body once local metadata references it"
+        );
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_drops_record_after_confirmed_local_commit() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-committed", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXCOMMITTED";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let bucket = "transition-transaction-committed-bucket";
+        let object = "object.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"confirmed local commit record cleanup".repeat(1024));
+        let original = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name.to_string(),
+                etag: original.etag.clone().expect("source object should have etag"),
+                ..Default::default()
+            },
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+        store
+            .transition_object(bucket, object, &opts)
+            .await
+            .expect("transition should commit");
+        let committed = store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("committed object info should be readable");
+        let mut remote_parts = committed.transitioned_object.name.rsplit('/');
+        let write_id = uuid::Uuid::parse_str(remote_parts.next().expect("remote object should contain write id"))
+            .expect("write id should parse");
+        let transaction_id = uuid::Uuid::parse_str(remote_parts.next().expect("remote object should contain transaction id"))
+            .expect("transaction id should parse");
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id,
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id,
+            source: TransitionSourceIdentity {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                version_id: None,
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: original
+                    .mod_time
+                    .expect("source object should have mod_time")
+                    .unix_timestamp_nanos()
+                    .try_into()
+                    .expect("test timestamp should fit i64"),
+                size: original.size,
+                etag: original.etag.expect("source object should have etag"),
+                version_mode: TransitionSourceVersionMode::Unversioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1_780_000_000_000_000_000,
+        })
+        .expect("transaction should build");
+        transaction
+            .advance(
+                transaction.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::known_from_put_response(
+                    committed.transitioned_object.version_id.clone(),
+                )),
+            )
+            .expect("transaction should enter uploaded state");
+        transaction
+            .advance(transaction.fence(), TransitionTransactionState::LocalCommitStarted, None)
+            .expect("transaction should enter local commit state");
+        save_transition_transaction_record(store.clone(), &transaction)
+            .await
+            .expect("transaction record should persist");
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 1);
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(
+            backend.object_count().await,
+            1,
+            "confirmed local commit recovery must not delete the committed remote body"
+        );
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_retains_unproven_remote_candidates() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-unproven", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXUNPROVEN";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let new_transaction = || {
+            TransitionTransaction::new(TransitionTransactionInit {
+                deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+                transaction_id: uuid::Uuid::new_v4(),
+                owner_epoch: uuid::Uuid::new_v4(),
+                write_id: uuid::Uuid::new_v4(),
+                source: TransitionSourceIdentity {
+                    bucket: "absent-source-bucket".to_string(),
+                    object: "source-object".to_string(),
+                    version_id: None,
+                    data_dir: uuid::Uuid::new_v4(),
+                    mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                    size: 42,
+                    etag: "source-etag".to_string(),
+                    version_mode: TransitionSourceVersionMode::Unversioned,
+                },
+                tier_name: tier_name.to_string(),
+                backend_fingerprint: backend_identity,
+                not_after_unix_nanos: 1_780_000_000_000_000_000,
+            })
+            .expect("transaction should build")
+        };
+
+        let upload_started = new_transaction();
+        let mut local_commit_started = new_transaction();
+        local_commit_started
+            .advance(
+                local_commit_started.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        local_commit_started
+            .advance(local_commit_started.fence(), TransitionTransactionState::LocalCommitStarted, None)
+            .expect("transaction should enter local commit state");
+
+        backend.set_put_remote_version(Some(remote_version)).await;
+        for transaction in [&upload_started, &local_commit_started] {
+            let candidate = bytes::Bytes::from_static(b"unproven transition remote candidate");
+            backend
+                .put(
+                    &transaction.remote_object,
+                    ReaderImpl::Body(candidate.clone()),
+                    i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+                )
+                .await
+                .expect("mock backend should accept candidate");
+            save_transition_transaction_record(store.clone(), transaction)
+                .await
+                .expect("transaction record should persist");
+        }
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (2, 0, 2, 0));
+        assert_eq!(
+            transition_transaction_record_count(store.clone()).await,
+            2,
+            "an upload without completion proof or unproven local commit must remain for authoritative reconcile"
+        );
+        assert_eq!(backend.object_count().await, 2, "recovery must not delete an unproven remote candidate");
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(backend.exact_remove_count(), 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_deletes_provider_recovered_unknown_upload() {
+        let versioned_remote = uuid::Uuid::new_v4().to_string();
+        for (case, tier_name, remote_version) in [
+            ("missing", "TXPROBEMISSING", None),
+            ("unversioned", "TXPROBEUNVERSIONED", Some(String::new())),
+            ("versioned", "TXPROBEVERSIONED", Some(versioned_remote)),
+        ] {
+            let temp_dir = tempfile::tempdir().expect("create temp store dir");
+            let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+                temp_dir.path(),
+                &format!("transition-transaction-probe-{case}"),
+                &[4],
+            ))
+            .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+            let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+            let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+                .await
+                .expect("tier lease should resolve")
+                .backend_identity();
+            let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+                deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+                transaction_id: uuid::Uuid::new_v4(),
+                owner_epoch: uuid::Uuid::new_v4(),
+                write_id: uuid::Uuid::new_v4(),
+                source: TransitionSourceIdentity {
+                    bucket: "source-bucket".to_string(),
+                    object: "source-object".to_string(),
+                    version_id: None,
+                    data_dir: uuid::Uuid::new_v4(),
+                    mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                    size: 42,
+                    etag: "source-etag".to_string(),
+                    version_mode: TransitionSourceVersionMode::Unversioned,
+                },
+                tier_name: tier_name.to_string(),
+                backend_fingerprint: backend_identity,
+                not_after_unix_nanos: 1_780_000_000_000_000_000,
+            })
+            .expect("transaction should build");
+            transaction
+                .advance(transaction.fence(), TransitionTransactionState::UploadOutcomeUnknown, None)
+                .expect("transaction should enter unknown upload outcome state");
+
+            if let Some(version) = &remote_version {
+                backend.set_put_remote_version(Some(version.clone())).await;
+                let candidate = bytes::Bytes::from_static(b"provider-recovered transition remote candidate");
+                backend
+                    .put(
+                        &transaction.remote_object,
+                        ReaderImpl::Body(candidate.clone()),
+                        i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+                    )
+                    .await
+                    .expect("mock backend should accept candidate");
+            }
+            save_transition_transaction_record(store.clone(), &transaction)
+                .await
+                .expect("transaction record should persist");
+
+            let stats = recover_transition_transaction_records(store.clone(), 100, None)
+                .await
+                .expect("transition transaction recovery should run");
+
+            assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+            assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+            assert_eq!(
+                backend.object_count().await,
+                0,
+                "case {case}: recovered unknown upload candidate must be absent"
+            );
+            let removed = remote_version
+                .map(|version| vec![(transaction.remote_object.clone(), version)])
+                .unwrap_or_default();
+            assert_eq!(
+                backend.remove_versions().await,
+                removed,
+                "case {case}: recovery must delete only provider-recovered candidates"
+            );
+            assert_eq!(
+                backend.exact_remove_count(),
+                usize::from(removed.first().is_some_and(|(_, version)| !version.is_empty()))
+            );
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_response_loss_persists_unknown_outcome_for_provider_recovery() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-response-loss", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXRESPONSELOSS";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "transition-response-loss-bucket";
+        let object = "source.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("source bucket should be created");
+        let payload = b"a response-lost tier PUT must remain recoverable".repeat(1024);
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let source = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        backend.lose_next_put_response();
+
+        let error = store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("source object should have an ETag"),
+                        ..Default::default()
+                    },
+                    version_id: source.version_id.map(|version| version.to_string()),
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a lost tier PUT response must fail the transition request");
+        assert!(
+            matches!(error, StorageError::Io(ref err) if err.kind() == std::io::ErrorKind::ConnectionReset),
+            "the response-loss error must remain visible to the caller: {error:?}"
+        );
+
+        let records = store
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TRANSITION_TRANSACTION_RECORD_PREFIX,
+                None,
+                None,
+                10,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("transition transaction records should be listable");
+        assert_eq!(records.objects.len(), 1, "response loss must leave one durable transaction record");
+        let transaction_id = records.objects[0]
+            .name
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|name| uuid::Uuid::parse_str(name).ok())
+            .expect("transaction record name should contain a UUID");
+        let transaction = load_transition_transaction_record(store.clone(), transaction_id)
+            .await
+            .expect("response loss transaction record should load");
+        assert_eq!(
+            transaction.state,
+            TransitionTransactionState::UploadOutcomeUnknown,
+            "a response-lost PUT must not remain in UploadStarted"
+        );
+        assert!(
+            backend.contains(&transaction.remote_object).await,
+            "the test backend must retain the remote candidate"
+        );
+
+        backend
+            .set_transition_candidate_probe_override(Some(TransitionCandidateProbe::Unsupported))
+            .await;
+        let unsupported_stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("unsupported provider recovery should fail closed");
+        assert_eq!(
+            (
+                unsupported_stats.scanned,
+                unsupported_stats.recovered,
+                unsupported_stats.retained,
+                unsupported_stats.failed
+            ),
+            (1, 0, 1, 0),
+            "an unsupported provider probe must retain the unknown upload"
+        );
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 1);
+        assert!(
+            backend.contains(&transaction.remote_object).await,
+            "unsupported recovery must not delete the candidate"
+        );
+        assert_eq!(backend.remove_count().await, 0, "unsupported recovery must not attempt cleanup");
+
+        backend.set_transition_candidate_probe_override(None).await;
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("provider-authoritative recovery should run");
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0, "recovery must delete the provider-confirmed candidate");
+        let op_log = backend.op_log().await;
+        assert!(
+            op_log.iter().any(|operation| matches!(operation, MockWarmOp::Probe { .. })),
+            "response-loss recovery must enter the provider probe branch"
+        );
+        assert!(
+            op_log.iter().any(|operation| matches!(operation, MockWarmOp::Put { .. })),
+            "response-loss fixture must record that the remote PUT reached the backend"
+        );
+        let source_after = store
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("recovery must preserve the local source object");
+        assert_eq!(source_after.size, i64::try_from(payload.len()).expect("payload length should fit i64"));
     }
 }

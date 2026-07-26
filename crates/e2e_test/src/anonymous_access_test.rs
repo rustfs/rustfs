@@ -170,3 +170,81 @@ async fn test_anonymous_access_allowed_when_restrict_public_buckets_disabled()
     info!("Test passed: anonymous access allowed with RestrictPublicBuckets=false");
     Ok(())
 }
+
+/// A policy granting anonymous `s3:ListBucket` also permits ListObjectVersions.
+/// That grant must still be subject to RestrictPublicBuckets: the versions listing
+/// reaches authorization through a fallback branch, and that branch has to apply the
+/// same public-access gate as a direct grant.
+#[tokio::test]
+#[serial]
+async fn ghsa_x298_anonymous_list_object_versions_denied_when_restrict_public_buckets_enabled()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    info!("Starting test: anonymous ListObjectVersions denied with RestrictPublicBuckets=true...");
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket_name = "anon-test-restrict-versions";
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket_name).send().await?;
+
+    let policy_json = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowAnonymousListBucket",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:ListBucket"],
+                "Resource": [format!("arn:aws:s3:::{}", bucket_name)]
+            }
+        ]
+    })
+    .to_string();
+
+    admin_client
+        .put_bucket_policy()
+        .bucket(bucket_name)
+        .policy(&policy_json)
+        .send()
+        .await?;
+
+    admin_client
+        .put_object()
+        .bucket(bucket_name)
+        .key("test.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello anonymous"))
+        .send()
+        .await?;
+
+    // Without the public-access block the fallback grant is expected to work.
+    let versions_url = format!("{}/{}?versions=", env.url, bucket_name);
+    let resp = local_http_client().get(&versions_url).send().await?;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "Anonymous ListObjectVersions should succeed via the s3:ListBucket grant"
+    );
+
+    admin_client
+        .put_public_access_block()
+        .bucket(bucket_name)
+        .public_access_block_configuration(
+            PublicAccessBlockConfiguration::builder()
+                .restrict_public_buckets(true)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let resp = local_http_client().get(&versions_url).send().await?;
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "Anonymous ListObjectVersions must be denied when RestrictPublicBuckets is true"
+    );
+
+    info!("Test passed: anonymous ListObjectVersions denied with RestrictPublicBuckets=true");
+    Ok(())
+}

@@ -44,6 +44,7 @@ serde = { workspace = true, features = ["derive"] }
 starshard = { workspace = true, features = ["rayon", "async", "serde"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "fs"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 metrics = { workspace = true }
@@ -62,6 +63,7 @@ axum = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 criterion = { workspace = true, features = ["html_reports"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

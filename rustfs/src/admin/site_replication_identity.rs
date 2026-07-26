@@ -84,7 +84,7 @@ pub(crate) fn mark_unknown_peer_sync_enabled(peers: &mut BTreeMap<String, PeerIn
     }
 }
 
-fn is_https_endpoint(endpoint: &str) -> bool {
+pub(super) fn is_https_endpoint(endpoint: &str) -> bool {
     canonical_endpoint(endpoint).starts_with("https://")
 }
 

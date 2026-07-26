@@ -38,7 +38,7 @@ use crate::{
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetType, build_queued_payload, open_target_queue_store, persist_queued_payload_to_store, redacted_optional_secret,
-        redacted_secret,
+        redacted_secret, with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
@@ -70,6 +70,8 @@ const POSTGRES_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Absolute ceiling on a single checkout, wrapping `pool.get()` in a Tokio
 /// timeout as a belt-and-suspenders guard on top of the deadpool timeouts.
 const POSTGRES_POOL_CHECKOUT_HARD_LIMIT: Duration = Duration::from_secs(20);
+/// Absolute ceiling for one SQL delivery, including pool checkout and execution.
+const POSTGRES_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Returns `true` for any `s3:ObjectRemoved:*` event.
 ///
@@ -730,30 +732,29 @@ where
 
         let key = resolve_payload_key(&payload, meta);
 
-        let result = match self.args.format {
-            // For the single-row `namespace` format, an object removal must
-            // delete the row rather than UPSERT it, otherwise stale state
-            // lingers in the table after the object is gone.
-            PostgresFormat::Namespace if is_object_removed_event(&meta.event_name) => {
-                client.execute(&self.namespace_delete_sql, &[&key]).await
+        with_delivery_deadline(POSTGRES_DELIVERY_TIMEOUT, "PostgreSQL delivery", async {
+            match self.args.format {
+                // For the single-row `namespace` format, an object removal must
+                // delete the row rather than UPSERT it, otherwise stale state
+                // lingers in the table after the object is gone.
+                PostgresFormat::Namespace if is_object_removed_event(&meta.event_name) => {
+                    client.execute(&self.namespace_delete_sql, &[&key]).await
+                }
+                PostgresFormat::Namespace => client.execute(&self.namespace_sql, &[&key, &payload]).await,
+                PostgresFormat::Access => {
+                    let event_name_str = meta.event_name.to_string();
+                    let queued_at_ms = meta.queued_at_unix_ms as i64;
+                    client
+                        .execute(&self.access_sql, &[&event_id, &event_name_str, &key, &payload, &queued_at_ms])
+                        .await
+                }
             }
-            PostgresFormat::Namespace => client.execute(&self.namespace_sql, &[&key, &payload]).await,
-            PostgresFormat::Access => {
-                let event_name_str = meta.event_name.to_string();
-                let queued_at_ms = meta.queued_at_unix_ms as i64;
-                client
-                    .execute(&self.access_sql, &[&event_id, &event_name_str, &key, &payload, &queued_at_ms])
-                    .await
-            }
-        };
+            .map_err(|err| map_pg_error(&err, "PostgreSQL insert failed"))
+        })
+        .await?;
 
-        match result {
-            Ok(_) => {
-                self.delivery_counters.record_success();
-                Ok(())
-            }
-            Err(err) => Err(map_pg_error(&err, "PostgreSQL insert failed")),
-        }
+        self.delivery_counters.record_success();
+        Ok(())
     }
 
     /// Probes the table from `init()`. Failure is non-fatal when a queue is

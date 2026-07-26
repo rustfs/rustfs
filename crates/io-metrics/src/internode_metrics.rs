@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const INTERNODE_OPERATION_READ_FILE_STREAM: &str = "read_file_stream";
 pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
 pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
+pub const INTERNODE_OPERATION_NS_SCANNER: &str = "ns_scanner";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
 pub const INTERNODE_OPERATION_GRPC_READ_MULTIPLE: &str = "grpc_read_multiple";
@@ -34,6 +35,8 @@ pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
 /// peer's request vs a client decoding a peer's response (grpc-optimization P2).
 pub const INTERNODE_MSGPACK_DIRECTION_REQUEST: &str = "request";
 pub const INTERNODE_MSGPACK_DIRECTION_RESPONSE: &str = "response";
+pub const INTERNODE_MSGPACK_CODEC_MSGPACK: &str = "msgpack";
+pub const INTERNODE_MSGPACK_CODEC_JSON: &str = "json";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
@@ -43,6 +46,7 @@ const DOMINANT_ERROR_LABEL: &str = "dominant_error";
 const HTTP_VERSION_LABEL: &str = "http_version";
 const DIRECTION_LABEL: &str = "direction";
 const MESSAGE_LABEL: &str = "message";
+const CODEC_LABEL: &str = "codec";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
@@ -59,6 +63,10 @@ const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
 const INTERNODE_OPERATION_PAYLOAD_BYTES: &str = "rustfs_system_network_internode_operation_payload_bytes";
 const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_internode_operation_large_payloads_total";
 const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
+const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
+const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
+const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
+const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +156,9 @@ pub struct InternodeMetricsSnapshot {
     pub operation_http_versions_total: u64,
     pub operation_stall_timeouts_total: u64,
     pub operation_write_shutdown_errors_total: u64,
+    pub signature_v1_fallback_total: u64,
+    pub body_digest_fallback_total: u64,
+    pub replay_cache_overflow_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -164,6 +175,10 @@ pub struct InternodeMetrics {
     operation_http_versions_total: AtomicU64,
     operation_stall_timeouts_total: AtomicU64,
     operation_write_shutdown_errors_total: AtomicU64,
+    msgpack_json_decode_error_total: AtomicU64,
+    signature_v1_fallback_total: AtomicU64,
+    body_digest_fallback_total: AtomicU64,
+    replay_cache_overflow_total: AtomicU64,
 }
 
 impl InternodeMetrics {
@@ -360,6 +375,53 @@ impl InternodeMetrics {
         counter!(INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL, DIRECTION_LABEL => direction, MESSAGE_LABEL => message).increment(1);
     }
 
+    pub fn record_msgpack_json_decode_error(&self, direction: &'static str, message: &'static str, codec: &'static str) {
+        self.msgpack_json_decode_error_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL,
+            DIRECTION_LABEL => direction,
+            MESSAGE_LABEL => message,
+            CODEC_LABEL => codec
+        )
+        .increment(1);
+    }
+
+    #[doc(hidden)]
+    pub fn msgpack_json_decode_error_total_for_test(&self) -> u64 {
+        self.msgpack_json_decode_error_total.load(Ordering::Relaxed)
+    }
+
+    /// Count an internode gRPC request that was accepted through the legacy constant-target
+    /// signature because it carried no v2 auth headers (rolling-upgrade fallback, see
+    /// <https://github.com/rustfs/backlog/issues/1327>). Only accepted requests count: rejected
+    /// requests never authenticated, so they are not a rollout signal. This counter must read zero
+    /// across a release window fleet-wide before `RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT` may be
+    /// enabled; after the strict flip the legacy fallback path is closed and the counter stays flat.
+    pub fn record_signature_v1_fallback(&self) {
+        self.signature_v1_fallback_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL).increment(1);
+    }
+
+    /// Count a mutating internode disk RPC that was accepted without a signature-bound canonical
+    /// body digest (rolling-upgrade fallback, see
+    /// <https://github.com/rustfs/backlog/issues/1327>). Only accepted requests count. This counter
+    /// must read zero across a release window fleet-wide before
+    /// `RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT` may be enabled; after the strict flip digestless
+    /// mutations are rejected and the counter stays flat.
+    pub fn record_body_digest_fallback(&self) {
+        self.body_digest_fallback_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_BODY_DIGEST_FALLBACK_TOTAL).increment(1);
+    }
+
+    /// Count a body-bound internode RPC rejected because the replay-protection nonce cache was
+    /// full. Overflow fails closed, so a sustained non-zero rate means
+    /// `RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY` is undersized for this node's peak legitimate
+    /// mutation rate and writes are being refused — alert on this counter.
+    pub fn record_replay_cache_overflow(&self) {
+        self.replay_cache_overflow_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL).increment(1);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
@@ -406,6 +468,9 @@ impl InternodeMetrics {
             operation_http_versions_total: self.operation_http_versions_total.load(Ordering::Relaxed),
             operation_stall_timeouts_total: self.operation_stall_timeouts_total.load(Ordering::Relaxed),
             operation_write_shutdown_errors_total: self.operation_write_shutdown_errors_total.load(Ordering::Relaxed),
+            signature_v1_fallback_total: self.signature_v1_fallback_total.load(Ordering::Relaxed),
+            body_digest_fallback_total: self.body_digest_fallback_total.load(Ordering::Relaxed),
+            replay_cache_overflow_total: self.replay_cache_overflow_total.load(Ordering::Relaxed),
         }
     }
 
@@ -423,6 +488,10 @@ impl InternodeMetrics {
         self.operation_http_versions_total.store(0, Ordering::Relaxed);
         self.operation_stall_timeouts_total.store(0, Ordering::Relaxed);
         self.operation_write_shutdown_errors_total.store(0, Ordering::Relaxed);
+        self.msgpack_json_decode_error_total.store(0, Ordering::Relaxed);
+        self.signature_v1_fallback_total.store(0, Ordering::Relaxed);
+        self.body_digest_fallback_total.store(0, Ordering::Relaxed);
+        self.replay_cache_overflow_total.store(0, Ordering::Relaxed);
     }
 }
 
@@ -512,6 +581,12 @@ pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
 pub fn cluster_peer_is_offline(addr: &str) -> bool {
     let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     peers.get(normalize_peer_key(addr)).map(|peer| !peer.online).unwrap_or(false)
+}
+
+/// Return the last observed online/offline state for a peer, if this process has observed one.
+pub fn cluster_peer_observed_online_status(addr: &str) -> Option<bool> {
+    let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    peers.get(normalize_peer_key(addr)).map(|peer| peer.online)
 }
 
 /// Decide whether to fast-fail (bypass) an offline peer instead of attempting to reach it
@@ -719,8 +794,18 @@ mod tests {
             INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
             "rustfs_system_network_internode_msgpack_json_fallback_total"
         );
+        assert_eq!(
+            INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_decode_error_total"
+        );
         assert_eq!(INTERNODE_MSGPACK_DIRECTION_REQUEST, "request");
         assert_eq!(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "response");
+        assert_eq!(INTERNODE_MSGPACK_CODEC_MSGPACK, "msgpack");
+        assert_eq!(INTERNODE_MSGPACK_CODEC_JSON, "json");
+        assert_eq!(
+            INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
+            "rustfs_system_network_internode_signature_v1_fallback_total"
+        );
     }
 
     #[test]
@@ -729,6 +814,41 @@ mod tests {
         let metrics = InternodeMetrics::default();
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+    }
+
+    #[test]
+    fn msgpack_json_decode_error_counter_tracks_codec_direction_and_message() {
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 0);
+
+        metrics.record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_REQUEST,
+            "FileInfo",
+            INTERNODE_MSGPACK_CODEC_MSGPACK,
+        );
+        metrics.record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+            "RawFileInfo",
+            INTERNODE_MSGPACK_CODEC_JSON,
+        );
+
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 2);
+        metrics.reset_for_test();
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 0);
+    }
+
+    #[test]
+    fn signature_v1_fallback_counter_updates_snapshot_and_resets() {
+        // Instance-local metrics keep this independent of the process-global registry.
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.snapshot().signature_v1_fallback_total, 0);
+
+        metrics.record_signature_v1_fallback();
+        metrics.record_signature_v1_fallback();
+        assert_eq!(metrics.snapshot().signature_v1_fallback_total, 2);
+
+        metrics.reset_for_test();
+        assert_eq!(metrics.snapshot().signature_v1_fallback_total, 0);
     }
 
     #[test]
@@ -780,6 +900,18 @@ mod tests {
         assert!(cluster_peer_is_offline(slashed));
         record_peer_reachable(slashed);
         assert!(!cluster_peer_is_offline(bare), "reachable via one form must mark the shared entry online");
+    }
+
+    #[test]
+    fn cluster_peer_observed_online_status_reports_known_and_unknown_peers() {
+        let addr = "http://cluster-peer-snapshot-status-test:9000";
+        assert_eq!(cluster_peer_observed_online_status(addr), None);
+
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+
+        record_peer_unreachable(addr, 1);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(false));
     }
 
     #[test]

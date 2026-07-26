@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity};
+use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity, TierConfigReloadOutcome};
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
@@ -21,6 +21,7 @@ use crate::runtime::sources as runtime_sources;
 use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::services::rebalance::RebalSaveOpt;
 use crate::storage_api_contracts::admin::StorageAdminApi;
+use bytes::Bytes;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
@@ -28,13 +29,15 @@ use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
 use rustfs_utils::XHost;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// After this many consecutive admin-call failures, mark the peer as offline.
 const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
@@ -42,6 +45,8 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
 const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
 const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const TIER_CONFIG_RELOAD_RETRY_BASE: Duration = Duration::from_millis(100);
+const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 
 /// Cached result from the last successful admin call to a peer.
 struct PeerAdminCache {
@@ -53,6 +58,16 @@ struct PeerAdminCache {
     /// cached `online` snapshot from being served indefinitely while a peer is
     /// actually down (rustfs/backlog#1049 P2).
     last_server_success: Option<SystemTime>,
+}
+
+#[derive(Default)]
+struct TierConfigReloadWorkers {
+    peers: HashMap<String, bool>,
+}
+
+enum TierConfigReloadFinish {
+    Completed,
+    Pending,
 }
 
 impl PeerAdminCache {
@@ -93,17 +108,21 @@ pub fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
 pub struct NotificationSys {
     pub peer_clients: Vec<Option<PeerRestClient>>,
     pub all_peer_clients: Vec<Option<PeerRestClient>>,
+    peer_topology_hosts: Vec<String>,
     peer_admin_caches: Vec<Mutex<PeerAdminCache>>,
+    tier_config_reload_workers: Arc<Mutex<TierConfigReloadWorkers>>,
 }
 
 impl NotificationSys {
     pub async fn new(eps: EndpointServerPools) -> Self {
-        let (peer_clients, all_peer_clients) = PeerRestClient::new_clients(eps).await;
+        let (peer_clients, all_peer_clients, peer_topology_hosts) = PeerRestClient::new_clients_with_topology(eps).await;
         let peer_admin_caches = (0..peer_clients.len()).map(|_| Mutex::new(PeerAdminCache::new())).collect();
         Self {
             peer_clients,
             all_peer_clients,
+            peer_topology_hosts,
             peer_admin_caches,
+            tier_config_reload_workers: Default::default(),
         }
     }
 }
@@ -111,6 +130,17 @@ impl NotificationSys {
 pub struct NotificationPeerErr {
     pub host: String,
     pub err: Option<Error>,
+}
+
+fn notification_peer_result<T>(host: String, result: Result<T>) -> NotificationPeerErr {
+    NotificationPeerErr { host, err: result.err() }
+}
+
+fn unreachable_notification_peer_err() -> NotificationPeerErr {
+    NotificationPeerErr {
+        host: String::new(),
+        err: Some(Error::other("peer is not reachable")),
+    }
 }
 
 impl NotificationSys {
@@ -240,7 +270,7 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn reload_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+    async fn signal_dynamic_config(&self, sub_sys: &str, dry_run: bool) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter() {
             let sub_sys = sub_sys.to_string();
@@ -250,7 +280,7 @@ impl NotificationSys {
                         .signal_service(
                             crate::cluster::rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC,
                             &sub_sys,
-                            false,
+                            dry_run,
                             SystemTime::UNIX_EPOCH,
                         )
                         .await
@@ -273,6 +303,14 @@ impl NotificationSys {
             });
         }
         join_all(futures).await
+    }
+
+    pub async fn preflight_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+        self.signal_dynamic_config(sub_sys, true).await
+    }
+
+    pub async fn reload_dynamic_config(&self, sub_sys: &str) -> Vec<NotificationPeerErr> {
+        self.signal_dynamic_config(sub_sys, false).await
     }
 
     pub async fn refresh_config_snapshot(&self) -> Vec<NotificationPeerErr> {
@@ -358,22 +396,19 @@ impl NotificationSys {
         let peer_timeout = Duration::from_secs(5);
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
-            let endpoints = endpoints.clone();
-            let cache = self.peer_admin_caches.get(idx);
+            let host = self
+                .peer_topology_hosts
+                .get(idx)
+                .cloned()
+                .or_else(|| client.as_ref().map(|client| client.host.to_string()))
+                .unwrap_or_default();
             futures.push(async move {
-                // `peer_clients` comes from `new_clients`, which only ever pushes
-                // `Some(client)` (local hosts are excluded, not slotted as
-                // `None`), so this branch is unreachable in practice. Kept as a
-                // defensive fallback: report an explicit `unknown` state rather
-                // than a blank `default()` entry, so it can never contribute a
-                // hollow row to `servers[]` (rustfs/backlog#1049 P3).
                 let Some(client) = client else {
-                    return ServerProperties {
-                        state: ItemState::Unknown.to_string().to_owned(),
-                        ..Default::default()
+                    return PeerServerInfoProbe {
+                        host,
+                        result: Err(PeerServerInfoProbeFailure::NoClient),
                     };
                 };
-                let host = client.host.to_string();
 
                 // First attempt. A single evicted or half-open internode channel
                 // is enough to fail one probe and, before retrying, would drop
@@ -382,8 +417,7 @@ impl NotificationSys {
                 // before falling back (rustfs/backlog#1049, P1-B).
                 match timeout(peer_timeout, client.server_info()).await {
                     Ok(Ok(info)) => {
-                        update_server_info_cache(cache, &host, &info);
-                        return info;
+                        return PeerServerInfoProbe { host, result: Ok(info) };
                     }
                     Ok(Err(err)) => debug!("peer {host} server_info failed (attempt 1/2): {err}"),
                     Err(_) => debug!("peer {host} server_info timed out (attempt 1/2) after {peer_timeout:?}"),
@@ -399,26 +433,29 @@ impl NotificationSys {
 
                 // Second and final attempt on the fresh channel.
                 match timeout(peer_timeout, client.server_info()).await {
-                    Ok(Ok(info)) => {
-                        update_server_info_cache(cache, &host, &info);
-                        info
-                    }
+                    Ok(Ok(info)) => PeerServerInfoProbe { host, result: Ok(info) },
                     Ok(Err(err)) => {
                         warn!("peer {host} server_info failed after retry: {err}");
                         let health = peer_disk_health(&host).await;
-                        handle_server_info_failure(cache, &host, &endpoints, health.as_ref())
+                        PeerServerInfoProbe {
+                            host,
+                            result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                        }
                     }
                     Err(_) => {
                         warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
                         client.evict_connection().await;
                         let health = peer_disk_health(&host).await;
-                        handle_server_info_failure(cache, &host, &endpoints, health.as_ref())
+                        PeerServerInfoProbe {
+                            host,
+                            result: Err(PeerServerInfoProbeFailure::Rpc { health }),
+                        }
                     }
                 }
             });
         }
 
-        join_all(futures).await
+        publish_server_info_probe_round(&self.peer_admin_caches, &endpoints, join_all(futures).await)
     }
 
     pub async fn load_user(&self, access_key: &str, temp: bool) -> Vec<NotificationPeerErr> {
@@ -1019,6 +1056,40 @@ impl NotificationSys {
         Ok(generations)
     }
 
+    pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<bool> {
+        let mut by_host = HashMap::with_capacity(acknowledgements.len());
+        for (host, instance_id, generation) in acknowledgements {
+            if by_host.insert(host.clone(), (instance_id, generation)).is_some() {
+                return Err(Error::other(format!("duplicate scanner dirty usage acknowledgement target: {host}")));
+            }
+        }
+
+        let clients = self
+            .peer_clients
+            .iter()
+            .flatten()
+            .map(|client| (client.grid_host.clone(), client.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut failures = Vec::new();
+        let mut futures = Vec::with_capacity(by_host.len());
+        for (host, (instance_id, generation)) in by_host {
+            let Some(client) = clients.get(&host).cloned() else {
+                failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: peer is not reachable"));
+                continue;
+            };
+            futures.push(async move {
+                let result = scanner_activity_with_timeout(
+                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                    &host,
+                    client.acknowledge_scanner_dirty_usage(instance_id, generation),
+                )
+                .await;
+                (host, result)
+            });
+        }
+        aggregate_scanner_dirty_usage_acknowledgement_results(join_all(futures).await, failures)
+    }
+
     pub async fn reload_site_replication_config(&self) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter() {
@@ -1070,6 +1141,275 @@ impl NotificationSys {
         }
         join_all(futures).await
     }
+
+    /// Starts one immediate configuration reload worker per peer. Concurrent
+    /// tier mutations share the existing worker for that peer.
+    pub fn spawn_transition_tier_config_reload_workers(self: &Arc<Self>) {
+        self.spawn_transition_tier_config_reload_workers_with_cancel_token(runtime_sources::background_services_cancel_token());
+    }
+
+    fn spawn_transition_tier_config_reload_workers_with_cancel_token(self: &Arc<Self>, cancel_token: Option<CancellationToken>) {
+        let Some(cancel_token) = cancel_token else {
+            warn!(
+                event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                action = "reload_transition_tier_config",
+                result = "background_service_unavailable",
+                "notification peer propagation"
+            );
+            return;
+        };
+        for (peer_index, client) in self.peer_clients.iter().enumerate() {
+            let Some(client) = client.clone() else {
+                warn!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "reload_transition_tier_config",
+                    peer_index,
+                    result = "peer_unreachable",
+                    "notification peer propagation"
+                );
+                continue;
+            };
+            let host = client.grid_host.clone();
+            if !self.reserve_tier_config_reload_worker(&host) {
+                debug!(
+                    event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    action = "reload_transition_tier_config",
+                    host,
+                    result = "coalesced",
+                    "notification peer propagation"
+                );
+                continue;
+            }
+            let sys = Arc::clone(self);
+            let cancel_token = cancel_token.clone();
+            tokio::spawn(async move {
+                run_tier_config_reload_worker(sys, host, cancel_token, move || {
+                    let client = client.clone();
+                    async move { client.load_transition_tier_config_single_attempt_outcome().await }
+                })
+                .await;
+            });
+        }
+    }
+
+    fn reserve_tier_config_reload_worker(&self, host: &str) -> bool {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        match workers.peers.get_mut(host) {
+            Some(pending) => {
+                *pending = true;
+                false
+            }
+            None => {
+                workers.peers.insert(host.to_string(), false);
+                true
+            }
+        }
+    }
+
+    fn take_tier_config_reload_pending(&self, host: &str) -> bool {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        let Some(pending) = workers.peers.get_mut(host) else {
+            return false;
+        };
+        let pending_reload = *pending;
+        *pending = false;
+        pending_reload
+    }
+
+    fn finish_tier_config_reload_worker(&self, host: &str) -> TierConfigReloadFinish {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        let Some(pending) = workers.peers.get_mut(host) else {
+            return TierConfigReloadFinish::Completed;
+        };
+        if *pending {
+            *pending = false;
+            return TierConfigReloadFinish::Pending;
+        }
+        workers.peers.remove(host);
+        TierConfigReloadFinish::Completed
+    }
+
+    fn cancel_tier_config_reload_worker(&self, host: &str) {
+        let mut workers = self
+            .tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned");
+        workers.peers.remove(host);
+    }
+
+    fn tier_config_reload_worker_active(&self, host: &str) -> bool {
+        self.tier_config_reload_workers
+            .lock()
+            .expect("tier config reload worker state must not be poisoned")
+            .peers
+            .contains_key(host)
+    }
+
+    pub async fn prepare_tier_mutation(&self, mutation_id: Uuid, canonical_payload: Bytes) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            let payload = canonical_payload.clone();
+            futures.push(async move {
+                if let Some(client) = client {
+                    notification_peer_result(client.host.to_string(), client.prepare_tier_mutation(mutation_id, payload).await)
+                } else {
+                    unreachable_notification_peer_err()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn commit_tier_mutation(&self, mutation_id: Uuid, canonical_payload: Bytes) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            let payload = canonical_payload.clone();
+            futures.push(async move {
+                if let Some(client) = client {
+                    notification_peer_result(client.host.to_string(), client.commit_tier_mutation(mutation_id, payload).await)
+                } else {
+                    unreachable_notification_peer_err()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+
+    pub async fn abort_tier_mutation(&self, mutation_id: Uuid) -> Vec<NotificationPeerErr> {
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for client in self.peer_clients.iter().cloned() {
+            futures.push(async move {
+                if let Some(client) = client {
+                    notification_peer_result(client.host.to_string(), client.abort_tier_mutation(mutation_id).await)
+                } else {
+                    unreachable_notification_peer_err()
+                }
+            });
+        }
+        join_all(futures).await
+    }
+}
+
+async fn run_tier_config_reload_worker<F, Fut>(
+    sys: Arc<NotificationSys>,
+    host: String,
+    cancel_token: CancellationToken,
+    mut reload: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = TierConfigReloadOutcome>,
+{
+    let mut retry_attempt = 0;
+    loop {
+        if cancel_token.is_cancelled() {
+            sys.cancel_tier_config_reload_worker(&host);
+            return;
+        }
+        let result = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                sys.cancel_tier_config_reload_worker(&host);
+                return;
+            }
+            result = reload() => result,
+        };
+
+        match result {
+            TierConfigReloadOutcome::Success => match sys.finish_tier_config_reload_worker(&host) {
+                TierConfigReloadFinish::Completed => {
+                    debug!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        result = "success",
+                        "notification peer propagation"
+                    );
+                    return;
+                }
+                TierConfigReloadFinish::Pending => retry_attempt = 0,
+            },
+            TierConfigReloadOutcome::Terminal(_) => match sys.finish_tier_config_reload_worker(&host) {
+                TierConfigReloadFinish::Completed => {
+                    warn!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        outcome = "terminal",
+                        "tier configuration reload stopped after a terminal outcome"
+                    );
+                    return;
+                }
+                TierConfigReloadFinish::Pending => retry_attempt = 0,
+            },
+            TierConfigReloadOutcome::TransientReconnect(_) | TierConfigReloadOutcome::TransientRetrySameChannel(_) => {
+                let delay = tier_config_reload_retry_delay(retry_attempt);
+                retry_attempt = retry_attempt.saturating_add(1);
+                if sys.take_tier_config_reload_pending(&host) {
+                    retry_attempt = 0;
+                    continue;
+                }
+                if retry_attempt == 1 {
+                    warn!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        retry_attempt,
+                        retry_delay_ms = delay.as_millis(),
+                        outcome = "transient",
+                        "tier configuration reload failed; retrying"
+                    );
+                } else if retry_attempt.is_power_of_two() {
+                    debug!(
+                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        action = "reload_transition_tier_config",
+                        host,
+                        retry_attempt,
+                        retry_delay_ms = delay.as_millis(),
+                        outcome = "transient",
+                        "tier configuration reload retry failed"
+                    );
+                }
+
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        sys.cancel_tier_config_reload_worker(&host);
+                        return;
+                    }
+                    _ = sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+fn tier_config_reload_retry_delay(retry_attempt: u32) -> Duration {
+    let multiplier = 1_u32 << retry_attempt.min(6);
+    TIER_CONFIG_RELOAD_RETRY_BASE
+        .checked_mul(multiplier)
+        .unwrap_or(TIER_CONFIG_RELOAD_RETRY_CAP)
+        .min(TIER_CONFIG_RELOAD_RETRY_CAP)
 }
 
 async fn scanner_activity_with_timeout<F>(timeout_duration: Duration, host: &str, activity: F) -> Result<ScannerPeerActivity>
@@ -1196,6 +1536,16 @@ fn normalize_and_cache_peer_storage_info(cache: Option<&Mutex<PeerAdminCache>>, 
 struct PeerDiskHealth {
     any_online: bool,
     disks: Vec<rustfs_madmin::Disk>,
+}
+
+struct PeerServerInfoProbe {
+    host: String,
+    result: std::result::Result<ServerProperties, PeerServerInfoProbeFailure>,
+}
+
+enum PeerServerInfoProbeFailure {
+    Rpc { health: Option<PeerDiskHealth> },
+    NoClient,
 }
 
 /// Consult the local disk-health state for `host` without issuing any RPC.
@@ -1359,6 +1709,30 @@ fn handle_server_info_failure(
     unknown_server_properties(host, endpoints)
 }
 
+fn publish_server_info_probe_round(
+    caches: &[Mutex<PeerAdminCache>],
+    endpoints: &EndpointServerPools,
+    probes: Vec<PeerServerInfoProbe>,
+) -> Vec<ServerProperties> {
+    probes
+        .into_iter()
+        .enumerate()
+        .map(|(idx, probe)| {
+            let cache = caches.get(idx);
+            match probe.result {
+                Ok(info) => {
+                    update_server_info_cache(cache, &probe.host, &info);
+                    info
+                }
+                Err(PeerServerInfoProbeFailure::Rpc { health }) => {
+                    handle_server_info_failure(cache, &probe.host, endpoints, health.as_ref())
+                }
+                Err(PeerServerInfoProbeFailure::NoClient) => unknown_server_properties(&probe.host, endpoints),
+            }
+        })
+        .collect()
+}
+
 fn update_server_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &ServerProperties) {
     let Some(cache) = cache else {
         return;
@@ -1491,6 +1865,23 @@ fn aggregate_notification_failures(operation: &str, failures: Vec<String>) -> Re
     )))
 }
 
+fn aggregate_scanner_dirty_usage_acknowledgement_results(
+    results: Vec<(String, Result<ScannerPeerActivity>)>,
+    mut failures: Vec<String>,
+) -> Result<bool> {
+    let mut dirty_usage_pending = false;
+    for (host, result) in results {
+        match result {
+            Ok(activity) => {
+                dirty_usage_pending |= activity.dirty_usage_pending != Some(false);
+            }
+            Err(err) => failures.push(format!("peer {host} scanner dirty usage acknowledgement failed: {err}")),
+        }
+    }
+    aggregate_notification_failures("acknowledge_scanner_dirty_usage", failures)?;
+    Ok(dirty_usage_pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1569,7 +1960,9 @@ mod tests {
                 "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
                 "http://127.0.0.1:9000".to_string(),
             ))],
+            peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
         };
 
         let client = sys
@@ -1612,7 +2005,9 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1631,7 +2026,9 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1647,7 +2044,9 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: Vec::new(),
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
             peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1667,7 +2066,9 @@ mod tests {
         let sys = NotificationSys {
             peer_clients: vec![Some(client)],
             all_peer_clients: vec![None],
+            peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1676,6 +2077,52 @@ mod tests {
             .expect_err("an incomplete peer topology must disable scanner idle backoff");
 
         assert!(err.to_string().contains("peer topology is incomplete"));
+    }
+
+    #[tokio::test]
+    async fn server_info_no_client_slot_uses_topology_host_without_counting_rpc_failure() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+
+        let servers = sys.server_info().await;
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].endpoint, "node-a:9000");
+        assert_eq!(servers[0].state, ItemState::Unknown.to_string());
+        let cache = sys.peer_admin_caches[0].lock().expect("cache mutex should not be poisoned");
+        assert_eq!(cache.server_failures, 0, "construction-only missing slots are not failed RPC attempts");
+        assert!(cache.last_server_info.is_none());
+    }
+
+    #[test]
+    fn server_info_failure_cache_stays_aligned_with_topology_slot() {
+        let cache_a = Mutex::new(PeerAdminCache {
+            last_server_info: Some(build_props("cached-a")),
+            last_server_success: Some(SystemTime::now()),
+            server_failures: 1,
+            storage_failures: 0,
+            last_storage_info: None,
+        });
+        let cache_b = Mutex::new(PeerAdminCache {
+            last_server_info: Some(build_props("cached-b")),
+            last_server_success: Some(SystemTime::now()),
+            server_failures: 1,
+            storage_failures: 0,
+            last_storage_info: None,
+        });
+        let caches = [cache_a, cache_b];
+        let endpoints = EndpointServerPools::from(Vec::new());
+
+        let rendered = handle_server_info_failure(Some(&caches[1]), "node-b:9000", &endpoints, None);
+
+        assert_eq!(rendered.endpoint, "cached-b");
+        assert_eq!(caches[0].lock().expect("cache mutex should not be poisoned").server_failures, 1);
+        assert_eq!(caches[1].lock().expect("cache mutex should not be poisoned").server_failures, 2);
     }
 
     #[tokio::test]
@@ -1693,11 +2140,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_dirty_usage_acknowledgement_rejects_missing_and_duplicate_targets() {
+        let sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+            peer_topology_hosts: Vec::new(),
+        };
+        let missing = sys
+            .acknowledge_scanner_dirty_usage(vec![("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7)])
+            .await
+            .expect_err("a missing acknowledgement target must remain pending");
+        assert!(missing.to_string().contains("peer is not reachable"));
+
+        let duplicate = sys
+            .acknowledge_scanner_dirty_usage(vec![
+                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
+                ("peer-1".to_string(), "0123456789abcdef0123456789abcdef".to_string(), 7),
+            ])
+            .await
+            .expect_err("duplicate acknowledgement targets must be rejected");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate scanner dirty usage acknowledgement target")
+        );
+    }
+
+    #[test]
+    fn scanner_dirty_usage_acknowledgement_preserves_newer_pending_work() {
+        let activity = |dirty_usage_pending| ScannerPeerActivity {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 1,
+            maintenance_generation: 1,
+            protocol_version: crate::storage_api_contracts::internode::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            topology_digest: Some([0; 32]),
+            data_movement_active: Some(false),
+            dirty_usage_generation: Some(2),
+            dirty_usage_pending,
+        };
+
+        let pending = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![
+                ("peer-1".to_string(), Ok(activity(Some(false)))),
+                ("peer-2".to_string(), Ok(activity(Some(true)))),
+            ],
+            Vec::new(),
+        )
+        .expect("successful acknowledgements should return their pending state");
+        assert!(pending, "new dirty usage reported by an acknowledged peer must remain pending");
+
+        let cleared = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![("peer-1".to_string(), Ok(activity(Some(false))))],
+            Vec::new(),
+        )
+        .expect("a cleared acknowledgement should succeed");
+        assert!(!cleared, "an explicitly cleared peer must not remain pending");
+
+        let unknown =
+            aggregate_scanner_dirty_usage_acknowledgement_results(vec![("peer-1".to_string(), Ok(activity(None)))], Vec::new())
+                .expect("an acknowledgement without a pending field should remain retryable");
+        assert!(unknown, "a peer that cannot prove its dirty state is clear must remain pending");
+
+        let err = aggregate_scanner_dirty_usage_acknowledgement_results(
+            vec![("peer-1".to_string(), Err(Error::other("injected acknowledgement failure")))],
+            Vec::new(),
+        )
+        .expect_err("a reachable peer acknowledgement failure must be reported");
+        assert!(err.to_string().contains("peer-1"));
+        assert!(err.to_string().contains("injected acknowledgement failure"));
+    }
+
+    #[tokio::test]
     async fn load_bucket_metadata_reports_unreachable_peers() {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let err = sys
@@ -1711,12 +2233,213 @@ mod tests {
         assert!(msg.contains("peer[0]"));
     }
 
+    #[test]
+    fn tier_config_reload_retry_delay_is_exponentially_capped() {
+        assert_eq!(tier_config_reload_retry_delay(0), Duration::from_millis(100));
+        assert_eq!(tier_config_reload_retry_delay(1), Duration::from_millis(200));
+        assert_eq!(tier_config_reload_retry_delay(5), Duration::from_millis(3200));
+        assert_eq!(tier_config_reload_retry_delay(6), TIER_CONFIG_RELOAD_RETRY_CAP);
+        assert_eq!(tier_config_reload_retry_delay(u32::MAX), TIER_CONFIG_RELOAD_RETRY_CAP);
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_retries_only_network_failures() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    TierConfigReloadOutcome::TransientReconnect(Error::other("connection refused"))
+                } else {
+                    TierConfigReloadOutcome::Success
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_converges_after_readiness_unknown() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    TierConfigReloadOutcome::TransientRetrySameChannel(Error::other("Service was not ready: test client"))
+                } else {
+                    TierConfigReloadOutcome::Success
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_stops_on_terminal_failure() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { TierConfigReloadOutcome::Terminal(Error::NotImplemented) }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_worker_reloads_once_after_success_with_pending_mutation() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let sys_for_reload = Arc::clone(&sys);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), CancellationToken::new(), move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sys = Arc::clone(&sys_for_reload);
+            async move {
+                if attempt == 0 {
+                    assert!(!sys.reserve_tier_config_reload_worker("node-a:9000"));
+                    TierConfigReloadOutcome::Success
+                } else {
+                    TierConfigReloadOutcome::Success
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
+    #[test]
+    fn tier_config_reload_none_peer_does_not_start_a_worker() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        });
+
+        sys.spawn_transition_tier_config_reload_workers_with_cancel_token(Some(CancellationToken::new()));
+
+        assert!(
+            sys.tier_config_reload_workers
+                .lock()
+                .expect("tier config reload worker state must not be poisoned")
+                .peers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tier_config_reload_without_background_token_does_not_reserve_a_worker() {
+        let client = PeerRestClient::new(
+            "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
+            "http://127.0.0.1:9000".to_string(),
+        );
+        let sys = Arc::new(NotificationSys {
+            peer_clients: vec![Some(client)],
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        });
+
+        sys.spawn_transition_tier_config_reload_workers_with_cancel_token(None);
+
+        assert!(
+            sys.tier_config_reload_workers
+                .lock()
+                .expect("tier config reload worker state must not be poisoned")
+                .peers
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_config_reload_cancellation_during_transient_backoff_releases_state() {
+        let sys = Arc::new(NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        });
+        assert!(sys.reserve_tier_config_reload_worker("node-a:9000"));
+        let cancel_token = CancellationToken::new();
+        let cancel_for_reload = cancel_token.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_reload = Arc::clone(&calls);
+
+        run_tier_config_reload_worker(Arc::clone(&sys), "node-a:9000".to_string(), cancel_token, move || {
+            let attempt = calls_for_reload.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let cancel_token = cancel_for_reload.clone();
+            async move {
+                if attempt == 0 {
+                    cancel_token.cancel();
+                }
+                TierConfigReloadOutcome::TransientReconnect(Error::other("connection refused"))
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!sys.tier_config_reload_worker_active("node-a:9000"));
+    }
+
     #[tokio::test]
     async fn load_transition_tier_config_reports_unreachable_peers() {
         let sys = NotificationSys {
             peer_clients: vec![None],
             all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
             peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
         };
 
         let results = sys.load_transition_tier_config().await;
@@ -1724,6 +2447,38 @@ mod tests {
         assert!(results[0].host.is_empty());
         assert!(results[0].err.is_some());
         assert!(results[0].err.as_ref().unwrap().to_string().contains("peer is not reachable"));
+    }
+
+    #[tokio::test]
+    async fn tier_mutation_fanout_reports_unreachable_peers_fail_closed() {
+        let sys = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let mutation_id = Uuid::from_u128(1);
+
+        let prepare = sys.prepare_tier_mutation(mutation_id, Bytes::from_static(b"prepare")).await;
+        assert_eq!(prepare.len(), 1);
+        assert!(prepare[0].host.is_empty());
+        assert!(
+            prepare[0]
+                .err
+                .as_ref()
+                .expect("unreachable prepare peer should carry an error")
+                .to_string()
+                .contains("peer is not reachable")
+        );
+
+        let commit = sys.commit_tier_mutation(mutation_id, Bytes::from_static(b"commit")).await;
+        assert_eq!(commit.len(), 1);
+        assert!(commit[0].err.is_some());
+
+        let abort = sys.abort_tier_mutation(mutation_id).await;
+        assert_eq!(abort.len(), 1);
+        assert!(abort[0].err.is_some());
     }
 
     // --- Tests for handle_peer_failure / handle_server_info_failure caching ---
@@ -1899,6 +2654,60 @@ mod tests {
             .checked_sub(SERVER_INFO_CACHE_MAX_AGE + Duration::from_secs(1))
             .expect("test clock underflow");
         assert!(!cached_snapshot_is_fresh(Some(stale)), "an old success is stale");
+    }
+
+    #[test]
+    fn server_info_probe_round_commits_failures_only_when_published() {
+        let caches = vec![Mutex::new(PeerAdminCache::new())];
+        let endpoints = EndpointServerPools::default();
+        let probes = vec![PeerServerInfoProbe {
+            host: "peer-1".to_string(),
+            result: Err(PeerServerInfoProbeFailure::Rpc { health: None }),
+        }];
+
+        assert_eq!(
+            caches[0]
+                .lock()
+                .expect("peer cache should lock before publish")
+                .server_failures,
+            0
+        );
+
+        let replies = publish_server_info_probe_round(&caches, &endpoints, probes);
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].endpoint, "peer-1");
+        assert_eq!(replies[0].state, ItemState::Unknown.to_string());
+        assert_eq!(
+            caches[0]
+                .lock()
+                .expect("peer cache should lock after publish")
+                .server_failures,
+            1
+        );
+    }
+
+    #[test]
+    fn server_info_probe_round_does_not_count_no_client_slots_as_rpc_failures() {
+        let caches = vec![Mutex::new(PeerAdminCache::new())];
+        let endpoints = EndpointServerPools::default();
+        let probes = vec![PeerServerInfoProbe {
+            host: "node-a:9000".to_string(),
+            result: Err(PeerServerInfoProbeFailure::NoClient),
+        }];
+
+        let replies = publish_server_info_probe_round(&caches, &endpoints, probes);
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].endpoint, "node-a:9000");
+        assert_eq!(replies[0].state, ItemState::Unknown.to_string());
+        assert_eq!(
+            caches[0]
+                .lock()
+                .expect("peer cache should lock after no-client publish")
+                .server_failures,
+            0
+        );
     }
 
     #[test]

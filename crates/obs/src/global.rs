@@ -259,6 +259,14 @@ mod tests {
     }
 
     #[test]
+    fn test_grafana_dashboard_deduplicates_cluster_bucket_usage() {
+        assert!(GRAFANA_DASHBOARD.contains("max by (job, bucket) (rustfs_cluster_usage_buckets_objects_count"));
+        assert!(GRAFANA_DASHBOARD.contains("max by (job, bucket) (rustfs_cluster_usage_buckets_total_bytes"));
+        assert!(!GRAFANA_DASHBOARD.contains("sum by (bucket) (rustfs_bucket_api_objects_total"));
+        assert!(!GRAFANA_DASHBOARD.contains("sum by (bucket) (rustfs_bucket_api_usage_bytes"));
+    }
+
+    #[test]
     fn test_readme_mentions_deployed_dashboard_path() {
         assert!(README.contains(".docker/observability/grafana/dashboards/rustfs.json"));
         assert!(README.contains("row title: `Log Cleaner`"));

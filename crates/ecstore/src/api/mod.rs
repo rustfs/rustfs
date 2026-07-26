@@ -43,10 +43,27 @@ pub mod bucket {
 
         pub mod bucket_lifecycle_ops {
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
-                ExpiryState, LifecycleOps, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
+                ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
+                ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
+                ManualTransitionRunReport, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
                 apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
+                enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
                 enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, post_restore_opts, run_stale_multipart_upload_cleanup_once, validate_transition_tier,
+                init_background_expiry, manual_transition_queue_snapshot, post_restore_opts,
+                run_stale_multipart_upload_cleanup_once, validate_transition_tier,
+            };
+        }
+
+        pub mod manual_transition_job {
+            pub use crate::bucket::lifecycle::manual_transition_job::{
+                ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
+                ManualTransitionScopeAdmissionClaim, claim_manual_transition_scope_admission,
+                delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
+                load_manual_transition_job_record_with_etag, load_manual_transition_scope_admission,
+                manual_transition_job_lease_expired, manual_transition_scope_admission_lease_expired,
+                manual_transition_scope_key, persist_manual_transition_job_progress, renew_manual_transition_job_lease,
+                request_manual_transition_job_cancel, save_manual_transition_job_record,
+                save_manual_transition_job_record_if_current, save_manual_transition_scope_admission_if_absent,
             };
         }
 
@@ -105,12 +122,13 @@ pub mod bucket {
 
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
-            BucketMetadataSys, delete, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
-            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
+            BucketMetadataSys, acquire_bucket_targets_transaction_lock, delete, get, get_accelerate_config, get_bucket_policy,
+            get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_public_access_block_config, get_quota_config, get_replication_config,
             get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
             init_bucket_metadata_sys, list_bucket_targets, remove_bucket_metadata, set_bucket_metadata, update,
+            update_bucket_targets_under_transaction_lock,
         };
     }
 
@@ -147,18 +165,19 @@ pub mod bucket {
 
     pub mod replication {
         pub use crate::bucket::replication::{
-            BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, MustReplicateOptions,
-            ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationConfig,
-            ReplicationConfigurationExt, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource,
-            ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO, ReplicationOperation, ReplicationPoolTrait,
-            ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge, ReplicationState, ReplicationStats,
-            ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError, ReplicationType, ResyncOpts,
-            ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType, delete_replication_state_from_config,
-            delete_replication_version_id, get_global_replication_pool, get_global_replication_stats,
-            init_background_replication, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
-            replication_target_arns, should_remove_replication_target, should_schedule_delete_replication,
-            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
-            validate_replication_config_target_arns, version_purge_status_to_filemeta,
+            BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DurableMrfBacklog, DynReplicationPool,
+            MrfOpKind, MrfReplicateEntry, MustReplicateOptions, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,
+            ReplicateObjectInfo, ReplicationConfig, ReplicationConfigurationExt, ReplicationDeleteScheduleInput,
+            ReplicationDeleteStateSource, ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO,
+            ReplicationOperation, ReplicationPoolTrait, ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge,
+            ReplicationState, ReplicationStats, ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError,
+            ReplicationType, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType,
+            delete_replication_state_from_config, delete_replication_version_id, get_global_replication_pool,
+            get_global_replication_stats, init_background_replication, read_durable_mrf_backlog, replication_state_to_filemeta,
+            replication_status_to_filemeta, replication_statuses_map, replication_target_arns, resync_start_conflict_id,
+            should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+            should_use_existing_delete_replication_source, validate_replication_config_target_arns,
+            version_purge_status_to_filemeta,
         };
     }
 
@@ -240,19 +259,23 @@ pub mod config {
     pub mod com {
         pub use crate::config::com::{
             COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
-            ServerConfigCorruptError, delete_config, is_server_config_corrupt_error, lookup_configs, read_config,
-            read_config_no_lock, read_config_with_metadata, read_config_without_migrate, save_config, save_config_with_opts,
-            save_server_config, try_migrate_server_config,
+            ServerConfigCorruptError, ServerConfigSnapshot, delete_config, is_server_config_corrupt_error, lookup_configs,
+            read_config, read_config_no_lock, read_config_with_metadata, read_config_without_migrate,
+            read_config_without_migrate_no_lock, read_existing_server_config_no_lock, read_server_config_snapshot, save_config,
+            save_config_no_lock, save_config_with_opts, save_server_config, save_server_config_no_lock,
+            save_server_config_snapshot, server_config_path, try_migrate_server_config, with_config_object_read_lock,
+            with_config_object_write_lock, with_server_config_read_lock, with_server_config_write_lock,
         };
     }
 
     pub mod storageclass {
         pub use crate::config::storageclass::{
-            CLASS_RRS, CLASS_STANDARD, Config, DEEP_ARCHIVE, DEFAULT_INLINE_BLOCK, DEFAULT_KVS, DEFAULT_RRS_PARITY,
-            EXPRESS_ONEZONE, GLACIER, GLACIER_IR, INLINE_BLOCK, INLINE_BLOCK_ENV, INTELLIGENT_TIERING, MIN_PARITY_DRIVES,
-            ONEZONE_IA, OPTIMIZE, OPTIMIZE_ENV, OUTPOSTS, RRS, RRS_ENV, SCHEME_PREFIX, SNOW, STANDARD, STANDARD_ENV, STANDARD_IA,
-            StorageClass, default_parity_count, lookup_config, lookup_config_for_pools, parse_storage_class, validate_parity,
-            validate_parity_inner,
+            CAPABILITY_CONTRACT_VERSION, CLASS_RRS, CLASS_STANDARD, Config, DEEP_ARCHIVE, DEFAULT_INLINE_BLOCK, DEFAULT_KVS,
+            DEFAULT_RRS_PARITY, EXPRESS_ONEZONE, GLACIER, GLACIER_IR, INLINE_BLOCK, INLINE_BLOCK_ENV, INTELLIGENT_TIERING,
+            LEGACY_LABEL_BEHAVIOR, MIN_PARITY_DRIVES, ONEZONE_IA, OPTIMIZE, OPTIMIZE_ENV, OUTPOSTS, RRS, RRS_ENV, SCHEME_PREFIX,
+            SNOW, STANDARD, STANDARD_ENV, STANDARD_IA, SUPPORTED_WRITE_CLASSES, StorageClass, UNSUPPORTED_WRITE_ERROR,
+            default_parity_count, effective_class, is_supported_write_class, lookup_config, lookup_config_for_pools,
+            parse_storage_class, validate_parity, validate_parity_inner,
         };
     }
 
@@ -280,9 +303,9 @@ pub mod disk {
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
         CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, OldCurrentSize, RUSTFS_META_BUCKET, ReadMultipleReq,
-        ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        new_disk, validate_batch_read_version_item_count,
+        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize, RUSTFS_META_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo,
+        WalkDirOptions, new_disk, validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
@@ -383,11 +406,12 @@ pub mod rio {
 
 pub mod rpc {
     pub use crate::cluster::rpc::{
-        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerPeerActivity, TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers,
-        gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
-        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
-        sign_tonic_rpc_response_proof, verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_rpc_response_proof,
+        LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, S3PeerSys,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerPeerActivity,
+        TONIC_RPC_PREFIX, TonicInterceptor, gen_signature_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
+        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
+        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_tonic_rpc_response_proof, verify_rpc_signature,
+        verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof,
         verify_tonic_rpc_signature,
     };
 }
@@ -434,6 +458,13 @@ pub mod tier {
         pub use crate::services::tier::tier_handlers::{
             ERR_TIER_ALREADY_EXISTS, ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS,
             ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR, ERR_TIER_RESERVED_NAME,
+        };
+    }
+
+    pub mod tier_mutation_peer {
+        pub use crate::services::tier::tier_mutation_peer::{
+            MAX_TIER_MUTATION_PEER_COMMIT_ETAG_SIZE, TierMutationPeerError, TierMutationPeerOutcome, TierMutationPeerResult,
+            TierMutationPeerState, handle_tier_mutation_peer_request,
         };
     }
 

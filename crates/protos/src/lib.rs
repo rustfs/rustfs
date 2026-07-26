@@ -25,7 +25,7 @@ use std::{
     collections::HashMap,
     error::Error,
     sync::LazyLock,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -35,6 +35,7 @@ use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -53,7 +54,11 @@ pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
 const TLS_GENERATION_CACHE_MAX_SIZE: usize = 512;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET: u8 = 0;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE: u8 = 1;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE: u8 = 2;
 static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
     if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
@@ -164,7 +169,11 @@ pub fn internode_rpc_max_message_size() -> usize {
 
 pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v2\0";
+pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
+pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
+pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
 
 pub fn heal_control_coordinator_epoch(topology_fingerprint: &str) -> Result<u64, &'static str> {
     let prefix = topology_fingerprint
@@ -249,6 +258,880 @@ pub fn canonical_heal_control_response_body(
     body.extend_from_slice(&u64::try_from(result.len())?.to_be_bytes());
     body.extend_from_slice(result);
     Ok(body)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TierMutationRpcPhase {
+    Prepare,
+    Commit,
+    Abort,
+}
+
+impl TierMutationRpcPhase {
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Commit => "commit",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+pub const TIER_MUTATION_RPC_PROTOCOL_VERSION: u32 = 1;
+
+pub fn canonical_tier_mutation_rpc_body(
+    version: u32,
+    phase: TierMutationRpcPhase,
+    mutation_id: Uuid,
+    canonical_payload: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-v1\0";
+
+    let phase = phase.as_wire_str().as_bytes();
+    let mutation_id = mutation_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + phase.len() + mutation_id.len() + 8 + canonical_payload.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(phase.len())?.to_be_bytes());
+    body.extend_from_slice(phase);
+    body.extend_from_slice(mutation_id);
+    body.extend_from_slice(&u64::try_from(canonical_payload.len())?.to_be_bytes());
+    body.extend_from_slice(canonical_payload);
+    Ok(body)
+}
+
+pub struct TierMutationRpcResponseProofInput<'a> {
+    pub version: u32,
+    pub phase: TierMutationRpcPhase,
+    pub mutation_id: Uuid,
+    pub canonical_payload: &'a [u8],
+    pub success: bool,
+    pub state: i32,
+    pub applied: bool,
+    pub error_info: Option<&'a str>,
+}
+
+pub fn canonical_tier_mutation_rpc_response_body(
+    input: TierMutationRpcResponseProofInput<'_>,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-response-v1\0";
+
+    let phase = input.phase.as_wire_str().as_bytes();
+    let mutation_id = input.mutation_id.as_bytes();
+    let error_info = input.error_info.map(str::as_bytes);
+    let error_info_len = error_info.map_or(0, <[u8]>::len);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len()
+            + 4
+            + 8
+            + phase.len()
+            + mutation_id.len()
+            + 8
+            + input.canonical_payload.len()
+            + 1
+            + 4
+            + 1
+            + 1
+            + 8
+            + error_info_len,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&input.version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(phase.len())?.to_be_bytes());
+    body.extend_from_slice(phase);
+    body.extend_from_slice(mutation_id);
+    body.extend_from_slice(&u64::try_from(input.canonical_payload.len())?.to_be_bytes());
+    body.extend_from_slice(input.canonical_payload);
+    body.push(u8::from(input.success));
+    body.extend_from_slice(&input.state.to_be_bytes());
+    body.push(u8::from(input.applied));
+    body.push(u8::from(error_info.is_some()));
+    body.extend_from_slice(&u64::try_from(error_info_len)?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
+/// Builds the stable byte representation authenticated for a scanner activity request.
+pub fn canonical_scanner_activity_request_body(
+    request: &proto_gen::node_service::ScannerActivityRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-request-v1\0";
+
+    let challenge = request.challenge.as_ref();
+    let acknowledge_instance_id = request.acknowledge_instance_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + acknowledge_instance_id.len() + 4 + 8 * 3);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&request.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(acknowledge_instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(acknowledge_instance_id);
+    body.extend_from_slice(&request.acknowledge_dirty_usage_generation.to_be_bytes());
+    Ok(body)
+}
+
+/// Builds the protocol-v4 byte representation authenticated for a scanner activity response.
+pub fn canonical_scanner_activity_v4_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v1\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 5 + 1);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    Ok(body)
+}
+
+/// Builds the stable byte representation authenticated for a scanner activity response.
+pub fn canonical_scanner_activity_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v2\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 6 + 2);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    Ok(body)
+}
+
+/// Length-prefixed, domain-separated byte builder for the disk-mutation canonical bodies below.
+/// Every variable-length field is u64-length-prefixed and every list u64-count-prefixed, so
+/// distinct field values can never collide into the same canonical bytes.
+struct CanonicalBodyBuilder {
+    body: Vec<u8>,
+}
+
+impl CanonicalBodyBuilder {
+    fn new(domain: &'static [u8]) -> Self {
+        let mut body = Vec::with_capacity(domain.len() + 128);
+        body.extend_from_slice(domain);
+        Self { body }
+    }
+
+    fn push_bytes(&mut self, field: &[u8]) -> Result<(), std::num::TryFromIntError> {
+        self.body.extend_from_slice(&u64::try_from(field.len())?.to_be_bytes());
+        self.body.extend_from_slice(field);
+        Ok(())
+    }
+
+    fn push_str(&mut self, field: &str) -> Result<(), std::num::TryFromIntError> {
+        self.push_bytes(field.as_bytes())
+    }
+
+    fn push_bool(&mut self, field: bool) {
+        self.body.push(u8::from(field));
+    }
+
+    fn push_count(&mut self, count: usize) -> Result<(), std::num::TryFromIntError> {
+        self.body.extend_from_slice(&u64::try_from(count)?.to_be_bytes());
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.body
+    }
+}
+
+// Canonical request bodies for the mutating NodeService disk RPCs (backlog#1327 body-digest
+// binding). Each covers every semantic wire field — including both the msgpack `_bin` payload and
+// its JSON compatibility copy — so tampering with either encoding, or stripping `_bin` to force
+// the JSON fallback decode path, breaks the signature-bound digest.
+
+pub fn canonical_rename_data_request_body(
+    request: &proto_gen::node_service::RenameDataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-data-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.file_info)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.file_info_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_version_request_body(
+    request: &proto_gen::node_service::DeleteVersionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-version-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_bool(request.force_del_marker);
+    body.push_str(&request.opts)?;
+    body.push_bytes(&request.file_info_bin)?;
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_versions_request_body(
+    request: &proto_gen::node_service::DeleteVersionsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-versions-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_count(request.versions.len())?;
+    for version in &request.versions {
+        body.push_str(version)?;
+    }
+    body.push_str(&request.opts)?;
+    body.push_count(request.versions_bin.len())?;
+    for version_bin in &request.versions_bin {
+        body.push_bytes(version_bin)?;
+    }
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_write_metadata_request_body(
+    request: &proto_gen::node_service::WriteMetadataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-metadata-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_bytes(&request.file_info_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_update_metadata_request_body(
+    request: &proto_gen::node_service::UpdateMetadataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-update-metadata-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_str(&request.opts)?;
+    body.push_bytes(&request.file_info_bin)?;
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_write_all_request_body(
+    request: &proto_gen::node_service::WriteAllRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-all-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.data)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_request_body(
+    request: &proto_gen::node_service::DeleteRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.options)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_paths_request_body(
+    request: &proto_gen::node_service::DeletePathsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-paths-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_count(request.paths.len())?;
+    for path in &request.paths {
+        body.push_str(path)?;
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_rename_file_request_body(
+    request: &proto_gen::node_service::RenameFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_rename_part_request_body(
+    request: &proto_gen::node_service::RenamePartRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-part-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.meta)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_volume_request_body(
+    request: &proto_gen::node_service::DeleteVolumeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-volume-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    // Binding `force` is the point: an unbound recursive-delete flag lets an on-path attacker
+    // turn a refuse-if-nonempty delete into a recursive volume wipe (backlog#1327).
+    body.push_bool(request.force);
+    Ok(body.finish())
+}
+
+pub fn canonical_make_volume_request_body(
+    request: &proto_gen::node_service::MakeVolumeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-make-volume-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_make_volumes_request_body(
+    request: &proto_gen::node_service::MakeVolumesRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-make-volumes-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_count(request.volumes.len())?;
+    for volume in &request.volumes {
+        body.push_str(volume)?;
+    }
+    Ok(body.finish())
+}
+
+#[cfg(test)]
+mod disk_mutation_canonical_tests {
+    use super::proto_gen::node_service::{
+        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
+        MakeVolumesRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, UpdateMetadataRequest, WriteAllRequest,
+        WriteMetadataRequest,
+    };
+    use super::*;
+
+    fn assert_all_distinct(bodies: &[Vec<u8>]) {
+        for (i, a) in bodies.iter().enumerate() {
+            for (j, b) in bodies.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "canonical bodies {i} and {j} must differ");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_data_canonical_body_binds_every_field() {
+        let baseline = RenameDataRequest {
+            disk: "disk-a".into(),
+            src_volume: "src-vol".into(),
+            src_path: "src-path".into(),
+            file_info: "{\"v\":1}".into(),
+            dst_volume: "dst-vol".into(),
+            dst_path: "dst-path".into(),
+            file_info_bin: vec![0x81, 0x01].into(),
+        };
+        let mut bodies = vec![canonical_rename_data_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut RenameDataRequest| r.disk = "disk-b".into(),
+            |r: &mut RenameDataRequest| r.src_volume = "src-vol2".into(),
+            |r: &mut RenameDataRequest| r.src_path = "src-path2".into(),
+            |r: &mut RenameDataRequest| r.file_info = "{\"v\":2}".into(),
+            |r: &mut RenameDataRequest| r.dst_volume = "dst-vol2".into(),
+            |r: &mut RenameDataRequest| r.dst_path = "dst-path2".into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_data_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn rename_data_canonical_body_is_injective_across_field_boundaries() {
+        // Length prefixes must prevent moving bytes between adjacent fields from colliding.
+        let shifted_left = RenameDataRequest {
+            src_volume: "ab".into(),
+            src_path: "c".into(),
+            ..Default::default()
+        };
+        let shifted_right = RenameDataRequest {
+            src_volume: "a".into(),
+            src_path: "bc".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            canonical_rename_data_request_body(&shifted_left).unwrap(),
+            canonical_rename_data_request_body(&shifted_right).unwrap(),
+        );
+    }
+
+    #[test]
+    fn delete_version_canonical_body_binds_every_field() {
+        let baseline = DeleteVersionRequest {
+            disk: "disk-a".into(),
+            volume: "vol".into(),
+            path: "path".into(),
+            file_info: "{\"v\":1}".into(),
+            force_del_marker: false,
+            opts: "{}".into(),
+            file_info_bin: vec![0x81].into(),
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_delete_version_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut DeleteVersionRequest| r.disk = "disk-b".into(),
+            |r: &mut DeleteVersionRequest| r.volume = "vol2".into(),
+            |r: &mut DeleteVersionRequest| r.path = "path2".into(),
+            |r: &mut DeleteVersionRequest| r.file_info = "{\"v\":2}".into(),
+            |r: &mut DeleteVersionRequest| r.force_del_marker = true,
+            |r: &mut DeleteVersionRequest| r.opts = "{\"o\":1}".into(),
+            |r: &mut DeleteVersionRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut DeleteVersionRequest| r.opts_bin = Vec::new().into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_version_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn delete_versions_canonical_body_binds_lists_and_options() {
+        let baseline = DeleteVersionsRequest {
+            disk: "disk-a".into(),
+            volume: "vol".into(),
+            versions: vec!["v1".into(), "v2".into()],
+            opts: "{}".into(),
+            versions_bin: vec![vec![0x01].into(), vec![0x02].into()],
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_delete_versions_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut DeleteVersionsRequest| r.disk = "disk-b".into(),
+            |r: &mut DeleteVersionsRequest| r.volume = "vol2".into(),
+            |r: &mut DeleteVersionsRequest| r.versions = vec!["v1".into(), "v3".into()],
+            |r: &mut DeleteVersionsRequest| r.versions = vec!["v1v2".into()],
+            |r: &mut DeleteVersionsRequest| r.opts = "{\"o\":1}".into(),
+            |r: &mut DeleteVersionsRequest| r.versions_bin = vec![vec![0x01].into(), vec![0x03].into()],
+            |r: &mut DeleteVersionsRequest| r.versions_bin = vec![vec![0x01, 0x02].into()],
+            |r: &mut DeleteVersionsRequest| r.versions_bin = Vec::new(),
+            |r: &mut DeleteVersionsRequest| r.opts_bin = vec![0x81].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_versions_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn remaining_disk_mutation_canonical_bodies_bind_every_field() {
+        // Mutating each field in turn and asserting all bodies differ catches a dropped or
+        // duplicated `push_*` in these hand-written builders — an unbound field is tamperable.
+        let write_metadata = WriteMetadataRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            file_info: "{\"a\":1}".into(),
+            file_info_bin: vec![0x81].into(),
+        };
+        let mut bodies = vec![canonical_write_metadata_request_body(&write_metadata).unwrap()];
+        for mutate in [
+            |r: &mut WriteMetadataRequest| r.disk = "d2".into(),
+            |r: &mut WriteMetadataRequest| r.volume = "v2".into(),
+            |r: &mut WriteMetadataRequest| r.path = "p2".into(),
+            |r: &mut WriteMetadataRequest| r.file_info = "{\"a\":2}".into(),
+            |r: &mut WriteMetadataRequest| r.file_info_bin = vec![0x82].into(),
+        ] {
+            let mut request = write_metadata.clone();
+            mutate(&mut request);
+            bodies.push(canonical_write_metadata_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let update_metadata = UpdateMetadataRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            file_info: "{\"a\":1}".into(),
+            opts: "{\"o\":1}".into(),
+            file_info_bin: vec![0x81].into(),
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_update_metadata_request_body(&update_metadata).unwrap()];
+        for mutate in [
+            |r: &mut UpdateMetadataRequest| r.disk = "d2".into(),
+            |r: &mut UpdateMetadataRequest| r.volume = "v2".into(),
+            |r: &mut UpdateMetadataRequest| r.path = "p2".into(),
+            |r: &mut UpdateMetadataRequest| r.file_info = "{\"a\":2}".into(),
+            |r: &mut UpdateMetadataRequest| r.opts = "{\"o\":2}".into(),
+            |r: &mut UpdateMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut UpdateMetadataRequest| r.opts_bin = vec![0x81].into(),
+        ] {
+            let mut request = update_metadata.clone();
+            mutate(&mut request);
+            bodies.push(canonical_update_metadata_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let write_all = WriteAllRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            data: vec![0xAA, 0xBB].into(),
+        };
+        let mut bodies = vec![canonical_write_all_request_body(&write_all).unwrap()];
+        for mutate in [
+            |r: &mut WriteAllRequest| r.disk = "d2".into(),
+            |r: &mut WriteAllRequest| r.volume = "v2".into(),
+            |r: &mut WriteAllRequest| r.path = "p2".into(),
+            |r: &mut WriteAllRequest| r.data = vec![0xAA, 0xBC].into(),
+        ] {
+            let mut request = write_all.clone();
+            mutate(&mut request);
+            bodies.push(canonical_write_all_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let delete = DeleteRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            options: "{\"o\":1}".into(),
+        };
+        let mut bodies = vec![canonical_delete_request_body(&delete).unwrap()];
+        for mutate in [
+            |r: &mut DeleteRequest| r.disk = "d2".into(),
+            |r: &mut DeleteRequest| r.volume = "v2".into(),
+            |r: &mut DeleteRequest| r.path = "p2".into(),
+            |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+        ] {
+            let mut request = delete.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let delete_paths = DeletePathsRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            paths: vec!["a".into(), "b".into()],
+        };
+        let mut bodies = vec![canonical_delete_paths_request_body(&delete_paths).unwrap()];
+        for mutate in [
+            |r: &mut DeletePathsRequest| r.disk = "d2".into(),
+            |r: &mut DeletePathsRequest| r.volume = "v2".into(),
+            |r: &mut DeletePathsRequest| r.paths = vec!["a".into(), "c".into()],
+            |r: &mut DeletePathsRequest| r.paths = vec!["ab".into()],
+        ] {
+            let mut request = delete_paths.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_paths_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let rename_file = RenameFileRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+        };
+        let mut bodies = vec![canonical_rename_file_request_body(&rename_file).unwrap()];
+        for mutate in [
+            |r: &mut RenameFileRequest| r.disk = "d2".into(),
+            |r: &mut RenameFileRequest| r.src_volume = "sv2".into(),
+            |r: &mut RenameFileRequest| r.src_path = "sp2".into(),
+            |r: &mut RenameFileRequest| r.dst_volume = "dv2".into(),
+            |r: &mut RenameFileRequest| r.dst_path = "dp2".into(),
+        ] {
+            let mut request = rename_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let rename_part = RenamePartRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: vec![0x01].into(),
+        };
+        let mut bodies = vec![canonical_rename_part_request_body(&rename_part).unwrap()];
+        for mutate in [
+            |r: &mut RenamePartRequest| r.disk = "d2".into(),
+            |r: &mut RenamePartRequest| r.src_volume = "sv2".into(),
+            |r: &mut RenamePartRequest| r.src_path = "sp2".into(),
+            |r: &mut RenamePartRequest| r.dst_volume = "dv2".into(),
+            |r: &mut RenamePartRequest| r.dst_path = "dp2".into(),
+            |r: &mut RenamePartRequest| r.meta = vec![0x02].into(),
+        ] {
+            let mut request = rename_part.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_part_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn volume_mutation_canonical_bodies_bind_their_fields() {
+        let delete_volume = DeleteVolumeRequest {
+            disk: "http://node-a:9000/data/rustfs0".into(),
+            volume: "bucket".into(),
+            force: false,
+        };
+        // The force flag must be part of the signed body: false → true is a recursive wipe.
+        let mut recursive = delete_volume.clone();
+        recursive.force = true;
+        assert_ne!(
+            canonical_delete_volume_request_body(&delete_volume).unwrap(),
+            canonical_delete_volume_request_body(&recursive).unwrap(),
+        );
+        let mut retargeted = delete_volume.clone();
+        retargeted.volume = "victim".into();
+        assert_ne!(
+            canonical_delete_volume_request_body(&delete_volume).unwrap(),
+            canonical_delete_volume_request_body(&retargeted).unwrap(),
+        );
+
+        let make_volume = MakeVolumeRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+        };
+        let mut tampered = make_volume.clone();
+        tampered.volume = "v2".into();
+        assert_ne!(
+            canonical_make_volume_request_body(&make_volume).unwrap(),
+            canonical_make_volume_request_body(&tampered).unwrap(),
+        );
+
+        let make_volumes = MakeVolumesRequest {
+            disk: "d".into(),
+            volumes: vec!["a".into(), "b".into()],
+        };
+        let mut merged = make_volumes.clone();
+        merged.volumes = vec!["ab".into()];
+        assert_ne!(
+            canonical_make_volumes_request_body(&make_volumes).unwrap(),
+            canonical_make_volumes_request_body(&merged).unwrap(),
+        );
+    }
+
+    #[test]
+    fn disk_mutation_canonical_domains_are_distinct_per_message() {
+        // The same field values must never authenticate one RPC's request as another's.
+        let rename_file = RenameFileRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+        };
+        let rename_part = RenamePartRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: Vec::new().into(),
+        };
+        assert_ne!(
+            canonical_rename_file_request_body(&rename_file).unwrap(),
+            canonical_rename_part_request_body(&rename_part).unwrap(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod scanner_activity_tests {
+    use super::{
+        canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
+        canonical_scanner_activity_v4_response_body,
+        proto_gen::node_service::{ScannerActivityRequest, ScannerActivityResponse},
+    };
+
+    #[test]
+    fn canonical_scanner_activity_request_binds_every_field() {
+        let request = ScannerActivityRequest {
+            challenge: vec![1; 16].into(),
+            protocol_version: 5,
+            acknowledge_instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            acknowledge_dirty_usage_generation: 11,
+        };
+        let baseline = canonical_scanner_activity_request_body(&request).expect("scanner activity request should encode");
+
+        let variants = [
+            ScannerActivityRequest {
+                challenge: vec![2; 16].into(),
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                protocol_version: 4,
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                acknowledge_instance_id: "1123456789abcdef0123456789abcdef".to_string(),
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                acknowledge_dirty_usage_generation: 12,
+                ..request
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_request_body(&variant).expect("scanner activity request variant should encode")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_scanner_activity_response_binds_challenge_and_every_status_field() {
+        let response = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: 4,
+            topology_digest: vec![9; 32].into(),
+            data_movement_active: true,
+            response_proof: Vec::new().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+        };
+        let baseline =
+            canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
+
+        let variants = [
+            ScannerActivityResponse {
+                instance_id: "1123456789abcdef0123456789abcdef".to_string(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                namespace_generation: 8,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                maintenance_generation: 4,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                protocol_version: 5,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                topology_digest: vec![8; 32].into(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                data_movement_active: false,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                dirty_usage_generation: 12,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                dirty_usage_pending: false,
+                ..response.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_response_body(&[1; 16], &variant)
+                    .expect("scanner activity response variant should encode")
+            );
+        }
+        assert_ne!(
+            baseline,
+            canonical_scanner_activity_response_body(&[2; 16], &response)
+                .expect("scanner activity response with a different challenge should encode")
+        );
+    }
+
+    #[test]
+    fn scanner_activity_v4_response_canonicalization_ignores_v5_fields() {
+        let response = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: 4,
+            topology_digest: vec![9; 32].into(),
+            data_movement_active: true,
+            response_proof: Vec::new().into(),
+            dirty_usage_generation: 0,
+            dirty_usage_pending: false,
+        };
+        let baseline =
+            canonical_scanner_activity_v4_response_body(&[1; 16], &response).expect("scanner activity v4 response should encode");
+        let expected = [
+            b"rustfs-scanner-activity-response-v1\0".as_slice(),
+            16u64.to_be_bytes().as_slice(),
+            [1u8; 16].as_slice(),
+            32u64.to_be_bytes().as_slice(),
+            b"0123456789abcdef0123456789abcdef".as_slice(),
+            7u64.to_be_bytes().as_slice(),
+            3u64.to_be_bytes().as_slice(),
+            4u32.to_be_bytes().as_slice(),
+            32u64.to_be_bytes().as_slice(),
+            [9u8; 32].as_slice(),
+            [1u8].as_slice(),
+        ]
+        .concat();
+        assert_eq!(
+            baseline, expected,
+            "protocol v4 response bytes must remain stable during rolling upgrades"
+        );
+        let extended = ScannerActivityResponse {
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+            ..response
+        };
+
+        assert_eq!(
+            baseline,
+            canonical_scanner_activity_v4_response_body(&[1; 16], &extended)
+                .expect("scanner activity v4 response should ignore v5 fields")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -363,15 +1246,214 @@ mod heal_control_tests {
     }
 }
 
+#[cfg(test)]
+mod tier_mutation_rpc_tests {
+    use super::{
+        TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase, TierMutationRpcResponseProofInput,
+        canonical_tier_mutation_rpc_body, canonical_tier_mutation_rpc_response_body,
+    };
+    use crate::proto_gen::node_service::TierMutationPeerState;
+    use uuid::uuid;
+
+    #[test]
+    fn canonical_tier_mutation_body_binds_phase_id_and_payload() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let baseline = canonical_tier_mutation_rpc_body(
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+        )
+        .expect("small mutation body should encode");
+        let mut golden = b"rustfs-tier-mutation-rpc-v1\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&7_u64.to_be_bytes());
+        golden.extend_from_slice(b"prepare");
+        golden.extend_from_slice(mutation_id.as_bytes());
+        golden.extend_from_slice(&u64::try_from(payload.len()).expect("payload length should fit").to_be_bytes());
+        golden.extend_from_slice(payload);
+        assert_eq!(baseline, golden);
+
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(2, TierMutationRpcPhase::Prepare, mutation_id, payload)
+                .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Commit,
+                mutation_id,
+                payload,
+            )
+            .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                uuid!("22345678-1234-5678-9abc-def012345678"),
+                payload,
+            )
+            .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                b"canonical-intent-record-tampered",
+            )
+            .expect("small mutation body should encode")
+        );
+    }
+
+    #[test]
+    fn canonical_tier_mutation_response_binds_request_state_and_error() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let baseline = canonical_tier_mutation_rpc_response_body(TierMutationRpcResponseProofInput {
+            version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: TierMutationRpcPhase::Prepare,
+            mutation_id,
+            canonical_payload: payload,
+            success: true,
+            state: TierMutationPeerState::Prepared as i32,
+            applied: true,
+            error_info: None,
+        })
+        .expect("small mutation response should encode");
+
+        let cases = [
+            TierMutationRpcResponseProofInput {
+                version: 2,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Commit,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id: uuid!("22345678-1234-5678-9abc-def012345678"),
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: b"tampered-intent-record",
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Committed as i32,
+                applied: true,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: false,
+                error_info: None,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Prepared as i32,
+                applied: true,
+                error_info: Some("error"),
+            },
+        ];
+        for case in cases {
+            assert_ne!(
+                baseline,
+                canonical_tier_mutation_rpc_response_body(case).expect("small mutation response should encode")
+            );
+        }
+    }
+}
+
 /// Whether internode metadata RPCs should send only the msgpack `_bin` payloads and leave the JSON
 /// compatibility strings empty (grpc-optimization P2-1). Shared by the client (`remote_disk`) and
-/// server (`node_service`) send paths. Defaults to `false` (dual-write); see
-/// [`rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY`] and the convergence runbook before enabling.
+/// server (`node_service`) send paths.
+///
+/// The legacy flag alone is deliberately insufficient: emptying JSON breaks old peers that only
+/// decode the compatibility field. Operators must also set the fleet-confirmed guard after the
+/// convergence runbook proves every peer supports `_bin` and rollback.
 pub fn internode_rpc_msgpack_only() -> bool {
-    rustfs_utils::get_env_bool(
+    match INTERNODE_RPC_MSGPACK_ONLY_CACHE.load(Ordering::Acquire) {
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE => return false,
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE => return true,
+        _ => {}
+    }
+
+    let enabled = rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
         rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
-    )
+    ) && rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
+    );
+    INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(
+        if enabled {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE
+        } else {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE
+        },
+        Ordering::Release,
+    );
+    enabled
+}
+
+#[doc(hidden)]
+pub fn reset_internode_rpc_msgpack_only_cache() {
+    INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
 }
 
 /// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
@@ -633,6 +1715,329 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct CompatPayloadField {
+        message: &'static str,
+        json_field: &'static str,
+        bin_field: &'static str,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum RequestJsonPolicy {
+        MsgpackOnlyEligible,
+        AlwaysDualWriteUntilFallbackZero,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RequestCompatSendSite {
+        field: CompatPayloadField,
+        json_encoder: &'static str,
+        policy: RequestJsonPolicy,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ResponseCompatSendSite {
+        field: CompatPayloadField,
+        json_encoder: &'static str,
+    }
+
+    const REQUEST_COMPAT_SEND_SITES: &[RequestCompatSendSite] = &[
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "BatchReadVersionRequest",
+                json_field: "batch_read_version_req",
+                bin_field: "batch_read_version_req_bin",
+            },
+            json_encoder: "let batch_read_version_req = compat_json(&req)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = serde_json::to_string(&fi)?;",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts = serde_json::to_string(&opts)?;",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionsRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts = match serde_json::to_string(&opts) {",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "DeleteVersionsRequest",
+                json_field: "versions",
+                bin_field: "versions_bin",
+            },
+            json_encoder: "versions_str.push(match serde_json::to_string(file_info_versions) {",
+            policy: RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadMultipleRequest",
+                json_field: "read_multiple_req",
+                bin_field: "read_multiple_req_bin",
+            },
+            json_encoder: "let read_multiple_req = compat_json(&req)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadVersionRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts_str = compat_json(opts)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "RenameDataRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = compat_json(&fi)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "UpdateMetadataRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = compat_json(&fi)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "UpdateMetadataRequest",
+                json_field: "opts",
+                bin_field: "opts_bin",
+            },
+            json_encoder: "let opts_str = compat_json(&opts)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+        RequestCompatSendSite {
+            field: CompatPayloadField {
+                message: "WriteMetadataRequest",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info = compat_json(&fi)?;",
+            policy: RequestJsonPolicy::MsgpackOnlyEligible,
+        },
+    ];
+
+    const RESPONSE_COMPAT_SEND_SITES: &[ResponseCompatSendSite] = &[
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "BatchReadVersionResponse",
+                json_field: "batch_read_version_resps",
+                bin_field: "batch_read_version_resps_bin",
+            },
+            json_encoder: "compat_response_json(batch_read_version_resp)",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadMultipleResponse",
+                json_field: "read_multiple_resps",
+                bin_field: "read_multiple_resps_bin",
+            },
+            json_encoder: "compat_response_json(read_multiple_resp)",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadVersionResponse",
+                json_field: "file_info",
+                bin_field: "file_info_bin",
+            },
+            json_encoder: "let file_info_json = compat_response_json(&file_info);",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "ReadXLResponse",
+                json_field: "raw_file_info",
+                bin_field: "raw_file_info_bin",
+            },
+            json_encoder: "let raw_file_info_json = compat_response_json(&raw_file_info);",
+        },
+        ResponseCompatSendSite {
+            field: CompatPayloadField {
+                message: "RenameDataResponse",
+                json_field: "rename_data_resp",
+                bin_field: "rename_data_resp_bin",
+            },
+            json_encoder: "let rename_data_resp_json = compat_response_json(&rename_data_resp);",
+        },
+    ];
+
+    fn proto_bin_json_fields(message_suffix: &str) -> Vec<CompatPayloadField> {
+        let proto = include_str!("node.proto");
+        let mut fields = Vec::new();
+        let mut current_message = None;
+
+        for line in proto.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("message ") {
+                current_message = rest.split_whitespace().next();
+                continue;
+            }
+            if line == "}" {
+                current_message = None;
+                continue;
+            }
+            let Some(message) = current_message else {
+                continue;
+            };
+            if line.starts_with("//") || !message.ends_with(message_suffix) || !line.contains("_bin") {
+                continue;
+            }
+            let Some(bin_field) = line.split_whitespace().find(|part| part.ends_with("_bin")) else {
+                continue;
+            };
+            let Some(json_field) = bin_field.strip_suffix("_bin") else {
+                continue;
+            };
+            fields.push(CompatPayloadField {
+                message,
+                json_field,
+                bin_field,
+            });
+        }
+
+        fields.sort();
+        fields
+    }
+
+    fn production_source(source: &'static str, file_name: &str) -> &'static str {
+        source
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_else(|| panic!("{file_name} should contain production source before tests"))
+    }
+
+    #[test]
+    fn request_compat_send_site_manifest_covers_node_proto_bin_fields() {
+        let mut manifest_fields = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| send_site.field)
+            .collect::<Vec<_>>();
+        manifest_fields.sort();
+        manifest_fields.dedup();
+
+        assert_eq!(
+            manifest_fields.len(),
+            REQUEST_COMPAT_SEND_SITES.len(),
+            "duplicate request send-site manifest entry"
+        );
+        assert_eq!(manifest_fields, proto_bin_json_fields("Request"));
+    }
+
+    #[test]
+    fn request_compat_send_site_manifest_pins_json_policy_and_encoder() {
+        let source = production_source(include_str!("../../ecstore/src/cluster/rpc/remote_disk.rs"), "remote_disk.rs");
+        let msgpack_only_eligible = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .filter(|send_site| send_site.policy == RequestJsonPolicy::MsgpackOnlyEligible)
+            .count();
+        let always_dual_write = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .filter(|send_site| send_site.policy == RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero)
+            .count();
+
+        assert_eq!(msgpack_only_eligible, 7);
+        assert_eq!(always_dual_write, 4);
+        for send_site in REQUEST_COMPAT_SEND_SITES {
+            assert!(
+                source.contains(send_site.json_encoder),
+                "{}.{} must keep its manifest encoder: {}",
+                send_site.field.message,
+                send_site.field.json_field,
+                send_site.json_encoder
+            );
+        }
+    }
+
+    #[test]
+    fn request_compat_send_site_manifest_pins_exact_json_policies() {
+        let mut policies = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| (send_site.field.message, send_site.field.json_field, send_site.policy))
+            .collect::<Vec<_>>();
+        policies.sort_by_key(|(message, json_field, _)| (*message, *json_field));
+
+        assert_eq!(
+            policies,
+            [
+                (
+                    "BatchReadVersionRequest",
+                    "batch_read_version_req",
+                    RequestJsonPolicy::MsgpackOnlyEligible
+                ),
+                ("DeleteVersionRequest", "file_info", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero),
+                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("ReadMultipleRequest", "read_multiple_req", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("ReadVersionRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("RenameDataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("UpdateMetadataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("UpdateMetadataRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("WriteMetadataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+            ]
+        );
+    }
+
+    #[test]
+    fn response_compat_send_site_manifest_covers_node_proto_bin_fields() {
+        let mut manifest_fields = RESPONSE_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| send_site.field)
+            .collect::<Vec<_>>();
+        manifest_fields.sort();
+        manifest_fields.dedup();
+
+        assert_eq!(
+            manifest_fields.len(),
+            RESPONSE_COMPAT_SEND_SITES.len(),
+            "duplicate response send-site manifest entry"
+        );
+        assert_eq!(manifest_fields, proto_bin_json_fields("Response"));
+    }
+
+    #[test]
+    fn response_compat_send_site_manifest_pins_json_encoder() {
+        let source = production_source(include_str!("../../../rustfs/src/storage/rpc/node_service/disk.rs"), "disk.rs");
+
+        for send_site in RESPONSE_COMPAT_SEND_SITES {
+            assert!(
+                source.contains(send_site.json_encoder),
+                "{}.{} must keep its manifest encoder: {}",
+                send_site.field.message,
+                send_site.field.json_field,
+                send_site.json_encoder
+            );
+        }
+    }
 
     #[test]
     fn enforce_tls_generation_cache_bound_evicts_when_retained_entries_still_full() {
@@ -672,6 +2077,64 @@ mod tests {
     fn bulk_channel_pool_size_is_at_least_one() {
         // Even without env configuration the pool size is clamped to a usable minimum.
         assert!(bulk_channel_pool_size() >= 1);
+    }
+
+    #[test]
+    fn internode_rpc_msgpack_only_reuses_cached_env_until_reset() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        reset_internode_rpc_msgpack_only_cache();
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                assert!(internode_rpc_msgpack_only());
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                assert!(internode_rpc_msgpack_only(), "cached value should avoid repeated env reads");
+                reset_internode_rpc_msgpack_only_cache();
+                assert!(!internode_rpc_msgpack_only(), "reset must reload current env values");
+            },
+        );
+
+        reset_internode_rpc_msgpack_only_cache();
+    }
+
+    #[test]
+    fn internode_rpc_msgpack_only_requires_request_and_fleet_confirmation() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        for (requested, fleet_confirmed, expected) in [
+            (None, None, false),
+            (Some("true"), None, false),
+            (None, Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("true"), true),
+        ] {
+            reset_internode_rpc_msgpack_only_cache();
+            temp_env::with_vars(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, requested),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, fleet_confirmed),
+                ],
+                || {
+                    assert_eq!(internode_rpc_msgpack_only(), expected);
+                },
+            );
+        }
+
+        reset_internode_rpc_msgpack_only_cache();
     }
 
     #[tokio::test]

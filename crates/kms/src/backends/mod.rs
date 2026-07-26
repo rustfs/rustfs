@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 pub mod local;
+pub mod static_kms;
 pub mod vault;
 pub mod vault_transit;
 

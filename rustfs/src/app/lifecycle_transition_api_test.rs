@@ -21,6 +21,7 @@ use super::storage_api::test::contract::{
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     list::ListOperations as _,
     multipart::MultipartOperations as _,
+    namespace::NamespaceLocking as _,
     object::{ObjectIO as _, ObjectOperations as _},
 };
 use super::storage_api::test::ecfs::FS;
@@ -40,6 +41,7 @@ use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATC
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
+use rustfs_utils::path::encode_dir_object;
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
@@ -63,6 +65,7 @@ const ENV_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOU
 const ENV_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
 const ENV_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED";
 const ENV_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
+const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
 fn init_tracing() {
     INIT.call_once(|| {});
@@ -548,6 +551,227 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
+#[ignore = "global-state object-version integration test: runs serialized in the CI ILM Integration (serial) lane"]
+async fn undo_copy_requires_the_observed_current_version() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-undo-copy-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let put = |payload: &'static [u8]| {
+        PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .body(Some(streaming_blob_from_bytes(payload)))
+            .content_length(Some(payload.len() as i64))
+            .build()
+            .unwrap()
+    };
+    let original = Box::pin(usecase.execute_put_object(&fs, build_request(put(b"original"), Method::PUT)))
+        .await
+        .expect("initial version should be written")
+        .output
+        .version_id
+        .expect("versioned PUT should return a version ID");
+    let observed_current = Box::pin(usecase.execute_put_object(&fs, build_request(put(b"replacement"), Method::PUT)))
+        .await
+        .expect("replacement version should be written")
+        .output
+        .version_id
+        .expect("versioned PUT should return a version ID");
+
+    let copy = || {
+        CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: object.to_string().into(),
+                version_id: Some(original.clone().into()),
+            })
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .unwrap()
+    };
+    let mut stale_req = build_request(copy(), Method::PUT);
+    stale_req.headers.insert(
+        RUSTFS_EXPECTED_CURRENT_VERSION_ID,
+        HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
+    );
+    let versions_before = live_object_version_count(&ecstore, bucket.as_str(), object).await;
+    let err = Box::pin(usecase.execute_copy_object(stale_req))
+        .await
+        .expect_err("stale destination must fail");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), object).await, versions_before);
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, b"replacement");
+
+    let mut matching_req = build_request(copy(), Method::PUT);
+    matching_req
+        .headers
+        .insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&observed_current).unwrap());
+    Box::pin(usecase.execute_copy_object(matching_req))
+        .await
+        .expect("matching destination version should permit undo copy");
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, b"original");
+    assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), object).await, versions_before + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state object-version integration test: runs serialized in the CI ILM Integration (serial) lane"]
+async fn undo_delete_only_removes_the_current_matching_delete_marker() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket = format!("test-undo-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let put = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .body(Some(streaming_blob_from_bytes(b"visible again")))
+        .content_length(Some(13))
+        .build()
+        .unwrap();
+    Box::pin(usecase.execute_put_object(&fs, build_request(put, Method::PUT)))
+        .await
+        .expect("object version should be written");
+    let marker = Box::pin(
+        usecase.execute_delete_object(build_request(
+            DeleteObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .build()
+                .unwrap(),
+            Method::DELETE,
+        )),
+    )
+    .await
+    .expect("delete marker should be created")
+    .output
+    .version_id
+    .expect("versioned delete should return the marker version");
+
+    let delete_marker = || {
+        DeleteObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .version_id(Some(marker.clone()))
+            .build()
+            .unwrap()
+    };
+    let mut stale_req = build_request(delete_marker(), Method::DELETE);
+    stale_req.headers.insert(
+        RUSTFS_EXPECTED_CURRENT_VERSION_ID,
+        HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
+    );
+    let err = Box::pin(usecase.execute_delete_object(stale_req))
+        .await
+        .expect_err("mismatched delete marker must fail");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+
+    let mut matching_req = build_request(delete_marker(), Method::DELETE);
+    matching_req
+        .headers
+        .insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&marker).unwrap());
+    Box::pin(usecase.execute_delete_object(matching_req))
+        .await
+        .expect("current matching delete marker should be removed");
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, b"visible again");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore = "global-state object-version integration test: runs serialized in the CI ILM Integration (serial) lane"]
+async fn undo_copy_serializes_a_concurrent_put_until_after_commit() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let bucket = format!("test-undo-race-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "test/object.txt";
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let put = |payload: &'static [u8]| {
+        PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .body(Some(streaming_blob_from_bytes(payload)))
+            .content_length(Some(payload.len() as i64))
+            .build()
+            .unwrap()
+    };
+    let fs = FS::new();
+    let usecase = DefaultObjectUsecase::from_global();
+    let original = Box::pin(usecase.execute_put_object(&fs, build_request(put(b"original"), Method::PUT)))
+        .await
+        .expect("original should be written")
+        .output
+        .version_id
+        .expect("original should be versioned");
+    let observed = Box::pin(usecase.execute_put_object(&fs, build_request(put(b"observed"), Method::PUT)))
+        .await
+        .expect("observed should be written")
+        .output
+        .version_id
+        .expect("observed should be versioned");
+    let encoded_object = encode_dir_object(object);
+    let lock = ecstore
+        .new_ns_lock(bucket.as_str(), &encoded_object)
+        .await
+        .expect("namespace lock should be available");
+    let blocker = lock
+        .get_write_lock(Duration::from_secs(10))
+        .await
+        .expect("test should acquire blocker");
+
+    let mut undo_req = build_request(
+        CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: object.to_string().into(),
+                version_id: Some(original.into()),
+            })
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+    undo_req
+        .headers
+        .insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&observed).unwrap());
+
+    let undo = tokio::spawn(async move {
+        let usecase = DefaultObjectUsecase::from_global();
+        Box::pin(usecase.execute_copy_object(undo_req)).await
+    });
+    tokio::task::yield_now().await;
+    let put = PutObjectInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .body(Some(streaming_blob_from_bytes(b"concurrent")))
+        .content_length(Some(10))
+        .build()
+        .unwrap();
+    let concurrent_put = tokio::spawn(async move {
+        let fs = FS::new();
+        let usecase = DefaultObjectUsecase::from_global();
+        Box::pin(usecase.execute_put_object(&fs, build_request(put, Method::PUT))).await
+    });
+
+    drop(blocker);
+    let undo_result = undo.await.expect("undo task should not panic");
+    let put_result = concurrent_put.await.expect("PUT task should not panic");
+    assert!(put_result.is_ok(), "ordinary PUT should eventually succeed: {put_result:?}");
+    if let Err(err) = undo_result {
+        assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
+    }
+    assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, b"concurrent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explicit_overwrite() {
     let (_disk_paths, ecstore) = setup_test_env().await;
@@ -836,9 +1060,13 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .build()
         .unwrap();
 
-    Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
+    let complete_output = Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
         .await
         .expect("Failed to complete multipart upload through usecase");
+    assert!(
+        complete_output.output.version_id.is_some(),
+        "versioned CompleteMultipartUpload should return the created version ID"
+    );
 
     let info = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
@@ -2083,5 +2311,80 @@ async fn put_object_computes_replication_decision_exactly_once() {
         calls, 1,
         "a single PUT must compute the replication decision exactly once; reverting to a \
          pre-commit + post-commit recompute makes this observe 2 (rustfs/backlog#1320)"
+    );
+}
+
+/// The object-lock handlers do not go through the object PUT path, so they must schedule
+/// replication themselves. Without it a retention or legal hold applied after upload stays
+/// local and the replica keeps its previous, unprotected state (a WORM object that is still
+/// deletable on the peer). This observes the shared decision counter: each handler must
+/// compute a replication decision exactly once, which is the step that drives both the
+/// persisted pending marker and the schedule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state usecase integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn object_lock_handlers_schedule_replication() {
+    use super::storage_api::object_usecase::bucket::replication::MUST_REPLICATE_OBJECT_CALLS;
+    use s3s::S3;
+    use std::sync::atomic::Ordering;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let fs = FS::new();
+
+    let bucket = format!("test-lock-repl-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let object = "locked/object.txt";
+
+    (*ecstore)
+        .make_bucket(
+            bucket.as_str(),
+            &MakeBucketOptions {
+                lock_enabled: true,
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to create object-lock bucket");
+    upload_test_object(&ecstore, bucket.as_str(), object, b"worm payload").await;
+
+    // PutObjectRetention must compute a replication decision.
+    MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
+    let retention_input = PutObjectRetentionInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .retention(Some(ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(time::macros::datetime!(2030-01-01 00:00:00 UTC).into()),
+        }))
+        .build()
+        .unwrap();
+    fs.put_object_retention(build_request(retention_input, Method::PUT))
+        .await
+        .expect("put_object_retention should succeed");
+    assert_eq!(
+        MUST_REPLICATE_OBJECT_CALLS.load(Ordering::SeqCst),
+        1,
+        "PutObjectRetention must compute the replication decision exactly once; 0 means the \
+         retention change never replicates and the peer copy stays unprotected"
+    );
+
+    // PutObjectLegalHold must do the same.
+    MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
+    let legal_hold_input = PutObjectLegalHoldInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .legal_hold(Some(ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
+        }))
+        .build()
+        .unwrap();
+    fs.put_object_legal_hold(build_request(legal_hold_input, Method::PUT))
+        .await
+        .expect("put_object_legal_hold should succeed");
+    assert_eq!(
+        MUST_REPLICATE_OBJECT_CALLS.load(Ordering::SeqCst),
+        1,
+        "PutObjectLegalHold must compute the replication decision exactly once; 0 means the \
+         legal hold never replicates and the peer copy stays deletable"
     );
 }

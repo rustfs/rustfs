@@ -89,7 +89,10 @@ pub(crate) mod server {
             }
         }
 
-        pub(crate) use crate::storage::storage_api::{EventArgs, StorageObjectInfo, register_event_dispatch_hook};
+        pub(crate) use crate::storage::storage_api::{
+            EventArgs, StorageObjectInfo, read_existing_server_config_no_lock, register_event_dispatch_hook,
+            with_server_config_read_lock,
+        };
     }
 
     pub(crate) mod http {
@@ -103,7 +106,8 @@ pub(crate) mod server {
 
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{
-            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, gen_tonic_signature_headers,
+            Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, gen_signature_headers,
+            gen_tonic_signature_headers,
         };
 
         pub(crate) mod ecfs {
@@ -135,7 +139,7 @@ pub(crate) mod server {
                 heal_topology_fingerprint, make_heal_control_server_for_source,
             };
             pub(crate) use crate::storage::storage_api::tonic_service_consumer::{
-                make_heal_control_server_with_cache, make_server,
+                make_heal_control_server_with_cache, make_server, make_tier_mutation_control_server,
             };
         }
     }
@@ -151,7 +155,10 @@ pub(crate) mod server {
     }
 
     pub(crate) mod module_switch {
-        pub(crate) use crate::storage::storage_api::{Error, read_config, save_config};
+        pub(crate) use crate::storage::storage_api::{
+            Error, read_config, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
+            with_config_object_write_lock,
+        };
     }
 
     pub(crate) mod readiness {
@@ -191,7 +198,8 @@ pub(crate) mod startup {
         }
 
         pub(crate) use crate::storage::storage_api::{
-            ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
+            ECStore, init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata,
+            try_migrate_iam_config,
         };
     }
 

@@ -23,7 +23,7 @@ use rustfs_config::{
     NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_TLS_CA,
     PULSAR_TOPIC, PULSAR_USERNAME,
 };
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::OutboundPolicy;
 use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
@@ -47,16 +47,13 @@ pub(super) fn split_env_field_and_instance(rest: &str, valid_fields: &HashSet<St
         .max_by_key(|(field, _)| field.len())
 }
 
-pub(super) fn is_target_enabled(config: &KVS) -> bool {
-    config
-        .lookup(ENABLE_KEY)
-        .map(|v| {
-            EnableState::from_str(v.as_str())
-                .ok()
-                .map(|s| s.is_enabled())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+pub(super) fn is_target_enabled(config: &KVS) -> Result<bool, TargetError> {
+    let Some(value) = config.lookup(ENABLE_KEY) else {
+        return Ok(false);
+    };
+    EnableState::from_str(value.as_str())
+        .map(EnableState::is_enabled)
+        .map_err(|_| TargetError::Configuration(format!("Invalid {ENABLE_KEY} value '{value}'")))
 }
 
 pub(super) fn parse_target_bool(value: Option<&str>) -> Option<bool> {
@@ -218,16 +215,20 @@ pub(super) fn validate_pulsar_broker_config(broker: &str, config: &KVS, default_
 }
 
 pub(super) fn parse_url(value: &str, field_label: &str) -> Result<Url, TargetError> {
-    Url::parse(value).map_err(|e| TargetError::Configuration(format!("Invalid {field_label}: {e} (value: '{value}')")))
+    Url::parse(value).map_err(|e| TargetError::Configuration(format!("Invalid {field_label}: {e}")))
 }
 
 pub(super) fn validate_outbound_http_url(value: &Url, field_label: &str) -> Result<(), TargetError> {
-    validate_outbound_url(value).map_err(|e| TargetError::Configuration(format!("{field_label} is not allowed: {e}")))
+    let policy =
+        OutboundPolicy::from_env_cached().map_err(|err| TargetError::Configuration(format!("invalid outbound policy: {err}")))?;
+    policy
+        .validate_url(value)
+        .map_err(|e| TargetError::Configuration(format!("{field_label} is not allowed: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_jetstream_enable, validate_nats_server_config, validate_pulsar_broker_config};
+    use super::{parse_jetstream_enable, parse_url, validate_nats_server_config, validate_pulsar_broker_config};
     use async_nats::ServerAddr;
     use rustfs_config::server_config::KVS;
     use rustfs_config::{
@@ -239,6 +240,12 @@ mod tests {
 
     fn nats_server() -> ServerAddr {
         ServerAddr::from_str("nats://127.0.0.1:4222").expect("valid nats address")
+    }
+
+    #[test]
+    fn parse_url_error_does_not_echo_the_configured_value() {
+        let err = parse_url("not a URL containing secret-token", "endpoint URL").expect_err("invalid URL should fail");
+        assert!(!err.to_string().contains("secret-token"));
     }
 
     // Absolute on Linux, macOS, and Windows. temp_dir needs no filesystem to exist for a

@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{error::NotificationError, event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
+use crate::error::NotificationError;
+use crate::{event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
+use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
-use rustfs_targets::{SharedTarget, Target, TargetRuntimeManager};
-use std::sync::Arc;
-use tokio::sync::{RwLock, Semaphore};
+use rustfs_targets::{SharedTarget, TargetRuntimeManager};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
+use tokio::sync::{RwLock, Semaphore, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 const LOG_COMPONENT_NOTIFY: &str = "notify";
@@ -29,7 +34,100 @@ const EVENT_NOTIFY_DISPATCH_STARTED: &str = "notify_dispatch_started";
 const EVENT_NOTIFY_DISPATCH_COMPLETED: &str = "notify_dispatch_completed";
 const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
 
+async fn wait_for_dispatch_tasks(handles: Vec<JoinHandle<()>>) {
+    for handle in handles {
+        if let Err(e) = handle.await {
+            let reason = if e.is_cancelled() { "join_cancelled" } else { "join_panicked" };
+            error!(
+                event = EVENT_NOTIFY_DISPATCH_FAILED,
+                component = LOG_COMPONENT_NOTIFY,
+                subsystem = LOG_SUBSYSTEM_DISPATCH,
+                reason,
+                "Notify dispatch task failed"
+            );
+        }
+    }
+}
+
 pub type SharedNotifyTargetList = Arc<RwLock<TargetList>>;
+
+static TARGET_LIST_DISPATCH_GATES: LazyLock<StdMutex<HashMap<usize, Weak<RwLock<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+pub(crate) fn shared_dispatch_gate(target_list: &SharedNotifyTargetList, preferred: Option<Arc<RwLock<()>>>) -> Arc<RwLock<()>> {
+    let key = Arc::as_ptr(target_list) as usize;
+    let mut gates = TARGET_LIST_DISPATCH_GATES.lock().unwrap_or_else(|err| err.into_inner());
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = preferred.unwrap_or_else(|| Arc::new(RwLock::new(())));
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+
+pub(crate) struct DirectDispatchTracker {
+    cancellation: CancellationToken,
+    inflight: watch::Sender<usize>,
+}
+
+impl DirectDispatchTracker {
+    fn new() -> Self {
+        let (inflight, _) = watch::channel(0);
+        Self {
+            cancellation: CancellationToken::new(),
+            inflight,
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> DirectDispatchLease {
+        self.inflight.send_modify(|count| *count += 1);
+        DirectDispatchLease {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    pub(crate) async fn wait_idle(&self) {
+        let mut inflight = self.inflight.subscribe();
+        while *inflight.borrow_and_update() != 0 {
+            if inflight.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn cancel_pending(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+struct DirectDispatchLease {
+    tracker: Arc<DirectDispatchTracker>,
+}
+
+impl DirectDispatchLease {
+    fn cancellation(&self) -> CancellationToken {
+        self.tracker.cancellation.clone()
+    }
+}
+
+impl Drop for DirectDispatchLease {
+    fn drop(&mut self) {
+        self.tracker.inflight.send_modify(|count| {
+            if let Some(next) = count.checked_sub(1) {
+                *count = next;
+            } else {
+                error!(
+                    event = EVENT_NOTIFY_DISPATCH_FAILED,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_DISPATCH,
+                    reason = "direct_lease_underflow",
+                    "Notify direct dispatch lease accounting underflowed"
+                );
+            }
+        });
+    }
+}
 
 /// Resolves the effective send concurrency (semaphore permit count).
 ///
@@ -63,6 +161,8 @@ fn coerce_send_concurrency(configured: usize) -> usize {
 
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
+    dispatch_gate: Arc<RwLock<()>>,
+    enqueue_limiter: Arc<Semaphore>,
     metrics: Arc<NotificationMetrics>,
     rule_engine: NotifyRuleEngine,
     target_list: SharedNotifyTargetList,
@@ -82,10 +182,14 @@ impl EventNotifier {
     /// Returns a new instance of EventNotifier.
     pub fn new(metrics: Arc<NotificationMetrics>, rule_engine: NotifyRuleEngine) -> Self {
         let max_inflight = resolve_send_concurrency();
+        let target_list = Arc::new(RwLock::new(TargetList::new()));
+        let dispatch_gate = shared_dispatch_gate(&target_list, None);
         EventNotifier {
+            dispatch_gate,
+            enqueue_limiter: Arc::new(Semaphore::new(max_inflight)),
             metrics,
             rule_engine,
-            target_list: Arc::new(RwLock::new(TargetList::new())),
+            target_list,
             send_limiter: Arc::new(Semaphore::new(max_inflight)),
         }
     }
@@ -97,6 +201,10 @@ impl EventNotifier {
     /// Returns an `Arc<RwLock<TargetList>>` representing the target list.
     pub fn target_list(&self) -> SharedNotifyTargetList {
         Arc::clone(&self.target_list)
+    }
+
+    pub(crate) fn dispatch_gate(&self) -> Arc<RwLock<()>> {
+        self.dispatch_gate.clone()
     }
 
     /// Returns a list of ARNs for the registered targets
@@ -115,12 +223,9 @@ impl EventNotifier {
             .collect()
     }
 
-    /// Removes all targets
     pub async fn remove_all_bucket_targets(&self) {
         let mut target_list_guard = self.target_list.write().await;
-        // The logic for sending cancel signals via stream_cancel_senders would be removed.
-        // TargetList::clear_targets_only already handles calling target.close().
-        target_list_guard.clear_targets_only().await; // Modified clear to not re-cancel
+        target_list_guard.clear_targets_only().await;
         info!(
             event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
             component = LOG_COMPONENT_NOTIFY,
@@ -155,7 +260,14 @@ impl EventNotifier {
             return;
         }
         let target_ids_len = target_ids.len();
-        let mut handles = vec![];
+        let mut deferred_handles = Vec::new();
+        let mut direct_handles = Vec::new();
+
+        // A lifecycle writer holds this gate only while handing queue-store
+        // ownership from one runtime generation to the next. Taking the read
+        // guard before cloning targets means the writer both blocks new sends
+        // and drains every save already using the old generation.
+        let dispatch_guard = Arc::new(self.dispatch_gate.clone().read_owned().await);
 
         // Use scope to limit the borrow scope of target_list
         let target_list_guard = self.target_list.read().await;
@@ -185,10 +297,17 @@ impl EventNotifier {
                     );
                     continue;
                 }
-                let limiter = self.send_limiter.clone();
+                let is_deferred = target_for_task.store().is_some();
+                let direct_dispatch_lease = (!is_deferred).then(|| target_list_guard.direct_dispatch_lease());
+                let direct_cancellation = direct_dispatch_lease.as_ref().map(DirectDispatchLease::cancellation);
+                let deferred_dispatch_guard = is_deferred.then(|| Arc::clone(&dispatch_guard));
+                let limiter = if is_deferred {
+                    self.enqueue_limiter.clone()
+                } else {
+                    self.send_limiter.clone()
+                };
                 let metrics = self.metrics.clone();
                 let event_clone = event.clone();
-                let is_deferred = target_for_task.store().is_some();
                 let target_name_for_task = target_for_task.name(); // Get the name before generating the task
                 debug!(
                     event = EVENT_NOTIFY_DISPATCH_STARTED,
@@ -207,9 +326,32 @@ impl EventNotifier {
                     data: event_clone.as_ref().clone(),
                 });
                 let handle = tokio::spawn(async move {
+                    let _direct_dispatch_lease = direct_dispatch_lease;
+                    let _deferred_dispatch_guard = deferred_dispatch_guard;
                     metrics.increment_processing();
-                    let _permit = match limiter.acquire_owned().await {
-                        Ok(p) => p,
+                    let permit = if let Some(cancellation) = direct_cancellation {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => {
+                                metrics.decrement_processing();
+                                metrics.increment_skipped();
+                                debug!(
+                                    event = EVENT_NOTIFY_DISPATCH_SKIPPED,
+                                    component = LOG_COMPONENT_NOTIFY,
+                                    subsystem = LOG_SUBSYSTEM_DISPATCH,
+                                    target_id = %target_name_for_task,
+                                    reason = "runtime_generation_replaced",
+                                    "Skipped pending direct notify dispatch"
+                                );
+                                return;
+                            }
+                            permit = limiter.acquire_owned() => permit,
+                        }
+                    } else {
+                        limiter.acquire_owned().await
+                    };
+                    let _permit = match permit {
+                        Ok(permit) => permit,
                         Err(e) => {
                             error!(
                                 event = EVENT_NOTIFY_DISPATCH_FAILED,
@@ -218,7 +360,7 @@ impl EventNotifier {
                                 target_id = %target_name_for_task,
                                 error = %e,
                                 reason = "permit_acquire_failed",
-                                "Failed to acquire notify send permit"
+                                "Failed to acquire notify dispatch permit"
                             );
                             metrics.increment_failed();
                             return;
@@ -260,7 +402,11 @@ impl EventNotifier {
                         );
                     }
                 });
-                handles.push(handle);
+                if is_deferred {
+                    deferred_handles.push(handle);
+                } else {
+                    direct_handles.push(handle);
+                }
             } else {
                 warn!(
                     event = EVENT_NOTIFY_DISPATCH_FAILED,
@@ -276,19 +422,13 @@ impl EventNotifier {
         // target_list is automatically released here
         drop(target_list_guard);
 
-        // Wait for all tasks to be completed
-        for handle in handles {
-            if let Err(e) = handle.await {
-                error!(
-                    event = EVENT_NOTIFY_DISPATCH_FAILED,
-                    component = LOG_COMPONENT_NOTIFY,
-                    subsystem = LOG_SUBSYSTEM_DISPATCH,
-                    error = %e,
-                    reason = "join_failed",
-                    "Notify dispatch task failed"
-                );
-            }
-        }
+        // Every store-backed save owns a share of the generation guard, so
+        // caller cancellation cannot race lifecycle handoff with an enqueue.
+        // Direct targets own no queue store and may finish against the detached
+        // target while lifecycle progresses.
+        drop(dispatch_guard);
+        wait_for_dispatch_tasks(deferred_handles).await;
+        wait_for_dispatch_tasks(direct_handles).await;
         debug!(
             event = EVENT_NOTIFY_DISPATCH_COMPLETED,
             component = LOG_COMPONENT_NOTIFY,
@@ -320,7 +460,7 @@ impl EventNotifier {
             target_list_guard.add(target)?;
         }
 
-        info!(
+        tracing::info!(
             event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_DISPATCH,
@@ -334,6 +474,7 @@ impl EventNotifier {
 
 /// A thread-safe list of targets
 pub struct TargetList {
+    direct_dispatches: Arc<DirectDispatchTracker>,
     /// Map of TargetID to Target
     runtime: TargetRuntimeManager<Event>,
 }
@@ -348,6 +489,7 @@ impl TargetList {
     /// Creates a new TargetList
     pub fn new() -> Self {
         TargetList {
+            direct_dispatches: Arc::new(DirectDispatchTracker::new()),
             runtime: TargetRuntimeManager::new(),
         }
     }
@@ -435,6 +577,20 @@ impl TargetList {
         self.runtime.status_snapshot(replay_workers)
     }
 
+    fn direct_dispatch_lease(&self) -> DirectDispatchLease {
+        self.direct_dispatches.acquire()
+    }
+
+    pub(crate) fn replace_runtime(
+        &mut self,
+        replacement: TargetRuntimeManager<Event>,
+    ) -> (TargetRuntimeManager<Event>, Arc<DirectDispatchTracker>) {
+        let runtime = std::mem::replace(&mut self.runtime, replacement);
+        let direct_dispatches = std::mem::replace(&mut self.direct_dispatches, Arc::new(DirectDispatchTracker::new()));
+        direct_dispatches.cancel_pending();
+        (runtime, direct_dispatches)
+    }
+
     pub fn runtime_mut(&mut self) -> &mut TargetRuntimeManager<Event> {
         &mut self.runtime
     }
@@ -458,7 +614,7 @@ mod tests {
     use rustfs_s3_types::EventName;
     use rustfs_targets::StoreError;
     use rustfs_targets::{
-        TargetError,
+        ReplayWorkerManager, TargetError,
         store::{Key, QueueStore, Store},
         target::{EntityTarget, QueuedPayload, QueuedPayloadMeta},
     };
@@ -466,6 +622,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use tokio::sync::Notify;
 
     #[tokio::test]
     async fn encoded_event_key_matches_raw_prefix_suffix_filter() {
@@ -525,18 +682,43 @@ mod tests {
 
     #[derive(Clone)]
     struct TestTarget {
+        block_first_save: Option<(Arc<Notify>, Arc<Notify>)>,
+        close_calls: Arc<AtomicUsize>,
+        close_entered: Option<Arc<Notify>>,
         id: TargetID,
         enabled: bool,
         save_calls: Arc<AtomicUsize>,
+        selected_calls: Arc<AtomicUsize>,
+        store: Option<QueueStore<QueuedPayload>>,
     }
 
     impl TestTarget {
         fn new(id: &str, name: &str, enabled: bool) -> Self {
             Self {
+                block_first_save: None,
+                close_calls: Arc::new(AtomicUsize::new(0)),
+                close_entered: None,
                 id: TargetID::new(id.to_string(), name.to_string()),
                 enabled,
                 save_calls: Arc::new(AtomicUsize::new(0)),
+                selected_calls: Arc::new(AtomicUsize::new(0)),
+                store: None,
             }
+        }
+
+        fn with_blocked_first_save(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+            self.block_first_save = Some((entered, release));
+            self
+        }
+
+        fn with_store(mut self, store: QueueStore<QueuedPayload>) -> Self {
+            self.store = Some(store);
+            self
+        }
+
+        fn with_close_observer(mut self, close_entered: Arc<Notify>) -> Self {
+            self.close_entered = Some(close_entered);
+            self
         }
     }
 
@@ -554,7 +736,13 @@ mod tests {
         }
 
         async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            self.save_calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.save_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0
+                && let Some((entered, release)) = &self.block_first_save
+            {
+                entered.notify_one();
+                release.notified().await;
+            }
             Ok(())
         }
 
@@ -563,11 +751,17 @@ mod tests {
         }
 
         async fn close(&self) -> Result<(), TargetError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(close_entered) = &self.close_entered {
+                close_entered.notify_one();
+            }
             Ok(())
         }
 
         fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
+            self.store
+                .as_ref()
+                .map(|store| store as &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync))
         }
 
         fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
@@ -580,8 +774,423 @@ mod tests {
         }
 
         fn is_enabled(&self) -> bool {
+            self.selected_calls.fetch_add(1, Ordering::SeqCst);
             self.enabled
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_pause_drains_entered_deferred_dispatch_and_blocks_new_dispatch() {
+        let metrics = Arc::new(NotificationMetrics::new());
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
+        let save_entered = Arc::new(Notify::new());
+        let save_release = Arc::new(Notify::new());
+        let queue_dir = tempfile::tempdir().expect("queue tempdir should be created");
+        let target = TestTarget::new("gated-target", "webhook", true)
+            .with_blocked_first_save(save_entered.clone(), save_release.clone())
+            .with_store(QueueStore::new(queue_dir.path(), 16, ".event"));
+
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
+        notifier
+            .target_list()
+            .write()
+            .await
+            .add(Arc::new(target.clone()))
+            .expect("target install should succeed");
+
+        let facade = crate::runtime_facade::NotifyRuntimeFacade::new_with_dispatch_gate(
+            notifier.target_list(),
+            Arc::new(RwLock::new(ReplayWorkerManager::new())),
+            notifier.dispatch_gate(),
+            Arc::new(Semaphore::new(1)),
+            metrics,
+        );
+        let first_dispatch = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("bucket", "first", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        save_entered.notified().await;
+        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+
+        let mut pause = Box::pin(facade.pause_dispatch());
+        tokio::select! {
+            biased;
+            _ = &mut pause => panic!("lifecycle pause crossed an in-flight dispatch"),
+            _ = std::future::ready(()) => {}
+        }
+
+        save_release.notify_one();
+        first_dispatch.await.expect("first dispatch task should finish");
+        let pause_guard = pause.await;
+
+        let replacement = TestTarget::new("gated-target", "webhook", true);
+        {
+            let target_list = notifier.target_list();
+            let mut target_list = target_list.write().await;
+            target_list.clear();
+            target_list
+                .add(Arc::new(replacement.clone()))
+                .expect("replacement target install should succeed");
+        }
+
+        let mut second_dispatch =
+            Box::pin(notifier.send(Arc::new(Event::new_test_event("bucket", "second", EventName::ObjectCreatedPut))));
+        tokio::select! {
+            biased;
+            _ = &mut second_dispatch => panic!("dispatch crossed the lifecycle pause"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(
+            replacement.selected_calls.load(Ordering::SeqCst),
+            0,
+            "a paused dispatch must not select a target from the replacement generation early"
+        );
+        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement.save_calls.load(Ordering::SeqCst), 0);
+
+        drop(pause_guard);
+        second_dispatch.await;
+        assert_eq!(target.selected_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement.selected_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement.save_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_pause_does_not_wait_for_direct_network_dispatch() {
+        let metrics = Arc::new(NotificationMetrics::new());
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
+        let save_entered = Arc::new(Notify::new());
+        let save_release = Arc::new(Notify::new());
+        let target =
+            TestTarget::new("direct-target", "webhook", true).with_blocked_first_save(save_entered.clone(), save_release.clone());
+
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
+        notifier
+            .target_list()
+            .write()
+            .await
+            .add(Arc::new(target))
+            .expect("target install should succeed");
+
+        let facade = crate::runtime_facade::NotifyRuntimeFacade::new_with_dispatch_gate(
+            notifier.target_list(),
+            Arc::new(RwLock::new(ReplayWorkerManager::new())),
+            notifier.dispatch_gate(),
+            Arc::new(Semaphore::new(1)),
+            metrics,
+        );
+        let dispatch = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("bucket", "object", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        save_entered.notified().await;
+
+        let mut pause = Box::pin(facade.pause_dispatch());
+        let pause_guard = tokio::select! {
+            biased;
+            guard = &mut pause => guard,
+            _ = std::future::ready(()) => panic!("a direct network send blocked lifecycle handoff"),
+        };
+        drop(pause_guard);
+        save_release.notify_one();
+        dispatch.await.expect("direct dispatch should finish after release");
+    }
+
+    #[tokio::test]
+    async fn replacement_cancels_permit_waiting_direct_dispatch_before_closing_target() {
+        let metrics = Arc::new(NotificationMetrics::new());
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier {
+            send_limiter: Arc::new(Semaphore::new(1)),
+            ..EventNotifier::new(metrics.clone(), rule_engine.clone())
+        });
+        let first_entered = Arc::new(Notify::new());
+        let first_release = Arc::new(Notify::new());
+        let close_entered = Arc::new(Notify::new());
+        let target = TestTarget::new("direct-target", "webhook", true)
+            .with_blocked_first_save(first_entered.clone(), first_release.clone())
+            .with_close_observer(close_entered);
+
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
+        notifier
+            .target_list()
+            .write()
+            .await
+            .add(Arc::new(target.clone()))
+            .expect("target should install");
+
+        let facade = crate::runtime_facade::NotifyRuntimeFacade::new_with_dispatch_gate(
+            notifier.target_list(),
+            Arc::new(RwLock::new(ReplayWorkerManager::new())),
+            notifier.dispatch_gate(),
+            Arc::new(Semaphore::new(1)),
+            metrics.clone(),
+        );
+        let first = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("bucket", "first", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        first_entered.notified().await;
+
+        // This task selects the old generation and acquires its lease before
+        // waiting for the saturated direct-send permit.
+        let second = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("bucket", "second", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while target.selected_calls.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both direct sends should select the old generation");
+
+        let activation = facade.activate_targets_with_replay(Vec::new()).await;
+        let mut replace = Box::pin(facade.replace_targets(activation));
+        tokio::select! {
+            biased;
+            result = &mut replace => panic!("replacement closed a generation with selected direct sends: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(target.close_calls.load(Ordering::SeqCst), 0);
+
+        first_release.notify_one();
+        first.await.expect("first direct dispatch should finish");
+        second.await.expect("permit-waiting direct dispatch should be cancelled");
+        replace.await.expect("replacement should close after direct leases drain");
+        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.processing_count(), 0);
+        assert_eq!(metrics.processed_count(), 1);
+        assert_eq!(metrics.skipped_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn caller_abort_does_not_release_deferred_generation_lease() {
+        let metrics = Arc::new(NotificationMetrics::new());
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
+        let save_entered = Arc::new(Notify::new());
+        let save_release = Arc::new(Notify::new());
+        let queue_dir = tempfile::tempdir().expect("queue tempdir should be created");
+        let target = TestTarget::new("deferred", "webhook", true)
+            .with_blocked_first_save(save_entered.clone(), save_release.clone())
+            .with_store(QueueStore::new(queue_dir.path(), 16, ".event"));
+
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
+        notifier
+            .target_list()
+            .write()
+            .await
+            .add(Arc::new(target))
+            .expect("target should install");
+        let facade = crate::runtime_facade::NotifyRuntimeFacade::new_with_dispatch_gate(
+            notifier.target_list(),
+            Arc::new(RwLock::new(ReplayWorkerManager::new())),
+            notifier.dispatch_gate(),
+            Arc::new(Semaphore::new(1)),
+            metrics,
+        );
+
+        let dispatch = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("bucket", "object", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        save_entered.notified().await;
+        dispatch.abort();
+        let _ = dispatch.await;
+
+        let mut pause = Box::pin(facade.pause_dispatch());
+        tokio::select! {
+            biased;
+            _ = &mut pause => panic!("caller abort released the deferred generation lease"),
+            _ = std::future::ready(()) => {}
+        }
+        save_release.notify_one();
+        let pause_guard = pause.await;
+        drop(pause_guard);
+    }
+
+    #[tokio::test]
+    async fn deferred_enqueue_concurrency_is_bounded() {
+        const LIMIT: usize = 2;
+        const TARGETS: usize = 3;
+
+        let metrics = Arc::new(NotificationMetrics::new());
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier {
+            enqueue_limiter: Arc::new(Semaphore::new(LIMIT)),
+            ..EventNotifier::new(metrics, rule_engine.clone())
+        });
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let queue_dir = tempfile::tempdir().expect("queue tempdir should be created");
+        let mut targets = Vec::new();
+        let mut rules_map = RulesMap::new();
+        for index in 0..TARGETS {
+            let target = TestTarget::new(&format!("deferred-{index}"), "webhook", true)
+                .with_blocked_first_save(entered.clone(), release.clone())
+                .with_store(QueueStore::new(queue_dir.path().join(index.to_string()), 16, ".event"));
+            rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+            notifier
+                .target_list()
+                .write()
+                .await
+                .add(Arc::new(target.clone()))
+                .expect("target should install");
+            targets.push(target);
+        }
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
+
+        let dispatch = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("bucket", "object", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        let total_calls = || {
+            targets
+                .iter()
+                .map(|target| target.save_calls.load(Ordering::SeqCst))
+                .sum::<usize>()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while total_calls() != LIMIT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the configured number of enqueues should enter");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(total_calls(), LIMIT, "enqueue concurrency exceeded its semaphore capacity");
+
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while total_calls() != TARGETS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the waiting enqueue should enter after a permit is released");
+        release.notify_waiters();
+        dispatch.await.expect("all bounded enqueues should finish");
+    }
+
+    #[tokio::test]
+    async fn deferred_enqueue_does_not_wait_for_a_blocked_direct_send_permit() {
+        let metrics = Arc::new(NotificationMetrics::new());
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = Arc::new(EventNotifier {
+            send_limiter: Arc::new(Semaphore::new(1)),
+            ..EventNotifier::new(metrics.clone(), rule_engine.clone())
+        });
+        let direct_entered = Arc::new(Notify::new());
+        let direct_release = Arc::new(Notify::new());
+        let direct =
+            TestTarget::new("direct", "webhook", true).with_blocked_first_save(direct_entered.clone(), direct_release.clone());
+        let deferred_entered = Arc::new(Notify::new());
+        let deferred_release = Arc::new(Notify::new());
+        let queue_dir = tempfile::tempdir().expect("queue tempdir should be created");
+        let deferred = TestTarget::new("deferred", "webhook", true)
+            .with_blocked_first_save(deferred_entered.clone(), deferred_release.clone())
+            .with_store(QueueStore::new(queue_dir.path(), 16, ".event"));
+
+        let mut direct_rules = RulesMap::new();
+        direct_rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), direct.id.clone());
+        rule_engine.set_bucket_rules("direct-bucket", direct_rules).await;
+        let mut deferred_rules = RulesMap::new();
+        deferred_rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), deferred.id.clone());
+        rule_engine.set_bucket_rules("deferred-bucket", deferred_rules).await;
+        {
+            let target_list = notifier.target_list();
+            let mut target_list = target_list.write().await;
+            target_list.add(Arc::new(direct)).expect("direct target should install");
+            target_list.add(Arc::new(deferred)).expect("deferred target should install");
+        }
+
+        let facade = crate::runtime_facade::NotifyRuntimeFacade::new_with_dispatch_gate(
+            notifier.target_list(),
+            Arc::new(RwLock::new(ReplayWorkerManager::new())),
+            notifier.dispatch_gate(),
+            Arc::new(Semaphore::new(1)),
+            metrics,
+        );
+        let direct_dispatch = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("direct-bucket", "object", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        direct_entered.notified().await;
+        let deferred_dispatch = tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                notifier
+                    .send(Arc::new(Event::new_test_event("deferred-bucket", "object", EventName::ObjectCreatedPut)))
+                    .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), deferred_entered.notified())
+            .await
+            .expect("queue persistence must not wait behind a direct network send permit");
+
+        let mut pause = Box::pin(facade.pause_dispatch());
+        tokio::select! {
+            biased;
+            _ = &mut pause => panic!("lifecycle pause crossed the blocked deferred enqueue"),
+            _ = std::future::ready(()) => {}
+        }
+        deferred_release.notify_one();
+        deferred_dispatch
+            .await
+            .expect("deferred dispatch should finish after release");
+        let pause_guard = tokio::select! {
+            biased;
+            guard = &mut pause => guard,
+            _ = std::future::ready(()) => panic!("direct network delivery kept the lifecycle gate locked"),
+        };
+        drop(pause_guard);
+
+        direct_release.notify_one();
+        direct_dispatch.await.expect("direct dispatch should finish after release");
     }
 
     #[tokio::test]

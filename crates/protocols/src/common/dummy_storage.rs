@@ -217,6 +217,15 @@ pub struct DummyBackend {
     inner: Mutex<Inner>,
 }
 
+// Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
+// instantiated with this double otherwise. The queues themselves are not worth
+// rendering, and locking to print them would risk deadlocking a failing test.
+impl std::fmt::Debug for DummyBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DummyBackend").finish_non_exhaustive()
+    }
+}
+
 impl Default for DummyBackend {
     fn default() -> Self {
         Self::new()
@@ -261,6 +270,18 @@ impl DummyBackend {
             .expect("lock")
             .put_object
             .push_back(Ok(PutObjectOutput::default()));
+    }
+
+    /// Queue a successful create_bucket. Authorization tests use this to tell
+    /// "denied before the backend" apart from "backend refused": an unqueued
+    /// create_bucket returns `Unconfigured`, so only a queued success proves the
+    /// driver reached the backend.
+    pub fn queue_create_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .create_bucket
+            .push_back(Ok(CreateBucketOutput::default()));
     }
 
     /// Queue a put_object error. Used by the commit_write retry tests

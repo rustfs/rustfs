@@ -149,6 +149,16 @@ export RUSTFS_IDENTITY_OPENID_EMAIL_CLAIM="email"
 export RUSTFS_IDENTITY_OPENID_USERNAME_CLAIM="preferred_username"
 ```
 
+If RustFS reaches Keycloak through an internal URL while tokens use a public issuer, configure both values:
+
+```bash
+export RUSTFS_IDENTITY_OPENID_CONFIG_URL="http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs/.well-known/openid-configuration"
+export RUSTFS_IDENTITY_OPENID_ISSUER="https://keycloak.example.com/realms/rustfs"
+```
+
+Discovery and issuer-relative JWKS requests use the internal `CONFIG_URL` base. ID token issuer validation still uses `ISSUER`.
+Use HTTPS with a trusted CA for the internal URL whenever possible. Discovery and JWKS define the token-signing trust root; use HTTP only on a network where DNS and traffic cannot be tampered with, because a compromised response can authorize forged tokens.
+
 For short-lived connectivity testing only, you may temporarily add:
 
 ```bash
@@ -234,7 +244,7 @@ curl -fsS "https://keycloak.example.com/realms/rustfs/.well-known/openid-configu
 
 Check that:
 
-- `issuer` equals `RUSTFS_IDENTITY_OPENID_CONFIG_URL`
+- `issuer` equals `RUSTFS_IDENTITY_OPENID_ISSUER` when set; otherwise it matches the issuer derived from `RUSTFS_IDENTITY_OPENID_CONFIG_URL`
 - `authorization_endpoint`, `token_endpoint`, and `jwks_uri` are present
 - `code_challenge_methods_supported` includes `S256`
 - the token endpoint accepts client secret authentication compatible with request-body submission

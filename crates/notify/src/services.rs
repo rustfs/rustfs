@@ -57,7 +57,13 @@ impl NotifyServices {
         live_event_history: Arc<RwLock<LiveEventHistory>>,
     ) -> Self {
         let runtime_view = NotifyRuntimeView::new(target_list.clone(), stream_cancellers.clone());
-        let runtime_facade = NotifyRuntimeFacade::new(target_list, stream_cancellers, concurrency_limiter, metrics.clone());
+        let runtime_facade = NotifyRuntimeFacade::new_with_dispatch_gate(
+            target_list,
+            stream_cancellers,
+            notifier.dispatch_gate(),
+            concurrency_limiter,
+            metrics.clone(),
+        );
         let config_manager = NotifyConfigManager::new(config, registry, rule_engine.clone(), runtime_facade.clone());
         let bucket_config_manager = NotifyBucketConfigManager::new(notifier.clone(), rule_engine, subscriber_view);
         let pipeline = NotifyPipeline::new(notifier, live_event_sender, live_event_history);

@@ -30,9 +30,11 @@ sftp = []
 
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-credentials.workspace = true
 rustfs-ecstore.workspace = true
 rustfs-data-usage.workspace = true
 rustfs-rio.workspace = true
+rustfs-utils = { workspace = true, features = ["egress"] }
 flatbuffers.workspace = true
 futures.workspace = true
 rustfs-lock.workspace = true
@@ -68,6 +70,8 @@ base64 = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 md5 = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost.workspace = true
 sha2 = { workspace = true }
 astral-tokio-tar = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }

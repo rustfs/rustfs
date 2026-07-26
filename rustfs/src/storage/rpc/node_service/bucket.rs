@@ -103,17 +103,20 @@ impl NodeService {
         debug!("delete bucket");
 
         let request = request.into_inner();
-        match self
-            .local_peer
-            .delete_bucket(
-                &request.bucket,
-                &DeleteBucketOptions {
-                    force: false,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
+        let options = if request.options.is_empty() {
+            DeleteBucketOptions::default()
+        } else {
+            match serde_json::from_str::<DeleteBucketOptions>(&request.options) {
+                Ok(options) => options,
+                Err(err) => {
+                    return Ok(Response::new(DeleteBucketResponse {
+                        success: false,
+                        error: Some(DiskError::other(format!("decode DeleteBucketOptions failed: {err}")).into()),
+                    }));
+                }
+            }
+        };
+        match self.local_peer.delete_bucket(&request.bucket, &options).await {
             Ok(_) => Ok(Response::new(DeleteBucketResponse {
                 success: true,
                 error: None,

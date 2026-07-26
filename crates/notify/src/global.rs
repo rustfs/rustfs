@@ -14,38 +14,86 @@
 
 use crate::{
     BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationMetricSnapshot,
-    NotificationSystem, NotificationTargetMetricSnapshot,
+    NotificationSystem, NotificationTargetMetricSnapshot, error::transition_join_error,
 };
 use rustfs_config::server_config::Config;
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use tracing::error;
 
 static NOTIFICATION_SYSTEM: OnceLock<Arc<NotificationSystem>> = OnceLock::new();
+static LEGACY_INITIALIZATION: LazyLock<Mutex<Option<LegacyInitialization>>> = LazyLock::new(|| Mutex::new(None));
+
+enum LegacyInitialization {
+    Initializing(Weak<NotificationSystem>),
+    Retryable(Weak<NotificationSystem>),
+    Initialized,
+}
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_GLOBAL: &str = "global";
 const EVENT_NOTIFY_GLOBAL_STATE: &str = "notify_global_state";
 
-/// Initialize the global notification system with the given configuration.
-/// This function should only be called once throughout the application life cycle.
-pub async fn initialize(config: Config) -> Result<(), NotificationError> {
-    // `new` is synchronous and responsible for creating instances
-    let system = NotificationSystem::new(config);
-    // `init` is asynchronous and responsible for performing I/O-intensive initialization
-    system.init().await?;
+fn notification_system_or_init(config: Config) -> Arc<NotificationSystem> {
+    NOTIFICATION_SYSTEM
+        .get_or_init(|| Arc::new(NotificationSystem::new(config)))
+        .clone()
+}
 
-    match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
-        Ok(_) => Ok(()),
-        Err(losing_system) => {
-            // Another initializer won the race. `init()` above already started this
-            // system's targets and replay workers, so simply dropping it would leak
-            // those background tasks. Shut the losing instance down cleanly before
-            // reporting the conflict (backlog#984).
-            losing_system.shutdown().await;
-            Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized))
+/// Initialize the global notification system with the given configuration.
+///
+/// This preserves the historical one-shot API contract. Server lifecycle code
+/// that needs idempotent reconciliation should use [`reconcile`] instead.
+pub async fn initialize(config: Config) -> Result<(), NotificationError> {
+    let system = {
+        let mut legacy = LEGACY_INITIALIZATION.lock().unwrap_or_else(|err| err.into_inner());
+        match legacy.as_ref() {
+            Some(LegacyInitialization::Retryable(system)) => {
+                let Some(system) = system.upgrade() else {
+                    return Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized));
+                };
+                if !NOTIFICATION_SYSTEM.get().is_some_and(|global| Arc::ptr_eq(global, &system)) {
+                    return Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized));
+                }
+                *legacy = Some(LegacyInitialization::Initializing(Arc::downgrade(&system)));
+                system
+            }
+            Some(LegacyInitialization::Initializing(_)) | Some(LegacyInitialization::Initialized) => {
+                return Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized));
+            }
+            None => {
+                if NOTIFICATION_SYSTEM.get().is_some() {
+                    return Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized));
+                }
+                let system = Arc::new(NotificationSystem::new(config.clone()));
+                if NOTIFICATION_SYSTEM.set(system.clone()).is_err() {
+                    return Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized));
+                }
+                *legacy = Some(LegacyInitialization::Initializing(Arc::downgrade(&system)));
+                system
+            }
         }
-    }
+    };
+
+    let task_system = system.clone();
+    tokio::spawn(async move {
+        let result = task_system.set_targets_enabled(true, Some(config)).await;
+        let mut legacy = LEGACY_INITIALIZATION.lock().unwrap_or_else(|err| err.into_inner());
+        if matches!(
+            legacy.as_ref(),
+            Some(LegacyInitialization::Initializing(current))
+                if current.upgrade().is_some_and(|current| Arc::ptr_eq(&current, &task_system))
+        ) {
+            *legacy = Some(if result.is_ok() {
+                LegacyInitialization::Initialized
+            } else {
+                LegacyInitialization::Retryable(Arc::downgrade(&task_system))
+            });
+        }
+        result
+    })
+    .await
+    .map_err(transition_join_error)?
 }
 
 /// Initialize the global notification system only for live in-process consumers.
@@ -54,12 +102,24 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
 /// ListenBucketNotification clients can receive live events even when external
 /// notification targets are disabled.
 pub fn initialize_live_events() -> Result<(), NotificationError> {
-    let system = NotificationSystem::new(Config::new());
-
-    match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
-        Ok(_) => Ok(()),
-        Err(_) => Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized)),
+    if NOTIFICATION_SYSTEM
+        .set(Arc::new(NotificationSystem::new(Config::new())))
+        .is_err()
+    {
+        return Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized));
     }
+    Ok(())
+}
+
+/// Ensures the stable process-wide live-event container exists.
+pub fn ensure_live_events() -> Arc<NotificationSystem> {
+    notification_system_or_init(Config::new())
+}
+
+/// Ensures the stable singleton exists and reconciles its target runtime.
+pub async fn reconcile(config: Config) -> Result<(), NotificationError> {
+    let system = notification_system_or_init(config.clone());
+    system.set_targets_enabled(true, Some(config)).await
 }
 
 /// Returns a handle to the global NotificationSystem instance.

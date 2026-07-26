@@ -21,6 +21,12 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Avoid redundant file reads, repeated commands, and unnecessary exploratory work once enough context is available.
 - A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification that survives Adversarial Validation (below).
 
+## Autonomy and Approval Boundaries
+
+- Inquiry tasks (answer, explain, review, diagnose, plan): report findings; do not change files unless a fix is explicitly requested.
+- Action tasks (change, build, fix): make in-scope local changes without asking for approval.
+- Ask for confirmation before destructive or hard-to-reverse operations (force-pushes, history rewrites, deleting data or branches), merging a PR (reviewer approval required), or any material expansion of the requested scope.
+
 ## Communication and Language
 
 - Respond in the same language used by the requester.

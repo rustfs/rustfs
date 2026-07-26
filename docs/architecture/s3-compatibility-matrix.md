@@ -38,6 +38,7 @@ The implemented test list currently covers the common object-storage surface:
 |---|---|---|
 | Bucket create/delete/list/head | Supported | `implemented_tests.txt` |
 | Object put/get/delete/copy/head | Supported | `implemented_tests.txt` |
+| CopyObject checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256, MD5, SHA512, XXHASH3, XXHASH64, XXHASH128), including source preservation and explicit override | Supported in the first RustFS release containing this change | `crates/e2e_test/src/copy_object_checksum_test.rs` |
 | ListObjects/ListObjectsV2 prefix, delimiter, marker, max-keys | Supported | `implemented_tests.txt` |
 | Multipart upload create/upload/complete/abort and selected multipart copy/checksum/object-attribute behavior | Supported | `implemented_tests.txt` |
 | Bucket and object tagging | Supported | `implemented_tests.txt` |

@@ -210,10 +210,12 @@ pub use io_metrics::{
     record_io_scheduler_decision, record_load_level_change, record_queue_operation, record_starvation_event,
 };
 pub use list_objects_metrics::{
-    LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
-    ListObjectsGatherObservation, ListObjectsIndexPageObservation, init_list_objects_metrics, record_list_objects_gather,
-    record_list_objects_index_attempt, record_list_objects_index_fallback, record_list_objects_index_live_verify_failure,
-    record_list_objects_index_served, record_list_objects_merge,
+    LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED,
+    LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_ERROR, LIST_OBJECTS_LOCAL_READ_DIR_OUTCOME_OK, LIST_OBJECTS_SOURCE_WALKER,
+    ListObjectsGatherObservation, ListObjectsIndexPageObservation, ListObjectsLocalReadDirObservation, init_list_objects_metrics,
+    record_list_objects_gather, record_list_objects_index_attempt, record_list_objects_index_fallback,
+    record_list_objects_index_live_verify_failure, record_list_objects_index_served, record_list_objects_local_read_dir,
+    record_list_objects_merge,
 };
 
 // Backpressure metrics exports
@@ -874,6 +876,19 @@ pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
         return;
     }
     counter!("rustfs_io_get_object_codec_streaming_fallback_total", "reason" => reason).increment(1);
+}
+
+/// Record the read path chosen for one encrypted Range GET on the Legacy (rio v1) backend
+/// together with its read amplification — physical ciphertext bytes scheduled for the
+/// erasure layer divided by the plaintext bytes the client requested. Observed at the
+/// ReadPlan decision point (https://github.com/rustfs/backlog/issues/1316 Phase A).
+#[inline(always)]
+pub fn record_get_encrypted_range_read_amplification(path: &'static str, amplification: f64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_encrypted_range_read_path_total", "path" => path).increment(1);
+    histogram!("rustfs_io_get_encrypted_range_read_amplification", "path" => path).record(amplification);
 }
 
 /// Record the final codec-streaming rollout decision for a GET request.

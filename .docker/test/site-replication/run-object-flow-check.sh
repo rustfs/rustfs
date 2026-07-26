@@ -18,6 +18,7 @@ set -eu
 ACCESS_KEY="${RUSTFS_SITE_REPL_ACCESS_KEY:-rustfsadmin}"
 SECRET_KEY="${RUSTFS_SITE_REPL_SECRET_KEY:-rustfsadmin}"
 BUCKET="${RUSTFS_SITE_REPL_FLOW_BUCKET:-site-repl-flow-check}"
+DELETE_BUCKET="${RUSTFS_SITE_REPL_DELETE_BUCKET:-site-repl-delete-$(date +%Y%m%d-%H%M%S)-$$}"
 PREFIX="${RUSTFS_SITE_REPL_FLOW_PREFIX:-flow-$(date +%Y%m%d-%H%M%S)}"
 WAIT_ATTEMPTS="${RUSTFS_SITE_REPL_WAIT_ATTEMPTS:-90}"
 WAIT_SLEEP_SECONDS="${RUSTFS_SITE_REPL_WAIT_SLEEP_SECONDS:-2}"
@@ -85,17 +86,39 @@ wait_for_object() {
 
 wait_for_bucket() {
   site="$1"
+  bucket="${2:-$BUCKET}"
   attempt=1
 
   while [ "$attempt" -le "$WAIT_ATTEMPTS" ]; do
-    if mc stat "$site/$BUCKET" >/dev/null 2>&1; then
+    if mc stat "$site/$bucket" >/dev/null 2>&1; then
       return 0
     fi
     sleep "$WAIT_SLEEP_SECONDS"
     attempt=$((attempt + 1))
   done
 
-  echo "bucket was not replicated in time: $site/$BUCKET" >&2
+  echo "bucket was not replicated in time: $site/$bucket" >&2
+  return 1
+}
+
+wait_for_bucket_delete() {
+  site="$1"
+  bucket="$2"
+  attempt=1
+
+  while [ "$attempt" -le "$WAIT_ATTEMPTS" ]; do
+    if result="$(mc stat --json "$site/$bucket" 2>&1)"; then
+      :
+    else
+      case "$result" in
+        *NoSuchBucket*) return 0 ;;
+      esac
+    fi
+    sleep "$WAIT_SLEEP_SECONDS"
+    attempt=$((attempt + 1))
+  done
+
+  echo "bucket deletion was not replicated in time: $site/$bucket" >&2
   return 1
 }
 
@@ -184,6 +207,20 @@ EOF
   done
 
   echo "verified replicated downloads for $object_name"
+done
+
+echo "creating empty bucket for replicated delete check: $DELETE_BUCKET"
+mc mb "site1/$DELETE_BUCKET" >/dev/null
+
+for site in site1 site2 site3; do
+  wait_for_bucket "$site" "$DELETE_BUCKET"
+done
+
+echo "deleting empty bucket on site1: $DELETE_BUCKET"
+mc rb "site1/$DELETE_BUCKET" >/dev/null
+
+for site in site1 site2 site3; do
+  wait_for_bucket_delete "$site" "$DELETE_BUCKET"
 done
 
 echo "site replication object flow check passed"

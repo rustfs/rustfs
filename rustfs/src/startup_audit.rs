@@ -20,6 +20,7 @@ use tracing::{error, info};
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
+const EVENT_NOTIFY_SYSTEM_STATE: &str = "notify_system_state";
 
 pub(crate) async fn init_audit_runtime() {
     match init_event_notifier_and_audit().await {
@@ -47,17 +48,28 @@ pub(crate) async fn init_event_notifier_and_audit() -> AuditResult<()> {
     init_event_notifier_and_audit_with(init_event_notifier, start_audit_system).await
 }
 
-async fn init_event_notifier_and_audit_with<NotifyFn, NotifyFuture, AuditFn, AuditFuture>(
+async fn init_event_notifier_and_audit_with<NotifyFn, NotifyFuture, NotifyError, AuditFn, AuditFuture>(
     notify: NotifyFn,
     start_audit: AuditFn,
 ) -> AuditResult<()>
 where
     NotifyFn: FnOnce() -> NotifyFuture,
-    NotifyFuture: Future<Output = ()>,
+    NotifyFuture: Future<Output = Result<(), NotifyError>>,
+    NotifyError: std::fmt::Display,
     AuditFn: FnOnce() -> AuditFuture,
     AuditFuture: Future<Output = AuditResult<()>>,
 {
-    notify().await;
+    if let Err(err) = notify().await {
+        error!(
+            target: "rustfs::main::run",
+            event = EVENT_NOTIFY_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "degraded",
+            error = %err,
+            "Notification runtime failed to start; continuing in degraded mode"
+        );
+    }
     start_audit().await
 }
 
@@ -75,6 +87,7 @@ mod tests {
         let result = init_event_notifier_and_audit_with(
             move || async move {
                 notify_events.lock().unwrap_or_else(|err| err.into_inner()).push("notify");
+                Ok::<(), &'static str>(())
             },
             move || async move {
                 audit_events.lock().unwrap_or_else(|err| err.into_inner()).push("audit");
@@ -97,6 +110,7 @@ mod tests {
         let result = init_event_notifier_and_audit_with(
             move || async move {
                 notify_events.lock().unwrap_or_else(|err| err.into_inner()).push("notify");
+                Ok::<(), &'static str>(())
             },
             move || async move {
                 audit_events.lock().unwrap_or_else(|err| err.into_inner()).push("audit");
@@ -108,5 +122,27 @@ mod tests {
         assert!(result.is_err());
         let events = events.lock().unwrap_or_else(|err| err.into_inner()).clone();
         assert_eq!(events, ["notify", "audit"]);
+    }
+
+    #[tokio::test]
+    async fn notify_failure_still_starts_audit() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify_events = events.clone();
+        let audit_events = events.clone();
+
+        let result = init_event_notifier_and_audit_with(
+            move || async move {
+                notify_events.lock().unwrap_or_else(|err| err.into_inner()).push("notify");
+                Err::<(), &'static str>("notify failed")
+            },
+            move || async move {
+                audit_events.lock().unwrap_or_else(|err| err.into_inner()).push("audit");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*events.lock().unwrap_or_else(|err| err.into_inner()), ["notify", "audit"]);
     }
 }

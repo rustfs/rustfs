@@ -39,6 +39,11 @@ pub const DEFAULT_DRIVE_WALKDIR_TIMEOUT_SECS: u64 = 5;
 pub const ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS: &str = "RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS";
 pub const DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS: u64 = 5;
 
+/// Maximum time the metacache merge consumer waits for the next visible
+/// `walk_dir()` entry from a reader before detaching it from the merge.
+pub const ENV_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS: &str = "RUSTFS_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS";
+pub const DEFAULT_DRIVE_WALKDIR_PEEK_TIMEOUT_SECS: u64 = 10;
+
 /// Interval in seconds between active health probes for local and remote drives.
 pub const ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS: &str = "RUSTFS_DRIVE_ACTIVE_CHECK_INTERVAL_SECS";
 pub const DEFAULT_DRIVE_ACTIVE_CHECK_INTERVAL_SECS: u64 = 15;

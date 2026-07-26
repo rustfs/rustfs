@@ -34,8 +34,8 @@ use crate::diagnostics::get::{
     GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GET_STAGE_READER_SETUP_DROP_PENDING,
     GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM, GET_STAGE_READER_TASK_BITROT_READER_INIT,
     GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION, GetObjectFailureReason, classify_disk_error,
-    get_stage_timer_if_enabled, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
-    record_get_stage_duration_if_enabled,
+    get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
@@ -53,11 +53,41 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
 use super::core::io_primitives::*;
+
+pub(super) struct GetObjectDownstreamWriter<W> {
+    inner: W,
+}
+
+impl<W> GetObjectDownstreamWriter<W> {
+    pub(super) fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner)
+            .poll_write(cx, buf)
+            .map(|result| result.map_err(mark_get_object_downstream_closed))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner)
+            .poll_flush(cx)
+            .map(|result| result.map_err(mark_get_object_downstream_closed))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner)
+            .poll_shutdown(cx)
+            .map(|result| result.map_err(mark_get_object_downstream_closed))
+    }
+}
 
 impl SetDisks {
     async fn get_object_metadata_cache_bypass_reason(
@@ -989,7 +1019,7 @@ impl SetDisks {
                 metrics_size_bucket,
                 decode_elapsed.as_secs_f64(),
             );
-            if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD || err.is_some() {
+            if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD && err.is_none() {
                 warn!(
                     event = EVENT_SET_DISK_READ,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1005,9 +1035,8 @@ impl SetDisks {
                     available_shards,
                     missing_shards,
                     elapsed_ms = decode_elapsed.as_millis(),
-                    error = ?err,
-                    state = if err.is_some() { "decode_failed_or_slow" } else { "decode_slow" },
-                    "Set disk object decode stage is slow or failed"
+                    state = "decode_slow",
+                    "Set disk object decode stage is slow"
                 );
             }
             debug!(
@@ -1050,19 +1079,35 @@ impl SetDisks {
 
                 if has_err {
                     let reason = classify_disk_error(&de_err);
-                    error!(
-                        bucket,
-                        object,
-                        part_index = current_part,
-                        part_number,
-                        part_offset,
-                        part_length,
-                        bytes_written = written,
-                        stage = GET_STAGE_DECODE,
-                        reason = reason.as_str(),
-                        error = ?de_err,
-                        "Erasure decode failed during GetObject"
-                    );
+                    if reason == GetObjectFailureReason::DownstreamClosed {
+                        debug!(
+                            bucket,
+                            object,
+                            part_index = current_part,
+                            part_number,
+                            part_offset,
+                            part_length,
+                            bytes_written = written,
+                            stage = GET_STAGE_DECODE,
+                            reason = reason.as_str(),
+                            error = ?de_err,
+                            "GetObject downstream closed during erasure decode"
+                        );
+                    } else {
+                        error!(
+                            bucket,
+                            object,
+                            part_index = current_part,
+                            part_number,
+                            part_offset,
+                            part_length,
+                            bytes_written = written,
+                            stage = GET_STAGE_DECODE,
+                            reason = reason.as_str(),
+                            error = ?de_err,
+                            "Erasure decode failed during GetObject"
+                        );
+                    }
                     record_get_object_pipeline_failure(GET_STAGE_DECODE, reason);
                     return Err(de_err.into());
                 }
@@ -2904,10 +2949,27 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+
+    #[tokio::test]
+    async fn downstream_writer_marks_closed_duplex_reader_as_downstream_close() {
+        let (reader, inner) = tokio::io::duplex(64);
+        drop(reader);
+        let mut writer = GetObjectDownstreamWriter::new(inner);
+        let err = writer
+            .write_all(b"range payload")
+            .await
+            .expect_err("closed duplex reader must fail the output write");
+
+        assert_eq!(
+            classify_disk_error(&DiskError::from(err)),
+            GetObjectFailureReason::DownstreamClosed,
+            "only the output adapter may classify a broken pipe as a downstream close"
+        );
+    }
 
     async fn local_test_disks(count: usize, bucket: &str) -> (Vec<tempfile::TempDir>, Vec<Option<crate::disk::DiskStore>>) {
         let mut dirs = Vec::with_capacity(count);

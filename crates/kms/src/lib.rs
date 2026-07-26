@@ -78,12 +78,14 @@ pub mod types;
 
 // Re-export public API
 pub use api_types::{
-    CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureVaultKmsRequest,
-    ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest, StartKmsResponse, StopKmsResponse,
-    TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
+    CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureStaticKmsRequest,
+    ConfigureVaultKmsRequest, ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest,
+    StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse,
+    UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
-pub use error::{KmsError, Result};
+pub use encryption::is_data_key_envelope;
+pub use error::{KmsError, KmsUnavailableError, Result};
 pub use manager::KmsManager;
 pub use service::{DataKey, ObjectEncryptionService};
 pub use service_manager::{

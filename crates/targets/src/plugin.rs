@@ -14,8 +14,9 @@
 
 use crate::{
     PluginRuntimeAdapter, RuntimeActivation, Target, TargetError,
-    config::collect_target_configs,
+    config::collect_target_config_results,
     manifest::{TargetPluginManifest, builtin_target_manifest},
+    target::with_deferred_queue_store_open,
 };
 use hashbrown::HashMap;
 use rustfs_config::server_config::{Config, KVS};
@@ -317,39 +318,77 @@ where
         config: &Config,
         route_prefix: &str,
     ) -> Result<Vec<BoxedTarget<E>>, TargetError> {
+        self.create_targets_from_config_with_store_mode(config, route_prefix, false)
+            .await
+            .map(|(targets, _)| targets)
+    }
+
+    /// Creates targets while deferring queue-store open until runtime handoff.
+    /// Unlike the compatibility activation API, lifecycle preparation reports
+    /// any invalid or unconstructable configured instance so the originating
+    /// Admin request cannot report a false success.
+    pub async fn create_dormant_targets_from_config(
+        &self,
+        config: &Config,
+        route_prefix: &str,
+    ) -> Result<(Vec<BoxedTarget<E>>, Vec<String>), TargetError> {
+        self.create_targets_from_config_with_store_mode(config, route_prefix, true)
+            .await
+    }
+
+    async fn create_targets_from_config_with_store_mode(
+        &self,
+        config: &Config,
+        route_prefix: &str,
+        defer_store_open: bool,
+    ) -> Result<(Vec<BoxedTarget<E>>, Vec<String>), TargetError> {
         let mut successful_targets = Vec::new();
-        let mut failed_targets = 0usize;
+        let mut failures = Vec::new();
 
         for (target_type, plugin) in &self.plugins {
             info!(target_type = %target_type, "Start working on target type");
-            for (id, merged_config) in collect_target_configs(config, route_prefix, target_type, plugin.valid_fields_set()) {
+            // Per-instance fault isolation: an invalid instance (e.g. an
+            // unparseable `enable` value) is recorded as a failure and skipped,
+            // never aborting the remaining instances or other target types.
+            let (collected, invalid_instances) =
+                collect_target_config_results(config, route_prefix, target_type, plugin.valid_fields_set());
+            for detail in invalid_instances {
+                error!(target_type = %target_type, reason = "invalid_config", detail = %detail, "Skipping target instance with invalid configuration");
+                failures.push(detail);
+            }
+            for (id, merged_config) in collected {
                 info!(target_type = %target_type, instance_id = %id, "Target is enabled, ready to create");
-                match self.create_target(target_type, id.clone(), &merged_config) {
+                let created = if defer_store_open {
+                    with_deferred_queue_store_open(|| self.create_target(target_type, id.clone(), &merged_config))
+                } else {
+                    self.create_target(target_type, id.clone(), &merged_config)
+                };
+                match created {
                     Ok(target) => {
                         info!(target_type = %target.id().name, instance_id = %id, "Create target successfully");
                         successful_targets.push(target);
                     }
-                    Err(err) => {
-                        failed_targets += 1;
-                        error!(target_type = %target_type, instance_id = %id, error = %err, "Failed to create target");
+                    Err(_) => {
+                        failures.push(format!("{target_type}/{id}: target construction failed"));
+                        error!(target_type = %target_type, instance_id = %id, reason = "construction_failed", "Failed to create target");
                     }
                 }
             }
         }
 
-        if failed_targets > 0 {
+        if !failures.is_empty() {
             warn!(
                 created = successful_targets.len(),
-                failed = failed_targets,
+                failed = failures.len(),
                 "Some configured targets failed to create and were skipped"
             );
         }
         info!(
             count = successful_targets.len(),
-            failed = failed_targets,
+            failed = failures.len(),
             "All target processing completed"
         );
-        Ok(successful_targets)
+        Ok((successful_targets, failures))
     }
 
     pub async fn create_activation_from_config<A>(
@@ -474,5 +513,62 @@ mod tests {
         assert_eq!(activation.targets.len(), 1);
         assert_eq!(activation.targets[0].id().to_string(), "primary:test");
         assert!(activation.replay_workers.is_empty());
+    }
+
+    // Regression: a single instance with a malformed `enable` value must not
+    // abort the remaining instances or unrelated target types. Before this fix
+    // the collector short-circuited the whole create path, so one typo took
+    // down every notify/audit target.
+    #[tokio::test]
+    async fn create_dormant_isolates_invalid_enable_and_still_loads_other_targets() {
+        let mut registry = TargetPluginRegistry::<String>::new();
+        for target_type in ["alpha", "beta"] {
+            registry.register(TargetPluginDescriptor::new(
+                target_type,
+                &[ENABLE_KEY, "endpoint"],
+                |_config| Ok(()),
+                move |id, _config| {
+                    Ok(Box::new(TestTarget {
+                        id: crate::arn::TargetID::new(id, target_type.to_string()),
+                    }))
+                },
+            ));
+        }
+
+        let mut cfg = Config(HashMap::new());
+
+        // alpha: one healthy instance plus one with a malformed `enable` value
+        // ("enable" is a typo -- EnableState accepts "enabled"/"on", not "enable").
+        let mut alpha = HashMap::new();
+        let mut alpha_good = KVS::new();
+        alpha_good.insert(ENABLE_KEY.to_string(), "on".to_string());
+        alpha_good.insert("endpoint".to_string(), "https://example.com/alpha".to_string());
+        alpha.insert("good".to_string(), alpha_good);
+        let mut alpha_bad = KVS::new();
+        alpha_bad.insert(ENABLE_KEY.to_string(), "enable".to_string());
+        alpha.insert("bad".to_string(), alpha_bad);
+        cfg.0.insert("notify_alpha".to_string(), alpha);
+
+        // beta: a healthy instance in a different target type must survive.
+        let mut beta = HashMap::new();
+        let mut beta_primary = KVS::new();
+        beta_primary.insert(ENABLE_KEY.to_string(), "on".to_string());
+        beta_primary.insert("endpoint".to_string(), "https://example.com/beta".to_string());
+        beta.insert("primary".to_string(), beta_primary);
+        cfg.0.insert("notify_beta".to_string(), beta);
+
+        let (targets, failures) = registry
+            .create_dormant_targets_from_config(&cfg, "notify_")
+            .await
+            .expect("a malformed instance must not abort target creation");
+
+        let mut created: Vec<String> = targets.iter().map(|target| target.id().to_string()).collect();
+        created.sort();
+        assert_eq!(created, vec!["good:alpha".to_string(), "primary:beta".to_string()]);
+
+        // The malformed instance is surfaced (so an Admin write can't report a
+        // false success) rather than silently dropped or fatally aborting.
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("alpha/bad"), "unexpected failure summary: {}", failures[0]);
     }
 }

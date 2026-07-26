@@ -881,6 +881,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bitrot_verify_rejects_issue_5173_final_block_hash_mismatch() {
+        let logical_size = 8_250_370usize;
+        let shard_size = 1_048_576usize;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let mut bitrot_writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, algo.clone());
+        let data = vec![0x5a; logical_size];
+        for chunk in data.chunks(shard_size) {
+            bitrot_writer.write(chunk).await.expect("issue 5173 shard should encode");
+        }
+        let mut written = bitrot_writer.into_inner().into_inner();
+
+        assert_eq!(written.len(), 8_250_626);
+        assert_eq!(written.len() - logical_size, 8 * algo.size());
+
+        let last = written.len() - 1;
+        written[last] ^= 0x01;
+        let err = bitrot_verify(
+            Cursor::new(written),
+            bitrot_shard_file_size(logical_size, shard_size, algo.clone()),
+            logical_size,
+            algo,
+            shard_size,
+        )
+        .await
+        .expect_err("final block hash mismatch must be rejected");
+        assert!(err.to_string().contains("hash mismatch"));
+    }
+
+    #[tokio::test]
     async fn write_all_vectored_retries_partial_hash_and_data_writes_and_rejects_zero_write() {
         let mut writer = LimitedVectoredWriter {
             max_write: 2,

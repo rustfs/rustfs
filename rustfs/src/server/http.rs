@@ -57,6 +57,7 @@ use rustfs_keystone::KeystoneAuthLayer;
 use rustfs_protocols::SwiftService;
 use rustfs_protos::proto_gen::node_service::{
     heal_control_service_server::HealControlServiceServer, node_service_server::NodeServiceServer,
+    tier_mutation_control_service_server::TierMutationControlServiceServer,
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -128,6 +129,9 @@ const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
 const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
 const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
 const HEAL_CONTROL_TONIC_RPC_PATH: &str = "/node_service.HealControlService/HealControl";
+const TIER_MUTATION_PREPARE_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/PrepareTierMutation";
+const TIER_MUTATION_COMMIT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/CommitTierMutation";
+const TIER_MUTATION_ABORT_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/AbortTierMutation";
 
 static ACTIVE_HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -1322,7 +1326,19 @@ fn process_connection(
             .max_encoding_message_size(heal_control_max_message_size),
             check_auth,
         );
-        let rpc_service = RpcRequestPathService::new(Routes::new(node_service).add_service(heal_control_service).prepare());
+        let tier_mutation_control_max_message_size = rustfs_protos::TIER_MUTATION_RPC_MAX_MESSAGE_SIZE;
+        let tier_mutation_control_service = InterceptedService::new(
+            TierMutationControlServiceServer::new(storage::tonic_service::make_tier_mutation_control_server())
+                .max_decoding_message_size(tier_mutation_control_max_message_size)
+                .max_encoding_message_size(tier_mutation_control_max_message_size),
+            check_auth,
+        );
+        let rpc_service = RpcRequestPathService::new(
+            Routes::new(node_service)
+                .add_service(heal_control_service)
+                .add_service(tier_mutation_control_service)
+                .prepare(),
+        );
 
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(true, None, s3_service);
@@ -1861,6 +1877,9 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         .strip_prefix(TONIC_RPC_PREFIX)
         .and_then(|suffix| suffix.strip_prefix('/'))
         .or_else(|| (target.uri.path() == HEAL_CONTROL_TONIC_RPC_PATH).then_some("HealControl"))
+        .or_else(|| (target.uri.path() == TIER_MUTATION_PREPARE_TONIC_RPC_PATH).then_some("PrepareTierMutation"))
+        .or_else(|| (target.uri.path() == TIER_MUTATION_COMMIT_TONIC_RPC_PATH).then_some("CommitTierMutation"))
+        .or_else(|| (target.uri.path() == TIER_MUTATION_ABORT_TONIC_RPC_PATH).then_some("AbortTierMutation"))
         .filter(|method| !method.is_empty() && !method.contains('/'))
         .ok_or_else(|| Status::unauthenticated("Invalid RPC request path"))?;
     debug_assert!(!rpc_method.is_empty());
@@ -2279,6 +2298,23 @@ mod tests {
         });
         assert!(check_auth(heal_request).is_ok(), "heal control service path should authenticate");
 
+        let tier_headers = storage::gen_tonic_signature_headers(
+            "127.0.0.1:9000",
+            "node_service.TierMutationControlService",
+            "PrepareTierMutation",
+            None,
+        )
+        .expect("tier mutation auth headers should build");
+        let mut tier_request = Request::new(());
+        tier_request.metadata_mut().as_mut().extend(tier_headers);
+        tier_request.extensions_mut().insert(RpcRequestTarget {
+            uri: TIER_MUTATION_PREPARE_TONIC_RPC_PATH
+                .parse()
+                .expect("tier mutation path should parse"),
+            method: Method::POST,
+        });
+        assert!(check_auth(tier_request).is_ok(), "tier mutation control service path should authenticate");
+
         let replay_headers = storage::gen_tonic_signature_headers("127.0.0.1:9000", "node_service.NodeService", "Ping", None)
             .expect("node service auth headers should build");
         let mut cross_service_replay = Request::new(());
@@ -2290,6 +2326,21 @@ mod tests {
         assert!(
             check_auth(cross_service_replay).is_err(),
             "node service signature must not replay to heal control"
+        );
+
+        let replay_headers = storage::gen_tonic_signature_headers("127.0.0.1:9000", "node_service.NodeService", "Ping", None)
+            .expect("node service auth headers should build");
+        let mut cross_service_replay = Request::new(());
+        cross_service_replay.metadata_mut().as_mut().extend(replay_headers);
+        cross_service_replay.extensions_mut().insert(RpcRequestTarget {
+            uri: TIER_MUTATION_PREPARE_TONIC_RPC_PATH
+                .parse()
+                .expect("tier mutation path should parse"),
+            method: Method::POST,
+        });
+        assert!(
+            check_auth(cross_service_replay).is_err(),
+            "node service signature must not replay to tier mutation control"
         );
 
         rustfs_common::set_global_local_node_name("127.0.0.1:9001").await;
@@ -2314,6 +2365,48 @@ mod tests {
         let error = check_auth(get_request).expect_err("wire GET must not reuse a POST gRPC signature");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(error.message(), "Invalid RPC request method");
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
+    /// Rolling-upgrade compatibility anchor for <https://github.com/rustfs/backlog/issues/1327>:
+    /// a legacy-only peer (constant-target signature, no v2 headers) must keep authenticating
+    /// through the real production path (`check_auth` + `RpcRequestTarget` extension), and every
+    /// such acceptance must increment the v1-fallback convergence counter exactly once. That
+    /// counter reading zero fleet-wide is the precondition for ever enabling
+    /// `RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_accepts_legacy_only_peer_and_counts_v1_fallback() {
+        use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name("127.0.0.1:9000").await;
+
+        // Exactly what an old peer sends on the gRPC plane: the legacy constant-target signature
+        // and timestamp headers, nothing else.
+        let legacy_headers = storage::gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy headers should build");
+        let mut request = Request::new(());
+        request.metadata_mut().as_mut().extend(legacy_headers);
+        request.extensions_mut().insert(RpcRequestTarget {
+            uri: "http://127.0.0.1:9000/node_service.NodeService/Ping"
+                .parse()
+                .expect("test RPC URI should parse"),
+            method: Method::POST,
+        });
+
+        let before = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        assert!(
+            check_auth(request).is_ok(),
+            "a legacy-only peer must keep authenticating during rolling upgrades"
+        );
+        let after = global_internode_metrics().snapshot().signature_v1_fallback_total;
+        assert_eq!(
+            after,
+            before + 1,
+            "an accepted legacy-only request must increment signature_v1_fallback_total exactly once"
+        );
+
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 

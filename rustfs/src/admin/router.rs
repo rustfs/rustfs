@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
-use super::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
@@ -28,8 +27,8 @@ use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::runtime_sources::{
-    ServerContextSlot, current_boot_time, current_bucket_monitor_handle, current_deployment_id, current_notification_system,
-    current_object_store_handle, current_region, current_replication_pool_handle, current_replication_stats_handle,
+    ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
+    current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
     current_server_config, default_object_usecase,
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
@@ -65,7 +64,7 @@ use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy};
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
     SUFFIX_SOURCE_VERSION_ID, get_source_scheme, insert_header,
@@ -197,18 +196,86 @@ struct ReplicationResetStatusTarget {
     error: Option<String>,
 }
 
+const REPLICATION_CHECK_PROBE_PREFIX: &str = ".rustfs.sys/replication-check/";
+const REPLICATION_CHECK_ERROR_MAX_BYTES: usize = 512;
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReplicationCheckResponse {
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "ActiveMutation")]
+    active_mutation: bool,
+    #[serde(rename = "MutationDescription")]
+    mutation_description: &'static str,
+    #[serde(rename = "ProbeNamespace")]
+    probe_namespace: &'static str,
+    #[serde(rename = "Targets")]
+    targets: Vec<ReplicationCheckTargetStatus>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct ReplicationCheckTargetStatus {
     #[serde(rename = "Arn")]
     arn: String,
-    #[serde(rename = "Endpoint")]
-    endpoint: String,
     #[serde(rename = "Bucket")]
     bucket: String,
     #[serde(rename = "Status")]
     status: String,
     #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(rename = "Phases")]
+    phases: ReplicationCheckPhases,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct ReplicationCheckPhases {
+    #[serde(rename = "Bucket")]
+    bucket: ReplicationCheckPhaseStatus,
+    #[serde(rename = "Versioning")]
+    versioning: ReplicationCheckPhaseStatus,
+    #[serde(rename = "ObjectLock")]
+    object_lock: ReplicationCheckPhaseStatus,
+    #[serde(rename = "Put")]
+    put: ReplicationCheckPhaseStatus,
+    #[serde(rename = "DeleteMarker")]
+    delete_marker: ReplicationCheckPhaseStatus,
+    #[serde(rename = "VersionDelete")]
+    version_delete: ReplicationCheckPhaseStatus,
+    #[serde(rename = "Cleanup")]
+    cleanup: ReplicationCheckPhaseStatus,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReplicationCheckPhaseStatus {
+    #[serde(rename = "Status")]
+    status: &'static str,
+    #[serde(rename = "Error", skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl Default for ReplicationCheckPhaseStatus {
+    fn default() -> Self {
+        Self {
+            status: "SKIPPED",
+            error: None,
+        }
+    }
+}
+
+impl ReplicationCheckPhaseStatus {
+    fn passed() -> Self {
+        Self {
+            status: "OK",
+            error: None,
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: "FAILED",
+            error: Some(bound_replication_check_error(error.into())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +296,7 @@ struct ListenNotificationFilter {
     suffix: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ObjectLambdaWebhookConfig {
     endpoint: Url,
     auth_token: String,
@@ -238,6 +305,7 @@ struct ObjectLambdaWebhookConfig {
     client_ca: String,
     skip_tls_verify: bool,
     response_header_timeout: Option<Duration>,
+    outbound_resolver: OutboundDnsResolver,
 }
 
 const LAMBDA_WEBHOOK_SUB_SYS: &str = "lambda_webhook";
@@ -612,7 +680,8 @@ fn resolve_object_lambda_webhook_config_from_server_config(
 
     let parsed_endpoint =
         Url::parse(&endpoint).map_err(|_| s3_error!(InvalidRequest, "object lambda target endpoint is invalid"))?;
-    validate_outbound_url(&parsed_endpoint)
+    let outbound_resolver = outbound_policy()?
+        .resolver_for(&parsed_endpoint)
         .map_err(|err| s3_error!(InvalidRequest, "object lambda target endpoint is not allowed: {}", err))?;
 
     Ok(ObjectLambdaWebhookConfig {
@@ -623,12 +692,13 @@ fn resolve_object_lambda_webhook_config_from_server_config(
         client_ca: kvs.lookup(WEBHOOK_CLIENT_CA).unwrap_or_default(),
         skip_tls_verify: config_enable_is_on(&kvs.lookup(WEBHOOK_SKIP_TLS_VERIFY).unwrap_or_default()),
         response_header_timeout,
+        outbound_resolver,
     })
 }
 
 async fn load_current_server_config() -> S3Result<Config> {
     if let Some(system) = notification_system() {
-        return Ok(system.config.read().await.clone());
+        return Ok(system.config_snapshot().await);
     }
 
     if let Some(store) = current_object_store_handle() {
@@ -658,9 +728,18 @@ async fn resolve_object_lambda_webhook_config(uri: &Uri) -> S3Result<ObjectLambd
 }
 
 fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Result<reqwest::Client> {
-    validate_outbound_url(&config.endpoint)
-        .map_err(|err| s3_error!(InvalidRequest, "object lambda target endpoint is not allowed: {}", err))?;
-    let mut builder = reqwest::Client::builder().user_agent(rustfs_targets::get_user_agent(rustfs_targets::ServiceType::Basis));
+    build_object_lambda_http_client_with_resolver(config, config.outbound_resolver.clone())
+}
+
+fn build_object_lambda_http_client_with_resolver(
+    config: &ObjectLambdaWebhookConfig,
+    resolver: impl reqwest::dns::Resolve + 'static,
+) -> S3Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(resolver)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(rustfs_targets::get_user_agent(rustfs_targets::ServiceType::Basis));
 
     if let Some(timeout) = config.response_header_timeout {
         builder = builder.timeout(timeout);
@@ -672,7 +751,7 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OBJECT_LAMBDA,
             result = "tls_verification_disabled",
-            endpoint = %config.endpoint,
+            endpoint_origin = %config.endpoint.origin().ascii_serialization(),
             "admin router state"
         );
         builder = builder.danger_accept_invalid_certs(true);
@@ -704,6 +783,17 @@ fn build_object_lambda_http_client(config: &ObjectLambdaWebhookConfig) -> S3Resu
     builder
         .build()
         .map_err(|e| s3_error!(InternalError, "failed to build object lambda http client: {e}"))
+}
+
+async fn send_object_lambda_request(request: reqwest::RequestBuilder) -> S3Result<reqwest::Response> {
+    request
+        .send()
+        .await
+        .map_err(|_| s3_error!(InternalError, "object lambda target request failed"))
+}
+
+fn outbound_policy() -> S3Result<&'static OutboundPolicy> {
+    OutboundPolicy::from_env_cached().map_err(|err| s3_error!(InvalidRequest, "invalid outbound policy: {}", err))
 }
 
 fn extract_request_scheme(headers: &HeaderMap, uri: &Uri) -> String {
@@ -1098,10 +1188,7 @@ async fn invoke_object_lambda_target(
         request_builder = request_builder.header("x-rustfs-object-lambda-version-id", version_id);
     }
 
-    let lambda_response = request_builder
-        .send()
-        .await
-        .map_err(|e| s3_error!(InternalError, "object lambda target request failed: {e}"))?;
+    let lambda_response = send_object_lambda_request(request_builder).await?;
 
     let status = lambda_response.status();
     let lambda_headers = lambda_response.headers().clone();
@@ -1421,11 +1508,12 @@ async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     }
 }
 
-async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtRoute) -> S3Result<S3Response<Body>> {
-    let bucket_stats = match current_replication_stats_handle() {
-        Some(stats) => stats.get_latest_replication_stats(bucket).await,
-        None => BucketStats::default(),
-    };
+async fn build_replication_metrics_response(
+    bucket: &str,
+    route: ReplicationExtRoute,
+    context: Option<Arc<crate::admin::runtime_sources::AppContext>>,
+) -> S3Result<S3Response<Body>> {
+    let bucket_stats = crate::admin::handlers::replication::cluster_replication_stats(bucket, context).await;
     let bucket_stats = apply_replication_metrics_bandwidth_report(bucket_stats, collect_replication_metrics_bandwidth(bucket));
     let bucket_stats = apply_replication_metrics_runtime_fields(bucket_stats, route, replication_metrics_uptime_seconds());
 
@@ -1467,10 +1555,12 @@ fn apply_replication_metrics_bandwidth_report(
     mut bucket_stats: BucketStats,
     bandwidth_report: HashMap<String, BandwidthDetails>,
 ) -> BucketStats {
+    if bucket_stats.replication_stats.expected_node_count > 1 {
+        return bucket_stats;
+    }
     for (arn, details) in bandwidth_report {
         let stat = bucket_stats.replication_stats.stats.entry(arn).or_default();
-        stat.bandwidth_limit_bytes_per_sec = details.limit_bytes_per_sec;
-        stat.current_bandwidth_bytes_per_sec = details.current_bandwidth_bytes_per_sec;
+        stat.set_node_local_bandwidth(details.limit_bytes_per_sec, details.current_bandwidth_bytes_per_sec);
     }
 
     bucket_stats
@@ -1647,14 +1737,18 @@ fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3R
     Ok(resp)
 }
 
-fn apply_replication_reset_to_targets(targets: &mut BucketTargets, reset: &ReplicationResetStartRequest) -> S3Result<()> {
-    let Some(target) = targets.targets.iter_mut().find(|target| target.arn == reset.arn) else {
-        return Err(s3_error!(InvalidRequest, "replication reset arn is not configured for this bucket"));
-    };
+fn map_replication_resync_start_error(error: StorageError) -> S3Error {
+    match replication::resync_start_conflict_id(&error) {
+        Some(active_resync_id) => replication_resync_active_conflict_error(active_resync_id),
+        None => s3_error!(InternalError, "{error}"),
+    }
+}
 
-    target.reset_id = reset.reset_id.clone();
-    target.reset_before_date = reset.reset_before;
-    Ok(())
+fn replication_resync_active_conflict_error(active_resync_id: &str) -> S3Error {
+    s3_error!(
+        OperationAborted,
+        "replication resync {active_resync_id} is already active for this target"
+    )
 }
 
 fn parse_reset_status_target(uri: &Uri) -> ReplicationResetStatusRequest {
@@ -1707,19 +1801,38 @@ fn build_replication_reset_status_response(
 
 fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatus>) -> S3Result<S3Response<Body>> {
     targets.sort_by(|left, right| left.arn.cmp(&right.arn));
+    let status = if targets.iter().all(|target| target.status == "OK") {
+        "OK"
+    } else {
+        "FAILED"
+    };
+    let data = serde_json::to_vec(&ReplicationCheckResponse {
+        status: status.to_string(),
+        active_mutation: true,
+        mutation_description: "Writes a probe object, creates a delete marker, deletes the probe version, and cleans up all probe artifacts on each target.",
+        probe_namespace: REPLICATION_CHECK_PROBE_PREFIX,
+        targets,
+    })
+    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+    let mut response = S3Response::with_status(Body::from(data), StatusCode::OK);
+    response
+        .headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
+}
 
-    if let Some(target) = targets.into_iter().find(|target| target.status != "OK") {
-        let detail = target.error.unwrap_or_else(|| target.status.to_lowercase());
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication check failed for target {} (bucket {}): {}",
-            target.arn,
-            target.bucket,
-            detail
-        ));
+fn bound_replication_check_error(mut error: String) -> String {
+    error = error.replace(['\r', '\n'], " ");
+    if error.len() <= REPLICATION_CHECK_ERROR_MAX_BYTES {
+        return error;
     }
-
-    Ok(S3Response::with_status(Body::empty(), StatusCode::OK))
+    let mut end = REPLICATION_CHECK_ERROR_MAX_BYTES.saturating_sub(3);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    error.truncate(end);
+    error.push_str("...");
+    error
 }
 
 fn format_replication_check_client_error(err: &S3ClientError, context: ReplicationCheckFailureContext) -> String {
@@ -1749,12 +1862,15 @@ fn format_replication_check_client_error(err: &S3ClientError, context: Replicati
         ReplicationCheckFailureContext::ObjectLockCheck => "target object lock check failed",
     };
 
-    match (err.code.as_deref(), err.message.as_deref()) {
-        (Some("NoSuchBucket" | "NotFound"), _) => format!("{context}: target bucket does not exist"),
-        (Some(code), Some(message)) if !message.is_empty() => format!("{context}: {code}: {message}"),
-        (Some(code), _) => format!("{context}: {code}"),
-        (None, Some(message)) if !message.is_empty() => format!("{context}: {message}"),
-        _ => format!("{context}: {}", err.error),
+    // Remote messages and transport errors may echo a signed URL, credentials, or
+    // endpoint user-info. Only expose the structured S3 code, which is sufficient
+    // for operators and safe to return to an untrusted caller.
+    match err.code.as_deref() {
+        Some("NoSuchBucket" | "NotFound") => format!("{context}: target bucket does not exist"),
+        Some(code) if code.chars().all(|ch| ch.is_ascii_alphanumeric()) => {
+            bound_replication_check_error(format!("{context}: {code}"))
+        }
+        _ => format!("{context}: remote request failed"),
     }
 }
 
@@ -1819,113 +1935,246 @@ fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::R
         .collect()
 }
 
-async fn check_replication_target(bucket: &str, target: &BucketTarget) -> ReplicationCheckTargetStatus {
+async fn check_replication_target(
+    bucket: &str,
+    target: &BucketTarget,
+    source_requires_object_lock: bool,
+) -> ReplicationCheckTargetStatus {
     let mut result = ReplicationCheckTargetStatus {
         arn: target.arn.clone(),
-        endpoint: target.endpoint.clone(),
         bucket: target.target_bucket.clone(),
         status: "OK".to_string(),
         error: None,
+        phases: ReplicationCheckPhases::default(),
     };
 
     if target.target_bucket == bucket
         && !target.deployment_id.is_empty()
         && current_deployment_id().as_deref() == Some(target.deployment_id.as_str())
     {
-        result.status = "FAILED".to_string();
-        result.error = Some("target bucket must not match source bucket on the same deployment".to_string());
+        fail_replication_check_target(&mut result, "target bucket must not match source bucket on the same deployment");
         return result;
     }
 
     let target_client = match resolve_replication_target_client(bucket, target).await {
         Ok(client) => client,
-        Err(err) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(err);
+        Err(_) => {
+            fail_replication_check_target(&mut result, "target client initialization failed");
             return result;
         }
     };
 
-    match target_client.bucket_exists(&target.target_bucket).await {
-        Ok(true) => {}
-        Ok(false) => {
-            result.status = "FAILED".to_string();
-            result.error = Some("target bucket does not exist".to_string());
-            return result;
-        }
+    match target_client.client.head_bucket().bucket(&target.target_bucket).send().await {
+        Ok(_) => result.phases.bucket = ReplicationCheckPhaseStatus::passed(),
         Err(err) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck));
+            let err = S3ClientError::from(err);
+            let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
+            result.phases.bucket = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(&mut result, error);
             return result;
         }
     }
 
     match target_client.get_bucket_versioning(&target.target_bucket).await {
-        Ok(Some(_)) => {}
+        Ok(Some(_)) => result.phases.versioning = ReplicationCheckPhaseStatus::passed(),
         Ok(None) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(format!("target bucket {} is not versioned", target.target_bucket));
+            let error = "target bucket is not versioned";
+            result.phases.versioning = ReplicationCheckPhaseStatus::failed(error);
+            fail_replication_check_target(&mut result, error);
             return result;
         }
         Err(err) => {
-            result.status = "FAILED".to_string();
-            result.error = Some(format_replication_check_client_error(
-                &err,
-                ReplicationCheckFailureContext::VersioningCheck,
-            ));
+            let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::VersioningCheck);
+            result.phases.versioning = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(&mut result, error);
             return result;
         }
     }
 
-    let probe_key = format!(".rustfs-replication-check-{}", Uuid::new_v4());
-    let (probe_version_id, probe_time) =
-        match put_replication_probe_object(&target_client, &target.target_bucket, &probe_key).await {
-            Ok(output) => output,
-            Err(err) => {
-                result.status = "FAILED".to_string();
-                result.error = Some(format_replication_check_client_error(
-                    &err,
-                    ReplicationCheckFailureContext::ReplicateObject,
-                ));
+    if source_requires_object_lock {
+        match target_client_object_lock_enabled_with_client(&target_client, &target.target_bucket).await {
+            Ok(true) => result.phases.object_lock = ReplicationCheckPhaseStatus::passed(),
+            Ok(false) => {
+                let error = "target bucket is not object lock enabled";
+                result.phases.object_lock = ReplicationCheckPhaseStatus::failed(error);
+                fail_replication_check_target(&mut result, error);
                 return result;
             }
-        };
-
-    if let Err(err) = delete_replication_probe_object(
-        &target_client,
-        &target.target_bucket,
-        &probe_key,
-        probe_version_id.as_deref(),
-        build_replication_probe_remove_options(probe_time, true),
-    )
-    .await
-    {
-        result.status = "FAILED".to_string();
-        result.error = Some(format_replication_check_client_error(
-            &err,
-            ReplicationCheckFailureContext::ReplicateDeleteMarker,
-        ));
-        return result;
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ObjectLockCheck);
+                result.phases.object_lock = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(&mut result, error);
+                return result;
+            }
+        }
+    } else {
+        result.phases.object_lock = ReplicationCheckPhaseStatus::passed();
     }
 
-    if let Err(err) = delete_replication_probe_object(
-        &target_client,
-        &target.target_bucket,
-        &probe_key,
-        probe_version_id.as_deref(),
-        build_replication_probe_remove_options(probe_time, false),
-    )
-    .await
-    {
-        result.status = "FAILED".to_string();
-        result.error = Some(format_replication_check_client_error(
-            &err,
-            ReplicationCheckFailureContext::DeleteObjectVersion,
-        ));
-        return result;
-    }
-
+    let probe_key = match allocate_replication_probe_key(&target_client, &target.target_bucket).await {
+        Ok(key) => key,
+        Err(error) => {
+            result.phases.put = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(&mut result, error);
+            return result;
+        }
+    };
+    let mut operations = RemoteReplicationProbeOperations {
+        client: &target_client,
+        bucket: &target.target_bucket,
+        key: &probe_key,
+        time: OffsetDateTime::now_utc(),
+    };
+    execute_replication_probe(&mut result, &mut operations).await;
     result
+}
+
+fn fail_replication_check_target(result: &mut ReplicationCheckTargetStatus, error: impl Into<String>) {
+    result.status = "FAILED".to_string();
+    if result.error.is_none() {
+        result.error = Some(bound_replication_check_error(error.into()));
+    }
+}
+
+#[async_trait::async_trait]
+trait ReplicationProbeOperations {
+    async fn put(&mut self) -> Result<Option<String>, S3ClientError>;
+    async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError>;
+    async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError>;
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String>;
+}
+
+struct RemoteReplicationProbeOperations<'a> {
+    client: &'a TargetClient,
+    bucket: &'a str,
+    key: &'a str,
+    time: OffsetDateTime,
+}
+
+#[async_trait::async_trait]
+impl ReplicationProbeOperations for RemoteReplicationProbeOperations<'_> {
+    async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+        put_replication_probe_object(self.client, self.bucket, self.key, self.time).await
+    }
+
+    async fn create_delete_marker(&mut self, version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
+        delete_replication_probe_object(
+            self.client,
+            self.bucket,
+            self.key,
+            version_id,
+            build_replication_probe_remove_options(self.time, true),
+        )
+        .await
+    }
+
+    async fn delete_version(&mut self, version_id: Option<&str>) -> Result<(), S3ClientError> {
+        delete_replication_probe_object(
+            self.client,
+            self.bucket,
+            self.key,
+            version_id,
+            build_replication_probe_remove_options(self.time, false),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+        cleanup_replication_probe(self.client, self.bucket, self.key, known_version_ids).await
+    }
+}
+
+async fn execute_replication_probe(result: &mut ReplicationCheckTargetStatus, operations: &mut impl ReplicationProbeOperations) {
+    let mut probe_version_id = None;
+    let mut delete_marker_version_id = None;
+    let mut cleanup_required = true;
+
+    match operations.put().await {
+        Ok(version_id) => {
+            probe_version_id = version_id;
+            result.phases.put = ReplicationCheckPhaseStatus::passed();
+        }
+        Err(err) => {
+            let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateObject);
+            result.phases.put = ReplicationCheckPhaseStatus::failed(&error);
+            fail_replication_check_target(result, error);
+            // The conditional PUT cannot have created an artifact when the
+            // target reports a collision with a concurrently-created key.
+            cleanup_required = err.code.as_deref() != Some("PreconditionFailed");
+        }
+    }
+
+    if result.phases.put.status == "OK" {
+        match operations.create_delete_marker(probe_version_id.as_deref()).await {
+            Ok(version_id) => {
+                delete_marker_version_id = version_id;
+                result.phases.delete_marker = ReplicationCheckPhaseStatus::passed();
+            }
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::ReplicateDeleteMarker);
+                result.phases.delete_marker = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, error);
+            }
+        }
+
+        match operations.delete_version(probe_version_id.as_deref()).await {
+            Ok(()) => result.phases.version_delete = ReplicationCheckPhaseStatus::passed(),
+            Err(err) => {
+                let error = format_replication_check_client_error(&err, ReplicationCheckFailureContext::DeleteObjectVersion);
+                result.phases.version_delete = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, error);
+            }
+        }
+    }
+
+    if cleanup_required {
+        match operations
+            .cleanup([probe_version_id.as_deref(), delete_marker_version_id.as_deref()])
+            .await
+        {
+            Ok(()) => result.phases.cleanup = ReplicationCheckPhaseStatus::passed(),
+            Err(error) => {
+                result.phases.cleanup = ReplicationCheckPhaseStatus::failed(&error);
+                fail_replication_check_target(result, format!("probe cleanup failed: {error}"));
+            }
+        }
+    } else {
+        result.phases.cleanup = ReplicationCheckPhaseStatus::passed();
+    }
+}
+
+fn new_replication_probe_key() -> String {
+    format!("{REPLICATION_CHECK_PROBE_PREFIX}{}/{}", Uuid::new_v4(), Uuid::new_v4())
+}
+
+async fn allocate_replication_probe_key(target_client: &TargetClient, target_bucket: &str) -> Result<String, String> {
+    for _ in 0..4 {
+        let probe_key = new_replication_probe_key();
+        let output = target_client
+            .client
+            .list_object_versions()
+            .bucket(target_bucket)
+            .prefix(&probe_key)
+            .max_keys(2)
+            .send()
+            .await
+            .map_err(|err| {
+                format_replication_check_client_error(&S3ClientError::from(err), ReplicationCheckFailureContext::ReplicateObject)
+            })?;
+        let occupied = output
+            .versions()
+            .iter()
+            .any(|version| version.key() == Some(probe_key.as_str()))
+            || output
+                .delete_markers()
+                .iter()
+                .any(|marker| marker.key() == Some(probe_key.as_str()));
+        if !occupied {
+            return Ok(probe_key);
+        }
+    }
+    Err("could not allocate a collision-free replication probe key".to_string())
 }
 
 async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) -> Result<Arc<TargetClient>, String> {
@@ -1970,8 +2219,8 @@ async fn put_replication_probe_object(
     target_client: &TargetClient,
     target_bucket: &str,
     probe_key: &str,
-) -> Result<(Option<String>, OffsetDateTime), S3ClientError> {
-    let now = OffsetDateTime::now_utc();
+    now: OffsetDateTime,
+) -> Result<Option<String>, S3ClientError> {
     let options = build_replication_probe_put_options(now);
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &options.internal.source_version_id);
@@ -1992,6 +2241,7 @@ async fn put_replication_probe_object(
         .put_object()
         .bucket(target_bucket)
         .key(probe_key)
+        .if_none_match("*")
         .content_length(8)
         .body(AwsByteStream::from_static(b"aaaaaaaa"))
         .customize()
@@ -2003,7 +2253,7 @@ async fn put_replication_probe_object(
         })
         .send()
         .await
-        .map(|output| (output.version_id().map(ToOwned::to_owned), now))
+        .map(|output| output.version_id().map(ToOwned::to_owned))
         .map_err(S3ClientError::from)
 }
 
@@ -2013,7 +2263,7 @@ async fn delete_replication_probe_object(
     probe_key: &str,
     version_id: Option<&str>,
     options: RemoveObjectOptions,
-) -> Result<(), S3ClientError> {
+) -> Result<Option<String>, S3ClientError> {
     let mut headers = HeaderMap::new();
     if options.replication_delete_marker {
         insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
@@ -2047,8 +2297,110 @@ async fn delete_replication_probe_object(
         })
         .send()
         .await
+        .map(|output| output.version_id().map(ToOwned::to_owned))
+        .map_err(S3ClientError::from)
+}
+
+async fn delete_replication_probe_version(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    version_id: &str,
+) -> Result<(), S3ClientError> {
+    target_client
+        .client
+        .delete_object()
+        .bucket(target_bucket)
+        .key(probe_key)
+        .version_id(version_id)
+        .send()
+        .await
         .map(|_| ())
         .map_err(S3ClientError::from)
+}
+
+async fn cleanup_replication_probe<'a>(
+    target_client: &TargetClient,
+    target_bucket: &str,
+    probe_key: &str,
+    known_version_ids: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let mut deleted_ids = HashSet::new();
+    for version_id in known_version_ids.into_iter().flatten() {
+        if deleted_ids.insert(version_id.to_string())
+            && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, version_id).await
+        {
+            errors.push(format_replication_check_client_error(
+                &err,
+                ReplicationCheckFailureContext::DeleteObjectVersion,
+            ));
+        }
+    }
+
+    let mut key_marker = None;
+    let mut version_id_marker = None;
+    loop {
+        let output = target_client
+            .client
+            .list_object_versions()
+            .bucket(target_bucket)
+            .prefix(probe_key)
+            .set_key_marker(key_marker.clone())
+            .set_version_id_marker(version_id_marker.clone())
+            .send()
+            .await
+            .map_err(|err| {
+                format_replication_check_client_error(
+                    &S3ClientError::from(err),
+                    ReplicationCheckFailureContext::DeleteObjectVersion,
+                )
+            })?;
+
+        let mut discovered_ids = Vec::new();
+        discovered_ids.extend(
+            output
+                .versions()
+                .iter()
+                .filter(|version| version.key() == Some(probe_key))
+                .filter_map(|version| version.version_id().map(ToOwned::to_owned)),
+        );
+        discovered_ids.extend(
+            output
+                .delete_markers()
+                .iter()
+                .filter(|marker| marker.key() == Some(probe_key))
+                .filter_map(|marker| marker.version_id().map(ToOwned::to_owned)),
+        );
+        for version_id in discovered_ids {
+            if deleted_ids.insert(version_id.clone())
+                && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, &version_id).await
+            {
+                errors.push(format_replication_check_client_error(
+                    &err,
+                    ReplicationCheckFailureContext::DeleteObjectVersion,
+                ));
+            }
+        }
+
+        if output.is_truncated() != Some(true) {
+            break;
+        }
+        let next_key_marker = output.next_key_marker().map(ToOwned::to_owned);
+        let next_version_id_marker = output.next_version_id_marker().map(ToOwned::to_owned);
+        if next_key_marker.is_none() || next_key_marker == key_marker {
+            errors.push("target returned an invalid cleanup pagination marker".to_string());
+            break;
+        }
+        key_marker = next_key_marker;
+        version_id_marker = next_version_id_marker;
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(bound_replication_check_error(errors.join("; ")))
+    }
 }
 
 async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
@@ -2085,39 +2437,20 @@ async fn run_replication_check(bucket: &str) -> S3Result<S3Response<Body>> {
 
     let mut statuses = Vec::with_capacity(replication_targets.len());
     for target in &replication_targets {
-        let mut status = check_replication_target(bucket, target).await;
-        if status.status == "OK" && source_requires_object_lock {
-            let target_lock_enabled = match target_client_object_lock_enabled(bucket, target).await {
-                Ok(enabled) => enabled,
-                Err(err) => {
-                    status.status = "FAILED".to_string();
-                    status.error = Some(format_replication_check_client_error(
-                        &err,
-                        ReplicationCheckFailureContext::ObjectLockCheck,
-                    ));
-                    false
-                }
-            };
-            if status.status == "OK" && !target_lock_enabled {
-                status.status = "FAILED".to_string();
-                status.error = Some(format!("target bucket {} is not object lock enabled", target.target_bucket));
-            }
-        }
-        statuses.push(status);
+        statuses.push(check_replication_target(bucket, target, source_requires_object_lock).await);
     }
 
     build_replication_check_response(statuses)
 }
 
-async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) -> Result<bool, S3ClientError> {
-    let target_client = resolve_replication_target_client(bucket, target)
-        .await
-        .map_err(S3ClientError::new)?;
-
+async fn target_client_object_lock_enabled_with_client(
+    target_client: &TargetClient,
+    target_bucket: &str,
+) -> Result<bool, S3ClientError> {
     match target_client
         .client
         .get_object_lock_configuration()
-        .bucket(&target.target_bucket)
+        .bucket(target_bucket)
         .send()
         .await
     {
@@ -2137,34 +2470,43 @@ async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) 
 }
 
 async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<ReplicationResetTarget> {
-    let targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
-    let resolved_arn = resolve_replication_reset_target_arn(&config, &reset.arn)?;
-    let mut resolved_reset = reset.clone();
-    resolved_reset.arn = resolved_arn.clone();
-
-    let mut targets = metadata_sys::list_bucket_targets(bucket).await.map_err(ApiError::from)?;
-    apply_replication_reset_to_targets(&mut targets, &resolved_reset)?;
-
-    let json_targets = serde_json::to_vec(&targets).map_err(|e| s3_error!(InternalError, "{e}"))?;
-    metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
-        .await
-        .map_err(ApiError::from)?;
-    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
-    drop(targets_guard);
-
     let Some(pool) = current_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
-    pool.start_bucket_resync(replication::resync_opts(
-        bucket,
-        resolved_arn.clone(),
-        &reset.reset_id,
-        reset.reset_before,
-    ))
+    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let _transaction_guard = metadata_sys::acquire_bucket_targets_transaction_lock(bucket)
+        .await
+        .map_err(ApiError::from)?;
+    let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
+    let resolved_arn = resolve_replication_reset_target_arn(&config, &reset.arn)?;
+    let targets = metadata_sys::list_bucket_targets_from_disk(bucket)
+        .await
+        .map_err(ApiError::from)?;
+    let opts = replication::resync_opts(bucket, resolved_arn.clone(), &reset.reset_id, reset.reset_before);
+    let admission_pool = pool.clone();
+    let activation_pool = pool.clone();
+    let committed_targets = replication::commit_resync_target(
+        targets,
+        opts,
+        move |opts| async move { admission_pool.admit_bucket_resync(opts).await },
+        move |encoded| async move {
+            metadata_sys::update_bucket_targets_under_transaction_lock(bucket, encoded)
+                .await
+                .map(|_| ())
+                .map_err(|_| {
+                    StorageError::other(
+                        "replication resync was accepted but target metadata commit failed; retry the same reset ID to reconcile",
+                    )
+                })
+        },
+        move |opts, recovering| async move { activation_pool.activate_bucket_resync(opts, recovering).await },
+    )
     .await
-    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+    .map_err(map_replication_resync_start_error)?;
+    BucketTargetSys::get()
+        .update_all_targets(bucket, Some(&committed_targets))
+        .await;
 
     Ok(ReplicationResetTarget {
         arn: resolved_arn,
@@ -2192,7 +2534,7 @@ async fn handle_replication_extension_request(
     match ext_req.route {
         ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
             ensure_replication_config_exists(&ext_req.bucket).await?;
-            build_replication_metrics_response(&ext_req.bucket, ext_req.route).await
+            build_replication_metrics_response(&ext_req.bucket, ext_req.route, app_context_from_req(req)).await
         }
         ReplicationExtRoute::Check => {
             let (versioning, _) = metadata_sys::get_versioning_config(&ext_req.bucket)
@@ -2576,7 +2918,70 @@ mod tests {
     use http::Method;
     use http::Uri;
     use s3s::S3Request;
+    use std::net::{IpAddr, SocketAddr};
     use time::macros::datetime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct StaticResolver(IpAddr);
+
+    impl reqwest::dns::Resolve for StaticResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let address = SocketAddr::new(self.0, 0);
+            Box::pin(async move { Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs) })
+        }
+    }
+
+    fn object_lambda_test_config(endpoint: Url) -> ObjectLambdaWebhookConfig {
+        object_lambda_test_config_with_policy(endpoint, &OutboundPolicy::default())
+    }
+
+    fn object_lambda_test_config_with_policy(endpoint: Url, policy: &OutboundPolicy) -> ObjectLambdaWebhookConfig {
+        let outbound_resolver = policy
+            .resolver_for(&endpoint)
+            .expect("test endpoint should satisfy its outbound policy");
+        ObjectLambdaWebhookConfig {
+            endpoint,
+            auth_token: String::new(),
+            client_cert: String::new(),
+            client_key: String::new(),
+            client_ca: String::new(),
+            skip_tls_verify: false,
+            response_header_timeout: Some(Duration::from_secs(2)),
+            outbound_resolver,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl CapturedLog {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured log lock").clone()).expect("captured logs must be UTF-8")
+        }
+    }
 
     #[test]
     fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
@@ -2804,23 +3209,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_replication_reset_to_targets_updates_matching_target() {
-        let mut targets = BucketTargets {
-            targets: vec![crate::admin::storage_api::bucket::target::BucketTarget {
-                arn: "arn:target".to_string(),
-                ..Default::default()
-            }],
-        };
-        let reset = ReplicationResetStartRequest {
-            arn: "arn:target".to_string(),
-            reset_id: "rid-1".to_string(),
-            reset_before: Some(OffsetDateTime::now_utc()),
-        };
+    fn active_replication_resync_conflict_maps_to_http_conflict() {
+        let error = replication_resync_active_conflict_error("run-active");
 
-        apply_replication_reset_to_targets(&mut targets, &reset).expect("target update should succeed");
-
-        assert_eq!(targets.targets[0].reset_id, "rid-1");
-        assert_eq!(targets.targets[0].reset_before_date, reset.reset_before);
+        assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+        assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+        assert!(error.message().unwrap_or_default().contains("run-active"));
     }
 
     #[test]
@@ -2912,54 +3306,185 @@ mod tests {
         assert_eq!(payload["Targets"][0]["Error"], "boom");
     }
 
+    fn replication_check_target(arn: &str, status: &str, error: Option<&str>) -> ReplicationCheckTargetStatus {
+        ReplicationCheckTargetStatus {
+            arn: arn.to_string(),
+            bucket: format!("bucket-{arn}"),
+            status: status.to_string(),
+            error: error.map(ToOwned::to_owned),
+            phases: ReplicationCheckPhases::default(),
+        }
+    }
+
+    #[derive(Default)]
+    struct ScriptedReplicationProbe {
+        put_error: Option<&'static str>,
+        delete_marker_error: Option<&'static str>,
+        version_delete_error: Option<&'static str>,
+        cleanup_error: Option<&'static str>,
+        calls: Vec<&'static str>,
+        cleanup_ids: Vec<Option<String>>,
+    }
+
+    fn scripted_probe_error(code: &str) -> S3ClientError {
+        S3ClientError::with_metadata(
+            format!("{code}: secret remote detail"),
+            None,
+            Some(code.to_string()),
+            Some("secret remote detail".to_string()),
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicationProbeOperations for ScriptedReplicationProbe {
+        async fn put(&mut self) -> Result<Option<String>, S3ClientError> {
+            self.calls.push("put");
+            match self.put_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(Some("object-version".to_string())),
+            }
+        }
+
+        async fn create_delete_marker(&mut self, _version_id: Option<&str>) -> Result<Option<String>, S3ClientError> {
+            self.calls.push("delete-marker");
+            match self.delete_marker_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(Some("marker-version".to_string())),
+            }
+        }
+
+        async fn delete_version(&mut self, _version_id: Option<&str>) -> Result<(), S3ClientError> {
+            self.calls.push("version-delete");
+            match self.version_delete_error {
+                Some(code) => Err(scripted_probe_error(code)),
+                None => Ok(()),
+            }
+        }
+
+        async fn cleanup(&mut self, known_version_ids: [Option<&str>; 2]) -> Result<(), String> {
+            self.calls.push("cleanup");
+            self.cleanup_ids = known_version_ids
+                .into_iter()
+                .map(|version_id| version_id.map(ToOwned::to_owned))
+                .collect();
+            match self.cleanup_error {
+                Some(error) => Err(error.to_string()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_probe_attempts_cleanup_after_ambiguous_put_failure() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            put_error: Some("InternalError"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "cleanup"]);
+        assert_eq!(result.status, "FAILED");
+        assert_eq!(result.phases.put.status, "FAILED");
+        assert_eq!(result.phases.delete_marker.status, "SKIPPED");
+        assert_eq!(result.phases.version_delete.status, "SKIPPED");
+        assert_eq!(result.phases.cleanup.status, "OK");
+    }
+
+    #[tokio::test]
+    async fn replication_probe_continues_version_delete_and_cleanup_after_marker_failure() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            delete_marker_error: Some("AccessDenied"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(operations.cleanup_ids, [Some("object-version".to_string()), None]);
+        assert_eq!(result.phases.delete_marker.status, "FAILED");
+        assert_eq!(result.phases.version_delete.status, "OK");
+        assert_eq!(result.phases.cleanup.status, "OK");
+    }
+
+    #[tokio::test]
+    async fn replication_probe_reports_version_delete_and_cleanup_failures_separately() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            version_delete_error: Some("AccessDenied"),
+            cleanup_error: Some("cleanup unavailable"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put", "delete-marker", "version-delete", "cleanup"]);
+        assert_eq!(
+            operations.cleanup_ids,
+            [Some("object-version".to_string()), Some("marker-version".to_string())]
+        );
+        assert_eq!(result.phases.version_delete.status, "FAILED");
+        assert_eq!(result.phases.cleanup.status, "FAILED");
+        assert_eq!(result.phases.cleanup.error.as_deref(), Some("cleanup unavailable"));
+        assert!(
+            result.error.as_deref().unwrap_or_default().contains("permissions missing"),
+            "the first mutation failure remains the target summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_probe_does_not_clean_up_a_conditional_collision() {
+        let mut result = replication_check_target("arn:a", "OK", None);
+        let mut operations = ScriptedReplicationProbe {
+            put_error: Some("PreconditionFailed"),
+            ..Default::default()
+        };
+
+        execute_replication_probe(&mut result, &mut operations).await;
+
+        assert_eq!(operations.calls, ["put"]);
+        assert_eq!(result.phases.put.status, "FAILED");
+        assert_eq!(result.phases.cleanup.status, "OK");
+    }
+
     #[test]
-    fn build_replication_check_response_returns_empty_body_on_success() {
+    fn build_replication_check_response_documents_active_mutations() {
         let response = build_replication_check_response(vec![
-            ReplicationCheckTargetStatus {
-                arn: "arn:a".to_string(),
-                endpoint: "remote-a:9000".to_string(),
-                bucket: "bucket-a".to_string(),
-                status: "OK".to_string(),
-                error: None,
-            },
-            ReplicationCheckTargetStatus {
-                arn: "arn:z".to_string(),
-                endpoint: "remote-z:9000".to_string(),
-                bucket: "bucket-z".to_string(),
-                status: "OK".to_string(),
-                error: None,
-            },
+            replication_check_target("arn:a", "OK", None),
+            replication_check_target("arn:z", "OK", None),
         ])
         .expect("response should build");
 
         let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
             .expect("body should read")
             .to_bytes();
-        assert!(bytes.is_empty());
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+        assert_eq!(payload["Status"], "OK");
+        assert_eq!(payload["ActiveMutation"], true);
+        assert_eq!(payload["ProbeNamespace"], REPLICATION_CHECK_PROBE_PREFIX);
+        assert!(payload["MutationDescription"].as_str().unwrap_or_default().contains("Writes"));
+        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
     }
 
     #[test]
-    fn build_replication_check_response_surfaces_first_failure() {
-        let err = build_replication_check_response(vec![
-            ReplicationCheckTargetStatus {
-                arn: "arn:z".to_string(),
-                endpoint: "remote-z:9000".to_string(),
-                bucket: "bucket-z".to_string(),
-                status: "FAILED".to_string(),
-                error: Some("boom".to_string()),
-            },
-            ReplicationCheckTargetStatus {
-                arn: "arn:a".to_string(),
-                endpoint: "remote-a:9000".to_string(),
-                bucket: "bucket-a".to_string(),
-                status: "OK".to_string(),
-                error: None,
-            },
+    fn build_replication_check_response_preserves_partial_target_results() {
+        let response = build_replication_check_response(vec![
+            replication_check_target("arn:z", "FAILED", Some("boom")),
+            replication_check_target("arn:a", "OK", None),
         ])
-        .expect_err("failed target should surface as request error");
+        .expect("partial result should remain structured");
 
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
-        assert!(err.message().unwrap_or_default().contains("arn:z"));
+        let bytes = futures::executor::block_on(http_body_util::BodyExt::collect(response.output))
+            .expect("body should read")
+            .to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("response should be JSON");
+        assert_eq!(payload["Status"], "FAILED");
+        assert_eq!(payload["Targets"][0]["Arn"], "arn:a");
+        assert_eq!(payload["Targets"][0]["Status"], "OK");
+        assert_eq!(payload["Targets"][1]["Arn"], "arn:z");
+        assert_eq!(payload["Targets"][1]["Error"], "boom");
     }
 
     #[test]
@@ -2987,7 +3512,7 @@ mod tests {
     }
 
     #[test]
-    fn format_replication_check_client_error_uses_remote_code_and_message() {
+    fn format_replication_check_client_error_excludes_remote_message() {
         let err = S3ClientError::with_metadata(
             "InvalidRequest: bucket versioning is suspended",
             None,
@@ -2996,10 +3521,50 @@ mod tests {
         );
 
         let formatted = format_replication_check_client_error(&err, ReplicationCheckFailureContext::VersioningCheck);
+        assert_eq!(formatted, "target bucket versioning check failed: InvalidRequest");
+        assert!(!formatted.contains("suspended"));
+    }
+
+    #[test]
+    fn replication_check_error_is_single_line_and_bounded() {
+        let error = format!("first\nsecond {}", "é".repeat(REPLICATION_CHECK_ERROR_MAX_BYTES));
+        let bounded = bound_replication_check_error(error);
+
+        assert!(bounded.len() <= REPLICATION_CHECK_ERROR_MAX_BYTES);
+        assert!(!bounded.contains('\n'));
+        assert!(bounded.ends_with("..."));
+    }
+
+    #[test]
+    fn replication_probe_keys_use_reserved_high_entropy_namespace() {
+        let first = new_replication_probe_key();
+        let second = new_replication_probe_key();
+
+        assert!(first.starts_with(REPLICATION_CHECK_PROBE_PREFIX));
         assert_eq!(
-            formatted,
-            "target bucket versioning check failed: InvalidRequest: bucket versioning is suspended"
+            first
+                .strip_prefix(REPLICATION_CHECK_PROBE_PREFIX)
+                .expect("prefix should exist")
+                .split('/')
+                .count(),
+            2
         );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn replication_check_unknown_transport_error_does_not_expose_secrets() {
+        let err = S3ClientError::with_metadata(
+            "https://ACCESS:SECRET@example.test/?X-Amz-Signature=signature",
+            None,
+            None,
+            Some("Authorization: Bearer token".to_string()),
+        );
+
+        let formatted = format_replication_check_client_error(&err, ReplicationCheckFailureContext::BucketCheck);
+        assert_eq!(formatted, "target bucket check failed: remote request failed");
+        assert!(!formatted.contains("SECRET"));
+        assert!(!formatted.contains("token"));
     }
 
     #[test]
@@ -3177,6 +3742,10 @@ mod tests {
         assert_eq!(stat.replicated_count, 3);
         assert_eq!(stat.bandwidth_limit_bytes_per_sec, 2048);
         assert_eq!(stat.current_bandwidth_bytes_per_sec, 1536.5);
+        assert_eq!(
+            serde_json::to_value(stat).expect("target stats should serialize")["bandwidth_scope"],
+            "node_local"
+        );
     }
 
     #[test]
@@ -3198,6 +3767,34 @@ mod tests {
 
         assert_eq!(stat.bandwidth_limit_bytes_per_sec, 4096);
         assert_eq!(stat.current_bandwidth_bytes_per_sec, 1024.25);
+    }
+
+    #[test]
+    fn apply_replication_metrics_bandwidth_report_does_not_replace_cluster_values() {
+        let mut stats = BucketStats::default();
+        stats.replication_stats.expected_node_count = 2;
+        let target = stats
+            .replication_stats
+            .stats
+            .entry("arn:replication:a".to_string())
+            .or_default();
+        target.bandwidth_limit_bytes_per_sec = 8192;
+        target.current_bandwidth_bytes_per_sec = 3000.0;
+
+        let updated = apply_replication_metrics_bandwidth_report(
+            stats,
+            HashMap::from([(
+                "arn:replication:a".to_string(),
+                BandwidthDetails {
+                    limit_bytes_per_sec: 2048,
+                    current_bandwidth_bytes_per_sec: 1000.0,
+                },
+            )]),
+        );
+        let target = &updated.replication_stats.stats["arn:replication:a"];
+
+        assert_eq!(target.bandwidth_limit_bytes_per_sec, 8192);
+        assert_eq!(target.current_bandwidth_bytes_per_sec, 3000.0);
     }
 
     #[test]
@@ -3776,6 +4373,214 @@ mod tests {
         let err = validate_object_lambda_response_auth_headers(&mismatched, "route-123", "token-456")
             .expect_err("mismatched auth headers should fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn object_lambda_client_ignores_proxies_and_does_not_follow_redirects() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_OBJECT_LAMBDA_PROXY_CHILD";
+        const TARGET_URL_ENV: &str = "RUSTFS_TEST_OBJECT_LAMBDA_TARGET_URL";
+        const TARGET_ADDR_ENV: &str = "RUSTFS_TEST_OBJECT_LAMBDA_TARGET_ADDR";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let endpoint = Url::parse(&std::env::var(TARGET_URL_ENV).expect("child target URL")).expect("target URL");
+            let address = std::env::var(TARGET_ADDR_ENV)
+                .expect("child target address")
+                .parse::<SocketAddr>()
+                .expect("target address");
+            let config = object_lambda_test_config(endpoint);
+            let client = build_object_lambda_http_client_with_resolver(&config, StaticResolver(address.ip()))
+                .expect("object lambda client should build");
+            tokio::runtime::Runtime::new().expect("child runtime").block_on(async {
+                let response = client
+                    .get(config.endpoint)
+                    .send()
+                    .await
+                    .expect("object lambda request should bypass environment proxy");
+                assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+            });
+            return;
+        }
+
+        use std::io::{Read, Write};
+        use std::net::TcpListener as StdTcpListener;
+
+        let target_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind object lambda target");
+        let target_address = target_listener.local_addr().expect("object lambda target address");
+        let redirect_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind redirect destination");
+        let redirect_address = redirect_listener.local_addr().expect("redirect destination address");
+        drop(redirect_listener);
+        let target = std::thread::spawn(move || {
+            let (mut stream, _) = target_listener.accept().expect("accept object lambda request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).expect("read object lambda request");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /transform HTTP/1.1"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/metadata\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        redirect_address.port()
+                    )
+                    .as_bytes(),
+                )
+                .expect("write object lambda redirect");
+        });
+        let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("reserve refused proxy address");
+        let proxy_address = proxy_listener.local_addr().expect("proxy address");
+        drop(proxy_listener);
+        let target_url = format!("http://object-lambda.test:{}/transform", target_address.port());
+        let proxy_url = format!("http://{proxy_address}");
+        let output = std::process::Command::new(std::env::current_exe().expect("resolve current test executable"))
+            .arg("object_lambda_client_ignores_proxies_and_does_not_follow_redirects")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(TARGET_URL_ENV, target_url)
+            .env(TARGET_ADDR_ENV, target_address.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("NO_PROXY", "")
+            .output()
+            .expect("run isolated object lambda proxy test child");
+
+        assert!(
+            output.status.success(),
+            "proxy test child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        target.join().expect("object lambda target should finish");
+    }
+
+    #[tokio::test]
+    async fn object_lambda_client_uses_configured_outbound_policy_resolver() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind object lambda policy target");
+        let address = listener.local_addr().expect("object lambda policy target address");
+        let endpoint = Url::parse(&format!("http://{address}/transform")).expect("object lambda endpoint");
+        let policy = OutboundPolicy::from_allowed_origins(&endpoint.origin().ascii_serialization())
+            .expect("loopback test origin should be explicitly allowed");
+        let config = object_lambda_test_config_with_policy(endpoint.clone(), &policy);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept object lambda policy request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).await.expect("read object lambda policy request");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /transform HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write object lambda policy response");
+        });
+
+        let response = build_object_lambda_http_client(&config)
+            .expect("object lambda policy client should build")
+            .get(endpoint)
+            .send()
+            .await
+            .expect("configured policy resolver should reach the allowed origin");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        server.await.expect("object lambda policy target should finish");
+    }
+
+    #[tokio::test]
+    async fn object_lambda_client_preserves_hostname_for_tls_sni() {
+        use rustls::{
+            ServerConfig, ServerConnection, StreamOwned,
+            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Once};
+
+        static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
+        INSTALL_CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["object-lambda.test".to_string()]).expect("cert should generate");
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let ca_path = temp_dir.path().join("object-lambda-ca.pem");
+        std::fs::write(&ca_path, cert.pem()).expect("write object lambda CA");
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+                )
+                .expect("server certificate should be valid"),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind object lambda TLS server");
+        let address = listener.local_addr().expect("object lambda TLS address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept object lambda TLS request");
+            let connection = ServerConnection::new(server_config).expect("server TLS connection");
+            let mut stream = StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read object lambda TLS request");
+            assert_eq!(stream.conn.server_name(), Some("object-lambda.test"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write object lambda TLS response");
+        });
+        let endpoint =
+            Url::parse(&format!("https://object-lambda.test:{}/transform", address.port())).expect("object lambda TLS endpoint");
+        let mut config = object_lambda_test_config(endpoint.clone());
+        config.client_ca = ca_path.to_string_lossy().into_owned();
+
+        let response = build_object_lambda_http_client_with_resolver(&config, StaticResolver(address.ip()))
+            .expect("object lambda TLS client should build")
+            .get(endpoint)
+            .send()
+            .await
+            .expect("TLS request should keep the configured hostname for SNI");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        server.join().expect("object lambda TLS server should finish");
+    }
+
+    #[test]
+    fn object_lambda_tls_warning_redacts_endpoint_details() {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(captured.clone())
+            .finish();
+        let mut config = object_lambda_test_config(
+            Url::parse("https://object-lambda.test/private?token=secret").expect("object lambda endpoint"),
+        );
+        config.skip_tls_verify = true;
+
+        tracing::subscriber::with_default(subscriber, || {
+            build_object_lambda_http_client_with_resolver(&config, StaticResolver(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+                .expect("object lambda client should build");
+        });
+
+        let logs = captured.contents();
+        assert!(logs.contains("https://object-lambda.test"));
+        for secret in ["/private", "token=secret"] {
+            assert!(!logs.contains(secret), "TLS warning leaked {secret}: {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn object_lambda_request_error_does_not_expose_endpoint_details() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("reserve refused endpoint");
+        let address = listener.local_addr().expect("refused endpoint address");
+        drop(listener);
+        let request = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build")
+            .get(format!("http://{address}/private?token=secret"));
+
+        let error = send_object_lambda_request(request)
+            .await
+            .expect_err("refused object lambda request should fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("object lambda target request failed"));
+        assert!(!rendered.contains("/private"));
+        assert!(!rendered.contains("token=secret"));
     }
 
     #[test]

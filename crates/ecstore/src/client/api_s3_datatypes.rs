@@ -55,34 +55,38 @@ pub struct ListBucketV2Result {
     pub start_after: String,
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
 pub struct Version {
-    etag: String,
-    is_latest: bool,
-    key: String,
-    last_modified: OffsetDateTime,
-    owner: Owner,
-    size: i64,
-    storage_class: String,
-    version_id: String,
-    user_metadata: HashMap<String, String>,
-    user_tags: HashMap<String, String>,
-    is_delete_marker: bool,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    pub is_latest: bool,
+    pub key: String,
+    pub size: i64,
+    pub storage_class: String,
+    pub version_id: String,
+    pub user_metadata: HashMap<String, String>,
+    pub user_tags: HashMap<String, String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
 pub struct ListVersionsResult {
-    versions: Vec<Version>,
-    common_prefixes: Vec<CommonPrefix>,
-    name: String,
-    prefix: String,
-    delimiter: String,
-    max_keys: i64,
-    encoding_type: String,
-    is_truncated: bool,
-    key_marker: String,
-    version_id_marker: String,
-    next_key_marker: String,
-    next_version_id_marker: String,
+    #[serde(rename = "Version")]
+    pub versions: Vec<Version>,
+    #[serde(rename = "DeleteMarker")]
+    pub delete_markers: Vec<Version>,
+    pub common_prefixes: Vec<CommonPrefix>,
+    pub name: String,
+    pub prefix: String,
+    pub delimiter: String,
+    pub max_keys: i64,
+    pub encoding_type: String,
+    pub is_truncated: bool,
+    pub key_marker: String,
+    pub version_id_marker: String,
+    pub next_key_marker: String,
+    pub next_version_id_marker: String,
 }
 
 pub struct ListBucketResult {

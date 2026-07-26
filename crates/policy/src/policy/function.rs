@@ -30,6 +30,36 @@ pub mod key_name;
 pub mod number;
 pub mod string;
 
+/// Set qualifier applied to a condition key that carries multiple request values.
+///
+/// The distinction matters for negated operators (`StringNotEquals`, `StringNotLike`,
+/// `ArnNotEquals`, `ArnNotLike`, ...). For those, negation must be applied to each
+/// request value *before* the quantifier aggregates them; negating the aggregate
+/// instead turns `ForAllValues` into `ForAnyValue` and vice versa.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum Quantifier {
+    /// No `ForAllValues:`/`ForAnyValue:` prefix. The operator is applied to the value
+    /// set as a whole, matching AWS single-valued-key semantics.
+    #[default]
+    None,
+    /// `ForAnyValue:` — satisfied when at least one request value satisfies the operator.
+    /// Unsatisfiable when the key is absent from the request.
+    ForAnyValue,
+    /// `ForAllValues:` — satisfied when every request value satisfies the operator.
+    /// Vacuously satisfied when the key is absent from the request.
+    ForAllValues,
+}
+
+/// Whether `name` — a condition key with its namespace prefix already stripped, as it
+/// appears in the condition-value map — is one of the well-known keys whose value must
+/// come from server-verified state rather than from request input.
+///
+/// Code that assembles the condition map uses this to refuse request-supplied values
+/// for identity and connection keys. See [`KeyName::is_server_derived`].
+pub fn is_server_derived_condition_key(name: &str) -> bool {
+    KeyName::server_derived_key_names().any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct Functions {
     for_any_value: Vec<Condition>,
@@ -48,19 +78,19 @@ impl Functions {
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for c in self.for_any_value.iter() {
-            if !c.evaluate_with_resolver(false, values, resolver).await {
+            if !c.evaluate_with_resolver(Quantifier::ForAnyValue, values, resolver).await {
                 return false;
             }
         }
 
         for c in self.for_all_values.iter() {
-            if !c.evaluate_with_resolver(true, values, resolver).await {
+            if !c.evaluate_with_resolver(Quantifier::ForAllValues, values, resolver).await {
                 return false;
             }
         }
 
         for c in self.for_normal.iter() {
-            if !c.evaluate_with_resolver(false, values, resolver).await {
+            if !c.evaluate_with_resolver(Quantifier::None, values, resolver).await {
                 return false;
             }
         }

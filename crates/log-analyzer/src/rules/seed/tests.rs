@@ -73,7 +73,7 @@ fn msg(message: &'static str) -> Sample {
 #[test]
 fn seed_rule_set_is_valid_and_complete() {
     let set = seed_rule_set();
-    assert_eq!(set.rules().len(), 68);
+    assert_eq!(set.rules().len(), 69);
     // Every message-matching rule carries at least one anchor for the CI
     // guard; the only anchor-less rules are the two structural matchers
     // (panic kind, scanner target+level).
@@ -113,6 +113,14 @@ fn every_rule_has_a_positive_sample() {
             msg("reporting peer disks offline after consecutive storage_info failures"),
         ),
         ("drive-faulty-error", msg("remote drive is faulty")),
+        (
+            "metacache-listing-timeout",
+            Sample {
+                message: "Metacache listing quorum failed",
+                fields: &[("state", "quorum_failed"), ("bucket", "photos"), ("path", "wide/")],
+                ..Default::default()
+            },
+        ),
         ("unformatted-disk", msg("Unformatted disk found")),
         ("disk-access-denied", msg("disk access denied: /data/disk1")),
         ("inconsistent-drive", msg("inconsistent drive found")),
@@ -308,6 +316,23 @@ fn smoke_samples_hit_exact_rule_sets() {
         &["disk-marked-faulty"],
     );
     exact(&msg("erasure write quorum (required=8, achieved=5)"), &["ec-write-quorum"]);
+    exact(
+        &Sample {
+            message: "Metacache listing quorum failed",
+            fields: &[("state", "quorum_failed"), ("bucket", "photos"), ("path", "wide/")],
+            ..Default::default()
+        },
+        &["metacache-listing-timeout"],
+    );
+    exact(
+        &Sample {
+            message: "S3Error InvalidAccessKeyId: Access Key Id you provided does not exist",
+            fields: &[("code", "InvalidAccessKeyId")],
+            ..Default::default()
+        },
+        &["unknown-access-key"],
+    );
+    exact(&msg("HTTP transport failed: BrokenPipe while streaming response body"), &[]);
     // Internode auth failures legitimately hit both the internode rule and
     // the generic client signature rule.
     exact(

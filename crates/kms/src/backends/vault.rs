@@ -600,7 +600,9 @@ impl VaultKmsBackend {
 
         let vault_config = match &config.backend_config {
             crate::config::BackendConfig::VaultKv2(vault_config) => (**vault_config).clone(),
-            crate::config::BackendConfig::Local(_) | crate::config::BackendConfig::VaultTransit(_) => {
+            crate::config::BackendConfig::Local(_)
+            | crate::config::BackendConfig::VaultTransit(_)
+            | crate::config::BackendConfig::Static(_) => {
                 return Err(KmsError::configuration_error("Expected Vault KV2 backend configuration"));
             }
         };

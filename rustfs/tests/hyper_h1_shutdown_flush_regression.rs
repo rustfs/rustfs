@@ -8,19 +8,16 @@
 // before the full Content-Length body was flushed, which S3 clients
 // (minio-go / warp) report as `unexpected EOF`. Fixed upstream by
 // hyperium/hyper#4018 (commit 72046cc7, "fix(http1): flush buffered data
-// before shutdown"), which RustFS pulls in via the `[patch.crates-io]` hyper
-// pin in the workspace Cargo.toml.
+// before shutdown"), released in hyper 1.11.0.
 //
-// This test reproduces the exact trigger deterministically and fails if the
-// pin is ever dropped / hyper is downgraded below the fix — the one realistic
-// regression vector (an accidental `cargo update` or a lost patch). It mirrors
+// This test reproduces the exact trigger deterministically and fails if hyper
+// is downgraded below the fix. It mirrors
 // hyper's own upstream regression test `tests/h1_shutdown_while_buffered.rs`.
 //
 // The load-bearing assertion is on `shutdown_called_with_buffered`, a flag set
 // synchronously inside `poll_shutdown`. It is timing-independent: a slow CI
 // runner can only fail to reach the shutdown at all (a false pass), never flip
-// the flag spuriously (a false red). Drop this test once the hyper pin is
-// replaced by a released hyper > 1.10.1 that contains commit 72046cc7.
+// the flag spuriously (a false red).
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -150,7 +147,7 @@ async fn hyper_h1_does_not_shutdown_with_buffered_response() {
     assert!(
         !s.shutdown_called_with_buffered,
         "hyper shut the HTTP/1 socket down with {} response bytes still buffered — the backlog#1232 \
-         premature-FIN bug is back; the hyper flush-before-shutdown pin (hyperium/hyper#4018) was likely dropped",
+         premature-FIN bug is back; hyperium/hyper#4018 may have regressed",
         s.buffered_at_shutdown
     );
 }

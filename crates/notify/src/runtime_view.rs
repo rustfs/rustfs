@@ -61,7 +61,8 @@ impl NotifyRuntimeView {
     }
 
     pub async fn snapshot_target_health(&self) -> Vec<RuntimeTargetHealthSnapshot> {
-        self.target_list.read().await.runtime_health_snapshots().await
+        let targets = self.target_list.read().await.values();
+        rustfs_targets::health_snapshots_for_targets(targets).await
     }
 
     pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
@@ -84,7 +85,7 @@ mod tests {
         Arc,
         atomic::{AtomicU64, Ordering},
     };
-    use tokio::sync::RwLock;
+    use tokio::sync::{Notify, RwLock};
 
     #[derive(Clone)]
     struct TestTarget {
@@ -93,6 +94,8 @@ mod tests {
         failed_messages: Arc<AtomicU64>,
         failed_store_length: u64,
         id: TargetID,
+        health_started: Option<Arc<Notify>>,
+        health_release: Option<Arc<Notify>>,
         total_messages: Arc<AtomicU64>,
     }
 
@@ -104,6 +107,8 @@ mod tests {
                 failed_messages: Arc::new(AtomicU64::new(0)),
                 failed_store_length: 0,
                 id: TargetID::new(id.to_string(), name.to_string()),
+                health_started: None,
+                health_release: None,
                 total_messages: Arc::new(AtomicU64::new(0)),
             }
         }
@@ -120,6 +125,12 @@ mod tests {
 
         fn with_enabled(mut self, enabled: bool) -> Self {
             self.enabled = enabled;
+            self
+        }
+
+        fn with_health_gate(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+            self.health_started = Some(started);
+            self.health_release = Some(release);
             self
         }
 
@@ -142,6 +153,10 @@ mod tests {
         }
 
         async fn is_active(&self) -> Result<bool, TargetError> {
+            if let (Some(started), Some(release)) = (&self.health_started, &self.health_release) {
+                started.notify_one();
+                release.notified().await;
+            }
             Ok(self.active)
         }
 
@@ -267,5 +282,30 @@ mod tests {
         let status = runtime_view.runtime_status_snapshot().await;
         assert_eq!(status.target_count, 2);
         assert_eq!(status.replay_worker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn health_probe_does_not_hold_the_target_list_read_lock() {
+        let target_list = Arc::new(RwLock::new(TargetList::new()));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let target = Arc::new(TestTarget::new("blocked", "webhook").with_health_gate(started.clone(), release.clone()));
+        target_list
+            .write()
+            .await
+            .add(target as Arc<dyn Target<Event> + Send + Sync>)
+            .expect("test target should be added");
+        let runtime_view = NotifyRuntimeView::new(target_list.clone(), Arc::new(RwLock::new(ReplayWorkerManager::new())));
+
+        let snapshot_task = tokio::spawn(async move { runtime_view.snapshot_target_health().await });
+        started.notified().await;
+
+        let write_guard = tokio::time::timeout(std::time::Duration::from_secs(1), target_list.write())
+            .await
+            .expect("network health probe must not retain the target-list read lock");
+        drop(write_guard);
+        release.notify_one();
+
+        assert_eq!(snapshot_task.await.expect("snapshot task should finish").len(), 1);
     }
 }

@@ -80,6 +80,25 @@ mod tests {
         assert_eq!(head_resp.content_encoding(), Some("zstd"), "HEAD should return Content-Encoding: zstd");
         assert_eq!(head_resp.content_type(), Some("text/plain"), "HEAD should return correct Content-Type");
 
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("DELETE object failed");
+        client
+            .delete_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("DELETE bucket failed");
+        client
+            .list_buckets()
+            .send()
+            .await
+            .expect("RustFS must remain available after deleting a bucket");
+
         env.stop_server();
     }
 

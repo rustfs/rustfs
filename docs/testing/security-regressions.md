@@ -21,6 +21,12 @@ forced to update its pinned test (red -> green).
 | [GHSA-3p3x-734c-h5vx](https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx) | Constant-time secret comparison on WebDAV/FTPS password login | rustfs/rustfs#4403 | `assert_ftps_ghsa_3p3x_wrong_credentials_rejected` (`crates/e2e_test/src/protocols/ftps_core.rs`); `GHSA-3p3x` auth-failure block in `test_webdav_core_operations` (`crates/e2e_test/src/protocols/webdav_core.rs`) | e2e (protocols suite) |
 | [GHSA-r5qv-rc46-hv8q](https://github.com/rustfs/rustfs/security/advisories/GHSA-r5qv-rc46-hv8q) | Internode RPC authentication must fail closed | rustfs/rustfs#4402 | `ghsa_r5qv_resolve_shared_secret_rejects_default_fallback`, `ghsa_r5qv_verify_rpc_signature_fails_closed_on_missing_or_invalid_auth` (`crates/ecstore/src/cluster/rpc/http_auth.rs`) | unit |
 | [GHSA-m77q-r63m-pj89](https://github.com/rustfs/rustfs/security/advisories/GHSA-m77q-r63m-pj89) | STS JWTs signed with shared root secret (intentionally unfixed) | n/a | `test_ghsa_m77q_sts_session_token_signed_with_root_secret` (flow-level pin: signing key == root secret, root-only decode, authorizes) and `test_created_sts_credentials_authorize_with_session_token_claims` (`crates/iam/src/sys.rs`); `token_signing_key` doc (`crates/iam/src/root_credentials.rs`) — pin current by-design behavior; fixing m77q must update red -> green | unit |
+| [GHSA-5354-r3w2-34m8](https://github.com/rustfs/rustfs/security/advisories/GHSA-5354-r3w2-34m8) | Service-account parent must stay within caller scope — a non-owner holding `CreateServiceAccountAdminAction` could parent a service account to the root credential and authenticate as owner | rustfs/rustfs#5141 | `ghsa_5354_non_owner_service_account_parent_confined_to_scope` and the `add_service_account_parent_within_scope` invariant it pins (`rustfs/src/admin/handlers/service_account.rs`) | unit |
+| [GHSA-3ppv-fx5m-m749](https://github.com/rustfs/rustfs/security/advisories/GHSA-3ppv-fx5m-m749) | Versioned object reads must be authorized against `s3:GetObjectVersion`, not `s3:GetObject` (`get_object`, CopyObject source, UploadPartCopy source) | rustfs/rustfs#5142 | `ghsa_3ppv_versioned_read_selects_get_object_version_action` and the `versioned_read_action` helper it pins (`rustfs/src/storage/access.rs`) | unit |
+| [GHSA-v9cp-qfw9-9pfp](https://github.com/rustfs/rustfs/security/advisories/GHSA-v9cp-qfw9-9pfp) | `ForAllValues:`/`ForAnyValue:` negated string operators were transposed — negation was applied to the aggregate quantified result instead of the per-value predicate | pending | `ghsa_v9cp_for_all_values_not_equals_partial_overlap`, `ghsa_v9cp_for_any_value_not_equals_partial_overlap` and the absent-key/positive-quantifier cases beside them (`crates/policy/tests/quantified_negation.rs`) — the value set must partially overlap the policy set, contained or disjoint sets cannot tell the two quantifiers apart | unit (crate test) |
+| [GHSA-6r96-hmgc-726c](https://github.com/rustfs/rustfs/security/advisories/GHSA-6r96-hmgc-726c) | Request headers must not populate server-derived IAM condition keys (`userid`, `groups`, `jwt:`/`ldap:` claim names) | pending | `ghsa_6r96_identity_condition_keys_ignore_spoofed_headers`, `ghsa_6r96_claim_condition_keys_ignore_spoofed_headers`, and `test_request_headers_still_reach_conditions` which guards the reserved set from growing too broad (`rustfs/src/auth.rs`) | unit |
+| [GHSA-x298-9x87-fvjq](https://github.com/rustfs/rustfs/security/advisories/GHSA-x298-9x87-fvjq) | The anonymous ListObjectVersions -> `s3:ListBucket` fallback must reach the same public-access gates as a direct grant | pending | `ghsa_x298_anonymous_list_object_versions_denied_when_restrict_public_buckets_enabled` (`crates/e2e_test/src/anonymous_access_test.rs`) — asserts 200 before the public-access block is applied so the test proves the gate rather than a broken fallback | e2e |
+| [GHSA-g3vq-vv42-f647](https://github.com/rustfs/rustfs/security/advisories/GHSA-g3vq-vv42-f647) | FTPS `MKD` must clear the `s3:CreateBucket` authorization boundary before reaching the backend | pending | `ghsa_g3vq_mkd_denied_before_reaching_backend` (`crates/protocols/src/ftps/driver.rs`) — primes `create_bucket` to succeed so the assertion distinguishes "denied at authorization" from "backend refused" | unit |
 
 ## Where these run (CI-execution map)
 
@@ -28,11 +34,23 @@ Every security regression must land where CI actually runs it — a named test i
 an unexecuted suite is theater. The suites split across three execution paths by
 topology:
 
-- **Unit tests** — `ghsa_r5qv_*` (`crates/ecstore`) and the GHSA-m77q STS
-  pinning (`crates/iam`) run automatically in the default CI pass
+- **Unit tests** — `ghsa_r5qv_*` (`crates/ecstore`), the GHSA-m77q STS
+  pinning (`crates/iam`), `ghsa_5354_*` / `ghsa_3ppv_*` / `ghsa_6r96_*`
+  (`rustfs` lib), `ghsa_v9cp_*` (`crates/policy` crate test), and
+  `ghsa_g3vq_*` (`crates/protocols`) run automatically in the default CI pass
   (`cargo nextest run --profile ci --all --exclude e2e_test`) — no special
-  wiring. This is the CI-executed regression for the RPC fail-closed (r5qv) and
-  STS-signing (m77q) advisories.
+  wiring. This is the CI-executed regression for the RPC fail-closed (r5qv),
+  STS-signing (m77q), service-account parent-scope (5354), versioned-read
+  authorization (3ppv), condition-key injection (6r96), quantified-negation
+  (v9cp), and FTPS MKD authorization (g3vq) advisories.
+
+  `ghsa_g3vq_*` sits behind `rustfs-protocols`' `ftps` feature, which is off by
+  default for that crate alone. It still runs in the workspace pass because the
+  `rustfs` crate defaults to `["ftps", "webdav"]` and cargo unifies features
+  across the build. Running `cargo test -p rustfs-protocols` on its own silently
+  skips it — use `--features ftps` in that case. The `protocol-features` CI
+  matrix covers `swift` and `sftp` only, for the same reason: those are not in
+  any default feature set, so they need explicit jobs.
 - **S3-API negative-auth e2e (e2e-smoke, PR-gated)** — the attacker-facing S3
   auth-rejection suites run on every PR via the `e2e-smoke` nextest profile
   (`.config/nextest.toml`), which each spawns its own server on a random port

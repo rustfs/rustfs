@@ -16,7 +16,12 @@ use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::{EventNotifier, TargetList};
 use crate::services::NotifyServices;
 use crate::{
-    Event, error::NotificationError, pipeline::LiveEventHistory, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
+    Event,
+    error::NotificationError,
+    lifecycle::{NotificationLifecycleTransition, NotificationRuntimeState},
+    pipeline::LiveEventHistory,
+    registry::TargetRegistry,
+    rule_engine::NotifyRuleEngine,
     rules::BucketNotificationConfig,
 };
 use hashbrown::HashMap;
@@ -160,11 +165,12 @@ impl NotificationMetrics {
 
 /// The notification system that integrates all components
 pub struct NotificationSystem {
-    /// The event notifier
+    /// Event dispatcher. Runtime target mutation remains lifecycle-owned.
     pub notifier: Arc<EventNotifier>,
-    /// The target registry
+    /// Target factory registry. Creating a target does not publish it.
     pub registry: Arc<TargetRegistry>,
-    /// The current configuration
+    /// The current cached configuration. Runtime publication must still go
+    /// through the lifecycle methods on this type.
     pub config: Arc<RwLock<Config>>,
     services: NotifyServices,
 }
@@ -220,10 +226,12 @@ impl NotificationSystem {
         self.services.runtime_view.get_active_targets().await
     }
 
-    /// Gets the complete Target list, including both active and inactive Targets.
-    ///
-    /// # Return
-    /// An `Arc<RwLock<TargetList>>` containing all Targets.
+    pub async fn config_snapshot(&self) -> Config {
+        self.config.read().await.clone()
+    }
+
+    /// Gets a read-only runtime container handle. Public mutation methods on
+    /// `TargetList` are intentionally unavailable outside this crate.
     pub async fn get_all_targets(&self) -> Arc<RwLock<TargetList>> {
         self.services.runtime_view.get_all_targets()
     }
@@ -327,6 +335,43 @@ impl NotificationSystem {
         self.services.config_manager.reload_config(new_config).await
     }
 
+    /// Synchronously publishes a config generation without changing target mode.
+    pub fn publish_config(&self, new_config: Config) -> NotificationLifecycleTransition {
+        self.services.config_manager.lifecycle().update_config(new_config)
+    }
+
+    /// Reconciles the cached and active configuration with the persisted
+    /// server config without changing the target-runtime mode.
+    pub async fn reload_persisted_config(&self) -> Result<(), NotificationError> {
+        self.services.config_manager.reload_persisted_config().await
+    }
+
+    /// Reconciles from an explicitly selected storage context.
+    pub async fn reload_persisted_config_from_store(&self, store: Arc<crate::NotifyStore>) -> Result<(), NotificationError> {
+        self.services.config_manager.reload_persisted_config_from_store(store).await
+    }
+
+    /// Enables or suspends configured notification targets without replacing
+    /// the process-wide live-event container.
+    pub async fn set_targets_enabled(&self, enabled: bool, config: Option<Config>) -> Result<(), NotificationError> {
+        self.publish_targets_enabled(enabled, config).wait().await
+    }
+
+    /// Synchronously accepts a target-runtime mode transition. The returned
+    /// receipt can be awaited after the caller releases its persistence lock.
+    pub fn publish_targets_enabled(&self, enabled: bool, config: Option<Config>) -> NotificationLifecycleTransition {
+        self.services.config_manager.lifecycle().set_mode(enabled, config)
+    }
+
+    pub fn runtime_lifecycle_state(&self) -> NotificationRuntimeState {
+        self.services.config_manager.lifecycle().state()
+    }
+
+    /// Returns whether the latest accepted lifecycle generation is active.
+    pub fn runtime_lifecycle_is_converged(&self) -> bool {
+        self.services.config_manager.lifecycle().is_converged()
+    }
+
     /// Loads the bucket notification configuration
     pub async fn load_bucket_notification_config(
         &self,
@@ -365,9 +410,13 @@ impl NotificationSystem {
         self.services.runtime_view.runtime_status_snapshot().await
     }
 
-    // Add a method to shut down the system
     pub async fn shutdown(&self) {
-        self.services.runtime_facade.shutdown().await;
+        let _ = self.shutdown_checked().await;
+    }
+
+    /// Irreversibly terminates the notification target runtime for this process.
+    pub async fn shutdown_checked(&self) -> Result<(), NotificationError> {
+        self.services.config_manager.lifecycle().terminate().wait().await
     }
 }
 

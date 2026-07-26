@@ -1744,7 +1744,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (bucket) (rustfs_bucket_api_objects_total{job=~\"$job\", bucket=~\"$bucket\"})",
+          "expr": "max by (job, bucket) (rustfs_cluster_usage_buckets_objects_count{job=~\"$job\", bucket=~\"$bucket\"})",
           "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "A"
@@ -1844,7 +1844,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (bucket) (rustfs_bucket_api_usage_bytes{job=~\"$job\", bucket=~\"$bucket\"})",
+          "expr": "max by (job, bucket) (rustfs_cluster_usage_buckets_total_bytes{job=~\"$job\", bucket=~\"$bucket\"})",
           "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "A"
@@ -11583,7 +11583,7 @@
           "text": "All",
           "value": "$__all"
         },
-        "definition": "label_values(rustfs_bucket_api_objects_total,bucket)",
+        "definition": "label_values(rustfs_cluster_usage_buckets_objects_count,bucket)",
         "includeAll": true,
         "label": "Bucket",
         "multi": true,
@@ -11591,7 +11591,7 @@
         "options": [],
         "query": {
           "qryType": 1,
-          "query": "label_values(rustfs_bucket_api_objects_total,bucket)",
+          "query": "label_values(rustfs_cluster_usage_buckets_objects_count,bucket)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

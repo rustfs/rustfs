@@ -70,9 +70,9 @@ pub(crate) use storage_api::{
     init_bucket_metadata_sys, init_ecstore_config, init_local_disks_with_instance_ctx, init_lock_clients,
     is_all_buckets_not_found, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, is_valid_storage_class,
     load_bucket_metadata, options_consumer, prewarm_local_disk_id_map_with_instance_ctx, read_config, record_replication_proxy,
-    rpc_consumer, runtime_sources_consumer, s3_api_consumer, save_config, serialize, set_bucket_metadata,
-    table_catalog_path_hash, to_s3s_etag, topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata,
-    try_migrate_iam_config, try_migrate_server_config, update_bucket_metadata_config, verify_rpc_signature, wrap_reader,
+    rpc_consumer, runtime_sources_consumer, s3_api_consumer, serialize, set_bucket_metadata, table_catalog_path_hash,
+    to_s3s_etag, topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata, try_migrate_iam_config,
+    try_migrate_server_config, update_bucket_metadata_config, verify_rpc_signature, wrap_reader,
 };
 
 #[cfg(test)]

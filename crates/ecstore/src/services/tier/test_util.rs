@@ -74,7 +74,9 @@ use crate::disk::format::FormatV3;
 use crate::disk::{DiskAPI, DiskOption, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, new_disk};
 use crate::services::tier::tier::TierConfigMgr;
 use crate::services::tier::tier_config::{TierConfig, TierMinIO, TierType};
-use crate::services::tier::warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options};
+use crate::services::tier::warm_backend::{
+    TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
+};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::path_join_buf;
 
@@ -142,6 +144,7 @@ pub enum MockWarmOp {
     Put { object: String },
     Get { object: String },
     Remove { object: String },
+    Probe { object: String },
     ExternalRemove { object: String },
     InUse,
 }
@@ -160,7 +163,10 @@ struct MockWarmBackendInner {
     faults: Mutex<FaultConfig>,
     put_read_limit: Mutex<Option<usize>>,
     put_remote_version: Mutex<Option<String>>,
+    response_loss_after_put: AtomicBool,
+    transition_candidate_probe_override: Mutex<Option<TransitionCandidateProbe>>,
     reject_non_empty_remote_versions: AtomicBool,
+    reject_non_empty_remote_version_validations: AtomicUsize,
     fail_remove: AtomicBool,
     exact_remove_count: AtomicUsize,
     op_log: Mutex<Vec<MockWarmOp>>,
@@ -378,9 +384,27 @@ impl MockWarmBackend {
         *self.inner.put_remote_version.lock().await = remote_version;
     }
 
+    /// Make the next PUT persist its body remotely but lose its response.
+    pub fn lose_next_put_response(&self) {
+        self.inner.response_loss_after_put.store(true, Ordering::Release);
+    }
+
+    /// Override candidate probing for transition-recovery fail-closed tests.
+    pub async fn set_transition_candidate_probe_override(&self, probe: Option<TransitionCandidateProbe>) {
+        *self.inner.transition_candidate_probe_override.lock().await = probe;
+    }
+
     /// Reject non-empty remote versions before transition metadata is committed.
     pub fn set_reject_non_empty_remote_versions(&self, reject: bool) {
         self.inner.reject_non_empty_remote_versions.store(reject, Ordering::Release);
+    }
+
+    /// Reject the next non-empty remote version validation without changing
+    /// subsequent exact-version backend cleanup behavior.
+    pub fn reject_next_non_empty_remote_version_validation(&self) {
+        self.inner
+            .reject_non_empty_remote_version_validations
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     /// Enable or disable a persistent remove failure for durability tests.
@@ -442,6 +466,11 @@ impl MockWarmBackend {
     /// Return the exact object/version pairs passed to successful tier removes.
     pub async fn remove_versions(&self) -> Vec<(String, String)> {
         self.inner.remove_versions.lock().await.clone()
+    }
+
+    /// Return the provider-authoritative view of a remote transition candidate.
+    pub async fn probe_transition_candidate_state(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        self.probe_transition_candidate(object).await
     }
 
     /// Number of `get` calls recorded — useful to assert restore reads hit the
@@ -575,12 +604,30 @@ impl MockWarmBackend {
             }
         }
     }
+
+    fn maybe_lose_put_response(&self) -> Result<(), std::io::Error> {
+        if self.inner.response_loss_after_put.swap(false, Ordering::AcqRel) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "mock warm backend lost PUT response after storing remote object",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl WarmBackend for MockWarmBackend {
     fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
-        if self.inner.reject_non_empty_remote_versions.load(Ordering::Acquire) && !remote_version_id.is_empty() {
+        if remote_version_id.is_empty() {
+            return Ok(());
+        }
+        let reject_once = self
+            .inner
+            .reject_non_empty_remote_version_validations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
+            .is_ok();
+        if reject_once || self.inner.reject_non_empty_remote_versions.load(Ordering::Acquire) {
             return Err(std::io::Error::other("mock warm backend requires an unversioned remote object"));
         }
         Ok(())
@@ -599,6 +646,7 @@ impl WarmBackend for MockWarmBackend {
             object: object.to_string(),
         })
         .await;
+        self.maybe_lose_put_response()?;
         Ok(version)
     }
 
@@ -649,6 +697,7 @@ impl WarmBackend for MockWarmBackend {
             object: object.to_string(),
         })
         .await;
+        self.maybe_lose_put_response()?;
         Ok(version)
     }
 
@@ -723,6 +772,26 @@ impl WarmBackend for MockWarmBackend {
         }
         self.inner.exact_remove_count.fetch_add(1, Ordering::AcqRel);
         self.remove(object, rv).await
+    }
+
+    async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        self.precondition().await?;
+        self.record(MockWarmOp::Probe {
+            object: object.to_string(),
+        })
+        .await;
+        if let Some(probe) = self.inner.transition_candidate_probe_override.lock().await.clone() {
+            return Ok(probe);
+        }
+        let objects = self.inner.objects.lock().await;
+        let Some(stored) = objects.get(object) else {
+            return Ok(TransitionCandidateProbe::Missing);
+        };
+        if stored.remote_version_id.is_empty() {
+            Ok(TransitionCandidateProbe::UnversionedPresent)
+        } else {
+            Ok(TransitionCandidateProbe::VersionedPresent(stored.remote_version_id.clone()))
+        }
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
@@ -907,5 +976,75 @@ pub async fn wait_for_free_version_absence(disk_path: &Path, bucket: &str, objec
             return false;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn mock_probe_distinguishes_missing_unversioned_and_versioned_candidates() {
+        let backend = MockWarmBackend::new();
+
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("missing")
+                .await
+                .expect("probe missing candidate"),
+            TransitionCandidateProbe::Missing
+        );
+
+        backend.set_put_remote_version(Some(String::new())).await;
+        backend
+            .put("unversioned", ReaderImpl::Body(Bytes::new()), 0)
+            .await
+            .expect("put unversioned candidate");
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("unversioned")
+                .await
+                .expect("probe unversioned candidate"),
+            TransitionCandidateProbe::UnversionedPresent
+        );
+
+        let remote_version = Uuid::new_v4().to_string();
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        backend
+            .put("versioned", ReaderImpl::Body(Bytes::new()), 0)
+            .await
+            .expect("put versioned candidate");
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("versioned")
+                .await
+                .expect("probe versioned candidate"),
+            TransitionCandidateProbe::VersionedPresent(remote_version)
+        );
+
+        assert_eq!(
+            backend
+                .op_log()
+                .await
+                .into_iter()
+                .filter(|op| matches!(op, MockWarmOp::Probe { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_probe_preserves_fault_fail_closed_behavior() {
+        let backend = MockWarmBackend::new();
+        backend.set_reject_credentials(true).await;
+
+        let err = backend
+            .probe_transition_candidate("remote-object")
+            .await
+            .expect_err("credential rejection must fail the authoritative probe");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(backend.op_log().await.is_empty());
     }
 }

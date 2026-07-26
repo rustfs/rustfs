@@ -160,6 +160,7 @@ pub struct InstanceContext {
     /// Replaces the process-global cancel-token static.
     background_cancel_token: OnceLock<CancellationToken>,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
+    transition_transaction_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     #[cfg(test)]
     tier_delete_journal_recovery_wakeup: tokio::sync::Notify,
 }
@@ -197,6 +198,7 @@ impl InstanceContext {
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
+            transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             #[cfg(test)]
             tier_delete_journal_recovery_wakeup: tokio::sync::Notify::new(),
         }
@@ -370,6 +372,13 @@ impl InstanceContext {
             .insert(store_id)
     }
 
+    pub(crate) fn mark_transition_transaction_recovery_started(&self, store_id: Uuid) -> bool {
+        self.transition_transaction_recovery_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(store_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn wake_tier_delete_journal_recovery(&self) {
         self.tier_delete_journal_recovery_wakeup.notify_one();
@@ -438,8 +447,14 @@ impl std::fmt::Debug for InstanceContext {
                 &self
                     .tier_delete_journal_recovery_stores
                     .lock()
-                    .map(|stores| stores.len())
-                    .unwrap_or_default(),
+                    .map_or(0, |stores| stores.len()),
+            )
+            .field(
+                "transition_transaction_recovery_store_count",
+                &self
+                    .transition_transaction_recovery_stores
+                    .lock()
+                    .map_or(0, |stores| stores.len()),
             )
             .finish_non_exhaustive()
     }

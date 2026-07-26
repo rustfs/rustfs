@@ -732,6 +732,12 @@ where
         let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
+        // MKD creates a bucket, so it has to clear the same authorization boundary as
+        // an S3 CreateBucket call.
+        authorize_operation(session_context, &S3Action::CreateBucket, &bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
         // Create bucket for directory
         match self
             .storage
@@ -891,6 +897,37 @@ where
 mod tests {
     use super::parse_s3_path;
     use rustfs_utils::path;
+
+    /// GHSA-g3vq-vv42-f647: MKD creates a bucket, so it must clear the
+    /// `s3:CreateBucket` authorization boundary before touching the backend.
+    /// The queued success is what makes this a real guard — an unqueued
+    /// create_bucket would fail on its own and the test would pass even if the
+    /// authorization check were removed again.
+    #[tokio::test]
+    async fn ghsa_g3vq_mkd_denied_before_reaching_backend() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_create_bucket_ok();
+
+        let driver = FtpsDriver::new(backend);
+        let user = super::super::server::FtpsUser {
+            username: "denied-user".to_string(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        let result = with_test_auth_override(|_, _, _| false, driver.mkd(&user, "/denied-bucket")).await;
+
+        assert!(
+            result.is_err(),
+            "MKD must fail closed when authorization denies s3:CreateBucket, even though the backend was primed to succeed"
+        );
+    }
 
     proptest::proptest! {
         #[test]

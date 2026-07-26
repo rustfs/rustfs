@@ -16,12 +16,14 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-#[cfg(test)]
+use crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM;
+use crate::storage::storage_api::ecstore_tier::tier_mutation_peer::{self, TierMutationPeerState as EcTierMutationPeerState};
 use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_SYS;
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG,
+    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
     reload_transition_tier_config,
 };
@@ -31,6 +33,9 @@ use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
+use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
+use rustfs_config::notify::NOTIFY_SUB_SYSTEMS;
+use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_filemeta::MetacacheReader;
 use rustfs_iam::store::UserType;
 use rustfs_lock::LockClient;
@@ -54,6 +59,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 pub(crate) mod heal;
 
@@ -68,6 +74,26 @@ const EVENT_RPC_RESPONSE_EMITTED: &str = "rpc_response_emitted";
 const EVENT_RPC_BACKGROUND_TASK_SPAWNED: &str = "rpc_background_task_spawned";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 const HEAL_CONTROL_REPLAY_CACHE_MAX_ENTRIES: usize = 4096;
+const TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE: i32 = 0;
+const TIER_MUTATION_PEER_STATE_PREPARED_WIRE: i32 = 1;
+const TIER_MUTATION_PEER_STATE_COMMITTED_WIRE: i32 = 2;
+const TIER_MUTATION_PEER_STATE_ABORTED_WIRE: i32 = 3;
+
+fn signal_service_response(success: bool, error_info: Option<String>) -> Response<SignalServiceResponse> {
+    Response::new(SignalServiceResponse {
+        success,
+        error_info,
+        protocol_version: rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION,
+    })
+}
+
+fn supports_dynamic_config_rpc(sub_system: &str) -> bool {
+    NOTIFY_SUB_SYSTEMS.contains(&sub_system)
+        || matches!(
+            sub_system,
+            STORAGE_CLASS_SUB_SYS | AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS | SCANNER_SUB_SYS | HEAL_SUB_SYS
+        )
+}
 
 #[derive(Debug)]
 struct HealControlReplayEntry {
@@ -157,11 +183,54 @@ fn validate_admin_heal_control_start(request: &rustfs_common::heal_channel::Heal
     Ok(())
 }
 
-fn scanner_activity_response(namespace_generation: u64) -> ScannerActivityResponse {
+fn scanner_activity_response(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+    dirty_usage: rustfs_scanner::ScannerDirtyUsageState,
+) -> ScannerActivityResponse {
     ScannerActivityResponse {
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
         namespace_generation,
         maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+        topology_digest: topology_digest.to_vec().into(),
+        data_movement_active,
+        response_proof: Bytes::new(),
+        dirty_usage_generation: dirty_usage.generation,
+        dirty_usage_pending: dirty_usage.pending,
+    }
+}
+
+fn previous_scanner_activity_response(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+) -> ScannerActivityResponse {
+    ScannerActivityResponse {
+        instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        namespace_generation,
+        maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        protocol_version: SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+        topology_digest: topology_digest.to_vec().into(),
+        data_movement_active,
+        response_proof: Bytes::new(),
+        dirty_usage_generation: 0,
+        dirty_usage_pending: false,
+    }
+}
+
+fn legacy_scanner_activity_response(namespace_generation: u64) -> ScannerActivityResponse {
+    ScannerActivityResponse {
+        instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        namespace_generation,
+        maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
+        protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+        topology_digest: Bytes::new(),
+        data_movement_active: false,
+        response_proof: Bytes::new(),
+        dirty_usage_generation: 0,
+        dirty_usage_pending: false,
     }
 }
 
@@ -482,6 +551,203 @@ async fn execute_heal_control_envelope_with_manager(
         remove_heal_control_replay(&mut replay_cache, &request_id, &replay_entry);
     }
     Ok(result)
+}
+
+#[derive(Clone, Default)]
+pub struct TierMutationControlRpcService {
+    context: Option<Arc<runtime_sources::AppContext>>,
+}
+
+impl std::fmt::Debug for TierMutationControlRpcService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TierMutationControlRpcService")
+            .field("context_present", &self.context.is_some())
+            .finish()
+    }
+}
+
+pub fn make_tier_mutation_control_server() -> TierMutationControlRpcService {
+    TierMutationControlRpcService {
+        context: runtime_sources::current_app_context(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn make_tier_mutation_control_server_for_context(
+    context: Option<Arc<runtime_sources::AppContext>>,
+) -> TierMutationControlRpcService {
+    TierMutationControlRpcService { context }
+}
+
+impl TierMutationControlRpcService {
+    fn resolve_object_store(&self) -> Option<Arc<ECStore>> {
+        let context = self.context.clone().or_else(runtime_sources::current_app_context);
+        runtime_sources::current_object_store_handle_for_context(context.as_deref())
+    }
+
+    async fn execute_tier_mutation(
+        &self,
+        request: &Request<()>,
+        version: u32,
+        phase: rustfs_protos::TierMutationRpcPhase,
+        mutation_id: &str,
+        canonical_payload: &Bytes,
+    ) -> Result<Response<TierMutationControlResponse>, Status> {
+        validate_tier_mutation_payload_size(phase, canonical_payload.len())?;
+        let mutation_id = parse_tier_mutation_id(mutation_id)?;
+        let body = rustfs_protos::canonical_tier_mutation_rpc_body(version, phase, mutation_id, canonical_payload)
+            .map_err(|_| Status::invalid_argument("tier mutation request length cannot be represented"))?;
+        verify_tonic_canonical_body_digest(request, &body)
+            .map_err(|err| Status::permission_denied(format!("tier mutation authentication failed: {err}")))?;
+        let store = self
+            .resolve_object_store()
+            .ok_or_else(|| Status::failed_precondition("tier mutation object store is not initialized"))?;
+
+        match tier_mutation_peer::handle_tier_mutation_peer_request(store, version, phase, mutation_id, canonical_payload).await {
+            Ok(outcome) => tier_mutation_control_response(TierMutationControlResponseInput {
+                version,
+                phase,
+                mutation_id,
+                canonical_payload,
+                success: true,
+                state: tier_mutation_peer_state_to_proto_wire(outcome.state),
+                applied: outcome.applied,
+                error_info: None,
+            }),
+            Err(err) => tier_mutation_control_response(TierMutationControlResponseInput {
+                version,
+                phase,
+                mutation_id,
+                canonical_payload,
+                success: false,
+                state: TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE,
+                applied: false,
+                error_info: Some(err.to_string()),
+            }),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl tier_mutation_control_service_server::TierMutationControlService for TierMutationControlRpcService {
+    async fn prepare_tier_mutation(
+        &self,
+        request: Request<TierMutationPrepareRequest>,
+    ) -> Result<Response<TierMutationControlResponse>, Status> {
+        let (metadata, extensions, inner) = request.into_parts();
+        let request = Request::from_parts(metadata, extensions, ());
+        self.execute_tier_mutation(
+            &request,
+            inner.version,
+            rustfs_protos::TierMutationRpcPhase::Prepare,
+            &inner.mutation_id,
+            &inner.canonical_payload,
+        )
+        .await
+    }
+
+    async fn commit_tier_mutation(
+        &self,
+        request: Request<TierMutationCommitRequest>,
+    ) -> Result<Response<TierMutationControlResponse>, Status> {
+        let (metadata, extensions, inner) = request.into_parts();
+        let request = Request::from_parts(metadata, extensions, ());
+        self.execute_tier_mutation(
+            &request,
+            inner.version,
+            rustfs_protos::TierMutationRpcPhase::Commit,
+            &inner.mutation_id,
+            &inner.canonical_payload,
+        )
+        .await
+    }
+
+    async fn abort_tier_mutation(
+        &self,
+        request: Request<TierMutationAbortRequest>,
+    ) -> Result<Response<TierMutationControlResponse>, Status> {
+        let (metadata, extensions, inner) = request.into_parts();
+        let request = Request::from_parts(metadata, extensions, ());
+        self.execute_tier_mutation(
+            &request,
+            inner.version,
+            rustfs_protos::TierMutationRpcPhase::Abort,
+            &inner.mutation_id,
+            &inner.canonical_payload,
+        )
+        .await
+    }
+}
+
+fn parse_tier_mutation_id(mutation_id: &str) -> Result<Uuid, Status> {
+    let parsed = Uuid::parse_str(mutation_id).map_err(|_| Status::invalid_argument("tier mutation id is invalid"))?;
+    if parsed.to_string() != mutation_id {
+        return Err(Status::invalid_argument("tier mutation id is not canonical"));
+    }
+    Ok(parsed)
+}
+
+fn validate_tier_mutation_payload_size(phase: rustfs_protos::TierMutationRpcPhase, payload_len: usize) -> Result<(), Status> {
+    let limit = match phase {
+        rustfs_protos::TierMutationRpcPhase::Prepare => rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE,
+        rustfs_protos::TierMutationRpcPhase::Commit => rustfs_protos::TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE,
+        rustfs_protos::TierMutationRpcPhase::Abort => {
+            if payload_len != 0 {
+                return Err(Status::invalid_argument("tier mutation abort payload must be empty"));
+            }
+            return Ok(());
+        }
+        _ => return Err(Status::invalid_argument("tier mutation rpc phase is unsupported")),
+    };
+    if payload_len > limit {
+        return Err(Status::invalid_argument("tier mutation payload exceeds size limit"));
+    }
+    Ok(())
+}
+
+struct TierMutationControlResponseInput<'a> {
+    version: u32,
+    phase: rustfs_protos::TierMutationRpcPhase,
+    mutation_id: Uuid,
+    canonical_payload: &'a [u8],
+    success: bool,
+    state: i32,
+    applied: bool,
+    error_info: Option<String>,
+}
+
+fn tier_mutation_control_response(
+    input: TierMutationControlResponseInput<'_>,
+) -> Result<Response<TierMutationControlResponse>, Status> {
+    let canonical_response =
+        rustfs_protos::canonical_tier_mutation_rpc_response_body(rustfs_protos::TierMutationRpcResponseProofInput {
+            version: input.version,
+            phase: input.phase,
+            mutation_id: input.mutation_id,
+            canonical_payload: input.canonical_payload,
+            success: input.success,
+            state: input.state,
+            applied: input.applied,
+            error_info: input.error_info.as_deref(),
+        })
+        .map_err(|_| Status::internal("tier mutation response length cannot be represented"))?;
+    let response_proof = sign_tonic_rpc_response_proof(&canonical_response)
+        .map_err(|_| Status::internal("tier mutation response proof is unavailable"))?;
+    Ok(Response::new(TierMutationControlResponse {
+        success: input.success,
+        state: input.state,
+        applied: input.applied,
+        error_info: input.error_info,
+        response_proof: response_proof.into(),
+    }))
+}
+
+fn tier_mutation_peer_state_to_proto_wire(state: EcTierMutationPeerState) -> i32 {
+    match state {
+        EcTierMutationPeerState::Prepared => TIER_MUTATION_PEER_STATE_PREPARED_WIRE,
+        EcTierMutationPeerState::Committed => TIER_MUTATION_PEER_STATE_COMMITTED_WIRE,
+        EcTierMutationPeerState::Aborted => TIER_MUTATION_PEER_STATE_ABORTED_WIRE,
+    }
 }
 
 #[tonic::async_trait]
@@ -995,9 +1261,28 @@ impl Node for NodeService {
 
     async fn get_bucket_stats(
         &self,
-        _request: Request<GetBucketStatsDataRequest>,
+        request: Request<GetBucketStatsDataRequest>,
     ) -> Result<Response<GetBucketStatsDataResponse>, Status> {
-        Err(unimplemented_rpc("get_bucket_stats"))
+        let bucket = request.into_inner().bucket;
+        if bucket.is_empty() {
+            return Err(Status::invalid_argument("bucket is required"));
+        }
+        let context = self.context.clone().or_else(runtime_sources::current_app_context);
+        let Some(stats) = runtime_sources::current_replication_stats_handle_for_context(context.as_deref()) else {
+            return Ok(Response::new(GetBucketStatsDataResponse {
+                success: false,
+                bucket_stats: Bytes::new(),
+                error_info: Some("replication statistics provider is unavailable".to_string()),
+            }));
+        };
+        let bucket_stats = stats.get_latest_replication_stats(&bucket).await;
+        let bucket_stats =
+            rmp_serde::to_vec_named(&bucket_stats).map_err(|_| Status::internal("failed to serialize replication statistics"))?;
+        Ok(Response::new(GetBucketStatsDataResponse {
+            success: true,
+            bucket_stats: bucket_stats.into(),
+            error_info: None,
+        }))
     }
 
     async fn get_sr_metrics(
@@ -1166,13 +1451,20 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
+        let Some(iam_sys) = self
+            .context
+            .as_ref()
+            .map(|context| context.iam().handle())
+            .or_else(runtime_sources::current_iam_handle)
+        else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
-        let resp = iam_sys.delete_service_account(&access_key, false).await;
+        // This legacy RPC is a cache notification. Reloading shared state keeps a
+        // delayed delete notification from removing a recreated service account.
+        let resp = iam_sys.load_service_account(&access_key).await;
         if let Err(err) = resp {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
@@ -1314,51 +1606,154 @@ impl Node for NodeService {
         let raw_signal = vars.get(PEER_RESTSIGNAL).map(String::as_str);
         let signal = raw_signal.and_then(|value| value.parse::<u64>().ok());
         let sub_system = vars.get(PEER_RESTSUB_SYS).map(String::as_str).unwrap_or_default();
+        let dry_run = match vars.get(PEER_RESTDRY_RUN).map(String::as_str) {
+            None => false,
+            Some(value) => match value.parse::<bool>() {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(signal_service_response(false, Some(format!("invalid dry-run value: {value}"))));
+                }
+            },
+        };
 
         match signal {
             Some(SERVICE_SIGNAL_REFRESH_CONFIG) => match reload_runtime_config_snapshot().await {
-                Ok(()) => Ok(Response::new(SignalServiceResponse {
-                    success: true,
-                    error_info: None,
-                })),
-                Err(err) => Ok(Response::new(SignalServiceResponse {
-                    success: false,
-                    error_info: Some(err.to_string()),
-                })),
+                Ok(()) => Ok(signal_service_response(true, None)),
+                Err(_) => Ok(signal_service_response(false, Some("runtime config snapshot reload failed".to_string()))),
             },
-            Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => match reload_dynamic_config_runtime_state(sub_system).await {
-                Ok(()) => Ok(Response::new(SignalServiceResponse {
-                    success: true,
-                    error_info: None,
-                })),
-                Err(err) => Ok(Response::new(SignalServiceResponse {
-                    success: false,
-                    error_info: Some(err.to_string()),
-                })),
-            },
-            Some(other) => Ok(Response::new(SignalServiceResponse {
-                success: false,
-                error_info: Some(format!("unsupported service signal: {other}")),
-            })),
-            None if raw_signal.is_some() => Ok(Response::new(SignalServiceResponse {
-                success: false,
-                error_info: Some(format!("invalid service signal value: {}", raw_signal.unwrap_or_default())),
-            })),
-            None => Ok(Response::new(SignalServiceResponse {
-                success: false,
-                error_info: Some("missing service signal".to_string()),
-            })),
+            Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => {
+                let supported = sub_system == MODULE_SWITCHES_SIGNAL_SUBSYSTEM || supports_dynamic_config_rpc(sub_system);
+                if !supported {
+                    return Ok(signal_service_response(
+                        false,
+                        Some(format!("unsupported dynamic config subsystem: {sub_system}")),
+                    ));
+                }
+                if dry_run {
+                    return Ok(signal_service_response(true, None));
+                }
+                match reload_dynamic_config_runtime_state(sub_system).await {
+                    Ok(()) => Ok(signal_service_response(true, None)),
+                    Err(_) => Ok(signal_service_response(
+                        false,
+                        Some(format!("dynamic config reload failed for {sub_system}")),
+                    )),
+                }
+            }
+            Some(other) => Ok(signal_service_response(false, Some(format!("unsupported service signal: {other}")))),
+            None if raw_signal.is_some() => Ok(signal_service_response(
+                false,
+                Some(format!("invalid service signal value: {}", raw_signal.unwrap_or_default())),
+            )),
+            None => Ok(signal_service_response(false, Some("missing service signal".to_string()))),
         }
     }
 
     async fn scanner_activity(
         &self,
-        _request: Request<ScannerActivityRequest>,
+        request: Request<ScannerActivityRequest>,
     ) -> Result<Response<ScannerActivityResponse>, Status> {
+        let request_protocol = request.get_ref().protocol_version;
+        match request_protocol {
+            // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): legacy request body is unbound. Remove after protocol v0 peers are unsupported.
+            SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION => {
+                if !request.get_ref().acknowledge_instance_id.is_empty()
+                    || request.get_ref().acknowledge_dirty_usage_generation != 0
+                {
+                    return Err(Status::invalid_argument("legacy scanner activity request cannot acknowledge dirty usage"));
+                }
+            }
+            SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
+                verify_tonic_canonical_body_digest(&request, request.get_ref().challenge.as_ref())
+                    .map_err(|err| Status::permission_denied(format!("scanner activity authentication failed: {err}")))?;
+                if !request.get_ref().acknowledge_instance_id.is_empty()
+                    || request.get_ref().acknowledge_dirty_usage_generation != 0
+                {
+                    return Err(Status::invalid_argument("scanner activity protocol v4 cannot acknowledge dirty usage"));
+                }
+            }
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+                let canonical = rustfs_protos::canonical_scanner_activity_request_body(request.get_ref())
+                    .map_err(|_| Status::invalid_argument("scanner activity request is too large to authenticate"))?;
+                verify_tonic_canonical_body_digest(&request, &canonical)
+                    .map_err(|err| Status::permission_denied(format!("scanner activity authentication failed: {err}")))?;
+                let has_acknowledgement = !request.get_ref().acknowledge_instance_id.is_empty();
+                if has_acknowledgement != (request.get_ref().acknowledge_dirty_usage_generation != 0) {
+                    return Err(Status::invalid_argument(
+                        "scanner dirty usage acknowledgement requires both instance ID and generation",
+                    ));
+                }
+            }
+            version => {
+                return Err(Status::failed_precondition(format!(
+                    "unsupported scanner activity request protocol {version}"
+                )));
+            }
+        }
+        let challenge_len = request.get_ref().challenge.len();
+        if challenge_len != 16 && !(request_protocol == SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION && challenge_len == 0) {
+            return Err(Status::invalid_argument("scanner activity challenge must be 16 bytes"));
+        }
         let store = self
             .resolve_object_store()
             .ok_or_else(|| Status::unavailable("storage layer is not initialized"))?;
-        Ok(Response::new(scanner_activity_response(store.scanner_namespace_mutation_generation())))
+        if request.get_ref().challenge.is_empty() {
+            // Older peers send an empty protocol-0 request and cannot establish
+            // the topology fence required for distributed usage publication.
+            return Ok(Response::new(legacy_scanner_activity_response(
+                store.scanner_namespace_mutation_generation(),
+            )));
+        }
+        let request = request.into_inner();
+        let challenge: [u8; 16] = request
+            .challenge
+            .as_ref()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("scanner activity challenge must be 16 bytes"))?;
+        if !request.acknowledge_instance_id.is_empty() {
+            rustfs_scanner::acknowledge_dirty_usage_generation(
+                &request.acknowledge_instance_id,
+                request.acknowledge_dirty_usage_generation,
+            )
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        }
+        let namespace_generation = store.scanner_namespace_mutation_generation();
+        let topology_digest = rustfs_scanner::scanner_topology_digest(store.as_ref());
+        let data_movement_active = store.scanner_data_movement_active().await;
+        let mut response = match request_protocol {
+            SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION | SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
+                previous_scanner_activity_response(namespace_generation, topology_digest, data_movement_active)
+            }
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => scanner_activity_response(
+                namespace_generation,
+                topology_digest,
+                data_movement_active,
+                rustfs_scanner::scanner_dirty_usage_state(),
+            ),
+            version => {
+                return Err(Status::failed_precondition(format!(
+                    "unsupported scanner activity request protocol {version}"
+                )));
+            }
+        };
+        let canonical = match response.protocol_version {
+            SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION => {
+                rustfs_protos::canonical_scanner_activity_v4_response_body(&challenge, &response)
+            }
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+                rustfs_protos::canonical_scanner_activity_response_body(&challenge, &response)
+            }
+            version => {
+                return Err(Status::internal(format!(
+                    "scanner activity response selected unsupported protocol {version}"
+                )));
+            }
+        }
+        .map_err(|_| Status::internal("scanner activity response is too large to authenticate"))?;
+        response.response_proof = sign_tonic_rpc_response_proof(&canonical)
+            .map_err(|_| Status::unavailable("scanner activity response authentication is unavailable"))?
+            .into();
+        Ok(Response::new(response))
     }
 
     async fn background_heal_status(
@@ -1614,11 +2009,14 @@ impl Node for NodeService {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService, PEER_RESTSIGNAL,
-        PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
-        admit_heal_control_replay, background_rebalance_start_error_message, execute_heal_control_envelope_with_manager,
-        initialize_heal_topology_fingerprint, make_heal_control_server, make_heal_control_server_with_cache, make_server,
-        remove_heal_control_replay, scanner_activity_response, stop_rebalance_response,
+        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, MetricType, Node as _, NodeService,
+        PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+        SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+        STORAGE_CLASS_SUB_SYS, admit_heal_control_replay, background_rebalance_start_error_message,
+        execute_heal_control_envelope_with_manager, initialize_heal_topology_fingerprint, legacy_scanner_activity_response,
+        make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
+        make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
+        scanner_activity_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{HealBucketInfo, HealEndpoint};
@@ -1629,6 +2027,14 @@ mod tests {
     };
     use bytes::Bytes;
     use rustfs_heal::heal::{manager::HealManager, storage::HealStorageAPI};
+    use rustfs_iam::{
+        store::{
+            Store as _,
+            object::{IAM_CONFIG_PREFIX, ObjectStore},
+        },
+        sys::NewServiceAccountOpts,
+    };
+    use rustfs_kms::KmsServiceManager;
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
@@ -1643,12 +2049,14 @@ mod tests {
         MakeVolumesRequest, Mss, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest,
         ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest,
         RenamePartRequest, ScannerActivityRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest,
-        StatVolumeRequest, StopRebalanceRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest,
-        WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        StatVolumeRequest, StopRebalanceRequest, TierMutationPeerState, TierMutationPrepareRequest,
+        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
         node_service_server::NodeServiceServer,
+        tier_mutation_control_service_server::TierMutationControlService as _,
     };
     use std::{collections::HashMap, sync::Arc};
     use time::OffsetDateTime;
@@ -1967,6 +2375,256 @@ mod tests {
             .insert("x-rustfs-rpc-auth-version", "2".parse().expect("valid metadata value"));
     }
 
+    fn signed_tier_prepare_request(mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Request<TierMutationPrepareRequest> {
+        let mut request = Request::new(TierMutationPrepareRequest {
+            version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            mutation_id: mutation_id.to_string(),
+            canonical_payload,
+        });
+        let body = rustfs_protos::canonical_tier_mutation_rpc_body(
+            request.get_ref().version,
+            rustfs_protos::TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &request.get_ref().canonical_payload,
+        )
+        .expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+        request
+    }
+
+    fn delete_request_message(options: &str) -> DeleteRequest {
+        DeleteRequest {
+            disk: "http://node-a:9000/data/rustfs0".to_string(),
+            volume: "bucket".to_string(),
+            path: "object".to_string(),
+            options: options.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_mutation_body_digest_gate_runs_before_disk_lookup() {
+        let service = make_server();
+
+        // A digestless mutation stays accepted through the default fail-open gate (rolling
+        // upgrade posture) and proceeds to the disk lookup.
+        let digestless = service
+            .delete(Request::new(delete_request_message("{}")))
+            .await
+            .expect("a digestless mutation must stay accepted while the strict gate is off");
+        assert!(!digestless.into_inner().success, "the unknown test disk cannot resolve");
+
+        // A digest bound to different request contents must be rejected before any disk work.
+        let mut tampered = Request::new(delete_request_message("{}"));
+        let other_body = rustfs_protos::canonical_delete_request_body(&delete_request_message("{\"recursive\":true}"))
+            .expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut tampered, &other_body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut tampered);
+        let tampered = service
+            .delete(tampered)
+            .await
+            .expect_err("a tampered mutation must fail closed");
+        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
+
+        // A digest matching the received wire fields authenticates and proceeds to the disk lookup.
+        let mut signed = Request::new(delete_request_message("{}"));
+        let body = rustfs_protos::canonical_delete_request_body(signed.get_ref()).expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut signed, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut signed);
+        let signed = service
+            .delete(signed)
+            .await
+            .expect("a correctly body-bound mutation must pass the digest gate");
+        assert!(!signed.into_inner().success, "the unknown test disk cannot resolve");
+    }
+
+    /// Per-handler wiring check for every mutating disk RPC. A mismatched digest must be rejected
+    /// (catches a handler that omits its `verify_disk_mutation_digest` gate) and a correctly
+    /// body-bound digest must pass the gate (catches a handler wired to the wrong
+    /// `canonical_*_request_body`, which would reject legitimate traffic). Both failure modes are
+    /// realistic across these copy-pasted call sites and are otherwise invisible to the digestless
+    /// fail-open tests.
+    #[tokio::test]
+    async fn every_mutating_handler_enforces_its_body_digest() {
+        let service = make_server();
+        let disk = "http://node-a:9000/data/rustfs0".to_string();
+
+        macro_rules! assert_gated {
+            ($method:ident, $msg:expr, $canonical:path) => {{
+                let msg = $msg;
+
+                // Correct digest: the gate passes and the handler proceeds to the (unknown) disk
+                // lookup, so it must NOT fail with PermissionDenied.
+                let mut ok = Request::new(msg.clone());
+                let body = $canonical(ok.get_ref()).expect("canonical body should encode");
+                set_tonic_canonical_body_digest(&mut ok, &body).expect("digest metadata should encode");
+                mark_v2_authenticated(&mut ok);
+                if let Err(status) = service.$method(ok).await {
+                    assert_ne!(
+                        status.code(),
+                        tonic::Code::PermissionDenied,
+                        concat!(stringify!($method), ": a correctly body-bound request must pass the digest gate"),
+                    );
+                }
+
+                // Mismatched digest: the gate must reject before any disk work.
+                let mut bad = Request::new(msg);
+                set_tonic_canonical_body_digest(&mut bad, b"unrelated-canonical-body").expect("digest metadata should encode");
+                mark_v2_authenticated(&mut bad);
+                let err = service
+                    .$method(bad)
+                    .await
+                    .expect_err(concat!(stringify!($method), ": a tampered body must be rejected"));
+                assert_eq!(
+                    err.code(),
+                    tonic::Code::PermissionDenied,
+                    concat!(stringify!($method), " must fail closed on a body-digest mismatch"),
+                );
+            }};
+        }
+
+        assert_gated!(
+            rename_data,
+            RenameDataRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                file_info: "{}".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                file_info_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_gated!(
+            delete_version,
+            DeleteVersionRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                force_del_marker: false,
+                opts: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_delete_version_request_body
+        );
+        assert_gated!(
+            delete_versions,
+            DeleteVersionsRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                versions: vec!["a".into()],
+                opts: "{}".into(),
+                versions_bin: vec![vec![0x80].into()],
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_delete_versions_request_body
+        );
+        assert_gated!(
+            write_metadata,
+            WriteMetadataRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_write_metadata_request_body
+        );
+        assert_gated!(
+            update_metadata,
+            UpdateMetadataRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                file_info: "{}".into(),
+                opts: "{}".into(),
+                file_info_bin: vec![0x80].into(),
+                opts_bin: vec![0x80].into(),
+            },
+            rustfs_protos::canonical_update_metadata_request_body
+        );
+        assert_gated!(
+            write_all,
+            WriteAllRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                data: vec![0x01, 0x02].into(),
+            },
+            rustfs_protos::canonical_write_all_request_body
+        );
+        assert_gated!(
+            delete,
+            DeleteRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                path: "p".into(),
+                options: "{}".into(),
+            },
+            rustfs_protos::canonical_delete_request_body
+        );
+        assert_gated!(
+            delete_paths,
+            DeletePathsRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                paths: vec!["a".into()],
+            },
+            rustfs_protos::canonical_delete_paths_request_body
+        );
+        assert_gated!(
+            rename_file,
+            RenameFileRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+            },
+            rustfs_protos::canonical_rename_file_request_body
+        );
+        assert_gated!(
+            rename_part,
+            RenamePartRequest {
+                disk: disk.clone(),
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                meta: vec![0x03].into(),
+            },
+            rustfs_protos::canonical_rename_part_request_body
+        );
+        assert_gated!(
+            delete_volume,
+            DeleteVolumeRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+                force: true,
+            },
+            rustfs_protos::canonical_delete_volume_request_body
+        );
+        assert_gated!(
+            make_volume,
+            MakeVolumeRequest {
+                disk: disk.clone(),
+                volume: "v".into(),
+            },
+            rustfs_protos::canonical_make_volume_request_body
+        );
+        assert_gated!(
+            make_volumes,
+            MakeVolumesRequest {
+                disk,
+                volumes: vec!["v".into()],
+            },
+            rustfs_protos::canonical_make_volumes_request_body
+        );
+    }
+
     #[tokio::test]
     async fn heal_control_requires_body_bound_auth_before_topology_validation() {
         let service = make_heal_control_server();
@@ -2002,6 +2660,161 @@ mod tests {
             .await
             .expect_err("authenticated commands still require initialized topology");
         assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn tier_mutation_control_requires_body_bound_auth_before_store_lookup() {
+        let service = make_tier_mutation_control_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4();
+        let unsigned = service
+            .prepare_tier_mutation(Request::new(TierMutationPrepareRequest {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                mutation_id: mutation_id.to_string(),
+                canonical_payload: Bytes::from_static(b"intent"),
+            }))
+            .await
+            .expect_err("unsigned request must fail before store lookup");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
+
+        let mut tampered = signed_tier_prepare_request(mutation_id, Bytes::from_static(b"intent"));
+        let other_body = rustfs_protos::canonical_tier_mutation_rpc_body(
+            rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            rustfs_protos::TierMutationRpcPhase::Commit,
+            mutation_id,
+            b"intent",
+        )
+        .expect("small request should encode");
+        set_tonic_canonical_body_digest(&mut tampered, &other_body).expect("digest metadata should encode");
+        let tampered = service
+            .prepare_tier_mutation(tampered)
+            .await
+            .expect_err("phase replay must fail body-bound authentication");
+        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
+
+        let signed = signed_tier_prepare_request(mutation_id, Bytes::from_static(b"intent"));
+        let unavailable = service
+            .prepare_tier_mutation(signed)
+            .await
+            .expect_err("authenticated request still requires initialized object store");
+        assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn tier_mutation_control_requires_canonical_mutation_id() {
+        let service = make_tier_mutation_control_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let error = service
+            .prepare_tier_mutation(Request::new(TierMutationPrepareRequest {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                mutation_id,
+                canonical_payload: Bytes::from_static(b"intent"),
+            }))
+            .await
+            .expect_err("uppercase UUID must not pass canonical request binding");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn tier_mutation_control_rejects_old_protocol_version_before_store_lookup() {
+        let service = make_tier_mutation_control_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4();
+        let payload = Bytes::from_static(b"intent");
+        let mut request = Request::new(TierMutationPrepareRequest {
+            version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION - 1,
+            mutation_id: mutation_id.to_string(),
+            canonical_payload: payload,
+        });
+        let body = rustfs_protos::canonical_tier_mutation_rpc_body(
+            request.get_ref().version,
+            rustfs_protos::TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &request.get_ref().canonical_payload,
+        )
+        .expect("old-version request should encode for rejection test");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+
+        let error = service
+            .prepare_tier_mutation(request)
+            .await
+            .expect_err("old tier mutation protocol version must fail closed");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn tier_mutation_control_rejects_oversized_prepare_before_auth_and_store_lookup() {
+        let service = make_tier_mutation_control_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4();
+        let oversized = Bytes::from(vec![0; rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 1]);
+        let error = service
+            .prepare_tier_mutation(Request::new(TierMutationPrepareRequest {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                mutation_id: mutation_id.to_string(),
+                canonical_payload: oversized,
+            }))
+            .await
+            .expect_err("oversized prepare must fail before digest construction");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn tier_mutation_peer_state_wire_constants_match_generated_proto() {
+        assert_eq!(
+            super::TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE,
+            TierMutationPeerState::Unspecified as i32
+        );
+        assert_eq!(super::TIER_MUTATION_PEER_STATE_PREPARED_WIRE, TierMutationPeerState::Prepared as i32);
+        assert_eq!(super::TIER_MUTATION_PEER_STATE_COMMITTED_WIRE, TierMutationPeerState::Committed as i32);
+        assert_eq!(super::TIER_MUTATION_PEER_STATE_ABORTED_WIRE, TierMutationPeerState::Aborted as i32);
+    }
+
+    #[test]
+    fn tier_mutation_control_response_proof_binds_request_and_result() {
+        let _ = rustfs_credentials::set_global_rpc_secret("tier-mutation-control-response-proof-test-secret".to_string());
+        let mutation_id = uuid::Uuid::new_v4();
+        let payload = b"canonical-intent-record";
+        let response = super::tier_mutation_control_response(super::TierMutationControlResponseInput {
+            version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: rustfs_protos::TierMutationRpcPhase::Prepare,
+            mutation_id,
+            canonical_payload: payload,
+            success: false,
+            state: TierMutationPeerState::Unspecified as i32,
+            applied: false,
+            error_info: Some("store failed".to_string()),
+        })
+        .expect("response proof should be signed")
+        .into_inner();
+        let canonical =
+            rustfs_protos::canonical_tier_mutation_rpc_response_body(rustfs_protos::TierMutationRpcResponseProofInput {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: rustfs_protos::TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("store failed"),
+            })
+            .expect("small mutation response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
+            .expect("proof must authenticate the exact response");
+
+        let tampered =
+            rustfs_protos::canonical_tier_mutation_rpc_response_body(rustfs_protos::TierMutationRpcResponseProofInput {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: rustfs_protos::TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("store failed"),
+            })
+            .expect("small mutation response should encode");
+        let error = crate::storage::storage_api::verify_tonic_rpc_response_proof(&tampered, &response.response_proof)
+            .expect_err("proof must reject a tampered success flag");
+        assert_eq!(error.to_string(), "Invalid RPC response proof");
     }
 
     #[tokio::test]
@@ -2319,6 +3132,7 @@ mod tests {
 
         let request = Request::new(DeleteBucketRequest {
             bucket: "test-bucket".to_string(),
+            options: String::new(),
         });
 
         let response = service.delete_bucket(request).await;
@@ -2327,6 +3141,24 @@ mod tests {
         let delete_response = response.unwrap().into_inner();
         // Response should be valid regardless of success/failure
         assert!(delete_response.success || delete_response.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_rejects_invalid_options() {
+        let service = create_test_node_service();
+
+        let request = Request::new(DeleteBucketRequest {
+            bucket: "test-bucket".to_string(),
+            options: "invalid json".to_string(),
+        });
+
+        let response = service
+            .delete_bucket(request)
+            .await
+            .expect("RPC response should be returned")
+            .into_inner();
+        assert!(!response.success);
+        assert!(response.error.is_some());
     }
 
     #[tokio::test]
@@ -3653,6 +4485,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_service_account_rpc_reloads_instead_of_deleting_shared_state() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let temp_dir = tempfile::tempdir().expect("service-account RPC test directory");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build isolated IAM");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            Arc::clone(&iam),
+            Arc::new(KmsServiceManager::new()),
+        ));
+        let service = make_server_for_context(Some(context));
+        let access_key = "RPCRELOADSERVICE01";
+        iam.new_service_account(
+            "parent-user",
+            None,
+            NewServiceAccountOpts {
+                access_key: access_key.to_string(),
+                secret_key: "rpcReloadServiceSecret123".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create service account");
+
+        let response = service
+            .delete_service_account(Request::new(DeleteServiceAccountRequest {
+                access_key: access_key.to_string(),
+            }))
+            .await
+            .expect("legacy notification RPC response")
+            .into_inner();
+
+        assert!(response.success, "cache reload notification must succeed");
+        assert!(
+            iam.get_service_account(access_key).await.is_ok(),
+            "legacy delete notification must not delete durable service-account state"
+        );
+    }
+
+    #[tokio::test]
     async fn test_load_user_empty_access_key() {
         let service = create_test_node_service();
 
@@ -3773,24 +4658,199 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scanner_activity_requires_storage_layer() {
+    async fn test_scanner_activity_requires_body_bound_auth_before_storage_lookup() {
         let service = create_test_node_service();
 
-        let err = service
-            .scanner_activity(Request::new(ScannerActivityRequest {}))
+        let legacy = service
+            .scanner_activity(Request::new(ScannerActivityRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+                acknowledge_instance_id: String::new(),
+                acknowledge_dirty_usage_generation: 0,
+            }))
             .await
-            .expect_err("activity queries must fail closed before storage is initialized");
+            .expect_err("a rolling-upgrade request should pass authentication before storage lookup");
+        assert_eq!(legacy.code(), tonic::Code::Unavailable);
 
-        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let unsupported = service
+            .scanner_activity(Request::new(ScannerActivityRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION + 1,
+                acknowledge_instance_id: String::new(),
+                acknowledge_dirty_usage_generation: 0,
+            }))
+            .await
+            .expect_err("an unknown request protocol must fail before storage lookup");
+        assert_eq!(unsupported.code(), tonic::Code::FailedPrecondition);
+
+        let malformed_legacy = service
+            .scanner_activity(Request::new(ScannerActivityRequest {
+                challenge: vec![7; 15].into(),
+                protocol_version: SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
+                acknowledge_instance_id: String::new(),
+                acknowledge_dirty_usage_generation: 0,
+            }))
+            .await
+            .expect_err("a malformed legacy challenge must fail before storage lookup");
+        assert_eq!(malformed_legacy.code(), tonic::Code::InvalidArgument);
+
+        let unsigned = service
+            .scanner_activity(Request::new(ScannerActivityRequest {
+                challenge: vec![7; 16].into(),
+                protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+                acknowledge_instance_id: String::new(),
+                acknowledge_dirty_usage_generation: 0,
+            }))
+            .await
+            .expect_err("unsigned activity queries must fail before storage lookup");
+        assert_eq!(unsigned.code(), tonic::Code::PermissionDenied);
+
+        let mut malformed_current = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 15].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            acknowledge_instance_id: String::new(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        let malformed_canonical = rustfs_protos::canonical_scanner_activity_request_body(malformed_current.get_ref())
+            .expect("scanner activity request should encode");
+        set_tonic_canonical_body_digest(&mut malformed_current, &malformed_canonical).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut malformed_current);
+        let malformed_current = service
+            .scanner_activity(malformed_current)
+            .await
+            .expect_err("a signed malformed challenge must fail before storage lookup");
+        assert_eq!(malformed_current.code(), tonic::Code::InvalidArgument);
+
+        let mut tampered = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            acknowledge_instance_id: String::new(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        let other = ScannerActivityRequest {
+            challenge: vec![8; 16].into(),
+            ..tampered.get_ref().clone()
+        };
+        let other_canonical =
+            rustfs_protos::canonical_scanner_activity_request_body(&other).expect("scanner activity request should encode");
+        set_tonic_canonical_body_digest(&mut tampered, &other_canonical).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut tampered);
+        let tampered = service
+            .scanner_activity(tampered)
+            .await
+            .expect_err("tampered activity challenge must fail before storage lookup");
+        assert_eq!(tampered.code(), tonic::Code::PermissionDenied);
+
+        let mut downgraded = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            acknowledge_instance_id: String::new(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        let current_canonical = rustfs_protos::canonical_scanner_activity_request_body(downgraded.get_ref())
+            .expect("scanner activity request should encode");
+        set_tonic_canonical_body_digest(&mut downgraded, &current_canonical).expect("digest metadata should encode");
+        downgraded.get_mut().protocol_version = SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION;
+        mark_v2_authenticated(&mut downgraded);
+        let downgraded = service
+            .scanner_activity(downgraded)
+            .await
+            .expect_err("a signed current request must not be downgraded to protocol v4");
+        assert_eq!(downgraded.code(), tonic::Code::PermissionDenied);
+
+        let mut incomplete_acknowledgement = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            acknowledge_instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        let acknowledgement_canonical =
+            rustfs_protos::canonical_scanner_activity_request_body(incomplete_acknowledgement.get_ref())
+                .expect("scanner activity request should encode");
+        set_tonic_canonical_body_digest(&mut incomplete_acknowledgement, &acknowledgement_canonical)
+            .expect("digest metadata should encode");
+        mark_v2_authenticated(&mut incomplete_acknowledgement);
+        let incomplete_acknowledgement = service
+            .scanner_activity(incomplete_acknowledgement)
+            .await
+            .expect_err("dirty usage acknowledgements require an instance ID and generation");
+        assert_eq!(incomplete_acknowledgement.code(), tonic::Code::InvalidArgument);
+
+        let mut previous = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+            acknowledge_instance_id: String::new(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        set_tonic_canonical_body_digest(&mut previous, &[7; 16]).expect("protocol v4 digest metadata should encode");
+        mark_v2_authenticated(&mut previous);
+        let previous = service
+            .scanner_activity(previous)
+            .await
+            .expect_err("an authenticated protocol v4 request should reach storage lookup during rolling upgrades");
+        assert_eq!(previous.code(), tonic::Code::Unavailable);
+
+        let mut signed = Request::new(ScannerActivityRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
+            acknowledge_instance_id: String::new(),
+            acknowledge_dirty_usage_generation: 0,
+        });
+        let signed_canonical = rustfs_protos::canonical_scanner_activity_request_body(signed.get_ref())
+            .expect("scanner activity request should encode");
+        set_tonic_canonical_body_digest(&mut signed, &signed_canonical).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut signed);
+        let unavailable = service
+            .scanner_activity(signed)
+            .await
+            .expect_err("authenticated activity queries still require initialized storage");
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
     }
 
     #[test]
     fn test_scanner_activity_response_uses_process_epoch_and_generations() {
-        let response = scanner_activity_response(17);
+        let response = scanner_activity_response(
+            17,
+            [7; 32],
+            true,
+            rustfs_scanner::ScannerDirtyUsageState {
+                generation: 11,
+                pending: true,
+            },
+        );
 
         assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
         assert_eq!(response.namespace_generation, 17);
         assert_eq!(response.maintenance_generation, rustfs_scanner::scanner_maintenance_generation());
+        assert_eq!(response.protocol_version, rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION);
+        assert_eq!(response.topology_digest.as_ref(), &[7; 32]);
+        assert!(response.data_movement_active);
+        assert_eq!(response.dirty_usage_generation, 11);
+        assert!(response.dirty_usage_pending);
+    }
+
+    #[test]
+    fn test_previous_scanner_activity_response_omits_dirty_usage_fields() {
+        let response = previous_scanner_activity_response(17, [7; 32], true);
+
+        assert_eq!(response.protocol_version, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION);
+        assert_eq!(response.topology_digest.as_ref(), &[7; 32]);
+        assert!(response.data_movement_active);
+        assert_eq!(response.dirty_usage_generation, 0);
+        assert!(!response.dirty_usage_pending);
+    }
+
+    #[test]
+    fn test_legacy_scanner_activity_response_omits_extended_fields() {
+        let response = legacy_scanner_activity_response(17);
+
+        assert_eq!(response.namespace_generation, 17);
+        assert_eq!(response.protocol_version, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION);
+        assert!(response.topology_digest.is_empty());
+        assert!(!response.data_movement_active);
+        assert!(response.response_proof.is_empty());
+        assert_eq!(response.dirty_usage_generation, 0);
+        assert!(!response.dirty_usage_pending);
     }
 
     #[tokio::test]
@@ -3814,6 +4874,45 @@ mod tests {
         assert!(error_info.contains("unsupported dynamic config subsystem: identity_openid"));
     }
 
+    #[test]
+    fn dynamic_config_rpc_allowlist_matches_supported_subsystems() {
+        for sub_system in rustfs_config::notify::NOTIFY_SUB_SYSTEMS {
+            assert!(super::supports_dynamic_config_rpc(sub_system));
+        }
+        for sub_system in [
+            STORAGE_CLASS_SUB_SYS,
+            rustfs_config::audit::AUDIT_WEBHOOK_SUB_SYS,
+            rustfs_config::audit::AUDIT_MQTT_SUB_SYS,
+            rustfs_config::SCANNER_SUB_SYS,
+            rustfs_config::HEAL_SUB_SYS,
+        ] {
+            assert!(super::supports_dynamic_config_rpc(sub_system));
+        }
+        assert!(!super::supports_dynamic_config_rpc("identity_openid"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_dry_run_accepts_notify_without_runtime_mutation() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
+        vars.insert(PEER_RESTSUB_SYS.to_string(), rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS.to_string());
+        vars.insert(PEER_RESTDRY_RUN.to_string(), true.to_string());
+
+        let response = service
+            .signal_service(Request::new(SignalServiceRequest {
+                vars: Some(Mss { value: vars }),
+            }))
+            .await
+            .expect("notify capability probe should return a response")
+            .into_inner();
+
+        assert!(response.success, "new nodes must advertise notify lifecycle reload support");
+        assert!(response.error_info.is_none());
+        assert_eq!(response.protocol_version, rustfs_protos::DYNAMIC_CONFIG_PROTOCOL_VERSION);
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated global object layer state"]
     #[serial_test::serial]
@@ -3833,7 +4932,7 @@ mod tests {
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
-        assert!(error_info.contains("storage layer not initialized"));
+        assert_eq!(error_info, "runtime config snapshot reload failed");
     }
 
     #[tokio::test]
@@ -3856,7 +4955,7 @@ mod tests {
         let signal_response = response.unwrap().into_inner();
         assert!(!signal_response.success);
         let error_info = signal_response.error_info.expect("expected error info");
-        assert!(error_info.contains("storage layer not initialized"));
+        assert_eq!(error_info, format!("dynamic config reload failed for {STORAGE_CLASS_SUB_SYS}"));
     }
 
     fn assert_unimplemented_status<T>(response: Result<Response<T>, Status>, method: &str) {
@@ -3886,12 +4985,11 @@ mod tests {
                 .await,
             "download_profile_data",
         );
-        assert_unimplemented_status(
-            service
-                .get_bucket_stats(Request::new(GetBucketStatsDataRequest::default()))
-                .await,
-            "get_bucket_stats",
-        );
+        let bucket_stats_err = service
+            .get_bucket_stats(Request::new(GetBucketStatsDataRequest::default()))
+            .await
+            .expect_err("empty bucket statistics request should fail");
+        assert_eq!(bucket_stats_err.code(), tonic::Code::InvalidArgument);
         assert_unimplemented_status(
             service.get_sr_metrics(Request::new(GetSrMetricsDataRequest::default())).await,
             "get_sr_metrics",

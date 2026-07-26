@@ -765,11 +765,6 @@ where
 
     #[instrument(skip(self, body, meta), fields(target_id = %self.id))]
     async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
-
         debug!(
             event = EVENT_MQTT_DELIVERY_STATE,
             component = LOG_COMPONENT_TARGETS,
@@ -790,10 +785,22 @@ where
         // silently dropped the event while its durable copy was already deleted
         // (backlog#971). Error classification now matches on the typed error
         // instead of substring matching on the display string.
-        let notice = match client.publish_tracked(&self.args.topic, self.args.qos, false, body).await {
-            Ok(notice) => notice,
-            Err(e) => {
-                let err = classify_mqtt_client_error(&e);
+        let notice = match tokio::time::timeout(MQTT_PUBLISH_CONFIRM_TIMEOUT, async {
+            let client_guard = self.client.lock().await;
+            let client = client_guard
+                .as_ref()
+                .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
+            let notice = client
+                .publish_tracked(&self.args.topic, self.args.qos, false, body)
+                .await
+                .map_err(|error| classify_mqtt_client_error(&error))?;
+            drop(client_guard);
+            Ok(notice)
+        })
+        .await
+        {
+            Ok(Ok(notice)) => notice,
+            Ok(Err(err)) => {
                 warn!(
                     event = EVENT_MQTT_DELIVERY_STATE,
                     component = LOG_COMPONENT_TARGETS,
@@ -801,17 +808,28 @@ where
                     target_id = %self.id,
                     state = "publish_failed",
                     reason = "enqueue_error",
-                    error = %e,
+                    error = %err,
                     "mqtt delivery state"
                 );
                 mark_target_disconnected_on_connectivity_error(&self.connected, &err);
                 return Err(err);
             }
+            Err(_) => {
+                warn!(
+                    event = EVENT_MQTT_DELIVERY_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "publish_failed",
+                    reason = "enqueue_timeout",
+                    "mqtt delivery state"
+                );
+                // Admission can time out because the local bounded request
+                // channel is full while the MQTT session remains connected.
+                // Only protocol/client failures are evidence of disconnect.
+                return Err(TargetError::Timeout("MQTT publish enqueue timed out".to_string()));
+            }
         };
-
-        // Release the client lock before awaiting the broker acknowledgement so a
-        // slow/hung broker never blocks other senders from queueing publishes.
-        drop(client_guard);
 
         match tokio::time::timeout(MQTT_PUBLISH_CONFIRM_TIMEOUT, notice.wait_completion_async()).await {
             Ok(Ok(())) => {
@@ -1708,9 +1726,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientError, MQTT_RECONNECT_BACKOFF_MAX, MQTT_RECONNECT_BACKOFF_MIN, MQTTArgs, MQTTTlsConfig, PublishNoticeError, QoS,
-        classify_mqtt_client_error, classify_mqtt_notice_error, next_reconnect_backoff, reconnect_supervisor,
-        validate_mqtt_broker_url,
+        AsyncClient, ClientError, MQTT_RECONNECT_BACKOFF_MAX, MQTT_RECONNECT_BACKOFF_MIN, MQTTArgs, MQTTTarget, MQTTTlsConfig,
+        MqttOptions, PublishNoticeError, QoS, QueuedPayloadMeta, classify_mqtt_client_error, classify_mqtt_notice_error,
+        next_reconnect_backoff, reconnect_supervisor, validate_mqtt_broker_url,
     };
     use crate::error::TargetError;
     use crate::target::{REDACTED_SECRET, TargetType};
@@ -1719,6 +1737,23 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
     use url::Url;
+
+    fn base_mqtt_args() -> MQTTArgs {
+        MQTTArgs {
+            enable: true,
+            broker: Url::parse("mqtt://broker.example.com:1883").expect("valid broker"),
+            topic: "rustfs/events".to_string(),
+            qos: QoS::AtLeastOnce,
+            username: String::new(),
+            password: String::new(),
+            tls: MQTTTlsConfig::default(),
+            max_reconnect_interval: Duration::from_secs(1),
+            keep_alive: Duration::from_secs(30),
+            queue_dir: String::new(),
+            queue_limit: 0,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
 
     #[test]
     fn mqtt_client_error_classified_as_not_connected() {
@@ -1750,6 +1785,38 @@ mod tests {
         // request-level failure, not a transient disconnect.
         let err = PublishNoticeError::V5PubAck(rumqttc::PubAckReason::NotAuthorized);
         assert!(matches!(classify_mqtt_notice_error(&err), TargetError::Request(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enqueue_timeout_keeps_a_live_session_connected() {
+        let target = MQTTTarget::<String>::new("mqtt:test".to_string(), base_mqtt_args()).expect("target should build");
+        let (client, _event_loop) = AsyncClient::builder(MqttOptions::new("mqtt-timeout-test", ("localhost", 1883)))
+            .capacity(1)
+            .build();
+        client
+            .publish("fill", QoS::AtLeastOnce, false, b"fill".as_slice())
+            .await
+            .expect("first publish should fill the local channel");
+        *target.client.lock().await = Some(client);
+        target.connected.store(true, Ordering::SeqCst);
+        let meta = QueuedPayloadMeta::new(
+            rustfs_s3_types::EventName::ObjectCreatedPut,
+            "bucket".to_string(),
+            "object".to_string(),
+            "application/json",
+            2,
+        );
+
+        let error = target
+            .send_body(b"{}".to_vec(), &meta)
+            .await
+            .expect_err("a full local request channel should hit the enqueue deadline");
+
+        assert!(matches!(error, TargetError::Timeout(_)));
+        assert!(
+            target.connected.load(Ordering::SeqCst),
+            "local admission pressure is not evidence that the MQTT session disconnected"
+        );
     }
 
     #[test]
@@ -1864,21 +1931,13 @@ mod tests {
     #[test]
     fn debug_redacts_mqtt_secret_fields() {
         let args = MQTTArgs {
-            enable: true,
-            broker: Url::parse("mqtt://broker.example.com:1883").expect("valid broker"),
-            topic: "rustfs/events".to_string(),
-            qos: QoS::AtLeastOnce,
             username: "mqtt-user".to_string(),
             password: "mqtt-password".to_string(),
             tls: MQTTTlsConfig {
                 client_key_path: "/etc/rustfs/mqtt.key".to_string(),
                 ..MQTTTlsConfig::default()
             },
-            max_reconnect_interval: Duration::from_secs(1),
-            keep_alive: Duration::from_secs(30),
-            queue_dir: String::new(),
-            queue_limit: 0,
-            target_type: TargetType::NotifyEvent,
+            ..base_mqtt_args()
         };
 
         let rendered = format!("{args:?}");

@@ -29,7 +29,7 @@ use crate::client::{
 };
 use crate::services::tier::{
     tier_config::TierRustFS,
-    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,
 };
 
@@ -121,6 +121,10 @@ impl WarmBackend for WarmBackendRustFS {
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         self.0.remove(object, rv).await
+    }
+
+    async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+        self.0.probe_transition_candidate(object).await
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {

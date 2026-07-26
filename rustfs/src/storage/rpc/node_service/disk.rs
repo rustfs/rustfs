@@ -18,11 +18,13 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use crate::storage::storage_api::verify_tonic_mutation_body_digest;
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_MSGPACK_DIRECTION_REQUEST, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
@@ -41,14 +43,27 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
 ) -> std::result::Result<T, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer)
-            .map_err(|err| DiskError::other(format!("decode {value_name} msgpack failed: {err}")));
+        return T::deserialize(&mut deserializer).map_err(|err| {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                value_name,
+                INTERNODE_MSGPACK_CODEC_MSGPACK,
+            );
+            DiskError::other(format!("decode {value_name} msgpack failed: {err}"))
+        });
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, value_name);
-    serde_json::from_str(json).map_err(|err| DiskError::other(format!("decode {value_name} failed: {err}")))
+    serde_json::from_str(json).map_err(|err| {
+        global_internode_metrics().record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_REQUEST,
+            value_name,
+            INTERNODE_MSGPACK_CODEC_JSON,
+        );
+        DiskError::other(format!("decode {value_name} failed: {err}"))
+    })
 }
 
 fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
@@ -67,9 +82,27 @@ fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std
     Ok(serializer.into_inner())
 }
 
-/// JSON compatibility string for a dual-encoded response field. Returns an empty string when
-/// msgpack-only mode is enabled (grpc-optimization P2-1) so the redundant JSON copy is not sent;
-/// otherwise the legacy JSON encoding. The paired `_bin` (msgpack) field is always sent.
+/// Enforce the signature-bound canonical body digest on a mutating disk RPC (backlog#1327).
+///
+/// Digest-bearing requests are verified against the canonical bytes rebuilt from the received
+/// wire fields — which cover both the msgpack `_bin` payloads and their JSON compatibility
+/// copies, so tampering with either encoding (or stripping `_bin` to force the JSON fallback
+/// decode) is rejected. Digestless requests fall back per
+/// `RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT` (default: accept + convergence counter).
+fn verify_disk_mutation_digest<T>(
+    request: &Request<T>,
+    canonical_body: std::result::Result<Vec<u8>, std::num::TryFromIntError>,
+    op: &'static str,
+) -> std::result::Result<(), Status> {
+    let canonical_body =
+        canonical_body.map_err(|_| Status::invalid_argument(format!("{op} request length cannot be represented")))?;
+    verify_tonic_mutation_body_digest(request, &canonical_body)
+        .map_err(|err| Status::permission_denied(format!("{op} authentication failed: {err}")))
+}
+
+/// JSON compatibility string for a dual-encoded response field. Returns an empty string only when
+/// msgpack-only mode and its explicit fleet confirmation guard are both enabled; otherwise the
+/// legacy JSON encoding is retained for old peers. The paired `_bin` field is always sent.
 fn compat_response_json<T: serde::Serialize>(value: &T) -> std::result::Result<String, serde_json::Error> {
     if rustfs_protos::internode_rpc_msgpack_only() {
         return Ok(String::new());
@@ -157,6 +190,11 @@ impl NodeService {
         &self,
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_volume_request_body(request.get_ref()),
+            "delete_volume",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.delete_volume(&request.volume, request.force).await {
@@ -311,6 +349,11 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionsRequest>,
     ) -> Result<Response<DeleteVersionsResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_versions_request_body(request.get_ref()),
+            "delete_versions",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let mut versions = Vec::with_capacity(request.versions.len());
@@ -366,6 +409,11 @@ impl NodeService {
         &self,
         request: Request<DeleteVersionRequest>,
     ) -> Result<Response<DeleteVersionResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_version_request_body(request.get_ref()),
+            "delete_version",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -530,6 +578,11 @@ impl NodeService {
         &self,
         request: Request<WriteMetadataRequest>,
     ) -> Result<Response<WriteMetadataResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_write_metadata_request_body(request.get_ref()),
+            "write_metadata",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -563,6 +616,11 @@ impl NodeService {
         &self,
         request: Request<UpdateMetadataRequest>,
     ) -> Result<Response<UpdateMetadataResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_update_metadata_request_body(request.get_ref()),
+            "update_metadata",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -634,6 +692,11 @@ impl NodeService {
         &self,
         request: Request<DeletePathsRequest>,
     ) -> Result<Response<DeletePathsResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_delete_paths_request_body(request.get_ref()),
+            "delete_paths",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.delete_paths(&request.volume, &request.paths).await {
@@ -698,13 +761,24 @@ impl NodeService {
                 Ok(volume_infos) => {
                     let volume_infos = volume_infos
                         .into_iter()
-                        .filter_map(|volume_info| serde_json::to_string(&volume_info).ok())
-                        .collect();
-                    Ok(Response::new(ListVolumesResponse {
-                        success: true,
-                        volume_infos,
-                        error: None,
-                    }))
+                        .enumerate()
+                        .map(|(index, volume_info)| {
+                            serde_json::to_string(&volume_info)
+                                .map_err(|err| DiskError::other(format!("encode list volumes entry {index} failed: {err}")))
+                        })
+                        .collect::<std::result::Result<Vec<_>, DiskError>>();
+                    match volume_infos {
+                        Ok(volume_infos) => Ok(Response::new(ListVolumesResponse {
+                            success: true,
+                            volume_infos,
+                            error: None,
+                        })),
+                        Err(err) => Ok(Response::new(ListVolumesResponse {
+                            success: false,
+                            volume_infos: Vec::new(),
+                            error: Some(err.into()),
+                        })),
+                    }
                 }
                 Err(err) => Ok(Response::new(ListVolumesResponse {
                     success: false,
@@ -725,6 +799,11 @@ impl NodeService {
         &self,
         request: Request<MakeVolumeRequest>,
     ) -> Result<Response<MakeVolumeResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_make_volume_request_body(request.get_ref()),
+            "make_volume",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.make_volume(&request.volume).await {
@@ -749,6 +828,11 @@ impl NodeService {
         &self,
         request: Request<MakeVolumesRequest>,
     ) -> Result<Response<MakeVolumesResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_make_volumes_request_body(request.get_ref()),
+            "make_volumes",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.make_volumes(request.volumes.iter().map(|s| &**s).collect()).await {
@@ -773,6 +857,11 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_rename_data_request_body(request.get_ref()),
+            "rename_data",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
@@ -863,6 +952,11 @@ impl NodeService {
         &self,
         request: Request<RenameFileRequest>,
     ) -> Result<Response<RenameFileResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_rename_file_request_body(request.get_ref()),
+            "rename_file",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -890,6 +984,11 @@ impl NodeService {
         &self,
         request: Request<RenamePartRequest>,
     ) -> Result<Response<RenamePartResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_rename_part_request_body(request.get_ref()),
+            "rename_part",
+        )?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk
@@ -1058,6 +1157,7 @@ impl NodeService {
     }
 
     pub(super) async fn handle_delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
@@ -1088,6 +1188,7 @@ impl NodeService {
     }
 
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
+        verify_disk_mutation_digest(&request, rustfs_protos::canonical_write_all_request_body(request.get_ref()), "write_all")?;
         let request = request.into_inner();
         let data_len = request.data.len();
         let metrics = runtime_sources::current_internode_metrics();
@@ -1175,11 +1276,12 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
-        encode_read_multiple_response_payloads,
+        compat_response_json, decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
+        encode_msgpack_named, encode_read_multiple_response_payloads,
     };
     use crate::storage::storage_api::ReadMultipleResp;
     use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
+    use rustfs_io_metrics::internode_metrics::global_internode_metrics;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1211,6 +1313,136 @@ mod tests {
             SamplePayload {
                 name: "compat".to_string(),
                 count: 7,
+            }
+        );
+    }
+
+    fn with_internode_msgpack_env<R>(vars: [(&'static str, Option<&'static str>); 2], f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(vars, || {
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            let result = f();
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            result
+        })
+    }
+
+    #[test]
+    fn compat_response_json_keeps_json_when_msgpack_only_lacks_fleet_confirmation() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let payload = SamplePayload {
+                    name: "legacy-json".to_string(),
+                    count: 9,
+                };
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(!json.is_empty(), "old JSON clients must remain compatible without fleet confirmation");
+                assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
+            },
+        );
+    }
+
+    #[test]
+    fn compat_response_json_omits_json_only_after_fleet_confirmation() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let payload = SamplePayload {
+                    name: "msgpack-only".to_string(),
+                    count: 10,
+                };
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(json.is_empty(), "msgpack-only may empty JSON only after explicit fleet confirmation");
+            },
+        );
+    }
+
+    #[test]
+    fn compat_response_json_restores_json_when_either_msgpack_only_gate_is_removed() {
+        let payload = SamplePayload {
+            name: "rollback".to_string(),
+            count: 12,
+        };
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(json.is_empty(), "both gates should enter msgpack-only response mode");
+            },
+        );
+
+        for vars in [
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("false")),
+            ],
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("false")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+        ] {
+            with_internode_msgpack_env(vars, || {
+                let json = compat_response_json(&payload).expect("compat response json should encode");
+
+                assert!(!json.is_empty(), "removing either gate should restore old-peer JSON compatibility");
+                assert_eq!(json, serde_json::to_string(&payload).expect("json should encode"));
+            });
+        }
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_fails_closed_on_corrupt_non_empty_msgpack() {
+        let before = global_internode_metrics().msgpack_json_decode_error_total_for_test();
+        let err = decode_msgpack_or_json::<SamplePayload>(b"not-msgpack", r#"{"name":"json","count":1}"#, "SamplePayload")
+            .expect_err("corrupt non-empty msgpack must not fall back to JSON");
+        let after = global_internode_metrics().msgpack_json_decode_error_total_for_test();
+
+        assert!(err.to_string().contains("decode SamplePayload msgpack failed"), "unexpected error: {err}");
+        assert!(after > before, "corrupt msgpack should increment decode-error metrics");
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_reports_corrupt_json_item_when_msgpack_absent() {
+        let before = global_internode_metrics().msgpack_json_decode_error_total_for_test();
+        let err = decode_msgpack_or_json::<SamplePayload>(&[], "{not-json", "SamplePayload")
+            .expect_err("corrupt json item should fail in fallback branch");
+        let after = global_internode_metrics().msgpack_json_decode_error_total_for_test();
+
+        assert!(err.to_string().contains("decode SamplePayload failed"), "unexpected error: {err}");
+        assert!(after > before, "corrupt fallback JSON should increment decode-error metrics");
+    }
+
+    #[test]
+    fn decode_msgpack_or_json_accepts_named_msgpack_and_legacy_json() {
+        let payload = SamplePayload {
+            name: "named".to_string(),
+            count: 11,
+        };
+        let named_msgpack = encode_msgpack_named(&payload, "SamplePayload").expect("named msgpack should encode");
+        let decoded_msgpack =
+            decode_msgpack_or_json::<SamplePayload>(&named_msgpack, "", "SamplePayload").expect("named msgpack should decode");
+        let decoded_json = decode_msgpack_or_json::<SamplePayload>(&[], r#"{"name":"legacy-json","count":12}"#, "SamplePayload")
+            .expect("legacy json should decode");
+
+        assert_eq!(decoded_msgpack, payload);
+        assert_eq!(
+            decoded_json,
+            SamplePayload {
+                name: "legacy-json".to_string(),
+                count: 12
             }
         );
     }
@@ -1253,6 +1485,52 @@ mod tests {
     }
 
     #[test]
+    fn encode_read_multiple_response_payloads_respects_msgpack_only_gate_and_rollback() {
+        let responses = vec![ReadMultipleResp {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            file: "gate".to_string(),
+            exists: true,
+            data: b"payload".to_vec(),
+            ..Default::default()
+        }];
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_read_multiple_response_payloads(&responses).expect("read multiple responses should encode");
+
+                assert_eq!(json_payloads, vec![String::new()]);
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let decoded = decode_msgpack_or_json::<ReadMultipleResp>(&msgpack_payloads[0], "", "ReadMultipleResp")
+                    .expect("msgpack read multiple response should decode");
+                assert_eq!(decoded.file, responses[0].file);
+            },
+        );
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("false")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_read_multiple_response_payloads(&responses).expect("read multiple responses should encode");
+
+                assert!(!json_payloads[0].is_empty(), "rollback should restore response JSON");
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let json_decoded: ReadMultipleResp =
+                    serde_json::from_str(&json_payloads[0]).expect("json read multiple response should decode");
+                assert_eq!(json_decoded.file, responses[0].file);
+            },
+        );
+    }
+
+    #[test]
     fn encode_batch_read_version_response_payloads_keeps_json_and_msgpack_in_sync() {
         let responses = vec![BatchReadVersionResp {
             index: 3,
@@ -1277,5 +1555,50 @@ mod tests {
         assert_eq!(json_decoded.index, responses[0].index);
         assert_eq!(msgpack_decoded.path, responses[0].path);
         assert_eq!(msgpack_decoded.error, responses[0].error);
+    }
+
+    #[test]
+    fn encode_batch_read_version_response_payloads_respects_msgpack_only_gate_and_rollback() {
+        let responses = vec![BatchReadVersionResp {
+            index: 4,
+            path: "object-b".to_string(),
+            version_id: "version-b".to_string(),
+            success: true,
+            ..Default::default()
+        }];
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+
+                assert_eq!(json_payloads, vec![String::new()]);
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let decoded = decode_msgpack_or_json::<BatchReadVersionResp>(&msgpack_payloads[0], "", "BatchReadVersionResp")
+                    .expect("msgpack batch read version response should decode");
+                assert_eq!(decoded.path, responses[0].path);
+            },
+        );
+
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("false")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let (json_payloads, msgpack_payloads) =
+                    encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+
+                assert!(!json_payloads[0].is_empty(), "rollback should restore response JSON");
+                assert_eq!(msgpack_payloads.len(), responses.len());
+                let json_decoded: BatchReadVersionResp =
+                    serde_json::from_str(&json_payloads[0]).expect("json batch read version response should decode");
+                assert_eq!(json_decoded.path, responses[0].path);
+            },
+        );
     }
 }

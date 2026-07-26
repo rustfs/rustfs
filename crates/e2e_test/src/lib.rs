@@ -79,6 +79,12 @@ mod bucket_policy_check_test;
 #[cfg(test)]
 mod security_boundary_test;
 
+// Cross-process replay/tamper acceptance for the internode NodeService v2 RPC
+// signature (backlog#1327): method-path transplant, nonce replay, body tampering
+// and the two strict rollout flips, all against a real spawned server.
+#[cfg(test)]
+mod internode_rpc_signature_e2e_test;
+
 // Opt-in per-client S3 API rate limiting (backlog#1191)
 #[cfg(test)]
 mod api_rate_limit_test;
@@ -167,6 +173,10 @@ mod cluster_concurrency_test;
 #[cfg(test)]
 mod cluster_multidrive_pool_test;
 
+// backlog#1433: real 4-node EC boundary gate for inline storage and GET paths.
+#[cfg(test)]
+mod inline_fast_path_cluster_test;
+
 // PutObject / MultipartUpload with checksum (Content-MD5, x-amz-checksum-*)
 #[cfg(test)]
 mod checksum_upload_test;
@@ -188,10 +198,22 @@ mod heal_erasure_disk_rebuild_test;
 mod copy_object_metadata_test;
 
 #[cfg(test)]
+mod copy_object_tagging_test;
+
+#[cfg(test)]
 mod copy_object_version_restore_test;
 
 #[cfg(test)]
 mod copy_object_checksum_test;
+
+#[cfg(test)]
+mod ssec_copy_test;
+
+#[cfg(test)]
+mod multipart_storage_class_test;
+
+#[cfg(test)]
+mod storage_class_capability_test;
 
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
@@ -241,6 +263,9 @@ mod console_smoke_test;
 // plus non-admin 403 probes per endpoint (sec-4 pattern).
 #[cfg(test)]
 mod admin_iam_crud_test;
+
+#[cfg(test)]
+mod admin_pools_test;
 
 // Replication extension end-to-end regression tests
 #[cfg(test)]

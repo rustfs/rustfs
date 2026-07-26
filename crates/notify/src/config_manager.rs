@@ -13,89 +13,83 @@
 // limitations under the License.
 
 use crate::{
-    Event, NotificationError, registry::TargetRegistry, resolve_notify_object_store_handle, rule_engine::NotifyRuleEngine,
+    NotificationError,
+    lifecycle::{NotificationRuntimeState, NotifyLifecycleCoordinator},
+    registry::TargetRegistry,
+    resolve_notify_object_store_handle,
+    rule_engine::NotifyRuleEngine,
     runtime_facade::NotifyRuntimeFacade,
+    with_notify_server_config_read_lock, with_notify_server_config_write_lock,
 };
 use rustfs_config::notify::{
     NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS, NOTIFY_NATS_SUB_SYS,
     NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::server_config::{Config, KVS};
-use rustfs_targets::{Target, arn::TargetID};
-use std::sync::{Arc, LazyLock};
-use tokio::sync::{Mutex, RwLock};
+use rustfs_targets::arn::TargetID;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info};
-
-/// Serializes the read-modify-write sequence over the persisted notify server
-/// config. The persisted config is a single process-global resource (there is
-/// only one backing object store), so without this guard two concurrent updates
-/// can both read the same base config, apply disjoint changes, and race their
-/// full-config writes — the later write silently overwrites the earlier one,
-/// losing updates. Holding this mutex across the whole read→modify→write makes
-/// concurrent updates apply serially so every change is preserved.
-///
-/// The lock is only ever acquired inside `update_server_config`; it never nests
-/// with the per-manager `config` RwLock (the in-memory reload runs after this
-/// guard is released), so it introduces no lock-ordering risk.
-static NOTIFY_CONFIG_RMW_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_CONFIG: &str = "config";
-const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
 const EVENT_NOTIFY_CONFIG_UPDATE: &str = "notify_config_update";
 
 #[derive(Debug)]
 enum NotifyConfigStoreError {
+    Lock(String),
     StorageNotAvailable,
     Read(String),
     Save(String),
 }
 
-async fn update_server_config<F>(modifier: F) -> Result<Option<Config>, NotifyConfigStoreError>
+async fn update_server_config<F>(
+    modifier: F,
+    lifecycle: NotifyLifecycleCoordinator,
+) -> Result<Option<crate::lifecycle::NotificationLifecycleTransition>, NotifyConfigStoreError>
 where
-    F: FnMut(&mut Config) -> bool,
+    F: FnMut(&mut Config) -> bool + Send + 'static,
 {
     let Some(store) = resolve_notify_object_store_handle() else {
         return Err(NotifyConfigStoreError::StorageNotAvailable);
     };
 
+    let store_for_read = store.clone();
     let store_for_save = store.clone();
-    serialized_read_modify_write(
-        modifier,
-        move || async move {
-            crate::read_notify_server_config_without_migrate(store)
-                .await
-                .map_err(NotifyConfigStoreError::Read)
-        },
-        move |config| async move {
-            crate::save_notify_server_config(store_for_save, &config)
-                .await
-                .map_err(NotifyConfigStoreError::Save)
-        },
-    )
+    with_notify_server_config_write_lock(store, move || {
+        read_modify_write(
+            modifier,
+            move || async move {
+                crate::read_notify_server_config_without_migrate_no_lock(store_for_read)
+                    .await
+                    .map_err(NotifyConfigStoreError::Read)
+            },
+            move |config| async move {
+                crate::save_notify_server_config_no_lock(store_for_save, &config)
+                    .await
+                    .map_err(NotifyConfigStoreError::Save)
+            },
+            move |config| lifecycle.update_config(config),
+        )
+    })
     .await
+    .map_err(NotifyConfigStoreError::Lock)?
 }
 
-/// Runs a `read → modify → write` over the persisted notify config while holding
-/// [`NOTIFY_CONFIG_RMW_LOCK`], so concurrent updates serialize and cannot clobber
-/// each other's changes (backlog#968). `read`/`save` are injected so the exact
-/// production serialization path can be exercised in tests without a live store.
-async fn serialized_read_modify_write<F, R, RFut, S, SFut>(
+async fn read_modify_write<F, R, RFut, S, SFut, P, T>(
     mut modifier: F,
     read: R,
     save: S,
-) -> Result<Option<Config>, NotifyConfigStoreError>
+    publish: P,
+) -> Result<Option<T>, NotifyConfigStoreError>
 where
     F: FnMut(&mut Config) -> bool,
     R: FnOnce() -> RFut,
     RFut: std::future::Future<Output = Result<Config, NotifyConfigStoreError>>,
     S: FnOnce(Config) -> SFut,
     SFut: std::future::Future<Output = Result<(), NotifyConfigStoreError>>,
+    P: FnOnce(Config) -> T,
 {
-    // Hold the RMW lock across the entire read→modify→write so concurrent
-    // updates serialize and cannot clobber each other's changes (backlog#968).
-    let _rmw_guard = NOTIFY_CONFIG_RMW_LOCK.lock().await;
-
     let mut new_config = read().await?;
 
     if !modifier(&mut new_config) {
@@ -104,7 +98,7 @@ where
 
     save(new_config.clone()).await?;
 
-    Ok(Some(new_config))
+    Ok(Some(publish(new_config)))
 }
 
 pub(crate) fn notify_configuration_hint() -> String {
@@ -142,9 +136,8 @@ pub fn runtime_target_id_for_subsystem(target_type: &str, target_name: &str) -> 
 #[derive(Clone)]
 pub struct NotifyConfigManager {
     config: Arc<RwLock<Config>>,
-    registry: Arc<TargetRegistry>,
+    lifecycle: NotifyLifecycleCoordinator,
     rule_engine: NotifyRuleEngine,
-    runtime_facade: NotifyRuntimeFacade,
 }
 
 impl NotifyConfigManager {
@@ -154,64 +147,21 @@ impl NotifyConfigManager {
         rule_engine: NotifyRuleEngine,
         runtime_facade: NotifyRuntimeFacade,
     ) -> Self {
+        let lifecycle = NotifyLifecycleCoordinator::new(config.clone(), registry, runtime_facade);
         Self {
             config,
-            registry,
+            lifecycle,
             rule_engine,
-            runtime_facade,
         }
     }
 
+    pub(crate) fn lifecycle(&self) -> NotifyLifecycleCoordinator {
+        self.lifecycle.clone()
+    }
+
     pub async fn init(&self) -> Result<(), NotificationError> {
-        info!(
-            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-            component = LOG_COMPONENT_NOTIFY,
-            subsystem = LOG_SUBSYSTEM_CONFIG,
-            state = "initializing",
-            "notify runtime lifecycle"
-        );
-
-        let config = {
-            let guard = self.config.read().await;
-            debug!(
-                subsystem_count = guard.0.len(),
-                "Initializing notification system with configuration summary"
-            );
-            guard.clone()
-        };
-
-        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
-
-        info!(
-            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-            component = LOG_COMPONENT_NOTIFY,
-            subsystem = LOG_SUBSYSTEM_CONFIG,
-            state = "targets_created",
-            target_count = targets.len(),
-            "notify runtime lifecycle"
-        );
-        if targets.is_empty() {
-            debug!(
-                event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-                component = LOG_COMPONENT_NOTIFY,
-                subsystem = LOG_SUBSYSTEM_CONFIG,
-                state = "idle",
-                reason = "no_targets_configured",
-                hint = %notify_configuration_hint(),
-                "notify runtime lifecycle"
-            );
-        }
-
-        let activation = self.runtime_facade.activate_targets_with_replay(targets).await;
-        self.runtime_facade.replace_targets(activation).await?;
-        info!(
-            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-            component = LOG_COMPONENT_NOTIFY,
-            subsystem = LOG_SUBSYSTEM_CONFIG,
-            state = "initialized",
-            "notify runtime lifecycle"
-        );
-        Ok(())
+        let config = self.config.read().await.clone();
+        self.lifecycle.set_mode(true, Some(config)).wait().await
     }
 
     pub async fn remove_target(&self, target_id: &TargetID, target_type: &str) -> Result<(), NotificationError> {
@@ -227,6 +177,7 @@ impl NotifyConfigManager {
 
         let ttype = target_type.to_lowercase();
         let tname = target_id.id.to_lowercase();
+        let log_target_id = target_id.clone();
 
         // Guard against orphaning bucket notification rules (backlog#979). Removing a
         // target while a bucket rule still references it would leave a dangling
@@ -240,7 +191,7 @@ impl NotifyConfigManager {
             )));
         }
 
-        self.update_config_and_reload(|config| {
+        self.update_config_and_reload(move |config| {
             let mut changed = false;
             if let Some(targets_of_type) = config.0.get_mut(&ttype) {
                 if targets_of_type.remove(&tname).is_some() {
@@ -249,7 +200,7 @@ impl NotifyConfigManager {
                             component = LOG_COMPONENT_NOTIFY,
                         subsystem = LOG_SUBSYSTEM_CONFIG,
                         action = "remove_target",
-                        target_id = %target_id,
+                        target_id = %log_target_id,
                         result = "removed",
                         "notify config update"
                     );
@@ -265,7 +216,7 @@ impl NotifyConfigManager {
                     component = LOG_COMPONENT_NOTIFY,
                     subsystem = LOG_SUBSYSTEM_CONFIG,
                     action = "remove_target",
-                    target_id = %target_id,
+                    target_id = %log_target_id,
                     result = "not_found",
                     "notify config update"
                 );
@@ -287,7 +238,7 @@ impl NotifyConfigManager {
         );
         let ttype = target_type.to_lowercase();
         let tname = target_name.to_lowercase();
-        self.update_config_and_reload(|config| {
+        self.update_config_and_reload(move |config| {
             config.0.entry(ttype.clone()).or_default().insert(tname.clone(), kvs.clone());
             true
         })
@@ -316,7 +267,7 @@ impl NotifyConfigManager {
             )));
         }
 
-        self.update_config_and_reload(|config| {
+        self.update_config_and_reload(move |config| {
             let mut changed = false;
             if let Some(targets) = config.0.get_mut(&ttype) {
                 if targets.remove(&tname).is_some() {
@@ -332,8 +283,8 @@ impl NotifyConfigManager {
                     component = LOG_COMPONENT_NOTIFY,
                     subsystem = LOG_SUBSYSTEM_CONFIG,
                     action = "remove_target_config",
-                    target_type = %target_type,
-                    target_name = %target_name,
+                    target_type = %ttype,
+                    target_name = %tname,
                     result = "not_found",
                     "notify config update"
                 );
@@ -348,81 +299,62 @@ impl NotifyConfigManager {
     }
 
     pub async fn reload_config(&self, new_config: Config) -> Result<(), NotificationError> {
-        info!(
-            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-            component = LOG_COMPONENT_NOTIFY,
-            subsystem = LOG_SUBSYSTEM_CONFIG,
-            state = "reloading",
-            "notify runtime lifecycle"
-        );
+        self.lifecycle.set_mode(true, Some(new_config)).wait().await
+    }
 
-        self.update_config(new_config.clone()).await;
+    pub async fn reload_persisted_config(&self) -> Result<(), NotificationError> {
+        let Some(store) = resolve_notify_object_store_handle() else {
+            return Err(NotificationError::StorageNotAvailable(
+                "Failed to load target configuration: server storage not initialized".to_string(),
+            ));
+        };
+        self.reload_persisted_config_from_store(store).await
+    }
 
-        // Stop the currently running replay workers *before* activating the new ones
-        // (backlog#970). Each replay worker drains a per-target persisted store; if the
-        // new workers start while the old ones are still running against the same
-        // stores, both drain the same queues and re-deliver events. `replace_targets`
-        // below also stops workers, but only after `activate_targets_with_replay` has
-        // already spawned the new ones — so without this explicit stop-before-start
-        // there is a window where old and new workers overlap. (The full "signal +
-        // join" shutdown lives in the targets crate and is tracked under the same
-        // issue; this reorders the notify-side lifecycle.)
-        self.runtime_facade.stop_replay_workers().await;
-
-        let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self
-            .registry
-            .create_targets_from_config(&new_config)
-            .await
-            .map_err(NotificationError::Target)?;
-
-        info!(
-            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-            component = LOG_COMPONENT_NOTIFY,
-            subsystem = LOG_SUBSYSTEM_CONFIG,
-            state = "targets_created",
-            target_count = targets.len(),
-            "notify runtime lifecycle"
-        );
-        if targets.is_empty() {
-            debug!(
-                event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-                component = LOG_COMPONENT_NOTIFY,
-                subsystem = LOG_SUBSYSTEM_CONFIG,
-                state = "idle",
-                reason = "no_targets_configured",
-                hint = %notify_configuration_hint(),
-                "notify runtime lifecycle"
-            );
+    pub async fn reload_persisted_config_from_store(&self, store: Arc<crate::NotifyStore>) -> Result<(), NotificationError> {
+        if self.lifecycle.state() == NotificationRuntimeState::Terminated {
+            return Err(NotificationError::Initialization("Notification runtime has terminated".to_string()));
         }
 
-        let activation = self.runtime_facade.activate_targets_with_replay(targets).await;
-        self.runtime_facade.replace_targets(activation).await?;
-        info!(
-            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
-            component = LOG_COMPONENT_NOTIFY,
-            subsystem = LOG_SUBSYSTEM_CONFIG,
-            state = "reloaded",
-            "notify runtime lifecycle"
-        );
+        let read_store = store.clone();
+        let config_cache = self.config.clone();
+        let lifecycle = self.lifecycle.clone();
+        let transition = with_notify_server_config_read_lock(store, move || async move {
+            let config = crate::read_existing_notify_server_config_no_lock(read_store)
+                .await
+                .map_err(NotificationError::ReadConfig)?;
+            Ok::<_, NotificationError>(if *config_cache.read().await == config && lifecycle.is_converged() {
+                None
+            } else {
+                Some(lifecycle.update_config(config))
+            })
+        })
+        .await
+        .map_err(NotificationError::StorageNotAvailable)??;
+
+        if let Some(transition) = transition {
+            transition.wait().await?;
+        }
         Ok(())
     }
 
-    async fn update_config(&self, new_config: Config) {
-        let mut config = self.config.write().await;
-        *config = new_config;
-    }
-
-    async fn update_config_and_reload<F>(&self, mut modifier: F) -> Result<(), NotificationError>
+    async fn update_config_and_reload<F>(&self, modifier: F) -> Result<(), NotificationError>
     where
-        F: FnMut(&mut Config) -> bool,
+        F: FnMut(&mut Config) -> bool + Send + 'static,
     {
-        let Some(new_config) = update_server_config(&mut modifier).await.map_err(|err| match err {
-            NotifyConfigStoreError::StorageNotAvailable => NotificationError::StorageNotAvailable(
-                "Failed to save target configuration: server storage not initialized".to_string(),
-            ),
-            NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
-            NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
-        })?
+        if self.lifecycle.state() == NotificationRuntimeState::Terminated {
+            return Err(NotificationError::Initialization("Notification runtime has terminated".to_string()));
+        }
+        let Some(transition) = update_server_config(modifier, self.lifecycle.clone())
+            .await
+            .map_err(|err| match err {
+                NotifyConfigStoreError::Lock(err) => NotificationError::StorageNotAvailable(err),
+                NotifyConfigStoreError::StorageNotAvailable => NotificationError::StorageNotAvailable(
+                    "Failed to save target configuration: server storage not initialized".to_string(),
+                ),
+                NotifyConfigStoreError::Read(err) => NotificationError::ReadConfig(err),
+                NotifyConfigStoreError::Save(err) => NotificationError::SaveConfig(err),
+            })?
         else {
             debug!(
                 event = EVENT_NOTIFY_CONFIG_UPDATE,
@@ -443,15 +375,15 @@ impl NotifyConfigManager {
             result = "updated",
             "notify config update"
         );
-        self.reload_config(new_config).await
+        transition.wait().await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NotifyConfigManager, NotifyConfigStoreError, runtime_target_id_for_subsystem, serialized_read_modify_write};
-    use crate::NotificationError;
+    use super::{NotifyConfigManager, NotifyConfigStoreError, read_modify_write, runtime_target_id_for_subsystem};
     use crate::rules::RulesMap;
+    use crate::{NotificationError, NotificationRuntimeState};
     use crate::{
         integration::NotificationMetrics, notifier::EventNotifier, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
         runtime_facade::NotifyRuntimeFacade,
@@ -464,7 +396,10 @@ mod tests {
     use rustfs_s3_types::EventName;
     use rustfs_targets::ReplayWorkerManager;
     use rustfs_targets::arn::TargetID;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use tokio::sync::{RwLock, Semaphore};
 
     fn build_manager() -> NotifyConfigManager {
@@ -474,9 +409,10 @@ mod tests {
         let rule_engine = NotifyRuleEngine::new();
         let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
         let target_list = notifier.target_list();
-        let runtime_facade = NotifyRuntimeFacade::new(
+        let runtime_facade = NotifyRuntimeFacade::new_with_dispatch_gate(
             target_list,
             Arc::new(RwLock::new(ReplayWorkerManager::new())),
+            notifier.dispatch_gate(),
             Arc::new(Semaphore::new(4)),
             metrics,
         );
@@ -524,78 +460,39 @@ mod tests {
             .reload_config(Config::default())
             .await
             .expect("reload_config should succeed for empty targets");
+        assert!(matches!(manager.lifecycle().state(), NotificationRuntimeState::TargetsEnabled { .. }));
     }
 
-    // Regression test for backlog#968: the read-modify-write over the persisted
-    // notify config must be serialized. Many tasks concurrently add a distinct
-    // target through the same production RMW path (`serialized_read_modify_write`,
-    // which holds the global RMW lock across read→modify→write) against a shared
-    // in-memory backend. Every update must survive — no lost updates. Without the
-    // lock, concurrent tasks would read the same base config and clobber each
-    // other's writes, leaving only a subset of targets.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_config_updates_preserve_all_targets() {
-        // Shared in-memory stand-in for the persisted config backend.
-        let backend = Arc::new(RwLock::new(Config::default()));
-        const TASKS: usize = 32;
+    #[tokio::test]
+    async fn read_modify_write_publishes_only_after_save() {
+        let saved = Arc::new(AtomicBool::new(false));
+        let saved_by_writer = saved.clone();
+        let observed_by_publisher = saved.clone();
 
-        let mut handles = Vec::with_capacity(TASKS);
-        for idx in 0..TASKS {
-            let backend = backend.clone();
-            handles.push(tokio::spawn(async move {
-                let ttype = NOTIFY_WEBHOOK_SUB_SYS.to_lowercase();
-                let tname = format!("target-{idx}");
-
-                let read_backend = backend.clone();
-                let save_backend = backend.clone();
-
-                let result = serialized_read_modify_write(
-                    |config: &mut Config| {
-                        config
-                            .0
-                            .entry(ttype.clone())
-                            .or_default()
-                            .insert(tname.clone(), KVS::default());
-                        true
-                    },
-                    move || async move {
-                        let snapshot = read_backend.read().await.clone();
-                        // Yield inside the critical section to widen the race window:
-                        // if the RMW were not serialized, other tasks would read this
-                        // same base snapshot and their writes would clobber ours.
-                        tokio::task::yield_now().await;
-                        Ok::<_, NotifyConfigStoreError>(snapshot)
-                    },
-                    move |config: Config| async move {
-                        *save_backend.write().await = config;
-                        Ok::<_, NotifyConfigStoreError>(())
-                    },
-                )
-                .await
-                .expect("serialized RMW should succeed");
-                assert!(result.is_some(), "modifier reported a change, expected Some(config)");
-            }));
-        }
-
-        for handle in handles {
-            handle.await.expect("update task should not panic");
-        }
-
-        let final_config = backend.read().await;
-        let webhook_targets = final_config
-            .0
-            .get(&NOTIFY_WEBHOOK_SUB_SYS.to_lowercase())
-            .expect("webhook subsystem should exist after updates");
-
-        assert_eq!(
-            webhook_targets.len(),
-            TASKS,
-            "all concurrent target additions must be preserved (no lost updates)"
-        );
-        for idx in 0..TASKS {
-            let tname = format!("target-{idx}");
-            assert!(webhook_targets.contains_key(&tname), "missing target {tname}: concurrent update was lost");
-        }
+        read_modify_write(
+            |config| {
+                config
+                    .0
+                    .entry(NOTIFY_WEBHOOK_SUB_SYS.to_string())
+                    .or_default()
+                    .insert("primary".to_string(), KVS::default());
+                true
+            },
+            || async { Ok::<_, NotifyConfigStoreError>(Config::default()) },
+            move |_config| async move {
+                saved_by_writer.store(true, Ordering::Release);
+                Ok::<_, NotifyConfigStoreError>(())
+            },
+            move |_config| {
+                assert!(
+                    observed_by_publisher.load(Ordering::Acquire),
+                    "publication must observe the completed save"
+                );
+            },
+        )
+        .await
+        .expect("read-modify-write should succeed")
+        .expect("changed config should publish");
     }
 
     #[test]

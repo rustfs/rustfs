@@ -33,6 +33,7 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_EXPIRY_COMPUTED: &str = "lifecycle_expiry_computed";
 const EVENT_LIFECYCLE_DEBUG_DAY_SECS: &str = "lifecycle_debug_day_secs";
+const EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED: &str = "lifecycle_noncurrent_expiry_skipped";
 const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at least one rule";
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
 const _ERR_XML_NOT_WELL_FORMED: &str =
@@ -594,18 +595,28 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 if !obj.is_latest
                     && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
                     && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
-                    && let Some(successor_mod_time) = obj.successor_mod_time
                 {
-                    let expected_expiry = expected_expiry_time(successor_mod_time, noncurrent_days);
-                    if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
-                        events.push(Event {
-                            action: IlmAction::DeleteVersionAction,
-                            rule_id: rule.id.clone().unwrap_or_default(),
-                            due: Some(expected_expiry),
-                            noncurrent_days: 0,
-                            newer_noncurrent_versions: 0,
-                            storage_class: "".into(),
-                        });
+                    if let Some(successor_mod_time) = obj.successor_mod_time {
+                        let expected_expiry = expected_expiry_time(successor_mod_time, noncurrent_days);
+                        if now.unix_timestamp() >= expected_expiry.unix_timestamp() {
+                            events.push(Event {
+                                action: IlmAction::DeleteVersionAction,
+                                rule_id: rule.id.clone().unwrap_or_default(),
+                                due: Some(expected_expiry),
+                                noncurrent_days: 0,
+                                newer_noncurrent_versions: 0,
+                                storage_class: "".into(),
+                            });
+                        }
+                    } else {
+                        debug!(
+                            event = EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            object = %obj.name,
+                            reason = "missing_successor_mod_time",
+                            "Skipped noncurrent expiration for incomplete version chain"
+                        );
                     }
                 }
 
@@ -2051,6 +2062,127 @@ mod tests {
         assert_eq!(event.action, IlmAction::DeleteVersionAction);
         assert_eq!(event.rule_id, "noncurrent-expire");
         assert_eq!(event.due, Some(expected_expiry_time(base_time, 1)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_skips_noncurrent_expiration_without_successor() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-expire".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            successor_mod_time: None,
+            is_latest: false,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, base_time + Duration::days(2), 0).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_missing_successor_does_not_skip_noncurrent_transition() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-expire-and-transition".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                    storage_class: Some(TransitionStorageClass::from_static("COLDTIER44")),
+                }]),
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            successor_mod_time: None,
+            is_latest: false,
+            transition_status: "".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, datetime!(2100-01-01 00:00:00 UTC), 0).await;
+
+        assert_eq!(event.action, IlmAction::TransitionVersionAction);
+        assert_eq!(event.rule_id, "noncurrent-expire-and-transition");
+        assert_eq!(event.storage_class, "COLDTIER44");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_noncurrent_expiration_one_day_respects_due_boundary() {
+        let successor_time = datetime!(2025-06-15 12:00:00 UTC);
+        let due = expected_expiry_time(successor_time, 1);
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-one-day".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(successor_time - Duration::seconds(1)),
+            successor_mod_time: Some(successor_time),
+            is_latest: false,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        let before_due = lc.eval_inner(&opts, due - Duration::seconds(1), 0).await;
+        let at_due = lc.eval_inner(&opts, due, 0).await;
+
+        assert_eq!(before_due.action, IlmAction::NoneAction);
+        assert_eq!(at_due.action, IlmAction::DeleteVersionAction);
+        assert_eq!(at_due.rule_id, "noncurrent-one-day");
+        assert_eq!(at_due.due, Some(due));
     }
 
     #[tokio::test]

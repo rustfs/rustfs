@@ -16,7 +16,10 @@ pub mod http_service;
 pub mod node_service;
 
 pub use http_service::InternodeRpcService;
-pub use node_service::{HealControlRpcService, NodeService, make_heal_control_server, make_server};
+pub use node_service::{
+    HealControlRpcService, NodeService, TierMutationControlRpcService, make_heal_control_server, make_server,
+    make_tier_mutation_control_server,
+};
 
 use rmp_serde::Serializer;
 use serde::Serialize;

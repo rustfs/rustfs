@@ -97,7 +97,7 @@ pub static USAGE_VERSIONS_DISTRIBUTION_MD: LazyLock<MetricDescriptor> = LazyLock
 pub static USAGE_BUCKET_TOTAL_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::UsageBucketTotalBytes,
-        "Total bucket size in bytes",
+        "Cluster-wide logical bucket size in bytes",
         &[BUCKET_LABEL],
         subsystems::CLUSTER_USAGE_BUCKETS,
     )
@@ -106,7 +106,7 @@ pub static USAGE_BUCKET_TOTAL_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::n
 pub static USAGE_BUCKET_OBJECTS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::UsageBucketObjectsCount,
-        "Total objects count in bucket",
+        "Cluster-wide logical object count in bucket",
         &[BUCKET_LABEL],
         subsystems::CLUSTER_USAGE_BUCKETS,
     )
@@ -156,3 +156,22 @@ pub static USAGE_BUCKET_OBJECT_VERSION_COUNT_DISTRIBUTION_MD: LazyLock<MetricDes
         subsystems::CLUSTER_USAGE_BUCKETS,
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_usage_descriptors_identify_cluster_wide_logical_values() {
+        assert_eq!(
+            USAGE_BUCKET_TOTAL_BYTES_MD.get_full_metric_name(),
+            "rustfs_cluster_usage_buckets_total_bytes"
+        );
+        assert_eq!(
+            USAGE_BUCKET_OBJECTS_TOTAL_MD.get_full_metric_name(),
+            "rustfs_cluster_usage_buckets_objects_count"
+        );
+        assert!(USAGE_BUCKET_TOTAL_BYTES_MD.help.contains("Cluster-wide logical"));
+        assert!(USAGE_BUCKET_OBJECTS_TOTAL_MD.help.contains("Cluster-wide logical"));
+    }
+}

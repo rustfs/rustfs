@@ -30,6 +30,8 @@ pub struct ObjectOptions {
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
+    /// RustFS-only compare-and-set condition checked under the object write lock.
+    pub expected_current_version_id: Option<String>,
     pub no_lock: bool,
     /// True when an upper layer already holds the object read lock before
     /// forwarding a no_lock read to the set layer.
@@ -478,15 +480,14 @@ impl ObjectInfo {
             v
         };
 
-        // Extract storage class from metadata, default to STANDARD if not found
-        let storage_class = if !fi.transition_tier.is_empty() {
-            Some(fi.transition_tier.clone())
-        } else {
-            fi.metadata
-                .get(AMZ_STORAGE_CLASS)
-                .cloned()
-                .or_else(|| Some(storageclass::STANDARD.to_string()))
-        };
+        let storage_class = Some(
+            storageclass::effective_class(
+                fi.metadata.get(AMZ_STORAGE_CLASS).map(String::as_str),
+                (fi.transition_status == rustfs_filemeta::TRANSITION_COMPLETE && !fi.transition_tier.is_empty())
+                    .then_some(fi.transition_tier.as_str()),
+            )
+            .to_string(),
+        );
 
         let mut restore_ongoing = false;
         let mut restore_expires = None;
@@ -556,6 +557,29 @@ impl ObjectInfo {
         delimiter: Option<String>,
         after_version_marker: Option<VersionMarker>,
     ) -> Vec<ObjectInfo> {
+        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, false)
+            .await
+    }
+
+    pub(crate) async fn from_meta_cache_entries_sorted_versions_for_lifecycle(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+    ) -> Vec<ObjectInfo> {
+        Self::from_meta_cache_entries_sorted_versions_with_purge(entries, bucket, prefix, delimiter, after_version_marker, true)
+            .await
+    }
+
+    async fn from_meta_cache_entries_sorted_versions_with_purge(
+        entries: &MetaCacheEntriesSorted,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<String>,
+        after_version_marker: Option<VersionMarker>,
+        include_version_purge: bool,
+    ) -> Vec<ObjectInfo> {
         let vcfg = get_versioning_config(bucket).await.ok();
         let mut objects = Vec::with_capacity(entries.entries().len());
         let mut prev_prefix = "";
@@ -603,7 +627,7 @@ impl ObjectInfo {
                 };
 
                 for fi in versions.iter() {
-                    if !fi.version_purge_status().is_empty() {
+                    if !include_version_purge && !fi.version_purge_status().is_empty() {
                         continue;
                     }
 
@@ -799,6 +823,60 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 mod tests {
     use super::*;
     use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
+
+    fn inline_fast_path_object(size: i64, versioned: bool) -> ObjectInfo {
+        ObjectInfo {
+            size,
+            inlined: true,
+            version_id: versioned.then(|| Uuid::from_u128(1)),
+            parts: Arc::new(vec![ObjectPartInfo::default()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inline_fast_path_eligibility_preserves_exact_versioned_boundaries() {
+        for (case, size, versioned, expected) in [
+            ("unversioned below", 128 * 1024 - 1, false, true),
+            ("unversioned exact", 128 * 1024, false, true),
+            ("unversioned above", 128 * 1024 + 1, false, false),
+            ("versioned below", 16 * 1024 - 1, true, true),
+            ("versioned exact", 16 * 1024, true, true),
+            ("versioned above", 16 * 1024 + 1, true, false),
+        ] {
+            assert_eq!(
+                inline_fast_path_object(size, versioned).is_inline_fast_path_eligible(),
+                expected,
+                "{case}: object_size={size}, versioned={versioned}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_fast_path_eligibility_rejects_incompatible_object_shapes() {
+        let mut object = inline_fast_path_object(ObjectInfo::INLINE_MAX_SIZE, false);
+
+        object.inlined = false;
+        assert!(!object.is_inline_fast_path_eligible(), "non-inline objects must fall back");
+
+        object.inlined = true;
+        object.parts = Arc::new(vec![ObjectPartInfo::default(), ObjectPartInfo::default()]);
+        assert!(!object.is_inline_fast_path_eligible(), "multipart objects must fall back");
+
+        object.parts = Arc::new(vec![ObjectPartInfo::default()]);
+        object.user_defined = Arc::new(HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())]));
+        assert!(!object.is_inline_fast_path_eligible(), "encrypted objects must fall back");
+
+        object.user_defined = Arc::new(HashMap::from([(
+            rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_COMPRESSION),
+            "zstd".to_string(),
+        )]));
+        assert!(!object.is_inline_fast_path_eligible(), "compressed objects must fall back");
+
+        object.user_defined = Arc::default();
+        object.transitioned_object.tier = "remote-tier".to_string();
+        assert!(!object.is_inline_fast_path_eligible(), "transitioned objects must fall back");
+    }
 
     #[test]
     fn versions_after_marker_handles_null_version_marker() {
@@ -1009,6 +1087,67 @@ mod tests {
         assert_eq!(objects[0].num_versions, 1);
     }
 
+    #[tokio::test]
+    async fn lifecycle_versions_listing_preserves_purge_pending_versions() {
+        let visible_version_id = Uuid::new_v4();
+        let purge_version_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(purge_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("version pending purge should be added");
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(visible_version_id),
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("visible version should be added");
+        fm.delete_version(&FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(purge_version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let public_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+        let lifecycle_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(&entries, "bucket", "", None, None).await;
+
+        assert_eq!(public_objects.len(), 1);
+        assert_eq!(public_objects[0].version_id, Some(visible_version_id));
+        assert_eq!(public_objects[0].num_versions, 2);
+        assert_eq!(lifecycle_objects.len(), 2);
+        assert!(
+            lifecycle_objects
+                .iter()
+                .any(|object| object.version_purge_status == VersionPurgeStatusType::Pending)
+        );
+        assert!(lifecycle_objects.iter().all(|object| object.num_versions == 2));
+    }
+
     #[test]
     fn get_actual_size_prefers_actual_size_field() {
         let info = ObjectInfo {
@@ -1089,6 +1228,58 @@ mod tests {
         let info = ObjectInfo::from_file_info(&fi, "bucket", "object", true);
 
         assert_eq!(info.replication_decision, "arn=true;false;arn:replication::1:dest;rule-id");
+    }
+
+    #[test]
+    fn from_file_info_reports_effective_storage_class_for_legacy_metadata() {
+        for legacy_label in [
+            storageclass::STANDARD_IA,
+            storageclass::ONEZONE_IA,
+            storageclass::INTELLIGENT_TIERING,
+            storageclass::GLACIER,
+        ] {
+            let fi = FileInfo {
+                metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
+                ..Default::default()
+            };
+
+            let info = ObjectInfo::from_file_info(&fi, "bucket", "legacy-object", true);
+
+            assert_eq!(
+                info.storage_class.as_deref(),
+                Some(storageclass::STANDARD),
+                "{legacy_label} was only a label and must report the effective STANDARD layout"
+            );
+        }
+    }
+
+    #[test]
+    fn from_file_info_preserves_transitioned_tier_storage_class() {
+        let fi = FileInfo {
+            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            transition_tier: "WARM-TIER".to_string(),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "transitioned-object", true);
+
+        assert_eq!(info.storage_class.as_deref(), Some("WARM-TIER"));
+        assert_eq!(info.transitioned_object.tier, "WARM-TIER");
+    }
+
+    #[test]
+    fn from_file_info_ignores_a_tier_name_without_a_completed_transition() {
+        let fi = FileInfo {
+            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            transition_tier: "WARM-TIER".to_string(),
+            ..Default::default()
+        };
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "incomplete-transition", true);
+
+        assert_eq!(info.storage_class.as_deref(), Some(storageclass::STANDARD));
+        assert_eq!(info.transitioned_object.tier, "WARM-TIER");
     }
 
     #[test]

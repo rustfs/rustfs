@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::common::{is_target_enabled, split_env_field_and_instance};
+use crate::TargetError;
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENV_PREFIX};
 use std::collections::{HashMap, HashSet};
@@ -25,6 +26,31 @@ pub fn collect_target_configs(
     valid_fields: &HashSet<String>,
 ) -> Vec<(String, KVS)> {
     collect_target_configs_from_env(config, route_prefix, target_type, valid_fields, std::env::vars())
+}
+
+pub fn try_collect_target_configs(
+    config: &Config,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+) -> Result<Vec<(String, KVS)>, TargetError> {
+    try_collect_target_configs_from_env(config, route_prefix, target_type, valid_fields, std::env::vars())
+}
+
+/// Collects enabled target instance configs with per-instance fault isolation.
+///
+/// Unlike [`try_collect_target_configs`], an instance with an invalid
+/// configuration (for example an unparseable `enable` value) does not abort the
+/// whole target type. The enabled `(id, config)` pairs are returned alongside a
+/// summary line for every instance that could not be collected, so callers can
+/// load the healthy instances while still surfacing the failed ones.
+pub fn collect_target_config_results(
+    config: &Config,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+) -> (Vec<(String, KVS)>, Vec<String>) {
+    collect_target_config_results_from_env(config, route_prefix, target_type, valid_fields, std::env::vars())
 }
 
 fn is_sensitive_target_field(field_name: &str) -> bool {
@@ -58,7 +84,23 @@ fn redact_target_field_value(field_name: &str, value: &str) -> String {
         return crate::target::mysql::redact_mysql_dsn(value);
     }
     if is_sensitive_target_field(field_name) {
-        return "***redacted***".to_string();
+        return crate::target::REDACTED_SECRET.to_string();
+    }
+    if field_name.eq_ignore_ascii_case(rustfs_config::WEBHOOK_ENDPOINT)
+        || field_name.eq_ignore_ascii_case(rustfs_config::AMQP_URL)
+    {
+        return url::Url::parse(value)
+            .ok()
+            .and_then(|endpoint| {
+                let host = match endpoint.host()? {
+                    url::Host::Domain(host) => host.to_string(),
+                    url::Host::Ipv4(host) => host.to_string(),
+                    url::Host::Ipv6(host) => format!("[{host}]"),
+                };
+                let port = endpoint.port().map(|port| format!(":{port}")).unwrap_or_default();
+                Some(format!("{}://{host}{port}", endpoint.scheme()))
+            })
+            .unwrap_or_else(|| crate::target::REDACTED_SECRET.to_string());
     }
     value.to_string()
 }
@@ -123,7 +165,7 @@ pub fn collect_target_configs_from_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    collect_merged_target_configs_from_env(
+    collect_merged_target_configs_compat_from_env(
         config,
         &format!("{route_prefix}{target_type}").to_lowercase(),
         route_prefix,
@@ -137,6 +179,59 @@ where
     .collect()
 }
 
+pub fn try_collect_target_configs_from_env<I>(
+    config: &Config,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+    env_vars: I,
+) -> Result<Vec<(String, KVS)>, TargetError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    Ok(collect_merged_target_configs_from_env(
+        config,
+        &format!("{route_prefix}{target_type}").to_lowercase(),
+        route_prefix,
+        target_type,
+        valid_fields,
+        env_vars,
+    )?
+    .into_iter()
+    .filter(|record| record.enabled)
+    .map(|record| (record.instance_id, record.effective_config))
+    .collect())
+}
+
+pub fn collect_target_config_results_from_env<I>(
+    config: &Config,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+    env_vars: I,
+) -> (Vec<(String, KVS)>, Vec<String>)
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut configs = Vec::new();
+    let mut failures = Vec::new();
+    for result in collect_merged_target_config_results_from_env(
+        config,
+        &format!("{route_prefix}{target_type}").to_lowercase(),
+        route_prefix,
+        target_type,
+        valid_fields,
+        env_vars,
+    ) {
+        match result {
+            Ok(record) if record.enabled => configs.push((record.instance_id, record.effective_config)),
+            Ok(_) => {}
+            Err((record, err)) => failures.push(format!("{target_type}/{}: {err}", record.instance_id)),
+        }
+    }
+    (configs, failures)
+}
+
 pub(crate) fn collect_merged_target_configs_from_env<I>(
     config: &Config,
     section_name: &str,
@@ -144,7 +239,52 @@ pub(crate) fn collect_merged_target_configs_from_env<I>(
     target_type: &str,
     valid_fields: &HashSet<String>,
     env_vars: I,
+) -> Result<Vec<MergedTargetConfigRecord>, TargetError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    collect_merged_target_config_results_from_env(config, section_name, route_prefix, target_type, valid_fields, env_vars)
+        .into_iter()
+        .map(|result| result.map_err(|(_, err)| err))
+        .collect()
+}
+
+pub(crate) fn collect_merged_target_configs_compat_from_env<I>(
+    config: &Config,
+    section_name: &str,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+    env_vars: I,
 ) -> Vec<MergedTargetConfigRecord>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    collect_merged_target_config_results_from_env(config, section_name, route_prefix, target_type, valid_fields, env_vars)
+        .into_iter()
+        .map(|result| match result {
+            Ok(record) => record,
+            Err((record, err)) => {
+                warn!(
+                    target_type,
+                    instance_id = %record.instance_id,
+                    error = %err,
+                    "Treating target instance with invalid enable configuration as disabled"
+                );
+                record
+            }
+        })
+        .collect()
+}
+
+fn collect_merged_target_config_results_from_env<I>(
+    config: &Config,
+    section_name: &str,
+    route_prefix: &str,
+    target_type: &str,
+    valid_fields: &HashSet<String>,
+    env_vars: I,
+) -> Vec<Result<MergedTargetConfigRecord, (MergedTargetConfigRecord, TargetError)>>
 where
     I: IntoIterator<Item = (String, String)>,
 {
@@ -220,14 +360,28 @@ where
             let redacted_config = redacted_target_config(&merged_config);
             debug!(instance_id = %id, ?redacted_config, "Merged target configuration");
         }
-        merged_configs.push(MergedTargetConfigRecord {
-            instance_id: id,
-            enabled: is_target_enabled(&merged_config),
-            effective_config: merged_config,
-            has_file_default,
-            has_file_instance,
-            has_env_default,
-            has_env_instance,
+        merged_configs.push(match is_target_enabled(&merged_config) {
+            Ok(enabled) => Ok(MergedTargetConfigRecord {
+                instance_id: id,
+                enabled,
+                effective_config: merged_config,
+                has_file_default,
+                has_file_instance,
+                has_env_default,
+                has_env_instance,
+            }),
+            Err(err) => Err((
+                MergedTargetConfigRecord {
+                    instance_id: id,
+                    enabled: false,
+                    effective_config: merged_config,
+                    has_file_default,
+                    has_file_instance,
+                    has_env_default,
+                    has_env_instance,
+                },
+                err,
+            )),
         });
     }
 
@@ -237,9 +391,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_env_target_instance_ids_from_env, collect_target_configs_from_env, redact_target_field_value,
-        redacted_target_config,
+        collect_env_target_instance_ids_from_env, collect_target_config_results_from_env, collect_target_configs_from_env,
+        redact_target_field_value, redacted_target_config, try_collect_target_configs_from_env,
     };
+    use crate::TargetError;
     use rustfs_config::notify::{
         ENV_NOTIFY_REDIS_ENABLE, ENV_NOTIFY_REDIS_RECONNECT_RETRY_ATTEMPTS, ENV_NOTIFY_REDIS_TLS_ALLOW_INSECURE,
         ENV_NOTIFY_REDIS_URL, NOTIFY_REDIS_KEYS, NOTIFY_ROUTE_PREFIX,
@@ -269,7 +424,7 @@ mod tests {
 
         cfg.0.insert("notify_webhook".to_string(), subsystem);
 
-        let configs = collect_target_configs_from_env(
+        let configs = try_collect_target_configs_from_env(
             &cfg,
             NOTIFY_ROUTE_PREFIX,
             "webhook",
@@ -282,7 +437,8 @@ mod tests {
                 ("RUSTFS_NOTIFY_WEBHOOK_ENABLE".to_string(), "on".to_string()),
                 ("RUSTFS_NOTIFY_WEBHOOK_QUEUE_LIMIT".to_string(), "42".to_string()),
             ],
-        );
+        )
+        .expect("valid env target");
 
         let configs: HashMap<String, KVS> = configs.into_iter().collect();
         assert_eq!(configs.len(), 2);
@@ -295,7 +451,7 @@ mod tests {
     #[test]
     fn collect_target_configs_discovers_enabled_instance_from_env() {
         let cfg = Config(HashMap::new());
-        let configs = collect_target_configs_from_env(
+        let configs = try_collect_target_configs_from_env(
             &cfg,
             NOTIFY_ROUTE_PREFIX,
             "webhook",
@@ -307,7 +463,8 @@ mod tests {
                     "https://example.com/from-env".to_string(),
                 ),
             ],
-        );
+        )
+        .expect("valid target configs");
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].0, "primary");
@@ -323,7 +480,7 @@ mod tests {
         subsystem.insert("_".to_string(), default_kvs);
         cfg.0.insert("notify_webhook".to_string(), subsystem);
 
-        let configs = collect_target_configs_from_env(
+        let configs = try_collect_target_configs_from_env(
             &cfg,
             NOTIFY_ROUTE_PREFIX,
             "webhook",
@@ -332,7 +489,8 @@ mod tests {
                 "RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_SECONDARY".to_string(),
                 "https://example.com/secondary".to_string(),
             )],
-        );
+        )
+        .expect("valid target configs");
 
         assert!(configs.is_empty());
     }
@@ -361,7 +519,7 @@ mod tests {
         let cfg = Config(HashMap::new());
         let valid_fields = NOTIFY_REDIS_KEYS.iter().map(|key| (*key).to_string()).collect();
 
-        let configs = collect_target_configs_from_env(
+        let configs = try_collect_target_configs_from_env(
             &cfg,
             NOTIFY_ROUTE_PREFIX,
             "redis",
@@ -372,7 +530,8 @@ mod tests {
                 (format!("{ENV_NOTIFY_REDIS_RECONNECT_RETRY_ATTEMPTS}_PRIMARY"), "9".to_string()),
                 (format!("{ENV_NOTIFY_REDIS_TLS_ALLOW_INSECURE}_PRIMARY"), "off".to_string()),
             ],
-        );
+        )
+        .expect("valid redis target config");
 
         let configs: HashMap<String, KVS> = configs.into_iter().collect();
         let redis_config = configs.get("primary").expect("redis env target should be discovered");
@@ -381,6 +540,99 @@ mod tests {
         assert_eq!(redis_config.lookup(REDIS_URL).as_deref(), Some("redis://127.0.0.1:6379/0"));
         assert_eq!(redis_config.lookup(REDIS_RECONNECT_RETRY_ATTEMPTS).as_deref(), Some("9"));
         assert_eq!(redis_config.lookup(REDIS_TLS_ALLOW_INSECURE).as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn collect_target_configs_rejects_invalid_instance_enable_value() {
+        let err = try_collect_target_configs_from_env(
+            &Config(HashMap::new()),
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(), "invalid".to_string())],
+        )
+        .expect_err("invalid enable value must not look like a disabled target");
+
+        match err {
+            TargetError::Configuration(detail) => assert_eq!(detail, "Invalid enable value 'invalid'"),
+            other => panic!("expected a configuration error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn legacy_collection_keeps_valid_instances_when_one_enable_is_invalid() {
+        let configs = collect_target_configs_from_env(
+            &Config(HashMap::new()),
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_GOOD".to_string(), "on".to_string()),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_GOOD".to_string(), "https://example.com/good".to_string()),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_BAD".to_string(), "invalid".to_string()),
+            ],
+        );
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].0, "good");
+    }
+
+    #[test]
+    fn collect_target_config_results_isolates_invalid_instance_and_reports_it() {
+        let (configs, failures) = collect_target_config_results_from_env(
+            &Config(HashMap::new()),
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_GOOD".to_string(), "on".to_string()),
+                ("RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_GOOD".to_string(), "https://example.com/good".to_string()),
+                // "enable" is a common typo: EnableState accepts "enabled"/"on", not "enable".
+                ("RUSTFS_NOTIFY_WEBHOOK_ENABLE_BAD".to_string(), "enable".to_string()),
+            ],
+        );
+
+        // The healthy instance still loads even though a sibling is malformed...
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].0, "good");
+        // ...and the malformed instance is surfaced (not silently dropped, not
+        // aborting the whole target type) so callers can fail-report it.
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("webhook/bad") && failures[0].contains("enable"),
+            "unexpected failure summary: {}",
+            failures[0]
+        );
+    }
+
+    #[test]
+    fn collect_target_config_results_does_not_report_validly_disabled_instances() {
+        let (configs, failures) = collect_target_config_results_from_env(
+            &Config(HashMap::new()),
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(), "off".to_string())],
+        );
+
+        assert!(configs.is_empty());
+        assert!(failures.is_empty(), "a validly disabled instance is not a failure");
+    }
+
+    #[test]
+    fn collect_target_configs_preserves_whitespace_padded_legacy_value() {
+        let configs = try_collect_target_configs_from_env(
+            &Config(HashMap::new()),
+            NOTIFY_ROUTE_PREFIX,
+            "webhook",
+            &HashSet::from([ENABLE_KEY.to_string(), WEBHOOK_ENDPOINT.to_string()]),
+            vec![("RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(), " on ".to_string())],
+        )
+        .expect("the shared enable parser accepts surrounding whitespace");
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].0, "primary");
+        assert_eq!(configs[0].1.lookup(ENABLE_KEY).as_deref(), Some(" on "));
     }
 
     #[test]
@@ -394,6 +646,24 @@ mod tests {
     fn redact_target_field_value_keeps_non_sensitive_fields() {
         assert_eq!(redact_target_field_value("endpoint", "https://example.com"), "https://example.com");
         assert_eq!(redact_target_field_value("queue_limit", "1000"), "1000");
+    }
+
+    #[test]
+    fn redact_target_field_value_strips_endpoint_path_and_query() {
+        assert_eq!(
+            redact_target_field_value("endpoint", "https://example.com/private/hook?token=secret"),
+            "https://example.com"
+        );
+        assert_eq!(redact_target_field_value("endpoint", "not a URL with secret"), "***redacted***");
+    }
+
+    #[test]
+    fn redact_target_field_value_strips_url_credentials() {
+        assert_eq!(
+            redact_target_field_value("url", "amqps://user:secret@broker.example/vhost"),
+            "amqps://broker.example"
+        );
+        assert_eq!(redact_target_field_value("url", "not a URL with secret"), "***redacted***");
     }
 
     #[test]
@@ -435,7 +705,7 @@ mod tests {
         assert_eq!(
             redacted,
             vec![
-                ("endpoint".to_string(), "https://example.com/hook".to_string()),
+                ("endpoint".to_string(), "https://example.com".to_string()),
                 ("password".to_string(), "***redacted***".to_string()),
                 ("client_key".to_string(), "***redacted***".to_string()),
                 ("auth_token".to_string(), "***redacted***".to_string()),

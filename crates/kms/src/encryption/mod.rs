@@ -17,4 +17,4 @@
 pub mod ciphers;
 pub mod dek;
 
-pub use dek::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
+pub use dek::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material, is_data_key_envelope};

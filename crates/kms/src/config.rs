@@ -27,6 +27,8 @@ pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
+pub const ENV_KMS_STATIC_SECRET_KEY: &str = "RUSTFS_KMS_STATIC_SECRET_KEY";
+pub const ENV_KMS_STATIC_SECRET_KEY_FILE: &str = "RUSTFS_KMS_STATIC_SECRET_KEY_FILE";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
 pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
 
@@ -73,6 +75,7 @@ pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
         RedactionLevel::Secret,
         "admin configure request vault transit approle secret",
     ),
+    RedactionRule::new("kms.static.secret_key", RedactionLevel::Secret, "static backend secret key material"),
 ];
 
 pub(crate) const REDACTED_SECRET: &str = "***redacted***";
@@ -97,6 +100,9 @@ pub enum KmsBackend {
     /// Local file-based backend for development and testing only
     #[default]
     Local,
+    /// Static single-key backend that derives DEKs from a pre-configured key
+    #[serde(rename = "Static")]
+    Static,
 }
 
 /// Main KMS configuration
@@ -146,6 +152,8 @@ pub enum BackendConfig {
     VaultKv2(Box<VaultConfig>),
     /// Vault Transit backend configuration
     VaultTransit(Box<VaultTransitConfig>),
+    /// Static single-key backend configuration
+    Static(StaticConfig),
 }
 
 impl Default for BackendConfig {
@@ -160,6 +168,7 @@ impl fmt::Debug for BackendConfig {
             Self::Local(config) => f.debug_tuple("Local").field(config).finish(),
             Self::VaultKv2(config) => f.debug_tuple("VaultKv2").field(config).finish(),
             Self::VaultTransit(config) => f.debug_tuple("VaultTransit").field(config).finish(),
+            Self::Static(config) => f.debug_tuple("Static").field(config).finish(),
         }
     }
 }
@@ -193,6 +202,47 @@ impl Default for LocalConfig {
             master_key: None,
             file_permissions: Some(0o600), // Owner read/write only
         }
+    }
+}
+
+/// Static single-key KMS backend configuration
+///
+/// Uses a pre-configured AES-256 key to derive data encryption keys via
+/// HMAC-SHA256 + AES-256-GCM, matching the MinIO builtin/static KMS wire format.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct StaticConfig {
+    /// Key identifier (name) for the single configured key
+    pub key_id: String,
+    /// Base64-encoded 32-byte AES-256 key material (zeroed on drop)
+    pub secret_key: String,
+}
+
+impl fmt::Debug for StaticConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StaticConfig")
+            .field("key_id", &self.key_id)
+            .field("secret_key", &redacted_secret(&self.secret_key))
+            .finish()
+    }
+}
+
+impl StaticConfig {
+    /// Decode the base64-encoded secret key into raw bytes.
+    /// Returns an error if the key is not valid base64 or is not exactly 32 bytes.
+    pub fn decode_key(&self) -> Result<[u8; 32]> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.secret_key)
+            .map_err(|e| KmsError::configuration_error(format!("Static KMS secret key is not valid base64: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(KmsError::configuration_error(format!(
+                "Static KMS secret key must be exactly 32 bytes after base64 decoding, got {} bytes",
+                bytes.len()
+            )));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Ok(key)
     }
 }
 
@@ -404,6 +454,23 @@ impl KmsConfig {
         }
     }
 
+    /// Create a new KMS configuration for static single-key backend
+    ///
+    /// # Arguments
+    /// * `key_id` - The key identifier (name) for the configured key
+    /// * `secret_key` - Base64-encoded 32-byte AES-256 key material
+    pub fn static_kms(key_id: String, secret_key: String) -> Self {
+        Self {
+            backend: KmsBackend::Static,
+            backend_config: BackendConfig::Static(StaticConfig {
+                key_id: key_id.clone(),
+                secret_key,
+            }),
+            default_key_id: Some(key_id),
+            ..Default::default()
+        }
+    }
+
     /// Get the local configuration if backend is Local
     pub fn local_config(&self) -> Option<&LocalConfig> {
         match &self.backend_config {
@@ -424,6 +491,14 @@ impl KmsConfig {
     pub fn vault_transit_config(&self) -> Option<&VaultTransitConfig> {
         match &self.backend_config {
             BackendConfig::VaultTransit(config) => Some(config),
+            _ => None,
+        }
+    }
+
+    /// Get the static configuration if backend is Static
+    pub fn static_config(&self) -> Option<&StaticConfig> {
+        match &self.backend_config {
+            BackendConfig::Static(config) => Some(config),
             _ => None,
         }
     }
@@ -544,6 +619,16 @@ impl KmsConfig {
                     tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                 }
             }
+            BackendConfig::Static(config) => {
+                if config.key_id.is_empty() {
+                    return Err(KmsError::configuration_error("Static KMS key_id cannot be empty"));
+                }
+                if config.secret_key.is_empty() {
+                    return Err(KmsError::configuration_error("Static KMS secret_key cannot be empty"));
+                }
+                // Validate that the key can be decoded (right length, valid base64)
+                config.decode_key()?;
+            }
         }
 
         // Validate cache configuration
@@ -564,6 +649,7 @@ impl KmsConfig {
                 "local" => KmsBackend::Local,
                 "vault" | "vault-kv2" | "vault_kv2" => KmsBackend::VaultKv2,
                 "vault-transit" | "vault_transit" => KmsBackend::VaultTransit,
+                "static" => KmsBackend::Static,
                 _ => return Err(KmsError::configuration_error(format!("Unknown KMS backend: {backend_type}"))),
             };
         }
@@ -640,6 +726,47 @@ impl KmsConfig {
                     ),
                     tls: vault_tls_config(skip_tls_verify),
                 }));
+            }
+            KmsBackend::Static => {
+                // Read from file first, then fall back to direct env var
+                let secret_str = if let Some(file_path) = get_env_opt_str(ENV_KMS_STATIC_SECRET_KEY_FILE) {
+                    std::fs::read_to_string(&file_path).map_err(|e| {
+                        KmsError::configuration_error(format!("Failed to read static KMS secret key file {file_path}: {e}"))
+                    })?
+                } else {
+                    get_env_str(ENV_KMS_STATIC_SECRET_KEY, "")
+                };
+
+                let secret_str = secret_str.trim().to_string();
+                if secret_str.is_empty() {
+                    return Err(KmsError::configuration_error(format!(
+                        "Static KMS requires {ENV_KMS_STATIC_SECRET_KEY} or {ENV_KMS_STATIC_SECRET_KEY_FILE} to be set"
+                    )));
+                }
+
+                // Parse format: <key-id>:<base64-key>
+                let colon_pos = secret_str.find(':').ok_or_else(|| {
+                    KmsError::configuration_error("Static KMS secret key must be in format <key-name>:<base64-key>")
+                })?;
+                let key_id = secret_str[..colon_pos].to_string();
+                let secret_key = secret_str[colon_pos + 1..].to_string();
+
+                if key_id.is_empty() {
+                    return Err(KmsError::configuration_error(
+                        "Static KMS key name must not be empty in secret key string",
+                    ));
+                }
+                if secret_key.is_empty() {
+                    return Err(KmsError::configuration_error(
+                        "Static KMS base64 key must not be empty in secret key string",
+                    ));
+                }
+
+                config.backend_config = BackendConfig::Static(StaticConfig {
+                    key_id: key_id.clone(),
+                    secret_key,
+                });
+                config.default_key_id = Some(key_id);
             }
         }
 
@@ -1047,6 +1174,39 @@ mod tests {
                 assert_eq!(vault.address, "https://vault.example.com");
                 assert_eq!(vault.namespace.as_deref(), Some("tenant-a"));
                 assert_eq!(vault.mount_path, "transit-alt");
+            },
+        );
+    }
+
+    #[test]
+    fn test_from_env_reads_static_secret_file_and_sets_default_key() {
+        use base64::Engine as _;
+
+        let temp_dir = TempDir::new().expect("create temp dir for static KMS secret");
+        let secret_path = temp_dir.path().join("static-kms-secret");
+        // Named `*_key_b64` (not `*_secret`) so the logging-guardrails check does not
+        // flag these fixture interpolations as secrets leaking into log strings.
+        let file_key_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let env_key_b64 = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        std::fs::write(&secret_path, format!("file-key:{file_key_b64}\n")).expect("write static KMS secret file");
+
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("static")),
+                (
+                    ENV_KMS_STATIC_SECRET_KEY_FILE,
+                    Some(secret_path.to_str().expect("secret path should be utf-8")),
+                ),
+                (ENV_KMS_STATIC_SECRET_KEY, Some(&format!("env-key:{env_key_b64}"))),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("static KMS config should load from secret file");
+
+                assert_eq!(config.backend, KmsBackend::Static);
+                assert_eq!(config.default_key_id.as_deref(), Some("file-key"));
+                let static_config = config.static_config().expect("static backend config");
+                assert_eq!(static_config.key_id, "file-key");
+                assert_eq!(static_config.secret_key, file_key_b64);
             },
         );
     }

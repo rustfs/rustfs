@@ -16,8 +16,10 @@ use crate::cluster::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
     node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
+use crate::cluster::rpc::http_auth::set_tonic_canonical_body_digest;
 use crate::cluster::rpc::internode_data_transport::{
-    InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
+    InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, ReadStreamRequest, WalkDirStreamRequest,
+    WriteStreamRequest,
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
@@ -81,6 +83,7 @@ const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 const REMOTE_DISK_OPEN_READ_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_READ_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+const NS_SCANNER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Base backoff for idempotent read-only RPC retries (grpc-optimization P3-3); doubles per attempt.
 const REMOTE_DISK_READ_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
 const ENV_RUSTFS_METADATA_BATCH_READ: &str = "RUSTFS_METADATA_BATCH_READ";
@@ -96,6 +99,29 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
+
+/// Bind a mutating disk RPC to its canonical body: the digest lands in the request metadata, and
+/// the signing interceptor folds it (plus a replay-protected nonce) into the v2 signature scope
+/// (backlog#1327).
+fn attach_mutation_body_digest<T>(
+    request: &mut Request<T>,
+    canonical_body: std::result::Result<Vec<u8>, std::num::TryFromIntError>,
+    op: &'static str,
+) -> Result<()> {
+    let canonical_body = canonical_body.map_err(|_| Error::other(format!("{op} request length cannot be represented")))?;
+    set_tonic_canonical_body_digest(request, &canonical_body).map_err(Error::other)
+}
+
+fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
+    volume_infos
+        .into_iter()
+        .enumerate()
+        .map(|(index, json)| {
+            serde_json::from_str::<VolumeInfo>(&json)
+                .map_err(|err| Error::other(format!("decode list volumes entry {index} failed: {err}")))
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchMetadataRpcMode {
@@ -264,6 +290,71 @@ fn spawn_control_channel_prewarm(addr: String) {
 }
 
 impl RemoteDisk {
+    pub(crate) async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let probe = self.data_transport.probe_ns_scanner(NsScannerCapabilityRequest {
+            endpoint: self.endpoint.grid_host(),
+        });
+        let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
+            .await
+            .map_err(|_| DiskError::other("remote namespace scanner capability probe timed out"))?;
+        match result {
+            Ok(server_epoch) => Ok(Some(server_epoch)),
+            // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers and legacy transports lack the authenticated startup-epoch handshake. Remove after every supported peer implements namespace scanner protocol v3.
+            Err(DiskError::MethodNotAllowed) => Ok(None),
+            Err(err)
+                if matches!(
+                    err.internode_http_error_kind(),
+                    Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status))
+                        if matches!(status.as_u16(), 404 | 405)
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err)
+                if matches!(
+                    err.internode_http_error_kind(),
+                    Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)) if status.as_u16() == 426
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) async fn open_ns_scanner_stream(&self, request: crate::disk::NsScannerOpenRequest) -> Result<FileReader> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let crate::disk::NsScannerOpenRequest {
+            request_id,
+            server_epoch,
+            session_id,
+            session_sequence,
+            next_cycle,
+            leader_epoch,
+            body,
+            stall_timeout,
+        } = request;
+        self.data_transport
+            .open_ns_scanner(NsScannerStreamRequest {
+                endpoint: self.endpoint.grid_host(),
+                disk: self.disk_ref().await,
+                request_id,
+                server_epoch,
+                session_id,
+                session_sequence,
+                next_cycle,
+                leader_epoch,
+                body,
+                stall_timeout,
+            })
+            .await
+    }
+
     fn recovery_monitor_span(addr: &str, endpoint: &Endpoint) -> tracing::Span {
         tracing::info_span!(
             "recovery-monitor",
@@ -1022,9 +1113,8 @@ fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 /// JSON compatibility string for a dual-encoded (`_bin` + text) request field. Returns an empty
-/// string when msgpack-only mode is enabled (grpc-optimization P2-1) so the redundant JSON copy is
-/// not sent; otherwise the legacy JSON encoding. Only use for fields whose peer decodes `_bin`
-/// first — the paired `_bin` (msgpack) field must always be sent alongside.
+/// string only when msgpack-only mode and its explicit fleet confirmation guard are both enabled;
+/// otherwise the legacy JSON encoding is retained for old peers.
 fn compat_json<T: Serialize>(value: &T) -> Result<String> {
     if rustfs_protos::internode_rpc_msgpack_only() {
         return Ok(String::new());
@@ -1041,13 +1131,19 @@ fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer).map_err(Error::from);
+        return T::deserialize(&mut deserializer).map_err(|err| {
+            crate::cluster::rpc::runtime_sources::record_response_msgpack_decode_error(value_name);
+            Error::from(err)
+        });
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     crate::cluster::rpc::runtime_sources::record_response_json_fallback(value_name);
-    serde_json::from_str(json).map_err(Error::from)
+    serde_json::from_str(json).map_err(|err| {
+        crate::cluster::rpc::runtime_sources::record_response_json_decode_error(value_name);
+        Error::from(err)
+    })
 }
 
 /// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
@@ -1095,8 +1191,10 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
     }
     let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps.len());
     for (index, json_str) in response.read_multiple_resps.iter().enumerate() {
-        let resp = serde_json::from_str::<ReadMultipleResp>(json_str)
-            .map_err(|err| Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}")))?;
+        let resp = serde_json::from_str::<ReadMultipleResp>(json_str).map_err(|err| {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode_error("ReadMultipleResp");
+            Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}"))
+        })?;
         read_multiple_resps.push(resp);
     }
 
@@ -1144,6 +1242,7 @@ fn decode_batch_read_version_response_items(
     let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps.len());
     for (index, json_str) in response.batch_read_version_resps.iter().enumerate() {
         let resp = serde_json::from_str::<BatchReadVersionResp>(json_str).map_err(|err| {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode_error("BatchReadVersionResp");
             Error::other(format!("decode BatchReadVersionResp json item {index} from {endpoint} failed: {err}"))
         })?;
         if resp.success {
@@ -1253,10 +1352,12 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(MakeVolumeRequest {
+                let mut request = Request::new(MakeVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                 });
+                let canonical_body = rustfs_protos::canonical_make_volume_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "make_volume")?;
 
                 let response = client.make_volume(request).await?.into_inner();
 
@@ -1290,10 +1391,12 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(MakeVolumesRequest {
+                let mut request = Request::new(MakeVolumesRequest {
                     disk: self.endpoint.to_string(),
                     volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
                 });
+                let canonical_body = rustfs_protos::canonical_make_volumes_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "make_volumes")?;
 
                 let response = client.make_volumes(request).await?.into_inner();
 
@@ -1336,11 +1439,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let infos = response
-                    .volume_infos
-                    .into_iter()
-                    .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
-                    .collect();
+                let infos = decode_volume_infos(response.volume_infos)?;
 
                 Ok(infos)
             },
@@ -1407,11 +1506,13 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeleteVolumeRequest {
+                let mut request = Request::new(DeleteVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     force: force_delete,
                 });
+                let canonical_body = rustfs_protos::canonical_delete_volume_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete_volume")?;
 
                 let response = client.delete_volume(request).await?.into_inner();
 
@@ -1460,7 +1561,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeleteVersionRequest {
+                let mut request = Request::new(DeleteVersionRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -1470,6 +1571,8 @@ impl DiskAPI for RemoteDisk {
                     file_info_bin: file_info_bin.into(),
                     opts_bin: opts_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_delete_version_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete_version")?;
 
                 let response = client.delete_version(request).await?.into_inner();
 
@@ -1561,7 +1664,7 @@ impl DiskAPI for RemoteDisk {
             }
         };
 
-        let request = Request::new(DeleteVersionsRequest {
+        let mut request = Request::new(DeleteVersionsRequest {
             disk: self.endpoint.to_string(),
             volume: volume.to_string(),
             versions: versions_str,
@@ -1569,6 +1672,14 @@ impl DiskAPI for RemoteDisk {
             versions_bin,
             opts_bin: opts_bin.into(),
         });
+        let canonical_body = rustfs_protos::canonical_delete_versions_request_body(request.get_ref());
+        if let Err(err) = attach_mutation_body_digest(&mut request, canonical_body, "delete_versions") {
+            let mut errors = Vec::with_capacity(versions.len());
+            for _ in 0..versions.len() {
+                errors.push(Some(err.clone()));
+            }
+            return errors;
+        }
 
         // TODO: use Error not string
 
@@ -1637,11 +1748,13 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeletePathsRequest {
+                let mut request = Request::new(DeletePathsRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     paths: paths.clone(),
                 });
+                let canonical_body = rustfs_protos::canonical_delete_paths_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete_paths")?;
 
                 let response = client.delete_paths(request).await?.into_inner();
 
@@ -1680,13 +1793,15 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(WriteMetadataRequest {
+                let mut request = Request::new(WriteMetadataRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                     file_info,
                     file_info_bin: file_info_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_write_metadata_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "write_metadata")?;
 
                 let response = client.write_metadata(request).await?.into_inner();
 
@@ -1758,7 +1873,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(UpdateMetadataRequest {
+                let mut request = Request::new(UpdateMetadataRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -1767,6 +1882,8 @@ impl DiskAPI for RemoteDisk {
                     file_info_bin: file_info_bin.into(),
                     opts_bin: opts_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_update_metadata_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "update_metadata")?;
 
                 let response = client.update_metadata(request).await?.into_inner();
 
@@ -2014,7 +2131,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(RenameDataRequest {
+                let mut request = Request::new(RenameDataRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
@@ -2023,6 +2140,8 @@ impl DiskAPI for RemoteDisk {
                     dst_path: dst_path.to_string(),
                     file_info_bin: file_info_bin.into(),
                 });
+                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_data")?;
 
                 let response = client.rename_data(request).await?.into_inner();
 
@@ -2279,13 +2398,15 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(RenameFileRequest {
+                let mut request = Request::new(RenameFileRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
                 });
+                let canonical_body = rustfs_protos::canonical_rename_file_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_file")?;
 
                 let response = client.rename_file(request).await?.into_inner();
 
@@ -2322,7 +2443,7 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(RenamePartRequest {
+                let mut request = Request::new(RenamePartRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
                     src_path: src_path.to_string(),
@@ -2330,6 +2451,8 @@ impl DiskAPI for RemoteDisk {
                     dst_path: dst_path.to_string(),
                     meta,
                 });
+                let canonical_body = rustfs_protos::canonical_rename_part_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "rename_part")?;
 
                 let response = client.rename_part(request).await?.into_inner();
 
@@ -2367,12 +2490,14 @@ impl DiskAPI for RemoteDisk {
                     .get_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(DeleteRequest {
+                let mut request = Request::new(DeleteRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
                     path: path.to_string(),
                     options,
                 });
+                let canonical_body = rustfs_protos::canonical_delete_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "delete")?;
 
                 let response = client.delete(request).await?.into_inner();
 
@@ -2583,12 +2708,14 @@ impl DiskAPI for RemoteDisk {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
-                let request = Request::new(WriteAllRequest {
+                let mut request = Request::new(WriteAllRequest {
                     disk,
                     volume: volume.to_string(),
                     path: path.to_string(),
                     data,
                 });
+                let canonical_body = rustfs_protos::canonical_write_all_request_body(request.get_ref());
+                attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
                 let response = match client.write_all(request).await {
@@ -2724,6 +2851,19 @@ mod tests {
     static INIT: Once = Once::new();
 
     #[test]
+    fn list_volumes_decode_rejects_a_malformed_entry() {
+        let valid = serde_json::to_string(&VolumeInfo {
+            name: "bucket".to_string(),
+            created: None,
+        })
+        .expect("volume info should serialize");
+        let err = decode_volume_infos(vec![valid, "{".to_string()])
+            .expect_err("a malformed volume entry must fail the complete response");
+
+        assert!(err.to_string().contains("entry 1"));
+    }
+
+    #[test]
     fn decoded_remote_metadata_rejects_default_like_delete_marker() {
         let forged = FileInfo {
             deleted: true,
@@ -2795,14 +2935,31 @@ mod tests {
         Read(ReadStreamRequest),
         Write(WriteStreamRequest),
         WalkDir(WalkDirStreamRequest),
+        NsScanner(NsScannerStreamRequest),
+        NsScannerProbe(NsScannerCapabilityRequest),
     }
 
     #[derive(Debug, Clone, Default)]
     struct RecordingInternodeDataTransport {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
+        ns_scanner_probe_status: Arc<StdMutex<Option<u16>>>,
     }
 
     impl RecordingInternodeDataTransport {
+        fn with_ns_scanner_probe_status(status: u16) -> Self {
+            Self {
+                calls: Arc::default(),
+                ns_scanner_probe_status: Arc::new(StdMutex::new(Some(status))),
+            }
+        }
+
+        fn set_ns_scanner_probe_status(&self, status: Option<u16>) {
+            *self
+                .ns_scanner_probe_status
+                .lock()
+                .expect("namespace scanner probe status lock poisoned") = status;
+        }
+
         fn calls(&self) -> Vec<RecordedTransportCall> {
             self.calls.lock().expect("recorded transport calls lock poisoned").clone()
         }
@@ -3019,13 +3176,95 @@ mod tests {
 
     #[test]
     fn compat_json_dual_writes_by_default() {
-        // msgpack-only defaults off, so compat_json returns the JSON encoding (dual-write). The
-        // empty-string (msgpack-only) path is exercised via the env flag in integration, not here,
-        // to keep this test independent of process-global env state.
-        let resp = sample_read_multiple_resp("file", b"data");
-        let json = compat_json(&resp).expect("compat_json should encode");
-        assert!(!json.is_empty());
-        assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+                assert!(!json.is_empty());
+                assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+            },
+        );
+    }
+
+    fn with_internode_msgpack_env<R>(vars: [(&'static str, Option<&'static str>); 2], f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(vars, || {
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            let result = f();
+            rustfs_protos::reset_internode_rpc_msgpack_only_cache();
+            result
+        })
+    }
+
+    #[test]
+    fn compat_json_keeps_json_when_msgpack_only_lacks_fleet_confirmation() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(!json.is_empty(), "old JSON peers must remain compatible without fleet confirmation");
+                assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+            },
+        );
+    }
+
+    #[test]
+    fn compat_json_omits_json_only_after_fleet_confirmation() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(json.is_empty(), "msgpack-only may empty JSON only after explicit fleet confirmation");
+            },
+        );
+    }
+
+    #[test]
+    fn compat_json_restores_json_when_either_msgpack_only_gate_is_removed() {
+        with_internode_msgpack_env(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(json.is_empty(), "both gates should enter msgpack-only send mode");
+            },
+        );
+
+        for vars in [
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("false")),
+            ],
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("false")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+        ] {
+            with_internode_msgpack_env(vars, || {
+                let resp = sample_read_multiple_resp("file", b"data");
+                let json = compat_json(&resp).expect("compat_json should encode");
+
+                assert!(!json.is_empty(), "removing either gate should restore old-peer JSON compatibility");
+                assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
+            });
+        }
     }
 
     #[test]
@@ -3042,12 +3281,38 @@ mod tests {
             ],
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         let err = decode_read_multiple_response_items(response, &endpoint).expect_err("corrupt msgpack item should fail");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
         let err = err.to_string();
 
         assert!(err.contains("ReadMultipleResp msgpack item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt response msgpack should increment decode-error metrics");
+    }
+
+    #[test]
+    fn read_multiple_response_decode_reports_corrupt_json_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![
+                serde_json::to_string(&sample_read_multiple_resp("good", b"ok")).expect("json response should encode"),
+                "{not-json".to_string(),
+            ],
+            read_multiple_resps_bin: Vec::new(),
+            error: None,
+        };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
+
+        let err = decode_read_multiple_response_items(response, &endpoint).expect_err("corrupt json item should fail");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
+        let err = err.to_string();
+
+        assert!(err.contains("ReadMultipleResp json item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt response JSON should increment decode-error metrics");
     }
 
     fn sample_batch_read_version_resp(index: usize, path: &str, success: bool) -> BatchReadVersionResp {
@@ -3120,13 +3385,40 @@ mod tests {
             ],
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         let err = decode_batch_read_version_response_items(response, &endpoint)
             .expect_err("corrupt msgpack item should fail")
             .to_string();
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
 
         assert!(err.contains("BatchReadVersionResp msgpack item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt batch response msgpack should increment decode-error metrics");
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_reports_corrupt_json_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = BatchReadVersionResponse {
+            success: true,
+            batch_read_version_resps: vec![
+                serde_json::to_string(&sample_batch_read_version_resp(0, "ok", false)).expect("json should encode"),
+                "{not-json".to_string(),
+            ],
+            batch_read_version_resps_bin: Vec::new(),
+            error: None,
+        };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
+
+        let err = decode_batch_read_version_response_items(response, &endpoint)
+            .expect_err("corrupt json item should fail")
+            .to_string();
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_error_total_for_test();
+
+        assert!(err.contains("BatchReadVersionResp json item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
+        assert!(after > before, "corrupt batch response JSON should increment decode-error metrics");
     }
 
     #[test]
@@ -3247,6 +3539,26 @@ mod tests {
             Ok(Box::new(EmptyTestReader))
         }
 
+        async fn open_ns_scanner(&self, request: NsScannerStreamRequest) -> Result<FileReader> {
+            self.record(RecordedTransportCall::NsScanner(request));
+            Ok(Box::new(EmptyTestReader))
+        }
+
+        async fn probe_ns_scanner(&self, request: NsScannerCapabilityRequest) -> Result<Uuid> {
+            self.record(RecordedTransportCall::NsScannerProbe(request));
+            if let Some(status) = *self
+                .ns_scanner_probe_status
+                .lock()
+                .expect("namespace scanner probe status lock poisoned")
+            {
+                let status = reqwest::StatusCode::from_u16(status).expect("test status code should be valid");
+                return Err(
+                    rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)).into(),
+                );
+            }
+            Ok(Uuid::from_u128(1))
+        }
+
         fn name(&self) -> &'static str {
             "recording"
         }
@@ -3279,6 +3591,14 @@ mod tests {
             }
         }
 
+        async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
+            panic!("open_ns_scanner should not be used in walk_dir retry test");
+        }
+
+        async fn probe_ns_scanner(&self, _request: NsScannerCapabilityRequest) -> Result<Uuid> {
+            Ok(Uuid::from_u128(1))
+        }
+
         fn name(&self) -> &'static str {
             "retrying-walk-dir"
         }
@@ -3305,6 +3625,14 @@ mod tests {
 
         async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
             panic!("open_walk_dir should not be used in open_write retry test");
+        }
+
+        async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
+            panic!("open_ns_scanner should not be used in open_write retry test");
+        }
+
+        async fn probe_ns_scanner(&self, _request: NsScannerCapabilityRequest) -> Result<Uuid> {
+            Ok(Uuid::from_u128(1))
         }
 
         fn name(&self) -> &'static str {
@@ -3968,6 +4296,139 @@ mod tests {
             }
             other => panic!("expected walk-dir transport call, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let expected_disk = remote_disk.disk_ref().await;
+        let expected_body = b"namespace-scanner-request".to_vec();
+        let expected_request_id = Uuid::new_v4();
+        let expected_server_epoch = Uuid::new_v4();
+        let expected_session_id = Uuid::new_v4();
+
+        let _reader = remote_disk
+            .open_ns_scanner_stream(crate::disk::NsScannerOpenRequest {
+                request_id: expected_request_id,
+                server_epoch: expected_server_epoch,
+                session_id: expected_session_id,
+                session_sequence: 3,
+                next_cycle: 7,
+                leader_epoch: 9,
+                body: expected_body.clone(),
+                stall_timeout: Some(Duration::from_secs(15)),
+            })
+            .await
+            .expect("namespace scanner stream should open");
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::NsScanner(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+                assert_eq!(request.disk, expected_disk);
+                assert_eq!(request.request_id, expected_request_id);
+                assert_eq!(request.server_epoch, expected_server_epoch);
+                assert_eq!(request.session_id, expected_session_id);
+                assert_eq!(request.session_sequence, 3);
+                assert_eq!(request.next_cycle, 7);
+                assert_eq!(request.leader_epoch, 9);
+                assert_eq!(request.body, expected_body);
+                assert_eq!(request.stall_timeout, Some(Duration::from_secs(15)));
+            }
+            other => panic!("expected namespace scanner transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_uses_configured_data_transport() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("namespace scanner capability probe should succeed"),
+            Some(Uuid::from_u128(1))
+        );
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::NsScannerProbe(request) => {
+                assert_eq!(request.endpoint, "http://remote-node:9000");
+            }
+            other => panic!("expected namespace scanner capability probe, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_rejects_old_and_incompatible_peers() {
+        for status in [404, 405, 426] {
+            let transport = RecordingInternodeDataTransport::with_ns_scanner_probe_status(status);
+            let remote_disk = new_remote_disk_with_transport(Arc::new(transport)).await;
+
+            assert_eq!(
+                remote_disk
+                    .ns_scanner_server_epoch()
+                    .await
+                    .expect("unsupported namespace scanner response should be classified"),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_rejects_legacy_transport() {
+        let remote_disk = new_remote_disk_with_transport(Arc::new(RetryingOpenReadInternodeDataTransport::default())).await;
+
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("legacy transport should be classified as unsupported"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_reprobes_after_peer_upgrade() {
+        let transport = RecordingInternodeDataTransport::with_ns_scanner_probe_status(404);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("old peer should be classified as unsupported"),
+            None
+        );
+        transport.set_ns_scanner_probe_status(None);
+        assert_eq!(
+            remote_disk
+                .ns_scanner_server_epoch()
+                .await
+                .expect("upgraded peer should be re-probed"),
+            Some(Uuid::from_u128(1))
+        );
+        assert_eq!(transport.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_capability_propagates_transient_failure() {
+        let transport = RecordingInternodeDataTransport::with_ns_scanner_probe_status(503);
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport)).await;
+
+        let err = remote_disk
+            .ns_scanner_server_epoch()
+            .await
+            .expect_err("transient capability failure must not be reported as unsupported");
+        assert!(matches!(
+            err.internode_http_error_kind(),
+            Some(rustfs_rio::InternodeHttpErrorKind::HttpStatus(status)) if status.as_u16() == 503
+        ));
     }
 
     #[tokio::test]
