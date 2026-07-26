@@ -21,6 +21,19 @@ use tokio::sync::RwLock;
 /// Returns the backing [`tempfile::TempDir`]s alongside the set so callers keep
 /// them alive for the test's duration and the directories are removed on drop.
 pub(crate) async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
+    make_local_set_disks_with_ctx(drive_count, parity_count, crate::runtime::instance::bootstrap_ctx()).await
+}
+
+/// Like [`make_local_set_disks`], but binds the set to an explicit instance
+/// context. Tests whose assertions depend on ambient runtime state that other
+/// tests mutate (e.g. `SetupTypeGuard` flipping the shared setup type to
+/// DistErasure from `#[serial]` tests in a different serial group) pass an
+/// isolated context here so that state cannot leak into their code path.
+pub(crate) async fn make_local_set_disks_with_ctx(
+    drive_count: usize,
+    parity_count: usize,
+    ctx: Arc<crate::runtime::instance::InstanceContext>,
+) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
     let format = FormatV3::new(1, drive_count);
     let mut dirs = Vec::with_capacity(drive_count);
     let mut endpoints = Vec::with_capacity(drive_count);
@@ -55,7 +68,7 @@ pub(crate) async fn make_local_set_disks(drive_count: usize, parity_count: usize
         disks.push(Some(disk));
     }
 
-    let set_disks = SetDisks::new(
+    let set_disks = SetDisks::new_with_instance_ctx(
         "ecstore-validation-blackbox".to_string(),
         Arc::new(RwLock::new(disks)),
         drive_count,
@@ -65,6 +78,7 @@ pub(crate) async fn make_local_set_disks(drive_count: usize, parity_count: usize
         endpoints,
         format,
         Vec::new(),
+        ctx,
     )
     .await;
 

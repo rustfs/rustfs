@@ -9344,8 +9344,27 @@ mod tests {
 
     static STALE_MULTIPART_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 
+    /// Re-register the cached environment's disks into its (shared bootstrap)
+    /// context registry. Other `#[serial]` tests reset or reshape that
+    /// registry (`reset_local_disk_test_state`, their own `init_local_disks`),
+    /// and the peer-sys bucket operations of this env resolve local disks
+    /// through it at call time — without this repair, a lifecycle test that
+    /// runs after such a test fails bucket creation on write quorum.
+    async fn reregister_env_local_disks(ecstore: &Arc<ECStore>) {
+        use crate::disk::DiskAPI as _;
+
+        let map = ecstore.ctx.local_disk_map();
+        let mut guard = map.write().await;
+        for disks in ecstore.disk_map.values() {
+            for disk in disks.iter().flatten() {
+                guard.insert(disk.endpoint().to_string(), Some(disk.clone()));
+            }
+        }
+    }
+
     async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         if let Some((paths, ecstore)) = STALE_MULTIPART_TEST_ENV.get() {
+            reregister_env_local_disks(ecstore).await;
             return (paths.clone(), ecstore.clone());
         }
 

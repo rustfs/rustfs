@@ -118,11 +118,17 @@ impl QuotaChecker {
     }
 
     pub async fn get_quota_config(&self, bucket: &str) -> Result<BucketQuota, QuotaError> {
-        let meta = self
+        // `get_config`, not the map-only `get()`: a bucket with no persisted
+        // metadata must resolve to the fabricated default (no quota
+        // configured) so the admission check passes and the request reaches
+        // the NoSuchBucket answer — a map-only miss would fail every such
+        // PUT closed with 503 before the 404 could be produced. Real read
+        // faults still surface as errors and keep the fail-closed behavior.
+        let (meta, _) = self
             .metadata_sys
             .read()
             .await
-            .get(bucket)
+            .get_config(bucket)
             .await
             .map_err(QuotaError::StorageError)?;
 
@@ -178,6 +184,26 @@ impl QuotaChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+
+    /// Regression (PR #5307 / s3-tests `test_100_continue_error_retry`): a
+    /// bucket with no persisted metadata has no quota, so the admission check
+    /// must pass and let the request reach its NoSuchBucket answer. With the
+    /// map-only `get()` this failed closed as a retryable 503 on every PUT to
+    /// a nonexistent bucket.
+    #[tokio::test]
+    async fn quota_check_allows_bucket_without_persisted_metadata() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
+        let checker = QuotaChecker::new(sys);
+
+        let result = checker
+            .check_quota("no-such-bucket", QuotaOperation::PutObject, 1024)
+            .await
+            .expect("a bucket with no persisted metadata has no quota and must not fail the check");
+        assert!(result.allowed);
+        assert_eq!(result.quota_limit, None);
+    }
 
     #[tokio::test]
     async fn test_quota_check_no_limit() {

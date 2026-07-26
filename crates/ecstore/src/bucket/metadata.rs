@@ -649,7 +649,7 @@ impl BucketMetadata {
         Ok(())
     }
 
-    fn default_timestamps(&mut self) {
+    pub(crate) fn default_timestamps(&mut self) {
         if self.policy_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.policy_config_updated_at = self.created
         }
@@ -1093,16 +1093,25 @@ pub async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<Buc
 }
 
 pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: bool) -> Result<BucketMetadata> {
-    let mut bm = match read_bucket_metadata(api.clone(), bucket).await {
-        Ok(res) => res,
+    Ok(load_bucket_metadata_parse_with_presence(api, bucket, parse).await?.0)
+}
+
+/// The returned `bool` reports whether the metadata was actually read from
+/// persisted storage; `false` means no metadata exists for this bucket on this
+/// store and the returned value is a fabricated in-memory default.
+pub(crate) async fn load_bucket_metadata_parse_with_presence(
+    api: Arc<ECStore>,
+    bucket: &str,
+    parse: bool,
+) -> Result<(BucketMetadata, bool)> {
+    let (mut bm, persisted) = match read_bucket_metadata(api.clone(), bucket).await {
+        Ok(res) => (res, true),
         Err(err) => {
             if err != Error::ConfigNotFound {
                 return Err(err);
             }
 
-            // info!("bucketmeta {} not found with err {:?}, start to init ", bucket, &err);
-
-            BucketMetadata::new(bucket)
+            (BucketMetadata::new(bucket), false)
         }
     };
 
@@ -1112,7 +1121,7 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
         bm.parse_all_configs()?;
     }
 
-    Ok(bm)
+    Ok((bm, persisted))
 }
 
 async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {

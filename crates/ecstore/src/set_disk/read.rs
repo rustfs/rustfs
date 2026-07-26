@@ -2611,7 +2611,14 @@ mod metadata_cache_tests {
     #[tokio::test]
     #[serial(metadata_cache_publish_barrier)]
     async fn metadata_cache_production_fanout_cannot_publish_after_invalidation() {
-        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks(4, 2).await;
+        // Isolated context: an ambient DistErasure window (another test's
+        // SetupTypeGuard) would bypass metadata-cache publication entirely
+        // and time out the barrier below.
+        let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        isolated_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+            .await;
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, isolated_ctx).await;
         let bucket = "metadata-cache-production-fence";
         let object = "object";
         let disks = set.disks.read().await.clone();

@@ -30,7 +30,12 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
+        // Resolved from this set's own instance context (backlog#1052), not the
+        // ambient facade: the facade tracks whichever context is currently
+        // published process-wide, so a second instance (or, in tests, another
+        // test's transient DistErasure window) would push this set's namespace
+        // locking onto its own — possibly empty — dist locker list.
+        let set_lock = if self.ctx.is_dist_erasure().await {
             // Calculate quorum based on lockers count (majority)
             let lockers_count = self.lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
