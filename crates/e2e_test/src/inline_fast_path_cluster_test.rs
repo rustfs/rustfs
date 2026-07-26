@@ -1404,6 +1404,47 @@ async fn start_manual_transition_job(hot: &RustFSTestClusterEnvironment, bucket:
         .ok_or_else(|| format!("manual transition run response omitted job_id: {response}").into())
 }
 
+async fn start_manual_transition_job_on_node(
+    hot: &RustFSTestClusterEnvironment,
+    node_index: usize,
+    bucket: &str,
+    prefix: &str,
+    tier_name: &str,
+    dry_run: bool,
+    max_objects: u64,
+) -> TestResult<(StatusCode, String)> {
+    let bucket = urlencoding::encode(bucket);
+    let prefix = urlencoding::encode(prefix);
+    let tier = urlencoding::encode(tier_name);
+    let path = format!(
+        "/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&prefix={prefix}&tier={tier}&dryRun={dry_run}&maxObjects={max_objects}&mode=async"
+    );
+    signed_admin_request(&hot.nodes[node_index].url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await
+}
+
+async fn read_manual_transition_job_status_endpoint(
+    hot: &RustFSTestClusterEnvironment,
+    node_index: usize,
+    status_endpoint: &str,
+) -> TestResult<serde_json::Value> {
+    let (status, response) = signed_admin_request(
+        &hot.nodes[node_index].url,
+        Method::GET,
+        status_endpoint,
+        None,
+        &hot.access_key,
+        &hot.secret_key,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "manual transition job status endpoint was not readable on node {node_index}: {}",
+        compact_body(&response)
+    );
+    Ok(serde_json::from_str(&response)?)
+}
+
 async fn wait_for_manual_transition_job_terminal(
     hot: &RustFSTestClusterEnvironment,
     node_index: usize,
@@ -1949,6 +1990,143 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
         missing_body.contains("<Code>NoSuchKey</Code>") || missing_body.contains("NoSuchKey"),
         "unknown manual transition job should return NoSuchKey, body: {}",
         compact_body(&missing_body)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_manual_transition_distributed_admission_conflict_reports_status_and_backpressure() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inlinedistadmissioncoldadmin".to_string();
+    cold.secret_key = "inlinedistadmissioncoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env("RUSTFS_SCANNER_ENABLED", "false");
+    hot.set_env("RUSTFS_SCANNER_CYCLE", "3600");
+    hot.set_env("RUSTFS_MAX_TRANSITION_WORKERS", "1");
+    hot.set_env("RUSTFS_TRANSITION_QUEUE_CAPACITY", "1");
+    hot.start().await?;
+
+    let hot_client = hot.create_s3_client(0)?;
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
+
+    let bucket = format!("distributed-admission-{}", Uuid::new_v4().simple());
+    let prefix = "transition/distributed-admission/";
+    hot_client.create_bucket().bucket(&bucket).send().await?;
+    put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
+    for index in 0u8..64 {
+        let key = format!("{prefix}object-{index:02}.bin");
+        hot_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(payload(64 * KIB, index)))
+            .send()
+            .await?;
+    }
+
+    let (node0, node1) = tokio::join!(
+        start_manual_transition_job_on_node(&hot, 0, &bucket, prefix, &tier_name, false, 64),
+        start_manual_transition_job_on_node(&hot, 1, &bucket, prefix, &tier_name, false, 64)
+    );
+    let responses = [(0usize, node0?), (1usize, node1?)];
+    let accepted = responses
+        .iter()
+        .find(|(_, (status, _))| *status == StatusCode::ACCEPTED)
+        .ok_or_else(|| format!("one distributed async run must be accepted: {responses:#?}"))?;
+    let conflict = responses
+        .iter()
+        .find(|(_, (status, _))| *status == StatusCode::CONFLICT)
+        .ok_or_else(|| format!("one distributed async run must report conflict: {responses:#?}"))?;
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, (status, _))| *status == StatusCode::ACCEPTED)
+            .count(),
+        1,
+        "distributed admission must allow exactly one winner: {responses:#?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, (status, _))| *status == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "distributed admission must reject exactly one overlapping contender: {responses:#?}"
+    );
+
+    let accepted_body: serde_json::Value = serde_json::from_str(&accepted.1.1)?;
+    let conflict_body: serde_json::Value = serde_json::from_str(&conflict.1.1)?;
+    let job_id = accepted_body["job_id"]
+        .as_str()
+        .ok_or_else(|| format!("accepted response omitted job_id: {}", accepted.1.1))?;
+    let status_endpoint = accepted_body["status_endpoint"]
+        .as_str()
+        .ok_or_else(|| format!("accepted response omitted status_endpoint: {}", accepted.1.1))?;
+    assert_eq!(accepted_body["state"].as_str(), Some("accepted"));
+    assert_eq!(accepted_body["mode"].as_str(), Some("durable_job"));
+    assert_eq!(accepted_body["cancel_endpoint"].as_str(), Some(status_endpoint));
+    assert_eq!(conflict_body["state"].as_str(), Some("conflict"));
+    assert_eq!(conflict_body["mode"].as_str(), Some("durable_job"));
+    assert_eq!(conflict_body["active_job_id"].as_str(), Some(job_id));
+    assert_eq!(conflict_body["status_endpoint"].as_str(), Some(status_endpoint));
+    assert_eq!(conflict_body["cancel_endpoint"].as_str(), Some(status_endpoint));
+    assert!(
+        conflict_body["scope_key"]
+            .as_str()
+            .is_some_and(|scope_key| !scope_key.is_empty()),
+        "conflict response must expose a readable active scope key: {}",
+        conflict.1.1
+    );
+
+    let status = read_manual_transition_job_status_endpoint(&hot, conflict.0, status_endpoint).await?;
+    assert_eq!(status["job_id"].as_str(), Some(job_id));
+    assert_eq!(status["status_endpoint"].as_str(), Some(status_endpoint));
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, conflict.0, job_id, false).await?;
+    assert_eq!(terminal["job_id"].as_str(), Some(job_id));
+    assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(terminal["prefix"].as_str(), Some(prefix));
+    assert_eq!(terminal["dry_run"].as_bool(), Some(false));
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("partial"),
+        "small transition queue should surface terminal backpressure: {terminal}"
+    );
+    let skipped_queue_full = terminal["report"]["skipped_queue_full"]
+        .as_u64()
+        .ok_or_else(|| format!("terminal status omitted report.skipped_queue_full: {terminal}"))?;
+    assert!(
+        skipped_queue_full > 0,
+        "terminal status should include queue-full backpressure counters: {terminal}"
+    );
+    let queue_snapshot = terminal["queue_snapshot"]
+        .as_object()
+        .ok_or_else(|| format!("terminal status omitted queue_snapshot: {terminal}"))?;
+    for field in [
+        "queue_capacity",
+        "queued",
+        "active",
+        "workers",
+        "queue_full",
+        "queue_send_timeout",
+    ] {
+        assert!(
+            queue_snapshot.get(field).and_then(serde_json::Value::as_u64).is_some(),
+            "queue_snapshot.{field} must be readable in terminal status: {terminal}"
+        );
+    }
+    assert!(
+        cold_tier_object_count(&cold_client).await? < 64,
+        "queue pressure should leave at least one object untransitioned"
     );
 
     Ok(())
