@@ -3034,7 +3034,9 @@ else:
 compressed_key = object_key + compressed_probe_extension
 compressed_path = bucket_path + "/" + urllib.parse.quote(compressed_key, safe="/-_.~")
 if compressed_fallback_probe:
-    compressed_body = (b"RustFS compressed fallback probe\n" * 4096)[:128 * 1024]
+    compressed_size = max(object_size, codec_min_size, 128 * 1024)
+    compressed_pattern = b"RustFS compressed fallback probe\n"
+    compressed_body = (compressed_pattern * ((compressed_size // len(compressed_pattern)) + 1))[:compressed_size]
     compressed_put, _ = request(
         "PUT",
         compressed_path,
@@ -3325,6 +3327,7 @@ else:
 
 encrypted_key = object_key + ".encrypted"
 encrypted_path = bucket_path + "/" + urllib.parse.quote(encrypted_key, safe="/-_.~")
+encrypted_probe_body = payload(max(object_size, codec_min_size, 1))
 ssec_key = b"0123456789abcdef0123456789abcdef"
 ssec_key_b64 = base64.b64encode(ssec_key).decode()
 ssec_key_md5_b64 = base64.b64encode(hashlib.md5(ssec_key).digest()).decode()
@@ -3333,7 +3336,7 @@ ssec_headers = [
     ("x-amz-server-side-encryption-customer-key", ssec_key_b64),
     ("x-amz-server-side-encryption-customer-key-md5", ssec_key_md5_b64),
 ]
-encrypted_put, _ = request("PUT", encrypted_path, body, [("content-type", "application/octet-stream"), *ssec_headers])
+encrypted_put, _ = request("PUT", encrypted_path, encrypted_probe_body, [("content-type", "application/octet-stream"), *ssec_headers])
 if encrypted_put["status"] not in (200, 204):
     fallback_rows.append(
         {
@@ -3348,8 +3351,8 @@ if encrypted_put["status"] not in (200, 204):
         }
     )
 else:
-    encrypted_get, encrypted_body = request("GET", encrypted_path, extra_headers=ssec_headers)
-    encrypted_ok = encrypted_get["status"] == 200 and sha256_hex(encrypted_body) == sha256_hex(body)
+    encrypted_get, encrypted_get_body = request("GET", encrypted_path, extra_headers=ssec_headers)
+    encrypted_ok = encrypted_get["status"] == 200 and sha256_hex(encrypted_get_body) == sha256_hex(encrypted_probe_body)
     fallback_rows.append(
         {
             "profile": profile,
@@ -3357,7 +3360,7 @@ else:
             "object_key": encrypted_key,
             "status": "ok" if encrypted_ok else "unexpected_status_or_body",
             "status_code": encrypted_get["status"],
-            "body_len": len(encrypted_body),
+            "body_len": len(encrypted_get_body),
             "expected_runtime_fallback_reason": "encrypted",
             "note": "SSE-C encrypted object GET should stay on the legacy fallback path for codec profiles",
         }
