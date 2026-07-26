@@ -93,21 +93,6 @@ fn preflight_startup_rpc_secret_with(
     }
 }
 
-fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
-    let pool = endpoints.as_ref().get(idx).ok_or_else(|| {
-        Error::other(format!(
-            "store init failed to resolve decommission resume pool index {idx} from current endpoints"
-        ))
-    })?;
-    let endpoint = pool.endpoints.as_ref().first().ok_or_else(|| {
-        Error::other(format!(
-            "store init failed to resolve decommission resume pool index {idx}: no endpoints available"
-        ))
-    })?;
-
-    Ok(endpoint.is_local)
-}
-
 const LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES: usize = 6;
 const LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(60 * 3);
 const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -126,10 +111,6 @@ fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
             .as_ref()
             .is_some_and(|info| info.has_decommission_state() && !info.complete && !info.failed && !info.canceled)
     })
-}
-
-fn should_auto_start_rebalance_after_recovered_meta(pool_meta: &PoolMeta, rebalance_meta_loaded: bool) -> bool {
-    should_auto_start_rebalance_after_init(pool_meta_has_active_decommission(pool_meta), rebalance_meta_loaded)
 }
 
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
@@ -568,9 +549,8 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, load_pool_meta_for_startup, pool_first_endpoint_is_local,
-        preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with, resolve_store_init_stage_result,
-        save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
-        should_auto_start_rebalance_after_recovered_meta, should_resume_local_decommission,
+        pool_meta_has_active_decommission, preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with,
+        resolve_store_init_stage_result, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
         should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
@@ -743,46 +723,33 @@ mod tests {
     }
 
     #[test]
-    fn test_should_resume_local_decommission_respects_local_flag() {
+    fn test_pool_first_endpoint_is_local_respects_local_flag() {
         let mut local_endpoint = Endpoint::try_from("http://127.0.0.1:9000/data").expect("endpoint should parse");
         local_endpoint.is_local = true;
-        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+        let pool = PoolEndpoints {
             legacy: false,
             set_count: 1,
             drives_per_set: 1,
             endpoints: Endpoints::from(vec![local_endpoint]),
             cmd_line: "pool-0".to_string(),
             platform: String::new(),
-        }]);
+        };
 
-        assert!(should_resume_local_decommission(&endpoints, 0).expect("local endpoint should resume"));
+        assert!(pool_first_endpoint_is_local(&pool));
     }
 
     #[test]
-    fn test_should_resume_local_decommission_rejects_unresolvable_pool() {
-        let endpoints = EndpointServerPools::default();
-        let err = should_resume_local_decommission(&endpoints, 0).expect_err("missing pool should error");
-        assert_eq!(
-            err.to_string(),
-            "Io error: store init failed to resolve decommission resume pool index 0 from current endpoints"
-        );
-    }
-
-    #[test]
-    fn test_should_resume_local_decommission_rejects_missing_endpoint() {
-        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+    fn test_pool_first_endpoint_is_local_rejects_missing_endpoint() {
+        let pool = PoolEndpoints {
             legacy: false,
             set_count: 1,
             drives_per_set: 1,
             endpoints: Endpoints::from(Vec::<Endpoint>::new()),
             cmd_line: "pool-0".to_string(),
             platform: String::new(),
-        }]);
-        let err = should_resume_local_decommission(&endpoints, 0).expect_err("missing endpoint should error");
-        assert_eq!(
-            err.to_string(),
-            "Io error: store init failed to resolve decommission resume pool index 0: no endpoints available"
-        );
+        };
+
+        assert!(!pool_first_endpoint_is_local(&pool));
     }
 
     #[test]
@@ -829,7 +796,10 @@ mod tests {
         }));
         let rebalance_meta = Some(RebalanceMeta::default());
 
-        assert!(!should_auto_start_rebalance_after_recovered_meta(&pool_meta, rebalance_meta.is_some()));
+        assert!(!should_auto_start_rebalance_after_init(
+            pool_meta_has_active_decommission(&pool_meta),
+            rebalance_meta.is_some()
+        ));
     }
 
     #[test]
@@ -837,7 +807,10 @@ mod tests {
         let pool_meta = init_test_pool_meta(None);
         let rebalance_meta = Some(RebalanceMeta::default());
 
-        assert!(should_auto_start_rebalance_after_recovered_meta(&pool_meta, rebalance_meta.is_some()));
+        assert!(should_auto_start_rebalance_after_init(
+            pool_meta_has_active_decommission(&pool_meta),
+            rebalance_meta.is_some()
+        ));
     }
 
     #[test]
