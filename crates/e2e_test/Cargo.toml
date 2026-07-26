@@ -50,6 +50,7 @@ rustfs-filemeta.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 serial_test = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-sts = { workspace = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }

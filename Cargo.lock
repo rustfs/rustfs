@@ -3662,6 +3662,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "aws-smithy-http-client",
  "base64 0.23.0",
  "bytes",

@@ -30,6 +30,9 @@ use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
+use aws_sdk_sts::config::{Credentials as StsCredentials, Region as StsRegion};
+use aws_sdk_sts::{Client as StsClient, Config as StsConfig};
+use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -107,6 +110,55 @@ fn build_s3_client(url: &str, access_key: &str, secret_key: &str) -> Client {
     Client::from_conf(config)
 }
 
+fn build_sts_client(url: &str, access_key: &str, secret_key: &str) -> StsClient {
+    let mut config = StsConfig::builder()
+        .credentials_provider(StsCredentials::new(access_key, secret_key, None, None, "e2e-sts-authz"))
+        .region(StsRegion::new("us-east-1"))
+        .endpoint_url(url)
+        .behavior_version_latest();
+    if url.starts_with("http://") {
+        config = config.http_client(SmithyHttpClientBuilder::new().build_http());
+    }
+    StsClient::from_conf(config.build())
+}
+
+async fn create_user_with_policy(
+    env: &RustFSTestEnvironment,
+    user: &str,
+    secret: &str,
+    policy_name: &str,
+    statements: serde_json::Value,
+) -> Result<(), BoxError> {
+    admin_ok(
+        env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-user?accessKey={user}"),
+        Some(serde_json::json!({ "secretKey": secret, "status": "enabled" }).to_string()),
+    )
+    .await?;
+    admin_ok(
+        env,
+        http::Method::PUT,
+        &format!("/rustfs/admin/v3/add-canned-policy?name={policy_name}"),
+        Some(
+            serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": statements,
+            })
+            .to_string(),
+        ),
+    )
+    .await?;
+    admin_ok(
+        env,
+        http::Method::POST,
+        "/rustfs/admin/v3/idp/builtin/policy/attach",
+        Some(serde_json::json!({ "policies": [policy_name], "user": user }).to_string()),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Retries an S3 PUT until IAM propagation makes it succeed (bounded).
 async fn wait_for_s3_put(client: &Client, bucket: &str, key: &str, within: Duration) -> TestResult {
     let deadline = tokio::time::Instant::now() + within;
@@ -144,6 +196,92 @@ fn bucket_rw_policy(bucket: &str) -> String {
         }]
     })
     .to_string()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_assume_role_uses_explicit_deny_only_authorization() -> TestResult {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let implicit_user = "stsimplicit";
+    let explicit_allow_user = "stsallow";
+    let explicit_deny_user = "stsdeny";
+    let secret = "stsAuthzSecret123";
+    let sts_resource = "arn:aws:s3:::*";
+
+    create_user_with_policy(
+        &env,
+        implicit_user,
+        secret,
+        "sts-implicit-policy",
+        serde_json::json!([{
+            "Effect": "Allow",
+            "Action": ["s3:ListAllMyBuckets"],
+            "Resource": [sts_resource],
+        }]),
+    )
+    .await?;
+    create_user_with_policy(
+        &env,
+        explicit_allow_user,
+        secret,
+        "sts-allow-policy",
+        serde_json::json!([{
+            "Effect": "Allow",
+            "Action": ["sts:AssumeRole"],
+            "Resource": [sts_resource],
+        }]),
+    )
+    .await?;
+    create_user_with_policy(
+        &env,
+        explicit_deny_user,
+        secret,
+        "sts-deny-policy",
+        serde_json::json!([
+            {
+                "Effect": "Allow",
+                "Action": ["sts:AssumeRole"],
+                "Resource": [sts_resource],
+            },
+            {
+                "Effect": "Deny",
+                "Action": ["sts:AssumeRole"],
+                "Resource": [sts_resource],
+            }
+        ]),
+    )
+    .await?;
+
+    for user in [implicit_user, explicit_allow_user] {
+        let output = build_sts_client(&env.url, user, secret)
+            .assume_role()
+            .role_arn("arn:aws:iam::123456789012:role/test")
+            .role_session_name("sts-authz-e2e")
+            .send()
+            .await
+            .map_err(|err| format!("{user} should be allowed to call AssumeRole: {err:?}"))?;
+        let credentials = output
+            .credentials()
+            .ok_or_else(|| format!("{user} AssumeRole response should contain credentials"))?;
+        assert!(!credentials.access_key_id().is_empty());
+        assert!(!credentials.secret_access_key().is_empty());
+        assert!(!credentials.session_token().is_empty());
+    }
+
+    let denied = build_sts_client(&env.url, explicit_deny_user, secret)
+        .assume_role()
+        .role_arn("arn:aws:iam::123456789012:role/test")
+        .role_session_name("sts-authz-e2e")
+        .send()
+        .await;
+    assert!(denied.is_err(), "an explicit sts:AssumeRole Deny must override Allow");
+
+    env.stop_server();
+    Ok(())
 }
 
 /// Full user -> policy -> service-account lifecycle, proving each management

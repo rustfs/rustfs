@@ -183,7 +183,7 @@ async fn handle_assume_role(
             conditions: &conditions,
             is_owner: owner,
             claims: cred.claims_or_empty(),
-            deny_only: false,
+            deny_only: true,
             bucket: "",
             object: "",
         })
