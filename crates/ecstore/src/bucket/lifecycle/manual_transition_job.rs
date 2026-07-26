@@ -83,6 +83,8 @@ pub struct ManualTransitionJobRecord {
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_objects: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration: Option<std::time::Duration>,
     pub owner_id: String,
     pub lease_id: Uuid,
     pub lease_expires_at_unix_nanos: i128,
@@ -113,6 +115,7 @@ impl ManualTransitionJobRecord {
             tier: options.tier.clone(),
             dry_run: options.dry_run,
             max_objects: options.max_objects,
+            max_duration: options.max_duration,
             owner_id: owner_id.into(),
             lease_id,
             lease_expires_at_unix_nanos: manual_transition_job_lease_expires_at(now),
@@ -272,6 +275,7 @@ impl ManualTransitionJobRecord {
             tier: self.tier.clone(),
             dry_run: self.dry_run,
             max_objects: self.max_objects,
+            max_duration: self.max_duration,
             ..Default::default()
         }
     }
@@ -1875,6 +1879,7 @@ mod tests {
             tier: Some("warm".to_string()),
             dry_run: true,
             max_objects: Some(3),
+            max_duration: Some(std::time::Duration::from_secs(5)),
             ..Default::default()
         };
         let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
@@ -1887,6 +1892,7 @@ mod tests {
         assert_eq!(resume.tier.as_deref(), Some("warm"));
         assert!(resume.dry_run);
         assert_eq!(resume.max_objects, Some(3));
+        assert_eq!(resume.max_duration, Some(std::time::Duration::from_secs(5)));
         assert!(resume.cancel_token.is_none());
         assert!(resume.cancel_check.is_none());
         assert!(resume.progress_sink.is_none());
@@ -2082,6 +2088,7 @@ mod tests {
             prefix: "logs/".to_string(),
             tier: Some("warm".to_string()),
             max_objects: Some(1),
+            max_duration: Some(std::time::Duration::from_secs(10)),
             ..Default::default()
         };
 
@@ -2123,6 +2130,7 @@ mod tests {
             let encoded = record.encode().expect("budget partial job should encode");
             let decoded = ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("budget partial job should decode");
             assert_eq!(decoded.state, ManualTransitionJobState::Partial);
+            assert_eq!(decoded.max_duration, options.max_duration);
             assert_eq!(decoded.report.truncated_by_limit, truncated_by_limit);
             assert_eq!(decoded.report.truncated_by_duration, truncated_by_duration);
             assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-budget-token"));
