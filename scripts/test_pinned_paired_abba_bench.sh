@@ -34,6 +34,27 @@ if "$RUNNER" \
   exit 1
 fi
 
+if "$RUNNER" \
+  --access-key minioadmin \
+  --secret-key minioadmin \
+  --rustfs-endpoint http://127.0.0.1:9000 \
+  --rustfs-image-ref rustfs/rustfs:bench \
+  --rustfs-image-digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --rustfs-revision 42fc84063 \
+  --rustfs-ack-contract relaxed \
+  --minio-endpoint http://127.0.0.1:9100 \
+  --minio-image-ref quay.io/minio/minio:RELEASE.2025-07-18T21-56-31Z \
+  --minio-image-digest sha256:1111222233334444111122223333444411112222333344441111222233334444 \
+  --minio-release RELEASE.2025-07-18T21-56-31Z \
+  --minio-ack-contract strict \
+  --sizes 0B \
+  --out-dir "$TMP_DIR/bad-zero-size" \
+  --dry-run >"$TMP_DIR/bad-zero-size.log" 2>&1; then
+  echo "expected warp zero-byte benchmark size to fail" >&2
+  exit 1
+fi
+rg -q "warp requires object size > 0" "$TMP_DIR/bad-zero-size.log"
+
 "$RUNNER" \
   --access-key minioadmin \
   --secret-key minioadmin \
