@@ -1060,10 +1060,7 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert!(!resumed.report.dry_run);
     assert_eq!(resumed.report.scanned, 1, "async limit continuation resume: {resumed:#?}");
     assert_eq!(resumed.report.eligible, 0, "async limit continuation resume: {resumed:#?}");
-    assert_eq!(
-        resumed.report.skipped_not_transition, 1,
-        "async limit continuation resume: {resumed:#?}"
-    );
+    assert_eq!(resumed.report.skipped_not_transition, 1, "async limit continuation resume: {resumed:#?}");
     assert_eq!(resumed.report.transition_completed, 0);
     assert_eq!(resumed.report.transition_failed, 0);
     assert_eq!(resumed.report.tier_failure, 0);
