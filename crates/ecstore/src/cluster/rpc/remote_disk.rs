@@ -1443,7 +1443,7 @@ impl DiskAPI for RemoteDisk {
 
                 Ok(infos)
             },
-            Duration::ZERO,
+            get_max_timeout_duration(),
         )
         .await
     }
@@ -1522,7 +1522,7 @@ impl DiskAPI for RemoteDisk {
 
                 Ok(())
             },
-            Duration::ZERO,
+            get_max_timeout_duration(),
         )
         .await
     }
@@ -5209,5 +5209,90 @@ mod tests {
                         && span.get("request_id").and_then(Value::as_str) == Some("req-remote-disk-e2e")
                 })
         );
+    }
+
+    /// Peer that completes the TCP connect and then goes silent, so every RPC issued over the
+    /// cached lazy channel stays pending until the caller's own deadline fires.
+    async fn spawn_stalled_grpc_peer() -> Option<(String, tokio::task::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let accept_task = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let base_addr = format!("http://{}:{}", addr.ip(), addr.port());
+        let channel = TonicEndpoint::from_shared(base_addr.clone())
+            .expect("stalled peer endpoint should parse")
+            .connect_lazy();
+        runtime_sources::cache_test_node_channel(base_addr.clone(), channel).await;
+        Some((base_addr, accept_task))
+    }
+
+    async fn remote_disk_for_addr(base_addr: &str) -> RemoteDisk {
+        let url = url::Url::parse(&format!("{base_addr}/data/rustfs0")).expect("endpoint url should parse");
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct")
+    }
+
+    #[tokio::test]
+    async fn list_volumes_bounds_the_wait_on_a_stalled_peer() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some((base_addr, accept_task)) = spawn_stalled_grpc_peer().await else {
+            return;
+        };
+        let remote_disk = remote_disk_for_addr(&base_addr).await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+            let err = tokio::time::timeout(Duration::from_secs(10), remote_disk.list_volumes())
+                .await
+                .expect("list_volumes must bound the wait on a stalled peer")
+                .expect_err("a stalled peer must fail list_volumes");
+            assert!(matches!(err, DiskError::Timeout), "expected the operation deadline to fire, got {err:?}");
+        })
+        .await;
+
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_volume_bounds_the_wait_on_a_stalled_peer() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some((base_addr, accept_task)) = spawn_stalled_grpc_peer().await else {
+            return;
+        };
+        let remote_disk = remote_disk_for_addr(&base_addr).await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+            let err = tokio::time::timeout(Duration::from_secs(10), remote_disk.delete_volume("bucket", false))
+                .await
+                .expect("delete_volume must bound the wait on a stalled peer")
+                .expect_err("a stalled peer must fail delete_volume");
+            assert!(matches!(err, DiskError::Timeout), "expected the operation deadline to fire, got {err:?}");
+        })
+        .await;
+
+        accept_task.abort();
     }
 }

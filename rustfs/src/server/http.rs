@@ -29,7 +29,8 @@ use crate::server::{
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
     tls_material::{
-        TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
+        TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_loaded,
+        load_tls_material, spawn_reload_loop,
     },
 };
 use crate::storage_api::server::http as storage;
@@ -230,6 +231,18 @@ fn log_tls_handshake_failure(peer_addr: &str, kind: TlsHandshakeFailureKind, err
                 failure_type = kind.as_str(),
                 error = %err,
                 result = "client_error",
+                "TLS handshake failed"
+            );
+        }
+        TlsHandshakeFailureKind::Timeout => {
+            warn!(
+                event = EVENT_TLS_HANDSHAKE_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TLS,
+                peer_addr = %peer_addr,
+                failure_type = kind.as_str(),
+                error = %err,
+                result = "client_timeout",
                 "TLS handshake failed"
             );
         }
@@ -1049,6 +1062,7 @@ pub async fn start_http_server(
                 trusted_proxy_layer: rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone()),
                 rate_limit_layer: api_rate_limit_layer.clone(),
                 server_ctx: Arc::clone(&server_ctx),
+                tls_handshake_timeout: Duration::from_secs(http1_header_read_timeout),
             };
 
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.watcher(), connection_permit);
@@ -1109,6 +1123,10 @@ struct ConnectionContext {
     /// All clones share one limiter, keeping budgets global across connections.
     rate_limit_layer: Option<RateLimitLayer>,
     server_ctx: Arc<ServerContextSlot>,
+    /// Deadline for the TLS handshake of this connection. Reuses the HTTP/1 header-read budget,
+    /// the existing slow-client bound for the pre-request phase, and is pre-computed with the
+    /// other transport parameters to avoid a per-connection env read.
+    tls_handshake_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -1299,6 +1317,7 @@ fn process_connection(
             trusted_proxy_layer,
             rate_limit_layer,
             server_ctx,
+            tls_handshake_timeout,
         } = context;
 
         // Build the hybrid service per-connection.
@@ -1752,7 +1771,7 @@ fn process_connection(
                 .ok()
                 .map_or_else(|| "unknown".to_string(), |addr| addr.to_string());
             let acceptor = holder.get();
-            match acceptor.accept(socket).await {
+            match accept_tls_with_deadline(&acceptor, socket, tls_handshake_timeout).await {
                 Ok(tls_socket) => {
                     trace!("TLS handshake successful");
                     let stream = TokioIo::new(tls_socket);
@@ -1761,7 +1780,15 @@ fn process_connection(
                         handle_connection_error(Some(peer_addr.as_str()), &*err);
                     }
                 }
-                Err(err) => {
+                Err(TlsAcceptFailure::Timeout) => {
+                    let kind = TlsHandshakeFailureKind::Timeout;
+                    let err = format!("TLS handshake did not complete within {}s", tls_handshake_timeout.as_secs());
+                    log_tls_handshake_failure(&peer_addr, kind, &err);
+                    counter!("rustfs_tls_handshake_failures", &[("failure_type", kind.as_str())]).increment(1);
+
+                    return;
+                }
+                Err(TlsAcceptFailure::Handshake(err)) => {
                     let err_str = err.to_string();
                     let kind = TlsHandshakeFailureKind::classify(&err_str);
                     log_tls_handshake_failure(&peer_addr, kind, &err);

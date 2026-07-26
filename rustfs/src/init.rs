@@ -1110,7 +1110,7 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
             DEFAULT_WEBDAV_ADDRESS, ENV_WEBDAV_ADDRESS, ENV_WEBDAV_CA_FILE, ENV_WEBDAV_CERTS_DIR, ENV_WEBDAV_ENABLE,
-            ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
+            ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_MAX_CONNECTIONS, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
         };
         use rustfs_protocols::{WebDavConfig, WebDavServer};
 
@@ -1141,6 +1141,7 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
         let max_body_size = rustfs_utils::get_env_u64(ENV_WEBDAV_MAX_BODY_SIZE, WebDavConfig::DEFAULT_MAX_BODY_SIZE);
         let request_timeout_secs =
             rustfs_utils::get_env_u64(ENV_WEBDAV_REQUEST_TIMEOUT, WebDavConfig::DEFAULT_REQUEST_TIMEOUT_SECS);
+        let max_connections = rustfs_utils::get_env_usize(ENV_WEBDAV_MAX_CONNECTIONS, WebDavConfig::DEFAULT_MAX_CONNECTIONS);
 
         // Create WebDAV configuration
         let config = WebDavConfig {
@@ -1150,6 +1151,7 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
             ca_file,
             max_body_size,
             request_timeout_secs,
+            max_connections,
         };
 
         // Create WebDAV server with protocol storage client
@@ -1160,6 +1162,7 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
         let tls_enabled = server.config().tls_enabled;
         let max_body_size = server.config().max_body_size;
         let request_timeout_secs = server.config().request_timeout_secs;
+        let max_connections = server.config().max_connections;
 
         // Log server configuration
         debug!(
@@ -1173,6 +1176,7 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
             tls_enabled,
             max_body_size,
             request_timeout_secs,
+            max_connections,
             "Protocol runtime configured"
         );
 

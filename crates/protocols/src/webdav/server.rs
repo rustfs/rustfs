@@ -15,26 +15,30 @@
 use super::config::{WebDavConfig, WebDavInitError};
 use super::driver::WebDavDriver;
 use crate::common::client::s3::StorageBackend;
-use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
 use bytes::Bytes;
 use dav_server::DavHandler;
 use dav_server::fakels::FakeLs;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Body as HttpBody;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
 use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
 use rustfs_utils::MaskedAccessKey;
 use rustls::ServerConfig;
 use std::convert::Infallible;
+use std::io;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Semaphore, broadcast, watch};
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
@@ -47,6 +51,13 @@ const EVENT_WEBDAV_CONNECTION_STATE: &str = "webdav_connection_state";
 const EVENT_WEBDAV_REQUEST_VALIDATION_FAILED: &str = "webdav_request_validation_failed";
 const EVENT_WEBDAV_REQUEST_BODY_FAILED: &str = "webdav_request_body_failed";
 const EVENT_WEBDAV_AUTH_STATE: &str = "webdav_auth_state";
+const EVENT_WEBDAV_CONNECTION_CAP_STATE: &str = "webdav_connection_cap_state";
+
+/// Response body handed back to Hyper.
+///
+/// Boxed instead of collected: buffering the dav-server body would
+/// materialise a whole object in memory for every GET.
+type WebDavBody = Pin<Box<dyn HttpBody<Data = Bytes, Error = io::Error> + Send>>;
 
 /// WebDAV server implementation
 pub struct WebDavServer<S>
@@ -78,7 +89,7 @@ where
     }
 
     /// Start the WebDAV server
-    pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), WebDavInitError> {
+    pub async fn start(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<(), WebDavInitError> {
         info!(
             event = EVENT_WEBDAV_SERVER_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -87,10 +98,16 @@ where
             bind_addr = %self.config.bind_addr,
             tls_enabled = self.config.tls_enabled,
             max_body_size = self.config.max_body_size,
+            max_connections = self.config.max_connections,
             "WebDAV server starting"
         );
 
         let listener = TcpListener::bind(self.config.bind_addr).await?;
+        self.serve(listener, shutdown_rx).await
+    }
+
+    /// Serve connections from an already bound listener
+    async fn serve(&self, listener: TcpListener, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), WebDavInitError> {
         info!(
             event = EVENT_WEBDAV_SERVER_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -135,8 +152,47 @@ where
         };
 
         let storage = self.storage.clone();
+        let request_timeout = Duration::from_secs(self.config.request_timeout_secs);
+        let connection_limiter = Arc::new(Semaphore::new(self.config.max_connections.min(Semaphore::MAX_PERMITS)));
 
         loop {
+            // Admission control: hold a permit before accepting, so at
+            // saturation the kernel backlog absorbs the burst instead of the
+            // process spawning an unbounded number of connection tasks. The
+            // permit travels into the task and is released when it ends.
+            let permit = match connection_limiter.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    debug!(
+                        event = EVENT_WEBDAV_CONNECTION_CAP_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                        state = "saturated",
+                        max_connections = self.config.max_connections,
+                        "WebDAV connection cap saturated"
+                    );
+                    tokio::select! {
+                        permit = connection_limiter.clone().acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            // The semaphore is never closed; fail safe by
+                            // stopping the accept loop if it ever is.
+                            Err(_) => break,
+                        },
+                        _ = shutdown_rx.recv() => {
+                            info!(
+                                event = EVENT_WEBDAV_SERVER_STATE,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                                state = "shutdown_requested",
+                                "WebDAV shutdown requested"
+                            );
+                            let _ = reload_shutdown_tx.send(true);
+                            break;
+                        }
+                    }
+                }
+            };
+
             tokio::select! {
                 accept_result = listener.accept() => {
                     match accept_result {
@@ -153,11 +209,14 @@ where
                             );
                             tokio::spawn(
                                 async move {
+                                    let _permit = permit;
                                     if let Some(acceptor) = tls_acceptor {
-                                        match acceptor.accept(stream).await {
-                                            Ok(tls_stream) => {
+                                        // A handshake that never completes would otherwise
+                                        // hold its connection permit forever.
+                                        match timeout(request_timeout, acceptor.accept(stream)).await {
+                                            Ok(Ok(tls_stream)) => {
                                                 let io = TokioIo::new(tls_stream);
-                                                if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
+                                                if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size, request_timeout).await {
                                                     debug!(
                                                         event = EVENT_WEBDAV_CONNECTION_STATE,
                                                         component = LOG_COMPONENT_PROTOCOLS,
@@ -170,7 +229,7 @@ where
                                                     );
                                                 }
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 debug!(
                                                     event = EVENT_WEBDAV_CONNECTION_STATE,
                                                     component = LOG_COMPONENT_PROTOCOLS,
@@ -181,10 +240,21 @@ where
                                                     "webdav connection ended with error"
                                                 );
                                             }
+                                            Err(_) => {
+                                                debug!(
+                                                    event = EVENT_WEBDAV_CONNECTION_STATE,
+                                                    component = LOG_COMPONENT_PROTOCOLS,
+                                                    subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                                                    result = "tls_handshake_timeout",
+                                                    peer = %source_ip,
+                                                    timeout_secs = request_timeout.as_secs(),
+                                                    "webdav connection ended with error"
+                                                );
+                                            }
                                         }
                                     } else {
                                         let io = TokioIo::new(stream);
-                                        if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size).await {
+                                        if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, max_body_size, request_timeout).await {
                                             debug!(
                                                 event = EVENT_WEBDAV_CONNECTION_STATE,
                                                 component = LOG_COMPONENT_PROTOCOLS,
@@ -244,16 +314,24 @@ where
         storage: S,
         source_ip: IpAddr,
         max_body_size: u64,
+        request_timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let service = service_fn(move |req: Request<hyper::body::Incoming>| {
             let storage = storage.clone();
-            async move { Self::handle_request(req, storage, source_ip, max_body_size).await }
+            async move { Self::handle_request(req, storage, source_ip, max_body_size, request_timeout).await }
         });
 
-        http1::Builder::new().serve_connection(io, service).await?;
+        // A peer that opens a connection and dribbles (or never finishes)
+        // request headers is disconnected once the configured request
+        // timeout elapses. The timer is required for the deadline to apply.
+        http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(request_timeout)
+            .serve_connection(io, service)
+            .await?;
 
         Ok(())
     }
@@ -264,8 +342,12 @@ where
         storage: S,
         source_ip: IpAddr,
         max_body_size: u64,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
-        // Check Content-Length against max_body_size before reading body
+        request_timeout: Duration,
+    ) -> Result<Response<WebDavBody>, Infallible> {
+        // Advisory fast path only: a declared Content-Length lets an
+        // oversized request be rejected before any body is read. The
+        // authoritative limit is enforced in `dispatch_dav` against the
+        // bytes actually received, which a chunked request cannot dodge.
         if let Some(content_length) = req.headers().get("content-length")
             && let Ok(length_str) = content_length.to_str()
             && let Ok(length) = length_str.parse::<u64>()
@@ -324,49 +406,7 @@ where
             .locksystem(FakeLs::new())
             .build_handler();
 
-        // Convert request body
-        let (parts, body) = req.into_parts();
-        let body_bytes = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                error!(
-                    event = EVENT_WEBDAV_REQUEST_BODY_FAILED,
-                    component = LOG_COMPONENT_PROTOCOLS,
-                    subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                    result = "request_body_read_failed",
-                    source_ip = %source_ip,
-                    error = %e,
-                    "webdav request body failed"
-                );
-                return Ok(error_response(StatusCode::BAD_REQUEST, "Failed to read request body"));
-            }
-        };
-
-        // Create request for dav-server using Bytes
-        let dav_req = Request::from_parts(parts, dav_server::body::Body::from(body_bytes));
-
-        // Handle the request
-        let dav_resp = dav_handler.handle(dav_req).await;
-
-        // Convert response
-        let (parts, body) = dav_resp.into_parts();
-        let body_bytes = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                error!(
-                    event = EVENT_WEBDAV_REQUEST_BODY_FAILED,
-                    component = LOG_COMPONENT_PROTOCOLS,
-                    subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                    result = "response_body_read_failed",
-                    source_ip = %source_ip,
-                    error = %e,
-                    "webdav request body failed"
-                );
-                return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"));
-            }
-        };
-
-        Ok(Response::from_parts(parts, Full::new(body_bytes)))
+        Ok(dispatch_dav(req, dav_handler, source_ip, max_body_size, request_timeout).await)
     }
 
     /// Authenticate user against IAM system
@@ -442,6 +482,19 @@ where
             WebDavInitError::Server("User not found".to_string())
         })?;
 
+        if is_temporary_credential(&identity.credentials) {
+            warn!(
+                event = EVENT_WEBDAV_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_AUTH,
+                result = "temporary_credential_rejected",
+                source_ip = %source_ip,
+                access_key = %masked_access_key,
+                "WebDAV auth rejected temporary credential"
+            );
+            return Err(WebDavInitError::Server("Invalid credentials".to_string()));
+        }
+
         // Constant-time secret comparison to prevent timing side-channel
         // attacks. Same primitive used by the SFTP handler and rustfs/src/auth.rs.
         let secret_matches: bool = identity
@@ -491,25 +544,495 @@ where
     }
 }
 
+/// Read the request body and run it through the dav handler.
+///
+/// Both limits configured for the listener are enforced here: the body is
+/// truncated at `max_body_size` bytes actually received (a chunked upload
+/// declares no length, so a header check cannot bound it), and neither the
+/// body read nor the dav handler may run past `request_timeout`.
+async fn dispatch_dav<B>(
+    req: Request<B>,
+    dav_handler: DavHandler,
+    source_ip: IpAddr,
+    max_body_size: u64,
+    request_timeout: Duration,
+) -> Response<WebDavBody>
+where
+    B: HttpBody<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (parts, body) = req.into_parts();
+    let limit = usize::try_from(max_body_size).unwrap_or(usize::MAX);
+
+    let body_bytes = match timeout(request_timeout, Limited::new(body, limit).collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+            warn!(
+                event = EVENT_WEBDAV_REQUEST_VALIDATION_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                result = "payload_too_large",
+                max_body_size,
+                source_ip = %source_ip,
+                "webdav request validation failed"
+            );
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("Request body too large. Maximum size is {} bytes", max_body_size),
+            );
+        }
+        Ok(Err(e)) => {
+            error!(
+                event = EVENT_WEBDAV_REQUEST_BODY_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                result = "request_body_read_failed",
+                source_ip = %source_ip,
+                error = %e,
+                "webdav request body failed"
+            );
+            return error_response(StatusCode::BAD_REQUEST, "Failed to read request body");
+        }
+        Err(_) => {
+            warn!(
+                event = EVENT_WEBDAV_REQUEST_VALIDATION_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                result = "request_body_read_timeout",
+                timeout_secs = request_timeout.as_secs(),
+                source_ip = %source_ip,
+                "webdav request validation failed"
+            );
+            return error_response(StatusCode::REQUEST_TIMEOUT, "Request timed out");
+        }
+    };
+
+    // Create request for dav-server using Bytes
+    let dav_req = Request::from_parts(parts, dav_server::body::Body::from(body_bytes));
+
+    let dav_resp = match timeout(request_timeout, dav_handler.handle(dav_req)).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            warn!(
+                event = EVENT_WEBDAV_REQUEST_VALIDATION_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                result = "request_handling_timeout",
+                timeout_secs = request_timeout.as_secs(),
+                source_ip = %source_ip,
+                "webdav request validation failed"
+            );
+            return error_response(StatusCode::REQUEST_TIMEOUT, "Request timed out");
+        }
+    };
+
+    // Streamed straight to Hyper: collecting here would hold the whole
+    // object in memory for the duration of a GET.
+    let (parts, body) = dav_resp.into_parts();
+    Response::from_parts(parts, Box::pin(body) as WebDavBody)
+}
+
 /// Create unauthorized response with WWW-Authenticate header
-fn unauthorized_response() -> Response<Full<Bytes>> {
+fn unauthorized_response() -> Response<WebDavBody> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("WWW-Authenticate", "Basic realm=\"RustFS WebDAV\"")
-        .body(Full::new(Bytes::from("Unauthorized")))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("Unauthorized"))))
+        .body(fixed_body("Unauthorized"))
+        .unwrap_or_else(|_| Response::new(fixed_body("Unauthorized")))
 }
 
 /// Create error response
-fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode, message: &str) -> Response<WebDavBody> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::from(message.to_string())))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("Internal Server Error"))))
+        .body(fixed_body(message.to_string()))
+        .unwrap_or_else(|_| Response::new(fixed_body("Internal Server Error")))
+}
+
+/// Wrap a fixed byte payload in the streaming response body type
+fn fixed_body(message: impl Into<Bytes>) -> WebDavBody {
+    Box::pin(Full::new(message.into()).map_err(|never| match never {}))
 }
 
 /// Decode base64 string
 fn base64_decode(encoded: &str) -> Result<Vec<u8>, ()> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::client::s3::StorageBackend;
+    use async_trait::async_trait;
+    use dav_server::memfs::MemFs;
+    use futures_util::stream;
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+    use s3s::dto::*;
+    use std::fmt::{Debug, Formatter};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// Storage double for the connection-level tests. Those requests are
+    /// rejected before authentication succeeds, so storage is never reached.
+    #[derive(Clone)]
+    struct StubStorage;
+
+    impl Debug for StubStorage {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("StubStorage")
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for StubStorage {
+        type Error = std::io::Error;
+
+        async fn get_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+            _start_pos: Option<u64>,
+        ) -> Result<GetObjectOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn get_object_range(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+            _start_pos: u64,
+            _length: u64,
+        ) -> Result<GetObjectOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn put_object(
+            &self,
+            _input: PutObjectInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<PutObjectOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<DeleteObjectOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn head_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<HeadObjectOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn head_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<HeadBucketOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn list_objects_v2(
+            &self,
+            _input: ListObjectsV2Input,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<ListObjectsV2Output, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn create_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CreateBucketOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn delete_bucket(
+            &self,
+            _bucket: &str,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<DeleteBucketOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn copy_object(
+            &self,
+            _input: CopyObjectInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CopyObjectOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn create_multipart_upload(
+            &self,
+            _input: CreateMultipartUploadInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CreateMultipartUploadOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn upload_part(
+            &self,
+            _input: UploadPartInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<UploadPartOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            _input: CompleteMultipartUploadInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            _input: AbortMultipartUploadInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<AbortMultipartUploadOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+
+        async fn upload_part_copy(
+            &self,
+            _input: UploadPartCopyInput,
+            _access_key: &str,
+            _secret_key: &str,
+        ) -> Result<UploadPartCopyOutput, Self::Error> {
+            unreachable!("connection tests should not hit storage")
+        }
+    }
+
+    /// Request body that never produces a frame, standing in for a peer that
+    /// opens a chunked upload and then stalls.
+    struct StalledBody;
+
+    impl HttpBody for StalledBody {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    fn memfs_handler() -> DavHandler {
+        DavHandler::builder()
+            .filesystem(MemFs::new())
+            .locksystem(FakeLs::new())
+            .build_handler()
+    }
+
+    /// Chunked upload: no Content-Length header, `chunks` frames of `chunk_len` bytes.
+    fn chunked_request(
+        chunks: usize,
+        chunk_len: usize,
+    ) -> Request<StreamBody<impl stream::Stream<Item = io::Result<Frame<Bytes>>>>> {
+        let frames: Vec<io::Result<Frame<Bytes>>> = (0..chunks)
+            .map(|_| Ok(Frame::data(Bytes::from(vec![b'a'; chunk_len]))))
+            .collect();
+        Request::builder()
+            .method("PUT")
+            .uri("/upload.bin")
+            .body(StreamBody::new(stream::iter(frames)))
+            .expect("build chunked request")
+    }
+
+    fn get_request(uri: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .expect("build get request")
+    }
+
+    /// R03-CAN-051 / R03-CAN-067 / R05-CAN-094: a chunked upload declares no
+    /// Content-Length, so the limit has to hold on the bytes actually read.
+    #[tokio::test]
+    async fn chunked_upload_over_max_body_size_is_rejected() {
+        let handler = memfs_handler();
+
+        let resp = dispatch_dav(chunked_request(8, 8), handler.clone(), TEST_IP, 16, Duration::from_secs(30)).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // The oversized body must not have reached the filesystem.
+        let stored = dispatch_dav(get_request("/upload.bin"), handler, TEST_IP, 16, Duration::from_secs(30)).await;
+        assert_eq!(stored.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_within_max_body_size_is_accepted() {
+        let handler = memfs_handler();
+
+        let resp = dispatch_dav(chunked_request(2, 4), handler.clone(), TEST_IP, 16, Duration::from_secs(30)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = dispatch_dav(get_request("/upload.bin"), handler, TEST_IP, 16, Duration::from_secs(30)).await;
+        assert_eq!(stored.status(), StatusCode::OK);
+        let bytes = stored.into_body().collect().await.expect("collect body").to_bytes();
+        assert_eq!(bytes.len(), 8);
+    }
+
+    /// R04-CAN-089 / R05-CAN-094: a request whose body never arrives must be
+    /// cut off at the configured request timeout.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_request_body_hits_request_timeout() {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/stalled.bin")
+            .body(StalledBody)
+            .expect("build stalled request");
+
+        let resp = timeout(
+            Duration::from_secs(600),
+            dispatch_dav(req, memfs_handler(), TEST_IP, 1024, Duration::from_secs(30)),
+        )
+        .await
+        .expect("stalled body was never cut off by the configured request timeout");
+
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    /// R03-CAN-052: the object body must reach Hyper as a stream. A collected
+    /// body reports an exact size hint; a streamed one does not.
+    #[tokio::test]
+    async fn get_response_body_is_streamed_not_buffered() {
+        let handler = memfs_handler();
+        let put = dispatch_dav(chunked_request(4, 4), handler.clone(), TEST_IP, 1024, Duration::from_secs(30)).await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let resp = dispatch_dav(get_request("/upload.bin"), handler, TEST_IP, 1024, Duration::from_secs(30)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.body().size_hint().upper().is_none(),
+            "response body was collected into memory instead of streamed"
+        );
+
+        let bytes = resp.into_body().collect().await.expect("collect body").to_bytes();
+        assert_eq!(bytes.len(), 16);
+    }
+
+    /// R04-CAN-089: a peer that opens a connection and never finishes its
+    /// request headers must be disconnected at the configured timeout.
+    #[tokio::test(start_paused = true)]
+    async fn slow_request_headers_hit_request_timeout() {
+        let (mut client, server) = tokio::io::duplex(1024);
+
+        let conn = tokio::spawn(WebDavServer::<StubStorage>::handle_connection_impl(
+            TokioIo::new(server),
+            StubStorage,
+            TEST_IP,
+            1024,
+            Duration::from_secs(30),
+        ));
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .expect("write partial headers");
+
+        let outcome = timeout(Duration::from_secs(600), conn).await;
+        assert!(outcome.is_ok(), "connection outlived the configured request timeout");
+    }
+
+    /// R05-CAN-097: the accept loop must not serve more connections at once
+    /// than the configured cap.
+    #[tokio::test]
+    async fn accept_loop_is_bounded_by_max_connections() {
+        let config = WebDavConfig {
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            tls_enabled: false,
+            cert_dir: None,
+            ca_file: None,
+            max_body_size: 1024,
+            request_timeout_secs: 30,
+            max_connections: 1,
+        };
+        let server = WebDavServer::new(config, StubStorage).await.expect("build server");
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.serve(listener, shutdown_rx).await });
+
+        // The first client occupies the single permit; keep-alive holds it
+        // after the response.
+        let mut first = TcpStream::connect(addr).await.expect("connect first");
+        first
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write first");
+        let mut buf = [0u8; 64];
+        let read = first.read(&mut buf).await.expect("read first");
+        assert!(read > 0, "first connection was not served");
+
+        // The second client lands in the backlog and must not be served.
+        let mut second = TcpStream::connect(addr).await.expect("connect second");
+        second
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write second");
+        let blocked = timeout(Duration::from_millis(500), second.read(&mut buf)).await;
+        assert!(blocked.is_err(), "second connection was served while the cap was saturated");
+
+        // Releasing the first permit admits the queued connection.
+        drop(first);
+        let served = timeout(Duration::from_secs(10), second.read(&mut buf))
+            .await
+            .expect("second connection was never served")
+            .expect("read second");
+        assert!(served > 0, "second connection returned no data");
+
+        let _ = shutdown_tx.send(());
+        let _ = timeout(Duration::from_secs(10), serving).await;
+    }
+
+    #[tokio::test]
+    async fn config_rejects_zero_max_connections() {
+        let config = WebDavConfig {
+            tls_enabled: false,
+            max_connections: 0,
+            ..WebDavConfig::default()
+        };
+
+        let err = config.validate().await.expect_err("zero max_connections must be rejected");
+        assert!(matches!(err, WebDavInitError::InvalidConfig(_)), "unexpected error: {err}");
+    }
 }
