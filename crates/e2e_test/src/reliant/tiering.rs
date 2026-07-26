@@ -87,6 +87,7 @@ const MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX: &str = "manual-async-same-scope-c
 const MANUAL_TIER_FAILURE_PREFIX: &str = "manual-tier-failure/";
 const MANUAL_WORKER_FAILURE_PREFIX: &str = "manual-worker-failure/";
 const MANUAL_ACTIVE_CANCEL_PREFIX: &str = "manual-active-cancel/";
+const MANUAL_ASYNC_CONFLICT_OBJECTS: usize = 512;
 const MANUAL_ACTIVE_CANCEL_OBJECTS: usize = 512;
 const MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
@@ -520,6 +521,34 @@ async fn wait_for_manual_transition_job_terminal(
             .into());
         }
         tokio::time::sleep(StdDuration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_manual_transition_job_running(
+    hot: &RustFSTestEnvironment,
+    status_endpoint: &str,
+    deadline: StdDuration,
+) -> Result<ManualTransitionJobStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
+    loop {
+        let status = manual_transition_job_status(hot, status_endpoint).await?;
+        if status.status == "running" {
+            return Ok(status);
+        }
+        if matches!(status.status.as_str(), "completed" | "partial" | "cancelled" | "failed" | "unknown") {
+            return Err(format!(
+                "manual transition job reached terminal state before it became observable as running: {status:#?}"
+            )
+            .into());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "manual transition job at {status_endpoint} did not become running within {}s; last={status:#?}",
+                deadline.as_secs()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
     }
 }
 
@@ -1002,7 +1031,7 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     add_rustfs_tier(&hot, &cold).await?;
 
     hot_client.create_bucket().bucket(MANUAL_ASYNC_CONFLICT_BUCKET).send().await?;
-    for idx in 0..50 {
+    for idx in 0..MANUAL_ASYNC_CONFLICT_OBJECTS {
         let key = format!("{MANUAL_ASYNC_CONFLICT_NESTED_PREFIX}obj-{idx:02}");
         put_single_part_object(&hot_client, MANUAL_ASYNC_CONFLICT_BUCKET, &key, b"async conflict payload").await?;
     }
@@ -1015,22 +1044,15 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     )
     .await?;
 
-    let (first, second) = tokio::join!(
-        manual_transition_async_run_raw(&hot, MANUAL_ASYNC_CONFLICT_BUCKET, MANUAL_ASYNC_CONFLICT_PREFIX, false, 50),
-        manual_transition_async_run_raw(&hot, MANUAL_ASYNC_CONFLICT_BUCKET, MANUAL_ASYNC_CONFLICT_NESTED_PREFIX, false, 50)
-    );
-    let responses = [first?, second?];
-    let accepted = responses
-        .iter()
-        .find(|(status, _)| *status == reqwest::StatusCode::ACCEPTED)
-        .ok_or("one concurrent async run must be accepted")?;
-    let conflict = responses
-        .iter()
-        .find(|(status, _)| *status == reqwest::StatusCode::CONFLICT)
-        .ok_or("one concurrent async run must report conflict")?;
-
-    let accepted: ManualTransitionRunResponse = serde_json::from_str(&accepted.1)?;
-    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict.1)?;
+    let before_remote_count = cold_tier_object_count(&cold_client).await?;
+    let accepted = manual_transition_async_run(
+        &hot,
+        MANUAL_ASYNC_CONFLICT_BUCKET,
+        MANUAL_ASYNC_CONFLICT_PREFIX,
+        false,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+    )
+    .await?;
     let job_id = accepted
         .job_id
         .as_deref()
@@ -1042,6 +1064,22 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
 
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.mode, "durable_job");
+    let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
+    assert_eq!(active.job_id, job_id);
+    let (conflict_status, conflict_body) = manual_transition_async_run_raw(
+        &hot,
+        MANUAL_ASYNC_CONFLICT_BUCKET,
+        MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
+        false,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+    )
+    .await?;
+    assert_eq!(
+        conflict_status,
+        reqwest::StatusCode::CONFLICT,
+        "overlapping async run response: {conflict_body}"
+    );
+    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict_body)?;
     assert_eq!(conflict.state, "conflict");
     assert_eq!(conflict.mode, "durable_job");
     assert_eq!(conflict.active_job_id, job_id);
@@ -1054,16 +1092,19 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     assert_eq!(terminal.status, "completed", "terminal conflict winner response: {terminal:#?}");
     assert!(!terminal.report.dry_run);
     assert_eq!(terminal.report.bucket, MANUAL_ASYNC_CONFLICT_BUCKET);
-    assert!(
-        terminal.report.prefix == MANUAL_ASYNC_CONFLICT_PREFIX || terminal.report.prefix == MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
+    assert_eq!(terminal.report.prefix, MANUAL_ASYNC_CONFLICT_PREFIX);
+    assert_eq!(
+        terminal.report.scanned, MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
         "terminal conflict winner response: {terminal:#?}"
     );
-    assert_eq!(terminal.report.scanned, 50, "terminal conflict winner response: {terminal:#?}");
-    assert_eq!(terminal.report.eligible, 50, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(
+        terminal.report.eligible, MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+        "terminal conflict winner response: {terminal:#?}"
+    );
     assert_eq!(terminal.report.dry_run_eligible, 0, "terminal conflict winner response: {terminal:#?}");
     assert_eq!(
         terminal.report.enqueued + terminal.report.skipped_already_in_flight,
-        50,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
         "terminal conflict winner response: {terminal:#?}"
     );
     assert_eq!(
@@ -1072,7 +1113,9 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     );
     assert_eq!(terminal.report.transition_failed, 0, "terminal conflict winner response: {terminal:#?}");
     assert_eq!(terminal.report.tier_failure, 0, "terminal conflict winner response: {terminal:#?}");
-    assert!(cold_tier_object_count(&cold_client).await? <= 50);
+    let after_remote_count = cold_tier_object_count(&cold_client).await?;
+    assert!(after_remote_count >= before_remote_count);
+    assert!(after_remote_count <= before_remote_count + MANUAL_ASYNC_CONFLICT_OBJECTS);
 
     Ok(())
 }
@@ -1420,22 +1463,7 @@ async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled()
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
 
-    let start = Instant::now();
-    let active = loop {
-        let status = manual_transition_job_status(&hot, status_endpoint).await?;
-        if status.status == "running" {
-            break status;
-        }
-        assert!(
-            !matches!(status.status.as_str(), "completed" | "partial" | "cancelled" | "failed" | "unknown"),
-            "manual transition job reached terminal state before active cancel could be requested: {status:#?}"
-        );
-        assert!(
-            start.elapsed() < MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT,
-            "manual transition job did not become running before active cancel timeout: {status:#?}"
-        );
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-    };
+    let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
     assert_eq!(active.job_id, job_id);
     assert_eq!(active.status_endpoint, status_endpoint);
     assert!(!active.cancel_requested);
