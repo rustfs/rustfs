@@ -4628,10 +4628,10 @@ mod tests {
         load_manual_transition_job_record, load_manual_transition_scope_admission,
         load_manual_transition_scope_admission_with_etag, manual_transition_scope_record_object_name,
         manual_transition_worker_result_object_name, manual_transition_worker_result_task_key,
-        reconcile_manual_transition_worker_results, record_manual_transition_worker_result, renew_manual_transition_job_lease,
-        request_manual_transition_job_cancel, save_manual_transition_job_record,
-        save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
-        save_manual_transition_worker_result_if_absent,
+        persist_manual_transition_job_progress, reconcile_manual_transition_worker_results,
+        record_manual_transition_worker_result, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
+        save_manual_transition_job_record, save_manual_transition_scope_admission_if_absent,
+        save_manual_transition_scope_admission_if_current, save_manual_transition_worker_result_if_absent,
     };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
@@ -7567,6 +7567,61 @@ mod tests {
         assert_eq!(value.get("continuation_token").and_then(|value| value.as_str()), Some("opaque"));
         assert!(value.get("next_marker").is_none());
         assert!(value.get("next_version_idmarker").is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_progress_persists_checkpoint_and_renews_admission() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            ..Default::default()
+        };
+        let record = ManualTransitionJobRecord::new(job_id, "manual-progress-journal-bucket", &options, "owner-a");
+        let scope_key = record.scope_key.clone();
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("running scope admission should save");
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                .expect("resume cursor should encode");
+        let queue_snapshot = ManualTransitionQueueSnapshot {
+            queued: 1,
+            active: 2,
+            workers: 3,
+            ..Default::default()
+        };
+        let report = ManualTransitionRunReport {
+            bucket: "manual-progress-journal-bucket".to_string(),
+            prefix: "logs/".to_string(),
+            scanned: 1000,
+            continuation_token: Some(continuation_token.clone()),
+            ..Default::default()
+        };
+
+        let persisted = persist_manual_transition_job_progress(ecstore.clone(), job_id, &report, queue_snapshot)
+            .await
+            .expect("page checkpoint should persist to the job record");
+
+        assert_eq!(persisted.state, ManualTransitionJobState::Running);
+        assert_eq!(persisted.report.scanned, 1000);
+        assert_eq!(persisted.report.continuation_token.as_deref(), Some(continuation_token.as_str()));
+        assert_eq!(persisted.queue_snapshot, queue_snapshot);
+        let loaded = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("checkpointed job should reload");
+        assert_eq!(loaded.report.continuation_token.as_deref(), Some(continuation_token.as_str()));
+        assert_eq!(loaded.queue_snapshot, queue_snapshot);
+        let admission = load_manual_transition_scope_admission(ecstore, &scope_key)
+            .await
+            .expect("running checkpoint must keep the scope admission alive");
+        assert_eq!(admission.job_id, job_id);
+        assert_eq!(admission.lease_id, loaded.lease_id);
+        assert_eq!(admission.updated_at_unix_nanos, loaded.updated_at_unix_nanos);
     }
 
     #[tokio::test]
