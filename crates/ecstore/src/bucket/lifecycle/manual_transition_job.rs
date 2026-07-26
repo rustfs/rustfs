@@ -2077,6 +2077,120 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_record_queue_pressure_reports_persist_readback() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            max_objects: Some(10),
+            ..Default::default()
+        };
+
+        for (bucket, skipped_queue_full, skipped_queue_closed, skipped_queue_timeout, active_snapshot, terminal_snapshot) in [
+            (
+                "manual-queue-full-readback-bucket",
+                2,
+                0,
+                0,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    queued: 4,
+                    workers: 2,
+                    queue_full: 2,
+                    ..Default::default()
+                },
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    queue_full: 2,
+                    ..Default::default()
+                },
+            ),
+            (
+                "manual-queue-closed-readback-bucket",
+                0,
+                1,
+                0,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    ..Default::default()
+                },
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    ..Default::default()
+                },
+            ),
+            (
+                "manual-queue-timeout-readback-bucket",
+                0,
+                0,
+                1,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    active: 1,
+                    workers: 2,
+                    queue_send_timeout: 1,
+                    ..Default::default()
+                },
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    queue_send_timeout: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), bucket, &options, TEST_OWNER);
+            record.complete(
+                ManualTransitionRunReport {
+                    enqueued: 1,
+                    skipped_queue_full,
+                    skipped_queue_closed,
+                    skipped_queue_timeout,
+                    continuation_token: Some("opaque-queue-pressure-token".to_string()),
+                    ..Default::default()
+                },
+                active_snapshot,
+            );
+
+            assert_eq!(record.state, ManualTransitionJobState::Running);
+            assert!(record.report.has_partial_enqueue());
+            assert!(record.report.worker_transition_pending());
+            assert_eq!(record.queue_snapshot, active_snapshot);
+
+            let encoded = record.encode().expect("queue-pressure partial job should encode");
+            let decoded =
+                ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("running queue-pressure job should decode");
+            assert_eq!(decoded.state, ManualTransitionJobState::Running);
+            assert!(decoded.report.worker_transition_pending());
+            assert_eq!(decoded.report.skipped_queue_full, skipped_queue_full);
+            assert_eq!(decoded.report.skipped_queue_closed, skipped_queue_closed);
+            assert_eq!(decoded.report.skipped_queue_timeout, skipped_queue_timeout);
+            assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-queue-pressure-token"));
+            assert_eq!(decoded.queue_snapshot, active_snapshot);
+
+            record.record_worker_result(ManualTransitionWorkerResult::Completed, terminal_snapshot);
+
+            let encoded = record.encode().expect("terminal queue-pressure partial job should encode");
+            let decoded =
+                ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("terminal queue-pressure job should decode");
+            assert_eq!(decoded.state, ManualTransitionJobState::Partial);
+            assert!(decoded.is_terminal());
+            assert_eq!(decoded.report.enqueued, 1);
+            assert_eq!(decoded.report.transition_completed, 1);
+            assert_eq!(decoded.report.skipped_queue_full, skipped_queue_full);
+            assert_eq!(decoded.report.skipped_queue_closed, skipped_queue_closed);
+            assert_eq!(decoded.report.skipped_queue_timeout, skipped_queue_timeout);
+            assert!(decoded.report.has_partial_enqueue());
+            assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-queue-pressure-token"));
+            assert_eq!(decoded.queue_snapshot, terminal_snapshot);
+            assert!(decoded.completed_at_unix_nanos.is_some());
+            assert!(decoded.error.is_none());
+        }
+    }
+
+    #[test]
     fn manual_transition_job_record_budget_reports_are_partial_and_resumable() {
         let options = ManualTransitionRunOptions {
             prefix: "logs/".to_string(),
