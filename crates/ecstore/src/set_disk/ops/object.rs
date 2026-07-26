@@ -3070,6 +3070,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         if version_found {
+            opts.precondition_check(&goi)?;
             check_object_lock_delete(bucket, object, &goi, &opts).await?;
         }
 
