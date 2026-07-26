@@ -1048,6 +1048,25 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(second_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
     assert_eq!(second_cancel.report.continuation_token, terminal.report.continuation_token);
 
+    let status_after_cancel = manual_transition_job_status(&hot, status_endpoint).await?;
+    assert_eq!(status_after_cancel.job_id, job_id);
+    assert_eq!(status_after_cancel.status, second_cancel.status);
+    assert_eq!(status_after_cancel.status_endpoint, status_endpoint);
+    assert_eq!(status_after_cancel.cancel_endpoint, status_endpoint);
+    assert_eq!(status_after_cancel.cancel_requested, second_cancel.cancel_requested);
+    assert_eq!(status_after_cancel.failure_reason, second_cancel.failure_reason);
+    assert_eq!(status_after_cancel.report.bucket, terminal.report.bucket);
+    assert_eq!(status_after_cancel.report.prefix, terminal.report.prefix);
+    assert_eq!(status_after_cancel.report.tier, terminal.report.tier);
+    assert_eq!(status_after_cancel.report.scanned, terminal.report.scanned);
+    assert_eq!(status_after_cancel.report.skipped_not_transition, terminal.report.skipped_not_transition);
+    assert_eq!(status_after_cancel.report.transition_completed, terminal.report.transition_completed);
+    assert_eq!(status_after_cancel.report.transition_failed, terminal.report.transition_failed);
+    assert_eq!(status_after_cancel.report.tier_failure, terminal.report.tier_failure);
+    assert_eq!(status_after_cancel.report.cancelled, terminal.report.cancelled);
+    assert_eq!(status_after_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
+    assert_eq!(status_after_cancel.report.continuation_token, terminal.report.continuation_token);
+
     let resumed = manual_transition_run_with_max_and_continuation(
         &hot,
         MANUAL_ASYNC_LIMIT_BUCKET,
