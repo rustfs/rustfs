@@ -659,34 +659,40 @@ pub async fn claim_manual_transition_scope_admission(
     api: Arc<ECStore>,
     admission: &ManualTransitionScopeAdmission,
 ) -> EcstoreResult<ManualTransitionScopeAdmissionClaim> {
-    match save_manual_transition_scope_admission_if_absent(api.clone(), admission).await {
-        Ok(()) => return finish_manual_transition_scope_admission_claim(api, admission).await,
-        Err(Error::PreconditionFailed) => {}
-        Err(err) => return Err(err),
-    }
-
-    let (active, etag) = load_manual_transition_scope_admission_with_etag(api.clone(), &admission.scope_key).await?;
-    let scope_lease_expired = manual_transition_scope_admission_lease_expired(&active);
-    let active_job_reclaimable = if active.job_id == admission.job_id {
-        scope_lease_expired
-    } else {
-        match load_manual_transition_job_record(api.clone(), active.job_id).await {
-            Ok(active_job) => {
-                active_job.is_terminal() || (scope_lease_expired && manual_transition_job_lease_expired(&active_job))
-            }
-            Err(Error::ConfigNotFound) => true,
+    loop {
+        match save_manual_transition_scope_admission_if_absent(api.clone(), admission).await {
+            Ok(()) => return finish_manual_transition_scope_admission_claim(api, admission).await,
+            Err(Error::PreconditionFailed) => {}
             Err(err) => return Err(err),
         }
-    };
-    if active_job_reclaimable {
-        return match save_manual_transition_scope_admission_if_current(api.clone(), admission, &etag).await {
-            Ok(()) => finish_manual_transition_scope_admission_claim(api, admission).await,
-            Err(Error::PreconditionFailed) => Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active))),
-            Err(err) => Err(err),
-        };
-    }
 
-    Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active)))
+        let (active, etag) = match load_manual_transition_scope_admission_with_etag(api.clone(), &admission.scope_key).await {
+            Ok(active) => active,
+            Err(Error::ConfigNotFound) => continue,
+            Err(err) => return Err(err),
+        };
+        let scope_lease_expired = manual_transition_scope_admission_lease_expired(&active);
+        let active_job_reclaimable = if active.job_id == admission.job_id {
+            scope_lease_expired
+        } else {
+            match load_manual_transition_job_record(api.clone(), active.job_id).await {
+                Ok(active_job) => {
+                    active_job.is_terminal() || (scope_lease_expired && manual_transition_job_lease_expired(&active_job))
+                }
+                Err(Error::ConfigNotFound) => true,
+                Err(err) => return Err(err),
+            }
+        };
+        if active_job_reclaimable {
+            match save_manual_transition_scope_admission_if_current(api.clone(), admission, &etag).await {
+                Ok(()) => return finish_manual_transition_scope_admission_claim(api, admission).await,
+                Err(Error::PreconditionFailed) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        return Ok(ManualTransitionScopeAdmissionClaim::Conflict(Box::new(active)));
+    }
 }
 
 async fn finish_manual_transition_scope_admission_claim(
