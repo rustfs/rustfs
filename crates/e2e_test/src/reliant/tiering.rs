@@ -396,6 +396,18 @@ struct ManualTransitionRunReport {
 }
 
 #[derive(Debug, Deserialize)]
+struct ManualTransitionQueueSnapshot {
+    queue_capacity: u64,
+    queued: u64,
+    active: u64,
+    workers: u64,
+    queue_full: u64,
+    queue_send_timeout: u64,
+    compensation_pending: u64,
+    compensation_running: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct ManualTransitionJobStatusResponse {
     job_id: String,
     status_endpoint: String,
@@ -404,6 +416,7 @@ struct ManualTransitionJobStatusResponse {
     cancel_requested: bool,
     failure_reason: Option<String>,
     report: ManualTransitionRunReport,
+    queue_snapshot: ManualTransitionQueueSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1052,6 +1065,14 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert!(!terminal.report.cancelled);
     assert!(terminal.report.truncated_by_limit);
     assert!(!terminal.report.truncated_by_duration);
+    assert!(terminal.queue_snapshot.queue_capacity >= terminal.queue_snapshot.queued);
+    assert_eq!(terminal.queue_snapshot.queued, 0);
+    assert!(terminal.queue_snapshot.workers >= terminal.queue_snapshot.active);
+    assert_eq!(terminal.queue_snapshot.active, 0);
+    assert_eq!(terminal.queue_snapshot.queue_full, 0);
+    assert_eq!(terminal.queue_snapshot.queue_send_timeout, 0);
+    assert_eq!(terminal.queue_snapshot.compensation_pending, 0);
+    assert_eq!(terminal.queue_snapshot.compensation_running, 0);
     let continuation = terminal
         .report
         .continuation_token
