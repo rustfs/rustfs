@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
-    ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
+mod storage_api;
+
+use storage_api::manual_transition::{
+    ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionQueueSnapshot, ManualTransitionRunOptions,
+    ManualTransitionRunReport,
 };
-use rustfs_ecstore::api::bucket::lifecycle::manual_transition_job::{ManualTransitionJobRecord, ManualTransitionJobState};
 use uuid::Uuid;
 
 #[test]
