@@ -87,6 +87,7 @@ const MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX: &str = "manual-async-same-scope-c
 const MANUAL_TIER_FAILURE_PREFIX: &str = "manual-tier-failure/";
 const MANUAL_WORKER_FAILURE_PREFIX: &str = "manual-worker-failure/";
 const MANUAL_ACTIVE_CANCEL_PREFIX: &str = "manual-active-cancel/";
+const MANUAL_ASYNC_CONFLICT_OBJECTS: usize = 512;
 const MANUAL_ACTIVE_CANCEL_OBJECTS: usize = 512;
 const MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
@@ -353,6 +354,7 @@ struct ManualTransitionRunResponse {
     mode: String,
     job_id: Option<String>,
     status_endpoint: Option<String>,
+    cancel_endpoint: Option<String>,
     report: ManualTransitionRunReport,
 }
 
@@ -393,6 +395,7 @@ struct ManualTransitionRunReport {
 struct ManualTransitionJobStatusResponse {
     job_id: String,
     status_endpoint: String,
+    cancel_endpoint: String,
     status: String,
     cancel_requested: bool,
     failure_reason: Option<String>,
@@ -520,6 +523,34 @@ async fn wait_for_manual_transition_job_terminal(
             .into());
         }
         tokio::time::sleep(StdDuration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_manual_transition_job_running(
+    hot: &RustFSTestEnvironment,
+    status_endpoint: &str,
+    deadline: StdDuration,
+) -> Result<ManualTransitionJobStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let start = Instant::now();
+    loop {
+        let status = manual_transition_job_status(hot, status_endpoint).await?;
+        if status.status == "running" {
+            return Ok(status);
+        }
+        if matches!(status.status.as_str(), "completed" | "partial" | "cancelled" | "failed" | "unknown") {
+            return Err(format!(
+                "manual transition job reached terminal state before it became observable as running: {status:#?}"
+            )
+            .into());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "manual transition job at {status_endpoint} did not become running within {}s; last={status:#?}",
+                deadline.as_secs()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
     }
 }
 
@@ -853,14 +884,25 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
     assert!(
         status_endpoint.ends_with(job_id),
         "status endpoint must embed job id: endpoint={status_endpoint}, job_id={job_id}"
+    );
+    assert_eq!(
+        accepted.cancel_endpoint.as_deref(),
+        Some(status_endpoint),
+        "async run must return the cancel endpoint used by rc cancel"
     );
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
     assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.cancel_endpoint, status_endpoint);
     assert_eq!(terminal.status, "completed", "terminal job response: {terminal:#?}");
     assert!(!terminal.cancel_requested);
     assert_eq!(terminal.failure_reason, None);
@@ -886,6 +928,8 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
 
     let after_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(after_cancel.status, "completed");
+    assert_eq!(after_cancel.status_endpoint, status_endpoint);
+    assert_eq!(after_cancel.cancel_endpoint, status_endpoint);
     assert!(!after_cancel.cancel_requested);
     assert_eq!(
         cold_tier_object_count(&cold_client).await?,
@@ -934,10 +978,16 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    assert_eq!(
+        accepted.cancel_endpoint.as_deref(),
+        Some(status_endpoint),
+        "async partial run must return the cancel endpoint used by rc cancel"
+    );
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
     assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.cancel_endpoint, status_endpoint);
     assert_eq!(terminal.status, "partial", "terminal limit job response: {terminal:#?}");
     assert!(!terminal.cancel_requested);
     assert_eq!(terminal.failure_reason, None);
@@ -958,9 +1008,20 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert!(!terminal.report.cancelled);
     assert!(terminal.report.truncated_by_limit);
     assert!(!terminal.report.truncated_by_duration);
+    let continuation = terminal
+        .report
+        .continuation_token
+        .as_deref()
+        .ok_or("terminal partial async job must return an opaque continuation token")?;
+    assert!(
+        !continuation.contains(MANUAL_ASYNC_LIMIT_PREFIX),
+        "async continuation token must not expose the raw object prefix: {continuation}"
+    );
 
     let after_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(after_cancel.status, "partial");
+    assert_eq!(after_cancel.status_endpoint, status_endpoint);
+    assert_eq!(after_cancel.cancel_endpoint, status_endpoint);
     assert!(!after_cancel.cancel_requested);
     assert_eq!(after_cancel.report.bucket, terminal.report.bucket);
     assert_eq!(after_cancel.report.prefix, terminal.report.prefix);
@@ -972,9 +1033,12 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(after_cancel.report.tier_failure, terminal.report.tier_failure);
     assert_eq!(after_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(after_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
+    assert_eq!(after_cancel.report.continuation_token, terminal.report.continuation_token);
 
     let second_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(second_cancel.status, "partial");
+    assert_eq!(second_cancel.status_endpoint, status_endpoint);
+    assert_eq!(second_cancel.cancel_endpoint, status_endpoint);
     assert!(!second_cancel.cancel_requested);
     assert_eq!(second_cancel.report.scanned, terminal.report.scanned);
     assert_eq!(second_cancel.report.transition_completed, terminal.report.transition_completed);
@@ -982,6 +1046,51 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(second_cancel.report.tier_failure, terminal.report.tier_failure);
     assert_eq!(second_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(second_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
+    assert_eq!(second_cancel.report.continuation_token, terminal.report.continuation_token);
+
+    let status_after_cancel = manual_transition_job_status(&hot, status_endpoint).await?;
+    assert_eq!(status_after_cancel.job_id, job_id);
+    assert_eq!(status_after_cancel.status, second_cancel.status);
+    assert_eq!(status_after_cancel.status_endpoint, status_endpoint);
+    assert_eq!(status_after_cancel.cancel_endpoint, status_endpoint);
+    assert_eq!(status_after_cancel.cancel_requested, second_cancel.cancel_requested);
+    assert_eq!(status_after_cancel.failure_reason, second_cancel.failure_reason);
+    assert_eq!(status_after_cancel.report.bucket, terminal.report.bucket);
+    assert_eq!(status_after_cancel.report.prefix, terminal.report.prefix);
+    assert_eq!(status_after_cancel.report.tier, terminal.report.tier);
+    assert_eq!(status_after_cancel.report.scanned, terminal.report.scanned);
+    assert_eq!(status_after_cancel.report.skipped_not_transition, terminal.report.skipped_not_transition);
+    assert_eq!(status_after_cancel.report.transition_completed, terminal.report.transition_completed);
+    assert_eq!(status_after_cancel.report.transition_failed, terminal.report.transition_failed);
+    assert_eq!(status_after_cancel.report.tier_failure, terminal.report.tier_failure);
+    assert_eq!(status_after_cancel.report.cancelled, terminal.report.cancelled);
+    assert_eq!(status_after_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
+    assert_eq!(status_after_cancel.report.continuation_token, terminal.report.continuation_token);
+
+    let resumed = manual_transition_run_with_max_and_continuation(
+        &hot,
+        MANUAL_ASYNC_LIMIT_BUCKET,
+        MANUAL_ASYNC_LIMIT_PREFIX,
+        false,
+        10,
+        Some(continuation),
+    )
+    .await?;
+    assert_eq!(resumed.state, "completed", "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.mode, "enqueue_only");
+    assert_eq!(resumed.report.bucket, MANUAL_ASYNC_LIMIT_BUCKET);
+    assert_eq!(resumed.report.prefix, MANUAL_ASYNC_LIMIT_PREFIX);
+    assert_eq!(resumed.report.tier.as_deref(), Some(TIER_NAME));
+    assert!(!resumed.report.dry_run);
+    assert_eq!(resumed.report.scanned, 1, "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.report.eligible, 0, "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.report.skipped_not_transition, 1, "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.report.transition_completed, 0);
+    assert_eq!(resumed.report.transition_failed, 0);
+    assert_eq!(resumed.report.tier_failure, 0);
+    assert!(!resumed.report.cancelled);
+    assert!(!resumed.report.truncated_by_limit);
+    assert!(resumed.report.continuation_token.is_none());
     assert_eq!(cold_tier_object_count(&cold_client).await?, before_remote_count);
     Ok(())
 }
@@ -1002,7 +1111,7 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     add_rustfs_tier(&hot, &cold).await?;
 
     hot_client.create_bucket().bucket(MANUAL_ASYNC_CONFLICT_BUCKET).send().await?;
-    for idx in 0..50 {
+    for idx in 0..MANUAL_ASYNC_CONFLICT_OBJECTS {
         let key = format!("{MANUAL_ASYNC_CONFLICT_NESTED_PREFIX}obj-{idx:02}");
         put_single_part_object(&hot_client, MANUAL_ASYNC_CONFLICT_BUCKET, &key, b"async conflict payload").await?;
     }
@@ -1015,22 +1124,15 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     )
     .await?;
 
-    let (first, second) = tokio::join!(
-        manual_transition_async_run_raw(&hot, MANUAL_ASYNC_CONFLICT_BUCKET, MANUAL_ASYNC_CONFLICT_PREFIX, false, 50),
-        manual_transition_async_run_raw(&hot, MANUAL_ASYNC_CONFLICT_BUCKET, MANUAL_ASYNC_CONFLICT_NESTED_PREFIX, false, 50)
-    );
-    let responses = [first?, second?];
-    let accepted = responses
-        .iter()
-        .find(|(status, _)| *status == reqwest::StatusCode::ACCEPTED)
-        .ok_or("one concurrent async run must be accepted")?;
-    let conflict = responses
-        .iter()
-        .find(|(status, _)| *status == reqwest::StatusCode::CONFLICT)
-        .ok_or("one concurrent async run must report conflict")?;
-
-    let accepted: ManualTransitionRunResponse = serde_json::from_str(&accepted.1)?;
-    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict.1)?;
+    let before_remote_count = cold_tier_object_count(&cold_client).await?;
+    let accepted = manual_transition_async_run(
+        &hot,
+        MANUAL_ASYNC_CONFLICT_BUCKET,
+        MANUAL_ASYNC_CONFLICT_PREFIX,
+        false,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+    )
+    .await?;
     let job_id = accepted
         .job_id
         .as_deref()
@@ -1039,9 +1141,30 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
         .status_endpoint
         .as_deref()
         .ok_or("accepted async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("accepted async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.mode, "durable_job");
+    let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
+    assert_eq!(active.job_id, job_id);
+    let (conflict_status, conflict_body) = manual_transition_async_run_raw(
+        &hot,
+        MANUAL_ASYNC_CONFLICT_BUCKET,
+        MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
+        false,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+    )
+    .await?;
+    assert_eq!(
+        conflict_status,
+        reqwest::StatusCode::CONFLICT,
+        "overlapping async run response: {conflict_body}"
+    );
+    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict_body)?;
     assert_eq!(conflict.state, "conflict");
     assert_eq!(conflict.mode, "durable_job");
     assert_eq!(conflict.active_job_id, job_id);
@@ -1054,16 +1177,19 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     assert_eq!(terminal.status, "completed", "terminal conflict winner response: {terminal:#?}");
     assert!(!terminal.report.dry_run);
     assert_eq!(terminal.report.bucket, MANUAL_ASYNC_CONFLICT_BUCKET);
-    assert!(
-        terminal.report.prefix == MANUAL_ASYNC_CONFLICT_PREFIX || terminal.report.prefix == MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
+    assert_eq!(terminal.report.prefix, MANUAL_ASYNC_CONFLICT_PREFIX);
+    assert_eq!(
+        terminal.report.scanned, MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
         "terminal conflict winner response: {terminal:#?}"
     );
-    assert_eq!(terminal.report.scanned, 50, "terminal conflict winner response: {terminal:#?}");
-    assert_eq!(terminal.report.eligible, 50, "terminal conflict winner response: {terminal:#?}");
+    assert_eq!(
+        terminal.report.eligible, MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+        "terminal conflict winner response: {terminal:#?}"
+    );
     assert_eq!(terminal.report.dry_run_eligible, 0, "terminal conflict winner response: {terminal:#?}");
     assert_eq!(
         terminal.report.enqueued + terminal.report.skipped_already_in_flight,
-        50,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
         "terminal conflict winner response: {terminal:#?}"
     );
     assert_eq!(
@@ -1072,7 +1198,9 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     );
     assert_eq!(terminal.report.transition_failed, 0, "terminal conflict winner response: {terminal:#?}");
     assert_eq!(terminal.report.tier_failure, 0, "terminal conflict winner response: {terminal:#?}");
-    assert!(cold_tier_object_count(&cold_client).await? <= 50);
+    let after_remote_count = cold_tier_object_count(&cold_client).await?;
+    assert!(after_remote_count >= before_remote_count);
+    assert!(after_remote_count <= before_remote_count + MANUAL_ASYNC_CONFLICT_OBJECTS);
 
     Ok(())
 }
@@ -1152,6 +1280,11 @@ async fn test_manual_transition_async_same_scope_conflict_reports_active_job() -
         .status_endpoint
         .as_deref()
         .ok_or("accepted same-scope async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("accepted same-scope async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.mode, "durable_job");
@@ -1245,6 +1378,11 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
@@ -1333,6 +1471,11 @@ async fn test_manual_transition_async_worker_failure_reports_terminal_partial() 
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
@@ -1419,36 +1562,29 @@ async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled()
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    assert_eq!(
+        accepted.cancel_endpoint.as_deref(),
+        Some(status_endpoint),
+        "async active-cancel run must return the cancel endpoint used by rc cancel"
+    );
 
-    let start = Instant::now();
-    let active = loop {
-        let status = manual_transition_job_status(&hot, status_endpoint).await?;
-        if status.status == "running" {
-            break status;
-        }
-        assert!(
-            !matches!(status.status.as_str(), "completed" | "partial" | "cancelled" | "failed" | "unknown"),
-            "manual transition job reached terminal state before active cancel could be requested: {status:#?}"
-        );
-        assert!(
-            start.elapsed() < MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT,
-            "manual transition job did not become running before active cancel timeout: {status:#?}"
-        );
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-    };
+    let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
     assert_eq!(active.job_id, job_id);
     assert_eq!(active.status_endpoint, status_endpoint);
+    assert_eq!(active.cancel_endpoint, status_endpoint);
     assert!(!active.cancel_requested);
 
     let cancel_response = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(cancel_response.job_id, job_id);
     assert_eq!(cancel_response.status_endpoint, status_endpoint);
+    assert_eq!(cancel_response.cancel_endpoint, status_endpoint);
     assert_eq!(cancel_response.status, "running", "active cancel response: {cancel_response:#?}");
     assert!(cancel_response.cancel_requested, "active cancel response: {cancel_response:#?}");
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
     assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.cancel_endpoint, status_endpoint);
     assert_eq!(terminal.status, "cancelled", "terminal active cancel response: {terminal:#?}");
     assert!(terminal.cancel_requested);
     assert_eq!(terminal.failure_reason, None);
@@ -1469,6 +1605,35 @@ async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled()
         before_remote_count,
         "active dry-run cancel must not create a remote tier object"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_job_status_cancel_reject_unknown_jobs() -> TestResult {
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+
+    for method in [Method::GET, Method::DELETE] {
+        let (status, body) = signed_admin_request(
+            &hot.url,
+            method.clone(),
+            "/rustfs/admin/v3/ilm/transition/jobs/not-a-uuid",
+            None,
+            &hot.access_key,
+            &hot.secret_key,
+        )
+        .await?;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{method} invalid job id response: {body}");
+        assert!(body.contains("InvalidArgument"), "{method} invalid job id body: {body}");
+
+        let missing_endpoint = "/rustfs/admin/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111";
+        let (status, body) =
+            signed_admin_request(&hot.url, method.clone(), missing_endpoint, None, &hot.access_key, &hot.secret_key).await?;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{method} missing job response: {body}");
+        assert!(body.contains("NoSuchKey"), "{method} missing job body: {body}");
+    }
 
     Ok(())
 }
@@ -1507,6 +1672,7 @@ async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestRe
     assert!(response.get("status").is_none() || response.get("status").is_some_and(|v| v.is_null()));
     assert!(response.get("status_endpoint").is_none() || response.get("status_endpoint").is_some_and(|v| v.is_null()));
     assert!(response.get("cancel").is_none() || response.get("cancel").is_some_and(|v| v.is_null()));
+    assert!(response.get("cancel_endpoint").is_none() || response.get("cancel_endpoint").is_some_and(|v| v.is_null()));
 
     Ok(())
 }

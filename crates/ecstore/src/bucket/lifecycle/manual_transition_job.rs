@@ -31,14 +31,18 @@ use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::store::ECStore;
 
 pub const MANUAL_TRANSITION_JOB_SCHEMA: &str = "rustfs-manual-transition-job-v1";
+pub const MANUAL_TRANSITION_TASK_SCHEMA: &str = "rustfs-manual-transition-task-v1";
 pub const MANUAL_TRANSITION_WORKER_RESULT_SCHEMA: &str = "rustfs-manual-transition-worker-result-v1";
 pub const MANUAL_TRANSITION_JOB_RECORD_PREFIX: &str = "ilm/manual-transition/jobs";
 pub const MANUAL_TRANSITION_SCOPE_RECORD_PREFIX: &str = "ilm/manual-transition/scopes";
+pub const MANUAL_TRANSITION_TASK_PREFIX: &str = "ilm/manual-transition/tasks";
 pub const MANUAL_TRANSITION_WORKER_RESULT_PREFIX: &str = "ilm/manual-transition/results";
 pub const MAX_MANUAL_TRANSITION_JOB_RECORD_SIZE: usize = 64 * 1024;
+pub const MAX_MANUAL_TRANSITION_TASK_RECORD_SIZE: usize = 16 * 1024;
 pub const MAX_MANUAL_TRANSITION_WORKER_RESULT_RECORD_SIZE: usize = 8 * 1024;
 const MANUAL_TRANSITION_JOB_LEASE_SECONDS: i128 = 60;
 const MANUAL_TRANSITION_LEGACY_SCOPE_SCAN_LIMIT: i32 = 1000;
+const MANUAL_TRANSITION_TASK_SCAN_LIMIT: i32 = 1000;
 const MANUAL_TRANSITION_WORKER_RESULT_SCAN_LIMIT: i32 = 1000;
 
 fn is_false(value: &bool) -> bool {
@@ -160,6 +164,21 @@ impl ManualTransitionJobRecord {
         true
     }
 
+    pub fn mark_unknown_for_task_journal_error(
+        &mut self,
+        error: impl Into<String>,
+        queue_snapshot: ManualTransitionQueueSnapshot,
+    ) -> bool {
+        if self.state != ManualTransitionJobState::Running || !self.scan_completed {
+            return false;
+        }
+        self.queue_snapshot = queue_snapshot;
+        self.state = ManualTransitionJobState::Unknown;
+        self.error = Some(format!("manual transition task journal is corrupt: {}", error.into()));
+        self.mark_updated_terminal();
+        true
+    }
+
     pub fn cancel_after_recovery(&mut self, queue_snapshot: ManualTransitionQueueSnapshot) {
         if self.state == ManualTransitionJobState::Running && self.cancel_requested {
             self.scan_completed = true;
@@ -189,11 +208,18 @@ impl ManualTransitionJobRecord {
         self.mark_terminal_if_worker_drained();
     }
 
-    fn apply_worker_result_counts(&mut self, completed: u64, failed: u64, queue_snapshot: ManualTransitionQueueSnapshot) -> bool {
+    fn apply_worker_result_counts(
+        &mut self,
+        completed: u64,
+        failed: u64,
+        task_queued: u64,
+        queue_snapshot: ManualTransitionQueueSnapshot,
+    ) -> bool {
         if self.is_terminal() {
             return false;
         }
-        if completed.saturating_add(failed) > self.report.enqueued {
+        let enqueued = self.report.enqueued.max(task_queued);
+        if completed.saturating_add(failed) > enqueued {
             self.queue_snapshot = queue_snapshot;
             self.state = ManualTransitionJobState::Unknown;
             self.error = Some("manual transition worker result journal exceeds enqueued count".to_string());
@@ -202,10 +228,14 @@ impl ManualTransitionJobRecord {
         }
         let transition_completed = self.report.transition_completed.max(completed);
         let transition_failed = self.report.transition_failed.max(failed);
-        if transition_completed == self.report.transition_completed && transition_failed == self.report.transition_failed {
+        if enqueued == self.report.enqueued
+            && transition_completed == self.report.transition_completed
+            && transition_failed == self.report.transition_failed
+        {
             return false;
         }
         let scan_tier_failure = self.report.tier_failure.saturating_sub(self.report.transition_failed);
+        self.report.enqueued = enqueued;
         self.report.transition_completed = transition_completed;
         self.report.transition_failed = transition_failed;
         self.report.tier_failure = scan_tier_failure.saturating_add(transition_failed);
@@ -413,6 +443,111 @@ impl ManualTransitionJobRecord {
 pub enum ManualTransitionWorkerResult {
     Completed,
     TierFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualTransitionTaskRecord {
+    pub schema: String,
+    pub job_id: Uuid,
+    pub task_key: String,
+    pub bucket: String,
+    pub object: String,
+    pub version_id: Option<Uuid>,
+    pub storage_class: String,
+    pub queued_at_unix_nanos: i128,
+}
+
+impl ManualTransitionTaskRecord {
+    pub fn new(
+        job_id: Uuid,
+        task_key: impl Into<String>,
+        bucket: impl Into<String>,
+        object: impl Into<String>,
+        version_id: Option<Uuid>,
+        storage_class: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: MANUAL_TRANSITION_TASK_SCHEMA.to_string(),
+            job_id,
+            task_key: task_key.into(),
+            bucket: bucket.into(),
+            object: object.into(),
+            version_id,
+            storage_class: storage_class.into(),
+            queued_at_unix_nanos: OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ManualTransitionJobError> {
+        self.validate()?;
+        let record_bytes = serde_json::to_vec(self)?;
+        let content_sha256 = hex_sha256(&record_bytes, ToOwned::to_owned);
+        let persisted = PersistedManualTransitionTaskRecord {
+            schema: MANUAL_TRANSITION_TASK_SCHEMA.to_string(),
+            content_sha256,
+            record: self.clone(),
+        };
+        let encoded = serde_json::to_vec(&persisted)?;
+        if encoded.len() > MAX_MANUAL_TRANSITION_TASK_RECORD_SIZE {
+            return Err(ManualTransitionJobError::Corrupt("encoded task record exceeds maximum size"));
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(expected_job_id: Uuid, expected_task_key: &str, data: &[u8]) -> Result<Self, ManualTransitionJobError> {
+        if data.len() > MAX_MANUAL_TRANSITION_TASK_RECORD_SIZE {
+            return Err(ManualTransitionJobError::Corrupt("encoded task record exceeds maximum size"));
+        }
+        let persisted: PersistedManualTransitionTaskRecord = serde_json::from_slice(data)?;
+        if persisted.schema != MANUAL_TRANSITION_TASK_SCHEMA {
+            return Err(ManualTransitionJobError::UnsupportedSchema(persisted.schema));
+        }
+        if !is_sha256_checksum(&persisted.content_sha256) {
+            return Err(ManualTransitionJobError::Corrupt("task record content checksum is not a sha256 checksum"));
+        }
+        let record = persisted.record;
+        let record_bytes = serde_json::to_vec(&record)?;
+        let actual_checksum = hex_sha256(&record_bytes, ToOwned::to_owned);
+        if persisted.content_sha256 != actual_checksum {
+            return Err(ManualTransitionJobError::ChecksumMismatch);
+        }
+        if record.job_id != expected_job_id {
+            return Err(ManualTransitionJobError::Corrupt("task record job_id does not match record key"));
+        }
+        if record.task_key != expected_task_key {
+            return Err(ManualTransitionJobError::Corrupt("task record task_key does not match record key"));
+        }
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), ManualTransitionJobError> {
+        if self.job_id.is_nil() {
+            return Err(ManualTransitionJobError::Corrupt("task record job_id is nil"));
+        }
+        if !is_sha256_checksum(&self.task_key) {
+            return Err(ManualTransitionJobError::Corrupt("task record task_key is not a sha256 checksum"));
+        }
+        if self.bucket.is_empty() {
+            return Err(ManualTransitionJobError::Corrupt("task record bucket is empty"));
+        }
+        if self.object.is_empty() {
+            return Err(ManualTransitionJobError::Corrupt("task record object is empty"));
+        }
+        if self.storage_class.trim().is_empty() {
+            return Err(ManualTransitionJobError::Corrupt("task record storage_class is empty"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedManualTransitionTaskRecord {
+    schema: String,
+    content_sha256: String,
+    record: ManualTransitionTaskRecord,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -661,6 +796,17 @@ pub fn manual_transition_worker_result_object_prefix(job_id: Uuid) -> Result<Str
     manual_transition_job_sharded_prefix(MANUAL_TRANSITION_WORKER_RESULT_PREFIX, job_id)
 }
 
+pub fn manual_transition_task_object_prefix(job_id: Uuid) -> Result<String, ManualTransitionJobError> {
+    manual_transition_job_sharded_prefix(MANUAL_TRANSITION_TASK_PREFIX, job_id)
+}
+
+pub fn manual_transition_task_object_name(job_id: Uuid, task_key: &str) -> Result<String, ManualTransitionJobError> {
+    if !is_sha256_checksum(task_key) {
+        return Err(ManualTransitionJobError::Corrupt("task record task_key is not a sha256 checksum"));
+    }
+    Ok(format!("{}/{}.json", manual_transition_task_object_prefix(job_id)?, task_key))
+}
+
 pub fn manual_transition_worker_result_object_name(job_id: Uuid, task_key: &str) -> Result<String, ManualTransitionJobError> {
     if !is_sha256_checksum(task_key) {
         return Err(ManualTransitionJobError::Corrupt("worker result task_key is not a sha256 checksum"));
@@ -683,6 +829,22 @@ fn manual_transition_worker_result_task_key_from_object_name(
         .ok_or(ManualTransitionJobError::Corrupt("worker result suffix is invalid"))?;
     if task_key.contains('/') || !is_sha256_checksum(task_key) {
         return Err(ManualTransitionJobError::Corrupt("worker result task_key is invalid"));
+    }
+    Ok(task_key.to_string())
+}
+
+fn manual_transition_task_key_from_object_name(job_id: Uuid, object_name: &str) -> Result<String, ManualTransitionJobError> {
+    let prefix = manual_transition_task_object_prefix(job_id)?;
+    let rest = object_name
+        .strip_prefix(&prefix)
+        .ok_or(ManualTransitionJobError::Corrupt("task record object prefix is invalid"))?
+        .strip_prefix('/')
+        .ok_or(ManualTransitionJobError::Corrupt("task record object path is invalid"))?;
+    let task_key = rest
+        .strip_suffix(".json")
+        .ok_or(ManualTransitionJobError::Corrupt("task record suffix is invalid"))?;
+    if task_key.contains('/') || !is_sha256_checksum(task_key) {
+        return Err(ManualTransitionJobError::Corrupt("task record task_key is invalid"));
     }
     Ok(task_key.to_string())
 }
@@ -812,6 +974,97 @@ pub(crate) async fn save_manual_transition_worker_result_if_absent(
     }
 }
 
+pub(crate) async fn save_manual_transition_task_if_absent(
+    api: Arc<ECStore>,
+    record: &ManualTransitionTaskRecord,
+) -> EcstoreResult<bool> {
+    let object =
+        manual_transition_task_object_name(record.job_id, &record.task_key).map_err(manual_transition_job_store_error)?;
+    let data = record.encode().map_err(manual_transition_job_store_error)?;
+    match config_boundary::save_config_with_opts(
+        api,
+        &object,
+        data,
+        &ObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(Error::PreconditionFailed) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn load_manual_transition_task_record(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    task_key: &str,
+) -> EcstoreResult<ManualTransitionTaskRecord> {
+    let object = manual_transition_task_object_name(job_id, task_key).map_err(manual_transition_job_store_error)?;
+    let data = config_boundary::read_config(api, &object).await?;
+    ManualTransitionTaskRecord::decode(job_id, task_key, &data).map_err(manual_transition_job_store_error)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ManualTransitionTaskJournalStats {
+    queued: u64,
+}
+
+enum ManualTransitionTaskJournal {
+    Stats(ManualTransitionTaskJournalStats),
+    Corrupt(String),
+}
+
+async fn scan_manual_transition_task_journal(api: Arc<ECStore>, job_id: Uuid) -> EcstoreResult<ManualTransitionTaskJournal> {
+    let prefix = manual_transition_task_object_prefix(job_id).map_err(manual_transition_job_store_error)?;
+    let mut marker = None;
+    let mut stats = ManualTransitionTaskJournalStats::default();
+    loop {
+        let page = api
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                &prefix,
+                marker,
+                None,
+                MANUAL_TRANSITION_TASK_SCAN_LIMIT,
+                false,
+                None,
+                false,
+            )
+            .await?;
+        for object in page.objects {
+            let task_key = match manual_transition_task_key_from_object_name(job_id, &object.name) {
+                Ok(task_key) => task_key,
+                Err(err) => return Ok(ManualTransitionTaskJournal::Corrupt(err.to_string())),
+            };
+            let object_name = manual_transition_task_object_name(job_id, &task_key).map_err(manual_transition_job_store_error)?;
+            let data = match config_boundary::read_config(api.clone(), &object_name).await {
+                Ok(data) => data,
+                Err(err) => return Err(err),
+            };
+            if let Err(err) = ManualTransitionTaskRecord::decode(job_id, &task_key, &data) {
+                return Ok(ManualTransitionTaskJournal::Corrupt(err.to_string()));
+            }
+            stats.queued = stats.queued.saturating_add(1);
+        }
+        if !page.is_truncated {
+            return Ok(ManualTransitionTaskJournal::Stats(stats));
+        }
+        let Some(next_marker) = page.next_continuation_token else {
+            return Err(Error::other("manual transition task journal page is truncated without a next marker"));
+        };
+        marker = Some(next_marker);
+    }
+}
+
 pub async fn load_manual_transition_worker_result_stats(
     api: Arc<ECStore>,
     job_id: Uuid,
@@ -880,6 +1133,12 @@ pub async fn reconcile_manual_transition_worker_results(
     job_id: Uuid,
     queue_snapshot: ManualTransitionQueueSnapshot,
 ) -> EcstoreResult<ManualTransitionJobRecord> {
+    let task_stats = match scan_manual_transition_task_journal(api.clone(), job_id).await? {
+        ManualTransitionTaskJournal::Stats(stats) => stats,
+        ManualTransitionTaskJournal::Corrupt(error) => {
+            return mark_manual_transition_job_unknown_for_task_journal_error(api, job_id, error, queue_snapshot).await;
+        }
+    };
     let stats = match scan_manual_transition_worker_result_journal(api.clone(), job_id).await? {
         ManualTransitionWorkerResultJournal::Stats(stats) => stats,
         ManualTransitionWorkerResultJournal::Corrupt(error) => {
@@ -888,7 +1147,7 @@ pub async fn reconcile_manual_transition_worker_results(
     };
     for _ in 0..4 {
         let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
-        let changed = record.apply_worker_result_counts(stats.completed, stats.failed, queue_snapshot);
+        let changed = record.apply_worker_result_counts(stats.completed, stats.failed, task_stats.queued, queue_snapshot);
         if !changed {
             return Ok(record);
         }
@@ -905,6 +1164,30 @@ pub async fn reconcile_manual_transition_worker_results(
                 } else {
                     renew_manual_transition_scope_admission_from_job(api, &record).await?;
                 }
+                return Ok(record);
+            }
+            Err(Error::PreconditionFailed) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Error::PreconditionFailed)
+}
+
+async fn mark_manual_transition_job_unknown_for_task_journal_error(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    error: String,
+    queue_snapshot: ManualTransitionQueueSnapshot,
+) -> EcstoreResult<ManualTransitionJobRecord> {
+    for _ in 0..4 {
+        let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
+        if !record.mark_unknown_for_task_journal_error(error.clone(), queue_snapshot) {
+            return Ok(record);
+        }
+        match save_manual_transition_job_record_if_current(api.clone(), &record, &etag).await {
+            Ok(()) => {
+                delete_manual_transition_scope_admission_if_current(api, &record.scope_key, record.job_id, record.lease_id)
+                    .await?;
                 return Ok(record);
             }
             Err(Error::PreconditionFailed) => continue,
@@ -1199,11 +1482,7 @@ pub async fn renew_manual_transition_job_lease(
 ) -> EcstoreResult<ManualTransitionJobRecord> {
     let (mut record, mut etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
     if record.state == ManualTransitionJobState::Running {
-        if record.scan_completed
-            && record.report.worker_transition_pending()
-            && queue_snapshot.queued == 0
-            && queue_snapshot.active == 0
-        {
+        if record.scan_completed && queue_snapshot.queued == 0 && queue_snapshot.active == 0 {
             record = reconcile_manual_transition_worker_results(api.clone(), job_id, queue_snapshot).await?;
             if record.is_terminal() || !record.report.worker_transition_pending() {
                 return Ok(record);
@@ -1427,6 +1706,88 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_unknown_checkpoint_persists_counters_and_cursor() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            max_objects: Some(5),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.update_running_progress(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                scanned: 5,
+                eligible: 4,
+                enqueued: 3,
+                skipped_queue_full: 2,
+                skipped_queue_timeout: 1,
+                tier_failure: 1,
+                truncated_by_limit: true,
+                continuation_token: Some("opaque-page-token".to_string()),
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot {
+                queue_capacity: 8,
+                queued: 3,
+                active: 2,
+                workers: 4,
+                queue_full: 2,
+                queue_send_timeout: 1,
+                ..Default::default()
+            },
+        );
+        record.record_worker_result(
+            ManualTransitionWorkerResult::TierFailure,
+            ManualTransitionQueueSnapshot {
+                queue_capacity: 8,
+                queued: 2,
+                active: 1,
+                workers: 4,
+                queue_full: 2,
+                queue_send_timeout: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(record.mark_unknown_if_recovery_would_skip_pending_page(ManualTransitionQueueSnapshot {
+            queue_capacity: 8,
+            workers: 4,
+            queue_full: 2,
+            queue_send_timeout: 1,
+            ..Default::default()
+        }));
+        let encoded = record.encode().expect("unknown checkpoint should encode");
+        let decoded = ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("unknown checkpoint should decode");
+
+        assert_eq!(decoded.state, ManualTransitionJobState::Unknown);
+        assert!(decoded.is_terminal());
+        assert!(decoded.completed_at_unix_nanos.is_some());
+        assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-page-token"));
+        assert!(decoded.report.was_truncated());
+        assert!(decoded.report.has_partial_enqueue());
+        assert_eq!(decoded.report.scanned, 5);
+        assert_eq!(decoded.report.eligible, 4);
+        assert_eq!(decoded.report.enqueued, 3);
+        assert_eq!(decoded.report.skipped_queue_full, 2);
+        assert_eq!(decoded.report.skipped_queue_timeout, 1);
+        assert_eq!(decoded.report.transition_failed, 1);
+        assert_eq!(decoded.report.tier_failure, 2);
+        assert_eq!(decoded.queue_snapshot.queue_capacity, 8);
+        assert_eq!(decoded.queue_snapshot.workers, 4);
+        assert_eq!(decoded.queue_snapshot.queue_full, 2);
+        assert_eq!(decoded.queue_snapshot.queue_send_timeout, 1);
+        assert!(
+            decoded
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("page/task journal"))
+        );
+    }
+
+    #[test]
     fn manual_transition_job_marks_unknown_when_worker_results_are_lost() {
         let options = ManualTransitionRunOptions::default();
         let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
@@ -1589,6 +1950,22 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_task_record_rejects_checksum_drift() {
+        let job_id = Uuid::new_v4();
+        let task_key = manual_transition_worker_result_task_key("bucket", "logs/a", Some(Uuid::new_v4()));
+        let record = ManualTransitionTaskRecord::new(job_id, &task_key, "bucket", "logs/a", Some(Uuid::new_v4()), "WARM");
+        let encoded = record.encode().expect("task record should encode");
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).expect("encoded task record should be json");
+        value["record"]["storage_class"] = serde_json::Value::String("COLD".to_string());
+        let mutated = serde_json::to_vec(&value).expect("mutated task record should encode");
+
+        let err =
+            ManualTransitionTaskRecord::decode(job_id, &task_key, &mutated).expect_err("task checksum drift must fail closed");
+
+        assert!(matches!(err, ManualTransitionJobError::ChecksumMismatch));
+    }
+
+    #[test]
     fn manual_transition_job_record_rejects_unknown_report_fields() {
         let options = ManualTransitionRunOptions::default();
         let record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
@@ -1618,6 +1995,26 @@ mod tests {
         assert!(record.completed_at_unix_nanos.is_some());
         assert!(
             record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown after restart"))
+        );
+    }
+
+    #[test]
+    fn manual_transition_job_record_persists_restart_unknown_state() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.mark_unknown_if_unowned();
+
+        let encoded = record.encode().expect("unknown restart job should encode");
+        let decoded = ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("unknown restart job should decode");
+
+        assert_eq!(decoded.state, ManualTransitionJobState::Unknown);
+        assert!(decoded.is_terminal());
+        assert!(decoded.completed_at_unix_nanos.is_some());
+        assert!(
+            decoded
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("unknown after restart"))
@@ -1741,10 +2138,19 @@ mod tests {
                 ..Default::default()
             },
         );
+        let other_bucket = manual_transition_scope_key(
+            "bucket-b",
+            &ManualTransitionRunOptions {
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(broad, nested);
         assert_eq!(broad, disjoint);
         assert_ne!(broad, dry_run);
+        assert_ne!(broad, other_bucket);
     }
 
     #[test]

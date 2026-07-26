@@ -78,3 +78,133 @@ fn manual_transition_record_persists_combined_tier_and_queue_failures_as_partial
     assert!(decoded.completed_at_unix_nanos.is_some());
     assert!(decoded.error.is_none());
 }
+
+#[test]
+fn manual_transition_record_marks_unknown_when_cursor_would_skip_pending_page() {
+    let options = ManualTransitionRunOptions {
+        prefix: "logs/".to_string(),
+        tier: Some("WARM".to_string()),
+        ..Default::default()
+    };
+    let job_id = Uuid::new_v4();
+    let mut record = ManualTransitionJobRecord::new(job_id, "manual-pending-page-bucket", &options, "owner-a");
+    record.report = ManualTransitionRunReport {
+        bucket: "manual-pending-page-bucket".to_string(),
+        prefix: options.prefix.clone(),
+        tier: options.tier,
+        scanned: 1000,
+        eligible: 2,
+        enqueued: 2,
+        transition_completed: 1,
+        continuation_token: Some("opaque-page-cursor".to_string()),
+        ..Default::default()
+    };
+
+    let marked = record.mark_unknown_if_recovery_would_skip_pending_page(ManualTransitionQueueSnapshot::default());
+
+    assert!(marked);
+    assert_eq!(record.state, ManualTransitionJobState::Unknown);
+    assert!(record.is_terminal());
+    assert_eq!(record.queue_snapshot, ManualTransitionQueueSnapshot::default());
+    assert!(
+        record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("page/task journal is missing"))
+    );
+
+    let encoded = record.encode().expect("pending-page unknown state should encode");
+    let decoded = ManualTransitionJobRecord::decode(job_id, &encoded).expect("pending-page unknown state should decode");
+    assert_eq!(decoded.state, ManualTransitionJobState::Unknown);
+    assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-page-cursor"));
+    assert_eq!(decoded.report.enqueued, 2);
+    assert_eq!(decoded.report.transition_completed, 1);
+    assert!(decoded.completed_at_unix_nanos.is_some());
+}
+
+#[test]
+fn manual_transition_record_keeps_running_when_pending_task_journal_remains() {
+    let options = ManualTransitionRunOptions {
+        prefix: "logs/".to_string(),
+        tier: Some("WARM".to_string()),
+        ..Default::default()
+    };
+    let job_id = Uuid::new_v4();
+    let mut record = ManualTransitionJobRecord::new(job_id, "manual-pending-task-bucket", &options, "owner-a");
+    record.report = ManualTransitionRunReport {
+        bucket: "manual-pending-task-bucket".to_string(),
+        prefix: options.prefix.clone(),
+        tier: options.tier,
+        scanned: 1000,
+        eligible: 2,
+        enqueued: 2,
+        transition_completed: 1,
+        continuation_token: Some("opaque-page-cursor".to_string()),
+        ..Default::default()
+    };
+    let queue_snapshot = ManualTransitionQueueSnapshot {
+        queued: 1,
+        active: 1,
+        workers: 2,
+        ..Default::default()
+    };
+
+    let marked = record.mark_unknown_if_recovery_would_skip_pending_page(queue_snapshot);
+
+    assert!(!marked);
+    assert_eq!(record.state, ManualTransitionJobState::Running);
+    assert!(!record.is_terminal());
+    assert!(record.completed_at_unix_nanos.is_none());
+    assert!(record.error.is_none());
+}
+
+#[test]
+fn manual_transition_record_marks_unknown_when_worker_result_is_lost_after_drain() {
+    let options = ManualTransitionRunOptions {
+        prefix: "logs/".to_string(),
+        tier: Some("WARM".to_string()),
+        ..Default::default()
+    };
+    let job_id = Uuid::new_v4();
+    let mut record = ManualTransitionJobRecord::new(job_id, "manual-lost-worker-result-bucket", &options, "owner-a");
+    record.complete(
+        ManualTransitionRunReport {
+            bucket: "manual-lost-worker-result-bucket".to_string(),
+            prefix: options.prefix.clone(),
+            tier: options.tier,
+            scanned: 2,
+            eligible: 2,
+            enqueued: 2,
+            ..Default::default()
+        },
+        ManualTransitionQueueSnapshot {
+            queued: 1,
+            workers: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(record.state, ManualTransitionJobState::Running);
+    assert!(record.scan_completed);
+
+    let marked = record.mark_unknown_if_worker_results_lost(ManualTransitionQueueSnapshot::default());
+
+    assert!(marked);
+    assert_eq!(record.state, ManualTransitionJobState::Unknown);
+    assert!(record.is_terminal());
+    assert_eq!(record.report.enqueued, 2);
+    assert_eq!(record.report.transition_completed, 0);
+    assert_eq!(record.queue_snapshot, ManualTransitionQueueSnapshot::default());
+    assert!(
+        record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("worker result was not persisted"))
+    );
+
+    let encoded = record.encode().expect("lost-worker-result unknown state should encode");
+    let decoded = ManualTransitionJobRecord::decode(job_id, &encoded).expect("lost-worker-result unknown state should decode");
+    assert_eq!(decoded.state, ManualTransitionJobState::Unknown);
+    assert_eq!(decoded.report.enqueued, 2);
+    assert_eq!(decoded.report.transition_completed, 0);
+    assert!(decoded.completed_at_unix_nanos.is_some());
+}

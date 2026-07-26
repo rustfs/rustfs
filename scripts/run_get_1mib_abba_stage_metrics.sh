@@ -47,6 +47,7 @@ DIAGNOSTIC_OBS_METRIC_ENDPOINT="${RUSTFS_OBS_METRIC_ENDPOINT:-}"
 DIAGNOSTIC_OBS_METER_INTERVAL="${RUSTFS_OBS_METER_INTERVAL:-1}"
 DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="${RUSTFS_OBS_SERVICE_NAME:-RustFS-get-1mib-abba}"
 RESOURCE_SAMPLE_INTERVAL_SECS="${RUSTFS_GET_BENCH_RESOURCE_SAMPLE_INTERVAL_SECS:-5}"
+COMPRESSED_FALLBACK_PROBE=false
 HEALTH_TIMEOUT_SECS=60
 SKIP_BUILD=false
 DRY_RUN=false
@@ -103,6 +104,8 @@ Diagnostics:
                                           (default: <obs-endpoint>/v1/metrics)
   --diagnostic-obs-meter-interval <secs>
   --diagnostic-obs-service-name-prefix <name>
+  --compressed-fallback-probe    Forward the disk-compressed object fallback
+                                 probe to the underlying smoke runner
 
 Binary/options:
   --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
@@ -166,6 +169,7 @@ while [[ $# -gt 0 ]]; do
     --diagnostic-obs-metric-endpoint) DIAGNOSTIC_OBS_METRIC_ENDPOINT="$2"; shift 2 ;;
     --diagnostic-obs-meter-interval) DIAGNOSTIC_OBS_METER_INTERVAL="$2"; shift 2 ;;
     --diagnostic-obs-service-name-prefix) DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="$2"; shift 2 ;;
+    --compressed-fallback-probe) COMPRESSED_FALLBACK_PROBE=true; shift ;;
     --rustfs-bin) RUSTFS_BIN="$2"; shift 2 ;;
     --warp-bin) WARP_BIN="$2"; shift 2 ;;
     --python-bin) PYTHON_BIN="$2"; shift 2 ;;
@@ -276,6 +280,7 @@ diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
 diagnostic_obs_endpoint=${DIAGNOSTIC_OBS_ENDPOINT}
 diagnostic_obs_metric_endpoint=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
 diagnostic_obs_meter_interval=${DIAGNOSTIC_OBS_METER_INTERVAL}
+compressed_fallback_probe=${COMPRESSED_FALLBACK_PROBE}
 stage_metrics_artifacts=service_metrics_summary.csv,service_metrics_round_summary.csv,service_metrics_stage_distribution.csv,service_metrics_round_percentiles.csv
 body_header_parity_artifacts=compat_summary.csv,response_headers_legacy.json,response_headers_codec_legacy.json,body_sha256_legacy.txt,body_sha256_codec_legacy.txt
 performance_conclusion=not_encoded_by_harness_collect_raw_abba_stage_metrics_first
@@ -365,6 +370,9 @@ run_cell() {
   fi
   if [[ "$WARP_WARMUP_GET_BEFORE_BENCH" == "true" ]]; then
     cmd+=(--warp-warmup-get-before-bench)
+  fi
+  if [[ "$COMPRESSED_FALLBACK_PROBE" == "true" ]]; then
+    cmd+=(--compressed-fallback-probe)
   fi
   if [[ "$SKIP_BUILD" == "true" ]]; then
     cmd+=(--skip-build)
