@@ -7392,6 +7392,53 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_record_closed_and_timeout_reports_are_partial() {
+        let options = ManualTransitionRunOptions::default();
+
+        for (bucket, outcome, skipped_queue_closed, skipped_queue_timeout, queue_snapshot) in [
+            (
+                "manual-queue-closed-bucket",
+                TransitionEnqueueOutcome::QueueClosed,
+                1,
+                0,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 1,
+                    workers: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "manual-queue-timeout-bucket",
+                TransitionEnqueueOutcome::QueueSendTimedOut,
+                0,
+                1,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 1,
+                    workers: 1,
+                    queue_send_timeout: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut report = ManualTransitionRunReport::new(bucket, &options);
+            report.record_enqueue_outcome(outcome);
+            assert!(report.has_partial_enqueue());
+
+            let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), bucket, &options, "owner");
+            record.complete(report, queue_snapshot);
+
+            assert_eq!(record.state, ManualTransitionJobState::Partial);
+            assert_eq!(record.report.enqueued, 0);
+            assert_eq!(record.report.skipped_queue_full, 0);
+            assert_eq!(record.report.skipped_queue_closed, skipped_queue_closed);
+            assert_eq!(record.report.skipped_queue_timeout, skipped_queue_timeout);
+            assert_eq!(record.queue_snapshot.queue_send_timeout, queue_snapshot.queue_send_timeout);
+            assert!(record.completed_at_unix_nanos.is_some());
+            assert!(record.error.is_none());
+        }
+    }
+
+    #[test]
     fn manual_transition_version_marker_preserves_null_version_cursor() {
         let null_version = ObjectInfo {
             version_id: None,
