@@ -141,6 +141,17 @@ impl ManualTransitionJobRecord {
         self.mark_updated_terminal();
     }
 
+    pub fn cancel_after_recovery(&mut self, queue_snapshot: ManualTransitionQueueSnapshot) {
+        if self.state == ManualTransitionJobState::Running && self.cancel_requested {
+            self.scan_completed = true;
+            self.report.cancelled = true;
+            self.queue_snapshot = queue_snapshot;
+            self.error = None;
+            self.state = ManualTransitionJobState::Cancelled;
+            self.mark_updated_terminal();
+        }
+    }
+
     pub fn record_worker_result(&mut self, result: ManualTransitionWorkerResult, queue_snapshot: ManualTransitionQueueSnapshot) {
         if self.is_terminal() {
             return;
@@ -209,6 +220,23 @@ impl ManualTransitionJobRecord {
         self.queue_snapshot = queue_snapshot;
         self.state = ManualTransitionJobState::Unknown;
         self.error = Some("manual transition worker result was not persisted before the transition queue drained".to_string());
+        self.mark_updated_terminal();
+        true
+    }
+
+    pub fn mark_unknown_if_recovery_would_skip_pending_page(&mut self, queue_snapshot: ManualTransitionQueueSnapshot) -> bool {
+        if self.state != ManualTransitionJobState::Running
+            || self.report.continuation_token.is_none()
+            || !self.report.worker_transition_pending()
+            || queue_snapshot.queued > 0
+            || queue_snapshot.active > 0
+        {
+            return false;
+        }
+        self.queue_snapshot = queue_snapshot;
+        self.state = ManualTransitionJobState::Unknown;
+        self.error =
+            Some("manual transition page/task journal is missing for pending work before the durable cursor".to_string());
         self.mark_updated_terminal();
         true
     }
@@ -838,15 +866,16 @@ pub async fn delete_manual_transition_scope_admission_if_current(
     job_id: Uuid,
     lease_id: Uuid,
 ) -> EcstoreResult<bool> {
-    match load_manual_transition_scope_admission(api.clone(), scope_key).await {
-        Ok(admission) if admission.job_id == job_id && admission.lease_id == lease_id => {}
+    let etag = match load_manual_transition_scope_admission_with_etag(api.clone(), scope_key).await {
+        Ok((admission, etag)) if admission.job_id == job_id && admission.lease_id == lease_id => etag,
         Ok(_) => return Ok(false),
         Err(Error::ConfigNotFound) => return Ok(true),
         Err(err) => return Err(err),
-    }
+    };
     let object = manual_transition_scope_record_object_name(scope_key).map_err(manual_transition_job_store_error)?;
-    match config_boundary::delete_config(api, &object).await {
+    match config_boundary::delete_config_if_match(api, &object, &etag).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(true),
+        Err(Error::PreconditionFailed) => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -962,6 +991,22 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_cancel_recovery_finishes_after_worker_drain() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.report.enqueued = 2;
+        record.report.transition_completed = 2;
+        record.mark_cancel_requested();
+
+        record.cancel_after_recovery(ManualTransitionQueueSnapshot::default());
+
+        assert_eq!(record.state, ManualTransitionJobState::Cancelled);
+        assert!(record.report.cancelled);
+        assert_eq!(record.report.enqueued, 2);
+        assert_eq!(record.report.transition_completed, 2);
+    }
+
+    #[test]
     fn manual_transition_job_record_decode_normalizes_legacy_cancelled_report() {
         let options = ManualTransitionRunOptions::default();
         let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
@@ -1028,6 +1073,30 @@ mod tests {
         assert!(record.mark_unknown_if_worker_results_lost(ManualTransitionQueueSnapshot::default()));
         assert_eq!(record.state, ManualTransitionJobState::Unknown);
         assert!(record.error.as_deref().is_some_and(|err| err.contains("worker result")));
+        assert!(record.completed_at_unix_nanos.is_some());
+    }
+
+    #[test]
+    fn manual_transition_job_marks_unknown_when_recovery_would_skip_pending_page() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.report.enqueued = 2;
+        record.report.transition_completed = 1;
+
+        assert!(!record.mark_unknown_if_recovery_would_skip_pending_page(ManualTransitionQueueSnapshot {
+            queued: 1,
+            ..Default::default()
+        }));
+
+        record.report.continuation_token = Some("opaque".to_string());
+        assert!(!record.mark_unknown_if_recovery_would_skip_pending_page(ManualTransitionQueueSnapshot {
+            active: 1,
+            ..Default::default()
+        }));
+
+        assert!(record.mark_unknown_if_recovery_would_skip_pending_page(ManualTransitionQueueSnapshot::default()));
+        assert_eq!(record.state, ManualTransitionJobState::Unknown);
+        assert!(record.error.as_deref().is_some_and(|err| err.contains("page/task journal")));
         assert!(record.completed_at_unix_nanos.is_some());
     }
 
