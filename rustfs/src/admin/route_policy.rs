@@ -413,6 +413,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/scanner/status", SERVER_INFO, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/expiry/status",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
@@ -1810,6 +1816,12 @@ mod tests {
         ] {
             assert_not_action(method, path, SERVER_INFO);
         }
+    }
+
+    #[test]
+    fn route_policy_allows_server_info_for_ilm_expiry_status() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SET_TIER);
     }
 
     #[test]

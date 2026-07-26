@@ -22,7 +22,7 @@ use chrono::Utc;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_common::metrics::ScannerMetricsReport;
+use rustfs_common::metrics::{ScannerLifecycleExpirySnapshot, ScannerMaintenanceControlSnapshot, ScannerMetricsReport};
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
@@ -47,6 +47,17 @@ struct ScannerFreshnessStatus {
     last_cycle_end_unix_secs: u64,
     max_expected_age_seconds: u64,
     reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct IlmExpiryStatusResponse {
+    enabled: bool,
+    disabled_reason: Option<String>,
+    freshness: ScannerFreshnessStatus,
+    lifecycle_expiry: ScannerLifecycleExpirySnapshot,
+    maintenance_control: ScannerMaintenanceControlSnapshot,
+    current_cycle_lifecycle_expiry_actions: u64,
+    last_cycle_lifecycle_expiry_actions: u64,
 }
 
 fn scanner_disabled_reason(enabled: bool) -> Option<String> {
@@ -110,11 +121,34 @@ fn scanner_status_response(
     }
 }
 
+fn ilm_expiry_status_response(
+    enabled: bool,
+    metrics: ScannerMetricsReport,
+    runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
+    cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
+) -> IlmExpiryStatusResponse {
+    let freshness = scanner_freshness_status(&metrics, &runtime_config, cycle_schedule.effective_interval_seconds());
+    IlmExpiryStatusResponse {
+        enabled,
+        disabled_reason: scanner_disabled_reason(enabled),
+        freshness,
+        lifecycle_expiry: metrics.lifecycle_expiry,
+        maintenance_control: metrics.maintenance_control,
+        current_cycle_lifecycle_expiry_actions: metrics.current_cycle_lifecycle_expiry_actions,
+        last_cycle_lifecycle_expiry_actions: metrics.last_cycle_lifecycle_expiry_actions,
+    }
+}
+
 pub fn register_scanner_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::GET,
         format!("{ADMIN_PREFIX}/v3/scanner/status").as_str(),
         AdminOperation(&ScannerStatusHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}/v3/ilm/expiry/status").as_str(),
+        AdminOperation(&IlmExpiryStatusHandler {}),
     )?;
 
     Ok(())
@@ -166,6 +200,25 @@ impl Operation for ScannerStatusHandler {
         let response = scanner_status_response(enabled, metrics, runtime_config, cycle_schedule);
         let body = serde_json::to_vec(&response).map_err(|err| {
             S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode scanner status: {err}"))
+        })?;
+
+        json_response(body)
+    }
+}
+
+pub struct IlmExpiryStatusHandler {}
+
+#[async_trait::async_trait]
+impl Operation for IlmExpiryStatusHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let _cred = validate_scanner_status_request(&req).await?;
+        let enabled = scanner_enabled_from_env();
+        let metrics = current_scanner_metrics_report().await;
+        let runtime_config = rustfs_scanner::scanner_runtime_config_status();
+        let cycle_schedule = rustfs_scanner::scanner_cycle_schedule_status();
+        let response = ilm_expiry_status_response(enabled, metrics, runtime_config, cycle_schedule);
+        let body = serde_json::to_vec(&response).map_err(|err| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode ILM expiry status: {err}"))
         })?;
 
         json_response(body)
@@ -243,5 +296,45 @@ mod tests {
         assert_eq!(encoded["cycle_schedule"]["effective_interval_seconds"], 0);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_enabled"], false);
         assert_eq!(encoded["cycle_schedule"]["clean_idle_backoff_multiplier"], 1);
+    }
+
+    #[test]
+    fn ilm_expiry_status_serializes_lifecycle_expiry_contract() {
+        let metrics = ScannerMetricsReport {
+            lifecycle_expiry: ScannerLifecycleExpirySnapshot {
+                current_queue_capacity: 32,
+                current_queued: 7,
+                current_active: 2,
+                current_workers: 4,
+                queue_missed: 3,
+                scanner_queued: 17,
+                scanner_missed: 5,
+                scanner_blocked: 11,
+                scanner_not_enqueued: 13,
+                delete_failed: 19,
+            },
+            maintenance_control: ScannerMaintenanceControlSnapshot {
+                primary_control: "expiry_backlog".to_string(),
+                ..Default::default()
+            },
+            current_cycle_lifecycle_expiry_actions: 23,
+            last_cycle_lifecycle_expiry_actions: 29,
+            ..Default::default()
+        };
+        let response = ilm_expiry_status_response(
+            true,
+            metrics,
+            rustfs_scanner::scanner_runtime_config_status(),
+            rustfs_scanner::ScannerCycleScheduleStatus::default(),
+        );
+
+        let encoded = serde_json::to_value(response).expect("ILM expiry status should serialize");
+        assert_eq!(encoded["lifecycle_expiry"]["current_queue_capacity"].as_u64(), Some(32));
+        assert_eq!(encoded["lifecycle_expiry"]["scanner_blocked"].as_u64(), Some(11));
+        assert_eq!(encoded["lifecycle_expiry"]["scanner_not_enqueued"].as_u64(), Some(13));
+        assert_eq!(encoded["lifecycle_expiry"]["delete_failed"].as_u64(), Some(19));
+        assert_eq!(encoded["maintenance_control"]["primary_control"].as_str(), Some("expiry_backlog"));
+        assert_eq!(encoded["current_cycle_lifecycle_expiry_actions"].as_u64(), Some(23));
+        assert_eq!(encoded["last_cycle_lifecycle_expiry_actions"].as_u64(), Some(29));
     }
 }
