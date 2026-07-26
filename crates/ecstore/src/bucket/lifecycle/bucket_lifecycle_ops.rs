@@ -8622,11 +8622,30 @@ mod tests {
         assert_eq!(active.scope_key, legacy.scope_key);
         assert!(
             matches!(
-                load_manual_transition_scope_admission(ecstore, &new_record.scope_key).await,
+                load_manual_transition_scope_admission(ecstore.clone(), &new_record.scope_key).await,
                 Err(Error::ConfigNotFound)
             ),
             "conflicted bucket-level admission must be released"
         );
+
+        let other_bucket_record =
+            ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-legacy-scope-other-bucket", &legacy_options, "new-owner");
+        save_manual_transition_job_record(ecstore.clone(), &other_bucket_record)
+            .await
+            .expect("other bucket job record should save");
+
+        let other_bucket_claim = claim_manual_transition_scope_admission(
+            ecstore.clone(),
+            &ManualTransitionScopeAdmission::from_job(&other_bucket_record),
+        )
+        .await
+        .expect("cross-bucket admission claim should resolve");
+
+        assert_eq!(other_bucket_claim, ManualTransitionScopeAdmissionClaim::Claimed);
+        let current = load_manual_transition_scope_admission(ecstore, &other_bucket_record.scope_key)
+            .await
+            .expect("other bucket admission should be saved");
+        assert_eq!(current.job_id, other_bucket_record.job_id);
     }
 
     #[tokio::test]
