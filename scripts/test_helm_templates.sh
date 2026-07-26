@@ -201,7 +201,7 @@ command -v yq >/dev/null 2>&1 || { echo "yq is required for extra-volumes struct
 assert_extra_volumes_wired() {
   local output="$1" label="$2"
 
-  if ! yq eval '.spec.template.spec.volumes[].name' - <<<"$output" | grep -q "^ca-bundle$"; then
+  if ! yq eval '.spec.template.spec.volumes[].name' - <<<"$output" | grep "^ca-bundle$" >/dev/null; then
     echo "ca-bundle not found in spec.template.spec.volumes of $label" >&2
     exit 1
   fi
@@ -213,7 +213,7 @@ assert_extra_volumes_wired() {
     exit 1
   fi
 
-  if yq eval '.spec.template.spec.initContainers[].volumeMounts[].name' - <<<"$output" | grep -q "^ca-bundle$"; then
+  if yq eval '.spec.template.spec.initContainers[].volumeMounts[].name' - <<<"$output" | grep "^ca-bundle$" >/dev/null; then
     echo "ca-bundle must not appear in initContainers volumeMounts of $label" >&2
     exit 1
   fi
@@ -221,7 +221,7 @@ assert_extra_volumes_wired() {
 
 assert_extra_volumes_absent() {
   local output="$1" label="$2"
-  if yq eval '.spec.template.spec.volumes[].name' - <<<"$output" | grep -q "^ca-bundle$"; then
+  if yq eval '.spec.template.spec.volumes[].name' - <<<"$output" | grep "^ca-bundle$" >/dev/null; then
     echo "ca-bundle must not appear in spec.template.spec.volumes of $label with empty extraVolumes" >&2
     exit 1
   fi
@@ -343,6 +343,54 @@ if grep -q "name: data$" <<<"$generic_eight_by_two"; then
   echo "Generic 8x2 topology must NOT contain a single 'data' PVC" >&2
   exit 1
 fi
+
+# Distributed startup coordination must use the configured endpoint port and
+# stay transport-neutral so the same wait works with and without mTLS.
+custom_port_startup=$(render_distributed_statefulset \
+  --set service.endpoint.port=9443 \
+  --set config.rustfs.address=:9443)
+grep -q 'name: ENDPOINT_PORT' <<<"$custom_port_startup"
+grep -A1 'name: ENDPOINT_PORT' <<<"$custom_port_startup" | grep -q 'value: "9443"'
+grep -q 'nc -z -w 2' <<<"$custom_port_startup"
+if grep -q 'http.*9000/health' <<<"$custom_port_startup"; then
+  echo "Distributed startup wait must not hardcode the HTTP scheme or port 9000" >&2
+  exit 1
+fi
+
+mtls_startup=$(render_distributed_statefulset --set mtls.enabled=true)
+grep -q 'nc -z -w 2' <<<"$mtls_startup"
+if grep -q 'wget .*http.*health' <<<"$mtls_startup"; then
+  echo "mTLS startup wait must not use a plaintext HTTP health probe" >&2
+  exit 1
+fi
+
+# The timeout is one global deadline and invalid non-positive values fail
+# during rendering instead of creating an unbounded init wait.
+grep -q 'deadline=$(($(date +%s) + STARTUP_WAIT_TIMEOUT_SECONDS))' <<<"$custom_port_startup"
+invalid_startup_timeout_status=0
+render_distributed_statefulset --set startupWaitTimeoutSeconds=0 >/dev/null 2>&1 || invalid_startup_timeout_status=$?
+if [[ $invalid_startup_timeout_status -eq 0 ]]; then
+  echo "Distributed mode with startupWaitTimeoutSeconds=0 must fail rendering" >&2
+  exit 1
+fi
+
+# Every pool waits for DNS across the complete normalized pool list, while
+# port availability follows the stable pool-index/ordinal startup order.
+multi_pool_startup=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  --set pools.enabled=true \
+  --set 'pools.list[0].replicaCount=2' \
+  --set 'pools.list[1].replicaCount=2')
+grep -q 'nslookup "rustfs-0.rustfs-headless.rustfs.svc.cluster.local"' <<<"$multi_pool_startup"
+grep -q 'nslookup "rustfs-pool1-1.rustfs-headless.rustfs.svc.cluster.local"' <<<"$multi_pool_startup"
+if grep -q 'rustfs-pool1-headless' <<<"$multi_pool_startup"; then
+  echo "Multi-pool startup wait must use the shared root headless service" >&2
+  exit 1
+fi
+grep -q 'wait_for_peer "rustfs-1:${ENDPOINT_PORT}"' <<<"$multi_pool_startup"
+grep -q 'wait_for_peer "rustfs-pool1-${i}:${ENDPOINT_PORT}"' <<<"$multi_pool_startup"
 
 # volumeClaimTemplates must not contain empty annotations when pvcAnnotations are unset,
 # because Kubernetes treats annotations: {} as a mutation of the immutable field.
