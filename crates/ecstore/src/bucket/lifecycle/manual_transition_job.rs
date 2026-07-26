@@ -2131,6 +2131,60 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_budget_report_waits_for_pending_workers() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            max_objects: Some(1),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-budget-pending-bucket", &options, TEST_OWNER);
+        let active_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 4,
+            queued: 1,
+            active: 1,
+            workers: 2,
+            ..Default::default()
+        };
+
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "manual-budget-pending-bucket".to_string(),
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                scanned: 1,
+                eligible: 1,
+                enqueued: 1,
+                truncated_by_limit: true,
+                continuation_token: Some("opaque-budget-token".to_string()),
+                ..Default::default()
+            },
+            active_snapshot,
+        );
+
+        assert_eq!(record.state, ManualTransitionJobState::Running);
+        assert!(record.scan_completed);
+        assert!(record.completed_at_unix_nanos.is_none());
+        assert!(record.report.was_truncated());
+        assert!(record.report.worker_transition_pending());
+        assert_eq!(record.report.continuation_token.as_deref(), Some("opaque-budget-token"));
+        assert_eq!(record.queue_snapshot, active_snapshot);
+
+        let drained_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 4,
+            workers: 2,
+            ..Default::default()
+        };
+        record.record_worker_result(ManualTransitionWorkerResult::Completed, drained_snapshot);
+
+        assert_eq!(record.state, ManualTransitionJobState::Partial);
+        assert_eq!(record.report.transition_completed, 1);
+        assert_eq!(record.queue_snapshot, drained_snapshot);
+        assert!(record.completed_at_unix_nanos.is_some());
+        assert!(record.error.is_none());
+    }
+
+    #[test]
     fn manual_transition_scope_key_is_stable_and_sanitized() {
         let first = manual_transition_scope_key(
             "bucket",
