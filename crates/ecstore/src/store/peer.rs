@@ -61,10 +61,6 @@ pub async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
     None
 }
 
-pub async fn get_disk_via_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
-    runtime_sources::local_disk_for_endpoint(endpoint).await
-}
-
 pub async fn all_local_disk_path() -> Vec<String> {
     runtime_sources::local_disk_paths().await
 }

@@ -20,6 +20,15 @@ pub(crate) mod contract_compat {
     pub(crate) use super::{DiskStore, ECStore, Error, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, SetDisks};
 }
 
+pub(crate) mod manual_transition {
+    pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
+        ManualTransitionQueueSnapshot, ManualTransitionRunOptions, ManualTransitionRunReport,
+    };
+    pub(crate) use rustfs_ecstore::api::bucket::lifecycle::manual_transition_job::{
+        ManualTransitionJobRecord, ManualTransitionJobState,
+    };
+}
+
 pub(crate) mod replication_compat {
     pub(crate) use rustfs_ecstore::api::bucket::replication::{
         BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,
