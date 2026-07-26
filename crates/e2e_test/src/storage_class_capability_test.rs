@@ -389,6 +389,10 @@ mod tests {
             !unsigned_body.contains("supported_write_classes"),
             "the capability contract must not bypass admin authentication"
         );
+        assert!(
+            !unsigned_body.contains("manual_transition_jobs"),
+            "manual transition job capabilities must not bypass admin authentication"
+        );
 
         let response = signed_admin_get(&env, path).await?;
         assert_eq!(response.status(), StatusCode::OK);
@@ -400,6 +404,25 @@ mod tests {
         );
         assert_eq!(body["storage_classes"]["unsupported_write_error"], "InvalidStorageClass");
         assert_eq!(body["storage_classes"]["legacy_label_behavior"], "normalized_to_effective_class");
+        assert_eq!(body["summary"]["manual_transition_jobs"]["state"], "supported");
+        assert_eq!(body["manual_transition_jobs"]["contract_version"], 1);
+        assert_eq!(body["manual_transition_jobs"]["status"]["state"], "supported");
+        assert_eq!(body["manual_transition_jobs"]["modes"], serde_json::json!(["enqueue_only", "async"]));
+        assert_eq!(body["manual_transition_jobs"]["run_route"], "/rustfs/admin/v3/ilm/transition/run");
+        assert_eq!(
+            body["manual_transition_jobs"]["status_route"],
+            "/rustfs/admin/v3/ilm/transition/jobs/{job_id}"
+        );
+        assert_eq!(
+            body["manual_transition_jobs"]["cancel_route"],
+            "/rustfs/admin/v3/ilm/transition/jobs/{job_id}"
+        );
+        assert_eq!(body["manual_transition_jobs"]["job_id_format"], "uuid");
+        assert_eq!(body["manual_transition_jobs"]["admission_scope"], "bucket");
+        assert_eq!(
+            body["manual_transition_jobs"]["mixed_version_policy"],
+            "fail_closed_when_capability_unknown_or_unsupported"
+        );
         Ok(())
     }
 }
