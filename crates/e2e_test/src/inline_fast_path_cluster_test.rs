@@ -1906,13 +1906,14 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
     let prefix = "transition/distributed-admission/";
     hot_client.create_bucket().bucket(&bucket).send().await?;
     put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
-    for index in 0u8..64 {
+    for index in 0..64 {
         let key = format!("{prefix}object-{index:02}.bin");
+        let seed = u8::try_from(index)?;
         hot_client
             .put_object()
             .bucket(&bucket)
             .key(key)
-            .body(ByteStream::from(payload(64 * KIB, index)))
+            .body(ByteStream::from(payload(64 * KIB, seed)))
             .send()
             .await?;
     }
@@ -1985,11 +1986,11 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
         Some("partial"),
         "small transition queue should surface terminal backpressure: {terminal}"
     );
-    let skipped_queue_full = terminal["report"]["skipped_queue_full"]
-        .as_u64()
-        .ok_or_else(|| format!("terminal status omitted report.skipped_queue_full: {terminal}"))?;
     assert!(
-        skipped_queue_full > 0,
+        terminal["report"]["skipped_queue_full"]
+            .as_u64()
+            .ok_or_else(|| format!("terminal status omitted report.skipped_queue_full: {terminal}"))?
+            > 0,
         "terminal status should include queue-full backpressure counters: {terminal}"
     );
     let queue_snapshot = terminal["queue_snapshot"]
