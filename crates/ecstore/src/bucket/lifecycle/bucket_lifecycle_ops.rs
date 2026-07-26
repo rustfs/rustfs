@@ -4572,8 +4572,8 @@ mod tests {
     use crate::bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
         claim_manual_transition_scope_admission, legacy_manual_transition_scope_key, load_manual_transition_job_record,
-        load_manual_transition_scope_admission, request_manual_transition_job_cancel, save_manual_transition_job_record,
-        save_manual_transition_scope_admission_if_absent,
+        load_manual_transition_scope_admission, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
+        save_manual_transition_job_record, save_manual_transition_scope_admission_if_absent,
     };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
@@ -7756,6 +7756,58 @@ mod tests {
 
         assert_eq!(after_terminal_cancel.state, ManualTransitionJobState::Completed);
         assert!(!after_terminal_cancel.cancel_requested);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_job_lost_worker_results_mark_unknown_and_release_admission() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let mut record = ManualTransitionJobRecord::new(
+            job_id,
+            "manual-lost-worker-result-bucket",
+            &ManualTransitionRunOptions::default(),
+            "owner-a",
+        );
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "manual-lost-worker-result-bucket".to_string(),
+                enqueued: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot {
+                queued: 1,
+                ..Default::default()
+            },
+        );
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record with pending worker result should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("running job admission should save");
+
+        let renewed = renew_manual_transition_job_lease(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("lost worker result should persist unknown state");
+
+        assert_eq!(renewed.state, ManualTransitionJobState::Unknown);
+        assert!(renewed.completed_at_unix_nanos.is_some());
+        assert!(
+            renewed.error.as_deref().is_some_and(|error| error.contains("worker result")),
+            "unknown job should keep actionable lost-worker context: {renewed:#?}"
+        );
+        let loaded = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown job should reload");
+        assert_eq!(loaded.state, ManualTransitionJobState::Unknown);
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "unknown lost-worker job must release the scope admission"
+        );
     }
 
     #[tokio::test]
