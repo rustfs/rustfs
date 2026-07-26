@@ -4627,10 +4627,10 @@ mod tests {
         load_manual_transition_job_record, load_manual_transition_scope_admission,
         load_manual_transition_scope_admission_with_etag, manual_transition_scope_record_object_name,
         manual_transition_worker_result_object_name, manual_transition_worker_result_task_key,
-        persist_manual_transition_job_progress, reconcile_manual_transition_worker_results,
-        record_manual_transition_worker_result, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
-        save_manual_transition_job_record, save_manual_transition_scope_admission_if_absent,
-        save_manual_transition_scope_admission_if_current, save_manual_transition_worker_result_if_absent,
+        reconcile_manual_transition_worker_results, record_manual_transition_worker_result, renew_manual_transition_job_lease,
+        request_manual_transition_job_cancel, save_manual_transition_job_record,
+        save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
+        save_manual_transition_worker_result_if_absent,
     };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
