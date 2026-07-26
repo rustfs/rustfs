@@ -49,6 +49,7 @@ DIAGNOSTIC_METRICS=false
 DIAGNOSTIC_METRICS_URL="http://127.0.0.1:8889/metrics"
 DIAGNOSTIC_PROMETHEUS_QUERY_URL=""
 DIAGNOSTIC_PROMETHEUS_QUERY='{__name__=~"rustfs_io_get_object_.*"}'
+DEFAULT_DIAGNOSTIC_OBS_ENDPOINT="http://127.0.0.1:4318"
 DIAGNOSTIC_METRICS_SETTLE_SECS="${RUSTFS_DIAGNOSTIC_METRICS_SETTLE_SECS:-2}"
 DIAGNOSTIC_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 DIAGNOSTIC_OBS_METRIC_ENDPOINT="${RUSTFS_OBS_METRIC_ENDPOINT:-}"
@@ -149,8 +150,10 @@ Core options:
                                  (default: rustfs_io_get_object_)
   --diagnostic-obs-endpoint <url>
                                  RUSTFS_OBS_ENDPOINT passed to RustFS during diagnostic runs
+                                 (default when --diagnostic-metrics is enabled: http://127.0.0.1:4318)
   --diagnostic-obs-metric-endpoint <url>
                                  RUSTFS_OBS_METRIC_ENDPOINT passed to RustFS during diagnostic runs
+                                 (default when --diagnostic-metrics is enabled: <obs-endpoint>/v1/metrics)
   --diagnostic-obs-meter-interval <secs>
                                  RUSTFS_OBS_METER_INTERVAL passed during diagnostic runs (default: 1)
   --diagnostic-obs-service-name-prefix <name>
@@ -480,6 +483,18 @@ validate_args() {
   fi
   if [[ "$DETACH" == "true" && "$DRY_RUN" != "true" ]]; then
     require_cmd nohup
+  fi
+}
+
+resolve_diagnostic_observability_endpoints() {
+  if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    return 0
+  fi
+  if [[ -z "$DIAGNOSTIC_OBS_ENDPOINT" ]]; then
+    DIAGNOSTIC_OBS_ENDPOINT="$DEFAULT_DIAGNOSTIC_OBS_ENDPOINT"
+  fi
+  if [[ -z "$DIAGNOSTIC_OBS_METRIC_ENDPOINT" ]]; then
+    DIAGNOSTIC_OBS_METRIC_ENDPOINT="${DIAGNOSTIC_OBS_ENDPOINT%/}/v1/metrics"
   fi
 }
 
@@ -1501,6 +1516,16 @@ def sample_to_line(sample):
     return f"{name} {value}"
 
 
+def sample_matches_service(sample, service_name):
+    if not service_name:
+        return True
+    metric = sample.get("metric", {})
+    return any(
+        metric.get(key) == service_name
+        for key in ("service.name", "service_name", "job", "otel_scope_name")
+    )
+
+
 try:
     separator = "&" if "?" in query_url else "?"
     url = f"{query_url}{separator}{urllib.parse.urlencode({'query': query})}"
@@ -1520,9 +1545,7 @@ if payload.get("status") != "success":
 samples = [
     sample
     for sample in payload.get("data", {}).get("result", [])
-    if not service_name
-    or sample.get("metric", {}).get("service.name") == service_name
-    or sample.get("metric", {}).get("service_name") == service_name
+    if sample_matches_service(sample, service_name)
 ]
 lines = [line for sample in samples if (line := sample_to_line(sample))]
 if not lines:
@@ -1702,6 +1725,15 @@ def classify(metric):
     return "get_object"
 
 
+def has_service_label(labels, service_name):
+    if not service_name:
+        return True
+    return any(
+        f'{key}="{service_name}"' in labels
+        for key in ("service_name", "service.name", "job", "otel_scope_name")
+    )
+
+
 def read_metrics(path):
     rows = {}
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -1714,8 +1746,7 @@ def read_metrics(path):
         if not metric.startswith(metric_prefix):
             continue
         labels = labels or ""
-        if service_name and f'service_name="{service_name}"' not in labels \
-                and f'service.name="{service_name}"' not in labels:
+        if not has_service_label(labels, service_name):
             continue
         rows[(metric, labels)] = float(value)
     return rows
@@ -1892,6 +1923,15 @@ def label_value(labels, key):
     return match.group(1).replace(r'\"', '"').replace(r"\\", "\\")
 
 
+def has_service_label(labels, service_name):
+    if not service_name:
+        return True
+    return any(
+        f'{key}="{service_name}"' in labels
+        for key in ("service_name", "service.name", "job", "otel_scope_name")
+    )
+
+
 def read_metrics(path):
     rows = {}
     if not path.exists() or path.stat().st_size == 0:
@@ -1906,8 +1946,7 @@ def read_metrics(path):
         if not metric.startswith(metric_prefix):
             continue
         labels = labels or ""
-        if service_name and f'service_name="{service_name}"' not in labels \
-                and f'service.name="{service_name}"' not in labels:
+        if not has_service_label(labels, service_name):
             continue
         rows[(metric, labels)] = float(value)
     return rows
@@ -4135,6 +4174,7 @@ main() {
   ORIGINAL_ARGS=("$@")
   parse_args "$@"
   validate_args
+  resolve_diagnostic_observability_endpoints
   setup_output
   run_detached_if_requested
   local codec_profiles=()
