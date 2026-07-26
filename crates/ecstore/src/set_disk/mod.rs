@@ -1648,7 +1648,7 @@ fn classify_get_codec_streaming_object_class(
     if object_info.is_encrypted() {
         return GetCodecStreamingObjectClass::Encrypted;
     }
-    if object_info.is_compressed() {
+    if object_info.is_compressed() || fi.is_compressed() {
         return GetCodecStreamingObjectClass::Compressed;
     }
     if object_info.is_remote() {
@@ -1864,20 +1864,6 @@ fn get_codec_streaming_reader_gate(
         };
     }
 
-    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
-        return GetCodecStreamingGate {
-            object_class,
-            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize),
-            prefer_data_blocks_first_reader_setup: false,
-        };
-    };
-    if object_info.size < min_size {
-        return GetCodecStreamingGate {
-            object_class,
-            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize),
-            prefer_data_blocks_first_reader_setup: false,
-        };
-    }
     if object_class == GetCodecStreamingObjectClass::Encrypted {
         return GetCodecStreamingGate {
             object_class,
@@ -1914,6 +1900,20 @@ fn get_codec_streaming_reader_gate(
                 prefer_data_blocks_first_reader_setup: false,
             };
         }
+    }
+    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize),
+            prefer_data_blocks_first_reader_setup: false,
+        };
+    };
+    if object_info.size < min_size {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize),
+            prefer_data_blocks_first_reader_setup: false,
+        };
     }
 
     GetCodecStreamingGate {
