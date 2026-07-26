@@ -41,7 +41,7 @@ fn manual_transition_record_persists_combined_tier_and_queue_failures_as_partial
         ManualTransitionRunReport {
             bucket: "manual-combined-failures-bucket".to_string(),
             prefix: options.prefix.clone(),
-            tier: options.tier.clone(),
+            tier: options.tier,
             scanned: 4,
             eligible: 3,
             skipped_queue_full: 1,
