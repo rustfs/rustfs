@@ -5121,17 +5121,15 @@ mod tests {
 
                 let mut compressed_fi = fi.clone();
                 insert_str(&mut compressed_fi.metadata, SUFFIX_COMPRESSION, "lz4".to_string());
-                let compressed = codec_streaming_test_object_info(&compressed_fi);
+                let mut compressed = codec_streaming_test_object_info(&compressed_fi);
                 assert_eq!(
                     codec_streaming_reader_gate_for_test(&None, &compressed, &compressed_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
                 );
 
-                let mut compressed_without_object_metadata = compressed.clone();
-                compressed_without_object_metadata.user_defined = Arc::default();
+                compressed.user_defined = Arc::default();
                 assert_eq!(
-                    codec_streaming_reader_gate_for_test(&None, &compressed_without_object_metadata, &compressed_fi, true)
-                        .decision,
+                    codec_streaming_reader_gate_for_test(&None, &compressed, &compressed_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
                 );
 
@@ -5148,6 +5146,64 @@ mod tests {
                 assert_eq!(
                     codec_streaming_reader_gate_for_test(&None, &remote, &remote_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_format_fallbacks_precede_min_size() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1048576")),
+            ],
+            || {
+                let mut encrypted_fi = codec_streaming_test_fileinfo(16 * 1024, 1);
+                encrypted_fi
+                    .metadata
+                    .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+                let encrypted = codec_streaming_test_object_info(&encrypted_fi);
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &encrypted, &encrypted_fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted)
+                );
+
+                let mut compressed_fi = codec_streaming_test_fileinfo(16 * 1024, 1);
+                insert_str(&mut compressed_fi.metadata, SUFFIX_COMPRESSION, "lz4".to_string());
+                let compressed = codec_streaming_test_object_info(&compressed_fi);
+
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &compressed, &compressed_fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
+                );
+
+                let mut encrypted_fi = codec_streaming_test_fileinfo(16 * 1024, 1);
+                encrypted_fi
+                    .metadata
+                    .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+                let encrypted = codec_streaming_test_object_info(&encrypted_fi);
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &encrypted, &encrypted_fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted)
+                );
+
+                let mut remote_fi = codec_streaming_test_fileinfo(16 * 1024, 1);
+                remote_fi.transition_status = TRANSITION_COMPLETE.to_string();
+                let remote = codec_streaming_test_object_info(&remote_fi);
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &remote, &remote_fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote)
+                );
+
+                let multipart_fi = codec_streaming_test_fileinfo(16 * 1024, 2);
+                let multipart = codec_streaming_test_object_info(&multipart_fi);
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &multipart, &multipart_fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart)
                 );
             },
         );
