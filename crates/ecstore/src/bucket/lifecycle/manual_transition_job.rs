@@ -1706,6 +1706,88 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_unknown_checkpoint_persists_counters_and_cursor() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            max_objects: Some(5),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+        record.update_running_progress(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                scanned: 5,
+                eligible: 4,
+                enqueued: 3,
+                skipped_queue_full: 2,
+                skipped_queue_timeout: 1,
+                tier_failure: 1,
+                truncated_by_limit: true,
+                continuation_token: Some("opaque-page-token".to_string()),
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot {
+                queue_capacity: 8,
+                queued: 3,
+                active: 2,
+                workers: 4,
+                queue_full: 2,
+                queue_send_timeout: 1,
+                ..Default::default()
+            },
+        );
+        record.record_worker_result(
+            ManualTransitionWorkerResult::TierFailure,
+            ManualTransitionQueueSnapshot {
+                queue_capacity: 8,
+                queued: 2,
+                active: 1,
+                workers: 4,
+                queue_full: 2,
+                queue_send_timeout: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(record.mark_unknown_if_recovery_would_skip_pending_page(ManualTransitionQueueSnapshot {
+            queue_capacity: 8,
+            workers: 4,
+            queue_full: 2,
+            queue_send_timeout: 1,
+            ..Default::default()
+        }));
+        let encoded = record.encode().expect("unknown checkpoint should encode");
+        let decoded = ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("unknown checkpoint should decode");
+
+        assert_eq!(decoded.state, ManualTransitionJobState::Unknown);
+        assert!(decoded.is_terminal());
+        assert!(decoded.completed_at_unix_nanos.is_some());
+        assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-page-token"));
+        assert!(decoded.report.was_truncated());
+        assert!(decoded.report.has_partial_enqueue());
+        assert_eq!(decoded.report.scanned, 5);
+        assert_eq!(decoded.report.eligible, 4);
+        assert_eq!(decoded.report.enqueued, 3);
+        assert_eq!(decoded.report.skipped_queue_full, 2);
+        assert_eq!(decoded.report.skipped_queue_timeout, 1);
+        assert_eq!(decoded.report.transition_failed, 1);
+        assert_eq!(decoded.report.tier_failure, 2);
+        assert_eq!(decoded.queue_snapshot.queue_capacity, 8);
+        assert_eq!(decoded.queue_snapshot.workers, 4);
+        assert_eq!(decoded.queue_snapshot.queue_full, 2);
+        assert_eq!(decoded.queue_snapshot.queue_send_timeout, 1);
+        assert!(
+            decoded
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("page/task journal"))
+        );
+    }
+
+    #[test]
     fn manual_transition_job_marks_unknown_when_worker_results_are_lost() {
         let options = ManualTransitionRunOptions::default();
         let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
