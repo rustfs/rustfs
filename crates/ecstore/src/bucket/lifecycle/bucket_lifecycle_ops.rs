@@ -4603,9 +4603,10 @@ mod tests {
         jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
-        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink,
-        manual_transition_version_marker, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, persist_manual_transition_page_checkpoint, recover_manual_transition_job,
+        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
+        manual_transition_recovery_progress_sink, mark_delete_opts_skip_decommissioned_on_remote_success,
+        merge_stale_multipart_candidate, persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint,
+        recover_manual_transition_job,
         recover_manual_transition_jobs, recover_manual_transition_jobs_once, replication_state_for_delete,
         resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
         resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
@@ -8540,6 +8541,86 @@ mod tests {
 
         assert_eq!(after_terminal_cancel.state, ManualTransitionJobState::Completed);
         assert!(!after_terminal_cancel.cancel_requested);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_progress_checkpoint_survives_reload_and_recovery() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let bucket = "manual-progress-checkpoint-bucket";
+        let continuation_token =
+            encode_manual_transition_continuation_token(Some("logs/page-end".to_string()), Some("null".to_string()))
+                .expect("resume token should encode");
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, bucket, &options, "owner-a");
+        record.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("running scope admission should save");
+
+        let checkpointed = persist_manual_transition_job_progress(
+            ecstore.clone(),
+            job_id,
+            &ManualTransitionRunReport {
+                bucket: bucket.to_string(),
+                prefix: "logs/".to_string(),
+                scanned: 2,
+                eligible: 2,
+                enqueued: 2,
+                continuation_token: Some(continuation_token.clone()),
+                truncated_by_limit: true,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        )
+        .await
+        .expect("running progress checkpoint should persist");
+
+        assert_eq!(checkpointed.report.continuation_token.as_deref(), Some(continuation_token.as_str()));
+        assert_eq!(checkpointed.report.enqueued, 2);
+
+        let reloaded = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("checkpointed job should reload");
+        assert_eq!(reloaded.report.continuation_token.as_deref(), Some(continuation_token.as_str()));
+        assert_eq!(reloaded.report.scanned, 2);
+        assert_eq!(reloaded.report.enqueued, 2);
+
+        let mut expired = reloaded.clone();
+        expired.lease_expires_at_unix_nanos = 0;
+        save_manual_transition_job_record(ecstore.clone(), &expired)
+            .await
+            .expect("checkpointed job owner loss should persist");
+
+        let outcome = recover_manual_transition_job(ecstore.clone(), job_id, ManualTransitionQueueSnapshot::default())
+            .await
+            .expect("recovery should fail closed when checkpointed page has pending worker results");
+        assert_eq!(outcome, ManualTransitionJobRecoveryOutcome::Unknown);
+        let recovered = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("unknown checkpointed job should reload");
+        assert_eq!(recovered.state, ManualTransitionJobState::Unknown);
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("page/task journal")),
+            "unknown checkpoint recovery must retain page/task journal context: {recovered:#?}"
+        );
+        assert!(
+            matches!(
+                load_manual_transition_scope_admission(ecstore, &record.scope_key).await,
+                Err(Error::ConfigNotFound)
+            ),
+            "unknown checkpoint recovery must release scope admission"
+        );
     }
 
     #[tokio::test]
