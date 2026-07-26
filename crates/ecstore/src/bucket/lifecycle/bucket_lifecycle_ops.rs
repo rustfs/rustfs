@@ -7870,7 +7870,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = enqueue_transition_for_existing_objects_scoped(ecstore, &bucket, options)
+        let report = enqueue_transition_for_existing_objects_scoped(ecstore.clone(), &bucket, options)
             .await
             .expect("manual transition dry-run scan should stop on active cancel");
 
@@ -7894,6 +7894,29 @@ mod tests {
         assert_eq!(marker.as_deref(), Some(keys[0].as_str()));
         assert_eq!(version_marker.as_deref(), Some("null"));
         assert_eq!(cancel_polls.load(Ordering::SeqCst), 2);
+
+        let resumed = enqueue_transition_for_existing_objects_scoped(
+            ecstore,
+            &bucket,
+            ManualTransitionRunOptions {
+                prefix: prefix.to_string(),
+                continuation_token: Some(token.to_string()),
+                tier: Some("WARM".to_string()),
+                dry_run: true,
+                max_objects: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("manual transition dry-run scan should resume after active cancel");
+
+        assert!(!resumed.cancelled);
+        assert!(!resumed.was_truncated());
+        assert_eq!(resumed.scanned, 1);
+        assert_eq!(resumed.eligible, 1);
+        assert_eq!(resumed.dry_run_eligible, 1);
+        assert_eq!(resumed.enqueued, 0);
+        assert!(resumed.continuation_token.is_none());
     }
 
     #[tokio::test]
