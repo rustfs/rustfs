@@ -884,6 +884,11 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
     assert!(
         status_endpoint.ends_with(job_id),
         "status endpoint must embed job id: endpoint={status_endpoint}, job_id={job_id}"
@@ -1081,6 +1086,11 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
         .status_endpoint
         .as_deref()
         .ok_or("accepted async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("accepted async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.mode, "durable_job");
@@ -1215,6 +1225,11 @@ async fn test_manual_transition_async_same_scope_conflict_reports_active_job() -
         .status_endpoint
         .as_deref()
         .ok_or("accepted same-scope async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("accepted same-scope async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.mode, "durable_job");
@@ -1308,6 +1323,11 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
@@ -1396,6 +1416,11 @@ async fn test_manual_transition_async_worker_failure_reports_terminal_partial() 
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    let cancel_endpoint = accepted
+        .cancel_endpoint
+        .as_deref()
+        .ok_or("async response must include cancel_endpoint")?;
+    assert_eq!(cancel_endpoint, status_endpoint);
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
@@ -1530,6 +1555,35 @@ async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_job_status_cancel_reject_unknown_jobs() -> TestResult {
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+
+    for method in [Method::GET, Method::DELETE] {
+        let (status, body) = signed_admin_request(
+            &hot.url,
+            method.clone(),
+            "/rustfs/admin/v3/ilm/transition/jobs/not-a-uuid",
+            None,
+            &hot.access_key,
+            &hot.secret_key,
+        )
+        .await?;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{method} invalid job id response: {body}");
+        assert!(body.contains("InvalidArgument"), "{method} invalid job id body: {body}");
+
+        let missing_endpoint = "/rustfs/admin/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111";
+        let (status, body) =
+            signed_admin_request(&hot.url, method.clone(), missing_endpoint, None, &hot.access_key, &hot.secret_key).await?;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{method} missing job response: {body}");
+        assert!(body.contains("NoSuchKey"), "{method} missing job body: {body}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestResult {
     let mut cold = RustFSTestEnvironment::new().await?;
     cold.access_key = "manualcontractcoldtieradmin".to_string();
@@ -1563,6 +1617,7 @@ async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestRe
     assert!(response.get("status").is_none() || response.get("status").is_some_and(|v| v.is_null()));
     assert!(response.get("status_endpoint").is_none() || response.get("status_endpoint").is_some_and(|v| v.is_null()));
     assert!(response.get("cancel").is_none() || response.get("cancel").is_some_and(|v| v.is_null()));
+    assert!(response.get("cancel_endpoint").is_none() || response.get("cancel_endpoint").is_some_and(|v| v.is_null()));
 
     Ok(())
 }
