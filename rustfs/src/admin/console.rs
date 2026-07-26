@@ -226,6 +226,12 @@ struct ApiDiscovery {
     cluster_snapshot: String,
     #[serde(rename = "extensionsCatalog")]
     extensions_catalog: String,
+    #[serde(rename = "ilmExpiryStatus")]
+    ilm_expiry_status: String,
+    #[serde(rename = "ilmTransitionRun")]
+    ilm_transition_run: String,
+    #[serde(rename = "ilmTransitionJob")]
+    ilm_transition_job: String,
 }
 
 fn console_api_discovery() -> ApiDiscovery {
@@ -234,6 +240,9 @@ fn console_api_discovery() -> ApiDiscovery {
         runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
         cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
         extensions_catalog: usecase.extensions_catalog_route().to_string(),
+        ilm_expiry_status: format!("{RUSTFS_ADMIN_PREFIX}/ilm/expiry/status"),
+        ilm_transition_run: format!("{RUSTFS_ADMIN_PREFIX}/ilm/transition/run"),
+        ilm_transition_job: format!("{RUSTFS_ADMIN_PREFIX}/ilm/transition/jobs/{{job_id}}"),
     }
 }
 
@@ -853,6 +862,9 @@ mod tests {
         assert_eq!(cfg.api.discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(cfg.api.discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(cfg.api.discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
+        assert_eq!(cfg.api.discovery.ilm_expiry_status, "/rustfs/admin/v3/ilm/expiry/status");
+        assert_eq!(cfg.api.discovery.ilm_transition_run, "/rustfs/admin/v3/ilm/transition/run");
+        assert_eq!(cfg.api.discovery.ilm_transition_job, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
     }
 
     #[tokio::test]
@@ -871,6 +883,12 @@ mod tests {
         assert_eq!(value["api"]["discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(value["api"]["discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(value["api"]["discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
+        assert_eq!(value["api"]["discovery"]["ilmExpiryStatus"], "/rustfs/admin/v3/ilm/expiry/status");
+        assert_eq!(value["api"]["discovery"]["ilmTransitionRun"], "/rustfs/admin/v3/ilm/transition/run");
+        assert_eq!(
+            value["api"]["discovery"]["ilmTransitionJob"],
+            "/rustfs/admin/v3/ilm/transition/jobs/{job_id}"
+        );
     }
 
     #[test]
