@@ -76,6 +76,7 @@ const MANUAL_ASYNC_LIMIT_BUCKET: &str = "ilm7-manual-async-limit";
 const MANUAL_ASYNC_CONFLICT_BUCKET: &str = "ilm7-manual-async-conflict";
 const MANUAL_TIER_FAILURE_BUCKET: &str = "ilm7-manual-tier-failure";
 const MANUAL_WORKER_FAILURE_BUCKET: &str = "ilm7-manual-worker-failure";
+const MANUAL_ACTIVE_CANCEL_BUCKET: &str = "ilm7-manual-active-cancel";
 const MANUAL_QUEUE_PRESSURE_PREFIX: &str = "manual-queue-pressure/";
 const MANUAL_CONTINUATION_PREFIX: &str = "manual-continuation/";
 const MANUAL_ASYNC_LIMIT_PREFIX: &str = "manual-async-limit/";
@@ -83,6 +84,9 @@ const MANUAL_ASYNC_CONFLICT_PREFIX: &str = "manual-async-conflict/";
 const MANUAL_ASYNC_CONFLICT_NESTED_PREFIX: &str = "manual-async-conflict/nested/";
 const MANUAL_TIER_FAILURE_PREFIX: &str = "manual-tier-failure/";
 const MANUAL_WORKER_FAILURE_PREFIX: &str = "manual-worker-failure/";
+const MANUAL_ACTIVE_CANCEL_PREFIX: &str = "manual-active-cancel/";
+const MANUAL_ACTIVE_CANCEL_OBJECTS: usize = 512;
+const MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
 const MANUAL_DUE_KEY: &str = "manual-due/report.bin";
 const MANUAL_DRY_RUN_KEY: &str = "manual-dry-run/report.bin";
@@ -1241,6 +1245,106 @@ async fn test_manual_transition_async_worker_failure_reports_terminal_partial() 
         StdDuration::from_secs(2),
     )
     .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualactivecancelcoldadmin".to_string();
+    cold.secret_key = "manualactivecancelcoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(MANUAL_ACTIVE_CANCEL_BUCKET).send().await?;
+    put_lifecycle_transition_rule(
+        &hot_client,
+        MANUAL_ACTIVE_CANCEL_BUCKET,
+        "manual-active-cancel",
+        MANUAL_ACTIVE_CANCEL_PREFIX,
+        1,
+    )
+    .await?;
+    for idx in 0..MANUAL_ACTIVE_CANCEL_OBJECTS {
+        let key = format!("{MANUAL_ACTIVE_CANCEL_PREFIX}obj-{idx:03}");
+        put_single_part_object(&hot_client, MANUAL_ACTIVE_CANCEL_BUCKET, &key, b"manual active cancel payload").await?;
+    }
+
+    let before_remote_count = cold_tier_object_count(&cold_client).await?;
+    let accepted =
+        manual_transition_async_run(&hot, MANUAL_ACTIVE_CANCEL_BUCKET, MANUAL_ACTIVE_CANCEL_PREFIX, true, 10_000).await?;
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.mode, "durable_job");
+    assert_eq!(accepted.report.bucket, MANUAL_ACTIVE_CANCEL_BUCKET);
+    assert_eq!(accepted.report.prefix, MANUAL_ACTIVE_CANCEL_PREFIX);
+    assert!(accepted.report.dry_run);
+    assert_eq!(accepted.report.scanned, 0);
+    assert_eq!(accepted.report.enqueued, 0);
+    assert_eq!(accepted.report.transition_completed, 0);
+    assert_eq!(accepted.report.transition_failed, 0);
+    let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
+    let status_endpoint = accepted
+        .status_endpoint
+        .as_deref()
+        .ok_or("async response must include status_endpoint")?;
+
+    let start = Instant::now();
+    let active = loop {
+        let status = manual_transition_job_status(&hot, status_endpoint).await?;
+        if status.status == "running" {
+            break status;
+        }
+        assert!(
+            !matches!(status.status.as_str(), "completed" | "partial" | "cancelled" | "failed" | "unknown"),
+            "manual transition job reached terminal state before active cancel could be requested: {status:#?}"
+        );
+        assert!(
+            start.elapsed() < MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT,
+            "manual transition job did not become running before active cancel timeout: {status:#?}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    };
+    assert_eq!(active.job_id, job_id);
+    assert_eq!(active.status_endpoint, status_endpoint);
+    assert!(!active.cancel_requested);
+
+    let cancel_response = manual_transition_job_cancel(&hot, status_endpoint).await?;
+    assert_eq!(cancel_response.job_id, job_id);
+    assert_eq!(cancel_response.status_endpoint, status_endpoint);
+    assert_eq!(cancel_response.status, "running", "active cancel response: {cancel_response:#?}");
+    assert!(cancel_response.cancel_requested, "active cancel response: {cancel_response:#?}");
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
+    assert_eq!(terminal.job_id, job_id);
+    assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.status, "cancelled", "terminal active cancel response: {terminal:#?}");
+    assert!(terminal.cancel_requested);
+    assert_eq!(terminal.failure_reason, None);
+    assert_eq!(terminal.report.bucket, MANUAL_ACTIVE_CANCEL_BUCKET);
+    assert_eq!(terminal.report.prefix, MANUAL_ACTIVE_CANCEL_PREFIX);
+    assert_eq!(terminal.report.tier.as_deref(), Some(TIER_NAME));
+    assert!(terminal.report.dry_run);
+    assert!(terminal.report.lifecycle_config_found);
+    assert!(terminal.report.cancelled, "terminal active cancel response: {terminal:#?}");
+    assert_eq!(terminal.report.enqueued, 0, "terminal active cancel response: {terminal:#?}");
+    assert_eq!(terminal.report.transition_completed, 0);
+    assert_eq!(terminal.report.transition_failed, 0);
+    assert_eq!(terminal.report.tier_failure, 0);
+    assert!(!terminal.report.truncated_by_limit);
+    assert!(!terminal.report.truncated_by_duration);
+    assert_eq!(
+        cold_tier_object_count(&cold_client).await?,
+        before_remote_count,
+        "active dry-run cancel must not create a remote tier object"
+    );
 
     Ok(())
 }
