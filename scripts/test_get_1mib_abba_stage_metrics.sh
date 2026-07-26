@@ -35,7 +35,12 @@ rg -qx 'inner_legacy_duplex_buffer_policy=adaptive_duplex_buffer_size' "${OUT_DI
 rg -qx 'exact_1mib_legacy_duplex_buffer_bytes=65536' "${OUT_DIR}/manifest.env"
 rg -qx 'handoff_attribution=true' "${OUT_DIR}/manifest.env"
 rg -qx 'diagnostic_metrics=true' "${OUT_DIR}/manifest.env"
+rg -qx 'diagnostic_obs_endpoint=http://127.0.0.1:4318' "${OUT_DIR}/manifest.env"
+rg -qx 'diagnostic_obs_metric_endpoint=http://127.0.0.1:4318/v1/metrics' "${OUT_DIR}/manifest.env"
+rg -qx 'diagnostic_obs_meter_interval=1' "${OUT_DIR}/manifest.env"
 rg -qx 'performance_conclusion=not_encoded_by_harness_collect_raw_abba_stage_metrics_first' "${OUT_DIR}/manifest.env"
+rg -Fq '("service.name", "service_name", "job", "otel_scope_name")' "${SCRIPT_DIR}/run_get_codec_streaming_smoke.sh"
+rg -Fq '("service_name", "service.name", "job", "otel_scope_name")' "${SCRIPT_DIR}/run_get_codec_streaming_smoke.sh"
 
 matrix_rows="$(awk -F',' 'NR > 1 { count++ } END { print count + 0 }' "${OUT_DIR}/abba_matrix.csv")"
 if [[ "$matrix_rows" != "4" ]]; then
@@ -68,6 +73,8 @@ for outer_size in 65536 1048576; do
       rg -qx 'sizes=1MiB' "$profile_manifest"
       rg -qx 'RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=true' "$profile_manifest"
       rg -qx 'RUSTFS_OBS_METRICS_EXPORT_ENABLED=true' "$profile_manifest"
+      rg -qx 'RUSTFS_OBS_ENDPOINT=http://127.0.0.1:4318' "$profile_manifest"
+      rg -qx 'RUSTFS_OBS_METRIC_ENDPOINT=http://127.0.0.1:4318/v1/metrics' "$profile_manifest"
       rg -qx 'RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=1048576' "$profile_manifest"
       test -f "${cell_dir}/${profile}/service_metrics_round_summary.csv"
       test -f "${cell_dir}/${profile}/service_metrics_stage_distribution.csv"
