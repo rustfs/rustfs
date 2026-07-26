@@ -19,6 +19,7 @@ use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
 use rustfs_config::server_config::KVS;
+use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -27,6 +28,7 @@ const EVENT_DECOMMISSION_RESUME_RETRY: &str = "decommission_resume_retry";
 const EVENT_DECOMMISSION_RESUME_FAILED: &str = "decommission_resume_failed";
 const EVENT_STORE_FORMAT_RETRY: &str = "store_format_retry";
 const EVENT_ECSTORE_INIT_STATUS: &str = "ecstore_init_status";
+const EVENT_STORE_RPC_SECRET_PREFLIGHT_FAILED: &str = "store_rpc_secret_preflight_failed";
 
 fn pool_first_endpoint_is_local(pool: &crate::layout::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
@@ -47,6 +49,48 @@ fn resolve_startup_pool_defaults_with(
     validate(endpoint_pools)?;
     let drive_counts = startup_pool_drive_counts(endpoint_pools);
     drive_counts.into_iter().map(ec_drives_no_config).collect()
+}
+
+/// Fail fast when the topology spans remote nodes but no internode RPC secret
+/// resolves. Every remote format read would otherwise fail client-side with
+/// "No valid auth token" and startup would retry for minutes before dying with
+/// a misleading "erasure read quorum" error (issues #4939, #5153).
+fn preflight_startup_rpc_secret(endpoint_pools: &EndpointServerPools) -> Result<()> {
+    preflight_startup_rpc_secret_with(endpoint_pools, try_get_rpc_token)
+}
+
+fn preflight_startup_rpc_secret_with(
+    endpoint_pools: &EndpointServerPools,
+    resolve_rpc_token: impl FnOnce() -> std::io::Result<String>,
+) -> Result<()> {
+    let has_remote_endpoint = endpoint_pools
+        .as_ref()
+        .iter()
+        .flat_map(|pool| pool.endpoints.as_ref().iter())
+        .any(|endpoint| !endpoint.is_local);
+
+    if !has_remote_endpoint {
+        return Ok(());
+    }
+
+    match resolve_rpc_token() {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // The message prefix must stay aligned with the runtime log in
+            // cluster/rpc/http_auth.rs: the log-analyzer `rpc-secret-resolution`
+            // rule anchors on it, and this preflight aborts before that log
+            // would ever be emitted.
+            error!(
+                event = EVENT_STORE_RPC_SECRET_PREFLIGHT_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                "RPC auth secret resolution failed: {err}; {RPC_SECRET_REQUIRED_OPERATOR_MESSAGE}"
+            );
+            Err(Error::other(format!(
+                "store init aborted: endpoints include remote nodes but {err}; {RPC_SECRET_REQUIRED_OPERATOR_MESSAGE}"
+            )))
+        }
+    }
 }
 
 fn should_resume_local_decommission(endpoints: &EndpointServerPools, idx: usize) -> Result<bool> {
@@ -217,6 +261,8 @@ impl ECStore {
         // payload writes use the runtime storage-class snapshot published later
         // from config before the store is marked ready.
         let default_pool_parities = resolve_startup_pool_defaults(&endpoint_pools)?;
+
+        preflight_startup_rpc_secret(&endpoint_pools)?;
 
         let mut deployment_id = None;
 
@@ -522,9 +568,10 @@ impl ECStore {
 mod tests {
     use super::{
         LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, load_pool_meta_for_startup, pool_first_endpoint_is_local,
-        resolve_startup_pool_defaults_with, resolve_store_init_stage_result, save_validated_pool_meta_for_startup,
-        should_auto_start_rebalance_after_init, should_auto_start_rebalance_after_recovered_meta,
-        should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with, resolve_store_init_stage_result,
+        save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
+        should_auto_start_rebalance_after_recovered_meta, should_resume_local_decommission,
+        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
     use crate::{
@@ -851,6 +898,123 @@ mod tests {
         assert!(
             pool_first_endpoint_is_local(endpoints.as_ref().get(1).expect("second pool should exist")),
             "the expanded pool should be initialized by its own first local endpoint"
+        );
+    }
+
+    fn rpc_preflight_pools(pools: Vec<Vec<Endpoint>>) -> EndpointServerPools {
+        EndpointServerPools::from(
+            pools
+                .into_iter()
+                .enumerate()
+                .map(|(pool_index, endpoints)| PoolEndpoints {
+                    legacy: false,
+                    set_count: 1,
+                    drives_per_set: endpoints.len(),
+                    endpoints: Endpoints::from(endpoints),
+                    cmd_line: format!("pool-{pool_index}"),
+                    platform: String::new(),
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn parsed_local_endpoint() -> Endpoint {
+        let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/data").expect("local endpoint should parse");
+        endpoint.is_local = true;
+        endpoint
+    }
+
+    fn parsed_remote_endpoint() -> Endpoint {
+        let mut endpoint = Endpoint::try_from("http://10.0.0.2:9000/data").expect("remote endpoint should parse");
+        endpoint.is_local = false;
+        endpoint
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_aborts_for_remote_endpoints_without_secret() {
+        // The remote endpoint intentionally sits behind a local one: the
+        // preflight must scan every endpoint, not just the first.
+        let pools = rpc_preflight_pools(vec![vec![parsed_local_endpoint(), parsed_remote_endpoint()]]);
+
+        let err = preflight_startup_rpc_secret_with(&pools, || {
+            Err(std::io::Error::other(rustfs_credentials::RPC_SECRET_REQUIRED_MESSAGE))
+        })
+        .expect_err("remote endpoints without an RPC secret must abort startup before the format retry loop");
+
+        let message = err.to_string();
+        assert!(message.contains("store init aborted"), "unexpected error: {message}");
+        assert!(
+            message.contains(rustfs_credentials::RPC_SECRET_REQUIRED_MESSAGE),
+            "error must state the resolution failure: {message}"
+        );
+        assert!(
+            message.contains(rustfs_credentials::RPC_SECRET_REQUIRED_OPERATOR_MESSAGE),
+            "error must carry the operator remediation guidance: {message}"
+        );
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_aborts_for_remote_endpoint_in_later_pool() {
+        // The remote endpoint hides in a later, otherwise-local pool: a
+        // first-pool shortcut (the `first_local` shape) must not pass.
+        let pools = rpc_preflight_pools(vec![vec![parsed_local_endpoint()], vec![parsed_remote_endpoint()]]);
+
+        let err = preflight_startup_rpc_secret_with(&pools, || {
+            Err(std::io::Error::other(rustfs_credentials::RPC_SECRET_REQUIRED_MESSAGE))
+        })
+        .expect_err("a remote endpoint in a later pool must abort startup without an RPC secret");
+
+        let message = err.to_string();
+        assert!(message.contains("store init aborted"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_skips_resolution_for_local_only_endpoints() {
+        preflight_startup_rpc_secret_with(&rpc_preflight_pools(vec![vec![parsed_local_endpoint()]]), || {
+            panic!("single-node topology must not resolve an RPC secret")
+        })
+        .expect("local-only topology must start without an RPC secret");
+    }
+
+    #[test]
+    fn test_rpc_secret_preflight_accepts_remote_endpoints_with_resolved_secret() {
+        preflight_startup_rpc_secret_with(&rpc_preflight_pools(vec![vec![parsed_remote_endpoint()]]), || {
+            Ok("resolved-secret".to_string())
+        })
+        .expect("a resolvable RPC secret must not block startup");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn test_new_with_instance_ctx_aborts_before_format_retry_loop_without_rpc_secret() {
+        // Guard: under a shared-process `cargo test` run another test may have
+        // already pinned the process-global RPC secret (ensure_test_rpc_secret),
+        // which would let init proceed past the preflight into remote disk
+        // init. A failing probe pins nothing, so it cannot poison later tests;
+        // under nextest's process-per-test model (CI) the guard never fires.
+        if rustfs_credentials::try_get_rpc_token().is_ok() {
+            return;
+        }
+
+        let mut remote_endpoint = parsed_remote_endpoint();
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(0);
+
+        let err = crate::store::ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            rpc_preflight_pools(vec![vec![remote_endpoint]]),
+            CancellationToken::new(),
+            Arc::new(crate::runtime::instance::InstanceContext::new()),
+        )
+        .await
+        .expect_err("distributed init without an RPC secret must abort before the format retry loop");
+
+        let message = err.to_string();
+        assert!(message.contains("store init aborted"), "unexpected error: {message}");
+        assert!(
+            message.contains(rustfs_credentials::RPC_SECRET_REQUIRED_OPERATOR_MESSAGE),
+            "abort must carry the operator remediation guidance: {message}"
         );
     }
 
