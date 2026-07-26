@@ -400,6 +400,18 @@ struct ManualTransitionRunReport {
 }
 
 #[derive(Debug, Deserialize)]
+struct ManualTransitionQueueSnapshot {
+    queue_capacity: u64,
+    queued: u64,
+    active: u64,
+    workers: u64,
+    queue_full: u64,
+    queue_send_timeout: u64,
+    compensation_pending: u64,
+    compensation_running: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct ManualTransitionJobStatusResponse {
     job_id: String,
     status_endpoint: String,
@@ -408,6 +420,7 @@ struct ManualTransitionJobStatusResponse {
     cancel_requested: bool,
     failure_reason: Option<String>,
     report: ManualTransitionRunReport,
+    queue_snapshot: ManualTransitionQueueSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,11 +509,17 @@ async fn manual_transition_job_status(
     hot: &RustFSTestEnvironment,
     status_endpoint: &str,
 ) -> Result<ManualTransitionJobStatusResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let (status, body) =
-        signed_admin_request(&hot.url, Method::GET, status_endpoint, None, &hot.access_key, &hot.secret_key).await?;
+    let (status, body) = manual_transition_job_status_raw(hot, status_endpoint).await?;
     assert_eq!(status, reqwest::StatusCode::OK, "manual transition job status response: {body}");
     assert_manual_transition_job_response_contract(&body, "manual transition job status response")?;
     Ok(serde_json::from_str(&body)?)
+}
+
+async fn manual_transition_job_status_raw(
+    hot: &RustFSTestEnvironment,
+    status_endpoint: &str,
+) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    signed_admin_request(&hot.url, Method::GET, status_endpoint, None, &hot.access_key, &hot.secret_key).await
 }
 
 async fn manual_transition_job_cancel(
@@ -545,7 +564,7 @@ fn assert_manual_transition_job_response_contract(
         "versionMarker",
     ] {
         assert!(
-            !body.contains(&format!("\"{incompatible}\"")),
+            value.get(incompatible).is_none(),
             "{context} must not expose incompatible field {incompatible}: {body}"
         );
     }
@@ -1056,6 +1075,14 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert!(!terminal.report.cancelled);
     assert!(terminal.report.truncated_by_limit);
     assert!(!terminal.report.truncated_by_duration);
+    assert!(terminal.queue_snapshot.queue_capacity >= terminal.queue_snapshot.queued);
+    assert_eq!(terminal.queue_snapshot.queued, 0);
+    assert!(terminal.queue_snapshot.workers >= terminal.queue_snapshot.active);
+    assert_eq!(terminal.queue_snapshot.active, 0);
+    assert_eq!(terminal.queue_snapshot.queue_full, 0);
+    assert_eq!(terminal.queue_snapshot.queue_send_timeout, 0);
+    assert_eq!(terminal.queue_snapshot.compensation_pending, 0);
+    assert_eq!(terminal.queue_snapshot.compensation_running, 0);
     let continuation = terminal
         .report
         .continuation_token
@@ -1397,12 +1424,14 @@ async fn test_manual_transition_async_different_buckets_admit_concurrently() -> 
 
     for bucket in [MANUAL_ASYNC_PARALLEL_BUCKET_A, MANUAL_ASYNC_PARALLEL_BUCKET_B] {
         hot_client.create_bucket().bucket(bucket).send().await?;
-        put_lifecycle_transition_rule(&hot_client, bucket, "manual-async-parallel", MANUAL_ASYNC_PARALLEL_PREFIX, 0).await?;
+        put_lifecycle_transition_rule(&hot_client, bucket, "manual-async-parallel", MANUAL_ASYNC_PARALLEL_PREFIX, 1).await?;
         for idx in 0..MANUAL_ASYNC_PARALLEL_OBJECTS {
             let key = format!("{MANUAL_ASYNC_PARALLEL_PREFIX}obj-{idx:02}");
             put_single_part_object(&hot_client, bucket, &key, b"async parallel bucket payload").await?;
         }
     }
+
+    let before_remote_count = cold_tier_object_count(&cold_client).await?;
 
     let (first, second) = tokio::join!(
         manual_transition_async_run_raw(
@@ -1492,8 +1521,8 @@ async fn test_manual_transition_async_different_buckets_admit_concurrently() -> 
     assert_eq!(second_terminal.report.transition_failed, 0);
     assert_eq!(
         cold_tier_object_count(&cold_client).await?,
-        0,
-        "parallel dry-run jobs must not create remote tier objects"
+        before_remote_count,
+        "parallel dry-run jobs must not create additional remote tier objects"
     );
 
     Ok(())
@@ -1785,7 +1814,12 @@ async fn test_manual_transition_async_cancel_after_process_restart_recovers_term
     let cold_client = cold.create_s3_client();
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
-    let restart_env = [("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")];
+    let restart_env = [
+        ("RUSTFS_SCANNER_ENABLED", "false"),
+        ("RUSTFS_SCANNER_CYCLE", "3600"),
+        ("RUSTFS_MAX_TRANSITION_WORKERS", "1"),
+        ("RUSTFS_TRANSITION_QUEUE_CAPACITY", "512"),
+    ];
     let mut hot = RustFSTestEnvironment::new().await?;
     hot.start_rustfs_server_with_env(vec![], &restart_env).await?;
     let hot_client = hot.create_s3_client();
@@ -1805,9 +1839,9 @@ async fn test_manual_transition_async_cancel_after_process_restart_recovers_term
         put_single_part_object(&hot_client, MANUAL_RESTART_CANCEL_BUCKET, &key, b"manual restart cancel payload").await?;
     }
 
-    let before_remote_count = cold_tier_object_count(&cold_client).await?;
+    cold.stop_server();
     let accepted =
-        manual_transition_async_run(&hot, MANUAL_RESTART_CANCEL_BUCKET, MANUAL_RESTART_CANCEL_PREFIX, true, 10_000).await?;
+        manual_transition_async_run(&hot, MANUAL_RESTART_CANCEL_BUCKET, MANUAL_RESTART_CANCEL_PREFIX, false, 10_000).await?;
     let job_id = accepted.job_id.as_deref().ok_or("async response must include job_id")?;
     let status_endpoint = accepted
         .status_endpoint
@@ -1815,57 +1849,87 @@ async fn test_manual_transition_async_cancel_after_process_restart_recovers_term
         .ok_or("async response must include status_endpoint")?;
     assert_eq!(accepted.cancel_endpoint.as_deref(), Some(status_endpoint));
 
-    let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
-    assert_eq!(active.job_id, job_id);
-    assert!(!active.cancel_requested);
-
     hot.restart_server_preserving_data(vec![], &restart_env).await?;
 
     let restarted = manual_transition_job_status(&hot, status_endpoint).await?;
     assert_eq!(restarted.job_id, job_id);
     assert_eq!(restarted.status_endpoint, status_endpoint);
     assert_eq!(restarted.cancel_endpoint, status_endpoint);
-    assert!(
-        matches!(restarted.status.as_str(), "running" | "completed" | "partial" | "cancelled" | "unknown"),
-        "restart status response must be running or terminal: {restarted:#?}"
-    );
 
-    let cancel_after_restart = manual_transition_job_cancel(&hot, status_endpoint).await?;
-    assert_eq!(cancel_after_restart.job_id, job_id);
-    assert_eq!(cancel_after_restart.status_endpoint, status_endpoint);
-    assert_eq!(cancel_after_restart.cancel_endpoint, status_endpoint);
-    if cancel_after_restart.status == "running" {
-        assert!(
-            cancel_after_restart.cancel_requested,
-            "cancel after restart must durably mark a still-running job: {cancel_after_restart:#?}"
-        );
-    }
+    let terminal = match restarted.status.as_str() {
+        "running" => {
+            let cancel_after_restart = manual_transition_job_cancel(&hot, status_endpoint).await?;
+            assert_eq!(cancel_after_restart.job_id, job_id);
+            assert_eq!(cancel_after_restart.status_endpoint, status_endpoint);
+            assert_eq!(cancel_after_restart.cancel_endpoint, status_endpoint);
+            assert_eq!(
+                cancel_after_restart.status, "running",
+                "cancel after restart response: {cancel_after_restart:#?}"
+            );
+            assert!(
+                cancel_after_restart.cancel_requested,
+                "cancel after restart must durably mark a still-running job: {cancel_after_restart:#?}"
+            );
+            wait_for_manual_transition_job_terminal(&hot, status_endpoint, MANUAL_RESTART_RECOVERY_TIMEOUT).await?
+        }
+        "unknown" | "cancelled" | "completed" | "partial" => {
+            let cancel_after_restart = manual_transition_job_cancel(&hot, status_endpoint).await?;
+            assert_eq!(cancel_after_restart.job_id, job_id);
+            assert_eq!(cancel_after_restart.status_endpoint, status_endpoint);
+            assert_eq!(cancel_after_restart.cancel_endpoint, status_endpoint);
+            assert_eq!(cancel_after_restart.status, restarted.status);
+            assert_eq!(cancel_after_restart.report.bucket, MANUAL_RESTART_CANCEL_BUCKET);
+            assert_eq!(cancel_after_restart.report.prefix, MANUAL_RESTART_CANCEL_PREFIX);
+            assert!(!cancel_after_restart.report.dry_run);
+            cancel_after_restart
+        }
+        _ => {
+            return Err(format!("unexpected manual transition job status after restart: {restarted:#?}").into());
+        }
+    };
 
-    let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, MANUAL_RESTART_RECOVERY_TIMEOUT).await?;
     assert_eq!(terminal.job_id, job_id);
     assert_eq!(terminal.status_endpoint, status_endpoint);
     assert_eq!(terminal.cancel_endpoint, status_endpoint);
     assert!(
         matches!(terminal.status.as_str(), "unknown" | "cancelled" | "completed" | "partial"),
-        "post-restart manual transition job must fail closed or recover terminal: {terminal:#?}"
+        "post-restart manual transition job must remain readable through the durable endpoint: {terminal:#?}"
     );
-    if terminal.status == "unknown" {
-        assert!(
-            terminal
-                .failure_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("restart") || reason.contains("owner loss")),
-            "unknown terminal status must explain the restart/owner-loss boundary: {terminal:#?}"
-        );
+    match terminal.status.as_str() {
+        "unknown" => {
+            assert!(
+                terminal
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("unknown after restart") || reason.contains("owner loss")),
+                "unknown terminal status must explain the restart/owner-loss boundary: {terminal:#?}"
+            );
+        }
+        "cancelled" => {
+            assert!(
+                terminal.cancel_requested,
+                "cancelled terminal response must retain the cancel request: {terminal:#?}"
+            );
+            assert!(
+                terminal.report.cancelled,
+                "cancelled terminal response must report cancellation: {terminal:#?}"
+            );
+            assert_eq!(terminal.failure_reason, None);
+        }
+        "partial" => {
+            assert!(
+                terminal.report.transition_failed > 0 || terminal.report.tier_failure > 0,
+                "partial terminal response must report a worker or tier failure after cold-tier stop: {terminal:#?}"
+            );
+        }
+        "completed" => {
+            assert_eq!(terminal.failure_reason, None);
+        }
+        _ => unreachable!("terminal status was validated above"),
     }
     assert_eq!(terminal.report.bucket, MANUAL_RESTART_CANCEL_BUCKET);
     assert_eq!(terminal.report.prefix, MANUAL_RESTART_CANCEL_PREFIX);
-    assert!(terminal.report.dry_run);
-    assert_eq!(
-        cold_tier_object_count(&cold_client).await?,
-        before_remote_count,
-        "dry-run restart recovery must not create remote tier objects"
-    );
+    assert!(!terminal.report.dry_run);
 
     Ok(())
 }

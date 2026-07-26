@@ -1237,6 +1237,47 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_response_reads_back_terminal_queue_pressure_snapshot() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("WARM".to_string()),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, "owner-a");
+        let queue_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 4,
+            queued: 2,
+            active: 1,
+            workers: 2,
+            queue_full: 3,
+            queue_send_timeout: 5,
+            compensation_pending: 7,
+            compensation_running: 1,
+        };
+
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "bucket".to_string(),
+                prefix: options.prefix,
+                tier: options.tier,
+                skipped_queue_full: 3,
+                skipped_queue_timeout: 5,
+                ..Default::default()
+            },
+            queue_snapshot,
+        );
+
+        let response = manual_transition_job_response(record);
+
+        assert_eq!(response.status, ManualTransitionJobState::Partial);
+        assert_eq!(response.report.skipped_queue_full, 3);
+        assert_eq!(response.report.skipped_queue_timeout, 5);
+        assert_eq!(response.queue_snapshot, queue_snapshot);
+        assert!(response.completed_at_unix_nanos.is_some());
+        assert_eq!(response.failure_reason, None);
+    }
+
+    #[test]
     fn manual_transition_active_job_cancel_token_round_trips() {
         let job_id = Uuid::new_v4();
         let cancel_token = CancellationToken::new();
