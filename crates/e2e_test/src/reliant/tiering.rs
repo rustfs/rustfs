@@ -75,6 +75,8 @@ const MANUAL_CONTINUATION_BUCKET: &str = "ilm7-manual-continuation";
 const MANUAL_ASYNC_LIMIT_BUCKET: &str = "ilm7-manual-async-limit";
 const MANUAL_ASYNC_CONFLICT_BUCKET: &str = "ilm7-manual-async-conflict";
 const MANUAL_ASYNC_SAME_SCOPE_CONFLICT_BUCKET: &str = "ilm7-manual-async-same-scope-conflict";
+const MANUAL_ASYNC_PARALLEL_BUCKET_A: &str = "ilm7-manual-async-parallel-a";
+const MANUAL_ASYNC_PARALLEL_BUCKET_B: &str = "ilm7-manual-async-parallel-b";
 const MANUAL_TIER_FAILURE_BUCKET: &str = "ilm7-manual-tier-failure";
 const MANUAL_WORKER_FAILURE_BUCKET: &str = "ilm7-manual-worker-failure";
 const MANUAL_ACTIVE_CANCEL_BUCKET: &str = "ilm7-manual-active-cancel";
@@ -84,10 +86,12 @@ const MANUAL_ASYNC_LIMIT_PREFIX: &str = "manual-async-limit/";
 const MANUAL_ASYNC_CONFLICT_PREFIX: &str = "manual-async-conflict/";
 const MANUAL_ASYNC_CONFLICT_NESTED_PREFIX: &str = "manual-async-conflict/nested/";
 const MANUAL_ASYNC_SAME_SCOPE_CONFLICT_PREFIX: &str = "manual-async-same-scope-conflict/";
+const MANUAL_ASYNC_PARALLEL_PREFIX: &str = "manual-async-parallel/";
 const MANUAL_TIER_FAILURE_PREFIX: &str = "manual-tier-failure/";
 const MANUAL_WORKER_FAILURE_PREFIX: &str = "manual-worker-failure/";
 const MANUAL_ACTIVE_CANCEL_PREFIX: &str = "manual-active-cancel/";
 const MANUAL_ASYNC_CONFLICT_OBJECTS: usize = 512;
+const MANUAL_ASYNC_PARALLEL_OBJECTS: usize = 64;
 const MANUAL_ACTIVE_CANCEL_OBJECTS: usize = 512;
 const MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
@@ -1328,6 +1332,125 @@ async fn test_manual_transition_async_same_scope_conflict_reports_active_job() -
         "terminal same-scope conflict winner response: {terminal:#?}"
     );
     assert!(cold_tier_object_count(&cold_client).await? <= 50);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_manual_transition_async_different_buckets_admit_concurrently() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "manualasyncparallelcoldadmin".to_string();
+    cold.secret_key = "manualasyncparallelcoldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    for bucket in [MANUAL_ASYNC_PARALLEL_BUCKET_A, MANUAL_ASYNC_PARALLEL_BUCKET_B] {
+        hot_client.create_bucket().bucket(bucket).send().await?;
+        put_lifecycle_transition_rule(&hot_client, bucket, "manual-async-parallel", MANUAL_ASYNC_PARALLEL_PREFIX, 0).await?;
+        for idx in 0..MANUAL_ASYNC_PARALLEL_OBJECTS {
+            let key = format!("{MANUAL_ASYNC_PARALLEL_PREFIX}obj-{idx:02}");
+            put_single_part_object(&hot_client, bucket, &key, b"async parallel bucket payload").await?;
+        }
+    }
+
+    let (first, second) = tokio::join!(
+        manual_transition_async_run_raw(
+            &hot,
+            MANUAL_ASYNC_PARALLEL_BUCKET_A,
+            MANUAL_ASYNC_PARALLEL_PREFIX,
+            true,
+            MANUAL_ASYNC_PARALLEL_OBJECTS as u64
+        ),
+        manual_transition_async_run_raw(
+            &hot,
+            MANUAL_ASYNC_PARALLEL_BUCKET_B,
+            MANUAL_ASYNC_PARALLEL_PREFIX,
+            true,
+            MANUAL_ASYNC_PARALLEL_OBJECTS as u64
+        )
+    );
+    let first = first?;
+    let second = second?;
+    assert_eq!(
+        first.0,
+        reqwest::StatusCode::ACCEPTED,
+        "different-bucket async run A must not conflict with run B: {}",
+        first.1
+    );
+    assert_eq!(
+        second.0,
+        reqwest::StatusCode::ACCEPTED,
+        "different-bucket async run B must not conflict with run A: {}",
+        second.1
+    );
+
+    let first: ManualTransitionRunResponse = serde_json::from_str(&first.1)?;
+    let second: ManualTransitionRunResponse = serde_json::from_str(&second.1)?;
+    assert_eq!(first.state, "accepted");
+    assert_eq!(first.mode, "durable_job");
+    assert_eq!(first.report.bucket, MANUAL_ASYNC_PARALLEL_BUCKET_A);
+    assert_eq!(first.report.prefix, MANUAL_ASYNC_PARALLEL_PREFIX);
+    assert!(first.report.dry_run);
+    assert_eq!(second.state, "accepted");
+    assert_eq!(second.mode, "durable_job");
+    assert_eq!(second.report.bucket, MANUAL_ASYNC_PARALLEL_BUCKET_B);
+    assert_eq!(second.report.prefix, MANUAL_ASYNC_PARALLEL_PREFIX);
+    assert!(second.report.dry_run);
+
+    let first_job_id = first.job_id.as_deref().ok_or("accepted async run A must include job_id")?;
+    let first_status_endpoint = first
+        .status_endpoint
+        .as_deref()
+        .ok_or("accepted async run A must include status_endpoint")?;
+    let second_job_id = second.job_id.as_deref().ok_or("accepted async run B must include job_id")?;
+    let second_status_endpoint = second
+        .status_endpoint
+        .as_deref()
+        .ok_or("accepted async run B must include status_endpoint")?;
+    assert_ne!(first_job_id, second_job_id);
+    assert_ne!(first_status_endpoint, second_status_endpoint);
+    assert_eq!(first.cancel_endpoint.as_deref(), Some(first_status_endpoint));
+    assert_eq!(second.cancel_endpoint.as_deref(), Some(second_status_endpoint));
+
+    let (first_terminal, second_terminal) = tokio::join!(
+        wait_for_manual_transition_job_terminal(&hot, first_status_endpoint, StdDuration::from_secs(30)),
+        wait_for_manual_transition_job_terminal(&hot, second_status_endpoint, StdDuration::from_secs(30))
+    );
+    let first_terminal = first_terminal?;
+    let second_terminal = second_terminal?;
+    assert_eq!(first_terminal.job_id, first_job_id);
+    assert_eq!(first_terminal.status, "completed", "terminal parallel run A: {first_terminal:#?}");
+    assert_eq!(first_terminal.report.bucket, MANUAL_ASYNC_PARALLEL_BUCKET_A);
+    assert_eq!(first_terminal.report.prefix, MANUAL_ASYNC_PARALLEL_PREFIX);
+    assert_eq!(
+        first_terminal.report.scanned, MANUAL_ASYNC_PARALLEL_OBJECTS as u64,
+        "terminal parallel run A: {first_terminal:#?}"
+    );
+    assert!(!first_terminal.report.cancelled);
+    assert_eq!(first_terminal.report.transition_failed, 0);
+
+    assert_eq!(second_terminal.job_id, second_job_id);
+    assert_eq!(second_terminal.status, "completed", "terminal parallel run B: {second_terminal:#?}");
+    assert_eq!(second_terminal.report.bucket, MANUAL_ASYNC_PARALLEL_BUCKET_B);
+    assert_eq!(second_terminal.report.prefix, MANUAL_ASYNC_PARALLEL_PREFIX);
+    assert_eq!(
+        second_terminal.report.scanned, MANUAL_ASYNC_PARALLEL_OBJECTS as u64,
+        "terminal parallel run B: {second_terminal:#?}"
+    );
+    assert!(!second_terminal.report.cancelled);
+    assert_eq!(second_terminal.report.transition_failed, 0);
+    assert_eq!(
+        cold_tier_object_count(&cold_client).await?,
+        0,
+        "parallel dry-run jobs must not create remote tier objects"
+    );
 
     Ok(())
 }
