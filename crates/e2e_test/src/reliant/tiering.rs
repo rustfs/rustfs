@@ -1003,6 +1003,15 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert!(!terminal.report.cancelled);
     assert!(terminal.report.truncated_by_limit);
     assert!(!terminal.report.truncated_by_duration);
+    let continuation = terminal
+        .report
+        .continuation_token
+        .as_deref()
+        .ok_or("terminal partial async job must return an opaque continuation token")?;
+    assert!(
+        !continuation.contains(MANUAL_ASYNC_LIMIT_PREFIX),
+        "async continuation token must not expose the raw object prefix: {continuation}"
+    );
 
     let after_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(after_cancel.status, "partial");
@@ -1019,6 +1028,7 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(after_cancel.report.tier_failure, terminal.report.tier_failure);
     assert_eq!(after_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(after_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
+    assert_eq!(after_cancel.report.continuation_token, terminal.report.continuation_token);
 
     let second_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(second_cancel.status, "partial");
@@ -1031,6 +1041,32 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     assert_eq!(second_cancel.report.tier_failure, terminal.report.tier_failure);
     assert_eq!(second_cancel.report.cancelled, terminal.report.cancelled);
     assert_eq!(second_cancel.report.truncated_by_limit, terminal.report.truncated_by_limit);
+    assert_eq!(second_cancel.report.continuation_token, terminal.report.continuation_token);
+
+    let resumed = manual_transition_run_with_max_and_continuation(
+        &hot,
+        MANUAL_ASYNC_LIMIT_BUCKET,
+        MANUAL_ASYNC_LIMIT_PREFIX,
+        false,
+        10,
+        Some(continuation),
+    )
+    .await?;
+    assert_eq!(resumed.state, "completed", "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.mode, "enqueue_only");
+    assert_eq!(resumed.report.bucket, MANUAL_ASYNC_LIMIT_BUCKET);
+    assert_eq!(resumed.report.prefix, MANUAL_ASYNC_LIMIT_PREFIX);
+    assert_eq!(resumed.report.tier.as_deref(), Some(TIER_NAME));
+    assert!(!resumed.report.dry_run);
+    assert_eq!(resumed.report.scanned, 1, "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.report.eligible, 0, "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.report.skipped_not_transition, 1, "async limit continuation resume: {resumed:#?}");
+    assert_eq!(resumed.report.transition_completed, 0);
+    assert_eq!(resumed.report.transition_failed, 0);
+    assert_eq!(resumed.report.tier_failure, 0);
+    assert!(!resumed.report.cancelled);
+    assert!(!resumed.report.truncated_by_limit);
+    assert!(resumed.report.continuation_token.is_none());
     assert_eq!(cold_tier_object_count(&cold_client).await?, before_remote_count);
     Ok(())
 }
