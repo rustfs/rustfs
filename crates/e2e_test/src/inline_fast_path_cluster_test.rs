@@ -1313,12 +1313,17 @@ async fn wait_for_manual_transition_job_terminal(
     hot: &RustFSTestClusterEnvironment,
     node_index: usize,
     job_id: &str,
+    retry_missing: bool,
 ) -> TestResult<serde_json::Value> {
     let path = format!("/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (status, response) =
             signed_admin_request(&hot.nodes[node_index].url, Method::GET, &path, None, &hot.access_key, &hot.secret_key).await?;
+        if retry_missing && status == StatusCode::NOT_FOUND && Instant::now() < deadline {
+            sleep(Duration::from_millis(200)).await;
+            continue;
+        }
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1790,7 +1795,7 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
     hot_client.create_bucket().bucket(&bucket).send().await?;
 
     let job_id = start_manual_transition_job(&hot, &bucket).await?;
-    let terminal = wait_for_manual_transition_job_terminal(&hot, 0, &job_id).await?;
+    let terminal = wait_for_manual_transition_job_terminal(&hot, 0, &job_id, false).await?;
     assert_eq!(
         terminal["status"].as_str(),
         Some("completed"),
@@ -1802,7 +1807,7 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
 
     hot.stop_node(3)?;
     hot.start_node(3).await?;
-    let after_restart = wait_for_manual_transition_job_terminal(&hot, 3, &job_id).await?;
+    let after_restart = wait_for_manual_transition_job_terminal(&hot, 3, &job_id, true).await?;
     assert_eq!(after_restart["status"], terminal["status"], "terminal job status changed after restart");
     assert_eq!(after_restart["job_id"].as_str(), Some(job_id.as_str()));
     assert_eq!(after_restart["bucket"].as_str(), Some(bucket.as_str()));
