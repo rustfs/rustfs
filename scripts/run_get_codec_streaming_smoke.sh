@@ -1284,6 +1284,92 @@ warmup_warp_get_before_bench() {
   done < <(benchmark_sizes)
 }
 
+ensure_benchmark_buckets_exist() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local bucket_file="${profile_dir}/benchmark_buckets.txt"
+  local bucket
+
+  : >"$bucket_file"
+  while IFS= read -r size; do
+    [[ -n "$size" ]] || continue
+    bucket="$(bucket_for_size "$size")"
+    if ! grep -Fxq "$bucket" "$bucket_file"; then
+      printf '%s\n' "$bucket" >>"$bucket_file"
+    fi
+  done < <(benchmark_sizes)
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY-RUN] ensure benchmark buckets exist profile=${profile} buckets=${bucket_file}"
+    return
+  fi
+
+  "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$bucket_file" <<'PY'
+import datetime as dt
+import hashlib
+import hmac
+import http.client
+import pathlib
+import sys
+import urllib.parse
+
+endpoint, access_key, secret_key, region, bucket_file = sys.argv[1:]
+parsed = urllib.parse.urlsplit(endpoint)
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sign(key: bytes, value: str) -> bytes:
+    return hmac.new(key, value.encode(), hashlib.sha256).digest()
+
+
+def signing_key(secret: str, date_stamp: str) -> bytes:
+    key_date = sign(("AWS4" + secret).encode(), date_stamp)
+    key_region = sign(key_date, region)
+    key_service = sign(key_region, "s3")
+    return sign(key_service, "aws4_request")
+
+
+def canonical_uri(path: str) -> str:
+    return "/".join(urllib.parse.quote(part, safe="-_.~/") for part in path.split("/")) or "/"
+
+
+def signed_headers(method: str, path: str, body: bytes):
+    amz_date = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    headers = [("host", parsed.netloc), ("x-amz-content-sha256", sha256_hex(body)), ("x-amz-date", amz_date)]
+    canonical_headers = "".join(f"{name}:{value}\n" for name, value in headers)
+    signed_names = ";".join(name for name, _ in headers)
+    canonical_request = "\n".join([method, canonical_uri(path), "", canonical_headers, signed_names, sha256_hex(body)])
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical_request.encode()).hexdigest()])
+    signature = hmac.new(signing_key(secret_key, date_stamp), string_to_sign.encode(), hashlib.sha256).hexdigest()
+    result = {name: value for name, value in headers}
+    result["Authorization"] = (
+        "AWS4-HMAC-SHA256 "
+        f"Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_names}, "
+        f"Signature={signature}"
+    )
+    return result
+
+
+for bucket in pathlib.Path(bucket_file).read_text(encoding="utf-8").splitlines():
+    if not bucket:
+        continue
+    path = "/" + urllib.parse.quote(bucket, safe="")
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request("PUT", path, body=b"", headers=signed_headers("PUT", path, b""))
+    response = conn.getresponse()
+    response.read()
+    conn.close()
+    if response.status not in (200, 409):
+        raise SystemExit(f"create benchmark bucket failed: {bucket}: {response.status} {response.reason}")
+PY
+}
+
 run_bench() {
   local profile="$1"
   local baseline_csv="${2:-}"
@@ -4006,6 +4092,7 @@ run_profile() {
 
   stop_server
   start_server "$profile"
+  ensure_benchmark_buckets_exist "$profile"
   prepare_warp_existing_objects "$profile"
   warmup_warp_get_before_bench "$profile"
   capture_service_metrics_snapshot "$profile" before
