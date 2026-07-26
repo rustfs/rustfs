@@ -59,6 +59,8 @@ const OBSERVABILITY_SUMMARY_RESOLVED: &str = "observability summary resolved fro
 const TOPOLOGY_SUMMARY_RESOLVED: &str = "topology summary resolved from capability snapshot";
 const TOPOLOGY_SNAPSHOT_NOT_AVAILABLE: &str = "endpoint topology is not available before storage endpoint pools initialize";
 pub(crate) const RUNTIME_CAPABILITIES_ROUTE_SUFFIX: &str = "/v4/runtime/capabilities";
+const MANUAL_TRANSITION_RUN_ROUTE: &str = "/rustfs/admin/v3/ilm/transition/run";
+const MANUAL_TRANSITION_JOB_ROUTE: &str = "/rustfs/admin/v3/ilm/transition/jobs/{job_id}";
 const SITE_REPLICATION_INFO_ROUTE: &str = "/rustfs/admin/v3/site-replication/info";
 const SITE_REPLICATION_EDIT_ROUTE: &str = "/rustfs/admin/v3/site-replication/edit";
 const SITE_REPLICATION_RESYNC_ROUTE: &str = "/rustfs/admin/v3/site-replication/resync/op";
@@ -635,11 +637,14 @@ pub struct RuntimeCapabilitiesSummary {
     pub site_replication_resync: CapabilityStatus,
     #[serde(default)]
     pub site_replication_repair: CapabilityStatus,
+    #[serde(default)]
+    pub manual_transition_jobs: CapabilityStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    pub manual_transition_jobs: ManualTransitionJobCapabilities,
     pub diagnostic_probes: DiagnosticProbeCapabilities,
     pub inspect_archive: super::inspect_archive::InspectArchiveCapability,
     pub storage_classes: StorageClassCapabilities,
@@ -650,6 +655,45 @@ pub struct RuntimeCapabilitiesResponse {
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManualTransitionJobCapabilities {
+    pub contract_version: u32,
+    pub status: CapabilityStatus,
+    pub modes: [&'static str; 2],
+    pub run_route: &'static str,
+    pub status_route: &'static str,
+    pub cancel_route: &'static str,
+    pub job_id_format: &'static str,
+    pub admission_scope: &'static str,
+    pub mixed_version_policy: &'static str,
+}
+
+impl ManualTransitionJobCapabilities {
+    fn current() -> Self {
+        let run = admin_route_capability(HttpMethod::Post, MANUAL_TRANSITION_RUN_ROUTE);
+        let status = admin_route_capability(HttpMethod::Get, MANUAL_TRANSITION_JOB_ROUTE);
+        let cancel = admin_route_capability(HttpMethod::Delete, MANUAL_TRANSITION_JOB_ROUTE);
+        let supported = run.state == CapabilityState::Supported
+            && status.state == CapabilityState::Supported
+            && cancel.state == CapabilityState::Supported;
+        Self {
+            contract_version: 1,
+            status: if supported {
+                CapabilityStatus::supported().with_reason("durable manual transition job routes are registered")
+            } else {
+                CapabilityStatus::unsupported().with_reason("one or more durable manual transition job routes are unavailable")
+            },
+            modes: ["enqueue_only", "async"],
+            run_route: MANUAL_TRANSITION_RUN_ROUTE,
+            status_route: MANUAL_TRANSITION_JOB_ROUTE,
+            cancel_route: MANUAL_TRANSITION_JOB_ROUTE,
+            job_id_format: "uuid",
+            admission_scope: "bucket",
+            mixed_version_policy: "fail_closed_when_capability_unknown_or_unsupported",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -827,6 +871,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        manual_transition_jobs: ManualTransitionJobCapabilities::current(),
         diagnostic_probes: DiagnosticProbeCapabilities::current(),
         inspect_archive: super::inspect_archive::InspectArchiveCapability::current(local_drive_count),
         storage_classes: StorageClassCapabilities::current(),
@@ -908,6 +953,7 @@ fn build_runtime_capabilities_summary(
         site_replication_edit: admin_route_capability(HttpMethod::Put, SITE_REPLICATION_EDIT_ROUTE),
         site_replication_resync: admin_route_capability(HttpMethod::Put, SITE_REPLICATION_RESYNC_ROUTE),
         site_replication_repair: SiteReplicationRepairCapabilities::current().status,
+        manual_transition_jobs: ManualTransitionJobCapabilities::current().status,
     }
 }
 
@@ -1039,11 +1085,12 @@ impl Operation for DataUsageInfoHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBSERVABILITY_SUMMARY_RESOLVED, RuntimeCapabilitiesHandler, SITE_REPLICATION_EDIT_ROUTE, SITE_REPLICATION_INFO_ROUTE,
-        SITE_REPLICATION_REPAIR_ROUTE, SITE_REPLICATION_REPAIR_STATUS_ROUTE, SITE_REPLICATION_RESYNC_ROUTE, ServerInfoResponse,
-        TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED, admin_route_capability_from_inventory,
-        build_runtime_capabilities_response, build_runtime_capabilities_summary, data_usage_info_gate_actions,
-        runtime_capabilities_gate_actions, system_admin_discovery,
+        MANUAL_TRANSITION_JOB_ROUTE, MANUAL_TRANSITION_RUN_ROUTE, OBSERVABILITY_SUMMARY_RESOLVED, RuntimeCapabilitiesHandler,
+        SITE_REPLICATION_EDIT_ROUTE, SITE_REPLICATION_INFO_ROUTE, SITE_REPLICATION_REPAIR_ROUTE,
+        SITE_REPLICATION_REPAIR_STATUS_ROUTE, SITE_REPLICATION_RESYNC_ROUTE, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE,
+        TOPOLOGY_SUMMARY_RESOLVED, admin_route_capability_from_inventory, build_runtime_capabilities_response,
+        build_runtime_capabilities_summary, data_usage_info_gate_actions, runtime_capabilities_gate_actions,
+        system_admin_discovery,
     };
     use crate::admin::router::Operation;
     use crate::admin::runtime_sources::DefaultAdminUsecase;
@@ -1096,6 +1143,19 @@ mod tests {
         assert_eq!(response.summary.site_replication_edit.state, CapabilityState::Supported);
         assert_eq!(response.summary.site_replication_resync.state, CapabilityState::Supported);
         assert_eq!(response.summary.site_replication_repair.state, CapabilityState::Supported);
+        assert_eq!(response.summary.manual_transition_jobs.state, CapabilityState::Supported);
+        assert_eq!(response.manual_transition_jobs.contract_version, 1);
+        assert_eq!(response.manual_transition_jobs.status.state, CapabilityState::Supported);
+        assert_eq!(response.manual_transition_jobs.modes, ["enqueue_only", "async"]);
+        assert_eq!(response.manual_transition_jobs.run_route, MANUAL_TRANSITION_RUN_ROUTE);
+        assert_eq!(response.manual_transition_jobs.status_route, MANUAL_TRANSITION_JOB_ROUTE);
+        assert_eq!(response.manual_transition_jobs.cancel_route, MANUAL_TRANSITION_JOB_ROUTE);
+        assert_eq!(response.manual_transition_jobs.job_id_format, "uuid");
+        assert_eq!(response.manual_transition_jobs.admission_scope, "bucket");
+        assert_eq!(
+            response.manual_transition_jobs.mixed_version_policy,
+            "fail_closed_when_capability_unknown_or_unsupported"
+        );
         assert_eq!(response.site_replication_repair.contract_version, 1);
         assert_eq!(response.site_replication_repair.status.state, CapabilityState::Supported);
         assert_eq!(response.site_replication_repair.modes, ["dry-run", "execute"]);
@@ -1142,6 +1202,19 @@ mod tests {
         assert_eq!(value["summary"]["site_replication_edit"]["state"], "supported");
         assert_eq!(value["summary"]["site_replication_resync"]["state"], "supported");
         assert_eq!(value["summary"]["site_replication_repair"]["state"], "supported");
+        assert_eq!(value["summary"]["manual_transition_jobs"]["state"], "supported");
+        assert_eq!(value["manual_transition_jobs"]["contract_version"], 1);
+        assert_eq!(value["manual_transition_jobs"]["status"]["state"], "supported");
+        assert_eq!(value["manual_transition_jobs"]["modes"], json!(["enqueue_only", "async"]));
+        assert_eq!(value["manual_transition_jobs"]["run_route"], MANUAL_TRANSITION_RUN_ROUTE);
+        assert_eq!(value["manual_transition_jobs"]["status_route"], MANUAL_TRANSITION_JOB_ROUTE);
+        assert_eq!(value["manual_transition_jobs"]["cancel_route"], MANUAL_TRANSITION_JOB_ROUTE);
+        assert_eq!(value["manual_transition_jobs"]["job_id_format"], "uuid");
+        assert_eq!(value["manual_transition_jobs"]["admission_scope"], "bucket");
+        assert_eq!(
+            value["manual_transition_jobs"]["mixed_version_policy"],
+            "fail_closed_when_capability_unknown_or_unsupported"
+        );
         assert_eq!(value["site_replication_repair"]["contract_version"], 1);
         assert_eq!(value["site_replication_repair"]["status"]["state"], "supported");
         assert_eq!(value["site_replication_repair"]["modes"], json!(["dry-run", "execute"]));
@@ -1176,6 +1249,26 @@ mod tests {
             (HttpMethod::Put, SITE_REPLICATION_RESYNC_ROUTE),
             (HttpMethod::Put, SITE_REPLICATION_REPAIR_ROUTE),
             (HttpMethod::Get, SITE_REPLICATION_REPAIR_STATUS_ROUTE),
+        ] {
+            assert_eq!(
+                admin_route_capability_from_inventory(
+                    method,
+                    path,
+                    crate::admin::route_policy::ADMIN_ROUTE_POLICY_SPECS,
+                    crate::admin::route_policy::DEFERRED_ADMIN_ROUTE_POLICIES,
+                )
+                .state,
+                CapabilityState::Supported,
+            );
+        }
+    }
+
+    #[test]
+    fn manual_transition_job_capabilities_follow_public_route_inventory() {
+        for (method, path) in [
+            (HttpMethod::Post, MANUAL_TRANSITION_RUN_ROUTE),
+            (HttpMethod::Get, MANUAL_TRANSITION_JOB_ROUTE),
+            (HttpMethod::Delete, MANUAL_TRANSITION_JOB_ROUTE),
         ] {
             assert_eq!(
                 admin_route_capability_from_inventory(
@@ -1235,6 +1328,7 @@ mod tests {
         assert_eq!(summary.site_replication_edit.state, CapabilityState::Unknown);
         assert_eq!(summary.site_replication_resync.state, CapabilityState::Unknown);
         assert_eq!(summary.site_replication_repair.state, CapabilityState::Unknown);
+        assert_eq!(summary.manual_transition_jobs.state, CapabilityState::Unknown);
     }
 
     #[tokio::test]
