@@ -66,19 +66,8 @@ impl Evaluator {
     }
 
     /// IsObjectLocked checks if it is appropriate to remove an
-    /// object according to locking configuration when this is lifecycle/bucket quota asking.
-    /// Uses the common `is_object_locked_by_metadata` function for consistency.
+    /// object according to its persisted object-lock metadata.
     pub fn is_object_locked(&self, obj: &ObjectOpts) -> bool {
-        // First check if object lock is enabled for this bucket
-        if self.lock_retention.as_ref().is_none_or(|v| {
-            v.object_lock_enabled
-                .as_ref()
-                .is_none_or(|v| v.as_str() != ObjectLockEnabled::ENABLED)
-        }) {
-            return false;
-        }
-
-        // Use the common function to check if the object is locked
         object_lock::is_object_locked_by_metadata(&obj.user_defined, obj.delete_marker)
     }
 
@@ -102,7 +91,8 @@ impl Evaluator {
                             v.object_lock_enabled
                                 .as_ref()
                                 .is_some_and(|v| v.as_str() == ObjectLockEnabled::ENABLED)
-                        }) || self.any_version_has_pending_replication(objs)
+                        }) || objs.iter().any(|obj| self.is_object_locked(obj))
+                            || self.any_version_has_pending_replication(objs)
                         {
                             event = Event::default();
                         } else {
@@ -122,9 +112,14 @@ impl Evaluator {
                             break 'top_loop;
                         }
                     }
-                    IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction => {
+                    IlmAction::DeleteAction
+                    | IlmAction::DeleteRestoredAction
+                    | IlmAction::DeleteVersionAction
+                    | IlmAction::DeleteRestoredVersionAction => {
                         // Defensive code, should never happen
-                        if obj.version_id.is_none_or(|v| v.is_nil()) {
+                        if matches!(event.action, IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction)
+                            && obj.version_id.is_none_or(|v| v.is_nil())
+                        {
                             event.action = IlmAction::NoneAction;
                         }
                         if self.is_object_locked(obj) {
@@ -198,12 +193,15 @@ fn lifecycle_action_waits_for_replication(action: IlmAction) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use rustfs_common::metrics::IlmAction;
     use s3s::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Transition, TransitionStorageClass,
+        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, ObjectLockConfiguration,
+        ObjectLockEnabled, Transition, TransitionStorageClass,
     };
+    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -295,6 +293,13 @@ mod tests {
         })
     }
 
+    fn lock_enabled_without_default_retention() -> Arc<ObjectLockConfiguration> {
+        Arc::new(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: None,
+        })
+    }
+
     fn object_opts(replication_status: ReplicationStatusType, version_purge_status: VersionPurgeStatusType) -> ObjectOpts {
         ObjectOpts {
             name: "logs/object".to_string(),
@@ -321,11 +326,38 @@ mod tests {
         }
     }
 
+    fn locked_current_object_opts(replication_status: ReplicationStatusType) -> ObjectOpts {
+        let mut user_defined = HashMap::new();
+        user_defined.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+
+        ObjectOpts {
+            user_defined,
+            ..current_object_opts(replication_status)
+        }
+    }
+
     fn versioned_object_opts(replication_status: ReplicationStatusType, is_latest: bool) -> ObjectOpts {
         ObjectOpts {
             num_versions: 2,
             is_latest,
             ..current_object_opts(replication_status)
+        }
+    }
+
+    fn locked_versioned_object_opts(replication_status: ReplicationStatusType, is_latest: bool) -> ObjectOpts {
+        let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("future retain-until date should format");
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        user_defined.insert(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until);
+
+        ObjectOpts {
+            user_defined,
+            ..versioned_object_opts(replication_status, is_latest)
         }
     }
 
@@ -415,6 +447,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluator_skips_latest_expiration_for_explicit_legal_hold_without_default_retention() {
+        let evaluator =
+            Evaluator::new(latest_expiration_lifecycle()).with_lock_retention(Some(lock_enabled_without_default_retention()));
+
+        let events = evaluator
+            .eval(&[locked_current_object_opts(ReplicationStatusType::Completed)])
+            .await
+            .expect("explicit legal hold should still produce a lifecycle decision");
+
+        assert_eq!(events[0].action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
     async fn evaluator_skips_transition_while_replication_pending() {
         let evaluator = Evaluator::new(latest_transition_lifecycle());
 
@@ -465,6 +510,22 @@ mod tests {
             .expect("completed replication should allow delete-all lifecycle decision");
 
         assert_eq!(events[0].action, IlmAction::DeleteAllVersionsAction);
+        assert_eq!(events[1].action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn evaluator_skips_delete_all_versions_for_explicit_retention_without_default_retention() {
+        let evaluator = Evaluator::new(all_versions_expiration_lifecycle())
+            .with_lock_retention(Some(lock_enabled_without_default_retention()));
+        let latest = versioned_object_opts(ReplicationStatusType::Completed, true);
+        let noncurrent = locked_versioned_object_opts(ReplicationStatusType::Completed, false);
+
+        let events = evaluator
+            .eval(&[latest, noncurrent])
+            .await
+            .expect("explicit retention should still produce lifecycle decisions");
+
+        assert_eq!(events[0].action, IlmAction::NoneAction);
         assert_eq!(events[1].action, IlmAction::NoneAction);
     }
 }

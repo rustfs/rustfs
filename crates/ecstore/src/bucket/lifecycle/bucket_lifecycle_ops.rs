@@ -80,7 +80,11 @@ use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
 };
-use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
+use rustfs_utils::{
+    get_env_i64, get_env_usize,
+    path::encode_dir_object,
+    string::{parse_bool, strings_has_prefix_fold},
+};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ObjectLockConfiguration, RestoreRequest,
     RestoreRequestType, RestoreStatus, Timestamp,
@@ -140,6 +144,7 @@ pub const AMZ_ENCRYPTION_KMS: &str = "aws:kms";
 pub const ERR_INVALID_STORAGECLASS: &str = "invalid tier.";
 const ENV_STALE_UPLOADS_EXPIRY: &str = "RUSTFS_API_STALE_UPLOADS_EXPIRY";
 const ENV_STALE_UPLOADS_CLEANUP_INTERVAL: &str = "RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL";
+const ENV_TIER_FREE_VERSION_RECOVERY_ENABLED: &str = "RUSTFS_TIER_FREE_VERSION_RECOVERY_ENABLED";
 const DEFAULT_STALE_UPLOADS_EXPIRY: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(6 * 60 * 60);
 const TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL: StdDuration = StdDuration::from_secs(60);
@@ -2084,7 +2089,51 @@ async fn abandon_manual_transition_recovery_lease(api: Arc<ECStore>, job_id: Uui
     Ok(())
 }
 
+fn tier_free_version_recovery_enabled() -> bool {
+    resolve_tier_free_version_recovery_enabled(env::var(ENV_TIER_FREE_VERSION_RECOVERY_ENABLED))
+}
+
+fn resolve_tier_free_version_recovery_enabled(value: Result<String, env::VarError>) -> bool {
+    match value {
+        Ok(value) => match parse_bool(value.trim()) {
+            Ok(enabled) => enabled,
+            Err(_) => {
+                warn!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    env = ENV_TIER_FREE_VERSION_RECOVERY_ENABLED,
+                    reason = "invalid_boolean",
+                    "Invalid tier free-version recovery setting; using enabled default"
+                );
+                true
+            }
+        },
+        Err(env::VarError::NotPresent) => true,
+        Err(env::VarError::NotUnicode(_)) => {
+            warn!(
+                event = EVENT_LIFECYCLE_WORKER_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                env = ENV_TIER_FREE_VERSION_RECOVERY_ENABLED,
+                "Non-Unicode tier free-version recovery setting; using enabled default"
+            );
+            true
+        }
+    }
+}
+
 fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<()>) -> Option<JoinHandle<()>> {
+    if !tier_free_version_recovery_enabled() {
+        warn!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            env = ENV_TIER_FREE_VERSION_RECOVERY_ENABLED,
+            "Tier free-version recovery disabled by configuration"
+        );
+        return None;
+    }
     if started.set(()).is_err() {
         return None;
     }
@@ -2256,6 +2305,7 @@ fn jitter_tier_free_version_recovery_delay(delay: StdDuration) -> StdDuration {
 struct TierFreeVersionRecoverySchedule {
     next_delay: StdDuration,
     idle_interval: StdDuration,
+    failure_interval: StdDuration,
     previous_run_duration: StdDuration,
     jitter_next_delay: bool,
     bucket_marker: Option<String>,
@@ -2268,6 +2318,7 @@ impl Default for TierFreeVersionRecoverySchedule {
         Self {
             next_delay: StdDuration::ZERO,
             idle_interval: TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
+            failure_interval: TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL,
             previous_run_duration: StdDuration::ZERO,
             jitter_next_delay: false,
             bucket_marker: None,
@@ -2292,12 +2343,19 @@ impl TierFreeVersionRecoverySchedule {
         self.reset_idle_interval();
     }
 
-    fn record_failure(&mut self, run_duration: StdDuration) {
-        self.reset_idle_interval();
-        self.previous_run_duration = run_duration;
+    fn record_failure(&mut self, _run_duration: StdDuration) {
+        self.idle_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
+        self.next_delay = self.failure_interval;
+        self.failure_interval =
+            std::cmp::min(self.failure_interval.saturating_mul(2), TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL);
+        // Keep the full backoff even after a long failed run, so a run whose
+        // duration exceeds the interval cannot restart immediately.
+        self.previous_run_duration = StdDuration::ZERO;
+        self.jitter_next_delay = false;
     }
 
     fn record_success(&mut self, stats: &FreeVersionRecoveryStats, run_duration: StdDuration) {
+        self.failure_interval = TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL;
         if stats.enqueued > 0 || stats.failed > 0 {
             self.follow_up_sweep = true;
         }
@@ -4079,20 +4137,27 @@ pub async fn eval_action_from_lifecycle(
     );
 
     let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
+    let object_locked = object_lock_boundary::is_object_locked_by_metadata(&oi.user_defined, oi.delete_marker);
 
     match event.action {
-        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction if lock_enabled => {
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction if lock_enabled || object_locked => {
             return lifecycle::Event::default();
         }
-        IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction => {
-            if oi.version_id.is_none() {
+        IlmAction::DeleteAction
+        | IlmAction::DeleteRestoredAction
+        | IlmAction::DeleteVersionAction
+        | IlmAction::DeleteRestoredVersionAction => {
+            if matches!(event.action, IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction)
+                && oi.version_id.is_none()
+            {
                 return lifecycle::Event::default();
             }
             // Lifecycle operations should never bypass governance retention
-            if lock_enabled
-                && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
-                    .await
-                    .is_some()
+            if object_locked
+                || (lock_enabled
+                    && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
+                        .await
+                        .is_some())
             {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
@@ -4476,11 +4541,12 @@ mod tests {
         manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
         mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
         persist_manual_transition_page_checkpoint, recover_manual_transition_jobs, recover_manual_transition_jobs_once,
-        replication_state_for_delete, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
-        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
-        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
-        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
-        transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
+        replication_state_for_delete, resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity,
+        resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
+        run_tier_free_version_recovery_loop, select_restore_s3_location, set_lifecycle_observability_observer,
+        set_recovered_free_version_enqueue_observer, should_defer_date_expiry_for_recent_config_update,
+        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple, transitioned_object_delete_opts,
+        wait_for_tier_free_version_recovery,
     };
     #[cfg(feature = "test-util")]
     use super::{delete_free_version_remote_object_then, encode_dir_object, get_transitioned_object_reader_with_tier_manager};
@@ -4540,6 +4606,7 @@ mod tests {
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
         RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
     };
+    use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -4586,6 +4653,30 @@ mod tests {
             assert_eq!(schedule.next_delay, StdDuration::from_secs(expected));
         }
         assert_eq!(schedule.next_delay.as_secs() / TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL.as_secs(), 10);
+    }
+
+    #[test]
+    fn tier_free_version_recovery_failure_backoff_waits_after_completion_and_resets_after_success() {
+        let mut schedule = TierFreeVersionRecoverySchedule::default();
+
+        for expected in [60, 120, 240, 480, 600, 600] {
+            schedule.record_failure(StdDuration::from_secs(75));
+            assert_eq!(schedule.next_delay, StdDuration::from_secs(expected));
+            assert_eq!(schedule.previous_run_duration, StdDuration::ZERO);
+        }
+
+        schedule.record_success(&free_version_recovery_stats(0, 0, false), StdDuration::ZERO);
+        schedule.record_failure(StdDuration::from_secs(75));
+        assert_eq!(schedule.next_delay, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL);
+        assert_eq!(schedule.previous_run_duration, StdDuration::ZERO);
+    }
+
+    #[test]
+    fn tier_free_version_recovery_enabled_setting_is_opt_out_and_fails_open() {
+        assert!(resolve_tier_free_version_recovery_enabled(Err(env::VarError::NotPresent)));
+        assert!(resolve_tier_free_version_recovery_enabled(Ok("true".to_string())));
+        assert!(!resolve_tier_free_version_recovery_enabled(Ok(" false ".to_string())));
+        assert!(resolve_tier_free_version_recovery_enabled(Ok("invalid".to_string())));
     }
 
     #[test]
@@ -7053,6 +7144,16 @@ mod tests {
         }
     }
 
+    fn current_object_with_metadata(
+        replication_status: ReplicationStatusType,
+        user_defined: HashMap<String, String>,
+    ) -> ObjectInfo {
+        ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..current_object(replication_status)
+        }
+    }
+
     #[test]
     fn lifecycle_replication_blocks_only_pending_failed_or_pending_purge() {
         assert!(lifecycle_replication_blocks_action(&delete_marker_object(
@@ -7655,6 +7756,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_object_lifecycle_skips_current_expiration_for_explicit_legal_hold() {
+        let lc = latest_expiration_lifecycle();
+        let object = current_object_with_metadata(
+            ReplicationStatusType::Completed,
+            HashMap::from([(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string())]),
+        );
+
+        let event = eval_action_from_lifecycle(&lc, None, &object).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    async fn existing_object_lifecycle_skips_current_expiration_for_explicit_retention() {
+        let lc = latest_expiration_lifecycle();
+        let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("future retain-until date should format");
+        let object = current_object_with_metadata(
+            ReplicationStatusType::Completed,
+            HashMap::from([
+                (
+                    X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+                    s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+                ),
+                (X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(), retain_until),
+            ]),
+        );
+
+        let event = eval_action_from_lifecycle(&lc, None, &object).await;
+
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
     async fn existing_object_lifecycle_skips_transition_while_replication_pending() {
         let lc = latest_transition_lifecycle();
         let object = current_object(ReplicationStatusType::Pending);
@@ -7873,6 +8009,21 @@ mod tests {
                 .await
                 .expect("seeded free-version object directory should be removed");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_disabled_does_not_consume_start_guard() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let started = OnceLock::new();
+
+        temp_env::async_with_vars([(super::ENV_TIER_FREE_VERSION_RECOVERY_ENABLED, Some("false"))], async {
+            let recovery = super::spawn_tier_free_version_recovery_once(Arc::clone(&ecstore), &started);
+
+            assert!(recovery.is_none());
+            assert!(started.get().is_none());
+        })
+        .await;
     }
 
     #[tokio::test]

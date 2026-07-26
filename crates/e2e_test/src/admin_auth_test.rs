@@ -46,9 +46,45 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const ADMIN_INFO_PATH: &str = "/rustfs/admin/v3/info";
+    const ADMIN_MANUAL_TRANSITION_BUCKET: &str = "auth-deny-manual-transition";
     const ADMIN_MANUAL_TRANSITION_PATH: &str =
-        "/rustfs/admin/v3/ilm/transition/run?bucket=auth-deny-manual-transition&maxObjects=1";
-    const ADMIN_MANUAL_TRANSITION_JOB_PATH: &str = "/rustfs/admin/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111";
+        "/rustfs/admin/v3/ilm/transition/run?bucket=auth-deny-manual-transition&maxObjects=1&mode=async";
+
+    fn assert_no_raw_manual_transition_markers(body: &str, context: &str) {
+        assert!(
+            !body.contains("\"marker\"") && !body.contains("\"versionMarker\"") && !body.contains("\"version_marker\""),
+            "{context} must not expose raw manual transition resume markers, body: {body}"
+        );
+    }
+
+    async fn wait_for_terminal_manual_transition_job(
+        env: &RustFSTestEnvironment,
+        status_endpoint: &str,
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, body) =
+                signed_request(&env.url, http::Method::GET, status_endpoint, None, &env.access_key, &env.secret_key).await?;
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "root credential must query manual transition job status, body: {body}"
+            );
+            assert_no_raw_manual_transition_markers(&body, "manual transition status response");
+            let value: serde_json::Value = serde_json::from_str(&body)?;
+            let job_status = value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("manual transition job status response must include status")?;
+            if matches!(job_status, "completed" | "partial" | "cancelled" | "failed" | "unknown") {
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("manual transition job did not reach terminal status within 30s; last={body}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
 
     /// Send a SigV4-signed request to `path` (optionally with a JSON `body`) and
     /// return `(status, body)`. Uses the `UNSIGNED_PAYLOAD` content hash so a
@@ -171,6 +207,11 @@ mod tests {
         let user_ak = "ilmtransitionlimited";
         let user_sk = "ilmtransitionlimitedsecret";
         create_limited_user(&env, user_ak, user_sk).await?;
+        env.create_s3_client()
+            .create_bucket()
+            .bucket(ADMIN_MANUAL_TRANSITION_BUCKET)
+            .send()
+            .await?;
 
         let (root_status, root_body) = signed_request(
             &env.url,
@@ -183,48 +224,63 @@ mod tests {
         .await?;
         assert_eq!(
             root_status,
-            reqwest::StatusCode::OK,
+            reqwest::StatusCode::ACCEPTED,
             "root credential must reach the manual transition handler, body: {root_body}"
         );
         assert!(
-            root_body.contains("\"mode\":\"enqueue_only\""),
-            "root response should be the manual transition JSON contract, body: {root_body}"
+            root_body.contains("\"mode\":\"durable_job\""),
+            "root response should be the durable manual transition JSON contract, body: {root_body}"
         );
-        let (root_status, root_body) = signed_request(
-            &env.url,
-            http::Method::GET,
-            ADMIN_MANUAL_TRANSITION_JOB_PATH,
-            None,
-            &env.access_key,
-            &env.secret_key,
-        )
-        .await?;
+        assert_no_raw_manual_transition_markers(&root_body, "manual transition run response");
+        let root_value: serde_json::Value = serde_json::from_str(&root_body)?;
+        let job_id = root_value
+            .get("job_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("manual transition async response must include job_id")?;
+        let status_endpoint = root_value
+            .get("status_endpoint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("manual transition async response must include status_endpoint")?;
+        let cancel_endpoint = root_value
+            .get("cancel_endpoint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("manual transition async response must include cancel_endpoint")?;
         assert_eq!(
-            root_status,
-            reqwest::StatusCode::NOT_FOUND,
-            "root credential must reach the manual transition status handler, body: {root_body}"
+            cancel_endpoint, status_endpoint,
+            "manual transition durable jobs currently use the same status/cancel endpoint"
         );
         assert!(
-            root_body.contains("NoSuchKey"),
-            "missing durable job should return NoSuchKey once authorized, body: {root_body}"
+            status_endpoint.ends_with(job_id),
+            "status endpoint must address the returned job id, job_id={job_id}, status_endpoint={status_endpoint}"
         );
-        let (root_status, root_body) = signed_request(
-            &env.url,
-            http::Method::DELETE,
-            ADMIN_MANUAL_TRANSITION_JOB_PATH,
-            None,
-            &env.access_key,
-            &env.secret_key,
-        )
-        .await?;
+
+        let terminal_body = wait_for_terminal_manual_transition_job(&env, status_endpoint).await?;
+        let terminal: serde_json::Value = serde_json::from_str(&terminal_body)?;
+        assert_eq!(terminal.get("job_id").and_then(serde_json::Value::as_str), Some(job_id));
+        assert_eq!(
+            terminal
+                .get("report")
+                .and_then(|report| report.get("bucket"))
+                .and_then(serde_json::Value::as_str),
+            Some(ADMIN_MANUAL_TRANSITION_BUCKET)
+        );
+
+        let (root_status, root_body) =
+            signed_request(&env.url, http::Method::DELETE, status_endpoint, None, &env.access_key, &env.secret_key).await?;
         assert_eq!(
             root_status,
-            reqwest::StatusCode::NOT_FOUND,
-            "root credential must reach the manual transition cancel handler, body: {root_body}"
+            reqwest::StatusCode::OK,
+            "root credential must cancel/query a terminal manual transition job idempotently, body: {root_body}"
         );
+        assert_no_raw_manual_transition_markers(&root_body, "manual transition cancel response");
+        let root_cancel: serde_json::Value = serde_json::from_str(&root_body)?;
+        assert_eq!(root_cancel.get("job_id").and_then(serde_json::Value::as_str), Some(job_id));
         assert!(
-            root_body.contains("NoSuchKey"),
-            "missing durable job cancel should return NoSuchKey once authorized, body: {root_body}"
+            matches!(
+                root_cancel.get("status").and_then(serde_json::Value::as_str),
+                Some("completed" | "partial" | "failed" | "unknown")
+            ),
+            "terminal cancel must not rewrite the job into cancelled state, body: {root_body}"
         );
 
         let (status, body) =
@@ -238,24 +294,24 @@ mod tests {
             body.contains("AccessDenied"),
             "manual transition rejection must carry the AccessDenied S3 error code, body: {body}"
         );
-        let (status, body) =
-            signed_request(&env.url, http::Method::GET, ADMIN_MANUAL_TRANSITION_JOB_PATH, None, user_ak, user_sk).await?;
+        let (status, body) = signed_request(&env.url, http::Method::GET, status_endpoint, None, user_ak, user_sk).await?;
         assert_eq!(
             status,
             reqwest::StatusCode::FORBIDDEN,
             "non-admin credential must get 403 on manual transition status, body: {body}"
         );
+        assert_no_raw_manual_transition_markers(&body, "manual transition status rejection");
         assert!(
             body.contains("AccessDenied"),
             "manual transition status rejection must carry the AccessDenied S3 error code, body: {body}"
         );
-        let (status, body) =
-            signed_request(&env.url, http::Method::DELETE, ADMIN_MANUAL_TRANSITION_JOB_PATH, None, user_ak, user_sk).await?;
+        let (status, body) = signed_request(&env.url, http::Method::DELETE, status_endpoint, None, user_ak, user_sk).await?;
         assert_eq!(
             status,
             reqwest::StatusCode::FORBIDDEN,
             "non-admin credential must get 403 on manual transition cancel, body: {body}"
         );
+        assert_no_raw_manual_transition_markers(&body, "manual transition cancel rejection");
         assert!(
             body.contains("AccessDenied"),
             "manual transition cancel rejection must carry the AccessDenied S3 error code, body: {body}"

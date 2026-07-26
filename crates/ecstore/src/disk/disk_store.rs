@@ -2063,7 +2063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn walk_dir_skip_total_timeout_keeps_stream_pending() {
+    async fn walk_dir_total_timeout_disable_modes_keep_stream_pending() {
         temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("1"))], async {
             let dir = tempfile::tempdir().expect("temp dir should be created");
             let endpoint =
@@ -2086,24 +2086,34 @@ mod tests {
                 .await
                 .expect("object metadata should be written");
 
-            let mut writer = PendingWriter;
-            let result = tokio::time::timeout(
-                Duration::from_millis(20),
-                wrapper.walk_dir(
+            for (reason, options) in [
+                (
+                    "skip_total_timeout",
                     WalkDirOptions {
                         bucket: bucket.to_string(),
                         recursive: true,
                         skip_total_timeout: true,
                         ..Default::default()
                     },
-                    &mut writer,
                 ),
-            )
-            .await;
+                (
+                    "zero per-request timeout",
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        timeout_ms: Some(0),
+                        stall_timeout_ms: None,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let mut writer = PendingWriter;
+                let result = tokio::time::timeout(Duration::from_millis(1_100), wrapper.walk_dir(options, &mut writer)).await;
 
-            assert!(result.is_err(), "skip_total_timeout should leave backpressured walk pending");
-            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
-            assert!(!wrapper.health.is_faulty());
+                assert!(result.is_err(), "{reason} should leave backpressured walk pending");
+                assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+                assert!(!wrapper.health.is_faulty());
+            }
         })
         .await;
     }
