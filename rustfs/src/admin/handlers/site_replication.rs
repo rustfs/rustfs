@@ -150,7 +150,6 @@ const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-rep
 const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
 const SITE_REPLICATION_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
-const SITE_REPLICATION_RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
 const RUSTFS_ADMIN_V3_PREFIX: &str = "/rustfs/admin/v3";
 const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 const MINIO_SITE_REPLICATION_JOIN_PATH: &str = "/minio/admin/v3/site-replication/join";
@@ -792,6 +791,11 @@ impl SRStatusOptions {
 }
 
 pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    // Hand the reconciler to the infra-layer scheduler here rather than letting startup call
+    // into this module: startup sits below this layer and must not depend upwards. The admin
+    // router is built before startup reconciles, so the hook is always installed in time.
+    crate::site_replication_reconcile::register_site_replication_reconciler(reconcile_site_replication_wiring);
+
     for (method, path, operation) in [
         (Method::PUT, "/v3/site-replication/add", AdminOperation(&SiteReplicationAddHandler {})),
         (
@@ -2570,7 +2574,7 @@ async fn site_replicator_secret_from_bucket_targets(access_key: &str) -> Option<
 /// the previous root secret fail to decrypt and surface as "no such account", which silently
 /// disables every control-plane push while `replicate info` still reports the site enabled.
 /// Both used to require deleting and recreating the account by hand.
-pub async fn reconcile_site_replicator_service_account() -> S3Result<()> {
+async fn reconcile_site_replicator_service_account() -> S3Result<()> {
     let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
     let state = load_site_replication_state().await?;
     if !state.enabled() || state.service_account_access_key != SITE_REPLICATOR_SERVICE_ACCOUNT {
@@ -2699,7 +2703,7 @@ pub async fn reconcile_site_replicator_service_account() -> S3Result<()> {
 /// builders only run on bucket creation, peer bucket-ops and metadata pushes — so without a
 /// pass here an upgraded site keeps the broken rules until someone recreates the bucket.
 /// Reconciliation is a no-op write-wise when the rules already match.
-pub async fn reconcile_site_replication_buckets() -> S3Result<()> {
+async fn reconcile_site_replication_buckets() -> S3Result<()> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
@@ -2725,51 +2729,42 @@ pub async fn reconcile_site_replication_buckets() -> S3Result<()> {
     Ok(())
 }
 
-/// Re-run the site-replication reconcile on a timer.
+/// Repair drifted site-replication wiring: the service account first, since the bucket pass
+/// signs its targets with that account's secret.
 ///
-/// Startup alone leaves a site broken until the next restart, and the events that rebuild
-/// rules (bucket creation, peer bucket-ops, metadata pushes) only ever touch one bucket.
-/// Both reconcilers are no-ops once the wiring matches — the bucket pass compares the
-/// serialized targets and rule set before writing — so a healthy deployment reads and
-/// writes nothing.
-pub fn spawn_site_replication_reconcile_task(ctx: tokio_util::sync::CancellationToken) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(SITE_REPLICATION_RECONCILE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // The first tick fires immediately and startup has just reconciled; skip it.
-        ticker.tick().await;
+/// Registered into the infra-layer scheduler (`site_replication_reconcile`) rather than
+/// called from it, so startup never has to reach up into this layer. Takes the lifecycle
+/// lock without blocking and gives up the whole round when an add/remove/endpoint-refresh
+/// holds it: those run in phases, and rebuilding rules between two of them would resurrect
+/// exactly what the operation just tore down. Skipping is free — startup has its own pass
+/// and the timer comes back.
+fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async {
+        let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+            return;
+        };
 
-        loop {
-            tokio::select! {
-                _ = ctx.cancelled() => break,
-                _ = ticker.tick() => {
-                    let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
-                        continue;
-                    };
-                    if let Err(err) = reconcile_site_replicator_service_account().await {
-                        warn!(
-                            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                            result = "periodic_service_account_reconcile_failed",
-                            error = ?err,
-                            "admin site replication state"
-                        );
-                    }
-                    if let Err(err) = reconcile_site_replication_buckets().await {
-                        warn!(
-                            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                            component = LOG_COMPONENT_ADMIN,
-                            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                            result = "periodic_bucket_reconcile_failed",
-                            error = ?err,
-                            "admin site replication state"
-                        );
-                    }
-                }
-            }
+        if let Err(err) = reconcile_site_replicator_service_account().await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "service_account_reconcile_failed",
+                error = ?err,
+                "admin site replication state"
+            );
         }
-    });
+        if let Err(err) = reconcile_site_replication_buckets().await {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "bucket_reconcile_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+    })
 }
 
 fn site_replication_peer_wire_path(path: &str) -> String {
