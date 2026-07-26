@@ -786,6 +786,9 @@ pub struct Metrics {
     scanner_expiry_queue_missed: AtomicU64,
     scanner_expiry_queued_total: AtomicU64,
     scanner_expiry_missed_total: AtomicU64,
+    scanner_expiry_blocked_total: AtomicU64,
+    scanner_expiry_not_enqueued_total: AtomicU64,
+    scanner_expiry_delete_failed_total: AtomicU64,
     scanner_transition_queue_capacity: AtomicU64,
     scanner_transition_queued: AtomicU64,
     scanner_transition_active: AtomicU64,
@@ -1051,6 +1054,12 @@ pub struct ScannerLifecycleExpirySnapshot {
     pub queue_missed: u64,
     pub scanner_queued: u64,
     pub scanner_missed: u64,
+    #[serde(default)]
+    pub scanner_blocked: u64,
+    #[serde(default)]
+    pub scanner_not_enqueued: u64,
+    #[serde(default)]
+    pub delete_failed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1755,6 +1764,9 @@ impl Metrics {
             scanner_expiry_queue_missed: AtomicU64::new(0),
             scanner_expiry_queued_total: AtomicU64::new(0),
             scanner_expiry_missed_total: AtomicU64::new(0),
+            scanner_expiry_blocked_total: AtomicU64::new(0),
+            scanner_expiry_not_enqueued_total: AtomicU64::new(0),
+            scanner_expiry_delete_failed_total: AtomicU64::new(0),
             scanner_transition_queue_capacity: AtomicU64::new(0),
             scanner_transition_queued: AtomicU64::new(0),
             scanner_transition_active: AtomicU64::new(0),
@@ -1985,7 +1997,16 @@ impl Metrics {
             self.scanner_expiry_queued_total.fetch_add(count, Ordering::Relaxed);
         } else {
             self.scanner_expiry_missed_total.fetch_add(count, Ordering::Relaxed);
+            self.scanner_expiry_not_enqueued_total.fetch_add(count, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_scanner_expiry_blocked(&self, count: u64) {
+        self.scanner_expiry_blocked_total.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_expiry_delete_failed(&self, count: u64) {
+        self.scanner_expiry_delete_failed_total.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_scanner_transition_enqueue_result(&self, count: u64, queued: bool) {
@@ -2850,6 +2871,9 @@ impl Metrics {
             queue_missed: self.scanner_expiry_queue_missed.load(Ordering::Relaxed),
             scanner_queued: self.scanner_expiry_queued_total.load(Ordering::Relaxed),
             scanner_missed: self.scanner_expiry_missed_total.load(Ordering::Relaxed),
+            scanner_blocked: self.scanner_expiry_blocked_total.load(Ordering::Relaxed),
+            scanner_not_enqueued: self.scanner_expiry_not_enqueued_total.load(Ordering::Relaxed),
+            delete_failed: self.scanner_expiry_delete_failed_total.load(Ordering::Relaxed),
         };
         m.lifecycle_transition = ScannerLifecycleTransitionSnapshot {
             current_queue_capacity: self.scanner_transition_queue_capacity.load(Ordering::Relaxed),
@@ -3385,6 +3409,8 @@ mod tests {
         });
         metrics.record_scanner_expiry_enqueue_result(6, true);
         metrics.record_scanner_expiry_enqueue_result(2, false);
+        metrics.record_scanner_expiry_blocked(4);
+        metrics.record_scanner_expiry_delete_failed(1);
 
         let report = metrics.report().await;
 
@@ -3395,6 +3421,9 @@ mod tests {
         assert_eq!(report.lifecycle_expiry.queue_missed, 3);
         assert_eq!(report.lifecycle_expiry.scanner_queued, 6);
         assert_eq!(report.lifecycle_expiry.scanner_missed, 2);
+        assert_eq!(report.lifecycle_expiry.scanner_blocked, 4);
+        assert_eq!(report.lifecycle_expiry.scanner_not_enqueued, 2);
+        assert_eq!(report.lifecycle_expiry.delete_failed, 1);
     }
 
     #[tokio::test]

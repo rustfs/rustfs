@@ -212,6 +212,18 @@ fn record_scanner_lifecycle_enqueue_result(src: &LcEventSrc, count: u64, queued:
     }
 }
 
+fn record_scanner_lifecycle_expiry_blocked(src: &LcEventSrc, count: u64) {
+    if matches!(src, LcEventSrc::Scanner) {
+        global_metrics().record_scanner_expiry_blocked(count);
+    }
+}
+
+fn record_scanner_lifecycle_expiry_delete_failed(src: &LcEventSrc, count: u64) {
+    if matches!(src, LcEventSrc::Scanner) {
+        global_metrics().record_scanner_expiry_delete_failed(count);
+    }
+}
+
 fn record_scanner_transition_enqueue_result(src: &LcEventSrc, count: u64, queued: bool) {
     if matches!(src, LcEventSrc::Scanner) {
         global_metrics().record_scanner_transition_enqueue_result(count, queued);
@@ -845,6 +857,7 @@ impl ExpiryState {
                         if deleted {
                             trace.emit(EVENT_LIFECYCLE_DELETE_COMPLETED, "delete_completed", None);
                         } else {
+                            record_scanner_lifecycle_expiry_delete_failed(&v.src, 1);
                             trace.emit(
                                 EVENT_LIFECYCLE_DELETE_FAILED,
                                 "delete_failed",
@@ -3495,6 +3508,7 @@ async fn enqueue_expiry_for_existing_object_group(
                             }
                         };
                         if blocked_by_replication {
+                            record_scanner_lifecycle_expiry_blocked(context.src, 1);
                             continue;
                         }
                         apply_existing_object_expiry(context.api.clone(), object, event, context.src).await;
@@ -5503,6 +5517,7 @@ mod tests {
         assert_eq!(state.stats.missed_tasks(), 1);
         let after = global_metrics().report().await.lifecycle_expiry;
         assert!(after.scanner_missed >= before.scanner_missed.saturating_add(1));
+        assert!(after.scanner_not_enqueued >= before.scanner_not_enqueued.saturating_add(1));
         let observed = observed.lock().expect("observability test events should not poison");
         assert!(observed.contains(&(EVENT_LIFECYCLE_EXPIRED_DETECTED, "detected", None)));
         assert!(observed.contains(&(EVENT_LIFECYCLE_NOT_ENQUEUED, "not_enqueued", Some("worker_unavailable"))));
@@ -5606,6 +5621,8 @@ mod tests {
         assert!(!second);
         assert_eq!(state.stats.pending_tasks(), 1);
         assert_eq!(state.stats.missed_tasks(), 1);
+        let after = global_metrics().report().await.lifecycle_expiry;
+        assert!(after.scanner_not_enqueued >= 1);
         let observed = observed.lock().expect("observability test events should not poison");
         assert_eq!(
             observed
