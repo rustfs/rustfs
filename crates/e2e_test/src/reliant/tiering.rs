@@ -354,6 +354,7 @@ struct ManualTransitionRunResponse {
     mode: String,
     job_id: Option<String>,
     status_endpoint: Option<String>,
+    cancel_endpoint: Option<String>,
     report: ManualTransitionRunReport,
 }
 
@@ -394,6 +395,7 @@ struct ManualTransitionRunReport {
 struct ManualTransitionJobStatusResponse {
     job_id: String,
     status_endpoint: String,
+    cancel_endpoint: String,
     status: String,
     cancel_requested: bool,
     failure_reason: Option<String>,
@@ -886,10 +888,16 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
         status_endpoint.ends_with(job_id),
         "status endpoint must embed job id: endpoint={status_endpoint}, job_id={job_id}"
     );
+    assert_eq!(
+        accepted.cancel_endpoint.as_deref(),
+        Some(status_endpoint),
+        "async run must return the cancel endpoint used by rc cancel"
+    );
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
     assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.cancel_endpoint, status_endpoint);
     assert_eq!(terminal.status, "completed", "terminal job response: {terminal:#?}");
     assert!(!terminal.cancel_requested);
     assert_eq!(terminal.failure_reason, None);
@@ -915,6 +923,8 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
 
     let after_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(after_cancel.status, "completed");
+    assert_eq!(after_cancel.status_endpoint, status_endpoint);
+    assert_eq!(after_cancel.cancel_endpoint, status_endpoint);
     assert!(!after_cancel.cancel_requested);
     assert_eq!(
         cold_tier_object_count(&cold_client).await?,
@@ -963,10 +973,16 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    assert_eq!(
+        accepted.cancel_endpoint.as_deref(),
+        Some(status_endpoint),
+        "async partial run must return the cancel endpoint used by rc cancel"
+    );
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
     assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.cancel_endpoint, status_endpoint);
     assert_eq!(terminal.status, "partial", "terminal limit job response: {terminal:#?}");
     assert!(!terminal.cancel_requested);
     assert_eq!(terminal.failure_reason, None);
@@ -990,6 +1006,8 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
 
     let after_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(after_cancel.status, "partial");
+    assert_eq!(after_cancel.status_endpoint, status_endpoint);
+    assert_eq!(after_cancel.cancel_endpoint, status_endpoint);
     assert!(!after_cancel.cancel_requested);
     assert_eq!(after_cancel.report.bucket, terminal.report.bucket);
     assert_eq!(after_cancel.report.prefix, terminal.report.prefix);
@@ -1004,6 +1022,8 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
 
     let second_cancel = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(second_cancel.status, "partial");
+    assert_eq!(second_cancel.status_endpoint, status_endpoint);
+    assert_eq!(second_cancel.cancel_endpoint, status_endpoint);
     assert!(!second_cancel.cancel_requested);
     assert_eq!(second_cancel.report.scanned, terminal.report.scanned);
     assert_eq!(second_cancel.report.transition_completed, terminal.report.transition_completed);
@@ -1462,21 +1482,29 @@ async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled()
         .status_endpoint
         .as_deref()
         .ok_or("async response must include status_endpoint")?;
+    assert_eq!(
+        accepted.cancel_endpoint.as_deref(),
+        Some(status_endpoint),
+        "async active-cancel run must return the cancel endpoint used by rc cancel"
+    );
 
     let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
     assert_eq!(active.job_id, job_id);
     assert_eq!(active.status_endpoint, status_endpoint);
+    assert_eq!(active.cancel_endpoint, status_endpoint);
     assert!(!active.cancel_requested);
 
     let cancel_response = manual_transition_job_cancel(&hot, status_endpoint).await?;
     assert_eq!(cancel_response.job_id, job_id);
     assert_eq!(cancel_response.status_endpoint, status_endpoint);
+    assert_eq!(cancel_response.cancel_endpoint, status_endpoint);
     assert_eq!(cancel_response.status, "running", "active cancel response: {cancel_response:#?}");
     assert!(cancel_response.cancel_requested, "active cancel response: {cancel_response:#?}");
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, StdDuration::from_secs(30)).await?;
     assert_eq!(terminal.job_id, job_id);
     assert_eq!(terminal.status_endpoint, status_endpoint);
+    assert_eq!(terminal.cancel_endpoint, status_endpoint);
     assert_eq!(terminal.status, "cancelled", "terminal active cancel response: {terminal:#?}");
     assert!(terminal.cancel_requested);
     assert_eq!(terminal.failure_reason, None);
