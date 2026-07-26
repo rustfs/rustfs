@@ -243,21 +243,18 @@ build_runner_cmd_for_product() {
   local bucket="$3"
   local leg_out_dir="$4"
   local endpoint image_ref image_digest revision_or_release ack_contract
-  local -a node_args
   if [[ "$product" == "rustfs" ]]; then
     endpoint="$RUSTFS_ENDPOINT"
     image_ref="$RUSTFS_IMAGE_REF"
     image_digest="$RUSTFS_IMAGE_DIGEST"
     revision_or_release="$RUSTFS_REVISION"
     ack_contract="$RUSTFS_ACK_CONTRACT"
-    node_args=("${RUSTFS_NODE_ARGS[@]}")
   else
     endpoint="$MINIO_ENDPOINT"
     image_ref="$MINIO_IMAGE_REF"
     image_digest="$MINIO_IMAGE_DIGEST"
     revision_or_release="$MINIO_RELEASE"
     ack_contract="$MINIO_ACK_CONTRACT"
-    node_args=("${MINIO_NODE_ARGS[@]}")
   fi
 
   RUNNER_CMD=(
@@ -286,7 +283,14 @@ build_runner_cmd_for_product() {
     --bucket "$bucket" \
     --out-dir "$leg_out_dir"
   )
-  RUNNER_CMD+=("${COMMON_LABELS[@]}" "${node_args[@]}")
+  if ((${#COMMON_LABELS[@]} > 0)); then
+    RUNNER_CMD+=("${COMMON_LABELS[@]}")
+  fi
+  if [[ "$product" == "rustfs" && ${#RUSTFS_NODE_ARGS[@]} -gt 0 ]]; then
+    RUNNER_CMD+=("${RUSTFS_NODE_ARGS[@]}")
+  elif [[ "$product" == "minio" && ${#MINIO_NODE_ARGS[@]} -gt 0 ]]; then
+    RUNNER_CMD+=("${MINIO_NODE_ARGS[@]}")
+  fi
   if [[ "$DRY_RUN" == "true" ]]; then
     RUNNER_CMD+=(--dry-run)
   fi

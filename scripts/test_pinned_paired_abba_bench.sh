@@ -47,6 +47,26 @@ fi
   --minio-image-digest sha256:1111222233334444111122223333444411112222333344441111222233334444 \
   --minio-release RELEASE.2025-07-18T21-56-31Z \
   --minio-ack-contract strict \
+  --concurrencies 1 \
+  --sizes 1048576B \
+  --rounds-per-leg 1 \
+  --cooldown-secs 0 \
+  --out-dir "$TMP_DIR/good-no-optional-arrays" \
+  --dry-run >"$TMP_DIR/dry-run-no-optional-arrays.log"
+
+"$RUNNER" \
+  --access-key minioadmin \
+  --secret-key minioadmin \
+  --rustfs-endpoint http://127.0.0.1:9000 \
+  --rustfs-image-ref rustfs/rustfs:bench \
+  --rustfs-image-digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --rustfs-revision 42fc84063 \
+  --rustfs-ack-contract relaxed \
+  --minio-endpoint http://127.0.0.1:9100 \
+  --minio-image-ref quay.io/minio/minio:RELEASE.2025-07-18T21-56-31Z \
+  --minio-image-digest sha256:1111222233334444111122223333444411112222333344441111222233334444 \
+  --minio-release RELEASE.2025-07-18T21-56-31Z \
+  --minio-ack-contract strict \
   --concurrencies 1,64 \
   --sizes 1048575B,1048576B,1048577B \
   --rounds-per-leg 5 \
