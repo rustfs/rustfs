@@ -6645,6 +6645,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_fanout_commits_prepared_peers_after_replayed_committed_prepare() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (mut candidate, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should reload");
+        candidate
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("candidate")));
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![
+                    FakeTierMutationPeer::boxed_with_prepare_commit(
+                        "peer-a",
+                        calls.clone(),
+                        Ok(PeerTierMutationState::Committed),
+                        Ok(PeerTierMutationState::Committed),
+                    ),
+                    FakeTierMutationPeer::boxed_with_prepare_commit(
+                        "peer-b",
+                        calls.clone(),
+                        Ok(PeerTierMutationState::Prepared),
+                        Ok(PeerTierMutationState::Committed),
+                    ),
+                ],
+                async {
+                    TierConfigMgr::update_candidate_owned(
+                        &manager,
+                        store.clone(),
+                        candidate,
+                        version,
+                        TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                        update,
+                        None,
+                    )
+                    .await
+                    .expect("committed replay plus partial prepare should publish after prepared peers commit");
+                },
+            )
+            .await;
+
+        let calls = lock_unpoisoned(&calls).clone();
+        let peer_a_prepare_call = calls
+            .iter()
+            .find(|call| call.starts_with("peer-a:prepare:"))
+            .expect("replayed peer should still receive prepare");
+        let peer_b_prepare = calls
+            .iter()
+            .position(|call| call.starts_with("peer-b:prepare:"))
+            .expect("remaining peer should prepare the mutation");
+        let peer_b_commit = calls
+            .iter()
+            .position(|call| call.starts_with("peer-b:commit:"))
+            .expect("prepared peer should receive commit");
+        assert!(peer_b_prepare < peer_b_commit, "{calls:?}");
+        let peer_b_prepare_id = calls[peer_b_prepare]
+            .split(':')
+            .nth(2)
+            .expect("prepare call should record the mutation id");
+        let peer_b_commit_id = calls[peer_b_commit]
+            .split(':')
+            .nth(2)
+            .expect("commit call should record the mutation id");
+        let peer_a_prepare_id = peer_a_prepare_call
+            .split(':')
+            .nth(2)
+            .expect("replayed prepare call should record the mutation id");
+        assert_eq!(peer_b_commit_id, peer_b_prepare_id, "{calls:?}");
+        assert_eq!(peer_a_prepare_id, peer_b_prepare_id, "{calls:?}");
+        assert!(
+            !calls.iter().any(|call| call.starts_with("peer-a:commit:")),
+            "already-committed prepare replay should not receive a duplicate commit: {calls:?}"
+        );
+        let saved_etag = load_tier_config_for_update(store.clone())
+            .await
+            .expect("saved tier config should reload")
+            .1
+            .expect("saved tier config should have an ETag");
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("peer-b:commit:") && call.ends_with(&format!(":{saved_etag}"))),
+            "prepared peer commit should carry the saved tier config ETag: {calls:?}"
+        );
+        assert!(
+            !manager.read().await.tiers.contains_key("COLD-A"),
+            "local manager should publish after the partially prepared peer commits"
+        );
+    }
+
+    #[tokio::test]
     async fn reload_handle_replays_committed_mutation_and_removes_intent_record() {
         let store = Arc::new(CasConfigStore::default());
         let mut persisted = empty_mgr();
