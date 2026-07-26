@@ -4534,8 +4534,9 @@ mod tests {
         StaleMultipartUploadCandidate, TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL, TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL,
         TRANSITION_COMPLETE, TierFreeVersionRecoverySchedule, TransitionEnqueueOutcome, TransitionState, TransitionedObject,
         VersionReplicationScan, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
-        enqueue_recovered_free_version_with_state, enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report,
-        eval_action_from_lifecycle, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
+        enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
+        enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
+        jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
         manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_version_marker,
@@ -7455,6 +7456,89 @@ mod tests {
             decode_manual_transition_continuation_token(token).expect("checkpoint token should decode");
         assert_eq!(marker.as_deref(), Some("logs/page-end"));
         assert_eq!(version_marker.as_deref(), Some("null"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_active_cancel_returns_resume_cursor_after_progress() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("manual-active-cancel-{}", Uuid::new_v4().simple());
+        let prefix = "manual-active-cancel/";
+        let keys = [format!("{prefix}obj-001"), format!("{prefix}obj-002")];
+        create_test_bucket(&ecstore, &bucket).await;
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>manual-active-cancel</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <Prefix>{prefix}</Prefix>
+    </Filter>
+    <Transition>
+      <Days>1</Days>
+      <StorageClass>WARM</StorageClass>
+    </Transition>
+  </Rule>
+</LifecycleConfiguration>"#
+        );
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("manual transition lifecycle metadata should be stored");
+        for key in &keys {
+            let mut reader = PutObjReader::from_vec(b"manual active cancel payload".to_vec());
+            ecstore
+                .put_object(
+                    &bucket,
+                    key,
+                    &mut reader,
+                    &ObjectOptions {
+                        mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(2)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("manual transition object should be created");
+        }
+
+        let cancel_polls = Arc::new(AtomicUsize::new(0));
+        let cancel_polls_for_check = Arc::clone(&cancel_polls);
+        let options = ManualTransitionRunOptions {
+            prefix: prefix.to_string(),
+            tier: Some("WARM".to_string()),
+            dry_run: true,
+            max_objects: Some(10),
+            cancel_check: Some(Arc::new(move || {
+                let cancel_polls_for_check = Arc::clone(&cancel_polls_for_check);
+                Box::pin(async move { cancel_polls_for_check.fetch_add(1, Ordering::SeqCst) >= 1 })
+            })),
+            ..Default::default()
+        };
+
+        let report = enqueue_transition_for_existing_objects_scoped(ecstore, &bucket, options)
+            .await
+            .expect("manual transition dry-run scan should stop on active cancel");
+
+        assert!(report.cancelled);
+        assert!(report.was_truncated());
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.eligible, 1);
+        assert_eq!(report.dry_run_eligible, 1);
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.transition_completed, 0);
+        assert_eq!(report.transition_failed, 0);
+        assert_eq!(report.tier_failure, 0);
+        assert_eq!(report.next_marker.as_deref(), Some(keys[0].as_str()));
+        assert_eq!(report.next_version_idmarker.as_deref(), Some("null"));
+        let token = report
+            .continuation_token
+            .as_deref()
+            .expect("cancelled active scan should expose an opaque resume token");
+        let (marker, version_marker) =
+            decode_manual_transition_continuation_token(token).expect("cancel continuation token should decode");
+        assert_eq!(marker.as_deref(), Some(keys[0].as_str()));
+        assert_eq!(version_marker.as_deref(), Some("null"));
+        assert_eq!(cancel_polls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
