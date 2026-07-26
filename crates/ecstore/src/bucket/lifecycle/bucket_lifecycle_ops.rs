@@ -4594,12 +4594,12 @@ mod tests {
     use crate::bucket::lifecycle::config_boundary;
     use crate::bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
-        ManualTransitionWorkerResult, claim_manual_transition_scope_admission, legacy_manual_transition_scope_key,
-        delete_manual_transition_scope_admission_if_current, load_manual_transition_job_record,
-        load_manual_transition_scope_admission, load_manual_transition_scope_admission_with_etag,
-        manual_transition_scope_record_object_name, renew_manual_transition_job_lease, request_manual_transition_job_cancel,
-        save_manual_transition_job_record, save_manual_transition_scope_admission_if_absent,
-        save_manual_transition_scope_admission_if_current,
+        ManualTransitionWorkerResult, claim_manual_transition_scope_admission,
+        delete_manual_transition_scope_admission_if_current, legacy_manual_transition_scope_key,
+        load_manual_transition_job_record, load_manual_transition_scope_admission,
+        load_manual_transition_scope_admission_with_etag, manual_transition_scope_record_object_name,
+        renew_manual_transition_job_lease, request_manual_transition_job_cancel, save_manual_transition_job_record,
+        save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
     };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
