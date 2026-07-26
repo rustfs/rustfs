@@ -8972,6 +8972,61 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn manual_transition_heartbeat_persists_backpressure_status_snapshot() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let job_id = Uuid::new_v4();
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("WARM".to_string()),
+            max_objects: Some(25),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(job_id, "manual-heartbeat-backpressure-bucket", &options, "owner-a");
+        record.report.scanned = 17;
+        record.report.eligible = 11;
+        record.report.enqueued = 3;
+        let old_lease_id = record.lease_id;
+        save_manual_transition_job_record(ecstore.clone(), &record)
+            .await
+            .expect("running job record should save");
+        save_manual_transition_scope_admission_if_absent(ecstore.clone(), &ManualTransitionScopeAdmission::from_job(&record))
+            .await
+            .expect("running scope admission should save");
+        let queue_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 4,
+            queued: 2,
+            active: 1,
+            workers: 2,
+            queue_full: 5,
+            queue_send_timeout: 7,
+            compensation_pending: 3,
+            compensation_running: 1,
+        };
+
+        let renewed = renew_manual_transition_job_lease(ecstore.clone(), job_id, queue_snapshot)
+            .await
+            .expect("running job heartbeat should persist queue pressure status");
+
+        assert_eq!(renewed.state, ManualTransitionJobState::Running);
+        assert_eq!(renewed.lease_id, old_lease_id);
+        assert_eq!(renewed.queue_snapshot, queue_snapshot);
+        assert_eq!(renewed.report.scanned, 17);
+        assert_eq!(renewed.report.eligible, 11);
+        assert_eq!(renewed.report.enqueued, 3);
+        let loaded = load_manual_transition_job_record(ecstore.clone(), job_id)
+            .await
+            .expect("renewed heartbeat should reload");
+        assert_eq!(loaded.queue_snapshot, queue_snapshot);
+        let admission = load_manual_transition_scope_admission(ecstore, &record.scope_key)
+            .await
+            .expect("heartbeat must keep scope admission aligned with the renewed job");
+        assert_eq!(admission.job_id, job_id);
+        assert_eq!(admission.lease_id, renewed.lease_id);
+        assert_eq!(admission.lease_expires_at_unix_nanos, renewed.lease_expires_at_unix_nanos);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn manual_transition_job_lost_worker_results_mark_unknown_and_release_admission() {
         let (_paths, ecstore) = setup_test_env().await;
         let job_id = Uuid::new_v4();
