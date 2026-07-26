@@ -135,9 +135,20 @@ The first flag only requests msgpack-only. The second flag is the explicit proof
 Only enable it **after** Stage 0 has read zero for a full window across the fleet:
 
 1. Ship with the flag **off** (no behavior change).
-2. Enable it on one node with both `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true`, then restart and watch the fallback counter for a soak period. If it stays zero, enable fleet-wide.
-3. **Rollback:** set either `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false` or `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false` (or unset either flag) and restart. No
+2. Rehearse the `request-only` gate with `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false`. This must keep writing JSON compatibility fields and is safe with unsupported/old peers; any fallback or decode-error increment still blocks convergence.
+3. Enable it on one canary node with both `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true`, then restart that node only and watch the fallback and decode-error counters for a soak period while real internode traffic is present. If they stay zero, enable fleet-wide.
+4. **Rollback:** set either `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false` or `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false` (or unset either flag) and restart. No
    wire-format was broken in this stage, so rollback is immediate and safe.
+
+The benchmark helper pins these operator states as dry-run phases:
+
+```bash
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase before --dry-run
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase request-only --dry-run
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase canary --dry-run
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase after --dry-run
+scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase rollback --dry-run
+```
 
 ## Stage 2 — Remove the proto JSON fields (next release, N+1)
 
