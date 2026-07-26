@@ -1814,15 +1814,8 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
     assert_eq!(after_restart["dry_run"].as_bool(), Some(true));
 
     let job_endpoint = format!("/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
-    let (cancel_status, cancel_body) = signed_admin_request(
-        &hot.nodes[3].url,
-        Method::DELETE,
-        &job_endpoint,
-        None,
-        &hot.access_key,
-        &hot.secret_key,
-    )
-    .await?;
+    let (cancel_status, cancel_body) =
+        signed_admin_request(&hot.nodes[3].url, Method::DELETE, &job_endpoint, None, &hot.access_key, &hot.secret_key).await?;
     assert_eq!(
         cancel_status,
         StatusCode::OK,
@@ -1830,7 +1823,10 @@ async fn four_node_manual_transition_job_status_survives_node_restart() -> TestR
         compact_body(&cancel_body)
     );
     let cancel_value: serde_json::Value = serde_json::from_str(&cancel_body)?;
-    assert_eq!(cancel_value["status"], after_restart["status"], "terminal status changed after restart cancel");
+    assert_eq!(
+        cancel_value["status"], after_restart["status"],
+        "terminal status changed after restart cancel"
+    );
     assert_eq!(cancel_value["job_id"].as_str(), Some(job_id.as_str()));
     assert_eq!(cancel_value["bucket"].as_str(), Some(bucket.as_str()));
     assert_eq!(cancel_value["dry_run"].as_bool(), Some(true));
