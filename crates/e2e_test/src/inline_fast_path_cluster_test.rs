@@ -39,7 +39,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{KeyValue, any_value::Value as AnyValue};
-use opentelemetry_proto::tonic::metrics::v1::{Metric, metric, number_data_point};
+use opentelemetry_proto::tonic::metrics::v1::{
+    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+};
 use prost::Message;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
@@ -66,8 +68,10 @@ type MetricValues = Arc<Mutex<BTreeMap<String, MetricPointVersions>>>;
 const KIB: usize = 1024;
 const READER_PATH_COUNTER: &str = "rustfs_io_get_object_reader_path_by_size_total";
 const MSGPACK_JSON_FALLBACK_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
+const MSGPACK_JSON_DECODE_ERROR_COUNTER: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const DIRECTION_LABEL: &str = "direction";
 const MESSAGE_LABEL: &str = "message";
+const CODEC_LABEL: &str = "codec";
 const INLINE_DIRECT: &str = "inline_direct";
 const LEGACY_DUPLEX: &str = "legacy_duplex";
 const EMPTY: &str = "empty";
@@ -80,6 +84,8 @@ const RANGE: &str = "range";
 const REMOTE: &str = "remote";
 const FALLBACK_REQUEST_DIRECTION: &str = "request";
 const FALLBACK_RESPONSE_DIRECTION: &str = "response";
+const MSGPACK_CODEC_MSGPACK: &str = "msgpack";
+const MSGPACK_CODEC_JSON: &str = "json";
 const MPU_PART_1_SIZE: usize = 5 * 1024 * 1024;
 const MPU_PART_2_SIZE: usize = 16 * KIB;
 const TIER_BUCKET: &str = "inline-fallback-cold-tier";
@@ -90,6 +96,7 @@ const MSGPACK_FALLBACK_CONTROL_SERIES: [(&str, &str); 4] = [
     (FALLBACK_REQUEST_DIRECTION, "BatchReadVersionReq"),
     (FALLBACK_RESPONSE_DIRECTION, "BatchReadVersionResp"),
 ];
+const MSGPACK_DECODE_ERROR_CODECS: [&str; 2] = [MSGPACK_CODEC_MSGPACK, MSGPACK_CODEC_JSON];
 const READER_SIZE_BUCKETS: [&str; 9] = [
     "le_4kib",
     "le_16kib",
@@ -136,6 +143,7 @@ struct OtlpMetricCollector {
     endpoint: String,
     values: MetricValues,
     fallback_values: MetricValues,
+    decode_error_values: MetricValues,
     task: JoinHandle<()>,
 }
 
@@ -145,8 +153,10 @@ impl OtlpMetricCollector {
         let endpoint = format!("http://{}/v1/metrics", listener.local_addr()?);
         let values = Arc::new(Mutex::new(BTreeMap::new()));
         let fallback_values = Arc::new(Mutex::new(BTreeMap::new()));
+        let decode_error_values = Arc::new(Mutex::new(BTreeMap::new()));
         let task_values = values.clone();
         let task_fallback_values = fallback_values.clone();
+        let task_decode_error_values = decode_error_values.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -154,11 +164,19 @@ impl OtlpMetricCollector {
                 };
                 let values = task_values.clone();
                 let fallback_values = task_fallback_values.clone();
+                let decode_error_values = task_decode_error_values.clone();
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(
                             TokioIo::new(stream),
-                            service_fn(move |request| handle_metric_export(request, values.clone(), fallback_values.clone())),
+                            service_fn(move |request| {
+                                handle_metric_export(
+                                    request,
+                                    values.clone(),
+                                    fallback_values.clone(),
+                                    decode_error_values.clone(),
+                                )
+                            }),
                         )
                         .await;
                 });
@@ -168,6 +186,7 @@ impl OtlpMetricCollector {
             endpoint,
             values,
             fallback_values,
+            decode_error_values,
             task,
         })
     }
@@ -199,6 +218,15 @@ impl OtlpMetricCollector {
 
     async fn msgpack_json_fallback_totals(&self) -> BTreeMap<String, u64> {
         self.fallback_values
+            .lock()
+            .await
+            .iter()
+            .map(|(key, points)| (key.clone(), points.values().map(|(_, value)| value).sum()))
+            .collect()
+    }
+
+    async fn msgpack_json_decode_error_totals(&self) -> BTreeMap<String, u64> {
+        self.decode_error_values
             .lock()
             .await
             .iter()
@@ -275,6 +303,7 @@ async fn handle_metric_export(
     request: Request<Incoming>,
     values: MetricValues,
     fallback_values: MetricValues,
+    decode_error_values: MetricValues,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.uri().path() != "/v1/metrics" {
         return Ok(response(StatusCode::NOT_FOUND));
@@ -306,8 +335,10 @@ async fn handle_metric_export(
         Ok(export) => {
             let mut values = values.lock().await;
             let mut fallback_values = fallback_values.lock().await;
+            let mut decode_error_values = decode_error_values.lock().await;
             record_reader_path_metrics(&export, &mut values);
             record_msgpack_fallback_metrics(&export, &mut fallback_values);
+            record_msgpack_decode_error_metrics(&export, &mut decode_error_values);
             Ok(response(StatusCode::OK))
         }
         Err(_) => Ok(response(StatusCode::BAD_REQUEST)),
@@ -373,20 +404,45 @@ fn record_reader_path_metric(metric: &Metric, values: &mut BTreeMap<String, Metr
 }
 
 fn record_msgpack_fallback_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    record_msgpack_counter_metrics(export, MSGPACK_JSON_FALLBACK_COUNTER, values, |attributes| {
+        let direction = attribute_string(attributes, DIRECTION_LABEL)?;
+        let message = attribute_string(attributes, MESSAGE_LABEL)?;
+        Some(msgpack_fallback_metric_key(direction, message))
+    });
+}
+
+fn msgpack_fallback_metric_key(direction: &str, message: &str) -> String {
+    format!("{direction}\u{1f}{message}")
+}
+
+fn record_msgpack_decode_error_metrics(export: &ExportMetricsServiceRequest, values: &mut BTreeMap<String, MetricPointVersions>) {
+    record_msgpack_counter_metrics(export, MSGPACK_JSON_DECODE_ERROR_COUNTER, values, |attributes| {
+        let direction = attribute_string(attributes, DIRECTION_LABEL)?;
+        let message = attribute_string(attributes, MESSAGE_LABEL)?;
+        let codec = attribute_string(attributes, CODEC_LABEL)?;
+        Some(msgpack_decode_error_metric_key(direction, message, codec))
+    });
+}
+
+fn record_msgpack_counter_metrics<F>(
+    export: &ExportMetricsServiceRequest,
+    counter_name: &str,
+    values: &mut BTreeMap<String, MetricPointVersions>,
+    metric_key: F,
+) where
+    F: Fn(&[KeyValue]) -> Option<String>,
+{
     for resource_metrics in &export.resource_metrics {
         for scope_metrics in &resource_metrics.scope_metrics {
             for metric in &scope_metrics.metrics {
-                if metric.name != MSGPACK_JSON_FALLBACK_COUNTER {
+                if metric.name != counter_name {
                     continue;
                 }
                 let Some(metric::Data::Sum(sum)) = &metric.data else {
                     continue;
                 };
                 for point in &sum.data_points {
-                    let Some(direction) = attribute_string(&point.attributes, DIRECTION_LABEL) else {
-                        continue;
-                    };
-                    let Some(message) = attribute_string(&point.attributes, MESSAGE_LABEL) else {
+                    let Some(key) = metric_key(&point.attributes) else {
                         continue;
                     };
                     let Some(number_data_point::Value::AsInt(value)) = point.value.as_ref() else {
@@ -394,7 +450,7 @@ fn record_msgpack_fallback_metrics(export: &ExportMetricsServiceRequest, values:
                     };
                     let value = u64::try_from(*value).unwrap_or_default();
                     values
-                        .entry(msgpack_fallback_metric_key(direction, message))
+                        .entry(key)
                         .or_default()
                         .entry(point.start_time_unix_nano)
                         .and_modify(|current| {
@@ -409,8 +465,8 @@ fn record_msgpack_fallback_metrics(export: &ExportMetricsServiceRequest, values:
     }
 }
 
-fn msgpack_fallback_metric_key(direction: &str, message: &str) -> String {
-    format!("{direction}\u{1f}{message}")
+fn msgpack_decode_error_metric_key(direction: &str, message: &str, codec: &str) -> String {
+    format!("{direction}\u{1f}{message}\u{1f}{codec}")
 }
 
 async fn assert_msgpack_fallback_unchanged(
@@ -432,6 +488,27 @@ async fn assert_msgpack_fallback_unchanged(
     Ok(())
 }
 
+async fn assert_msgpack_decode_errors_unchanged(
+    collector: &OtlpMetricCollector,
+    before: &BTreeMap<String, u64>,
+    series: &[(&str, &str)],
+) -> TestResult {
+    let after = collector.msgpack_json_decode_error_totals().await;
+    for &(direction, message) in series {
+        for &codec in &MSGPACK_DECODE_ERROR_CODECS {
+            let key = msgpack_decode_error_metric_key(direction, message, codec);
+            assert_eq!(
+                before.get(&key).copied().unwrap_or_default(),
+                after.get(&key).copied().unwrap_or_default(),
+                "decode-error counter changed for {direction}/{message}/{codec}: before={:?}, after={:?}",
+                before.get(&key),
+                after.get(&key),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<&'a str> {
     attributes.iter().find_map(|attribute| {
         if attribute.key != wanted_key {
@@ -442,6 +519,52 @@ fn attribute_string<'a>(attributes: &'a [KeyValue], wanted_key: &str) -> Option<
             _ => None,
         }
     })
+}
+
+#[test]
+fn records_msgpack_decode_error_metric_with_codec_label() {
+    let export = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: MSGPACK_JSON_DECODE_ERROR_COUNTER.to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![
+                                metric_attribute(DIRECTION_LABEL, FALLBACK_REQUEST_DIRECTION),
+                                metric_attribute(MESSAGE_LABEL, "ReadMultipleReq"),
+                                metric_attribute(CODEC_LABEL, MSGPACK_CODEC_JSON),
+                            ],
+                            start_time_unix_nano: 7,
+                            time_unix_nano: 11,
+                            value: Some(number_data_point::Value::AsInt(3)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut values = BTreeMap::new();
+
+    record_msgpack_decode_error_metrics(&export, &mut values);
+
+    let key = msgpack_decode_error_metric_key(FALLBACK_REQUEST_DIRECTION, "ReadMultipleReq", MSGPACK_CODEC_JSON);
+    assert_eq!(values.get(&key).and_then(|points| points.get(&7)).copied(), Some((11, 3)));
+}
+
+fn metric_attribute(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+            value: Some(AnyValue::StringValue(value.to_string())),
+        }),
+        ..Default::default()
+    }
 }
 
 fn boundary_cases(state: VersionState) -> Vec<BoundaryCase> {
@@ -1478,6 +1601,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     cluster.start().await?;
 
     let fallback_before = collector.msgpack_json_fallback_totals().await;
+    let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
     let bucket = "inline-mixed-msgpack-controls";
     cluster.create_test_bucket(bucket).await?;
@@ -1502,6 +1626,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     )
     .await?;
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     let encrypted_key = "encrypted/sse-s3.bin";
     let encrypted_body = payload(16 * KIB, 0xE3);
@@ -1551,6 +1676,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
     .await?;
 
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     Ok(())
 }
@@ -1621,6 +1747,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     let hot_client = hot.create_s3_client(0)?;
 
     let fallback_before = collector.msgpack_json_fallback_totals().await;
+    let decode_errors_before = collector.msgpack_json_decode_error_totals().await;
 
     let tier_name = unique_tier_name();
     add_rustfs_tier(&hot, &cold, &tier_name).await?;
@@ -1696,6 +1823,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     .await?;
 
     assert_msgpack_fallback_unchanged(&collector, &fallback_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
+    assert_msgpack_decode_errors_unchanged(&collector, &decode_errors_before, &MSGPACK_FALLBACK_CONTROL_SERIES).await?;
 
     Ok(())
 }
