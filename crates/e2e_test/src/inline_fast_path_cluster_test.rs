@@ -1282,6 +1282,61 @@ fn is_retryable_add_tier_error(response: &str) -> bool {
     response.contains("Remote tier configuration is already being replaced")
 }
 
+async fn start_manual_transition_job(hot: &RustFSTestClusterEnvironment, bucket: &str) -> TestResult<String> {
+    let path = format!("/rustfs/admin/v3/ilm/transition/run?bucket={bucket}&async=true&dryRun=true&maxObjects=1");
+    let (status, response) =
+        signed_admin_request(&hot.nodes[0].url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "async manual transition run must be accepted: {}",
+        compact_body(&response)
+    );
+    let value: serde_json::Value = serde_json::from_str(&response)?;
+    assert_eq!(
+        value["state"].as_str(),
+        Some("accepted"),
+        "manual transition run state changed: {response}"
+    );
+    assert_eq!(
+        value["mode"].as_str(),
+        Some("durable_job"),
+        "manual transition run mode changed: {response}"
+    );
+    value["job_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("manual transition run response omitted job_id: {response}").into())
+}
+
+async fn wait_for_manual_transition_job_terminal(
+    hot: &RustFSTestClusterEnvironment,
+    node_index: usize,
+    job_id: &str,
+) -> TestResult<serde_json::Value> {
+    let path = format!("/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, response) =
+            signed_admin_request(&hot.nodes[node_index].url, Method::GET, &path, None, &hot.access_key, &hot.secret_key).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "manual transition job status read failed: {}",
+            compact_body(&response)
+        );
+        let value: serde_json::Value = serde_json::from_str(&response)?;
+        match value["status"].as_str() {
+            Some("running") if Instant::now() < deadline => sleep(Duration::from_millis(200)).await,
+            Some("running") => {
+                return Err(format!("manual transition job {job_id} stayed running for 30s: {response}").into());
+            }
+            Some(_) => return Ok(value),
+            None => return Err(format!("manual transition job status response omitted status: {response}").into()),
+        }
+    }
+}
+
 fn transition_rule(tier_name: &str) -> TestResult<LifecycleRule> {
     Ok(LifecycleRule::builder()
         .id("inline-fallback-transition")
@@ -1720,6 +1775,62 @@ async fn four_node_add_tier_converges_after_offline_node_restart_without_second_
     hot.start_node(3).await?;
 
     wait_for_tier_converged(&hot, &tier_name, &add_tier_response).await
+}
+
+#[tokio::test]
+#[serial]
+async fn four_node_manual_transition_job_status_survives_node_restart() -> TestResult {
+    init_logging();
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.start().await?;
+
+    let hot_client = hot.create_s3_client(0)?;
+    let bucket = format!("manual-transition-job-{}", Uuid::new_v4().simple());
+    hot_client.create_bucket().bucket(&bucket).send().await?;
+
+    let job_id = start_manual_transition_job(&hot, &bucket).await?;
+    let terminal = wait_for_manual_transition_job_terminal(&hot, 0, &job_id).await?;
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("completed"),
+        "dry-run manual transition job should complete: {terminal}"
+    );
+    assert_eq!(terminal["job_id"].as_str(), Some(job_id.as_str()));
+    assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(terminal["dry_run"].as_bool(), Some(true));
+
+    hot.stop_node(3)?;
+    hot.start_node(3).await?;
+    let after_restart = wait_for_manual_transition_job_terminal(&hot, 3, &job_id).await?;
+    assert_eq!(after_restart["status"], terminal["status"], "terminal job status changed after restart");
+    assert_eq!(after_restart["job_id"].as_str(), Some(job_id.as_str()));
+    assert_eq!(after_restart["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(after_restart["dry_run"].as_bool(), Some(true));
+
+    let missing_job_id = Uuid::new_v4();
+    let (missing_status, missing_body) = signed_admin_request(
+        &hot.nodes[3].url,
+        Method::GET,
+        &format!("/rustfs/admin/v3/ilm/transition/jobs/{missing_job_id}"),
+        None,
+        &hot.access_key,
+        &hot.secret_key,
+    )
+    .await?;
+    assert_eq!(
+        missing_status,
+        StatusCode::NOT_FOUND,
+        "unknown manual transition job must remain a 404 after restart: {}",
+        compact_body(&missing_body)
+    );
+    assert!(
+        missing_body.contains("<Code>NoSuchKey</Code>") || missing_body.contains("NoSuchKey"),
+        "unknown manual transition job should return NoSuchKey, body: {}",
+        compact_body(&missing_body)
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
