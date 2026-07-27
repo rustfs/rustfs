@@ -83,5 +83,10 @@ rg -q "MIXED_MATRIX_CSV='$TMP_DIR/mixed-runbook/mixed_rollout_matrix.csv'" "$TMP
   --dry-run >"$TMP_DIR/stress-runbook.out"
 
 test -x "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "failure-snapshots" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "UNKNOWN_FAILURE_RATIO_THRESHOLD" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "QUEUE_MISMATCH_RATIO_THRESHOLD" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "UNKNOWN_FAILURE_COUNT_THRESHOLD" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "snapshot_failure" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "Manual transition nightly/stress stress-runbook" "$TMP_DIR/stress-runbook/manual_transition_nightly_stress_runbook.md"
 rg -q "SOAK_MATRIX_CSV='$TMP_DIR/stress-runbook/nightly_soak_matrix.csv'" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
