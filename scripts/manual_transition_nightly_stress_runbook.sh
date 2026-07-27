@@ -188,6 +188,7 @@ command_template() {
 - on startup failure (missing job_id, API error), write a timestamped snapshot under '__OUT_DIR__/failure-snapshots'
 - if immediate status shows failure_reason, capture snapshot under '__OUT_DIR__/failure-snapshots'
 - for each failed run, run manual_transition_journal_audit.sh and keep its outputs as evidence
+- for tier-failure attribution gates, run scripts/manual_transition_failure_samples.sh with the failed job ids and keep its summary CSV with the failure snapshot
 
 ## Usage
 

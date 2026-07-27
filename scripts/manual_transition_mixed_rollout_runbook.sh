@@ -195,7 +195,7 @@ command_template() {
 - matrix input: __MATRIX_CSV__
 - read ratio target: __READ_RATIO__%
 - scope: bucket=__JOB_BUCKET__, prefix template starts at __JOB_PREFIX__, __TIER_NOTE__
-- required tools: bash, curl, jq, awk, sed, date
+- required tools: bash, curl, jq, awk, sed, date, rg
 
 ## Commands
 
@@ -213,6 +213,7 @@ Use the commands below directly:
   - __RUNBOOK_FILE__
   - __COMMAND_FILE__
 - generated 'run_phase_commands.sh' is a per-phase audit starter; 'run_mixed_rollout_plan.sh' is the full runnable template.
+- for failure-oriented rollout phases, use scripts/manual_transition_failure_samples.sh to capture auth/network/timeout attribution evidence from the produced job ids.
 - recommended runbook order:
   1. Review 'mixed_rollout_checklist.md'.
   2. Inspect __MATRIX_CMD__ for each phase note.
