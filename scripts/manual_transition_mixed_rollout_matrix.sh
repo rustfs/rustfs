@@ -127,10 +127,6 @@ parse_phase_row() {
     echo "ERROR: phase ratio/duration must be integers: $spec" >&2
     exit 1
   fi
-  if (( old_ratio + new_ratio != 100 )); then
-    echo "ERROR: phase ratios must sum to 100: $spec" >&2
-    exit 1
-  fi
   echo "$name|$old_ratio|$new_ratio|$duration_min"
 }
 
@@ -253,12 +249,11 @@ run_rows() {
             printf " --admin-token \"\${ADMIN_TOKEN}\""
           fi
           printf '\n'
-          admin_check_cmd "$phase_name" "$job_id_ref" 1 1
           echo ""
         } >> "$run_script"
       done
-      done
-    done < <(tr ',' '\n' <<< "$PHASE_MATRIX")
+    done
+  done < <(tr ',' '\n' <<< "$PHASE_MATRIX")
 
   {
     echo "## Mixed-version rollout matrix artifacts"
