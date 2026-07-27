@@ -373,13 +373,13 @@ run_entry() {
     return 1
   fi
   printf '%s' "$status_json" >"${RESULT_DIR}/${result_tag}-status.json"
-  if ! status_info="$(printf '%s' "$status_json" | jq -r '[.status // "", .failure_reason // "", (.report.enqueued // 0), (.report.transition_completed // 0), (.report.transition_failed // 0), (.report.tier_failure_by_reason["unknown"] // 0), (.queue_snapshot.queued // 0), (.queue_snapshot.active // 0), (.queue_snapshot.compensation_pending // 0), (.queue_snapshot.compensation_running // 0), (.queue_snapshot.queue_full // 0), (.queue_snapshot.queue_send_timeout // 0)] | map(tostring) | @tsv')"; then
+  if ! status_info="$(printf '%s' "$status_json" | jq -r '[.status // "", .failure_reason // "__none__", (.report.enqueued // 0), (.report.transition_completed // 0), (.report.transition_failed // 0), (.report.tier_failure_by_reason["unknown"] // 0), (.queue_snapshot.queued // 0), (.queue_snapshot.active // 0), (.queue_snapshot.compensation_pending // 0), (.queue_snapshot.compensation_running // 0), (.queue_snapshot.queue_full // 0), (.queue_snapshot.queue_send_timeout // 0)] | map(tostring) | @tsv')"; then
     snapshot_failure "$tag" "invalid_job_status_json" "$job_id"
     return 1
   fi
   IFS=$'\t' read -r status failure_reason report_enqueued report_completed report_failed report_unknown_failure queue_snapshot_queued queue_snapshot_active compensation_pending compensation_running queue_full queue_send_timeout <<< "$status_info"
 
-  if [[ -n "$failure_reason" && "$failure_reason" != "null" ]]; then
+  if [[ "$failure_reason" != "__none__" ]]; then
     snapshot_failure "$tag" "failure_reason=${failure_reason}" "$job_id"
   fi
 

@@ -110,6 +110,12 @@ rg -q "manual_transition_failure_samples.sh" "$TMP_DIR/stress-runbook/manual_tra
 rg -q "is_terminal_status" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "status_json" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "@tsv" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q 'failure_reason // "__none__"' "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q 'failure_reason" != "__none__"' "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+if rg -F -q 'failure_reason // ""' "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"; then
+  echo "nightly stress runner must not emit an empty TSV failure_reason field" >&2
+  exit 1
+fi
 rg -q "job_id, status, bucket, prefix, tier" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 if rg -F -q 'join(\"' "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"; then
   echo "nightly stress runner must not emit escaped jq quotes" >&2
