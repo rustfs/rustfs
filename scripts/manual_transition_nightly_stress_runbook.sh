@@ -297,15 +297,13 @@ run_entry() {
   local response
   local job_id
   local status
+  local status_json
+  local status_info
   local headers=()
 
   if [[ "$budget_status" == "over-budget" ]]; then
     echo "[skip] ${tag} ${size} over budget: expected_ops=${expected_ops}"
     return 0
-  fi
-
-  if [[ "$UNKNOWN_FAILURE_COUNT_THRESHOLD" -gt 0 && "$expected_ops" -gt "$UNKNOWN_FAILURE_COUNT_THRESHOLD" ]]; then
-    :
   fi
 
   prefix="${JOB_PREFIX}/${tag}/${size}/${read_pct}r${write_pct}w"
@@ -335,10 +333,77 @@ run_entry() {
     return 1
   fi
 
-  status="$(curl -sS "${headers[@]}" -X GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}" | jq -r '.failure_reason // empty')"
-  if [[ -n "$status" && "$status" != "null" ]]; then
-    snapshot_failure "$tag" "failure_reason=${status}" "$job_id"
+  if ! status_json="$(curl -sS "${headers[@]}" -X GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}")"; then
+    snapshot_failure "$tag" "job_status_fetch_failed" "$job_id"
+    return 1
   fi
+  if ! status_info="$(printf '%s' "$status_json" | jq -r '[.status // "", .failure_reason // "", (.report.enqueued // 0), (.report.transition_completed // 0), (.report.transition_failed // 0), (.report.tier_failure_by_reason["unknown"] // 0), (.queue_snapshot.queued // 0), (.queue_snapshot.active // 0), (.queue_snapshot.compensation_pending // 0), (.queue_snapshot.compensation_running // 0), (.queue_snapshot.queue_full // 0), (.queue_snapshot.queue_send_timeout // 0)] | map(tostring) | join(\"\\u0000\")')"; then
+    snapshot_failure "$tag" "invalid_job_status_json" "$job_id"
+    return 1
+  fi
+  IFS=$'\0' read -r status failure_reason report_enqueued report_completed report_failed report_unknown_failure queue_snapshot_queued queue_snapshot_active compensation_pending compensation_running queue_full queue_send_timeout <<< "$status_info"
+
+  if [[ -n "$failure_reason" && "$failure_reason" != "null" ]]; then
+    snapshot_failure "$tag" "failure_reason=${failure_reason}" "$job_id"
+  fi
+
+  # Threshold checks are applied to terminal job statuses only to avoid transient noise
+  # from active windows that are still processing.
+  if is_terminal_status "$status"; then
+    local mismatch_count
+    local mismatch_ratio
+    local unknown_ratio
+    local ratio_denominator
+    mismatch_count="$((report_enqueued - report_completed - report_failed))"
+    if (( mismatch_count < 0 )); then
+      mismatch_count=0
+    fi
+    mismatch_count="$((queue_snapshot_queued + queue_snapshot_active + compensation_pending + compensation_running + queue_full + queue_send_timeout + mismatch_count))"
+
+    if (( expected_ops > 0 )); then
+      ratio_denominator="$expected_ops"
+    else
+      ratio_denominator="$report_enqueued"
+    fi
+    if (( ratio_denominator <= 0 )); then
+      ratio_denominator=0
+    fi
+
+    if (( ratio_denominator > 0 )); then
+      unknown_ratio="$(awk -v unknown="$report_unknown_failure" -v denom="$ratio_denominator" 'BEGIN{printf "%.6f", (unknown / denom)}')"
+      mismatch_ratio="$(awk -v mismatch="$mismatch_count" -v denom="$ratio_denominator" 'BEGIN{printf "%.6f", (mismatch / denom)}')"
+
+      if (( UNKNOWN_FAILURE_RATIO_THRESHOLD > 0 )) && \
+         awk "BEGIN{exit !($unknown_ratio > ${UNKNOWN_FAILURE_RATIO_THRESHOLD})}"; then
+        snapshot_failure "$tag" "unknown_failure_ratio=${unknown_ratio}/expected=${ratio_denominator}/threshold=${UNKNOWN_FAILURE_RATIO_THRESHOLD}" "$job_id"
+      fi
+
+      if (( UNKNOWN_FAILURE_COUNT_THRESHOLD > 0 )) && (( report_unknown_failure > UNKNOWN_FAILURE_COUNT_THRESHOLD )); then
+        snapshot_failure "$tag" "unknown_failure_count=${report_unknown_failure}/threshold=${UNKNOWN_FAILURE_COUNT_THRESHOLD}" "$job_id"
+      fi
+
+      if (( QUEUE_MISMATCH_RATIO_THRESHOLD > 0 )) && \
+         awk "BEGIN{exit !($mismatch_ratio > ${QUEUE_MISMATCH_RATIO_THRESHOLD})}"; then
+        snapshot_failure "$tag" "queue_mismatch_ratio=${mismatch_ratio}/expected=${ratio_denominator}/threshold=${QUEUE_MISMATCH_RATIO_THRESHOLD}" "$job_id"
+      fi
+    fi
+  fi
+
+  # Keep compatibility with older callers that monitor queue drift via full terminal status.
+  curl -sS "${headers[@]}" -X GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}" | jq '{status, report, queue_snapshot, failure_reason}'
+}
+
+is_terminal_status() {
+  local current_status="$1"
+
+  case "$current_status" in
+    completed|partial|failed|cancelled|unknown)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 main() {

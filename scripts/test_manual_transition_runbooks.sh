@@ -88,5 +88,29 @@ rg -q "UNKNOWN_FAILURE_RATIO_THRESHOLD" "$TMP_DIR/stress-runbook/run_nightly_str
 rg -q "QUEUE_MISMATCH_RATIO_THRESHOLD" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "UNKNOWN_FAILURE_COUNT_THRESHOLD" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "snapshot_failure" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "is_terminal_status" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "status_json" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "unknown_failure_ratio" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "queue_mismatch_ratio" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+rg -q "report_unknown_failure" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
 rg -q "Manual transition nightly/stress stress-runbook" "$TMP_DIR/stress-runbook/manual_transition_nightly_stress_runbook.md"
 rg -q "SOAK_MATRIX_CSV='$TMP_DIR/stress-runbook/nightly_soak_matrix.csv'" "$TMP_DIR/stress-runbook/run_nightly_stress_plan.sh"
+
+bash scripts/monitor_manual_transition_ci.sh --help | rg -q "Usage:"
+if bash scripts/monitor_manual_transition_ci.sh --issues >/tmp/monitor_manual_transition_ci.err 2>&1; then
+  echo "monitor script should fail when --issues has no value" >&2
+  exit 1
+fi
+if ! rg -q "ERROR: missing value for --issues" /tmp/monitor_manual_transition_ci.err; then
+  echo "monitor script missing missing-value guard for --issues" >&2
+  exit 1
+fi
+
+if bash scripts/monitor_manual_transition_ci.sh --runs 0 >/tmp/monitor_manual_transition_ci.err 2>&1; then
+  echo "monitor script should fail on invalid --runs" >&2
+  exit 1
+fi
+if ! rg -q "ERROR: --runs must be a positive integer" /tmp/monitor_manual_transition_ci.err; then
+  echo "monitor script missing invalid --runs guard output" >&2
+  exit 1
+fi

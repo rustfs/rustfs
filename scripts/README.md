@@ -90,6 +90,7 @@ their issue closes.
 | `manual_transition_journal_audit.sh` | dev-tool | Journal + metrics + log audit for manual transition jobs | — |
 | `manual_transition_mixed_rollout_matrix.sh` | dev-tool | Matrix generator for mixed-version rollout phases | — |
 | `manual_transition_mixed_rollout_runbook.sh` | dev-tool | Reusable mixed-version rollout runbook generator (external run) | — |
+| `monitor_manual_transition_ci.sh` | dev-tool | CI workflow/status watcher for manual transition follow-up monitoring | — |
 | `manual_transition_soak_matrix.sh` | dev-tool | Matrix generator for nightly stress windows | — |
 | `manual_transition_nightly_stress_runbook.sh` | dev-tool | Nightly stress entrypoint with failure snapshot templates | — |
 | `install-flatc.sh` | dev-tool | Local flatc installer (macOS) | — |
