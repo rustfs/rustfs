@@ -68,7 +68,7 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.96.0"
+rust-version = "1.97.1"
 version = "1.0.0-beta.11"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
@@ -211,7 +211,7 @@ zeroize = { version = "1.9.0" }
 # Time and Date
 chrono = { version = "0.4.45" }
 humantime = "2.4.0"
-jiff = { version = "0.2.34" }
+jiff = { version = "0.2.35" }
 time = { version = "0.3.54" }
 
 # Database
@@ -243,6 +243,7 @@ crossbeam-channel = "0.5.16"
 crossbeam-deque = "0.8.7"
 crossbeam-utils = "0.8.22"
 datafusion = { default-features = false, git = "https://github.com/apache/datafusion.git", rev = "dae03ee062b2abf986de8df12ea82fb1578a2d99" }
+#datafusion = { default-features = false, version = "54.1.0" }
 derive_builder = "0.20.2"
 enumset = "1.1.14"
 faster-hex = "0.10.0"

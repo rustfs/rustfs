@@ -23,15 +23,13 @@ use crate::bucket::lifecycle::lifecycle::{
 };
 use crate::bucket::lifecycle::manual_transition_job::{
     MANUAL_TRANSITION_JOB_RECORD_PREFIX, ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission,
-    ManualTransitionScopeAdmissionClaim, ManualTransitionTaskRecord, ManualTransitionWorkerResult,
-    ManualTransitionWorkerFailureReason,
-    claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
+    ManualTransitionScopeAdmissionClaim, ManualTransitionTaskRecord, ManualTransitionWorkerFailureReason,
+    ManualTransitionWorkerResult, claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
     load_manual_transition_job_record, load_manual_transition_job_record_with_etag,
     manual_transition_job_id_from_record_object_name, manual_transition_job_lease_expired,
     manual_transition_worker_result_task_key, persist_manual_transition_job_progress, reconcile_manual_transition_worker_results,
     record_manual_transition_worker_result, record_manual_transition_worker_result_with_reason,
-    renew_manual_transition_job_lease, save_manual_transition_job_record_if_current,
-    save_manual_transition_task_if_absent,
+    renew_manual_transition_job_lease, save_manual_transition_job_record_if_current, save_manual_transition_task_if_absent,
 };
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
@@ -4743,13 +4741,13 @@ mod tests {
         lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
         lifecycle_rule_has_date_expiration, lifecycle_version_purge_state_from_completed_targets,
         manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink,
-        manual_transition_version_marker, mark_delete_opts_skip_decommissioned_on_remote_success,
-        manual_transition_worker_failure_reason,
-        merge_stale_multipart_candidate, persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint,
-        recover_manual_transition_job, recover_manual_transition_jobs, replication_state_for_delete,
-        resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
-        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
-        select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
+        manual_transition_version_marker, manual_transition_worker_failure_reason,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
+        persist_manual_transition_job_progress, persist_manual_transition_page_checkpoint, recover_manual_transition_job,
+        recover_manual_transition_jobs, replication_state_for_delete, resolve_tier_free_version_recovery_enabled,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop, select_restore_s3_location,
+        set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
         should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
         transitioned_cleanup_tuple, transitioned_object_delete_opts, wait_for_tier_free_version_recovery,
     };
@@ -4763,17 +4761,16 @@ mod tests {
     use crate::bucket::lifecycle::manual_transition_job::{
         ManualTransitionJobRecord, ManualTransitionJobState, ManualTransitionScopeAdmission, ManualTransitionScopeAdmissionClaim,
         ManualTransitionTaskRecord, ManualTransitionWorkerFailureReason, ManualTransitionWorkerResult,
-        ManualTransitionWorkerResultRecord,
-        claim_manual_transition_scope_admission, delete_manual_transition_scope_admission_if_current,
-        legacy_manual_transition_scope_key, load_manual_transition_job_record, load_manual_transition_scope_admission,
+        ManualTransitionWorkerResultRecord, claim_manual_transition_scope_admission,
+        delete_manual_transition_scope_admission_if_current, legacy_manual_transition_scope_key,
+        load_manual_transition_job_record, load_manual_transition_scope_admission,
         load_manual_transition_scope_admission_with_etag, load_manual_transition_task_record,
         manual_transition_scope_record_object_name, manual_transition_worker_result_object_name,
         manual_transition_worker_result_task_key, reconcile_manual_transition_worker_results,
         record_manual_transition_worker_result, record_manual_transition_worker_result_with_reason,
-        renew_manual_transition_job_lease, request_manual_transition_job_cancel,
-        save_manual_transition_job_record, save_manual_transition_scope_admission_if_absent,
-        save_manual_transition_scope_admission_if_current, save_manual_transition_task_if_absent,
-        save_manual_transition_worker_result_if_absent,
+        renew_manual_transition_job_lease, request_manual_transition_job_cancel, save_manual_transition_job_record,
+        save_manual_transition_scope_admission_if_absent, save_manual_transition_scope_admission_if_current,
+        save_manual_transition_task_if_absent, save_manual_transition_worker_result_if_absent,
     };
     use crate::bucket::lifecycle::replication_sink::{
         ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
@@ -8622,7 +8619,13 @@ mod tests {
         .await
         .expect("worker result with failure reason should persist");
 
-        assert_eq!(final_record.report.tier_failure_by_reason.get(&ManualTransitionWorkerFailureReason::Network), Some(&1));
+        assert_eq!(
+            final_record
+                .report
+                .tier_failure_by_reason
+                .get(&ManualTransitionWorkerFailureReason::Network),
+            Some(&1)
+        );
         assert_eq!(final_record.report.transition_failed, 1);
         assert_eq!(final_record.report.tier_failure, 1);
     }

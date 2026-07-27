@@ -215,11 +215,7 @@ impl ManualTransitionJobRecord {
                 self.report.transition_failed = self.report.transition_failed.saturating_add(1);
                 self.report.tier_failure = self.report.tier_failure.saturating_add(1);
                 let reason = failure_reason.unwrap_or(ManualTransitionWorkerFailureReason::Unknown);
-                *self
-                    .report
-                    .tier_failure_by_reason
-                    .entry(reason)
-                    .or_insert(0) += 1;
+                *self.report.tier_failure_by_reason.entry(reason).or_insert(0) += 1;
             }
         }
         self.queue_snapshot = queue_snapshot;
@@ -612,11 +608,7 @@ pub struct ManualTransitionWorkerResultStats {
 }
 
 impl ManualTransitionWorkerResultStats {
-    fn record(
-        &mut self,
-        result: ManualTransitionWorkerResult,
-        failure_reason: Option<ManualTransitionWorkerFailureReason>,
-    ) {
+    fn record(&mut self, result: ManualTransitionWorkerResult, failure_reason: Option<ManualTransitionWorkerFailureReason>) {
         match result {
             ManualTransitionWorkerResult::Completed => self.completed = self.completed.saturating_add(1),
             ManualTransitionWorkerResult::TierFailure => {
@@ -1878,7 +1870,13 @@ mod tests {
             ManualTransitionQueueSnapshot::default(),
         );
 
-        assert_eq!(record.report.tier_failure_by_reason.get(&ManualTransitionWorkerFailureReason::NotFound), Some(&1));
+        assert_eq!(
+            record
+                .report
+                .tier_failure_by_reason
+                .get(&ManualTransitionWorkerFailureReason::NotFound),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -1894,16 +1892,22 @@ mod tests {
         let mut failure_reasons = BTreeMap::new();
         failure_reasons.insert(ManualTransitionWorkerFailureReason::PermissionDenied, 2);
 
-        record.apply_worker_result_counts(
-            0,
-            1,
-            &failure_reasons,
-            1,
-            ManualTransitionQueueSnapshot::default(),
-        );
+        record.apply_worker_result_counts(0, 1, &failure_reasons, 1, ManualTransitionQueueSnapshot::default());
 
-        assert_eq!(record.report.tier_failure_by_reason.get(&ManualTransitionWorkerFailureReason::NotFound), Some(&1));
-        assert_eq!(record.report.tier_failure_by_reason.get(&ManualTransitionWorkerFailureReason::PermissionDenied), Some(&2));
+        assert_eq!(
+            record
+                .report
+                .tier_failure_by_reason
+                .get(&ManualTransitionWorkerFailureReason::NotFound),
+            Some(&1)
+        );
+        assert_eq!(
+            record
+                .report
+                .tier_failure_by_reason
+                .get(&ManualTransitionWorkerFailureReason::PermissionDenied),
+            Some(&2)
+        );
     }
 
     #[test]
@@ -2195,10 +2199,17 @@ mod tests {
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.failed, 3);
         assert_eq!(
-            stats.tier_failure_by_reason.get(&ManualTransitionWorkerFailureReason::PermissionDenied),
+            stats
+                .tier_failure_by_reason
+                .get(&ManualTransitionWorkerFailureReason::PermissionDenied),
             Some(&2)
         );
-        assert_eq!(stats.tier_failure_by_reason.get(&ManualTransitionWorkerFailureReason::Unknown), Some(&1));
+        assert_eq!(
+            stats
+                .tier_failure_by_reason
+                .get(&ManualTransitionWorkerFailureReason::Unknown),
+            Some(&1)
+        );
     }
 
     #[test]
