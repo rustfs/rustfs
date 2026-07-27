@@ -1405,7 +1405,9 @@ pub async fn claim_manual_transition_scope_admission(
                 Ok(active_job) => {
                     active_job.is_terminal() || (scope_lease_expired && manual_transition_job_lease_expired(&active_job))
                 }
-                Err(Error::ConfigNotFound) => true,
+                // Missing active job metadata can be transient (for example, immediately after admission creation);
+                // require an expired scope lease before treating it as reclaimable.
+                Err(Error::ConfigNotFound) => scope_lease_expired,
                 Err(err) => return Err(err),
             }
         };
