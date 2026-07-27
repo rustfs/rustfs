@@ -846,7 +846,7 @@ fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEnt
 }
 
 fn should_publish_completed_snapshot(completed_count: usize, total_count: usize, budget_elapsed: bool, cancelled: bool) -> bool {
-    total_count > 0 && completed_count == total_count && !budget_elapsed && !cancelled
+    completed_count == total_count && !budget_elapsed && !cancelled
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1015,6 +1015,10 @@ fn completed_data_usage_info(
     }
 
     let merged_last_update = results.iter().filter_map(|result| result.info.last_update).max()?;
+    let bucket_sizes = buckets_usage
+        .iter()
+        .map(|(bucket, usage)| (bucket.clone(), usage.size))
+        .collect();
     let data_usage_info = DataUsageInfo {
         last_update: Some(merged_last_update),
         scanner_cycle: Some(results.first()?.info.next_cycle),
@@ -1023,7 +1027,9 @@ fn completed_data_usage_info(
         delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
         objects_total_size: u64::try_from(total.size).ok()?,
         buckets_count: u64::try_from(all_buckets.len()).ok()?,
+        bucket_sizes,
         buckets_usage,
+        usage_snapshot_complete: true,
         ..Default::default()
     };
     Some((data_usage_info, merged_last_update))
@@ -1042,7 +1048,10 @@ mod publish_gate_tests {
         assert!(!should_publish_completed_snapshot(2, 3, false, false));
         assert!(!should_publish_completed_snapshot(3, 3, true, false));
         assert!(!should_publish_completed_snapshot(3, 3, false, true));
-        assert!(!should_publish_completed_snapshot(0, 0, false, false));
+        assert!(
+            should_publish_completed_snapshot(0, 0, false, false),
+            "a completed empty namespace is an authoritative zero snapshot"
+        );
     }
 
     fn incomplete_scope_cache(source: DataUsageCacheSource) -> DataUsageCache {
@@ -1121,11 +1130,13 @@ mod publish_gate_tests {
 
     #[test]
     fn completed_data_usage_info_requires_every_set_before_publish() {
-        let all_buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        let all_buckets = vec!["bucket-a".to_string(), "bucket-b".to_string(), "bucket-empty".to_string()];
         let mut first_set = completed_root_cache("bucket-a", 1, 10, DataUsageCacheSource::new(0, 0));
         first_set.replace("bucket-b", DATA_USAGE_ROOT, DataUsageEntry::default());
+        first_set.replace("bucket-empty", DATA_USAGE_ROOT, DataUsageEntry::default());
         let mut second_set = completed_root_cache("bucket-b", 2, 20, DataUsageCacheSource::new(1, 0));
         second_set.replace("bucket-a", DATA_USAGE_ROOT, DataUsageEntry::default());
+        second_set.replace("bucket-empty", DATA_USAGE_ROOT, DataUsageEntry::default());
 
         assert!(
             completed_data_usage_info_for_test(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false)
@@ -1144,7 +1155,38 @@ mod publish_gate_tests {
         assert_eq!(last_update, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
         assert_eq!(data_usage_info.scanner_cycle, Some(0));
         assert_eq!(data_usage_info.objects_total_count, 3);
-        assert_eq!(data_usage_info.buckets_usage.len(), 2);
+        assert_eq!(data_usage_info.buckets_usage.len(), 3);
+        assert!(data_usage_info.usage_snapshot_complete);
+        assert_eq!(
+            data_usage_info
+                .buckets_usage
+                .get("bucket-empty")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
+        let mut completed_set = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+                source: Some(DataUsageCacheSource::new(0, 0)),
+                snapshot_complete: true,
+                scan_plan_digest: Some(TEST_PLAN_DIGEST),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        completed_set.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+
+        let (data_usage_info, _) = completed_data_usage_info_for_test(&[completed_set], &[], false, false)
+            .expect("a completed empty namespace should produce an authoritative snapshot");
+
+        assert!(data_usage_info.is_complete_bucket_usage_snapshot());
+        assert_eq!(data_usage_info.buckets_count, 0);
+        assert!(data_usage_info.buckets_usage.is_empty());
     }
 
     #[test]
@@ -2000,6 +2042,7 @@ impl ScannerIOCycle for ECStore {
             let empty_usage = DataUsageInfo {
                 last_update: Some(SystemTime::now()),
                 scanner_cycle: Some(want_cycle),
+                usage_snapshot_complete: true,
                 ..Default::default()
             };
             send_data_usage_update(&updates, empty_usage).await?;

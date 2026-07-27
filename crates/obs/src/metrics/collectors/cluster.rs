@@ -43,9 +43,9 @@ pub struct ClusterStats {
     /// Number of drives with no capacity observation
     pub missing_capacity_drives: u64,
     /// Total number of objects in the cluster
-    pub objects_count: u64,
+    pub objects_count: Option<u64>,
     /// Total number of buckets in the cluster
-    pub buckets_count: u64,
+    pub buckets_count: Option<u64>,
 }
 
 /// Collects cluster-wide metrics from the provided cluster statistics.
@@ -53,16 +53,21 @@ pub struct ClusterStats {
 /// Uses the metric descriptors from `metrics_type::cluster` module.
 /// Returns a vector of Prometheus metrics for cluster statistics.
 pub fn collect_cluster_metrics(stats: &ClusterStats) -> Vec<PrometheusMetric> {
-    vec![
+    let mut metrics = vec![
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_RAW_TOTAL_BYTES_MD, stats.raw_capacity_bytes as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_USABLE_TOTAL_BYTES_MD, stats.usable_capacity_bytes as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_USED_BYTES_MD, stats.used_bytes as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_FREE_BYTES_MD, stats.free_bytes as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_STALE_DRIVES_MD, stats.stale_capacity_drives as f64),
         PrometheusMetric::from_descriptor(&CLUSTER_CAPACITY_MISSING_DRIVES_MD, stats.missing_capacity_drives as f64),
-        PrometheusMetric::from_descriptor(&CLUSTER_OBJECTS_TOTAL_MD, stats.objects_count as f64),
-        PrometheusMetric::from_descriptor(&CLUSTER_BUCKETS_TOTAL_MD, stats.buckets_count as f64),
-    ]
+    ];
+    if let Some(objects_count) = stats.objects_count {
+        metrics.push(PrometheusMetric::from_descriptor(&CLUSTER_OBJECTS_TOTAL_MD, objects_count as f64));
+    }
+    if let Some(buckets_count) = stats.buckets_count {
+        metrics.push(PrometheusMetric::from_descriptor(&CLUSTER_BUCKETS_TOTAL_MD, buckets_count as f64));
+    }
+    metrics
 }
 
 #[cfg(test)]
@@ -79,8 +84,8 @@ mod tests {
             free_bytes: 1300,
             stale_capacity_drives: 1,
             missing_capacity_drives: 0,
-            objects_count: 100,
-            buckets_count: 5,
+            objects_count: Some(100),
+            buckets_count: Some(5),
         };
 
         let metrics = collect_cluster_metrics(&stats);
@@ -116,7 +121,7 @@ mod tests {
         let metrics = collect_cluster_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 8);
+        assert_eq!(metrics.len(), 6);
 
         // All values should be zero
         for metric in &metrics {
@@ -134,7 +139,27 @@ mod tests {
         assert_eq!(stats.free_bytes, 0);
         assert_eq!(stats.stale_capacity_drives, 0);
         assert_eq!(stats.missing_capacity_drives, 0);
-        assert_eq!(stats.objects_count, 0);
-        assert_eq!(stats.buckets_count, 0);
+        assert_eq!(stats.objects_count, None);
+        assert_eq!(stats.buckets_count, None);
+    }
+
+    #[test]
+    fn unknown_cluster_cardinality_is_omitted() {
+        let metrics = collect_cluster_metrics(&ClusterStats {
+            objects_count: None,
+            buckets_count: None,
+            ..Default::default()
+        });
+
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| metric.name != CLUSTER_OBJECTS_TOTAL_MD.get_full_metric_name())
+        );
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| metric.name != CLUSTER_BUCKETS_TOTAL_MD.get_full_metric_name())
+        );
     }
 }

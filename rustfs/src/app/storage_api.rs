@@ -931,6 +931,10 @@ pub(crate) mod s3_api {
 
 pub(crate) mod admin_usecase {
     pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
+        }
+
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
     }
 

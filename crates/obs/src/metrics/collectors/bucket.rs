@@ -33,10 +33,10 @@ use std::borrow::Cow;
 pub struct BucketStats {
     /// Name of the bucket
     pub name: String,
-    /// Total size of all objects in the bucket (bytes)
-    pub size_bytes: u64,
-    /// Number of objects in the bucket
-    pub objects_count: u64,
+    /// Total size of all objects in the bucket (bytes), when authoritative.
+    pub size_bytes: Option<u64>,
+    /// Number of objects in the bucket, when authoritative.
+    pub objects_count: Option<u64>,
     /// Quota limit for the bucket (bytes), 0 if no quota
     pub quota_bytes: u64,
 }
@@ -54,15 +54,19 @@ pub fn collect_bucket_metrics(buckets: &[BucketStats]) -> Vec<PrometheusMetric> 
     for bucket in buckets {
         let bucket_label: Cow<'static, str> = Cow::Owned(bucket.name.clone());
 
-        metrics.push(
-            PrometheusMetric::from_descriptor(&BUCKET_USAGE_BYTES_MD, bucket.size_bytes as f64)
-                .with_label("bucket", bucket_label.clone()),
-        );
+        if let Some(size_bytes) = bucket.size_bytes {
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_USAGE_BYTES_MD, size_bytes as f64)
+                    .with_label("bucket", bucket_label.clone()),
+            );
+        }
 
-        metrics.push(
-            PrometheusMetric::from_descriptor(&BUCKET_OBJECTS_TOTAL_MD, bucket.objects_count as f64)
-                .with_label("bucket", bucket_label.clone()),
-        );
+        if let Some(objects_count) = bucket.objects_count {
+            metrics.push(
+                PrometheusMetric::from_descriptor(&BUCKET_OBJECTS_TOTAL_MD, objects_count as f64)
+                    .with_label("bucket", bucket_label.clone()),
+            );
+        }
 
         metrics.push(
             PrometheusMetric::from_descriptor(&BUCKET_QUOTA_BYTES_MD, bucket.quota_bytes as f64)
@@ -83,14 +87,14 @@ mod tests {
         let buckets = vec![
             BucketStats {
                 name: "test-bucket".to_string(),
-                size_bytes: 1000,
-                objects_count: 100,
+                size_bytes: Some(1000),
+                objects_count: Some(100),
                 quota_bytes: 0,
             },
             BucketStats {
                 name: "another-bucket".to_string(),
-                size_bytes: 2000,
-                objects_count: 200,
+                size_bytes: Some(2000),
+                objects_count: Some(200),
                 quota_bytes: 0,
             },
         ];
@@ -114,8 +118,8 @@ mod tests {
     fn test_collect_bucket_metrics_with_quotas() {
         let buckets = vec![BucketStats {
             name: "quota-bucket".to_string(),
-            size_bytes: 500,
-            objects_count: 10,
+            size_bytes: Some(500),
+            objects_count: Some(10),
             quota_bytes: 10000,
         }];
 
@@ -146,8 +150,8 @@ mod tests {
     fn test_collect_bucket_metrics_zero_quota_always_reported() {
         let buckets = vec![BucketStats {
             name: "no-quota-bucket".to_string(),
-            size_bytes: 100,
-            objects_count: 5,
+            size_bytes: Some(100),
+            objects_count: Some(5),
             quota_bytes: 0,
         }];
 
@@ -166,11 +170,25 @@ mod tests {
     }
 
     #[test]
+    fn unknown_usage_only_reports_quota() {
+        let metrics = collect_bucket_metrics(&[BucketStats {
+            name: "unknown-usage".to_string(),
+            size_bytes: None,
+            objects_count: None,
+            quota_bytes: 4096,
+        }]);
+
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, BUCKET_QUOTA_BYTES_MD.get_full_metric_name());
+        assert_eq!(metrics[0].value, 4096.0);
+    }
+
+    #[test]
     fn test_bucket_stats_default() {
         let stats = BucketStats::default();
         assert!(stats.name.is_empty());
-        assert_eq!(stats.size_bytes, 0);
-        assert_eq!(stats.objects_count, 0);
+        assert_eq!(stats.size_bytes, None);
+        assert_eq!(stats.objects_count, None);
         assert_eq!(stats.quota_bytes, 0);
     }
 }

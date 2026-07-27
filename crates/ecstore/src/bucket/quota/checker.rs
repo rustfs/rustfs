@@ -167,7 +167,7 @@ impl QuotaChecker {
         }
 
         let quota = self.get_quota_config(bucket).await?;
-        let current_usage = self.get_real_time_usage(bucket).await.unwrap_or(0);
+        let current_usage = self.get_real_time_usage(bucket).await?;
 
         Ok((quota, Some(current_usage)))
     }
@@ -177,7 +177,11 @@ impl QuotaChecker {
     }
 
     pub async fn get_real_time_usage(&self, bucket: &str) -> Result<u64, QuotaError> {
-        Ok(get_bucket_usage_memory(bucket).await.unwrap_or(0))
+        get_bucket_usage_memory(bucket)
+            .await
+            .ok_or_else(|| QuotaError::UsageUnavailable {
+                bucket: bucket.to_string(),
+            })
     }
 }
 
@@ -185,6 +189,8 @@ impl QuotaChecker {
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+    use serial_test::serial;
+    use uuid::Uuid;
 
     /// Regression (PR #5307 / s3-tests `test_100_continue_error_retry`): a
     /// bucket with no persisted metadata has no quota, so the admission check
@@ -203,6 +209,26 @@ mod tests {
             .expect("a bucket with no persisted metadata has no quota and must not fail the check");
         assert!(result.allowed);
         assert_eq!(result.quota_limit, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_usage_rejects_an_unknown_mutation_baseline() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
+        let checker = QuotaChecker::new(sys);
+        let bucket = format!("quota-unknown-{}", Uuid::new_v4().simple());
+
+        crate::data_usage::record_bucket_object_write_memory(&bucket, None, 42).await;
+        let result = checker.get_real_time_usage(&bucket).await;
+        crate::data_usage::prepare_bucket_usage_for_namespace_change(&bucket, None)
+            .await
+            .expect("test usage cache cleanup should succeed");
+
+        assert!(
+            matches!(result, Err(QuotaError::UsageUnavailable { bucket: failed_bucket }) if failed_bucket == bucket),
+            "quota decisions must fail closed without an authoritative usage baseline"
+        );
     }
 
     #[tokio::test]

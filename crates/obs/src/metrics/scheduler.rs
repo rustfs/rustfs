@@ -79,10 +79,13 @@ use crate::metrics::schema::audit::{AUDIT_FAILED_MESSAGES_MD, AUDIT_TARGET_QUEUE
 use crate::metrics::schema::bucket_replication::{
     BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, TARGET_ARN_L,
 };
+use crate::metrics::schema::cluster::{CLUSTER_BUCKETS_TOTAL_MD, CLUSTER_OBJECTS_TOTAL_MD};
 use crate::metrics::schema::cluster_usage::{
     BUCKET_LABEL as USAGE_BUCKET_LABEL, RANGE_LABEL as USAGE_RANGE_LABEL, USAGE_BUCKET_DELETE_MARKERS_COUNT_MD,
     USAGE_BUCKET_OBJECT_SIZE_DISTRIBUTION_MD, USAGE_BUCKET_OBJECT_VERSION_COUNT_DISTRIBUTION_MD, USAGE_BUCKET_OBJECTS_TOTAL_MD,
-    USAGE_BUCKET_QUOTA_TOTAL_BYTES_MD, USAGE_BUCKET_TOTAL_BYTES_MD, USAGE_BUCKET_VERSIONS_COUNT_MD,
+    USAGE_BUCKET_QUOTA_TOTAL_BYTES_MD, USAGE_BUCKET_TOTAL_BYTES_MD, USAGE_BUCKET_VERSIONS_COUNT_MD, USAGE_BUCKETS_COUNT_MD,
+    USAGE_DELETE_MARKERS_COUNT_MD, USAGE_OBJECTS_COUNT_MD, USAGE_OBJECTS_DISTRIBUTION_MD, USAGE_SINCE_LAST_UPDATE_SECONDS_MD,
+    USAGE_TOTAL_BYTES_MD, USAGE_VERSIONS_COUNT_MD, USAGE_VERSIONS_DISTRIBUTION_MD,
 };
 use crate::metrics::schema::node_bucket::{BUCKET_OBJECTS_TOTAL_MD, BUCKET_QUOTA_BYTES_MD, BUCKET_USAGE_BYTES_MD};
 use crate::metrics::schema::notification_target::{
@@ -659,6 +662,26 @@ fn bucket_live_keys(stats: &[crate::metrics::collectors::BucketStats]) -> HashSe
     stats.iter().map(|stat| stat.name.clone()).collect()
 }
 
+fn bucket_observation_live_keys(stats: &[crate::metrics::collectors::BucketStats]) -> HashSet<BucketKey> {
+    stats
+        .iter()
+        .filter(|stat| stat.size_bytes.is_some() || stat.objects_count.is_some())
+        .map(|stat| stat.name.clone())
+        .collect()
+}
+
+fn bucket_observation_retire_keys(
+    previous_observations: &HashSet<BucketKey>,
+    current_buckets: &HashSet<BucketKey>,
+    current_observations: &HashSet<BucketKey>,
+) -> Vec<BucketKey> {
+    previous_observations
+        .difference(current_observations)
+        .filter(|bucket| current_buckets.contains(*bucket))
+        .cloned()
+        .collect()
+}
+
 fn collect_bucket_zero_tombstone_metrics(zero_tombstones: &HashMap<BucketKey, u8>) -> Vec<PrometheusMetric> {
     if zero_tombstones.is_empty() {
         return Vec::new();
@@ -677,12 +700,82 @@ fn collect_bucket_zero_tombstone_metrics(zero_tombstones: &HashMap<BucketKey, u8
     zero_metrics
 }
 
+#[derive(Default)]
+struct BucketSeriesState {
+    has_seen_snapshot: bool,
+    live_keys: HashSet<BucketKey>,
+    observation_keys: HashSet<BucketKey>,
+    zero_tombstones: HashMap<BucketKey, u8>,
+}
+
+struct BucketSeriesUpdate {
+    metrics: Vec<PrometheusMetric>,
+    retire_observations: Vec<BucketKey>,
+    retire_buckets: Vec<BucketKey>,
+}
+
+impl BucketSeriesState {
+    fn observe(
+        &mut self,
+        stats: Option<&[crate::metrics::collectors::BucketStats]>,
+        tombstone_cycles: u8,
+    ) -> Option<BucketSeriesUpdate> {
+        let stats = stats?;
+        let current_bucket_keys = bucket_live_keys(stats);
+        let current_observation_keys = bucket_observation_live_keys(stats);
+        let retire_observations =
+            bucket_observation_retire_keys(&self.observation_keys, &current_bucket_keys, &current_observation_keys);
+        self.observation_keys = current_observation_keys;
+        update_series_zero_tombstones(
+            &mut self.has_seen_snapshot,
+            &mut self.live_keys,
+            &mut self.zero_tombstones,
+            current_bucket_keys,
+            tombstone_cycles,
+        );
+        let mut metrics = collect_bucket_metrics(stats);
+        metrics.extend(collect_bucket_zero_tombstone_metrics(&self.zero_tombstones));
+        let retire_buckets = expire_series_zero_tombstones(&mut self.zero_tombstones);
+        Some(BucketSeriesUpdate {
+            metrics,
+            retire_observations,
+            retire_buckets,
+        })
+    }
+}
+
 fn retire_bucket_metric_series(bucket: &str) -> usize {
     let bucket_label: Cow<'static, str> = Cow::Owned(bucket.to_string());
     let labels = [("bucket", bucket_label.clone())];
     retire_metric_series(&BUCKET_USAGE_BYTES_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&BUCKET_OBJECTS_TOTAL_MD.get_full_metric_name(), &labels)
         + retire_metric_series(&BUCKET_QUOTA_BYTES_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_bucket_observation_metric_series(bucket: &str) -> usize {
+    let labels = [("bucket", Cow::Owned(bucket.to_string()))];
+    retire_metric_series(&BUCKET_USAGE_BYTES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_OBJECTS_TOTAL_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_cluster_usage_metric_series() -> usize {
+    let labels: [(&'static str, Cow<'static, str>); 0] = [];
+    [
+        USAGE_SINCE_LAST_UPDATE_SECONDS_MD.get_full_metric_name(),
+        USAGE_TOTAL_BYTES_MD.get_full_metric_name(),
+        USAGE_OBJECTS_COUNT_MD.get_full_metric_name(),
+        USAGE_VERSIONS_COUNT_MD.get_full_metric_name(),
+        USAGE_DELETE_MARKERS_COUNT_MD.get_full_metric_name(),
+        USAGE_BUCKETS_COUNT_MD.get_full_metric_name(),
+    ]
+    .iter()
+    .map(|name| retire_metric_series(name, &labels))
+    .sum()
+}
+
+fn retire_cluster_usage_distribution_series(metric_name: String, range: &str) -> usize {
+    let labels = [(USAGE_RANGE_LABEL, Cow::Owned(range.to_string()))];
+    retire_metric_series(&metric_name, &labels)
 }
 
 fn bucket_usage_live_keys(stats: &[crate::metrics::collectors::BucketUsageStats]) -> HashSet<BucketKey> {
@@ -973,11 +1066,23 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = metrics_interval(cluster_interval, Duration::ZERO);
+        let mut objects_count_was_authoritative = false;
+        let mut buckets_count_was_authoritative = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {
                         let (stats, cluster_health) = collect_cluster_and_health_stats().await;
+                        if objects_count_was_authoritative && stats.objects_count.is_none() {
+                            let labels: [(&'static str, Cow<'static, str>); 0] = [];
+                            let _ = retire_metric_series(&CLUSTER_OBJECTS_TOTAL_MD.get_full_metric_name(), &labels);
+                        }
+                        if buckets_count_was_authoritative && stats.buckets_count.is_none() {
+                            let labels: [(&'static str, Cow<'static, str>); 0] = [];
+                            let _ = retire_metric_series(&CLUSTER_BUCKETS_TOTAL_MD.get_full_metric_name(), &labels);
+                        }
+                        objects_count_was_authoritative = stats.objects_count.is_some();
+                        buckets_count_was_authoritative = stats.buckets_count.is_some();
                         let mut metrics = collect_cluster_metrics(&stats);
                         metrics.extend(collect_cluster_health_metrics(&cluster_health));
                         report_metrics(&metrics);
@@ -1004,6 +1109,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut bucket_usage_object_size_zero_tombstones: HashMap<BucketRangeKey, u8> = HashMap::new();
         let mut prev_bucket_usage_version_keys: HashSet<BucketRangeKey> = HashSet::new();
         let mut bucket_usage_version_zero_tombstones: HashMap<BucketRangeKey, u8> = HashMap::new();
+        let mut prev_cluster_usage_object_size_keys: HashSet<String> = HashSet::new();
+        let mut prev_cluster_usage_version_keys: HashSet<String> = HashSet::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1028,6 +1135,30 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             }
 
                             if let Some((cluster_usage, bucket_usage)) = collect_cluster_usage_metric_stats().await {
+                                let current_cluster_usage_object_size_keys = cluster_usage
+                                    .object_size_distribution
+                                    .iter()
+                                    .map(|(range, _)| range.clone())
+                                    .collect::<HashSet<_>>();
+                                for range in prev_cluster_usage_object_size_keys.difference(&current_cluster_usage_object_size_keys) {
+                                    let _ = retire_cluster_usage_distribution_series(
+                                        USAGE_OBJECTS_DISTRIBUTION_MD.get_full_metric_name(),
+                                        range,
+                                    );
+                                }
+                                prev_cluster_usage_object_size_keys = current_cluster_usage_object_size_keys;
+                                let current_cluster_usage_version_keys = cluster_usage
+                                    .versions_distribution
+                                    .iter()
+                                    .map(|(range, _)| range.clone())
+                                    .collect::<HashSet<_>>();
+                                for range in prev_cluster_usage_version_keys.difference(&current_cluster_usage_version_keys) {
+                                    let _ = retire_cluster_usage_distribution_series(
+                                        USAGE_VERSIONS_DISTRIBUTION_MD.get_full_metric_name(),
+                                        range,
+                                    );
+                                }
+                                prev_cluster_usage_version_keys = current_cluster_usage_version_keys;
                                 metrics.extend(collect_cluster_usage_metrics(&cluster_usage));
                                 update_series_zero_tombstones(
                                     &mut has_seen_bucket_usage_snapshot,
@@ -1073,6 +1204,41 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                                         &range,
                                     );
                                 }
+                            } else if has_seen_bucket_usage_snapshot {
+                                let _ = retire_cluster_usage_metric_series();
+                                for range in prev_cluster_usage_object_size_keys.drain() {
+                                    let _ = retire_cluster_usage_distribution_series(
+                                        USAGE_OBJECTS_DISTRIBUTION_MD.get_full_metric_name(),
+                                        &range,
+                                    );
+                                }
+                                for range in prev_cluster_usage_version_keys.drain() {
+                                    let _ = retire_cluster_usage_distribution_series(
+                                        USAGE_VERSIONS_DISTRIBUTION_MD.get_full_metric_name(),
+                                        &range,
+                                    );
+                                }
+                                for bucket in prev_bucket_usage_keys.drain() {
+                                    let _ = retire_bucket_usage_metric_series(&bucket);
+                                }
+                                for (bucket, range) in prev_bucket_usage_object_size_keys.drain() {
+                                    let _ = retire_bucket_usage_distribution_series(
+                                        USAGE_BUCKET_OBJECT_SIZE_DISTRIBUTION_MD.get_full_metric_name(),
+                                        &bucket,
+                                        &range,
+                                    );
+                                }
+                                for (bucket, range) in prev_bucket_usage_version_keys.drain() {
+                                    let _ = retire_bucket_usage_distribution_series(
+                                        USAGE_BUCKET_OBJECT_VERSION_COUNT_DISTRIBUTION_MD.get_full_metric_name(),
+                                        &bucket,
+                                        &range,
+                                    );
+                                }
+                                bucket_usage_zero_tombstones.clear();
+                                bucket_usage_object_size_zero_tombstones.clear();
+                                bucket_usage_version_zero_tombstones.clear();
+                                has_seen_bucket_usage_snapshot = false;
                             }
 
                             if !metrics.is_empty() {
@@ -1094,25 +1260,20 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     tokio::spawn(async move {
         let mut interval = metrics_interval(bucket_interval, Duration::ZERO);
         let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
-        let mut has_seen_bucket_snapshot = false;
-        let mut prev_bucket_keys: HashSet<BucketKey> = HashSet::new();
-        let mut bucket_zero_tombstones: HashMap<BucketKey, u8> = HashMap::new();
+        let mut series_state = BucketSeriesState::default();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::BucketStats, "bucket_stats", async {
                         let stats = collect_bucket_stats().await;
-                        update_series_zero_tombstones(
-                            &mut has_seen_bucket_snapshot,
-                            &mut prev_bucket_keys,
-                            &mut bucket_zero_tombstones,
-                            bucket_live_keys(&stats),
-                            tombstone_cycles,
-                        );
-                        let mut metrics = collect_bucket_metrics(&stats);
-                        metrics.extend(collect_bucket_zero_tombstone_metrics(&bucket_zero_tombstones));
-                        report_metrics(&metrics);
-                        for bucket in expire_series_zero_tombstones(&mut bucket_zero_tombstones) {
+                        let Some(update) = series_state.observe(stats.as_deref(), tombstone_cycles) else {
+                            return;
+                        };
+                        for bucket in update.retire_observations {
+                            let _ = retire_bucket_observation_metric_series(&bucket);
+                        }
+                        report_metrics(&update.metrics);
+                        for bucket in update.retire_buckets {
                             let _ = retire_bucket_metric_series(&bucket);
                         }
                     }).await;
@@ -1850,8 +2011,8 @@ mod tests {
         let mut zero_tombstones = HashMap::new();
         let live_stats = vec![crate::metrics::collectors::BucketStats {
             name: "tmp".to_string(),
-            size_bytes: 1024,
-            objects_count: 8,
+            size_bytes: Some(1024),
+            objects_count: Some(8),
             quota_bytes: 2048,
         }];
 
@@ -1883,6 +2044,50 @@ mod tests {
         let expired = expire_series_zero_tombstones(&mut zero_tombstones);
         assert_eq!(expired, vec!["tmp".to_string()]);
         assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn bucket_observation_retirement_distinguishes_unknown_usage_from_deletion() {
+        let previous = HashSet::from(["bucket".to_string()]);
+        let unknown_stats = vec![crate::metrics::collectors::BucketStats {
+            name: "bucket".to_string(),
+            size_bytes: None,
+            objects_count: None,
+            quota_bytes: 1024,
+        }];
+        let current_buckets = bucket_live_keys(&unknown_stats);
+        let current_observations = bucket_observation_live_keys(&unknown_stats);
+
+        assert_eq!(
+            bucket_observation_retire_keys(&previous, &current_buckets, &current_observations),
+            vec!["bucket".to_string()],
+            "an existing bucket with unknown usage must retire its previous usage observations"
+        );
+        assert!(
+            bucket_observation_retire_keys(&previous, &HashSet::new(), &HashSet::new()).is_empty(),
+            "a deleted bucket remains governed by the zero-tombstone lifecycle"
+        );
+    }
+
+    #[test]
+    fn unavailable_bucket_snapshot_preserves_metric_series_state() {
+        let mut state = BucketSeriesState::default();
+        let initial = [crate::metrics::collectors::BucketStats {
+            name: "bucket".to_string(),
+            size_bytes: Some(512),
+            objects_count: Some(2),
+            quota_bytes: 1024,
+        }];
+        assert!(state.observe(Some(&initial), 2).is_some());
+
+        let live_keys = state.live_keys.clone();
+        let observation_keys = state.observation_keys.clone();
+        let zero_tombstones = state.zero_tombstones.clone();
+
+        assert!(state.observe(None, 2).is_none());
+        assert_eq!(state.live_keys, live_keys);
+        assert_eq!(state.observation_keys, observation_keys);
+        assert_eq!(state.zero_tombstones, zero_tombstones);
     }
 
     #[test]

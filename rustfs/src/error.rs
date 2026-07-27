@@ -358,6 +358,7 @@ impl From<QuotaError> for ApiError {
         let code = match &err {
             QuotaError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
             QuotaError::ConfigNotFound { .. } => S3ErrorCode::NoSuchBucket,
+            QuotaError::UsageUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             QuotaError::InvalidConfig { .. } => S3ErrorCode::InvalidArgument,
             QuotaError::StorageError(_) => S3ErrorCode::InternalError,
         };
@@ -481,6 +482,16 @@ mod tests {
     #[test]
     fn test_kms_service_unavailable_maps_to_retryable_error() {
         let api_error = ApiError::from(StorageError::other(KmsUnavailableError));
+
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(api_error.message, "The service is unavailable. Please retry.");
+    }
+
+    #[test]
+    fn test_unknown_authoritative_quota_usage_maps_to_retryable_error() {
+        let api_error = ApiError::from(QuotaError::UsageUnavailable {
+            bucket: "bucket".to_string(),
+        });
 
         assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
         assert_eq!(api_error.message, "The service is unavailable. Please retry.");

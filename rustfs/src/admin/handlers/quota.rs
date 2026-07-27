@@ -27,7 +27,7 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::sync::Arc;
@@ -123,6 +123,16 @@ fn compat_bucket_quota_response(quota: &BucketQuota) -> CompatibleBucketQuotaRes
         rate: 0,
         requests: 0,
         quotatype: if size > 0 { "hard".to_string() } else { String::new() },
+    }
+}
+
+fn map_quota_query_error(error: QuotaError, bucket: &str, operation: &str) -> S3Error {
+    match error {
+        QuotaError::ConfigNotFound { .. } => s3_error!(NoSuchBucket, "bucket not found: {}", bucket),
+        QuotaError::UsageUnavailable { .. } => {
+            s3_error!(ServiceUnavailable, "authoritative bucket usage is not available yet")
+        }
+        error => s3_error!(InternalError, "failed to {}: {}", operation, error),
     }
 }
 
@@ -376,26 +386,33 @@ impl Operation for GetBucketQuotaHandler {
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        let (quota, current_usage) = quota_checker.get_quota_stats(&bucket).await.map_err(|e| match e {
-            QuotaError::ConfigNotFound { .. } => {
-                s3_error!(NoSuchBucket, "bucket not found: {}", bucket)
+        if is_compat_get_bucket_quota_path(req.uri.path()) {
+            if !quota_checker.bucket_exists(&bucket).await {
+                return Err(s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
             }
-            _ => s3_error!(InternalError, "failed to get quota: {}", e),
-        })?;
+            let quota = quota_checker
+                .get_quota_config(&bucket)
+                .await
+                .map_err(|e| s3_error!(InternalError, "failed to get quota: {}", e))?;
+            let json = serde_json::to_string(&compat_bucket_quota_response(&quota))
+                .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+            return Ok(S3Response::new((StatusCode::OK, Body::from(json))));
+        }
 
-        let json = if is_compat_get_bucket_quota_path(req.uri.path()) {
-            serde_json::to_string(&compat_bucket_quota_response(&quota))
-                .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?
-        } else {
-            let response = BucketQuotaResponse {
-                bucket,
-                quota: quota.quota,
-                size: current_usage.unwrap_or(0),
-                quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
-            };
+        let (quota, current_usage) = quota_checker
+            .get_quota_stats(&bucket)
+            .await
+            .map_err(|error| map_quota_query_error(error, &bucket, "get quota"))?;
 
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?
+        let response = BucketQuotaResponse {
+            bucket,
+            quota: quota.quota,
+            size: current_usage.unwrap_or(0),
+            quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
         };
+
+        let json =
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
     }
@@ -550,12 +567,10 @@ impl Operation for GetBucketQuotaStatsHandler {
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        let (quota, current_usage_opt) = quota_checker.get_quota_stats(&bucket).await.map_err(|e| match e {
-            QuotaError::ConfigNotFound { .. } => {
-                s3_error!(NoSuchBucket, "bucket not found: {}", bucket)
-            }
-            _ => s3_error!(InternalError, "failed to get quota stats: {}", e),
-        })?;
+        let (quota, current_usage_opt) = quota_checker
+            .get_quota_stats(&bucket)
+            .await
+            .map_err(|error| map_quota_query_error(error, &bucket, "get quota stats"))?;
 
         let current_usage = current_usage_opt.unwrap_or(0);
         let usage_percentage = quota.quota.and_then(|limit| {
@@ -659,7 +674,7 @@ impl Operation for CheckBucketQuotaHandler {
         let result = quota_checker
             .check_quota_with_usage_reporting(&bucket, operation, request.operation_size, true)
             .await
-            .map_err(|e| s3_error!(InternalError, "failed to check quota: {}", e))?;
+            .map_err(|error| map_quota_query_error(error, &bucket, "check quota"))?;
 
         let response = CheckQuotaResponse {
             bucket,
@@ -713,6 +728,19 @@ mod tests {
         assert!(json.contains("\"quota\":1024"));
         assert!(json.contains("\"size\":1024"));
         assert!(json.contains("\"quotatype\":\"hard\""));
+    }
+
+    #[test]
+    fn unknown_authoritative_usage_is_retryable() {
+        let error = map_quota_query_error(
+            QuotaError::UsageUnavailable {
+                bucket: "test-bucket".to_string(),
+            },
+            "test-bucket",
+            "check quota",
+        );
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]
