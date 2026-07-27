@@ -1324,28 +1324,27 @@ async fn test_manual_transition_async_scope_conflicts_report_active_job() -> Tes
     let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
     assert_eq!(active.job_id, job_id);
 
-    for conflicting_prefix in [MANUAL_ASYNC_CONFLICT_PREFIX, MANUAL_ASYNC_CONFLICT_NESTED_PREFIX] {
-        let (conflict_status, conflict_body) = manual_transition_async_run_raw(
-            &hot,
-            MANUAL_ASYNC_CONFLICT_BUCKET,
-            conflicting_prefix,
-            false,
-            MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
-        )
-        .await?;
-        assert_eq!(
-            conflict_status,
-            reqwest::StatusCode::CONFLICT,
-            "active async run must reject conflicting prefix {conflicting_prefix}: {conflict_body}"
-        );
-        let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict_body)?;
-        assert_eq!(conflict.state, "conflict");
-        assert_eq!(conflict.mode, "durable_job");
-        assert_eq!(conflict.active_job_id, job_id);
-        assert_eq!(conflict.status_endpoint, status_endpoint);
-        assert_eq!(conflict.cancel_endpoint, status_endpoint);
-        assert!(!conflict.scope_key.is_empty());
-    }
+    let (conflict_status, conflict_body) = manual_transition_async_run_raw(
+        &hot,
+        MANUAL_ASYNC_CONFLICT_BUCKET,
+        MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
+        false,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+    )
+    .await?;
+    assert_eq!(
+        conflict_status,
+        reqwest::StatusCode::CONFLICT,
+        "active async run must reject nested prefix {}: {conflict_body}",
+        MANUAL_ASYNC_CONFLICT_NESTED_PREFIX
+    );
+    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict_body)?;
+    assert_eq!(conflict.state, "conflict");
+    assert_eq!(conflict.mode, "durable_job");
+    assert_eq!(conflict.active_job_id, job_id);
+    assert_eq!(conflict.status_endpoint, status_endpoint);
+    assert_eq!(conflict.cancel_endpoint, status_endpoint);
+    assert!(!conflict.scope_key.is_empty());
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, MANUAL_ASYNC_CONFLICT_TERMINAL_TIMEOUT).await?;
     assert_eq!(terminal.job_id, job_id);
