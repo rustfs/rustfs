@@ -45,24 +45,17 @@ pub(crate) fn register_site_replication_reconciler(reconcile: ReconcileHook) {
     let _ = RECONCILER.set(reconcile);
 }
 
-/// Repair drifted site-replication wiring once.
+/// Repair drifted site-replication wiring, immediately and then on a timer.
 ///
-/// A no-op when site replication is disabled, and when the admin router was never built.
-pub(crate) async fn reconcile_site_replication_now() {
-    let Some(reconcile) = RECONCILER.get() else {
-        return;
-    };
-
-    reconcile().await;
-}
-
-/// Re-run the reconcilers on a timer.
+/// The first pass runs inside the spawned task rather than on the caller's path: it walks
+/// every bucket, so awaiting it would delay the rest of startup in proportion to bucket
+/// count. It is also spawned unconditionally, including when IAM bootstrap was deferred —
+/// a node that recovers IAM in the background would otherwise keep self-pointing rules
+/// until someone restarted it. The reconciler itself returns early while IAM or the object
+/// store are still unavailable, so an early tick is silent rather than noisy.
 ///
-/// Startup alone leaves a site broken until the next restart, and the events that rebuild
-/// replication rules (bucket creation, peer bucket-ops, metadata pushes) only ever touch one
-/// bucket. Both reconcilers are no-ops once the wiring matches — the bucket pass compares the
-/// serialized targets and rule set before writing — so a healthy deployment reads and writes
-/// nothing.
+/// Later passes are no-ops once the wiring matches — the bucket pass compares the serialized
+/// targets and rule set before writing — so a healthy deployment reads and writes nothing.
 pub(crate) fn spawn_site_replication_reconcile_task(ctx: CancellationToken) {
     if RECONCILER.get().is_none() {
         warn!("site replication reconciler is not registered; periodic reconcile disabled");
@@ -72,13 +65,16 @@ pub(crate) fn spawn_site_replication_reconcile_task(ctx: CancellationToken) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // The first tick fires immediately and startup has just reconciled; skip it.
-        ticker.tick().await;
 
         loop {
             tokio::select! {
                 _ = ctx.cancelled() => break,
-                _ = ticker.tick() => reconcile_site_replication_now().await,
+                // The first tick fires immediately, which is the startup repair pass.
+                _ = ticker.tick() => {
+                    if let Some(reconcile) = RECONCILER.get() {
+                        reconcile().await;
+                    }
+                }
             }
         }
     });

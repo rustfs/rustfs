@@ -103,7 +103,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -2485,6 +2485,7 @@ async fn set_site_replicator_service_account_secret(parent_user: &str, secret_ke
                     description: None,
                     expiration: None,
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: true,
                 },
             )
@@ -2535,34 +2536,91 @@ async fn ensure_site_replicator_service_account(parent_user: &str, rotate_secret
     Ok((access_key, secret_key))
 }
 
-/// Recover the shared site-replication secret from any bucket target.
+/// Whether a bucket target is one this site's own peer topology produced.
+///
+/// Bucket targets are writable by anyone holding `admin:SetBucketTarget`, so a target that
+/// merely carries the `site-replicator-0` access key proves nothing: an attacker with only
+/// that permission could plant a secret of their choosing and have reconciliation recreate
+/// the broadly privileged replication account with it. Require the target to name a peer in
+/// the persisted state *and* to point at that peer's recorded endpoint, which is state only
+/// `replicate add`/`edit` can write.
+fn bucket_target_matches_configured_peer(target: &BucketTarget, state: &SiteReplicationState) -> bool {
+    let Some(deployment_id) = bucket_target_deployment_id(target) else {
+        return false;
+    };
+    state
+        .peers
+        .get(&deployment_id)
+        .is_some_and(|peer| bucket_target_endpoint(target) == canonical_endpoint(&peer.endpoint))
+}
+
+/// Recover the shared site-replication secret from a bucket target belonging to a configured
+/// peer.
 ///
 /// Every site-replication bucket target stores the `site-replicator-0` credentials in
-/// `BUCKET_TARGETS_FILE`, which is not encrypted with the root credentials. That makes it
-/// the one local copy that survives a root-credential change, so it can reseed the IAM
-/// account when the IAM record itself became unreadable.
-async fn site_replicator_secret_from_bucket_targets(access_key: &str) -> Option<String> {
+/// `BUCKET_TARGETS_FILE`, which is not encrypted with the root credentials. That makes it the
+/// one local copy that survives a root-credential change, so it can reseed the IAM account
+/// when the IAM record itself became unreadable.
+///
+/// Returns `None` unless every matching target agrees on the secret: disagreement means at
+/// least one was written by something other than this site's own reconciliation, and picking
+/// either would be a guess.
+async fn site_replicator_secret_from_bucket_targets(access_key: &str, state: &SiteReplicationState) -> Option<String> {
     let store = current_object_store_handle()?;
     let buckets = store.list_bucket(&BucketOptions::default()).await.ok()?;
+    let mut recovered: Option<String> = None;
 
     for bucket in buckets {
         let Ok(targets) = metadata_sys::list_bucket_targets(&bucket.name).await else {
             continue;
         };
         for target in targets.targets {
-            if target.target_type != BucketTargetType::ReplicationService {
+            if target.target_type != BucketTargetType::ReplicationService
+                || !bucket_target_matches_configured_peer(&target, state)
+            {
                 continue;
             }
-            let Some(credentials) = target.credentials else {
+            let Some(credentials) = target.credentials.as_ref() else {
                 continue;
             };
-            if credentials.access_key == access_key && !credentials.secret_key.is_empty() {
-                return Some(credentials.secret_key);
+            if credentials.access_key != access_key || credentials.secret_key.is_empty() {
+                continue;
+            }
+            match &recovered {
+                Some(seen) if seen != &credentials.secret_key => return None,
+                Some(_) => {}
+                None => recovered = Some(credentials.secret_key.clone()),
             }
         }
     }
 
-    None
+    recovered
+}
+
+/// Whether the parent recorded in site-replication state can actually back a service account.
+///
+/// Repairing against a parent that does not exist would produce an account no policy path can
+/// resolve, so a missing parent means "leave the current binding alone and report it".
+async fn site_replicator_parent_is_usable(parent: &str) -> bool {
+    if rustfs_iam::is_root_access_key(parent) {
+        return true;
+    }
+    match current_iam_handle() {
+        Some(iam_sys) => iam_sys.get_user_info(parent).await.is_ok(),
+        None => false,
+    }
+}
+
+/// Whether an IAM lookup failure means the account is absent or unreadable, as opposed to a
+/// transient store failure. Only the former may trigger a reseed from bucket targets.
+fn is_missing_service_account_error(err: &rustfs_iam::error::Error) -> bool {
+    matches!(
+        err,
+        rustfs_iam::error::Error::NoSuchAccount(_)
+            | rustfs_iam::error::Error::NoSuchServiceAccount(_)
+            | rustfs_iam::error::Error::NoSuchUser(_)
+            | rustfs_iam::error::Error::ConfigNotFound
+    )
 }
 
 /// Reconcile the local `site-replicator-0` account against the persisted site-replication
@@ -2598,20 +2656,57 @@ async fn reconcile_site_replicator_service_account() -> S3Result<()> {
     }
 
     let access_key = SITE_REPLICATOR_SERVICE_ACCOUNT;
-    let (secret_key, reason) = match iam_sys.get_site_replicator_service_account_secret(access_key).await {
-        Ok(secret) => {
+    let session_policy = site_replicator_service_account_policy()?;
+    let reason = match iam_sys.get_site_replicator_service_account_secret(access_key).await {
+        Ok(_) => {
             // Never rebuild on an unread parent: `unwrap_or_default` here would compare an
-            // empty string against a real parent and recreate a healthy account on every boot.
+            // empty string against a real parent and repair a healthy account on every boot.
             let Ok((credentials, _)) = iam_sys.get_service_account(access_key).await else {
                 return Ok(());
             };
             if credentials.parent_user == parent_user {
                 return Ok(());
             }
-            (secret, "stale_parent")
+
+            if !site_replicator_parent_is_usable(&parent_user).await {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "service_account_parent_missing",
+                    reason = "stale_parent",
+                    parent = %parent_user,
+                    "admin site replication state"
+                );
+                return Ok(());
+            }
+
+            // The record is intact and may be authenticating replication traffic right now,
+            // so rebind it in place. Deleting first would open a window — however brief —
+            // where a crash or a storage error leaves the site with no replication account
+            // at all, which is worse than the stale binding being repaired.
+            iam_sys
+                .update_service_account(
+                    access_key,
+                    UpdateServiceAccountOpts {
+                        session_policy: Some(session_policy),
+                        secret_key: None,
+                        name: None,
+                        description: None,
+                        expiration: None,
+                        status: None,
+                        parent_user: Some(parent_user.clone()),
+                        allow_site_replicator_account: true,
+                    },
+                )
+                .await
+                .map_err(ApiError::from)?;
+            "stale_parent"
         }
-        Err(err) => {
-            let Some(secret) = site_replicator_secret_from_bucket_targets(access_key).await else {
+        // Only a genuinely absent or unreadable account may be reseeded from a bucket
+        // target. A transient store error must not trigger a rewrite of a live account.
+        Err(err) if is_missing_service_account_error(&err) => {
+            let Some(secret) = site_replicator_secret_from_bucket_targets(access_key, &state).await else {
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
@@ -2622,66 +2717,43 @@ async fn reconcile_site_replicator_service_account() -> S3Result<()> {
                 );
                 return Ok(());
             };
-            (secret, "account_unreadable")
+
+            if !site_replicator_parent_is_usable(&parent_user).await {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "service_account_parent_missing",
+                    reason = "account_unreadable",
+                    parent = %parent_user,
+                    "admin site replication state"
+                );
+                return Ok(());
+            }
+
+            // Nothing readable to preserve, so creation is the whole repair — there is no
+            // delete to leave a gap behind.
+            iam_sys
+                .new_service_account(
+                    &parent_user,
+                    None,
+                    NewServiceAccountOpts {
+                        session_policy: Some(session_policy),
+                        access_key: access_key.to_string(),
+                        secret_key: secret,
+                        name: None,
+                        description: None,
+                        expiration: None,
+                        allow_site_replicator_account: true,
+                        claims: None,
+                    },
+                )
+                .await
+                .map_err(ApiError::from)?;
+            "account_unreadable"
         }
+        Err(err) => return Err(ApiError::from(err).into()),
     };
-
-    // The recreate below is delete-then-create (the access key is fixed), so a parent that
-    // cannot back a service account would leave this site with no replication account at
-    // all — strictly worse than the drift being repaired. Refuse to start that sequence.
-    if !rustfs_iam::is_root_access_key(&parent_user) && iam_sys.get_user_info(&parent_user).await.is_err() {
-        warn!(
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            result = "service_account_parent_missing",
-            reason,
-            parent = %parent_user,
-            "admin site replication state"
-        );
-        return Ok(());
-    }
-
-    // `parent_user` is immutable through `update_service_account`, so rebinding means
-    // replacing the record. The peers keep the same access key and secret, so their
-    // in-flight requests still authenticate once the new record lands.
-    let session_policy = site_replicator_service_account_policy()?;
-    iam_sys
-        .delete_service_account(access_key, false)
-        .await
-        .map_err(ApiError::from)?;
-    if let Err(err) = iam_sys
-        .new_service_account(
-            &parent_user,
-            None,
-            NewServiceAccountOpts {
-                session_policy: Some(session_policy),
-                access_key: access_key.to_string(),
-                secret_key,
-                name: None,
-                description: None,
-                expiration: None,
-                allow_site_replicator_account: true,
-                claims: None,
-            },
-        )
-        .await
-    {
-        // The old record is already gone, so this site now has no replication account at
-        // all — strictly worse than the drift being repaired. Say so loudly: recovery is
-        // `mc admin replicate add` from any peer.
-        error!(
-            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            component = LOG_COMPONENT_ADMIN,
-            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-            result = "service_account_repair_failed",
-            reason,
-            error = %err,
-            "site replication service account was removed but could not be recreated; \
-             re-run `mc admin replicate add` to restore replication from this site"
-        );
-        return Err(ApiError::from(err).into());
-    }
 
     warn!(
         event = EVENT_ADMIN_SITE_REPLICATION_STATE,
@@ -2719,9 +2791,26 @@ async fn reconcile_site_replication_buckets() -> S3Result<()> {
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
                 bucket = %bucket.name,
-                result = "startup_bucket_reconcile_failed",
+                result = "bucket_reconcile_failed",
                 error = ?err,
                 "admin site replication state"
+            );
+            continue;
+        }
+
+        // Once per bucket per pass, so an operator sees a rule that resolves to nothing
+        // without the replication hot path logging it for every object. Reconciliation
+        // cannot fix this case: the rules are right and the peer endpoint is not reachable.
+        if let Ok(metadata) = metadata_sys::get(&bucket.name).await
+            && !site_replication_targets_online(&bucket.name, &metadata.replication_config_xml).await
+        {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                bucket = %bucket.name,
+                result = "replication_target_offline",
+                "a site replication rule has no usable remote target; objects for it are not replicating"
             );
         }
     }
@@ -2733,16 +2822,37 @@ async fn reconcile_site_replication_buckets() -> S3Result<()> {
 /// signs its targets with that account's secret.
 ///
 /// Registered into the infra-layer scheduler (`site_replication_reconcile`) rather than
-/// called from it, so startup never has to reach up into this layer. Takes the lifecycle
-/// lock without blocking and gives up the whole round when an add/remove/endpoint-refresh
-/// holds it: those run in phases, and rebuilding rules between two of them would resurrect
-/// exactly what the operation just tore down. Skipping is free — startup has its own pass
-/// and the timer comes back.
+/// called from it, so startup never has to reach up into this layer.
+///
+/// Gives up the whole round rather than racing a multi-phase operation. Two mechanisms are
+/// needed: the lifecycle lock covers add and remove, while an endpoint refresh commits
+/// bucket targets and peer state in separate steps *without* holding that lock
+/// (`SiteReplicationEditHandler`), so a tick landing between them would rewrite the targets
+/// from the stale endpoint. The pending marker in the persisted state closes that window.
+/// Skipping costs nothing — the timer comes back.
 fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async {
+        // The scheduler starts before IAM and the object store are guaranteed ready (IAM
+        // bootstrap may still be recovering), so an early tick returns quietly instead of
+        // logging a failure for every reconciler.
+        if current_iam_handle().is_none() || current_object_store_handle().is_none() {
+            return;
+        }
+
         let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
             return;
         };
+
+        match load_site_replication_state().await {
+            Ok(state) => {
+                if state.pending_endpoint_refresh.is_some() || state.pending_remove.is_some() || state.pending_rotation.is_some()
+                {
+                    return;
+                }
+            }
+            // Unreadable state is reported by the reconcilers below; do not double-log here.
+            Err(_) => return,
+        }
 
         if let Err(err) = reconcile_site_replicator_service_account().await {
             warn!(
@@ -6634,7 +6744,9 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
     // left over from a removed peer — or one whose destination ARN names this very
     // deployment, which no bucket target can ever satisfy — must not survive, otherwise
     // objects are queued against an ARN that resolves to nothing.
-    let existing_rules = existing.map(|config| config.rules).unwrap_or_default();
+    let (existing_role, existing_rules) = existing
+        .map(|config| (config.role, config.rules))
+        .unwrap_or_else(|| (String::new(), Vec::new()));
     let mut rules: Vec<ReplicationRule> = existing_rules
         .iter()
         .filter(|rule| !is_site_replication_rule(rule))
@@ -6645,15 +6757,20 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
         rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
     }
 
-    if rules == existing_rules {
+    // Only a site-replication ARN in `role` is ours to drop — an operator-authored role is
+    // part of the bucket's S3-visible configuration, and repairing a reverse rule must not
+    // quietly rewrite it. Same rule as `merge_incoming_replication_config`.
+    let role = match replication_target_arn_deployment_id(&existing_role) {
+        Some(_) => String::new(),
+        None => existing_role.clone(),
+    };
+
+    if rules == existing_rules && role == existing_role {
         return Ok(());
     }
 
-    let data = serialize(&ReplicationConfiguration {
-        role: String::new(),
-        rules,
-    })
-    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
+    let data = serialize(&ReplicationConfiguration { role, rules })
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
     metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data)
         .await
         .map_err(ApiError::from)?;
@@ -7807,6 +7924,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                                     secret_key: Some(create.secret_key),
                                     expiration: create.expiration,
                                     status: (!create.status.is_empty()).then_some(create.status),
+                                    parent_user: None,
                                     allow_site_replicator_account: create.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                                 },
                             )
@@ -7859,6 +7977,9 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
                             description: (!update.description.is_empty()).then_some(update.description),
                             expiration: update.expiration,
                             status: (!update.status.is_empty()).then_some(update.status),
+                            // Peers replicate credentials, never the local parent binding:
+                            // each site resolves its own parent from its own IAM.
+                            parent_user: None,
                             allow_site_replicator_account,
                         },
                     )
@@ -8328,6 +8449,7 @@ impl Operation for SRPeerJoinHandler {
                             description: None,
                             expiration: None,
                             status: None,
+                            parent_user: None,
                             allow_site_replicator_account: join_req.svc_acct_access_key == SITE_REPLICATOR_SERVICE_ACCOUNT,
                         },
                     )
@@ -12885,6 +13007,81 @@ mod tests {
         }
     }
 
+    fn replication_target(deployment_id: &str, endpoint: &str, secret: &str) -> BucketTarget {
+        BucketTarget {
+            source_bucket: "photos".to_string(),
+            target_bucket: "photos".to_string(),
+            endpoint: endpoint.to_string(),
+            deployment_id: deployment_id.to_string(),
+            arn: format!("arn:rustfs:replication::{deployment_id}:photos"),
+            target_type: BucketTargetType::ReplicationService,
+            credentials: Some(crate::admin::storage_api::bucket::target::Credentials {
+                access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                secret_key: secret.to_string(),
+                session_token: None,
+                expiration: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn state_with_peer(deployment_id: &str, endpoint: &str) -> SiteReplicationState {
+        let mut state = SiteReplicationState::default();
+        state.peers.insert(
+            deployment_id.to_string(),
+            PeerInfo {
+                deployment_id: deployment_id.to_string(),
+                ..peer(deployment_id, endpoint)
+            },
+        );
+        state
+    }
+
+    // Bucket targets are writable by anyone holding `admin:SetBucketTarget`. Recovering a
+    // secret from a target that merely carries the site-replicator access key would let such
+    // a principal choose the secret for the broadly privileged replication account.
+    #[test]
+    fn test_secret_recovery_rejects_target_outside_the_peer_topology() {
+        let state = state_with_peer("remote", "http://remote.example.com:9000");
+
+        assert!(
+            bucket_target_matches_configured_peer(
+                &replication_target("remote", "remote.example.com:9000", "shared-secret"),
+                &state
+            ),
+            "a target naming a configured peer at its recorded endpoint is ours"
+        );
+        assert!(
+            !bucket_target_matches_configured_peer(
+                &replication_target("attacker", "attacker.example.com:9000", "planted-secret"),
+                &state
+            ),
+            "a target naming an unknown deployment must never seed the replication account"
+        );
+        assert!(
+            !bucket_target_matches_configured_peer(
+                &replication_target("remote", "attacker.example.com:9000", "planted-secret"),
+                &state
+            ),
+            "a target reusing a peer id but pointing elsewhere must not seed the account"
+        );
+    }
+
+    // A transient store failure must not be read as "the account is gone" and trigger a
+    // reseed that overwrites a live account.
+    #[test]
+    fn test_only_missing_account_errors_allow_reseeding() {
+        use rustfs_iam::error::Error as IamError;
+
+        assert!(is_missing_service_account_error(&IamError::NoSuchAccount("x".into())));
+        assert!(is_missing_service_account_error(&IamError::NoSuchServiceAccount("x".into())));
+        assert!(is_missing_service_account_error(&IamError::ConfigNotFound));
+        assert!(
+            !is_missing_service_account_error(&IamError::IAMActionNotAllowed),
+            "a permission failure is not evidence that the account is absent"
+        );
+    }
+
     fn operator_rule(id: &str) -> ReplicationRule {
         ReplicationRule {
             id: Some(id.to_string()),
@@ -12938,6 +13135,29 @@ mod tests {
     #[test]
     fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
         assert!(merge_incoming_replication_config(Some(site_repl_config("home")), None).is_none());
+    }
+
+    // `role` is part of the bucket's S3-visible configuration. Repairing a reverse rule must
+    // drop only a sender-owned site-replication ARN, never an operator's own role — the same
+    // rule the merge path applies, so both paths agree on what is ours to rewrite.
+    #[test]
+    fn test_replication_role_is_only_cleared_when_it_is_a_site_replication_arn() {
+        let operator_role = "arn:aws:iam::123456789012:role/replication";
+        assert!(
+            replication_target_arn_deployment_id(operator_role).is_none(),
+            "an operator IAM role is not a site-replication ARN and must be preserved"
+        );
+        assert_eq!(
+            replication_target_arn_deployment_id("arn:rustfs:replication::home:photos").as_deref(),
+            Some("home"),
+            "a site-replication ARN is sender-owned and gets cleared"
+        );
+
+        let mut incoming = site_repl_config("home");
+        incoming.role = operator_role.to_string();
+        let merged = merge_incoming_replication_config(Some(incoming), Some(site_repl_config("office")))
+            .expect("merge should produce rules");
+        assert_eq!(merged.role, operator_role, "operator role must survive the merge");
     }
 
     // Rules and targets are keyed off the same ARN. Minting a fresh one while

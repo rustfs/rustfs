@@ -822,6 +822,15 @@ where
             cr.secret_key = secret;
         }
 
+        if let Some(parent_user) = opts.parent_user {
+            // Same gate as the account itself: a rebind grants the account whatever the new
+            // parent can do, so only the site-replication repair path may ask for one.
+            if parent_user.is_empty() || !opts.allow_site_replicator_account || name != SITE_REPLICATOR_SERVICE_ACCOUNT {
+                return Err(Error::IAMActionNotAllowed);
+            }
+            cr.parent_user = parent_user;
+        }
+
         if opts.name.is_some() {
             cr.name = opts.name;
         }
@@ -889,6 +898,10 @@ where
         if name == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
             m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
         }
+        // The parent lives in the token as well, and `prepare_service_account_auth` denies the
+        // request when the two disagree — a rebind that updated only the credential would
+        // lock the account out.
+        m.insert("parent".to_owned(), Value::String(cr.parent_user.clone()));
 
         cr.session_token = jwt_sign(&m, &cr.secret_key)?;
 
@@ -2674,6 +2687,7 @@ mod tests {
                             description: Some("new".to_string()),
                             expiration: None,
                             status: None,
+                            parent_user: None,
                             allow_site_replicator_account: false,
                         },
                     )
@@ -3036,6 +3050,7 @@ mod tests {
             description: Some("Updated service account".to_string()),
             expiration: None,
             session_policy: Some(policy),
+            parent_user: None,
             allow_site_replicator_account: false,
         };
 

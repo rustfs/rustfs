@@ -2098,12 +2098,12 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
 
     for arn in tgt_arns {
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &arn).await else {
-            // A configured rule whose ARN resolves to no target means this object is
-            // dropped for good, so it warrants a warning rather than a debug line: every
-            // other failure below this point logs at error. This is a misconfiguration
-            // path, not steady state, and the per-object event beside it already costs
-            // more than the log record.
-            warn!(
+            // Deliberately debug: this fires once per object per ARN, so a target that
+            // stays unreachable would flood the log from the replication hot path. The
+            // condition is reported once per pass by the site-replication reconciler and
+            // once per rebuild by `update_all_targets`, which is where an operator can act
+            // on it; the per-object event below still records each dropped object.
+            debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
