@@ -9376,6 +9376,9 @@ mod tests {
                 ..Default::default()
             };
             let mut stale = ManualTransitionJobRecord::new(Uuid::new_v4(), &bucket, &options, "old-owner");
+            if stale_case == "missing-job" {
+                stale.lease_expires_at_unix_nanos = OffsetDateTime::now_utc().unix_timestamp_nanos() - 1;
+            }
             if stale_case == "terminal-job" {
                 stale.complete(
                     ManualTransitionRunReport {
@@ -9410,6 +9413,48 @@ mod tests {
             assert_eq!(loaded.lease_id, replacement.lease_id);
             assert_eq!(loaded.owner_id, "new-owner");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manual_transition_admission_concurrent_same_scope_writes_is_singleton() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            ..Default::default()
+        };
+        let first = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-concurrent-scope-bucket", &options, "owner-a");
+        let first_admission = ManualTransitionScopeAdmission::from_job(&first);
+        let second = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-concurrent-scope-bucket", &options, "owner-b");
+        let second_admission = ManualTransitionScopeAdmission::from_job(&second);
+
+        let first_claim = claim_manual_transition_scope_admission(ecstore.clone(), &first_admission);
+        let second_claim = claim_manual_transition_scope_admission(ecstore.clone(), &second_admission);
+        let (first_result, second_result) = tokio::join!(first_claim, second_claim);
+        let first_claim = first_result.expect("first concurrent claim should resolve");
+        let second_claim = second_result.expect("second concurrent claim should resolve");
+
+        let mut claimed = 0;
+        let mut conflicted = 0;
+        let mut active_job_id = None;
+        for item in [first_claim, second_claim] {
+            match item {
+                ManualTransitionScopeAdmissionClaim::Claimed => claimed += 1,
+                ManualTransitionScopeAdmissionClaim::Conflict(active) => {
+                    conflicted += 1;
+                    active_job_id = Some(active.job_id);
+                }
+            }
+        }
+
+        assert_eq!(claimed, 1, "only one concurrent same-scope claim should be accepted");
+        assert_eq!(conflicted, 1, "only one concurrent same-scope claim should report conflict");
+        let active = load_manual_transition_scope_admission(ecstore.clone(), &first.scope_key)
+            .await
+            .expect("scope admission should remain");
+        assert!(active.job_id == first.job_id || active.job_id == second.job_id);
+        assert_eq!(active_job_id, Some(active.job_id), "conflict response must carry active owner");
     }
 
     #[tokio::test]
