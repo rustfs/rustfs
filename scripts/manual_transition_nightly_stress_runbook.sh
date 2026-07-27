@@ -200,6 +200,7 @@ command_template() {
 - unknown failure ratio threshold: __UNKNOWN_FAILURE_RATIO_THRESHOLD__
 - queue-mismatch tolerance ratio: __QUEUE_MISMATCH_RATIO_THRESHOLD__
 - unknown failure count threshold: __UNKNOWN_FAILURE_COUNT_THRESHOLD__
+- already-in-flight transitions: fail any terminal run with skipped_already_in_flight > 0
 
 ## Failure snapshot policy
 
@@ -373,11 +374,11 @@ run_entry() {
     return 1
   fi
   printf '%s' "$status_json" >"${RESULT_DIR}/${result_tag}-status.json"
-  if ! status_info="$(printf '%s' "$status_json" | jq -r '[.status // "", .failure_reason // "__none__", (.report.enqueued // 0), (.report.transition_completed // 0), (.report.transition_failed // 0), (.report.tier_failure_by_reason["unknown"] // 0), (.queue_snapshot.queued // 0), (.queue_snapshot.active // 0), (.queue_snapshot.compensation_pending // 0), (.queue_snapshot.compensation_running // 0), (.queue_snapshot.queue_full // 0), (.queue_snapshot.queue_send_timeout // 0)] | map(tostring) | @tsv')"; then
+  if ! status_info="$(printf '%s' "$status_json" | jq -r '[.status // "", .failure_reason // "__none__", (.report.enqueued // 0), (.report.transition_completed // 0), (.report.transition_failed // 0), (.report.skipped_already_in_flight // 0), (.report.tier_failure_by_reason["unknown"] // 0), (.queue_snapshot.queued // 0), (.queue_snapshot.active // 0), (.queue_snapshot.compensation_pending // 0), (.queue_snapshot.compensation_running // 0), (.queue_snapshot.queue_full // 0), (.queue_snapshot.queue_send_timeout // 0)] | map(tostring) | @tsv')"; then
     snapshot_failure "$tag" "invalid_job_status_json" "$job_id"
     return 1
   fi
-  IFS=$'\t' read -r status failure_reason report_enqueued report_completed report_failed report_unknown_failure queue_snapshot_queued queue_snapshot_active compensation_pending compensation_running queue_full queue_send_timeout <<< "$status_info"
+  IFS=$'\t' read -r status failure_reason report_enqueued report_completed report_failed report_already_in_flight report_unknown_failure queue_snapshot_queued queue_snapshot_active compensation_pending compensation_running queue_full queue_send_timeout <<< "$status_info"
 
   if [[ "$failure_reason" != "__none__" ]]; then
     snapshot_failure "$tag" "failure_reason=${failure_reason}" "$job_id"
@@ -390,6 +391,10 @@ run_entry() {
     local mismatch_ratio
     local unknown_ratio
     local ratio_denominator
+    if (( report_already_in_flight > 0 )); then
+      snapshot_failure "$tag" "already_in_flight=${report_already_in_flight}" "$job_id"
+      return 1
+    fi
     mismatch_count="$((report_enqueued - report_completed - report_failed))"
     if (( mismatch_count < 0 )); then
       mismatch_count=0
