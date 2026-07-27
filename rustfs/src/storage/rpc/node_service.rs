@@ -4417,6 +4417,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_bucket_metadata_failure_skips_scanner_maintenance() {
+        let service = create_test_node_service();
+        let maintenance_generation = rustfs_scanner::scanner_maintenance_generation();
+
+        let request = Request::new(LoadBucketMetadataRequest {
+            bucket: "reload-miss-scanner-guard-bucket".to_string(),
+            scanner_maintenance_change: true,
+        });
+
+        let response = service.load_bucket_metadata(request).await.expect("rpc should reply");
+        let load_response = response.into_inner();
+
+        // Whether the reload fails on missing server state or on the absent
+        // persisted metadata, a failed reload must report failure and must
+        // not tell the scanner a maintenance change landed.
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert_eq!(
+            rustfs_scanner::scanner_maintenance_generation(),
+            maintenance_generation,
+            "a failed metadata reload must not advance scanner maintenance activity"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires isolated global object layer state"]
     async fn test_load_bucket_metadata_no_object_layer() {
         let service = create_test_node_service();

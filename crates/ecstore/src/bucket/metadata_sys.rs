@@ -85,6 +85,20 @@ pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<(
     Ok(())
 }
 
+/// Peer LoadBucketMetadata entry point; see
+/// [`BucketMetadataSys::reload_from_store`] for the caching contract.
+///
+/// The outer write guard spans the disk load, mirroring [`update`]: every
+/// other cache installer holds this lock (read or write), so the snapshot
+/// read here can never land after — and roll back — a newer concurrent
+/// install, and the install-plus-registry-sync sequence stays atomic
+/// against concurrent removes and reloads.
+pub async fn reload_bucket_metadata(bucket: &str) -> Result<()> {
+    let sys = get_bucket_metadata_sys()?;
+    let lock = sys.write().await;
+    lock.reload_from_store(bucket).await
+}
+
 /// Drop a bucket's cached metadata from the in-memory map.
 ///
 /// This is the counterpart to [`set_bucket_metadata`] and is invoked when a
@@ -527,7 +541,13 @@ impl BucketMetadataSys {
                             // delete gate and wiping its target/durability
                             // sync state. Insert-if-vacant keeps the startup
                             // behavior for legacy buckets without a metadata
-                            // file, atomically under the map write lock.
+                            // file, atomically under the map write lock. At
+                            // startup the map is empty, so a transient miss
+                            // (indistinguishable from a legacy bucket at
+                            // this layer) still installs a fabricated
+                            // default, bounded by the next successful
+                            // persisted load — refresh cycle or peer reload
+                            // notification — which replaces it.
                             let mut map = self.metadata_map.write().await;
                             map.entry(bucket.clone()).or_insert_with(|| Arc::new(bm));
                         }
@@ -566,6 +586,43 @@ impl BucketMetadataSys {
             sync_bucket_target_sys(&bucket, &bm).await;
             sync_bucket_durability(&bucket, &bm);
         }
+    }
+
+    /// Reload `bucket`'s metadata from this system's own store and cache it,
+    /// refusing to treat a load miss as authoritative (the peer
+    /// LoadBucketMetadata notification path, [`reload_bucket_metadata`]).
+    ///
+    /// Only metadata actually read from persisted storage reaches the cache.
+    /// On a miss the fabricated default is discarded and an error is
+    /// returned: installing it would let a transient ConfigNotFound during
+    /// the notification overwrite a lock-enabled bucket's cached metadata
+    /// with an authoritative "no Object Lock" default, disabling the
+    /// batch-delete retention gate (`object_lock_delete_check_required`) on
+    /// this node until the next refresh. A miss is also not treated as
+    /// deletion: bucket deletion propagates through the dedicated
+    /// DeleteBucketMetadata notification ([`remove_bucket_metadata`]), which
+    /// is best-effort — a reload racing it can still re-install a just
+    /// deleted bucket's entry (pre-existing, bounded by the next delete or
+    /// restart) — but a reload miss removing entries would turn every
+    /// transient quorum dip into dropped metadata and spurious
+    /// target/durability teardown.
+    ///
+    /// The peer-visible error text is deliberately fixed: the notifying peer
+    /// matches error strings against network-failure needles
+    /// (`is_network_like_error`), so interpolating a caller-controlled
+    /// bucket name here could mark a healthy peer offline.
+    ///
+    /// Lock order: the caller holds the outer metadata-sys guard, and the
+    /// load acquires the namespace lock on the bucket's metadata config
+    /// object — the same `outer guard → meta-config namespace lock` order
+    /// `update`'s load takes; no path acquires these in reverse.
+    pub(crate) async fn reload_from_store(&self, bucket: &str) -> Result<()> {
+        let (bm, persisted) = load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true).await?;
+        if !persisted {
+            return Err(Error::other("no persisted bucket metadata readable; peer cache left unchanged"));
+        }
+        self.set(bucket.to_string(), Arc::new(bm)).await;
+        Ok(())
     }
 
     /// Remove a bucket's cached metadata from the in-memory map.
@@ -704,11 +761,7 @@ impl BucketMetadataSys {
             // defaults for buckets listed on disk — legacy buckets without a
             // metadata file — but never lets one replace an existing entry.)
             if persisted {
-                let mut map = self.metadata_map.write().await;
-                map.insert(bucket.to_string(), bm.clone());
-                drop(map);
-                sync_bucket_target_sys(bucket, &bm).await;
-                sync_bucket_durability(bucket, &bm);
+                self.set(bucket.to_string(), bm.clone()).await;
             } else {
                 self.absent_metadata.insert(bucket.to_string(), ()).await;
             }
@@ -1067,6 +1120,71 @@ mod tests {
             .expect_err("malformed persisted policy must not be treated as missing");
 
         assert!(matches!(err, Error::Io(_)), "malformed persisted policy must surface its parse failure");
+    }
+
+    /// Pins the peer reload-notification contract (`reload_from_store`, the
+    /// LoadBucketMetadata RPC path): only metadata actually read from
+    /// persisted storage enters the cache. A load miss errors out and leaves
+    /// the cache untouched — it must neither install a fabricated default
+    /// for an unknown bucket nor replace an existing entry, since a
+    /// transient ConfigNotFound during the notification would otherwise
+    /// downgrade a lock-enabled bucket to an authoritative "no Object Lock"
+    /// default and disable the batch-delete retention gate on this peer.
+    #[tokio::test]
+    async fn peer_reload_never_caches_fabricated_defaults_as_authoritative() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore.clone());
+
+        // (a) Miss with no cached entry: the reload fails and installs nothing.
+        let err = sys
+            .reload_from_store("reload-bucket")
+            .await
+            .expect_err("a reload miss must be reported to the notifying peer");
+        assert!(
+            err.to_string().contains("no persisted bucket metadata readable"),
+            "the miss must surface through the dedicated non-persisted branch, got: {err}"
+        );
+        assert!(
+            sys.get("reload-bucket").await.is_err(),
+            "a reload miss must not install a fabricated default"
+        );
+
+        // (b) Miss with an existing entry: the reload fails and the entry
+        // (standing in for a lock-enabled bucket's metadata) survives intact.
+        let mut kept = BucketMetadata::new("reload-bucket");
+        kept.object_lock_config_xml = b"<ObjectLockConfiguration/>".to_vec();
+        sys.set("reload-bucket".to_string(), Arc::new(kept)).await;
+        assert!(sys.reload_from_store("reload-bucket").await.is_err());
+        let cached = sys
+            .get("reload-bucket")
+            .await
+            .expect("existing entry must survive a reload miss");
+        assert_eq!(
+            cached.object_lock_config_xml,
+            b"<ObjectLockConfiguration/>".to_vec(),
+            "a reload miss must not replace the cached entry with a fabricated default"
+        );
+
+        // (c) Persisted metadata reloads over a stale cached entry: the
+        // reload converges the cache to disk truth.
+        let mut persisted = BucketMetadata::new("reload-bucket");
+        persisted.policy_config_json = b"persisted-marker".to_vec();
+        sys.persist_and_set(persisted).await.expect("metadata should persist");
+        let mut stale = BucketMetadata::new("reload-bucket");
+        stale.policy_config_json = b"stale-cache-marker".to_vec();
+        sys.set("reload-bucket".to_string(), Arc::new(stale)).await;
+        sys.reload_from_store("reload-bucket")
+            .await
+            .expect("persisted metadata should reload");
+        let cached = sys
+            .get("reload-bucket")
+            .await
+            .expect("reloaded persisted metadata must be cached");
+        assert_eq!(
+            cached.policy_config_json,
+            b"persisted-marker".to_vec(),
+            "a reload must converge the cache to the persisted disk state"
+        );
     }
 
     fn target(bucket: &str, id: &str) -> BucketTarget {
