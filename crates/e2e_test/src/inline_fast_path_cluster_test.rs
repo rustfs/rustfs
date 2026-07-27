@@ -2169,6 +2169,114 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
 
 #[tokio::test]
 #[serial]
+#[ignore = "manual #1508 evidence harness: starts a 4-node cluster, a remote tier, and an in-flight transition job"]
+async fn four_node_manual_transition_rollout_non_empty_restart_readback() -> TestResult {
+    init_logging();
+
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "inline1508coldadmin".to_string();
+    cold.secret_key = "inline1508coldsecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env("RUSTFS_SCANNER_ENABLED", "false");
+    hot.set_env("RUSTFS_SCANNER_CYCLE", "3600");
+    hot.set_env("RUSTFS_MAX_TRANSITION_WORKERS", "2");
+    hot.set_env("RUSTFS_TRANSITION_QUEUE_CAPACITY", "64");
+    hot.start().await?;
+    let hot_client = hot.create_s3_client(0)?;
+
+    let tier_name = unique_tier_name();
+    add_rustfs_tier(&hot, &cold, &tier_name).await?;
+    let bucket = format!("manual-transition-1508-{}", Uuid::new_v4().simple());
+    let prefix = "transition/manual-rollout/";
+    hot_client.create_bucket().bucket(&bucket).send().await?;
+    put_lifecycle_with_transition_retry(&hot_client, &bucket, &tier_name).await?;
+    for index in 0u8..24 {
+        let key = format!("{prefix}object-{index:02}.bin");
+        hot_client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(payload(64 * KIB, index)))
+            .send()
+            .await?;
+    }
+
+    let (accepted_status, accepted_body) =
+        start_manual_transition_job_on_node(&hot, 1, &bucket, prefix, &tier_name, false, 24).await?;
+    assert_eq!(
+        accepted_status,
+        StatusCode::ACCEPTED,
+        "non-empty #1508 transition job should be accepted by a rollout node: {}",
+        compact_body(&accepted_body)
+    );
+    let accepted: serde_json::Value = serde_json::from_str(&accepted_body)?;
+    let job_id = accepted["job_id"]
+        .as_str()
+        .ok_or_else(|| format!("accepted #1508 response omitted job_id: {accepted_body}"))?;
+    let status_endpoint = accepted["status_endpoint"]
+        .as_str()
+        .ok_or_else(|| format!("accepted #1508 response omitted status_endpoint: {accepted_body}"))?;
+
+    let terminal = wait_for_manual_transition_job_terminal(&hot, 0, job_id, false).await?;
+    assert_eq!(terminal["job_id"].as_str(), Some(job_id));
+    assert_eq!(terminal["bucket"].as_str(), Some(bucket.as_str()));
+    assert_eq!(terminal["prefix"].as_str(), Some(prefix));
+    assert_eq!(terminal["dry_run"].as_bool(), Some(false));
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("completed"),
+        "non-empty #1508 rollout transition should complete before restart readback: {terminal}"
+    );
+    let transition_failed = match terminal["report"]
+        .get("transition_failed")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(value) => value,
+        None => 0,
+    };
+    assert_eq!(
+        transition_failed, 0,
+        "terminal #1508 report should not hide transition failures: {terminal}"
+    );
+    assert_eq!(
+        terminal["report"]["tier_failure"].as_u64(),
+        Some(0),
+        "terminal #1508 report should not hide tier failures: {terminal}"
+    );
+    let transition_completed = terminal["report"]["transition_completed"]
+        .as_u64()
+        .ok_or_else(|| format!("terminal #1508 report omitted transition_completed: {terminal}"))?;
+    assert!(
+        transition_completed > 0,
+        "terminal #1508 report should include real completed transitions: {terminal}"
+    );
+    assert!(
+        cold_tier_object_count(&cold_client).await? > 0,
+        "cold tier should contain transitioned #1508 objects"
+    );
+
+    hot.stop_node(2)?;
+    hot.start_node(2).await?;
+    let after_restart = read_manual_transition_job_status_endpoint(&hot, 2, status_endpoint).await?;
+    assert_eq!(after_restart["job_id"].as_str(), Some(job_id));
+    assert_eq!(
+        after_restart["status"], terminal["status"],
+        "terminal #1508 status changed after rollout node restart"
+    );
+    assert_eq!(
+        after_restart["report"]["transition_completed"], terminal["report"]["transition_completed"],
+        "terminal #1508 transition count changed after rollout node restart"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_transition() -> TestResult {
     init_logging();
 
