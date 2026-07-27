@@ -26,8 +26,8 @@ use crate::{
     server::ADMIN_PREFIX,
     server::RemoteAddr,
 };
+use http::StatusCode;
 use http::header::HeaderValue;
-use http::{HeaderMap, StatusCode, Uri};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -61,16 +61,6 @@ const STS_DEFAULT_DURATION_SECS: usize = 3600;
 const STS_MIN_DURATION_SECS: usize = 900;
 /// Maximum STS temporary credential lifetime (seconds), matching AWS/MinIO AssumeRole (12 hours).
 const STS_MAX_DURATION_SECS: usize = 43200;
-
-pub(crate) fn is_sts_query_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
-    method == Method::POST
-        && uri.path() == "/"
-        && headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/x-www-form-urlencoded"))
-}
 
 /// Clamp the client-supplied DurationSeconds into the allowed STS window.
 ///
@@ -399,20 +389,6 @@ mod tests {
         assert_eq!(xml_escape("a&b"), "a&amp;b");
         assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
         assert_eq!(xml_escape("it's"), "it&apos;s");
-    }
-
-    #[test]
-    fn sts_query_route_match_requires_post_root_and_form_content_type() {
-        let uri = Uri::from_static("/");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-www-form-urlencoded; charset=utf-8"),
-        );
-
-        assert!(is_sts_query_request(&Method::POST, &uri, &headers));
-        assert!(!is_sts_query_request(&Method::GET, &uri, &headers));
-        assert!(!is_sts_query_request(&Method::POST, &Uri::from_static("/bucket"), &headers));
     }
 
     #[test]

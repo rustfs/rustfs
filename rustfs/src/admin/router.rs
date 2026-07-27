@@ -26,7 +26,6 @@ use super::storage_api::error::StorageError;
 use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::admin::handlers::sts::is_sts_query_request;
 use crate::admin::runtime_sources::{
     ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
     current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
@@ -39,6 +38,7 @@ use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
+    is_sts_query_request,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -4770,6 +4770,43 @@ mod tests {
             .await
             .expect_err("anonymous profile request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn check_access_limits_anonymous_sts_exemption_to_form_content_type() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        let request = |content_type: Option<&'static str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(content_type) = content_type {
+                headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            }
+            S3Request {
+                input: Body::from(String::from("Action=AssumeRoleWithWebIdentity")),
+                method: Method::POST,
+                uri: Uri::from_static("/"),
+                headers,
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            }
+        };
+
+        for content_type in [None, Some("application/json")] {
+            let mut req = request(content_type);
+            let err = router
+                .check_access(&mut req)
+                .await
+                .expect_err("anonymous STS request without form content type must be denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        }
+
+        let mut req = request(Some("application/x-www-form-urlencoded"));
+        router
+            .check_access(&mut req)
+            .await
+            .expect("anonymous form-encoded STS request should reach identity validation");
     }
 
     #[tokio::test]

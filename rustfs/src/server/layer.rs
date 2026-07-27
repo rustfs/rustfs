@@ -14,7 +14,6 @@
 
 use super::runtime_sources;
 use crate::admin::console::is_console_path;
-use crate::admin::handlers::sts::is_sts_query_request;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
@@ -638,6 +637,16 @@ pub struct StsQueryApiCompatLayer;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StsQueryRequest;
+
+pub(crate) fn is_sts_query_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    method == Method::POST
+        && uri.path() == "/"
+        && headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/x-www-form-urlencoded"))
+}
 
 impl<S> Layer<S> for StsQueryApiCompatLayer {
     type Service = StsQueryApiCompatService<S>;
@@ -1412,6 +1421,7 @@ fn sts_response_request_id<B>(req: &HttpRequest<B>) -> (String, HeaderValue) {
         .extensions()
         .get::<RequestContext>()
         .map(|context| context.request_id.as_str())
+        .filter(|request_id| !request_id.trim().is_empty())
         .unwrap_or("sts-request-id")
         .to_owned();
 
@@ -1463,7 +1473,8 @@ fn add_sts_response_metadata(mut xml: String, request_id: &str) -> Option<String
 }
 
 fn wrap_sts_error_response(xml: &str, status: StatusCode, request_id: &str) -> String {
-    let parsed = quick_xml::de::from_str::<SerializedS3Error>(xml).ok();
+    let (xml, _) = insert_missing_signature_error_message(xml.to_owned());
+    let parsed = quick_xml::de::from_str::<SerializedS3Error>(&xml).ok();
     let (code, message) = parsed
         .as_ref()
         .map(|error| (error.code.as_str(), error.message.as_deref().unwrap_or(&error.code)))
@@ -3125,6 +3136,41 @@ mod tests {
     }
 
     #[test]
+    fn sts_response_request_id_rejects_empty_context_id() {
+        let mut request = Request::new(());
+        request.extensions_mut().insert(RequestContext {
+            request_id: String::new(),
+            x_amz_request_id: String::new(),
+            trace_id: None,
+            span_id: None,
+            start_time: Instant::now(),
+        });
+
+        let (request_id, header) = sts_response_request_id(&request);
+        assert_eq!(request_id, "sts-request-id");
+        assert_eq!(header, HeaderValue::from_static("sts-request-id"));
+    }
+
+    #[test]
+    fn sts_query_route_match_requires_post_root_and_form_content_type() {
+        let uri = Uri::from_static("/");
+        let mut headers = HeaderMap::new();
+
+        assert!(!is_sts_query_request(&Method::POST, &uri, &headers));
+
+        headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert!(!is_sts_query_request(&Method::POST, &uri, &headers));
+
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded; charset=utf-8"),
+        );
+        assert!(is_sts_query_request(&Method::POST, &uri, &headers));
+        assert!(!is_sts_query_request(&Method::GET, &uri, &headers));
+        assert!(!is_sts_query_request(&Method::POST, &Uri::from_static("/bucket"), &headers));
+    }
+
+    #[test]
     fn sts_success_response_gets_response_metadata() {
         let xml = String::from(
             "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
@@ -3135,6 +3181,21 @@ mod tests {
         assert!(converted.contains("<Credentials/>"));
         assert!(converted.contains("<ResponseMetadata><RequestId>request-123</RequestId></ResponseMetadata>"));
         assert!(converted.ends_with("</AssumeRoleResponse>"));
+    }
+
+    #[test]
+    fn sts_web_identity_success_response_gets_response_metadata() {
+        let xml = String::from(
+            "<AssumeRoleWithWebIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+             <AssumeRoleWithWebIdentityResult><Credentials/></AssumeRoleWithWebIdentityResult>\
+             </AssumeRoleWithWebIdentityResponse>",
+        );
+        let converted =
+            add_sts_response_metadata(xml, "request-123").expect("AssumeRoleWithWebIdentity response should be converted");
+
+        assert!(converted.contains("<Credentials/>"));
+        assert!(converted.contains("<ResponseMetadata><RequestId>request-123</RequestId></ResponseMetadata>"));
+        assert!(converted.ends_with("</AssumeRoleWithWebIdentityResponse>"));
     }
 
     #[test]
@@ -3150,6 +3211,15 @@ mod tests {
         assert!(converted.contains("<Code>AccessDenied</Code>"));
         assert!(converted.contains("<Message>Access &amp; Denied</Message>"));
         assert!(converted.contains("<RequestId>request-456</RequestId>"));
+    }
+
+    #[test]
+    fn sts_signature_error_response_fills_missing_message() {
+        let converted =
+            wrap_sts_error_response("<Error><Code>SignatureDoesNotMatch</Code></Error>", StatusCode::FORBIDDEN, "request-456");
+        let expected = ApiError::error_code_to_message(&S3ErrorCode::SignatureDoesNotMatch);
+
+        assert!(converted.contains(&format!("<Message>{expected}</Message>")));
     }
 
     #[tokio::test]

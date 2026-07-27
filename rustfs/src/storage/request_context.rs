@@ -164,15 +164,26 @@ pub fn extract_request_id_from_headers(headers: &HeaderMap) -> String {
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
         .map(String::from)
-        .or_else(|| headers.get(AMZ_REQUEST_ID).and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(generate_fallback_request_id);
+        .or_else(|| {
+            headers
+                .get(AMZ_REQUEST_ID)
+                .and_then(|v| v.to_str().ok())
+                .filter(|value| !value.trim().is_empty())
+                .map(String::from)
+        });
 
-    if !headers.contains_key(REQUEST_ID_HEADER) && !headers.contains_key(AMZ_REQUEST_ID) {
-        counter!("rustfs_log_chain_fallback_request_id_total", "source" => "headers_missing").increment(1);
+    if request_id.is_none() {
+        let source = if headers.contains_key(REQUEST_ID_HEADER) || headers.contains_key(AMZ_REQUEST_ID) {
+            "headers_empty_or_invalid"
+        } else {
+            "headers_missing"
+        };
+        counter!("rustfs_log_chain_fallback_request_id_total", "source" => source).increment(1);
     }
 
-    request_id
+    request_id.unwrap_or_else(generate_fallback_request_id)
 }
 
 /// Spawn a request-internal task that inherits the current tracing span.
@@ -281,6 +292,21 @@ mod tests {
         headers.insert("x-amz-request-id", "amz-req-000".parse().unwrap());
         let id = extract_request_id_from_headers(&headers);
         assert_eq!(id, "x-req-789");
+    }
+
+    #[test]
+    fn test_extract_request_id_ignores_empty_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", http::HeaderValue::from_static(""));
+        headers.insert("x-amz-request-id", http::HeaderValue::from_static("amz-req-000"));
+        assert_eq!(extract_request_id_from_headers(&headers), "amz-req-000");
+
+        headers.insert(
+            "x-amz-request-id",
+            http::HeaderValue::from_bytes(b" \t").expect("optional whitespace is a valid header value"),
+        );
+        let id = extract_request_id_from_headers(&headers);
+        assert!(id.starts_with("req-"), "empty request ID headers must generate a fallback ID");
     }
 
     #[test]

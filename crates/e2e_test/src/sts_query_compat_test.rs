@@ -143,6 +143,12 @@ async fn test_sts_query_responses_are_aws_sdk_compatible() -> TestResult {
         .ok_or_else(|| format!("invalid signature should deserialize as an STS service error: {invalid_signature:?}"))?;
     assert_eq!(invalid_signature_service_error.code(), Some("SignatureDoesNotMatch"));
     assert!(
+        invalid_signature_service_error
+            .message()
+            .is_some_and(|message| message.starts_with("The request signature we calculated does not match")),
+        "signature rejection should preserve the canonical error message"
+    );
+    assert!(
         invalid_signature
             .request_id()
             .is_some_and(|request_id| !request_id.is_empty()),
