@@ -91,6 +91,7 @@ use rustfs_kms::{DataKey, KmsUnavailableError, is_data_key_envelope, types::Obje
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "rio-v2")]
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -2002,6 +2003,16 @@ pub(crate) struct LocalSseDekProvider {
     master_key: [u8; 32],
 }
 
+const LOCAL_SSE_DEK_FORMAT_VERSION: u8 = 1;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalSseDekEnvelope<'a> {
+    version: u8,
+    nonce: &'a str,
+    ciphertext: &'a str,
+}
+
 /// Test-only alias so existing test code that references `TestSseDekProvider`
 /// continues to compile without changes.
 #[cfg(test)]
@@ -2103,22 +2114,51 @@ impl LocalSseDekProvider {
             .encrypt(&nonce, dek.as_slice())
             .map_err(|_| ApiError::from(StorageError::other("Failed to encrypt DEK")))?;
 
-        // nonce:ciphertext
-        Ok(format!("{}:{}", BASE64_STANDARD.encode(nonce), BASE64_STANDARD.encode(ciphertext)))
+        let nonce = BASE64_STANDARD.encode(nonce);
+        let ciphertext = BASE64_STANDARD.encode(ciphertext);
+        serde_json::to_string(&LocalSseDekEnvelope {
+            version: LOCAL_SSE_DEK_FORMAT_VERSION,
+            nonce: &nonce,
+            ciphertext: &ciphertext,
+        })
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to serialize encrypted DEK: {e}"))))
     }
 
     // Simple decryption of DEK
     pub(crate) fn decrypt_dek(encrypted_dek: &str, cmk_value: [u8; 32]) -> Result<[u8; 32], ApiError> {
-        let parts: Vec<&str> = encrypted_dek.split(':').collect();
-        if parts.len() != 2 {
-            return Err(ApiError::from(StorageError::other("Invalid encrypted DEK format")));
-        }
-
+        let envelope = serde_json::from_str::<LocalSseDekEnvelope<'_>>(encrypted_dek);
+        let (nonce, ciphertext) = match envelope {
+            Ok(envelope) => {
+                if envelope.version != LOCAL_SSE_DEK_FORMAT_VERSION {
+                    return Err(ApiError::from(StorageError::other(format!(
+                        "Unsupported encrypted DEK format version: {}",
+                        envelope.version
+                    ))));
+                }
+                (envelope.nonce, envelope.ciphertext)
+            }
+            Err(json_error) if encrypted_dek.trim_start().starts_with('{') => {
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Invalid encrypted DEK JSON format: {json_error}"
+                ))));
+            }
+            Err(_) => {
+                // DEPRECATED: read-only compatibility for persisted colon-delimited DEKs.
+                // RUSTFS_COMPAT_TODO(sse-local-dek-json-v1): Remove after all supported upgrades have rewritten legacy DEKs.
+                let Some((nonce, ciphertext)) = encrypted_dek.split_once(':') else {
+                    return Err(ApiError::from(StorageError::other("Invalid encrypted DEK format")));
+                };
+                if ciphertext.contains(':') {
+                    return Err(ApiError::from(StorageError::other("Invalid encrypted DEK format")));
+                }
+                (nonce, ciphertext)
+            }
+        };
         let nonce_vec = BASE64_STANDARD
-            .decode(parts[0])
+            .decode(nonce)
             .map_err(|_| ApiError::from(StorageError::other("Invalid nonce format")))?;
         let ciphertext = BASE64_STANDARD
-            .decode(parts[1])
+            .decode(ciphertext)
             .map_err(|_| ApiError::from(StorageError::other("Invalid ciphertext format")))?;
 
         let key = Key::<Aes256Gcm>::from(cmk_value);
@@ -4036,17 +4076,25 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_dek_uses_random_nonce_prefixes() {
+    fn test_encrypt_dek_writes_json_with_random_nonces() {
         let dek = [0x11u8; 32];
         let cmk = [0x22u8; 32];
 
         let encrypted_a = TestSseDekProvider::encrypt_dek(dek, cmk).expect("first DEK wrap should succeed");
         let encrypted_b = TestSseDekProvider::encrypt_dek(dek, cmk).expect("second DEK wrap should succeed");
 
-        let nonce_a = encrypted_a.split(':').next().expect("wrapped DEK should contain nonce");
-        let nonce_b = encrypted_b.split(':').next().expect("wrapped DEK should contain nonce");
+        let envelope_a: super::LocalSseDekEnvelope =
+            serde_json::from_str(&encrypted_a).expect("first wrapped DEK should be a JSON envelope");
+        let envelope_b: super::LocalSseDekEnvelope =
+            serde_json::from_str(&encrypted_b).expect("second wrapped DEK should be a JSON envelope");
 
-        assert_ne!(nonce_a, nonce_b, "each DEK wrap should use a distinct nonce prefix");
+        assert_eq!(envelope_a.version, super::LOCAL_SSE_DEK_FORMAT_VERSION);
+        assert_eq!(envelope_b.version, super::LOCAL_SSE_DEK_FORMAT_VERSION);
+        assert_ne!(envelope_a.nonce, envelope_b.nonce, "each DEK wrap should use a distinct nonce");
+        assert_eq!(
+            TestSseDekProvider::decrypt_dek(&encrypted_a, cmk).expect("first JSON envelope should decrypt"),
+            dek
+        );
     }
 
     #[test]
@@ -4062,6 +4110,20 @@ mod tests {
 
         let decrypted = TestSseDekProvider::decrypt_dek(&legacy_payload, cmk).expect("legacy payload should remain decryptable");
         assert_eq!(decrypted, dek);
+    }
+
+    #[test]
+    fn test_decrypt_dek_rejects_unknown_json_version() {
+        let envelope = serde_json::json!({
+            "version": super::LOCAL_SSE_DEK_FORMAT_VERSION + 1,
+            "nonce": BASE64_STANDARD.encode([0u8; 12]),
+            "ciphertext": BASE64_STANDARD.encode([0u8; 48]),
+        })
+        .to_string();
+
+        let error = TestSseDekProvider::decrypt_dek(&envelope, [0x55u8; 32])
+            .expect_err("unknown JSON envelope versions must fail closed");
+        assert!(error.message.contains("Unsupported encrypted DEK format version"));
     }
 
     #[tokio::test]
