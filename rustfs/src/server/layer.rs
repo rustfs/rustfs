@@ -28,17 +28,19 @@ use crate::storage_api::server::layer::apply_cors_headers;
 use crate::storage_api::server::layer::request_context::{
     RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::Either;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use quick_xml::events::Event;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -57,6 +59,9 @@ const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+const STS_RESPONSE_METADATA_TAG: &str = "ResponseMetadata";
+const STS_REQUEST_ID_TAG: &str = "RequestId";
+const STS_SUCCESS_RESPONSE_TAGS: [&str; 2] = ["AssumeRoleResponse", "AssumeRoleWithWebIdentityResponse"];
 
 pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
     let path = uri.path();
@@ -1440,54 +1445,115 @@ where
     RestBody: Body<Data = Bytes>,
 {
     let bytes = BodyExt::collect(body).await?.to_bytes();
-    let Ok(xml) = String::from_utf8(bytes.to_vec()) else {
+    let Ok(xml) = std::str::from_utf8(&bytes) else {
         return Ok((bytes, false));
     };
 
     let converted = if status.is_success() {
         add_sts_response_metadata(xml, request_id)
     } else {
-        Some(wrap_sts_error_response(&xml, status, request_id))
+        Some(Bytes::from(wrap_sts_error_response(xml, status, request_id)))
     };
 
     match converted {
-        Some(xml) => Ok((Bytes::from(xml), true)),
+        Some(xml) => Ok((xml, true)),
         None => Ok((bytes, false)),
     }
 }
 
-fn add_sts_response_metadata(mut xml: String, request_id: &str) -> Option<String> {
-    if xml.contains("<ResponseMetadata>") {
-        return None;
-    }
+fn add_sts_response_metadata(xml: &str, request_id: &str) -> Option<Bytes> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut depth = 0_usize;
+    let mut root_prefix = None;
 
-    let closing_tag = ["</AssumeRoleResponse>", "</AssumeRoleWithWebIdentityResponse>"]
-        .into_iter()
-        .find(|tag| xml.contains(tag))?;
-    let index = xml.rfind(closing_tag)?;
-    xml.insert_str(
-        index,
-        &format!("<ResponseMetadata><RequestId>{}</RequestId></ResponseMetadata>", xml_escape(request_id)),
-    );
-    Some(xml)
+    loop {
+        let event_start = usize::try_from(reader.buffer_position()).ok()?;
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                if depth == 0 {
+                    if !is_sts_success_response_tag(element.local_name().as_ref()) {
+                        return None;
+                    }
+                    root_prefix = element
+                        .name()
+                        .prefix()
+                        .map(|prefix| std::str::from_utf8(prefix.as_ref()).map(str::to_owned))
+                        .transpose()
+                        .ok()?;
+                } else if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG.as_bytes() {
+                    return None;
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(element)) => {
+                if depth == 0 {
+                    return None;
+                }
+                if depth == 1 && element.local_name().as_ref() == STS_RESPONSE_METADATA_TAG.as_bytes() {
+                    return None;
+                }
+            }
+            Ok(Event::End(element)) => {
+                if depth == 0 {
+                    return None;
+                }
+                if depth == 1 {
+                    if !is_sts_success_response_tag(element.local_name().as_ref()) {
+                        return None;
+                    }
+                    let prefix = root_prefix.as_deref().map(|prefix| format!("{prefix}:")).unwrap_or_default();
+                    let metadata = format!(
+                        "<{prefix}{STS_RESPONSE_METADATA_TAG}>\
+                         <{prefix}{STS_REQUEST_ID_TAG}>{request_id}</{prefix}{STS_REQUEST_ID_TAG}>\
+                         </{prefix}{STS_RESPONSE_METADATA_TAG}>",
+                        request_id = xml_escape(request_id),
+                    );
+                    let capacity = xml.len().checked_add(metadata.len())?;
+                    let mut converted = BytesMut::with_capacity(capacity);
+                    converted.extend_from_slice(&xml.as_bytes()[..event_start]);
+                    converted.extend_from_slice(metadata.as_bytes());
+                    converted.extend_from_slice(&xml.as_bytes()[event_start..]);
+                    return Some(converted.freeze());
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+fn is_sts_success_response_tag(tag: &[u8]) -> bool {
+    STS_SUCCESS_RESPONSE_TAGS.iter().any(|candidate| candidate.as_bytes() == tag)
 }
 
 fn wrap_sts_error_response(xml: &str, status: StatusCode, request_id: &str) -> String {
-    let (xml, _) = insert_missing_signature_error_message(xml.to_owned());
-    let parsed = quick_xml::de::from_str::<SerializedS3Error>(&xml).ok();
+    let parsed = quick_xml::de::from_str::<SerializedS3Error>(xml).ok();
     let (code, message) = parsed
         .as_ref()
-        .map(|error| (error.code.as_str(), error.message.as_deref().unwrap_or(&error.code)))
-        .unwrap_or_else(|| sts_error_for_status(status));
+        .map(|error| {
+            let message = match error.message.as_deref() {
+                Some(message) => Cow::Borrowed(message),
+                None if error.code == S3ErrorCode::SignatureDoesNotMatch.as_str() => {
+                    Cow::Owned(ApiError::error_code_to_message(&S3ErrorCode::SignatureDoesNotMatch))
+                }
+                None => Cow::Borrowed(error.code.as_str()),
+            };
+            (error.code.as_str(), message)
+        })
+        .unwrap_or_else(|| {
+            let (code, message) = sts_error_for_status(status);
+            (code, Cow::Borrowed(message))
+        });
     let error_type = if status.is_server_error() { "Receiver" } else { "Sender" };
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
-         <Error><Type>{error_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>\
+        <Error><Type>{error_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>\
          <RequestId>{request_id}</RequestId></ErrorResponse>",
         code = xml_escape(code),
-        message = xml_escape(message),
+        message = xml_escape(&message),
         request_id = xml_escape(request_id),
     )
 }
@@ -3053,6 +3119,7 @@ mod tests {
     struct FixedStsResponse {
         status: StatusCode,
         body: Bytes,
+        upstream_request_id: Option<&'static str>,
     }
 
     impl<RequestBody: Send + 'static> Service<Request<RequestBody>> for FixedStsResponse {
@@ -3068,19 +3135,26 @@ mod tests {
             let body = tower_http::body::UnsyncBoxBody::new(
                 Full::from(self.body.clone()).map_err(|error| -> StsBoxError { match error {} }),
             );
-            ready(Ok(Response::builder()
+            let mut response = Response::builder()
                 .status(self.status)
                 .header(http::header::CONTENT_TYPE, "application/xml")
-                .header(http::header::CONTENT_LENGTH, self.body.len())
-                .body(body)
-                .expect("fixed STS response")))
+                .header(http::header::CONTENT_LENGTH, self.body.len());
+            if let Some(request_id) = self.upstream_request_id {
+                response = response.header(AMZ_REQUEST_ID, request_id);
+            }
+            ready(Ok(response.body(body).expect("fixed STS response")))
         }
     }
 
-    async fn call_sts_compat_layer(status: StatusCode, body: &'static [u8]) -> (HeaderMap, String) {
+    async fn call_sts_compat_layer(
+        status: StatusCode,
+        body: &'static [u8],
+        upstream_request_id: Option<&'static str>,
+    ) -> (HeaderMap, String) {
         let mut service = StsQueryApiCompatLayer.layer(FixedStsResponse {
             status,
             body: Bytes::from_static(body),
+            upstream_request_id,
         });
         let mut request = Request::builder()
             .method(Method::POST)
@@ -3107,8 +3181,12 @@ mod tests {
 
     #[tokio::test]
     async fn sts_compat_layer_uses_canonical_request_id_for_success_header_and_xml() {
-        let (headers, body) =
-            call_sts_compat_layer(StatusCode::OK, b"<AssumeRoleResponse><AssumeRoleResult/></AssumeRoleResponse>").await;
+        let (headers, body) = call_sts_compat_layer(
+            StatusCode::OK,
+            b"<AssumeRoleResponse><AssumeRoleResult/></AssumeRoleResponse>",
+            Some("upstream-request-id"),
+        )
+        .await;
 
         assert_eq!(
             headers.get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
@@ -3124,6 +3202,7 @@ mod tests {
         let (headers, body) = call_sts_compat_layer(
             StatusCode::FORBIDDEN,
             b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            None,
         )
         .await;
 
@@ -3172,11 +3251,10 @@ mod tests {
 
     #[test]
     fn sts_success_response_gets_response_metadata() {
-        let xml = String::from(
-            "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
-             <AssumeRoleResult><Credentials/></AssumeRoleResult></AssumeRoleResponse>",
-        );
+        let xml = "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+             <AssumeRoleResult><Credentials/></AssumeRoleResult></AssumeRoleResponse>";
         let converted = add_sts_response_metadata(xml, "request-123").expect("AssumeRole response should be converted");
+        let converted = std::str::from_utf8(&converted).expect("converted response should be UTF-8 XML");
 
         assert!(converted.contains("<Credentials/>"));
         assert!(converted.contains("<ResponseMetadata><RequestId>request-123</RequestId></ResponseMetadata>"));
@@ -3185,17 +3263,37 @@ mod tests {
 
     #[test]
     fn sts_web_identity_success_response_gets_response_metadata() {
-        let xml = String::from(
-            "<AssumeRoleWithWebIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+        let xml = "<AssumeRoleWithWebIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
              <AssumeRoleWithWebIdentityResult><Credentials/></AssumeRoleWithWebIdentityResult>\
-             </AssumeRoleWithWebIdentityResponse>",
-        );
+             </AssumeRoleWithWebIdentityResponse>";
         let converted =
             add_sts_response_metadata(xml, "request-123").expect("AssumeRoleWithWebIdentity response should be converted");
+        let converted = std::str::from_utf8(&converted).expect("converted response should be UTF-8 XML");
 
         assert!(converted.contains("<Credentials/>"));
         assert!(converted.contains("<ResponseMetadata><RequestId>request-123</RequestId></ResponseMetadata>"));
         assert!(converted.ends_with("</AssumeRoleWithWebIdentityResponse>"));
+    }
+
+    #[test]
+    fn sts_namespaced_success_response_gets_namespaced_metadata() {
+        let xml = "<sts:AssumeRoleResponse xmlns:sts=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+                   <sts:AssumeRoleResult/></sts:AssumeRoleResponse>";
+        let converted = add_sts_response_metadata(xml, "request-123").expect("namespaced response should be converted");
+        let converted = std::str::from_utf8(&converted).expect("converted response should be UTF-8 XML");
+
+        assert!(converted.contains("<sts:ResponseMetadata><sts:RequestId>request-123</sts:RequestId></sts:ResponseMetadata>"));
+        assert!(converted.ends_with("</sts:AssumeRoleResponse>"));
+    }
+
+    #[test]
+    fn sts_success_response_with_existing_metadata_is_unchanged() {
+        let xml = "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+                   <AssumeRoleResult/>\
+                   <ResponseMetadata source=\"upstream\"><RequestId>existing</RequestId></ResponseMetadata>\
+                   </AssumeRoleResponse>";
+
+        assert!(add_sts_response_metadata(xml, "request-123").is_none());
     }
 
     #[test]
@@ -3224,7 +3322,8 @@ mod tests {
 
     #[tokio::test]
     async fn sts_compat_layer_wraps_non_xml_short_circuit_errors() {
-        let (headers, body) = call_sts_compat_layer(StatusCode::SERVICE_UNAVAILABLE, b"Service not ready: waiting for iam").await;
+        let (headers, body) =
+            call_sts_compat_layer(StatusCode::SERVICE_UNAVAILABLE, b"Service not ready: waiting for iam", None).await;
 
         assert_eq!(
             headers.get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
@@ -3235,6 +3334,57 @@ mod tests {
         assert!(body.contains("<Message>Service Unavailable</Message>"));
         assert!(body.contains("<RequestId>server-request-id</RequestId>"));
         assert!(!body.contains("waiting for iam"));
+    }
+
+    #[tokio::test]
+    async fn sts_compat_layer_replaces_upstream_and_duplicate_error_request_ids() {
+        let (headers, body) = call_sts_compat_layer(
+            StatusCode::FORBIDDEN,
+            b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message>\
+              <RequestId>body-request-id-1</RequestId><RequestId>body-request-id-2</RequestId></Error>",
+            Some("header-request-id"),
+        )
+        .await;
+
+        assert_eq!(
+            headers.get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+            Some("server-request-id")
+        );
+        assert_eq!(body.matches("<RequestId>").count(), 1);
+        assert!(body.contains("<RequestId>server-request-id</RequestId>"));
+        for stale_request_id in ["header-request-id", "body-request-id-1", "body-request-id-2"] {
+            assert!(!body.contains(stale_request_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn sts_compat_layer_falls_back_for_empty_and_malformed_error_xml() {
+        for (body, status, expected_code, expected_message) in [
+            (
+                b"".as_slice(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "Service Unavailable",
+            ),
+            (
+                b"<Error><Code>AccessDenied".as_slice(),
+                StatusCode::BAD_GATEWAY,
+                "InternalError",
+                "Internal Server Error",
+            ),
+        ] {
+            let (headers, body) = call_sts_compat_layer(status, body, None).await;
+
+            assert_eq!(
+                headers.get(AMZ_REQUEST_ID).and_then(|value| value.to_str().ok()),
+                Some("server-request-id")
+            );
+            assert!(body.contains("<Type>Receiver</Type>"));
+            assert!(body.contains(&format!("<Code>{expected_code}</Code>")));
+            assert!(body.contains(&format!("<Message>{expected_message}</Message>")));
+            assert_eq!(body.matches("<RequestId>").count(), 1);
+            assert!(body.contains("<RequestId>server-request-id</RequestId>"));
+        }
     }
 
     #[tokio::test]
@@ -3260,6 +3410,7 @@ mod tests {
             .service(FixedStsResponse {
                 status: StatusCode::OK,
                 body: Bytes::from(xml),
+                upstream_request_id: None,
             });
         let mut request = Request::builder()
             .method(Method::POST)
