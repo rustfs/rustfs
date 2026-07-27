@@ -81,9 +81,9 @@ use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cac
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
 use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
-    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, namespace_reserved_user_metadata,
-    normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
+    bucket_versioning_config, copy_dst_opts, copy_src_opts, del_opts, del_opts_with_versioning, extract_metadata,
+    extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
+    namespace_reserved_user_metadata, normalize_content_encoding_for_storage, put_opts, validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -99,9 +99,9 @@ use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
-    RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
-    parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
-    strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
+    RFC1123, check_preconditions, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
+    parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,
+    validate_bucket_exists, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
     validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
@@ -607,6 +607,16 @@ struct GetObjectRequestContext {
     part_number: Option<usize>,
     rs: Option<HTTPRangeSpec>,
     opts: ObjectOptions,
+}
+
+/// Request fields that passed the cheap GET validations, ready for the
+/// bucket-metadata work in [`DefaultObjectUsecase::prepare_get_object_request_context`].
+struct GetObjectValidatedRequest {
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    part_number: Option<usize>,
+    rs: Option<HTTPRangeSpec>,
 }
 
 struct GetObjectReadSetup {
@@ -3552,7 +3562,9 @@ impl DefaultObjectUsecase {
         }
     }
 
-    async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
+    /// Cheap request-shape validations, run before the bucket-existence store
+    /// lookup so invalid requests keep their InvalidArgument precedence.
+    fn validate_get_object_request(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectValidatedRequest> {
         // Clone only the fields this path needs instead of the whole input.
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
@@ -3570,7 +3582,28 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
         }
 
-        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, &req.headers)
+        Ok(GetObjectValidatedRequest {
+            bucket,
+            key,
+            version_id,
+            part_number,
+            rs,
+        })
+    }
+
+    async fn prepare_get_object_request_context(
+        validated: GetObjectValidatedRequest,
+        headers: &HeaderMap,
+    ) -> S3Result<GetObjectRequestContext> {
+        let GetObjectValidatedRequest {
+            bucket,
+            key,
+            version_id,
+            part_number,
+            rs,
+        } = validated;
+
+        let opts: ObjectOptions = get_opts(&bucket, &key, version_id.clone(), part_number, headers)
             .await
             .map_err(ApiError::from)?;
 
@@ -3588,6 +3621,7 @@ impl DefaultObjectUsecase {
         &self,
         req: &S3Request<GetObjectInput>,
         manager: &'static ConcurrencyManager,
+        store: Arc<ECStore>,
         wrapper: &RequestTimeoutWrapper,
         timeout_config: &GetObjectTimeoutPolicy,
         bucket: &str,
@@ -3596,17 +3630,6 @@ impl DefaultObjectUsecase {
         opts: &ObjectOptions,
         part_number: Option<usize>,
     ) -> S3Result<GetObjectPreparedRead> {
-        // SF05: Store lookup first (cached via SF01 moka cache).
-        let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let store = get_validated_store(bucket).await?;
-        if let Some(store_lookup_start) = store_lookup_start {
-            rustfs_io_metrics::record_get_object_stage_duration(
-                "s3_handler",
-                "store_lookup",
-                store_lookup_start.elapsed().as_secs_f64(),
-            );
-        }
-
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
         let cache_adapter = self.object_data_cache();
@@ -4730,7 +4753,13 @@ impl DefaultObjectUsecase {
             use_large_put_concurrency_tuning,
         );
 
-        let store = get_validated_store(&bucket).await?;
+        // Resolve the store through the request-bound server context
+        // (backlog#1052 S6), not the process-global handle, so an embedded
+        // second server never writes into the first server's store.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        validate_bucket_exists(&store, &bucket).await?;
 
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         debug!(
@@ -5513,8 +5542,40 @@ impl DefaultObjectUsecase {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
+        // Cheap request-shape validations run first so invalid requests keep
+        // their InvalidArgument precedence over bucket existence.
+        let validated = match Self::validate_get_object_request(&req) {
+            Ok(validated) => validated,
+            Err(err) => {
+                lifecycle.finish_err();
+                return Err(err);
+            }
+        };
+
+        // SF05: Store lookup next (5s-TTL bucket-validation cache). Bucket
+        // existence is established before any bucket-metadata work, so requests
+        // naming nonexistent buckets fail before the versioning lookup in
+        // get_opts. The store comes from the request-bound server context
+        // (backlog#1052 S6), not the process-global handle.
+        let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let Some(store) = self.object_store() else {
+            lifecycle.finish_err();
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        if let Err(err) = validate_bucket_exists(&store, &req.input.bucket).await {
+            lifecycle.finish_err();
+            return Err(err);
+        }
+        if let Some(store_lookup_start) = store_lookup_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "s3_handler",
+                "store_lookup",
+                store_lookup_start.elapsed().as_secs_f64(),
+            );
+        }
+
         let request_context_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let request_context = match Self::prepare_get_object_request_context(&req).await {
+        let request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {
             Ok(request_context) => request_context,
             Err(err) => {
                 lifecycle.finish_err();
@@ -5540,7 +5601,18 @@ impl DefaultObjectUsecase {
         let manager = get_concurrency_manager();
 
         let prepared_read = match self
-            .prepare_get_object_read_execution(&req, manager, &wrapper, &timeout_config, &bucket, &key, rs, &opts, part_number)
+            .prepare_get_object_read_execution(
+                &req,
+                manager,
+                store,
+                &wrapper,
+                &timeout_config,
+                &bucket,
+                &key,
+                rs,
+                &opts,
+                part_number,
+            )
             .await
         {
             Ok(prepared_read) => prepared_read,
@@ -6474,7 +6546,7 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
+        let version_cfg = bucket_versioning_config(&bucket).await;
         let bypass_governance = has_bypass_governance_header(&req.headers);
         let bucket_lock_enabled = bucket_object_locking_enabled(&bucket).await;
 
@@ -6561,14 +6633,16 @@ impl DefaultObjectUsecase {
             };
 
             let metadata = extract_metadata(&req.headers);
-            let opts: ObjectOptions = del_opts(
+            // Reuse the request-level versioning config fetched above instead of
+            // re-resolving it per key (up to 1000 identical lookups per request).
+            let opts: ObjectOptions = del_opts_with_versioning(
                 &bucket,
                 &object.object_name,
                 object.version_id.map(|f| f.to_string()),
                 &req.headers,
                 metadata,
+                &version_cfg,
             )
-            .await
             .map_err(ApiError::from)?;
 
             // backlog#929 (HP-8): the accounting branch after the store delete
@@ -6915,6 +6989,16 @@ impl DefaultObjectUsecase {
             authorize_request(&mut req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
         }
 
+        // Establish bucket existence before any bucket-metadata work (matches
+        // PUT/GET): nonexistent buckets fail here instead of paying the
+        // versioning lookups in del_opts/get_opts first. Resolve the store
+        // through the request-bound server context (backlog#1052 S6), not the
+        // process-global handle.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        validate_bucket_exists(&store, &bucket).await?;
+
         let metadata = extract_metadata(&req.headers);
         // Clone version_id before it's moved
         let version_id_clone = version_id.clone();
@@ -6952,9 +7036,6 @@ impl DefaultObjectUsecase {
             ));
         }
         validate_undo_delete_version(expected_current_version_id.as_deref(), opts.version_id.as_deref())?;
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
         opts.expected_current_version_id = expected_current_version_id.clone();
 
         let replicate_force_delete = force_delete
@@ -7176,13 +7257,20 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
         }
 
+        // Establish bucket existence before any bucket-metadata work (matches
+        // PUT/GET): nonexistent buckets fail here instead of paying the
+        // versioning lookup in get_opts first. Resolve the store through the
+        // request-bound server context (backlog#1052 S6), not the
+        // process-global handle.
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        validate_bucket_exists(&store, &bucket).await?;
+
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(ApiError::from)?;
 
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
         // Modification Points: Explicitly handles get_object_info errors, distinguishing between object absence and other errors
         let info = match store.get_object_info(&bucket, &key, &opts).await {
             Ok(info) => info,
