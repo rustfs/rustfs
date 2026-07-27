@@ -133,6 +133,10 @@ parse_ratio() {
     echo "ERROR: mix percentages must be integers: $spec" >&2
     exit 1
   fi
+  if (( read_pct + write_pct != 100 )); then
+    echo "ERROR: read/write percentages must sum to 100: $spec" >&2
+    exit 1
+  fi
   echo "$name|$read_pct|$write_pct"
 }
 
