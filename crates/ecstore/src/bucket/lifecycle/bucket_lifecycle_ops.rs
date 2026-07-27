@@ -3452,7 +3452,10 @@ impl ManualTransitionRunReport {
     }
 
     pub fn has_partial_enqueue(&self) -> bool {
-        self.skipped_queue_full > 0 || self.skipped_queue_closed > 0 || self.skipped_queue_timeout > 0
+        self.skipped_already_in_flight > 0
+            || self.skipped_queue_full > 0
+            || self.skipped_queue_closed > 0
+            || self.skipped_queue_timeout > 0
     }
 
     pub fn was_truncated(&self) -> bool {

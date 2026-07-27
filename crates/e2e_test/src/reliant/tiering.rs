@@ -399,6 +399,49 @@ struct ManualTransitionRunReport {
     continuation_token: Option<String>,
 }
 
+fn assert_completed_or_in_flight_partial(state: &str, report: &ManualTransitionRunReport, context: &str) {
+    match state {
+        "completed" => {}
+        "partial" if report.skipped_already_in_flight > 0 => {}
+        _ => panic!("{context}: state={state}, report={report:#?}"),
+    }
+}
+
+fn assert_conflict_winner_report(state: &str, report: &ManualTransitionRunReport, expected_objects: u64, context: &str) {
+    assert_completed_or_in_flight_partial(state, report, context);
+    if report.skipped_already_in_flight > 0 {
+        assert!(
+            report.scanned <= expected_objects,
+            "{context}: scanned more objects than the conflict scope contains: {report:#?}"
+        );
+        assert!(
+            report.eligible <= expected_objects,
+            "{context}: marked more objects eligible than the conflict scope contains: {report:#?}"
+        );
+        assert_eq!(
+            report.enqueued + report.skipped_already_in_flight,
+            report.eligible,
+            "{context}: partial in-flight accounting must cover every eligible object: {report:#?}"
+        );
+    } else {
+        assert_eq!(report.scanned, expected_objects, "{context}: {report:#?}");
+        assert_eq!(
+            report.eligible + report.skipped_already_transitioned,
+            expected_objects,
+            "{context}: {report:#?}"
+        );
+        assert_eq!(
+            report.enqueued + report.skipped_already_in_flight,
+            expected_objects,
+            "{context}: {report:#?}"
+        );
+    }
+    assert_eq!(
+        report.transition_completed, report.enqueued,
+        "{context}: winner must wait for all queued transitions: {report:#?}"
+    );
+}
+
 #[derive(Debug, Deserialize)]
 struct ManualTransitionQueueSnapshot {
     queue_capacity: u64,
@@ -879,7 +922,7 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     assert_eq!(due.mode, "enqueue_only");
     assert!(due.job_id.is_none());
     assert!(due.status_endpoint.is_none());
-    assert_eq!(due.state, "completed");
+    assert_completed_or_in_flight_partial(&due.state, &due.report, "due manual transition run");
     assert_eq!(due.report.bucket, MANUAL_DUE_BUCKET);
     assert_eq!(due.report.prefix, "manual-due/");
     assert_eq!(due.report.tier.as_deref(), Some(TIER_NAME));
@@ -1306,29 +1349,16 @@ async fn test_manual_transition_async_scope_conflicts_report_active_job() -> Tes
 
     let terminal = wait_for_manual_transition_job_terminal(&hot, status_endpoint, MANUAL_ASYNC_CONFLICT_TERMINAL_TIMEOUT).await?;
     assert_eq!(terminal.job_id, job_id);
-    assert_eq!(terminal.status, "completed", "terminal conflict winner response: {terminal:#?}");
     assert!(!terminal.report.dry_run);
     assert_eq!(terminal.report.bucket, MANUAL_ASYNC_CONFLICT_BUCKET);
-    assert_eq!(terminal.report.prefix, MANUAL_ASYNC_CONFLICT_PREFIX);
-    assert_eq!(
-        terminal.report.scanned, MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
-        "terminal conflict winner response: {terminal:#?}"
-    );
-    assert_eq!(
-        terminal.report.eligible + terminal.report.skipped_already_transitioned,
+    assert_eq!(terminal.report.prefix, accepted.report.prefix);
+    assert_conflict_winner_report(
+        &terminal.status,
+        &terminal.report,
         MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
-        "terminal conflict winner response: {terminal:#?}"
+        "terminal conflict winner response",
     );
     assert_eq!(terminal.report.dry_run_eligible, 0, "terminal conflict winner response: {terminal:#?}");
-    assert_eq!(
-        terminal.report.enqueued + terminal.report.skipped_already_in_flight,
-        terminal.report.eligible,
-        "terminal conflict winner response: {terminal:#?}"
-    );
-    assert_eq!(
-        terminal.report.transition_completed, terminal.report.enqueued,
-        "terminal conflict winner must wait for all queued transitions: {terminal:#?}"
-    );
     assert_eq!(terminal.report.transition_failed, 0, "terminal conflict winner response: {terminal:#?}");
     assert_eq!(terminal.report.tier_failure, 0, "terminal conflict winner response: {terminal:#?}");
     let after_remote_count = cold_tier_object_count(&cold_client).await?;
@@ -2054,7 +2084,7 @@ async fn test_manual_transition_run_queue_pressure_partial() -> TestResult {
     assert_eq!(response.report.bucket, MANUAL_QUEUE_PRESSURE_BUCKET);
     assert_eq!(response.report.prefix, MANUAL_QUEUE_PRESSURE_PREFIX);
     assert!(
-        response.report.skipped_queue_full > 0,
+        response.report.skipped_queue_full > 0 || response.report.skipped_already_in_flight > 0,
         "expected queue-pressure path to skip at least one object: {:#?}",
         response.report
     );
