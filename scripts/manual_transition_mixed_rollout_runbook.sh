@@ -20,6 +20,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 ENDPOINT=""
 ADMIN_TOKEN=""
+ACCESS_KEY=""
+SECRET_KEY=""
+AWS_SIGV4_SCOPE="aws:amz:us-east-1:s3"
 OUT_DIR=""
 PHASE_MATRIX="request-only:100:0:30,canary:90:10:120,mixed:50:50:240,full-rollout:0:100:360,rollback:100:0:30"
 CONCURRENCIES="8,16,32"
@@ -45,6 +48,9 @@ Required:
 
 Optional:
   --admin-token         Bearer token for admin endpoints
+  --access-key          Access key for SigV4-signed admin calls
+  --secret-key          Secret key for SigV4-signed admin calls
+  --aws-sigv4-scope     curl --aws-sigv4 scope, default aws:amz:us-east-1:s3
   --job-bucket          Job bucket for transition scope (default: manual-transition)
   --job-prefix          Prefix for generated runbook phase names (default: journal-mixed-rollout)
   --tier                Transition tier (default: empty)
@@ -91,6 +97,18 @@ parse_args() {
         ;;
       --admin-token)
         ADMIN_TOKEN="$(arg_value "$1" "${2:-}")"
+        shift 2
+        ;;
+      --access-key)
+        ACCESS_KEY="$(arg_value "$1" "${2:-}")"
+        shift 2
+        ;;
+      --secret-key)
+        SECRET_KEY="$(arg_value "$1" "${2:-}")"
+        shift 2
+        ;;
+      --aws-sigv4-scope)
+        AWS_SIGV4_SCOPE="$(arg_value "$1" "${2:-}")"
         shift 2
         ;;
       --job-bucket)
@@ -181,8 +199,10 @@ command_template() {
   fi
   if [[ -n "$ADMIN_TOKEN" ]]; then
     token_note='export ADMIN_TOKEN=<set by caller>'
+  elif [[ -n "$ACCESS_KEY" ]]; then
+    token_note='SigV4 credentials embedded in generated runner'
   else
-    token_note='export ADMIN_TOKEN="" (set this value)'
+    token_note='export ADMIN_TOKEN="" or pass --access-key/--secret-key'
   fi
 
   cat >"$RUNBOOK_FILE" <<'RUNBOOK'
@@ -214,6 +234,8 @@ Use the commands below directly:
   - __COMMAND_FILE__
 - generated 'run_phase_commands.sh' is a per-phase audit starter; 'run_mixed_rollout_plan.sh' is the full runnable template.
 - for failure-oriented rollout phases, use scripts/manual_transition_failure_samples.sh to capture auth/network/timeout attribution evidence from the produced job ids.
+- for #1508 strict validation, pre-seed non-empty lifecycle-matching objects before each phase and keep both run response and terminal status/readback evidence.
+- for in-flight rollback validation, set IN_FLIGHT_ROLLBACK_HOOK to a script that replaces one new node with the old binary after job admission and before terminal status polling.
 - recommended runbook order:
   1. Review 'mixed_rollout_checklist.md'.
   2. Inspect __MATRIX_CMD__ for each phase note.
@@ -239,10 +261,16 @@ set -euo pipefail
 MIXED_MATRIX_CSV='__MIXED_MATRIX_CSV__'
 ENDPOINT='__ENDPOINT__'
 ADMIN_TOKEN='__ADMIN_TOKEN__'
+ACCESS_KEY='__ACCESS_KEY__'
+SECRET_KEY='__SECRET_KEY__'
+AWS_SIGV4_SCOPE='__AWS_SIGV4_SCOPE__'
 JOB_BUCKET='__JOB_BUCKET__'
 JOB_PREFIX='__JOB_PREFIX__'
 TIER='__TIER__'
 OUT_DIR='__OUT_DIR__'
+POLL_SECONDS="${POLL_SECONDS:-120}"
+S3_ENDPOINT="${S3_ENDPOINT:-$ENDPOINT}"
+IN_FLIGHT_ROLLBACK_HOOK="${IN_FLIGHT_ROLLBACK_HOOK:-}"
 
 require_cmd() {
   local cmd="$1"
@@ -255,6 +283,34 @@ require_cmd() {
 url_encode() {
   local value="$1"
   jq -rn --arg v "$value" '$v|@uri'
+}
+
+curl_admin() {
+  local method="$1"
+  local url="$2"
+  shift 2
+  local args=(-sS -X "$method")
+  if [[ -n "$ADMIN_TOKEN" ]]; then
+    args+=(-H "Authorization: Bearer ${ADMIN_TOKEN}")
+  elif [[ -n "$ACCESS_KEY" ]]; then
+    args+=(--aws-sigv4 "$AWS_SIGV4_SCOPE" --user "${ACCESS_KEY}:${SECRET_KEY}")
+  fi
+  curl "${args[@]}" "$url" "$@"
+}
+
+curl_s3() {
+  curl_admin "$@"
+}
+
+is_terminal_status() {
+  case "$1" in
+    completed|partial|failed|cancelled|unknown)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 normalize_object_count() {
@@ -283,6 +339,52 @@ normalize_object_count() {
   return 1
 }
 
+seed_phase_workload() {
+  local phase="$1"
+  local prefix="$2"
+  local object_count="$3"
+  local result_tag="$4"
+  local lifecycle_file="${OUT_DIR}/lifecycle-${result_tag}.xml"
+  local object_key="${prefix}/probe-${result_tag}.txt"
+
+  if [[ -z "$TIER" ]]; then
+    echo "ERROR: --tier is required for non-empty mixed-rollout evidence seeding" >&2
+    return 1
+  fi
+
+  curl_s3 PUT "${S3_ENDPOINT%/}/${JOB_BUCKET}" -o "${OUT_DIR}/create-bucket-${result_tag}.response" -w "%{http_code}\n" \
+    >"${OUT_DIR}/create-bucket-${result_tag}.http_code" || true
+
+  cat >"$lifecycle_file" <<XML
+<LifecycleConfiguration>
+  <Rule>
+    <ID>manual-transition-${phase}</ID>
+    <Filter><Prefix>${prefix}</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Transition><Days>0</Days><StorageClass>${TIER}</StorageClass></Transition>
+  </Rule>
+</LifecycleConfiguration>
+XML
+  curl_s3 PUT "${S3_ENDPOINT%/}/${JOB_BUCKET}?lifecycle" -H 'Content-Type: application/xml' --data-binary "@${lifecycle_file}" \
+    -o "${OUT_DIR}/put-lifecycle-${result_tag}.response" -w "%{http_code}\n" >"${OUT_DIR}/put-lifecycle-${result_tag}.http_code"
+
+  curl_s3 PUT "${S3_ENDPOINT%/}/${JOB_BUCKET}/${object_key}" --data-binary "rustfs #1508 ${phase} non-empty transition probe" \
+    -o "${OUT_DIR}/put-object-${result_tag}.response" -w "%{http_code}\n" >"${OUT_DIR}/put-object-${result_tag}.http_code"
+
+  echo "$object_key" >"${OUT_DIR}/object-key-${result_tag}.txt"
+  if (( object_count > 1 )); then
+    echo "[info] seeded one required probe object for ${phase}; caller may pre-seed the remaining $((object_count - 1)) objects under ${prefix}"
+  fi
+}
+
+head_phase_probe() {
+  local result_tag="$1"
+  local object_key
+  object_key="$(cat "${OUT_DIR}/object-key-${result_tag}.txt")"
+  curl_s3 HEAD "${S3_ENDPOINT%/}/${JOB_BUCKET}/${object_key}" -D "${OUT_DIR}/head-object-${result_tag}.headers" \
+    -o /dev/null -w "%{http_code}\n" >"${OUT_DIR}/head-object-${result_tag}.http_code" || true
+}
+
 run_transition() {
   local phase="$1"
   local concurrency="$2"
@@ -296,7 +398,9 @@ run_transition() {
   local response
   local job_id
   local status_url
-  local headers=()
+  local status_json
+  local result_tag
+  local status
 
   duration_sec=$((duration_min * 60))
   if ! object_count="$(normalize_object_count "$object_count_label")"; then
@@ -309,6 +413,8 @@ run_transition() {
   fi
 
   prefix="${JOB_PREFIX}/${phase}/${concurrency}c_${object_count_label}o"
+  result_tag="${phase}-${concurrency}-${object_count_label}"
+  seed_phase_workload "$phase" "$prefix" "$object_count" "$result_tag"
 
   query="bucket=$(url_encode "$JOB_BUCKET")"
   query="${query}&prefix=$(url_encode "$prefix")"
@@ -322,25 +428,34 @@ run_transition() {
 
   url="${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/run?${query}"
 
-  if [[ -n "$ADMIN_TOKEN" ]]; then
-    headers+=("-H" "Authorization: Bearer ${ADMIN_TOKEN}")
-  fi
-
   echo "==> phase=${phase} concurrency=${concurrency} object_count=${object_count} duration_min=${duration_min}"
-  response="$(curl -sS "${headers[@]}" -X POST "$url")"
+  response="$(curl_admin POST "$url")"
+  printf '%s\n' "$response" > "${OUT_DIR}/run-response-${result_tag}.json"
   job_id="$(printf '%s' "$response" | jq -r '.job_id // empty')"
   if [[ -z "$job_id" || "$job_id" == "null" ]]; then
     echo "ERROR: transition run did not return job_id for ${phase}" >&2
-    echo "$response"
+    printf '%s\n' "$response" > "${OUT_DIR}/run-response-missing-job-${result_tag}.json"
     return 1
   fi
 
   echo "job_id=${job_id}"
   status_url="${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}"
+  if [[ -n "$IN_FLIGHT_ROLLBACK_HOOK" ]]; then
+    "$IN_FLIGHT_ROLLBACK_HOOK" "$phase" "$job_id" "$status_url" "$OUT_DIR"
+  fi
   ./scripts/manual_transition_journal_audit.sh --endpoint "$ENDPOINT" --job-id "$job_id" ${ADMIN_TOKEN:+--admin-token "$ADMIN_TOKEN"} --out-dir "${OUT_DIR}/journal-audit-${phase}-${concurrency}-${object_count_label}" || true
-  printf '%s\n' "$response" > "${OUT_DIR}/run-response-${phase}-${concurrency}-${object_count_label}.json"
   echo "status_url=${status_url}"
-  curl -sS "${headers[@]}" -X GET "$status_url" | jq '{status, report, queue_snapshot, failure_reason}'
+  for _ in $(seq 1 "$POLL_SECONDS"); do
+    status_json="$(curl_admin GET "$status_url")"
+    printf '%s\n' "$status_json" > "${OUT_DIR}/status-${result_tag}.json"
+    status="$(printf '%s' "$status_json" | jq -r '.status // ""')"
+    if is_terminal_status "$status"; then
+      break
+    fi
+    sleep 1
+  done
+  head_phase_probe "$result_tag"
+  printf '%s\n' "$status_json" | jq '{job_id, status, bucket, prefix, tier, report, queue_snapshot, failure_reason}'
 }
 
 main() {
@@ -349,6 +464,14 @@ main() {
   require_cmd jq
   require_cmd awk
   require_cmd sed
+  if [[ -n "$ADMIN_TOKEN" && ( -n "$ACCESS_KEY" || -n "$SECRET_KEY" ) ]]; then
+    echo "ERROR: --admin-token cannot be combined with --access-key/--secret-key" >&2
+    exit 1
+  fi
+  if [[ -n "$ACCESS_KEY" && -z "$SECRET_KEY" || -z "$ACCESS_KEY" && -n "$SECRET_KEY" ]]; then
+    echo "ERROR: --access-key and --secret-key must be provided together" >&2
+    exit 1
+  fi
 
   if [[ ! -f "$MIXED_MATRIX_CSV" ]]; then
     echo "ERROR: expected matrix file missing: $MIXED_MATRIX_CSV" >&2
@@ -371,6 +494,9 @@ EOF
   perl -0pi -e "s#__MIXED_MATRIX_CSV__#${matrix_csv//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__ENDPOINT__#${ENDPOINT//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__ADMIN_TOKEN__#${ADMIN_TOKEN//#/#}#g" "$COMMAND_FILE"
+  perl -0pi -e "s#__ACCESS_KEY__#${ACCESS_KEY//#/#}#g" "$COMMAND_FILE"
+  perl -0pi -e "s#__SECRET_KEY__#${SECRET_KEY//#/#}#g" "$COMMAND_FILE"
+  perl -0pi -e "s#__AWS_SIGV4_SCOPE__#${AWS_SIGV4_SCOPE//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__JOB_BUCKET__#${JOB_BUCKET//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__JOB_PREFIX__#${JOB_PREFIX//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__TIER__#${TIER//#/#}#g" "$COMMAND_FILE"
@@ -393,6 +519,14 @@ main() {
   mkdir -p "$OUT_DIR"
   require_cmd awk
   require_cmd jq
+  if [[ -n "$ADMIN_TOKEN" && ( -n "$ACCESS_KEY" || -n "$SECRET_KEY" ) ]]; then
+    echo "ERROR: --admin-token cannot be combined with --access-key/--secret-key" >&2
+    exit 1
+  fi
+  if [[ -n "$ACCESS_KEY" && -z "$SECRET_KEY" || -z "$ACCESS_KEY" && -n "$SECRET_KEY" ]]; then
+    echo "ERROR: --access-key and --secret-key must be provided together" >&2
+    exit 1
+  fi
 
   main_matrix
   command_template

@@ -1149,6 +1149,16 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_response_reports_partial_for_in_flight_skip() {
+        let report = ManualTransitionRunReport {
+            skipped_already_in_flight: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(response_state(&report), "partial");
+    }
+
+    #[test]
     fn manual_transition_response_reports_partial_for_duration_budget() {
         let report = ManualTransitionRunReport {
             truncated_by_duration: true,

@@ -2461,6 +2461,25 @@ mod tests {
     }
 
     #[test]
+    fn manual_transition_job_record_in_flight_skip_report_is_partial() {
+        let options = ManualTransitionRunOptions::default();
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
+
+        record.complete(
+            ManualTransitionRunReport {
+                eligible: 1,
+                skipped_already_in_flight: 1,
+                ..Default::default()
+            },
+            ManualTransitionQueueSnapshot::default(),
+        );
+
+        assert_eq!(record.state, ManualTransitionJobState::Partial);
+        assert_eq!(record.report.skipped_already_in_flight, 1);
+        assert!(record.error.is_none());
+    }
+
+    #[test]
     fn manual_transition_job_record_queue_pressure_reports_persist_readback() {
         let options = ManualTransitionRunOptions {
             prefix: "logs/".to_string(),
