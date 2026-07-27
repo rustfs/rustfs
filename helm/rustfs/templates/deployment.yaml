@@ -115,6 +115,10 @@ spec:
                 name: {{ include "rustfs.fullname" . }}-config
             - secretRef:
                 name: {{ include "rustfs.secretName" . }}
+            {{- if include "rustfs.kmsVaultToken" . }}
+            - secretRef:
+                name: {{ include "rustfs.kmsSecretName" . }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- include "rustfs.probes" . | nindent 10 }}

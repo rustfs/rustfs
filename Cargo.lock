@@ -9972,6 +9972,7 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

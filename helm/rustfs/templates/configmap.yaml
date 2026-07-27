@@ -137,7 +137,8 @@ data:
   RUSTFS_KMS_ENABLE: "true"
   RUSTFS_KMS_BACKEND: {{ .vault_backend | quote }}
   RUSTFS_KMS_VAULT_ADDRESS: {{ .vault_address | quote }}
-  RUSTFS_KMS_VAULT_TOKEN: {{ .vault_token | quote }}
+  {{- /* RUSTFS_KMS_VAULT_TOKEN is a credential and is rendered into the KMS Secret
+         (templates/secret.yaml), never into this ConfigMap. */}}
   RUSTFS_KMS_DEFAULT_KEY_ID: {{ .default_key | quote }}
         {{- if eq .vault_backend "vault-transit" }}
   RUSTFS_KMS_VAULT_MOUNT_PATH: {{ .vault_mount_path | quote }}

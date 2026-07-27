@@ -1000,6 +1000,13 @@ where
 
     /// Recursively delete all objects in a bucket, then delete the bucket itself
     async fn delete_bucket_recursively(&self, bucket: &str) -> FsResult<()> {
+        // SECURITY: s3:DeleteBucket does not imply the right to destroy the
+        // bucket contents. Enumerating and deleting each object are separate
+        // authorization boundaries and must be cleared on their own.
+        authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, None)
+            .await
+            .map_err(|_| FsError::Forbidden)?;
+
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
@@ -1024,6 +1031,10 @@ where
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
+                            authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
+                                .await
+                                .map_err(|_| FsError::Forbidden)?;
+
                             let _ = self
                                 .storage
                                 .delete_object(
@@ -1370,6 +1381,14 @@ where
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
+                // SECURITY: clearing s3:DeleteObject on the directory marker key
+                // says nothing about the children stored under it. Enumerating the
+                // prefix and deleting each child are separate authorization
+                // boundaries and must be cleared on their own.
+                authorize_operation(&self.session_context, &S3Action::ListBucket, &bucket, Some(&prefix_with_slash))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+
                 // List and delete all objects with this prefix
                 let mut continuation_token = None;
                 loop {
@@ -1395,6 +1414,10 @@ where
                         if let Some(objects) = output.contents {
                             for obj in objects {
                                 if let Some(obj_key) = obj.key {
+                                    authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&obj_key))
+                                        .await
+                                        .map_err(|_| FsError::Forbidden)?;
+
                                     let _ = self
                                         .storage
                                         .delete_object(
@@ -1692,11 +1715,12 @@ where
 mod tests {
     use super::WebDavDriver;
     use crate::common::client::s3::StorageBackend as S3StorageBackend;
+    use crate::common::gateway::{S3Action, with_test_auth_override};
     use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
     use async_trait::async_trait;
     use bytes::Bytes;
     use dav_server::davpath::DavPath;
-    use dav_server::fs::FsError;
+    use dav_server::fs::{DavFileSystem, FsError};
     use futures_util::StreamExt;
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use rustfs_credentials::Credentials;
@@ -1887,6 +1911,7 @@ mod tests {
         objects: HashMap<(String, String), Vec<u8>>,
         put_keys: Vec<String>,
         delete_keys: Vec<String>,
+        deleted_buckets: Vec<String>,
         fail_delete_keys: HashSet<String>,
     }
 
@@ -2006,11 +2031,34 @@ mod tests {
 
         async fn list_objects_v2(
             &self,
-            _input: ListObjectsV2Input,
+            input: ListObjectsV2Input,
             _access_key: &str,
             _secret_key: &str,
         ) -> Result<ListObjectsV2Output, Self::Error> {
-            unreachable!("list_objects_v2 is not used in rename regression tests")
+            let prefix = input.prefix.map(|p| p.to_string()).unwrap_or_default();
+            let mut keys: Vec<String> = self
+                .state
+                .lock()
+                .expect("recording storage lock poisoned")
+                .objects
+                .keys()
+                .filter(|(bucket, key)| *bucket == input.bucket && key.starts_with(&prefix))
+                .map(|(_, key)| key.clone())
+                .collect();
+            keys.sort();
+
+            Ok(ListObjectsV2Output {
+                contents: Some(
+                    keys.into_iter()
+                        .map(|key| Object {
+                            key: Some(ObjectKey::from(key)),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                is_truncated: Some(false),
+                ..Default::default()
+            })
         }
 
         async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
@@ -2028,11 +2076,16 @@ mod tests {
 
         async fn delete_bucket(
             &self,
-            _bucket: &str,
+            bucket: &str,
             _access_key: &str,
             _secret_key: &str,
         ) -> Result<DeleteBucketOutput, Self::Error> {
-            unreachable!("delete_bucket is not used in rename regression tests")
+            self.state
+                .lock()
+                .expect("recording storage lock poisoned")
+                .deleted_buckets
+                .push(bucket.to_string());
+            Ok(DeleteBucketOutput::default())
         }
 
         async fn copy_object(
@@ -2246,6 +2299,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A bucket DELETE wipes every object in the bucket, so `s3:DeleteBucket`
+    /// alone must not be enough: each object needs its own `s3:DeleteObject`
+    /// boundary. The backend would happily complete the whole recursive delete
+    /// if the per-object check were removed again.
+    #[tokio::test]
+    async fn bucket_delete_denied_per_object_leaves_contents_and_bucket_intact() {
+        let (driver, storage) = recording_driver(&[("bucket", "secret.txt", b"secret")], &[]);
+        let path = DavPath::new("/bucket/").expect("path should parse");
+
+        let err = with_test_auth_override(
+            |action, _bucket, _object| !matches!(action, S3Action::DeleteObject),
+            driver.remove_dir(&path),
+        )
+        .await
+        .expect_err("bucket DELETE must fail closed when s3:DeleteObject is denied for a bucket member");
+
+        assert_eq!(err, FsError::Forbidden);
+
+        let state = storage.state.lock().expect("recording storage lock poisoned");
+        assert!(state.delete_keys.is_empty(), "no object may be deleted once the deny lands");
+        assert!(
+            state.deleted_buckets.is_empty(),
+            "the bucket must survive when its contents could not be authorized for deletion"
+        );
+        assert!(state.objects.contains_key(&("bucket".to_string(), "secret.txt".to_string())));
+    }
+
+    /// A directory DELETE authorizes the `dir/` marker key, but the children
+    /// stored under that prefix are separate resources and each needs its own
+    /// `s3:DeleteObject` boundary.
+    #[tokio::test]
+    async fn directory_delete_denied_for_child_leaves_child_intact() {
+        let (driver, storage) = recording_driver(&[("bucket", "dir/child.txt", b"child")], &[]);
+        let path = DavPath::new("/bucket/dir/").expect("path should parse");
+
+        let err = with_test_auth_override(
+            |action, _bucket, object| !matches!((action, object), (S3Action::DeleteObject, Some("dir/child.txt"))),
+            driver.remove_dir(&path),
+        )
+        .await
+        .expect_err("directory DELETE must fail closed when a child object denies s3:DeleteObject");
+
+        assert_eq!(err, FsError::Forbidden);
+
+        let state = storage.state.lock().expect("recording storage lock poisoned");
+        assert!(
+            state.delete_keys.is_empty(),
+            "the denied child must not be deleted, got {:?}",
+            state.delete_keys
+        );
+        assert!(
+            state
+                .objects
+                .contains_key(&("bucket".to_string(), "dir/child.txt".to_string()))
+        );
     }
 
     #[tokio::test]

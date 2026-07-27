@@ -83,6 +83,8 @@ pub struct ManualTransitionJobRecord {
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_objects: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration: Option<std::time::Duration>,
     pub owner_id: String,
     pub lease_id: Uuid,
     pub lease_expires_at_unix_nanos: i128,
@@ -113,6 +115,7 @@ impl ManualTransitionJobRecord {
             tier: options.tier.clone(),
             dry_run: options.dry_run,
             max_objects: options.max_objects,
+            max_duration: options.max_duration,
             owner_id: owner_id.into(),
             lease_id,
             lease_expires_at_unix_nanos: manual_transition_job_lease_expires_at(now),
@@ -272,6 +275,7 @@ impl ManualTransitionJobRecord {
             tier: self.tier.clone(),
             dry_run: self.dry_run,
             max_objects: self.max_objects,
+            max_duration: self.max_duration,
             ..Default::default()
         }
     }
@@ -1875,6 +1879,7 @@ mod tests {
             tier: Some("warm".to_string()),
             dry_run: true,
             max_objects: Some(3),
+            max_duration: Some(std::time::Duration::from_secs(5)),
             ..Default::default()
         };
         let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "bucket", &options, TEST_OWNER);
@@ -1887,6 +1892,7 @@ mod tests {
         assert_eq!(resume.tier.as_deref(), Some("warm"));
         assert!(resume.dry_run);
         assert_eq!(resume.max_objects, Some(3));
+        assert_eq!(resume.max_duration, Some(std::time::Duration::from_secs(5)));
         assert!(resume.cancel_token.is_none());
         assert!(resume.cancel_check.is_none());
         assert!(resume.progress_sink.is_none());
@@ -2073,6 +2079,230 @@ mod tests {
         assert_eq!(record.report.skipped_queue_full, 1);
         assert_eq!(record.queue_snapshot.queue_capacity, 1);
         assert_eq!(record.queue_snapshot.queue_full, 1);
+        assert!(record.error.is_none());
+    }
+
+    #[test]
+    fn manual_transition_job_record_queue_pressure_reports_persist_readback() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            max_objects: Some(10),
+            ..Default::default()
+        };
+
+        for (bucket, skipped_queue_full, skipped_queue_closed, skipped_queue_timeout, active_snapshot, terminal_snapshot) in [
+            (
+                "manual-queue-full-readback-bucket",
+                2,
+                0,
+                0,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    queued: 4,
+                    workers: 2,
+                    queue_full: 2,
+                    ..Default::default()
+                },
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    queue_full: 2,
+                    ..Default::default()
+                },
+            ),
+            (
+                "manual-queue-closed-readback-bucket",
+                0,
+                1,
+                0,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    ..Default::default()
+                },
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    ..Default::default()
+                },
+            ),
+            (
+                "manual-queue-timeout-readback-bucket",
+                0,
+                0,
+                1,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    active: 1,
+                    workers: 2,
+                    queue_send_timeout: 1,
+                    ..Default::default()
+                },
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 4,
+                    workers: 2,
+                    queue_send_timeout: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), bucket, &options, TEST_OWNER);
+            record.complete(
+                ManualTransitionRunReport {
+                    enqueued: 1,
+                    skipped_queue_full,
+                    skipped_queue_closed,
+                    skipped_queue_timeout,
+                    continuation_token: Some("opaque-queue-pressure-token".to_string()),
+                    ..Default::default()
+                },
+                active_snapshot,
+            );
+
+            assert_eq!(record.state, ManualTransitionJobState::Running);
+            assert!(record.report.has_partial_enqueue());
+            assert!(record.report.worker_transition_pending());
+            assert_eq!(record.queue_snapshot, active_snapshot);
+
+            let encoded = record.encode().expect("queue-pressure partial job should encode");
+            let decoded =
+                ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("running queue-pressure job should decode");
+            assert_eq!(decoded.state, ManualTransitionJobState::Running);
+            assert!(decoded.report.worker_transition_pending());
+            assert_eq!(decoded.report.skipped_queue_full, skipped_queue_full);
+            assert_eq!(decoded.report.skipped_queue_closed, skipped_queue_closed);
+            assert_eq!(decoded.report.skipped_queue_timeout, skipped_queue_timeout);
+            assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-queue-pressure-token"));
+            assert_eq!(decoded.queue_snapshot, active_snapshot);
+
+            record.record_worker_result(ManualTransitionWorkerResult::Completed, terminal_snapshot);
+
+            let encoded = record.encode().expect("terminal queue-pressure partial job should encode");
+            let decoded =
+                ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("terminal queue-pressure job should decode");
+            assert_eq!(decoded.state, ManualTransitionJobState::Partial);
+            assert!(decoded.is_terminal());
+            assert_eq!(decoded.report.enqueued, 1);
+            assert_eq!(decoded.report.transition_completed, 1);
+            assert_eq!(decoded.report.skipped_queue_full, skipped_queue_full);
+            assert_eq!(decoded.report.skipped_queue_closed, skipped_queue_closed);
+            assert_eq!(decoded.report.skipped_queue_timeout, skipped_queue_timeout);
+            assert!(decoded.report.has_partial_enqueue());
+            assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-queue-pressure-token"));
+            assert_eq!(decoded.queue_snapshot, terminal_snapshot);
+            assert!(decoded.completed_at_unix_nanos.is_some());
+            assert!(decoded.error.is_none());
+        }
+    }
+
+    #[test]
+    fn manual_transition_job_record_budget_reports_are_partial_and_resumable() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            max_objects: Some(1),
+            max_duration: Some(std::time::Duration::from_secs(10)),
+            ..Default::default()
+        };
+
+        for (bucket, truncated_by_limit, truncated_by_duration) in [
+            ("manual-budget-limit-bucket", true, false),
+            ("manual-budget-duration-bucket", false, true),
+        ] {
+            let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), bucket, &options, TEST_OWNER);
+            let queue_snapshot = ManualTransitionQueueSnapshot {
+                queue_capacity: 8,
+                queued: 1,
+                active: 1,
+                workers: 2,
+                ..Default::default()
+            };
+            record.complete(
+                ManualTransitionRunReport {
+                    bucket: bucket.to_string(),
+                    prefix: "logs/".to_string(),
+                    tier: Some("warm".to_string()),
+                    scanned: 1,
+                    eligible: 1,
+                    dry_run_eligible: 1,
+                    truncated_by_limit,
+                    truncated_by_duration,
+                    continuation_token: Some("opaque-budget-token".to_string()),
+                    ..Default::default()
+                },
+                queue_snapshot,
+            );
+
+            assert_eq!(record.state, ManualTransitionJobState::Partial);
+            assert_eq!(record.report.continuation_token.as_deref(), Some("opaque-budget-token"));
+            assert!(record.report.was_truncated());
+            assert_eq!(record.queue_snapshot, queue_snapshot);
+            assert!(record.completed_at_unix_nanos.is_some());
+            assert!(record.error.is_none());
+
+            let encoded = record.encode().expect("budget partial job should encode");
+            let decoded = ManualTransitionJobRecord::decode(record.job_id, &encoded).expect("budget partial job should decode");
+            assert_eq!(decoded.state, ManualTransitionJobState::Partial);
+            assert_eq!(decoded.max_duration, options.max_duration);
+            assert_eq!(decoded.report.truncated_by_limit, truncated_by_limit);
+            assert_eq!(decoded.report.truncated_by_duration, truncated_by_duration);
+            assert_eq!(decoded.report.continuation_token.as_deref(), Some("opaque-budget-token"));
+            assert_eq!(decoded.queue_snapshot, queue_snapshot);
+        }
+    }
+
+    #[test]
+    fn manual_transition_job_budget_report_waits_for_pending_workers() {
+        let options = ManualTransitionRunOptions {
+            prefix: "logs/".to_string(),
+            tier: Some("warm".to_string()),
+            max_objects: Some(1),
+            ..Default::default()
+        };
+        let mut record = ManualTransitionJobRecord::new(Uuid::new_v4(), "manual-budget-pending-bucket", &options, TEST_OWNER);
+        let active_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 4,
+            queued: 1,
+            active: 1,
+            workers: 2,
+            ..Default::default()
+        };
+
+        record.complete(
+            ManualTransitionRunReport {
+                bucket: "manual-budget-pending-bucket".to_string(),
+                prefix: "logs/".to_string(),
+                tier: Some("warm".to_string()),
+                scanned: 1,
+                eligible: 1,
+                enqueued: 1,
+                truncated_by_limit: true,
+                continuation_token: Some("opaque-budget-token".to_string()),
+                ..Default::default()
+            },
+            active_snapshot,
+        );
+
+        assert_eq!(record.state, ManualTransitionJobState::Running);
+        assert!(record.scan_completed);
+        assert!(record.completed_at_unix_nanos.is_none());
+        assert!(record.report.was_truncated());
+        assert!(record.report.worker_transition_pending());
+        assert_eq!(record.report.continuation_token.as_deref(), Some("opaque-budget-token"));
+        assert_eq!(record.queue_snapshot, active_snapshot);
+
+        let drained_snapshot = ManualTransitionQueueSnapshot {
+            queue_capacity: 4,
+            workers: 2,
+            ..Default::default()
+        };
+        record.record_worker_result(ManualTransitionWorkerResult::Completed, drained_snapshot);
+
+        assert_eq!(record.state, ManualTransitionJobState::Partial);
+        assert_eq!(record.report.transition_completed, 1);
+        assert_eq!(record.queue_snapshot, drained_snapshot);
+        assert!(record.completed_at_unix_nanos.is_some());
         assert!(record.error.is_none());
     }
 

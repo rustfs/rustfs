@@ -62,6 +62,7 @@ const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
     "rustfs_system_network_internode_operation_write_shutdown_errors_total";
 const INTERNODE_OPERATION_PAYLOAD_BYTES: &str = "rustfs_system_network_internode_operation_payload_bytes";
 const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_internode_operation_large_payloads_total";
+const INTERNODE_MSGPACK_JSON_DECODE_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_total";
 const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
 const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
@@ -175,6 +176,7 @@ pub struct InternodeMetrics {
     operation_http_versions_total: AtomicU64,
     operation_stall_timeouts_total: AtomicU64,
     operation_write_shutdown_errors_total: AtomicU64,
+    msgpack_json_decode_total: AtomicU64,
     msgpack_json_decode_error_total: AtomicU64,
     signature_v1_fallback_total: AtomicU64,
     body_digest_fallback_total: AtomicU64,
@@ -375,6 +377,17 @@ impl InternodeMetrics {
         counter!(INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL, DIRECTION_LABEL => direction, MESSAGE_LABEL => message).increment(1);
     }
 
+    pub fn record_msgpack_json_decode(&self, direction: &'static str, message: &'static str, codec: &'static str) {
+        self.msgpack_json_decode_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_MSGPACK_JSON_DECODE_TOTAL,
+            DIRECTION_LABEL => direction,
+            MESSAGE_LABEL => message,
+            CODEC_LABEL => codec
+        )
+        .increment(1);
+    }
+
     pub fn record_msgpack_json_decode_error(&self, direction: &'static str, message: &'static str, codec: &'static str) {
         self.msgpack_json_decode_error_total.fetch_add(1, Ordering::Relaxed);
         counter!(
@@ -389,6 +402,11 @@ impl InternodeMetrics {
     #[doc(hidden)]
     pub fn msgpack_json_decode_error_total_for_test(&self) -> u64 {
         self.msgpack_json_decode_error_total.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn msgpack_json_decode_total_for_test(&self) -> u64 {
+        self.msgpack_json_decode_total.load(Ordering::Relaxed)
     }
 
     /// Count an internode gRPC request that was accepted through the legacy constant-target
@@ -488,6 +506,7 @@ impl InternodeMetrics {
         self.operation_http_versions_total.store(0, Ordering::Relaxed);
         self.operation_stall_timeouts_total.store(0, Ordering::Relaxed);
         self.operation_write_shutdown_errors_total.store(0, Ordering::Relaxed);
+        self.msgpack_json_decode_total.store(0, Ordering::Relaxed);
         self.msgpack_json_decode_error_total.store(0, Ordering::Relaxed);
         self.signature_v1_fallback_total.store(0, Ordering::Relaxed);
         self.body_digest_fallback_total.store(0, Ordering::Relaxed);
@@ -791,6 +810,10 @@ mod tests {
         );
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
         assert_eq!(
+            INTERNODE_MSGPACK_JSON_DECODE_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_decode_total"
+        );
+        assert_eq!(
             INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
             "rustfs_system_network_internode_msgpack_json_fallback_total"
         );
@@ -814,6 +837,19 @@ mod tests {
         let metrics = InternodeMetrics::default();
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+    }
+
+    #[test]
+    fn msgpack_json_decode_counter_tracks_codec_direction_and_message() {
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.msgpack_json_decode_total_for_test(), 0);
+
+        metrics.record_msgpack_json_decode(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo", INTERNODE_MSGPACK_CODEC_MSGPACK);
+        metrics.record_msgpack_json_decode(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo", INTERNODE_MSGPACK_CODEC_JSON);
+
+        assert_eq!(metrics.msgpack_json_decode_total_for_test(), 2);
+        metrics.reset_for_test();
+        assert_eq!(metrics.msgpack_json_decode_total_for_test(), 0);
     }
 
     #[test]

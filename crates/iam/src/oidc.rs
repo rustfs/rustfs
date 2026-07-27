@@ -28,7 +28,7 @@ use openidconnect::{
 use reqwest::Client;
 use rustfs_config::oidc::*;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_OIDC_RESPONSE_SIZE};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_utils::egress::OutboundPolicy;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,8 @@ const EVENT_OIDC_HTTP: &str = "oidc_http";
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const OIDC_HTTP_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const OIDC_HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const OIDC_PLUGIN_AUTHN_WINDOW: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -254,6 +256,7 @@ fn oidc_http_error_diagnostics(error: &OidcHttpError) -> (&'static str, String) 
         OidcHttpError::Reqwest(_) => ("request", String::new()),
         OidcHttpError::Http(_) => ("http_build", String::new()),
         OidcHttpError::ForbiddenOutbound(_) => ("forbidden_outbound", String::new()),
+        OidcHttpError::ResponseTooLarge(limit) => ("response_too_large", limit.to_string()),
     }
 }
 
@@ -268,6 +271,9 @@ pub enum OidcHttpError {
     /// connection was attempted (invalid URL, loopback/link-local/metadata/private IP,
     /// or a malformed allow-origins configuration).
     ForbiddenOutbound(String),
+    /// The provider response body exceeded [`MAX_OIDC_RESPONSE_SIZE`] and was abandoned
+    /// instead of being buffered in full.
+    ResponseTooLarge(usize),
 }
 
 impl std::fmt::Display for OidcHttpError {
@@ -276,6 +282,7 @@ impl std::fmt::Display for OidcHttpError {
             Self::Reqwest(e) => write!(f, "{e}"),
             Self::Http(e) => write!(f, "{e}"),
             Self::ForbiddenOutbound(reason) => write!(f, "outbound request rejected: {reason}"),
+            Self::ResponseTooLarge(limit) => write!(f, "oidc response body exceeds {limit} bytes"),
         }
     }
 }
@@ -285,7 +292,7 @@ impl std::error::Error for OidcHttpError {
         match self {
             Self::Reqwest(e) => Some(e),
             Self::Http(e) => Some(e),
-            Self::ForbiddenOutbound(_) => None,
+            Self::ForbiddenOutbound(_) | Self::ResponseTooLarge(_) => None,
         }
     }
 }
@@ -309,7 +316,8 @@ pub(crate) struct ReqwestHttpClient {
 /// link-local, metadata, multicast and unauthorized private addresses up front, and the
 /// returned `OutboundDnsResolver` re-resolves and re-classifies the host on every new
 /// connection so DNS rebinding fails closed. Redirects are not followed: a redirect target
-/// would otherwise skip URL-shape re-validation.
+/// would otherwise skip URL-shape re-validation. The timeouts bound how long a slow or
+/// stalled provider can pin the calling task.
 fn build_oidc_http_client(uri: &str, policy_override: Option<&OutboundPolicy>) -> Result<Client, OidcHttpError> {
     let url = Url::parse(uri).map_err(|_| OidcHttpError::ForbiddenOutbound("invalid outbound OIDC URL".to_string()))?;
     let resolver = match policy_override {
@@ -322,11 +330,33 @@ fn build_oidc_http_client(uri: &str, policy_override: Option<&OutboundPolicy>) -
 
     let mut builder = reqwest::Client::builder()
         .dns_resolver(resolver)
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(OIDC_HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(OIDC_HTTP_CONNECT_TIMEOUT);
     if should_bypass_proxy_for_oidc_uri(uri) {
         builder = builder.no_proxy();
     }
     builder.build().map_err(OidcHttpError::Reqwest)
+}
+
+/// Buffer a provider response body, failing closed once `limit` bytes have been seen.
+///
+/// `Response::bytes` would buffer the whole body unconditionally, so a hostile or compromised
+/// provider endpoint could stream an arbitrarily large (or endless) body into memory.
+async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, OidcHttpError> {
+    if response.content_length().is_some_and(|len| len > limit as u64) {
+        return Err(OidcHttpError::ResponseTooLarge(limit));
+    }
+
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(OidcHttpError::Reqwest)? {
+        if body.len() + chunk.len() > limit {
+            return Err(OidcHttpError::ResponseTooLarge(limit));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
@@ -407,21 +437,23 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
             let status = response.status();
             let headers = response.headers().clone();
-            let body_bytes = response.bytes().await.map_err(|err| {
-                error!(
-                    event = EVENT_OIDC_HTTP,
-                    component = LOG_COMPONENT_IAM,
-                    subsystem = LOG_SUBSYSTEM_OIDC,
-                    result = "response_body_failed",
-                    method = %method,
-                    uri = %uri,
-                    status = status.as_u16(),
-                    elapsed_ms,
-                    error = %err,
-                    "oidc outbound http"
-                );
-                OidcHttpError::Reqwest(err)
-            })?;
+            let body_bytes = read_bounded_response_body(response, MAX_OIDC_RESPONSE_SIZE)
+                .await
+                .map_err(|err| {
+                    error!(
+                        event = EVENT_OIDC_HTTP,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "response_body_failed",
+                        method = %method,
+                        uri = %uri,
+                        status = status.as_u16(),
+                        elapsed_ms,
+                        error = %err,
+                        "oidc outbound http"
+                    );
+                    err
+                })?;
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let response_headers = format_http_headers(&headers);
                 debug!(
@@ -442,7 +474,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
 
             let mut http_response = http::Response::builder()
                 .status(status)
-                .body(body_bytes.to_vec())
+                .body(body_bytes)
                 .map_err(OidcHttpError::Http)?;
             *http_response.headers_mut() = headers;
 
@@ -2835,6 +2867,93 @@ mod tests {
             ),
             "metadata endpoint stays forbidden despite an unrelated allow-list entry"
         );
+    }
+
+    /// Serve exactly `body_len` bytes with no `Content-Length`, so the body ends only at EOF
+    /// and the size guard cannot rely on an advertised length.
+    fn start_unbounded_body_server(body_len: usize) -> Option<(String, std::thread::JoinHandle<()>)> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let base = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+
+            let chunk = vec![b'a'; 64 * 1024];
+            let mut written = 0usize;
+            while written < body_len {
+                let take = chunk.len().min(body_len - written);
+                if stream.write_all(&chunk[..take]).is_err() {
+                    break;
+                }
+                written += take;
+            }
+            let _ = stream.flush();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("mock body server should become ready");
+
+        Some((base, handle))
+    }
+
+    async fn fetch_oidc_mock_body(base: &str) -> Result<Vec<u8>, OidcHttpError> {
+        let policy = OutboundPolicy::from_allowed_origins(base).expect("origin should parse");
+        let client = ReqwestHttpClient::with_policy(policy);
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(base)
+            .body(Vec::new())
+            .expect("request should build");
+        client.call(request).await.map(http::Response::into_body)
+    }
+
+    #[tokio::test]
+    async fn oidc_response_body_at_the_limit_is_accepted() {
+        let Some((base, handle)) = start_unbounded_body_server(MAX_OIDC_RESPONSE_SIZE) else {
+            return;
+        };
+
+        let body = fetch_oidc_mock_body(&base)
+            .await
+            .expect("a body at the limit must be accepted");
+
+        assert_eq!(body.len(), MAX_OIDC_RESPONSE_SIZE);
+        handle.join().expect("mock body server thread should exit");
+    }
+
+    #[tokio::test]
+    async fn oidc_response_body_past_the_limit_is_rejected() {
+        let Some((base, handle)) = start_unbounded_body_server(MAX_OIDC_RESPONSE_SIZE + 1) else {
+            return;
+        };
+
+        let err = fetch_oidc_mock_body(&base)
+            .await
+            .map(|body| body.len())
+            .expect_err("an oversized provider response must fail closed instead of being buffered");
+
+        assert!(
+            matches!(err, OidcHttpError::ResponseTooLarge(MAX_OIDC_RESPONSE_SIZE)),
+            "unexpected error: {err}"
+        );
+        handle.join().expect("mock body server thread should exit");
     }
 
     /// Helper to create an OidcSys with configs only (no provider states needed).

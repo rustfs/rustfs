@@ -7575,13 +7575,27 @@ mod tests {
     }
 
     #[test]
-    fn manual_transition_job_record_closed_and_timeout_reports_are_partial() {
+    fn manual_transition_job_record_queue_pressure_reports_are_partial() {
         let options = ManualTransitionRunOptions::default();
 
-        for (bucket, outcome, skipped_queue_closed, skipped_queue_timeout, queue_snapshot) in [
+        for (bucket, outcome, skipped_queue_full, skipped_queue_closed, skipped_queue_timeout, queue_snapshot) in [
+            (
+                "manual-queue-full-bucket",
+                TransitionEnqueueOutcome::QueueFull,
+                1,
+                0,
+                0,
+                ManualTransitionQueueSnapshot {
+                    queue_capacity: 1,
+                    workers: 1,
+                    queue_full: 1,
+                    ..Default::default()
+                },
+            ),
             (
                 "manual-queue-closed-bucket",
                 TransitionEnqueueOutcome::QueueClosed,
+                0,
                 1,
                 0,
                 ManualTransitionQueueSnapshot {
@@ -7593,6 +7607,7 @@ mod tests {
             (
                 "manual-queue-timeout-bucket",
                 TransitionEnqueueOutcome::QueueSendTimedOut,
+                0,
                 0,
                 1,
                 ManualTransitionQueueSnapshot {
@@ -7612,9 +7627,10 @@ mod tests {
 
             assert_eq!(record.state, ManualTransitionJobState::Partial);
             assert_eq!(record.report.enqueued, 0);
-            assert_eq!(record.report.skipped_queue_full, 0);
+            assert_eq!(record.report.skipped_queue_full, skipped_queue_full);
             assert_eq!(record.report.skipped_queue_closed, skipped_queue_closed);
             assert_eq!(record.report.skipped_queue_timeout, skipped_queue_timeout);
+            assert_eq!(record.queue_snapshot.queue_full, queue_snapshot.queue_full);
             assert_eq!(record.queue_snapshot.queue_send_timeout, queue_snapshot.queue_send_timeout);
             assert!(record.completed_at_unix_nanos.is_some());
             assert!(record.error.is_none());
@@ -9344,8 +9360,27 @@ mod tests {
 
     static STALE_MULTIPART_TEST_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 
+    /// Re-register the cached environment's disks into its (shared bootstrap)
+    /// context registry. Other `#[serial]` tests reset or reshape that
+    /// registry (`reset_local_disk_test_state`, their own `init_local_disks`),
+    /// and the peer-sys bucket operations of this env resolve local disks
+    /// through it at call time — without this repair, a lifecycle test that
+    /// runs after such a test fails bucket creation on write quorum.
+    async fn reregister_env_local_disks(ecstore: &Arc<ECStore>) {
+        use crate::disk::DiskAPI as _;
+
+        let map = ecstore.ctx.local_disk_map();
+        let mut guard = map.write().await;
+        for disks in ecstore.disk_map.values() {
+            for disk in disks.iter().flatten() {
+                guard.insert(disk.endpoint().to_string(), Some(disk.clone()));
+            }
+        }
+    }
+
     async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         if let Some((paths, ecstore)) = STALE_MULTIPART_TEST_ENV.get() {
+            reregister_env_local_disks(ecstore).await;
             return (paths.clone(), ecstore.clone());
         }
 

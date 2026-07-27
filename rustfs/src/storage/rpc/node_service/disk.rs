@@ -43,27 +43,47 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(
 ) -> std::result::Result<T, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer).map_err(|err| {
-            global_internode_metrics().record_msgpack_json_decode_error(
-                INTERNODE_MSGPACK_DIRECTION_REQUEST,
-                value_name,
-                INTERNODE_MSGPACK_CODEC_MSGPACK,
-            );
-            DiskError::other(format!("decode {value_name} msgpack failed: {err}"))
-        });
+        return match T::deserialize(&mut deserializer) {
+            Ok(value) => {
+                global_internode_metrics().record_msgpack_json_decode(
+                    INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                    value_name,
+                    INTERNODE_MSGPACK_CODEC_MSGPACK,
+                );
+                Ok(value)
+            }
+            Err(err) => {
+                global_internode_metrics().record_msgpack_json_decode_error(
+                    INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                    value_name,
+                    INTERNODE_MSGPACK_CODEC_MSGPACK,
+                );
+                Err(DiskError::other(format!("decode {value_name} msgpack failed: {err}")))
+            }
+        };
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, value_name);
-    serde_json::from_str(json).map_err(|err| {
-        global_internode_metrics().record_msgpack_json_decode_error(
-            INTERNODE_MSGPACK_DIRECTION_REQUEST,
-            value_name,
-            INTERNODE_MSGPACK_CODEC_JSON,
-        );
-        DiskError::other(format!("decode {value_name} failed: {err}"))
-    })
+    match serde_json::from_str(json) {
+        Ok(value) => {
+            global_internode_metrics().record_msgpack_json_decode(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                value_name,
+                INTERNODE_MSGPACK_CODEC_JSON,
+            );
+            Ok(value)
+        }
+        Err(err) => {
+            global_internode_metrics().record_msgpack_json_decode_error(
+                INTERNODE_MSGPACK_DIRECTION_REQUEST,
+                value_name,
+                INTERNODE_MSGPACK_CODEC_JSON,
+            );
+            Err(DiskError::other(format!("decode {value_name} failed: {err}")))
+        }
+    }
 }
 
 fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
@@ -1298,15 +1318,20 @@ mod tests {
         };
 
         let binary = encode_msgpack(&payload, "SamplePayload").unwrap();
+        let before = global_internode_metrics().msgpack_json_decode_total_for_test();
         let decoded =
             decode_msgpack_or_json::<SamplePayload>(&binary, r#"{"name":"ignored","count":1}"#, "SamplePayload").unwrap();
+        let after = global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(decoded, payload);
+        assert!(after > before, "successful request msgpack decode should increment traffic metrics");
     }
 
     #[test]
     fn decode_msgpack_or_json_falls_back_to_json() {
+        let before = global_internode_metrics().msgpack_json_decode_total_for_test();
         let decoded = decode_msgpack_or_json::<SamplePayload>(&[], r#"{"name":"compat","count":7}"#, "SamplePayload").unwrap();
+        let after = global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(
             decoded,
@@ -1315,6 +1340,7 @@ mod tests {
                 count: 7,
             }
         );
+        assert!(after > before, "successful request JSON fallback decode should increment traffic metrics");
     }
 
     fn with_internode_msgpack_env<R>(vars: [(&'static str, Option<&'static str>); 2], f: impl FnOnce() -> R) -> R {

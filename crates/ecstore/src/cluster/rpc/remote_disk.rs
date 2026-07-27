@@ -1131,19 +1131,31 @@ fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
-        return T::deserialize(&mut deserializer).map_err(|err| {
-            crate::cluster::rpc::runtime_sources::record_response_msgpack_decode_error(value_name);
-            Error::from(err)
-        });
+        return match T::deserialize(&mut deserializer) {
+            Ok(value) => {
+                crate::cluster::rpc::runtime_sources::record_response_msgpack_decode(value_name);
+                Ok(value)
+            }
+            Err(err) => {
+                crate::cluster::rpc::runtime_sources::record_response_msgpack_decode_error(value_name);
+                Err(Error::from(err))
+            }
+        };
     }
 
     // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
     // must read zero across a release window before the redundant JSON fields can be dropped (P2).
     crate::cluster::rpc::runtime_sources::record_response_json_fallback(value_name);
-    serde_json::from_str(json).map_err(|err| {
-        crate::cluster::rpc::runtime_sources::record_response_json_decode_error(value_name);
-        Error::from(err)
-    })
+    match serde_json::from_str(json) {
+        Ok(value) => {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode(value_name);
+            Ok(value)
+        }
+        Err(err) => {
+            crate::cluster::rpc::runtime_sources::record_response_json_decode_error(value_name);
+            Err(Error::from(err))
+        }
+    }
 }
 
 /// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
@@ -1195,6 +1207,7 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
             crate::cluster::rpc::runtime_sources::record_response_json_decode_error("ReadMultipleResp");
             Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}"))
         })?;
+        crate::cluster::rpc::runtime_sources::record_response_json_decode("ReadMultipleResp");
         read_multiple_resps.push(resp);
     }
 
@@ -1245,6 +1258,7 @@ fn decode_batch_read_version_response_items(
             crate::cluster::rpc::runtime_sources::record_response_json_decode_error("BatchReadVersionResp");
             Error::other(format!("decode BatchReadVersionResp json item {index} from {endpoint} failed: {err}"))
         })?;
+        crate::cluster::rpc::runtime_sources::record_response_json_decode("BatchReadVersionResp");
         if resp.success {
             validate_decoded_file_info(&resp.file_info)?;
         }
@@ -1443,7 +1457,7 @@ impl DiskAPI for RemoteDisk {
 
                 Ok(infos)
             },
-            Duration::ZERO,
+            get_max_timeout_duration(),
         )
         .await
     }
@@ -1522,7 +1536,7 @@ impl DiskAPI for RemoteDisk {
 
                 Ok(())
             },
-            Duration::ZERO,
+            get_max_timeout_duration(),
         )
         .await
     }
@@ -3120,12 +3134,15 @@ mod tests {
             read_multiple_resps_bin: vec![encode_msgpack(&msgpack_resp).expect("msgpack response should encode").into()],
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         let decoded = decode_read_multiple_response_items(response, &endpoint).expect("msgpack response should decode");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].file, "msgpack");
         assert_eq!(decoded[0].data, b"binary");
+        assert!(after > before, "successful response msgpack decode should increment traffic metrics");
     }
 
     #[test]
@@ -3138,12 +3155,15 @@ mod tests {
             read_multiple_resps_bin: Vec::new(),
             error: None,
         };
+        let before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         let decoded = decode_read_multiple_response_items(response, &endpoint).expect("json response should decode");
+        let after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].file, "json");
         assert_eq!(decoded[0].data, b"fallback");
+        assert!(after > before, "successful response JSON decode should increment traffic metrics");
     }
 
     #[test]
@@ -5209,5 +5229,90 @@ mod tests {
                         && span.get("request_id").and_then(Value::as_str) == Some("req-remote-disk-e2e")
                 })
         );
+    }
+
+    /// Peer that completes the TCP connect and then goes silent, so every RPC issued over the
+    /// cached lazy channel stays pending until the caller's own deadline fires.
+    async fn spawn_stalled_grpc_peer() -> Option<(String, tokio::task::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let accept_task = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let base_addr = format!("http://{}:{}", addr.ip(), addr.port());
+        let channel = TonicEndpoint::from_shared(base_addr.clone())
+            .expect("stalled peer endpoint should parse")
+            .connect_lazy();
+        runtime_sources::cache_test_node_channel(base_addr.clone(), channel).await;
+        Some((base_addr, accept_task))
+    }
+
+    async fn remote_disk_for_addr(base_addr: &str) -> RemoteDisk {
+        let url = url::Url::parse(&format!("{base_addr}/data/rustfs0")).expect("endpoint url should parse");
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should construct")
+    }
+
+    #[tokio::test]
+    async fn list_volumes_bounds_the_wait_on_a_stalled_peer() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some((base_addr, accept_task)) = spawn_stalled_grpc_peer().await else {
+            return;
+        };
+        let remote_disk = remote_disk_for_addr(&base_addr).await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+            let err = tokio::time::timeout(Duration::from_secs(10), remote_disk.list_volumes())
+                .await
+                .expect("list_volumes must bound the wait on a stalled peer")
+                .expect_err("a stalled peer must fail list_volumes");
+            assert!(matches!(err, DiskError::Timeout), "expected the operation deadline to fire, got {err:?}");
+        })
+        .await;
+
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_volume_bounds_the_wait_on_a_stalled_peer() {
+        runtime_sources::ensure_test_rpc_secret();
+        let Some((base_addr, accept_task)) = spawn_stalled_grpc_peer().await else {
+            return;
+        };
+        let remote_disk = remote_disk_for_addr(&base_addr).await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+            let err = tokio::time::timeout(Duration::from_secs(10), remote_disk.delete_volume("bucket", false))
+                .await
+                .expect("delete_volume must bound the wait on a stalled peer")
+                .expect_err("a stalled peer must fail delete_volume");
+            assert!(matches!(err, DiskError::Timeout), "expected the operation deadline to fire, got {err:?}");
+        })
+        .await;
+
+        accept_task.abort();
     }
 }

@@ -127,6 +127,22 @@ pub(crate) fn record_response_json_fallback(message: &'static str) {
     global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, message);
 }
 
+pub(crate) fn record_response_msgpack_decode(message: &'static str) {
+    global_internode_metrics().record_msgpack_json_decode(
+        INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+        message,
+        INTERNODE_MSGPACK_CODEC_MSGPACK,
+    );
+}
+
+pub(crate) fn record_response_json_decode(message: &'static str) {
+    global_internode_metrics().record_msgpack_json_decode(
+        INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+        message,
+        INTERNODE_MSGPACK_CODEC_JSON,
+    );
+}
+
 pub(crate) fn record_response_msgpack_decode_error(message: &'static str) {
     global_internode_metrics().record_msgpack_json_decode_error(
         INTERNODE_MSGPACK_DIRECTION_RESPONSE,

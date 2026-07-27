@@ -195,6 +195,65 @@ if [[ $partial_empty_status -eq 0 ]]; then
   exit 1
 fi
 
+# The Vault KMS token is a credential: it must be rendered into a Secret and must never
+# reach the config ConfigMap, which is readable by anyone allowed to get ConfigMaps.
+kms_token="CS_TEST_SECRET_DO_NOT_LOG"
+kms_values=(
+  --set config.rustfs.kms.enabled=true
+  --set config.rustfs.kms.type=vault
+  --set config.rustfs.kms.vault.vault_backend=vault-kv2
+  --set config.rustfs.kms.vault.vault_address=http://vault.rustfs.svc:8200
+  --set "config.rustfs.kms.vault.vault_token=$kms_token"
+  --set config.rustfs.kms.vault.default_key=test-key
+)
+
+kms_configmap=$(render_distributed_configmap "${kms_values[@]}")
+if grep -q 'RUSTFS_KMS_VAULT_TOKEN' <<<"$kms_configmap"; then
+  echo "The Vault KMS token must not be rendered into the ConfigMap" >&2
+  exit 1
+fi
+if ! grep -q 'RUSTFS_KMS_VAULT_ADDRESS' <<<"$kms_configmap"; then
+  echo "Non-secret KMS settings must stay in the ConfigMap" >&2
+  exit 1
+fi
+
+kms_full=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  "${kms_values[@]}")
+if grep -q "$kms_token" <<<"$kms_full"; then
+  echo "The Vault KMS token must never appear in plaintext in any rendered manifest" >&2
+  exit 1
+fi
+expected_kms_token_b64=$(printf '%s' "$kms_token" | base64)
+if ! grep -q "RUSTFS_KMS_VAULT_TOKEN: \"$expected_kms_token_b64\"" <<<"$kms_full"; then
+  echo "The Vault KMS token must be rendered into a Secret" >&2
+  exit 1
+fi
+
+kms_statefulset=$(render_distributed_statefulset "${kms_values[@]}")
+if ! grep -q 'name: rustfs-kms-secret' <<<"$kms_statefulset"; then
+  echo "The distributed StatefulSet must consume the KMS Secret via envFrom" >&2
+  exit 1
+fi
+
+kms_deployment=$(render_standalone_deployment "${kms_values[@]}")
+if ! grep -q 'name: rustfs-kms-secret' <<<"$kms_deployment"; then
+  echo "The standalone Deployment must consume the KMS Secret via envFrom" >&2
+  exit 1
+fi
+
+# Without a configured token no KMS Secret is rendered and nothing references it.
+no_kms_output=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key)
+if grep -q 'kms-secret' <<<"$no_kms_output"; then
+  echo "No KMS Secret must be rendered when no Vault token is configured" >&2
+  exit 1
+fi
+
 command -v yq >/dev/null 2>&1 || { echo "yq is required for extra-volumes structural tests" >&2; exit 1; }
 
 # Structural helpers: verify wiring at the right YAML paths, not just string presence.
