@@ -172,7 +172,11 @@ Notes:
 - For ARN `arn:rustfs:sqs::primary:webhook`, use instance-scoped env vars with `_PRIMARY`.
 - If queue dir is omitted, default is `/opt/rustfs/events`; ensure it is writable by the container runtime user.
 - `RUSTFS_NOTIFY_WEBHOOK_SKIP_TLS_VERIFY_PRIMARY` defaults to `false`; enabling it skips webhook TLS certificate verification, allows MITM attacks, and emits a startup warning. Prefer `RUSTFS_NOTIFY_WEBHOOK_CLIENT_CA_PRIMARY` for private CAs.
-- Since `1.0.0-beta.11`, webhook endpoints on private or container networks (Docker Compose service names, `host.docker.internal`, RFC 1918 addresses) are blocked unless their exact `scheme://host:port` origin is listed in `RUSTFS_OUTBOUND_ALLOW_ORIGINS` (comma-separated; the origin only, without the path). See [Outbound Connection Policy](docs/operations/outbound-connection-policy.md).
+- Since `1.0.0-beta.11`, webhook endpoints on private or container networks
+  (`Docker Compose service names`, `host.docker.internal`, RFC 1918 addresses) are
+  blocked unless their exact `scheme://host:port` origin is listed in
+  `RUSTFS_OUTBOUND_ALLOW_ORIGINS` (the origin only, without the path). See
+  [Outbound Connection Policy](docs/operations/outbound-connection-policy.md).
 
 **NOTE**: We recommend reviewing the `docker-compose.yml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
 
