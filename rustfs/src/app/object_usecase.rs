@@ -501,7 +501,7 @@ fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
 /// Map a bucket-quota checker outcome onto the S3 admission result.
 ///
 /// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
-fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<()> {
+pub(super) fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<QuotaCheckResult> {
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -513,13 +513,17 @@ fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, Quota
         )),
         Err(e) => {
             counter!("rustfs_bucket_quota_check_failed_total").increment(1);
-            warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check failed closed");
+            if matches!(&e, QuotaError::UsageUnavailable { .. }) {
+                debug!(bucket, error = %e, state = "usage_pending", "Bucket quota check waiting for authoritative usage");
+            } else {
+                warn!(bucket, error = %e, state = "checker_failed", "Bucket quota check failed closed");
+            }
             Err(S3Error::with_message(
                 S3ErrorCode::ServiceUnavailable,
                 "Bucket quota check temporarily unavailable, please retry".to_string(),
             ))
         }
-        _ => Ok(()),
+        Ok(result) => Ok(result),
     }
 }
 
@@ -3253,7 +3257,7 @@ impl DefaultObjectUsecase {
             return Ok(());
         };
         let quota_checker = QuotaChecker::new(metadata_sys);
-        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await)
+        map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(|_| ())
     }
 
     fn build_memory_bytes_blob(
@@ -7895,25 +7899,9 @@ impl DefaultObjectUsecase {
         let extract_limits = put_object_extract_limits();
         let extract_quota_snapshot = if let Some(metadata_sys) = self.bucket_metadata_sys() {
             let quota_checker = QuotaChecker::new(metadata_sys);
-            match quota_checker.get_quota_config(&bucket).await {
-                Ok(quota) => {
-                    if let Some(limit) = quota.quota {
-                        match quota_checker.get_real_time_usage(&bucket).await {
-                            Ok(current_usage) => Some((current_usage, limit)),
-                            Err(err) => {
-                                warn!(bucket, error = %err, state = "extract_usage_snapshot_failed", "Bucket quota snapshot degraded to allow");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                }
-                Err(err) => {
-                    warn!(bucket, error = %err, state = "extract_quota_snapshot_failed", "Bucket quota snapshot degraded to allow");
-                    None
-                }
-            }
+            let check_result =
+                map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
+            check_result.current_usage.zip(check_result.quota_limit)
         } else {
             None
         };
@@ -8103,8 +8091,11 @@ impl DefaultObjectUsecase {
             let cache_adapter = self.object_data_cache();
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
 
-            let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
-                Ok(info) => info,
+            let (obj_info, backfilled_old_current_size) = match store
+                .put_object_with_old_current_size(&bucket, &fpath, &mut reader, &opts)
+                .await
+            {
+                Ok(result) => result,
                 Err(e) => {
                     if extract_options.ignore_errors {
                         warn!(error = %e, "Archive object write skipped due to ignore-errors");
@@ -8113,6 +8104,21 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+            let extract_versioned = BucketVersioningSys::prefix_enabled(&bucket, &fpath).await;
+            match previous_current_size_from_backfill(backfilled_old_current_size) {
+                Some(previous_current_size) => {
+                    if extract_versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
+                            .await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                    }
+                }
+                None => {
+                    record_bucket_object_write_unknown_previous_memory(&bucket, obj_info.size.max(0) as u64, extract_versioned)
+                        .await;
+                }
+            }
             let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
             if !wrote_any_entry {
                 rustfs_scanner::record_dirty_usage_bucket(&bucket);
@@ -13976,7 +13982,12 @@ mod tests {
 
     #[test]
     fn quota_admission_allows_within_limit() {
-        map_quota_check_outcome("bucket", Ok(quota_result(true))).expect("an allowed result admits the write");
+        let result = map_quota_check_outcome("bucket", Ok(quota_result(true))).expect("an allowed result admits the write");
+
+        assert_eq!(result.current_usage, Some(1024));
+        assert_eq!(result.quota_limit, Some(2048));
+        assert_eq!(result.operation_size, 512);
+        assert_eq!(result.remaining, Some(512));
     }
 
     #[test]
@@ -13995,6 +14006,18 @@ mod tests {
             }),
         )
         .expect_err("a checker fault must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    #[test]
+    fn quota_admission_fails_closed_on_unknown_authoritative_usage() {
+        let err = map_quota_check_outcome(
+            "bucket",
+            Err(QuotaError::UsageUnavailable {
+                bucket: "bucket".to_string(),
+            }),
+        )
+        .expect_err("unknown authoritative usage must not admit a quota-controlled write");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
     }
 }

@@ -1259,7 +1259,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn bucket_delete_finishes_usage_cleanup_before_same_name_recreation() {
+    async fn bucket_recreation_does_not_publish_unverified_usage() {
         let (_, ecstore) = setup_bucket_delete_test_env().await;
         let bucket = format!("bucket-usage-generation-{}", Uuid::new_v4().simple());
         ecstore
@@ -1307,13 +1307,11 @@ mod tests {
             .await
             .expect("recreated bucket usage base should load");
         crate::data_usage::apply_bucket_usage_memory_overlay(&mut recreated).await;
-        assert_eq!(
-            recreated
-                .buckets_usage
-                .get(&bucket)
-                .map(|usage| (usage.objects_count, usage.versions_count, usage.size)),
-            Some((1, 1, 84))
+        assert!(
+            !recreated.buckets_usage.contains_key(&bucket),
+            "a request-path delta without an authoritative baseline must remain unavailable"
         );
+        assert_eq!(crate::data_usage::get_bucket_usage_memory(&bucket).await, None);
     }
 
     #[tokio::test]
