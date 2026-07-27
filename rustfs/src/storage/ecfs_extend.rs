@@ -843,11 +843,21 @@ pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECS
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
+    validate_bucket_exists(&store, bucket).await?;
+
+    Ok(store)
+}
+
+/// Validate that `bucket` exists on `store`, using the same adaptive 5s-TTL
+/// positive cache as [`get_validated_store`]. Handlers that resolve their
+/// store through the request-bound server context (backlog#1052 S6) use this
+/// to keep bucket validation on that store instead of the process-global one.
+pub(crate) async fn validate_bucket_exists(store: &super::ECStore, bucket: &str) -> S3Result<()> {
     // Check cache — TTL is checked manually.
     if let Some(inserted_at) = cache_get(bucket)
         && inserted_at.elapsed() < BUCKET_VALIDATION_TTL
     {
-        return Ok(store); // Cache hit, skip validation
+        return Ok(()); // Cache hit, skip validation
     }
 
     // Cache miss or expired, perform validation
@@ -859,7 +869,7 @@ pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECS
     // Update cache
     cache_insert(bucket.to_string(), Instant::now());
 
-    Ok(store)
+    Ok(())
 }
 
 /// Quick check if CORS processing is needed (lightweight check for Origin header)
