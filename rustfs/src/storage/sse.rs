@@ -1885,6 +1885,10 @@ struct KmsSseDekProvider {
     service_manager: Option<Arc<rustfs_kms::KmsServiceManager>>,
 }
 
+fn kms_operation_error(error: rustfs_kms::KmsError) -> ApiError {
+    ApiError::from(StorageError::other(error))
+}
+
 impl KmsSseDekProvider {
     /// Create a new KMS-backed provider
     pub async fn new() -> Result<Self, ApiError> {
@@ -1936,7 +1940,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let (data_key, encrypted_data_key) = service
             .create_data_key(&kms_key_option, context)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to create data key: {}", e))))?;
+            .map_err(kms_operation_error)?;
 
         Ok((data_key, encrypted_data_key))
     }
@@ -1954,7 +1958,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_data_key(encrypted_dek, context)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
+            .map_err(kms_operation_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -1973,7 +1977,7 @@ impl SseDekProvider for KmsSseDekProvider {
         let data_key = service
             .decrypt_legacy_data_key(encrypted_dek)
             .await
-            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt legacy data key: {e}"))))?;
+            .map_err(kms_operation_error)?;
 
         Ok(data_key.plaintext_key)
     }
@@ -2596,10 +2600,10 @@ mod tests {
         SseDekProvider, SsecParams, StorageError, TestSseDekProvider, apply_managed_decryption_material,
         apply_managed_encryption_material, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
         extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
-        map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata, reset_sse_dek_provider,
-        resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
-        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params,
-        verify_ssec_key_match,
+        kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata,
+        reset_sse_dek_provider, resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption,
+        strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+        validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -2620,6 +2624,15 @@ mod tests {
         // All-zero 32-byte key is rejected.
         let zero = BASE64_STANDARD.encode([0u8; 32]);
         assert!(super::parse_simple_sse_cmk(&zero).is_err());
+    }
+
+    #[test]
+    fn kms_operation_errors_preserve_retryability_classification() {
+        let unavailable = kms_operation_error(rustfs_kms::KmsError::backend_error("connection refused"));
+        let corrupt = kms_operation_error(rustfs_kms::KmsError::cryptographic_error("decrypt", "authentication failed"));
+
+        assert_eq!(unavailable.code, S3ErrorCode::ServiceUnavailable);
+        assert_eq!(corrupt.code, S3ErrorCode::InternalError);
     }
 
     #[test]

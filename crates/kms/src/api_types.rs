@@ -161,6 +161,14 @@ pub struct ConfigureStaticKmsRequest {
     pub allow_insecure_dev_defaults: Option<bool>,
 }
 
+impl Drop for ConfigureStaticKmsRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+
+        self.secret_key.zeroize();
+    }
+}
+
 impl fmt::Debug for ConfigureStaticKmsRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConfigureStaticKmsRequest")
