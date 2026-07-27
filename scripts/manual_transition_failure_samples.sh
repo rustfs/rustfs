@@ -20,6 +20,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 ENDPOINT=""
 ADMIN_TOKEN=""
+ACCESS_KEY=""
+SECRET_KEY=""
+AWS_SIGV4_SCOPE="aws:amz:us-east-1:s3"
 OUT_DIR=""
 LOG_GLOB="/var/log/rustfs/*.log"
 METRIC_TYPES="1"
@@ -45,6 +48,9 @@ Required for real runs:
 
 Optional:
   --admin-token           Bearer token for /admin/v3 endpoints
+  --access-key            Access key for SigV4-signed admin/metrics calls
+  --secret-key            Secret key for SigV4-signed admin/metrics calls
+  --aws-sigv4-scope       curl --aws-sigv4 scope, default aws:amz:us-east-1:s3
   --log-glob              Log glob to scan, default /var/log/rustfs/*.log
   --metric-types          /admin/v3/metrics type flags, default 1
   --metric-samples        /admin/v3/metrics sample count, default 1
@@ -64,7 +70,8 @@ Output:
 Typical #1509 evidence target:
   scripts/manual_transition_failure_samples.sh \
     --endpoint https://127.0.0.1:9000 \
-    --admin-token "$TOKEN" \
+    --access-key "$ACCESS_KEY" \
+    --secret-key "$SECRET_KEY" \
     --sample auth:<JOB_ID_AUTH>:RemoteAuth \
     --sample network:<JOB_ID_NETWORK>:RemoteNetwork \
     --min-distinct-reasons 2 \
@@ -92,7 +99,7 @@ require_cmd() {
 
 normalize_uuid() {
   local raw="${1//-/}"
-  printf '%s' "${raw,,}"
+  printf '%s' "$raw" | tr '[:upper:]' '[:lower:]'
 }
 
 validate_uuid() {
@@ -117,6 +124,9 @@ parse_args() {
     case "$1" in
       --endpoint) ENDPOINT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --admin-token) ADMIN_TOKEN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --access-key) ACCESS_KEY="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --secret-key) SECRET_KEY="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --aws-sigv4-scope) AWS_SIGV4_SCOPE="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --sample) SAMPLES+=("$(arg_value "$1" "${2:-}")"); shift 2 ;;
       --log-glob) LOG_GLOB="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --metric-types) METRIC_TYPES="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -155,6 +165,14 @@ validate_args() {
   fi
   if [[ -z "$OUT_DIR" ]]; then
     OUT_DIR="${PROJECT_ROOT}/target/manual-transition-failure-samples/$(date +%Y%m%dT%H%M%S)"
+  fi
+  if [[ -n "$ADMIN_TOKEN" && ( -n "$ACCESS_KEY" || -n "$SECRET_KEY" ) ]]; then
+    echo "ERROR: --admin-token cannot be combined with --access-key/--secret-key" >&2
+    exit 1
+  fi
+  if [[ -n "$ACCESS_KEY" && -z "$SECRET_KEY" || -z "$ACCESS_KEY" && -n "$SECRET_KEY" ]]; then
+    echo "ERROR: --access-key and --secret-key must be provided together" >&2
+    exit 1
   fi
 }
 
@@ -201,6 +219,8 @@ curl_json() {
   local args=(-fsS)
   if [[ -n "$ADMIN_TOKEN" ]]; then
     args+=(-H "Authorization: Bearer ${ADMIN_TOKEN}")
+  elif [[ -n "$ACCESS_KEY" ]]; then
+    args+=(--aws-sigv4 "$AWS_SIGV4_SCOPE" --user "${ACCESS_KEY}:${SECRET_KEY}")
   fi
   curl "${args[@]}" "$url" > "$out_file"
 }
@@ -233,7 +253,8 @@ Replace the placeholders and run:
 ```bash
 scripts/manual_transition_failure_samples.sh \
   --endpoint <admin-api> \
-  --admin-token "$TOKEN" \
+  --access-key "$ACCESS_KEY" \
+  --secret-key "$SECRET_KEY" \
   --sample auth:<JOB_ID_AUTH>:<expected_reason_key> \
   --sample network:<JOB_ID_NETWORK>:<expected_reason_key> \
   --sample timeout:<JOB_ID_TIMEOUT>:<expected_reason_key> \
@@ -249,7 +270,7 @@ scripts/manual_transition_failure_samples.sh \
 - terminal partial/failed counts agree with `tier_failure_by_reason`
 PLAN
   cat >"${OUT_DIR}/commands.txt" <<COMMANDS
-scripts/manual_transition_failure_samples.sh --endpoint ${ENDPOINT} --sample auth:<JOB_ID_AUTH>:<expected_reason_key> --sample network:<JOB_ID_NETWORK>:<expected_reason_key> --min-distinct-reasons ${MIN_DISTINCT_REASONS} --out-dir ${OUT_DIR}
+scripts/manual_transition_failure_samples.sh --endpoint ${ENDPOINT} --access-key <ACCESS_KEY> --secret-key <SECRET_KEY> --sample auth:<JOB_ID_AUTH>:<expected_reason_key> --sample network:<JOB_ID_NETWORK>:<expected_reason_key> --min-distinct-reasons ${MIN_DISTINCT_REASONS} --out-dir ${OUT_DIR}
 COMMANDS
   echo "[DRY-RUN] generated ${OUT_DIR}/sample_plan.md"
   echo "[DRY-RUN] generated ${OUT_DIR}/commands.txt"
@@ -272,7 +293,7 @@ collect_logs() {
     log_paths=("$LOG_GLOB")
   fi
 
-  if ! rg --no-filename --color=never -- "${job_id}|lifecycle_tier_operation_failed|lifecycle_worker_state" -- "${log_paths[@]}" >"$raw_file" 2>"$err_file"; then
+  if ! rg --no-filename --color=never -- "${job_id}|lifecycle_tier_operation_failed|lifecycle_worker_state" "${log_paths[@]}" >"$raw_file" 2>"$err_file"; then
     :
   fi
 
@@ -312,6 +333,7 @@ write_command_notes() {
   cat >"${OUT_DIR}/commands.txt" <<COMMANDS
 # Re-run this evidence capture
 scripts/manual_transition_failure_samples.sh --endpoint ${ENDPOINT} --min-distinct-reasons ${MIN_DISTINCT_REASONS} --out-dir ${OUT_DIR} \\
+$(if [[ -n "$ADMIN_TOKEN" ]]; then printf '  --admin-token <ADMIN_TOKEN> \\\n'; elif [[ -n "$ACCESS_KEY" ]]; then printf '  --access-key <ACCESS_KEY> --secret-key <SECRET_KEY> \\\n'; fi)
 $(printf '  --sample %q \\\n' "${SAMPLES[@]}")
 
 # Per-job deep dive
@@ -398,6 +420,7 @@ main() {
   require_cmd jq
   require_cmd rg
   require_cmd awk
+  require_cmd tr
   mkdir -p "$OUT_DIR"
 
   local summary_csv="${OUT_DIR}/failure_attribution_summary.csv"

@@ -137,8 +137,28 @@ if ! rg -q "ERROR: --min-distinct-reasons must be a positive integer" /tmp/manua
   exit 1
 fi
 
+if bash "$FAILURE_SAMPLES" --endpoint http://127.0.0.1:9000 --access-key hotadmin --dry-run >/tmp/manual_transition_failure_samples.err 2>&1; then
+  echo "failure samples script should fail when SigV4 credentials are incomplete" >&2
+  exit 1
+fi
+if ! rg -q "ERROR: --access-key and --secret-key must be provided together" /tmp/manual_transition_failure_samples.err; then
+  echo "failure samples script missing incomplete SigV4 credential guard output" >&2
+  exit 1
+fi
+
+if bash "$FAILURE_SAMPLES" --endpoint http://127.0.0.1:9000 --admin-token token --access-key hotadmin --secret-key hotsecret --dry-run >/tmp/manual_transition_failure_samples.err 2>&1; then
+  echo "failure samples script should reject mixed bearer and SigV4 credentials" >&2
+  exit 1
+fi
+if ! rg -q "ERROR: --admin-token cannot be combined with --access-key/--secret-key" /tmp/manual_transition_failure_samples.err; then
+  echo "failure samples script missing mixed credential guard output" >&2
+  exit 1
+fi
+
 "$FAILURE_SAMPLES" \
   --endpoint http://127.0.0.1:9000 \
+  --access-key hotadmin \
+  --secret-key hotsecret \
   --sample auth:11111111-1111-4111-8111-111111111111:RemoteAuth \
   --sample network:22222222-2222-4222-8222-222222222222:RemoteNetwork \
   --out-dir "$TMP_DIR/failure-samples" \
@@ -146,4 +166,5 @@ fi
 
 rg -q "Manual transition failure attribution sample plan" "$TMP_DIR/failure-samples/sample_plan.md"
 rg -q "auth:<JOB_ID_AUTH>:<expected_reason_key>" "$TMP_DIR/failure-samples/sample_plan.md"
+rg -q -- "--access-key <ACCESS_KEY> --secret-key <SECRET_KEY>" "$TMP_DIR/failure-samples/commands.txt"
 rg -q -- "--min-distinct-reasons 2" "$TMP_DIR/failure-samples/commands.txt"
