@@ -90,6 +90,7 @@ pub mod protocols;
 pub mod runtime_capabilities;
 pub(crate) mod runtime_sources;
 pub mod server;
+pub(crate) mod site_replication_reconcile;
 pub(crate) mod startup_audit;
 pub(crate) mod startup_auth;
 pub(crate) mod startup_background;

@@ -807,15 +807,29 @@ impl BucketTargetSys {
             && !new_targets.is_empty()
         {
             for target in &new_targets.targets {
-                if let Ok(client) = self.get_remote_target_client_internal(target).await {
-                    arn_remotes_map.insert(
-                        target.arn.clone(),
-                        ArnTarget {
-                            client: Some(Arc::new(client)),
-                            last_refresh: OffsetDateTime::now_utc(),
-                        },
-                    );
-                    self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
+                match self.get_remote_target_client_internal(target).await {
+                    Ok(client) => {
+                        arn_remotes_map.insert(
+                            target.arn.clone(),
+                            ArnTarget {
+                                client: Some(Arc::new(client)),
+                                last_refresh: OffsetDateTime::now_utc(),
+                            },
+                        );
+                        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
+                    }
+                    // The target stays in `targets_map`, so it keeps showing up in
+                    // `bucket remote ls` while no client exists to replicate through it —
+                    // replication then drops every object for this ARN. Without this the
+                    // rejection (loopback endpoint, bad CA, unparseable URL) left no trace
+                    // anywhere.
+                    Err(err) => warn!(
+                        bucket = %bucket,
+                        arn = %target.arn,
+                        endpoint = %target.endpoint,
+                        error = %err,
+                        "replication target client unavailable; objects for this ARN will not replicate"
+                    ),
                 }
             }
             targets_map.insert(bucket.to_string(), new_targets.targets.clone());
