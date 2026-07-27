@@ -19,6 +19,7 @@ use super::storage_api::admin_usecase::capacity::{
     PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
+use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
 use super::storage_api::admin_usecase::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend_cached};
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
@@ -33,6 +34,7 @@ use crate::server::{DependencyReadiness, collect_dependency_readiness_report as 
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -212,6 +214,16 @@ impl DefaultAdminUsecase {
         result.map_err(|_| Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed"))
     }
 
+    fn data_usage_snapshot_covers_namespace(info: &DataUsageInfo, buckets: impl IntoIterator<Item = String>) -> bool {
+        if !info.is_complete_bucket_usage_snapshot() {
+            return false;
+        }
+
+        let current_buckets: HashSet<String> = buckets.into_iter().filter(|bucket| !bucket.starts_with('.')).collect();
+        current_buckets.len() == info.buckets_usage.len()
+            && current_buckets.iter().all(|bucket| info.buckets_usage.contains_key(bucket))
+    }
+
     async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
         store.refresh_rebalance_status_meta().await.map_err(|err| {
             error!("refresh rebalance metadata for pool status failed: {:?}", err);
@@ -255,6 +267,20 @@ impl DefaultAdminUsecase {
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
         let mut info = Self::map_data_usage_load_result(load_data_usage_from_backend_cached(store.clone()).await)?;
         apply_bucket_usage_memory_overlay(&mut info).await;
+        let buckets = store
+            .list_bucket(&BucketOptions {
+                cached: true,
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
+        if !Self::data_usage_snapshot_covers_namespace(&info, buckets.into_iter().map(|bucket| bucket.name)) {
+            return Err(Self::app_error(
+                S3ErrorCode::ServiceUnavailable,
+                "authoritative data usage snapshot is not available yet",
+            ));
+        }
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
@@ -643,6 +669,32 @@ mod tests {
             assert_eq!(err.code, S3ErrorCode::InternalError);
             assert_eq!(err.message, "load_data_usage_from_backend failed");
         });
+    }
+
+    #[test]
+    fn data_usage_snapshot_must_cover_the_current_bucket_namespace() {
+        let mut info = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            buckets_count: 1,
+            ..Default::default()
+        };
+        info.buckets_usage.insert("bucket-a".to_string(), Default::default());
+
+        assert!(DefaultAdminUsecase::data_usage_snapshot_covers_namespace(
+            &info,
+            ["bucket-a".to_string(), ".rustfs.sys".to_string()]
+        ));
+        assert!(!DefaultAdminUsecase::data_usage_snapshot_covers_namespace(
+            &info,
+            ["bucket-a".to_string(), "bucket-b".to_string()]
+        ));
+
+        info.usage_snapshot_complete = false;
+        assert!(!DefaultAdminUsecase::data_usage_snapshot_covers_namespace(
+            &info,
+            ["bucket-a".to_string()]
+        ));
     }
 
     #[tokio::test]

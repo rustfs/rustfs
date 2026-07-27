@@ -58,7 +58,9 @@ use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
 };
-use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
+use crate::app::object_usecase::{
+    build_put_like_object_lock_metadata, map_quota_check_outcome, validate_existing_object_lock_for_write,
+};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
@@ -516,6 +518,12 @@ impl DefaultMultipartUsecase {
             _ => None,
         };
 
+        let quota_metadata_sys = self.bucket_metadata_sys();
+        if let Some(metadata_sys) = quota_metadata_sys.as_ref() {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+            map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
+        }
+
         let obj_info = store
             .clone()
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
@@ -524,17 +532,18 @@ impl DefaultMultipartUsecase {
         let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
         record_capacity_write(Some(capacity_scope_token)).await;
 
-        // check quota after completing multipart upload
-        if let Some(metadata_sys) = self.bucket_metadata_sys() {
+        if let Some(metadata_sys) = quota_metadata_sys {
             let quota_checker = QuotaChecker::new(metadata_sys);
 
             match quota_checker
-                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size as u64)
+                .check_quota(&bucket, QuotaOperation::PutObject, obj_info.size.max(0) as u64)
                 .await
             {
                 Ok(check_result) => {
                     if !check_result.allowed {
-                        // Quota exceeded, delete the completed object
+                        // Preserve the established compensation behavior for
+                        // a known over-quota result. Unknown usage is rejected
+                        // by the preflight check before the upload is committed.
                         let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
                         let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
                         return Err(S3Error::with_message(
@@ -546,17 +555,16 @@ impl DefaultMultipartUsecase {
                             ),
                         ));
                     }
-                    // Update quota tracking after successful multipart upload
-                    if versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
-                            .await;
-                    } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
-                    }
                 }
-                Err(e) => {
-                    warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
+                Err(err) => {
+                    warn!("Quota check failed for bucket {} after multipart completion: {}", bucket, err);
                 }
+            }
+
+            if versioned {
+                record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+            } else {
+                record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
             }
         }
 
