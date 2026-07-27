@@ -32,6 +32,7 @@ pub(crate) use crate::runtime_sources::{
 #[cfg(test)]
 pub(crate) use crate::runtime_sources::{
     IamInterface, KmsInterface, NotificationSystemInterface, ServerConfigInterface, StorageClassInterface,
+    publish_test_app_context,
 };
 use rustfs_config::server_config::Config;
 use rustfs_kms::KmsServiceManager;
