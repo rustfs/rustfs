@@ -1875,10 +1875,28 @@ fn manual_transition_worker_failure_reason(err: &Error) -> ManualTransitionWorke
     if is_slow_down(err) {
         return ManualTransitionWorkerFailureReason::SlowDown;
     }
-    if is_network_or_host_down(&err.to_string(), false) {
+    let message = err.to_string();
+    if is_remote_tier_permission_denied_error(&message) {
+        return ManualTransitionWorkerFailureReason::PermissionDenied;
+    }
+    if is_remote_tier_network_error(&message) {
         return ManualTransitionWorkerFailureReason::Network;
     }
     ManualTransitionWorkerFailureReason::Unknown
+}
+
+fn is_remote_tier_permission_denied_error(message: &str) -> bool {
+    message.contains("remote tier request failed with status 401")
+        || message.contains("remote tier request failed with status 403")
+        || message.contains("InvalidAccessKeyId")
+        || message.contains("AccessDenied")
+        || message.contains("SignatureDoesNotMatch")
+}
+
+fn is_remote_tier_network_error(message: &str) -> bool {
+    message.contains("client error (SendRequest)")
+        || message.contains("dispatch failure")
+        || is_network_or_host_down(message, false)
 }
 
 fn is_err_permission_denied(err: &Error) -> bool {
@@ -7739,6 +7757,16 @@ mod tests {
         assert_eq!(
             manual_transition_worker_failure_reason(&Error::SlowDown),
             ManualTransitionWorkerFailureReason::SlowDown
+        );
+        assert_eq!(
+            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::other(
+                "remote tier request failed with status 403 Forbidden: InvalidAccessKeyId",
+            ))),
+            ManualTransitionWorkerFailureReason::PermissionDenied
+        );
+        assert_eq!(
+            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::other("client error (SendRequest)",))),
+            ManualTransitionWorkerFailureReason::Network
         );
         assert_eq!(
             manual_transition_worker_failure_reason(&Error::MethodNotAllowed),
