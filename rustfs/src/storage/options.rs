@@ -49,9 +49,21 @@ use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
 use s3s::dto::VersioningConfiguration;
 
+/// Test-only counter of versioning-config fetches, used to pin that batch
+/// handlers resolve the configuration once per request, not once per key
+/// (same counting pattern as MUST_REPLICATE_OBJECT_CALLS).
+///
+/// Blind spot: only fetches routed through [`bucket_versioning_config`] are
+/// counted — handler code that calls `BucketVersioningSys` directly bypasses
+/// this seam and its regression pins.
+#[cfg(test)]
+pub(crate) static VERSIONING_CONFIG_LOOKUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Fetch the bucket's versioning configuration once so callers can derive
 /// enabled/suspended state without repeated metadata-sys lookups per request.
-async fn bucket_versioning_config(bucket: &str) -> VersioningConfiguration {
+pub(crate) async fn bucket_versioning_config(bucket: &str) -> VersioningConfiguration {
+    #[cfg(test)]
+    VERSIONING_CONFIG_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match BucketVersioningSys::get(bucket).await {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -97,6 +109,20 @@ pub async fn del_opts(
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
     let versioning_cfg = bucket_versioning_config(bucket).await;
+    del_opts_with_versioning(bucket, object, vid, headers, metadata, &versioning_cfg)
+}
+
+/// Like [`del_opts`], but derives versioning state from an already-fetched
+/// configuration so batch callers (DeleteObjects) resolve the bucket's
+/// versioning once per request instead of once per key.
+pub fn del_opts_with_versioning(
+    bucket: &str,
+    object: &str,
+    vid: Option<String>,
+    headers: &HeaderMap<HeaderValue>,
+    metadata: HashMap<String, String>,
+    versioning_cfg: &VersioningConfiguration,
+) -> Result<ObjectOptions> {
     let versioned = versioning_cfg.prefix_enabled(object);
     let version_suspended = versioning_cfg.suspended();
 
@@ -126,7 +152,7 @@ pub async fn del_opts(
         None
     };
 
-    let mut opts = put_opts_from_headers(headers, metadata.clone()).map_err(|err| {
+    let mut opts = put_opts_from_headers(headers, metadata).map_err(|err| {
         error!("del_opts: invalid argument: {} error: {}", object, err);
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;

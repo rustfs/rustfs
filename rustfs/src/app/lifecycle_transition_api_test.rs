@@ -2388,3 +2388,145 @@ async fn object_lock_handlers_schedule_replication() {
          legal hold never replicates and the peer copy stays deletable"
     );
 }
+
+/// Regression pin for the DeleteObjects hot path: the bucket's versioning
+/// configuration must be resolved exactly once per request — not once per
+/// key, which used to cost up to 1000 identical metadata lookups per call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+async fn delete_objects_resolves_bucket_versioning_once_per_request() {
+    use super::storage_api::test::{ReqInfo, VERSIONING_CONFIG_LOOKUPS};
+    use std::sync::atomic::Ordering;
+
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+
+    let bucket = format!("test-delobjs-vers-once-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let keys = ["batch/a.txt", "batch/b.txt", "batch/c.txt"];
+    for key in keys {
+        upload_test_object(&ecstore, bucket.as_str(), key, b"delete objects versioning payload").await;
+    }
+
+    let input = DeleteObjectsInput::builder()
+        .bucket(bucket.clone())
+        .delete(Delete {
+            objects: keys
+                .iter()
+                .map(|key| ObjectIdentifier {
+                    key: key.to_string(),
+                    version_id: None,
+                    ..Default::default()
+                })
+                .collect(),
+            quiet: None,
+        })
+        .build()
+        .expect("delete objects input should build");
+
+    let mut req = build_request(input, Method::POST);
+    req.extensions.insert(ReqInfo {
+        cred: Some(rustfs_credentials::Credentials::default()),
+        is_owner: true,
+        ..Default::default()
+    });
+
+    let lookups_before = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst);
+    let response = usecase
+        .execute_delete_objects(req)
+        .await
+        .expect("delete objects should succeed");
+
+    let output = response.output;
+    let errors = output.errors.unwrap_or_default();
+    assert!(errors.is_empty(), "DeleteObjects reported per-key errors: {errors:?}");
+    assert_eq!(
+        output.deleted.unwrap_or_default().len(),
+        keys.len(),
+        "every requested key should be deleted"
+    );
+
+    let lookups = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst) - lookups_before;
+    assert_eq!(
+        lookups,
+        1,
+        "DeleteObjects must resolve bucket versioning exactly once per request; got {lookups} lookups for {} keys",
+        keys.len()
+    );
+}
+
+/// Regression pin for the nonexistent-bucket fast path: GET/HEAD/DeleteObject
+/// must decide NoSuchBucket from the bucket-existence check, before any bucket
+/// versioning lookup runs — and cheap request-shape validation still wins over
+/// bucket existence for GET.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+async fn nonexistent_bucket_fails_before_versioning_lookup_on_get_head_delete() {
+    use super::storage_api::test::VERSIONING_CONFIG_LOOKUPS;
+    use std::sync::atomic::Ordering;
+
+    let (_disk_paths, _ecstore) = setup_test_env().await;
+    let usecase = DefaultObjectUsecase::from_global();
+
+    // Never created.
+    let bucket = format!("test-missing-{}", &Uuid::new_v4().simple().to_string()[..8]);
+
+    // Request-shape validation keeps precedence over bucket existence: GET with
+    // both range and partNumber is InvalidArgument even on a missing bucket.
+    let get_invalid = GetObjectInput::builder()
+        .bucket(bucket.clone())
+        .key("k.txt".to_string())
+        .range(Some(Range::Int { first: 0, last: Some(1) }))
+        .part_number(Some(1))
+        .build()
+        .expect("get input should build");
+    let err = Box::pin(usecase.execute_get_object(build_request(get_invalid, Method::GET)))
+        .await
+        .expect_err("range+partNumber must be rejected");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+
+    let lookups_before = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst);
+
+    let get = GetObjectInput::builder()
+        .bucket(bucket.clone())
+        .key("k.txt".to_string())
+        .build()
+        .expect("get input should build");
+    let err = Box::pin(usecase.execute_get_object(build_request(get, Method::GET)))
+        .await
+        .expect_err("GET on a missing bucket must fail");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    // Bucket existence beats versionId-format validation (which lives in the
+    // opts builders) for HEAD and DeleteObject.
+    let head = HeadObjectInput::builder()
+        .bucket(bucket.clone())
+        .key("k.txt".to_string())
+        .version_id(Some("not-a-uuid".to_string()))
+        .build()
+        .expect("head input should build");
+    let err = Box::pin(usecase.execute_head_object(build_request(head, Method::HEAD)))
+        .await
+        .expect_err("HEAD on a missing bucket must fail");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    let del = DeleteObjectInput::builder()
+        .bucket(bucket.clone())
+        .key("k.txt".to_string())
+        .version_id(Some("not-a-uuid".to_string()))
+        .build()
+        .expect("delete input should build");
+    let err = Box::pin(usecase.execute_delete_object(build_request(del, Method::DELETE)))
+        .await
+        .expect_err("DeleteObject on a missing bucket must fail");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::NoSuchBucket);
+
+    let lookups = VERSIONING_CONFIG_LOOKUPS.load(Ordering::SeqCst) - lookups_before;
+    assert_eq!(
+        lookups, 0,
+        "requests naming a nonexistent bucket must fail before any bucket versioning lookup; got {lookups}"
+    );
+}
