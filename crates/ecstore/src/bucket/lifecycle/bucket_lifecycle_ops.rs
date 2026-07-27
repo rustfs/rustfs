@@ -7765,9 +7765,7 @@ mod tests {
             ManualTransitionWorkerFailureReason::PermissionDenied
         );
         assert_eq!(
-            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::other(
-                "client error (SendRequest)",
-            ))),
+            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::other("client error (SendRequest)",))),
             ManualTransitionWorkerFailureReason::Network
         );
         assert_eq!(
