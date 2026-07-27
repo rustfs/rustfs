@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
@@ -505,6 +505,14 @@ pub struct ManualTransitionTaskRecord {
     pub object: String,
     pub version_id: Option<Uuid>,
     pub storage_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mod_time_unix_nanos: Option<i128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_latest: Option<bool>,
     pub queued_at_unix_nanos: i128,
 }
 
@@ -525,8 +533,26 @@ impl ManualTransitionTaskRecord {
             object: object.into(),
             version_id,
             storage_class: storage_class.into(),
+            etag: None,
+            mod_time_unix_nanos: None,
+            size: None,
+            is_latest: None,
             queued_at_unix_nanos: OffsetDateTime::now_utc().unix_timestamp_nanos(),
         }
+    }
+
+    pub fn with_object_metadata(
+        mut self,
+        etag: Option<String>,
+        mod_time: Option<OffsetDateTime>,
+        size: i64,
+        is_latest: bool,
+    ) -> Self {
+        self.etag = etag;
+        self.mod_time_unix_nanos = mod_time.map(|time| time.unix_timestamp_nanos());
+        self.size = Some(size);
+        self.is_latest = Some(is_latest);
+        self
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ManualTransitionJobError> {
@@ -587,6 +613,9 @@ impl ManualTransitionTaskRecord {
         }
         if self.storage_class.trim().is_empty() {
             return Err(ManualTransitionJobError::Corrupt("task record storage_class is empty"));
+        }
+        if self.size.is_some_and(|size| size < 0) {
+            return Err(ManualTransitionJobError::Corrupt("task record size is negative"));
         }
         Ok(())
     }
@@ -1151,14 +1180,86 @@ pub async fn load_manual_transition_worker_result_stats(
     job_id: Uuid,
 ) -> EcstoreResult<ManualTransitionWorkerResultStats> {
     match scan_manual_transition_worker_result_journal(api, job_id).await? {
-        ManualTransitionWorkerResultJournal::Stats(stats) => Ok(stats),
+        ManualTransitionWorkerResultJournal::Stats(stats) => Ok(stats.stats),
         ManualTransitionWorkerResultJournal::Corrupt(error) => Err(Error::other(error)),
     }
 }
 
 enum ManualTransitionWorkerResultJournal {
-    Stats(ManualTransitionWorkerResultStats),
+    Stats(ManualTransitionWorkerResultJournalStats),
     Corrupt(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ManualTransitionWorkerResultJournalStats {
+    stats: ManualTransitionWorkerResultStats,
+    task_keys: BTreeSet<String>,
+}
+
+impl ManualTransitionWorkerResultJournalStats {
+    fn record(&mut self, result: ManualTransitionWorkerResultRecord) {
+        self.task_keys.insert(result.task_key.clone());
+        self.stats.record(result.result, result.failure_reason);
+    }
+}
+
+pub async fn load_manual_transition_pending_task_records(
+    api: Arc<ECStore>,
+    job_id: Uuid,
+    limit: usize,
+) -> EcstoreResult<Vec<ManualTransitionTaskRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let result_keys = match scan_manual_transition_worker_result_journal(api.clone(), job_id).await? {
+        ManualTransitionWorkerResultJournal::Stats(stats) => stats.task_keys,
+        ManualTransitionWorkerResultJournal::Corrupt(error) => return Err(Error::other(error)),
+    };
+    let prefix = manual_transition_task_object_prefix(job_id).map_err(manual_transition_job_store_error)?;
+    let mut marker = None;
+    let scan_limit = usize::try_from(MANUAL_TRANSITION_TASK_SCAN_LIMIT)
+        .map_err(|_| Error::other("manual transition task scan limit is invalid"))?;
+    let mut pending = Vec::with_capacity(limit.min(scan_limit));
+
+    loop {
+        let page = api
+            .clone()
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                &prefix,
+                marker,
+                None,
+                MANUAL_TRANSITION_TASK_SCAN_LIMIT,
+                false,
+                None,
+                false,
+            )
+            .await?;
+
+        for object in page.objects {
+            let task_key =
+                manual_transition_task_key_from_object_name(job_id, &object.name).map_err(manual_transition_job_store_error)?;
+            if result_keys.contains(&task_key) {
+                continue;
+            }
+            let object_name = manual_transition_task_object_name(job_id, &task_key).map_err(manual_transition_job_store_error)?;
+            let data = config_boundary::read_config(api.clone(), &object_name).await?;
+            let task = ManualTransitionTaskRecord::decode(job_id, &task_key, &data).map_err(manual_transition_job_store_error)?;
+            pending.push(task);
+            if pending.len() == limit {
+                return Ok(pending);
+            }
+        }
+
+        if !page.is_truncated {
+            return Ok(pending);
+        }
+        let Some(next_marker) = page.next_continuation_token else {
+            return Err(Error::other("manual transition task journal page is truncated without a next marker"));
+        };
+        marker = Some(next_marker);
+    }
 }
 
 async fn scan_manual_transition_worker_result_journal(
@@ -1167,7 +1268,7 @@ async fn scan_manual_transition_worker_result_journal(
 ) -> EcstoreResult<ManualTransitionWorkerResultJournal> {
     let prefix = manual_transition_worker_result_object_prefix(job_id).map_err(manual_transition_job_store_error)?;
     let mut marker = None;
-    let mut stats = ManualTransitionWorkerResultStats::default();
+    let mut stats = ManualTransitionWorkerResultJournalStats::default();
     loop {
         let page = api
             .clone()
@@ -1197,7 +1298,7 @@ async fn scan_manual_transition_worker_result_journal(
                 Ok(result) => result,
                 Err(err) => return Ok(ManualTransitionWorkerResultJournal::Corrupt(err.to_string())),
             };
-            stats.record(result.result, result.failure_reason);
+            stats.record(result);
         }
         if !page.is_truncated {
             return Ok(ManualTransitionWorkerResultJournal::Stats(stats));
@@ -1229,9 +1330,9 @@ pub async fn reconcile_manual_transition_worker_results(
     for _ in 0..4 {
         let (mut record, etag) = load_manual_transition_job_record_with_etag(api.clone(), job_id).await?;
         let changed = record.apply_worker_result_counts(
-            stats.completed,
-            stats.failed,
-            &stats.tier_failure_by_reason,
+            stats.stats.completed,
+            stats.stats.failed,
+            &stats.stats.tier_failure_by_reason,
             task_stats.queued,
             queue_snapshot,
         );
