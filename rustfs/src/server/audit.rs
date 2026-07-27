@@ -18,6 +18,7 @@ use super::{
 };
 use crate::runtime_sources::AppContext;
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
@@ -44,7 +45,7 @@ pub fn is_audit_module_enabled() -> bool {
     AUDIT_MODULE_ENABLED.load(Ordering::Relaxed)
 }
 
-fn has_any_audit_targets(config: &rustfs_config::server_config::Config) -> bool {
+fn has_any_persisted_audit_targets(config: &rustfs_config::server_config::Config) -> bool {
     for &subsystem in rustfs_config::audit::AUDIT_SUB_SYSTEMS {
         let Some(targets) = config.0.get(subsystem) else {
             continue;
@@ -54,6 +55,29 @@ fn has_any_audit_targets(config: &rustfs_config::server_config::Config) -> bool 
         }
     }
     false
+}
+
+fn has_any_collected_audit_targets(config: &rustfs_config::server_config::Config) -> bool {
+    rustfs_targets::catalog::builtin::builtin_audit_target_admin_descriptors()
+        .into_iter()
+        .any(|descriptor| {
+            let valid_fields = descriptor
+                .valid_fields()
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect::<HashSet<_>>();
+            let (configs, failures) = rustfs_targets::config::collect_target_config_results(
+                config,
+                rustfs_config::audit::AUDIT_ROUTE_PREFIX,
+                descriptor.manifest().target_type,
+                &valid_fields,
+            );
+            !configs.is_empty() || !failures.is_empty()
+        })
+}
+
+fn has_any_audit_targets(config: &rustfs_config::server_config::Config) -> bool {
+    has_any_persisted_audit_targets(config) || has_any_collected_audit_targets(config)
 }
 
 /// Start the audit system.
@@ -193,5 +217,37 @@ pub(crate) async fn apply_audit_module_switch_for_context(context: Option<&AppCo
         }
     } else {
         stop_audit_system().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_any_audit_targets;
+    use rustfs_config::server_config::Config;
+
+    #[test]
+    fn audit_target_detection_includes_env_only_targets() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY", Some("on")),
+                ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook")),
+            ],
+            || {
+                assert!(has_any_audit_targets(&Config::new()));
+            },
+        );
+    }
+
+    #[test]
+    fn audit_target_detection_ignores_disabled_env_only_targets() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_AUDIT_WEBHOOK_ENABLE_PRIMARY", Some("off")),
+                ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARY", Some("https://example.com/hook")),
+            ],
+            || {
+                assert!(!has_any_audit_targets(&Config::new()));
+            },
+        );
     }
 }
