@@ -20,6 +20,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 ENDPOINT=""
 ADMIN_TOKEN=""
+ACCESS_KEY=""
+SECRET_KEY=""
+AWS_SIGV4_SCOPE="aws:amz:us-east-1:s3"
 OUT_DIR=""
 WINDOW_SPEC="nightly-2h:120:16:5000:balanced,nightly-12h:720:24:8000:write-heavy,nightly-24h:1440:32:12000:read-heavy"
 SOAK_RATIOS="read-heavy:90:10,balanced:70:30,write-heavy:40:60"
@@ -47,6 +50,9 @@ Required:
 
 Optional:
   --admin-token         Bearer token for admin endpoints
+  --access-key          Access key for SigV4-signed admin calls
+  --secret-key          Secret key for SigV4-signed admin calls
+  --aws-sigv4-scope     curl --aws-sigv4 scope, default aws:amz:us-east-1:s3
   --window-spec         Comma-separated run spec: window:duration_min:concurrency:ops_per_min:mix_name
   --soak-ratios         Comma-separated mix ratios: label:read_pct:write_pct
   --workload-sizes      Object-size workload set
@@ -92,6 +98,18 @@ parse_args() {
         ;;
       --admin-token)
         ADMIN_TOKEN="$(arg_value "$1" "${2:-}")"
+        shift 2
+        ;;
+      --access-key)
+        ACCESS_KEY="$(arg_value "$1" "${2:-}")"
+        shift 2
+        ;;
+      --secret-key)
+        SECRET_KEY="$(arg_value "$1" "${2:-}")"
+        shift 2
+        ;;
+      --aws-sigv4-scope)
+        AWS_SIGV4_SCOPE="$(arg_value "$1" "${2:-}")"
         shift 2
         ;;
       --window-spec)
@@ -228,6 +246,9 @@ set -euo pipefail
 SOAK_MATRIX_CSV='__SOAK_MATRIX_CSV__'
 ENDPOINT='__ENDPOINT__'
 ADMIN_TOKEN='__ADMIN_TOKEN__'
+ACCESS_KEY='__ACCESS_KEY__'
+SECRET_KEY='__SECRET_KEY__'
+AWS_SIGV4_SCOPE='__AWS_SIGV4_SCOPE__'
 JOB_BUCKET='__JOB_BUCKET__'
 JOB_PREFIX='__JOB_PREFIX__'
 TIER='__TIER__'
@@ -238,7 +259,9 @@ OUT_DIR='__OUT_DIR__'
 : "${UNKNOWN_FAILURE_COUNT_THRESHOLD:=0}"
 
 SNAPSHOT_DIR="${OUT_DIR}/failure-snapshots"
+RESULT_DIR="${OUT_DIR}/run-results"
 mkdir -p "$SNAPSHOT_DIR"
+mkdir -p "$RESULT_DIR"
 
 require_cmd() {
   local cmd="$1"
@@ -251,6 +274,19 @@ require_cmd() {
 url_encode() {
   local value="$1"
   jq -rn --arg v "$value" '$v|@uri'
+}
+
+curl_admin() {
+  local method="$1"
+  local url="$2"
+  shift 2
+  local args=(-sS -X "$method")
+  if [[ -n "$ADMIN_TOKEN" ]]; then
+    args+=(-H "Authorization: Bearer ${ADMIN_TOKEN}")
+  elif [[ -n "$ACCESS_KEY" ]]; then
+    args+=(--aws-sigv4 "$AWS_SIGV4_SCOPE" --user "${ACCESS_KEY}:${SECRET_KEY}")
+  fi
+  curl "${args[@]}" "$url" "$@"
 }
 
 snapshot_failure() {
@@ -272,7 +308,7 @@ snapshot_failure() {
   } >"${snapshot_dir}/snapshot.meta"
 
   if [[ -n "$job_id" && "$job_id" != "NA" ]]; then
-    curl -sS ${ADMIN_TOKEN:+-H "Authorization: Bearer ${ADMIN_TOKEN}"} -X GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}" \
+    curl_admin GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}" \
       >"${snapshot_dir}/job_status.json"
     ./scripts/manual_transition_journal_audit.sh --endpoint "$ENDPOINT" --job-id "$job_id" ${ADMIN_TOKEN:+--admin-token "$ADMIN_TOKEN"} --out-dir "$snapshot_dir" || true
   fi
@@ -300,7 +336,7 @@ run_entry() {
   local status
   local status_json
   local status_info
-  local headers=()
+  local result_tag
 
   if [[ "$budget_status" == "over-budget" ]]; then
     echo "[skip] ${tag} ${size} over budget: expected_ops=${expected_ops}"
@@ -308,6 +344,7 @@ run_entry() {
   fi
 
   prefix="${JOB_PREFIX}/${tag}/${size}/${read_pct}r${write_pct}w"
+  result_tag="${tag}-${size}-${read_pct}r${write_pct}w"
   query="bucket=$(url_encode "$JOB_BUCKET")"
   query="${query}&prefix=$(url_encode "$prefix")"
   query="${query}&maxObjects=100000"
@@ -319,32 +356,30 @@ run_entry() {
 
   url="${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/run?${query}"
 
-  if [[ -n "$ADMIN_TOKEN" ]]; then
-    headers+=("-H" "Authorization: Bearer ${ADMIN_TOKEN}")
-  fi
-
   echo "==> run=${tag} size=${size} mix=${mix_name} read_pct=${read_pct} write_pct=${write_pct} duration_min=${duration_min}"
-  if ! response="$(curl -sS "${headers[@]}" -X POST "$url")"; then
+  if ! response="$(curl_admin POST "$url")"; then
     snapshot_failure "$tag" "curl_post_failed" "NA"
     return 1
   fi
+  printf '%s' "$response" >"${RESULT_DIR}/${result_tag}-run.json"
   job_id="$(printf '%s' "$response" | jq -r '.job_id // empty')"
   if [[ -z "$job_id" || "$job_id" == "null" ]]; then
     snapshot_failure "$tag" "missing_job_id" "NA"
     return 1
   fi
 
-  if ! status_json="$(curl -sS "${headers[@]}" -X GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}")"; then
+  if ! status_json="$(curl_admin GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}")"; then
     snapshot_failure "$tag" "job_status_fetch_failed" "$job_id"
     return 1
   fi
-  if ! status_info="$(printf '%s' "$status_json" | jq -r '[.status // "", .failure_reason // "", (.report.enqueued // 0), (.report.transition_completed // 0), (.report.transition_failed // 0), (.report.tier_failure_by_reason["unknown"] // 0), (.queue_snapshot.queued // 0), (.queue_snapshot.active // 0), (.queue_snapshot.compensation_pending // 0), (.queue_snapshot.compensation_running // 0), (.queue_snapshot.queue_full // 0), (.queue_snapshot.queue_send_timeout // 0)] | map(tostring) | join(\"\\u0000\")')"; then
+  printf '%s' "$status_json" >"${RESULT_DIR}/${result_tag}-status.json"
+  if ! status_info="$(printf '%s' "$status_json" | jq -r '[.status // "", .failure_reason // "__none__", (.report.enqueued // 0), (.report.transition_completed // 0), (.report.transition_failed // 0), (.report.tier_failure_by_reason["unknown"] // 0), (.queue_snapshot.queued // 0), (.queue_snapshot.active // 0), (.queue_snapshot.compensation_pending // 0), (.queue_snapshot.compensation_running // 0), (.queue_snapshot.queue_full // 0), (.queue_snapshot.queue_send_timeout // 0)] | map(tostring) | @tsv')"; then
     snapshot_failure "$tag" "invalid_job_status_json" "$job_id"
     return 1
   fi
-  IFS=$'\0' read -r status failure_reason report_enqueued report_completed report_failed report_unknown_failure queue_snapshot_queued queue_snapshot_active compensation_pending compensation_running queue_full queue_send_timeout <<< "$status_info"
+  IFS=$'\t' read -r status failure_reason report_enqueued report_completed report_failed report_unknown_failure queue_snapshot_queued queue_snapshot_active compensation_pending compensation_running queue_full queue_send_timeout <<< "$status_info"
 
-  if [[ -n "$failure_reason" && "$failure_reason" != "null" ]]; then
+  if [[ "$failure_reason" != "__none__" ]]; then
     snapshot_failure "$tag" "failure_reason=${failure_reason}" "$job_id"
   fi
 
@@ -374,24 +409,25 @@ run_entry() {
       unknown_ratio="$(awk -v unknown="$report_unknown_failure" -v denom="$ratio_denominator" 'BEGIN{printf "%.6f", (unknown / denom)}')"
       mismatch_ratio="$(awk -v mismatch="$mismatch_count" -v denom="$ratio_denominator" 'BEGIN{printf "%.6f", (mismatch / denom)}')"
 
-      if (( UNKNOWN_FAILURE_RATIO_THRESHOLD > 0 )) && \
-         awk "BEGIN{exit !($unknown_ratio > ${UNKNOWN_FAILURE_RATIO_THRESHOLD})}"; then
+      if awk "BEGIN{exit !(${UNKNOWN_FAILURE_RATIO_THRESHOLD} > 0 && $unknown_ratio > ${UNKNOWN_FAILURE_RATIO_THRESHOLD})}"; then
         snapshot_failure "$tag" "unknown_failure_ratio=${unknown_ratio}/expected=${ratio_denominator}/threshold=${UNKNOWN_FAILURE_RATIO_THRESHOLD}" "$job_id"
+        return 1
       fi
 
       if (( UNKNOWN_FAILURE_COUNT_THRESHOLD > 0 )) && (( report_unknown_failure > UNKNOWN_FAILURE_COUNT_THRESHOLD )); then
         snapshot_failure "$tag" "unknown_failure_count=${report_unknown_failure}/threshold=${UNKNOWN_FAILURE_COUNT_THRESHOLD}" "$job_id"
+        return 1
       fi
 
-      if (( QUEUE_MISMATCH_RATIO_THRESHOLD > 0 )) && \
-         awk "BEGIN{exit !($mismatch_ratio > ${QUEUE_MISMATCH_RATIO_THRESHOLD})}"; then
+      if awk "BEGIN{exit !(${QUEUE_MISMATCH_RATIO_THRESHOLD} > 0 && $mismatch_ratio > ${QUEUE_MISMATCH_RATIO_THRESHOLD})}"; then
         snapshot_failure "$tag" "queue_mismatch_ratio=${mismatch_ratio}/expected=${ratio_denominator}/threshold=${QUEUE_MISMATCH_RATIO_THRESHOLD}" "$job_id"
+        return 1
       fi
     fi
   fi
 
   # Keep compatibility with older callers that monitor queue drift via full terminal status.
-  curl -sS "${headers[@]}" -X GET "${ENDPOINT%/}/rustfs/admin/v3/ilm/transition/jobs/${job_id}" | jq '{status, report, queue_snapshot, failure_reason}'
+  printf '%s' "$status_json" | jq '{job_id, status, bucket, prefix, tier, report, queue_snapshot, failure_reason}'
 }
 
 is_terminal_status() {
@@ -413,18 +449,34 @@ main() {
   require_cmd jq
   require_cmd awk
 
+  if [[ -n "$ADMIN_TOKEN" && ( -n "$ACCESS_KEY" || -n "$SECRET_KEY" ) ]]; then
+    echo "ERROR: bearer token cannot be combined with SigV4 credentials" >&2
+    exit 1
+  fi
+  if [[ -n "$ACCESS_KEY" && -z "$SECRET_KEY" || -z "$ACCESS_KEY" && -n "$SECRET_KEY" ]]; then
+    echo "ERROR: ACCESS_KEY and SECRET_KEY must be provided together" >&2
+    exit 1
+  fi
+
   if [[ ! -f "$SOAK_MATRIX_CSV" ]]; then
     echo "ERROR: expected matrix file missing: $SOAK_MATRIX_CSV" >&2
     echo "Run manual_transition_soak_matrix.sh first." >&2
     exit 1
   fi
 
+  local failures=0
   while IFS=',' read -r window duration_min concurrency ops_per_min mix_name read_pct write_pct size expected_ops run_id budget_status; do
     if [[ -z "$window" || "$window" == "window" ]]; then
       continue
     fi
-    run_entry "${window}" "${duration_min}" "${concurrency}" "${ops_per_min}" "${mix_name}" "${read_pct}" "${write_pct}" "${size}" "${expected_ops}" "${budget_status}" || true
+    if ! run_entry "${window}" "${duration_min}" "${concurrency}" "${ops_per_min}" "${mix_name}" "${read_pct}" "${write_pct}" "${size}" "${expected_ops}" "${budget_status}"; then
+      failures=$((failures + 1))
+    fi
   done < <(tail -n +2 "$SOAK_MATRIX_CSV")
+  if (( failures > 0 )); then
+    echo "ERROR: ${failures} soak row(s) failed; see ${SNAPSHOT_DIR}" >&2
+    exit 1
+  fi
 }
 
 main "$@"
@@ -433,6 +485,9 @@ EOF
   perl -0pi -e "s#__SOAK_MATRIX_CSV__#${matrix_csv//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__ENDPOINT__#${ENDPOINT//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__ADMIN_TOKEN__#${ADMIN_TOKEN//#/#}#g" "$COMMAND_FILE"
+  perl -0pi -e "s#__ACCESS_KEY__#${ACCESS_KEY//#/#}#g" "$COMMAND_FILE"
+  perl -0pi -e "s#__SECRET_KEY__#${SECRET_KEY//#/#}#g" "$COMMAND_FILE"
+  perl -0pi -e "s#__AWS_SIGV4_SCOPE__#${AWS_SIGV4_SCOPE//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__JOB_BUCKET__#${JOB_BUCKET//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__JOB_PREFIX__#${JOB_PREFIX//#/#}#g" "$COMMAND_FILE"
   perl -0pi -e "s#__TIER__#${TIER//#/#}#g" "$COMMAND_FILE"
@@ -454,6 +509,14 @@ main() {
   mkdir -p "$OUT_DIR"
   require_cmd awk
   require_cmd jq
+  if [[ -n "$ADMIN_TOKEN" && ( -n "$ACCESS_KEY" || -n "$SECRET_KEY" ) ]]; then
+    echo "ERROR: --admin-token cannot be combined with --access-key/--secret-key" >&2
+    exit 1
+  fi
+  if [[ -n "$ACCESS_KEY" && -z "$SECRET_KEY" || -z "$ACCESS_KEY" && -n "$SECRET_KEY" ]]; then
+    echo "ERROR: --access-key and --secret-key must be provided together" >&2
+    exit 1
+  fi
 
   main_matrix
   command_template
