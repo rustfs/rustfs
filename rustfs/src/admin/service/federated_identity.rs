@@ -310,6 +310,7 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
     use rustfs_iam::federation::{FederatedAuthorization, FederatedClaims};
     use rustfs_iam::store::{Store, UserType, object::IAM_CONFIG_PREFIX};
     use rustfs_kms::KmsServiceManager;
@@ -417,9 +418,11 @@ mod tests {
             let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
                 .await
                 .expect("build test IAM");
-            crate::app::context::publish_global_app_context(Arc::new(
-                crate::runtime_sources::AppContext::with_default_interfaces(env.ecstore, iam, Arc::new(KmsServiceManager::new())),
-            ));
+            publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+                env.ecstore,
+                iam,
+                Arc::new(KmsServiceManager::new()),
+            )));
         }
 
         let iam = current_ready_iam_handle().expect("test IAM should be ready");
