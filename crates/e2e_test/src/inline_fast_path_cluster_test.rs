@@ -2231,13 +2231,10 @@ async fn four_node_manual_transition_rollout_non_empty_restart_readback() -> Tes
         Some("completed"),
         "non-empty #1508 rollout transition should complete before restart readback: {terminal}"
     );
-    let transition_failed = match terminal["report"]
+    let transition_failed: u64 = terminal["report"]
         .get("transition_failed")
         .and_then(serde_json::Value::as_u64)
-    {
-        Some(value) => value,
-        None => 0,
-    };
+        .unwrap_or_default();
     assert_eq!(
         transition_failed, 0,
         "terminal #1508 report should not hide transition failures: {terminal}"
