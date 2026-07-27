@@ -4803,6 +4803,153 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     Ok(())
 }
 
+/// Re-applying a site's own replication config must not disable the peer's reverse direction.
+///
+/// `PutBucketReplication` broadcasts the config to every peer — the console's replication
+/// Save button, `mc replicate import`, and a bucket-metadata import all go through it. The
+/// receiver used to overwrite its rules with the sender's, whose destination ARN names the
+/// receiver itself. No bucket target can satisfy that ARN, so every object written on the
+/// receiver was dropped with only a debug line, while `replicate status` still reported
+/// "1/1 Buckets in sync" because both configs were byte-identical.
+#[tokio::test]
+#[serial]
+async fn test_site_replication_config_broadcast_keeps_reverse_direction_real_dual_node() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-config-broadcast";
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "broadcast-source".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "broadcast-target".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {add_status:?}");
+    wait_for_site_replication_enabled(&source_env, 2).await?;
+    wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+
+    // Both directions work before the broadcast.
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key("from-source.txt")
+        .body(ByteStream::from_static(b"written on the initiating site"))
+        .send()
+        .await?;
+    assert_eq!(
+        wait_for_object_on_target(&target_client, bucket, "from-source.txt").await?,
+        b"written on the initiating site".to_vec(),
+    );
+    target_client
+        .put_object()
+        .bucket(bucket)
+        .key("from-target.txt")
+        .body(ByteStream::from_static(b"written on the joined site"))
+        .send()
+        .await?;
+    assert_eq!(
+        wait_for_object_on_target(&source_client, bucket, "from-target.txt").await?,
+        b"written on the joined site".to_vec(),
+    );
+
+    // Round-trip the source's own config through PutBucketReplication, exactly what the
+    // console does when an operator opens the bucket's replication page and saves it.
+    let source_config = source_client
+        .get_bucket_replication()
+        .bucket(bucket)
+        .send()
+        .await?
+        .replication_configuration
+        .ok_or("source bucket has no replication configuration")?;
+    source_client
+        .put_bucket_replication()
+        .bucket(bucket)
+        .replication_configuration(source_config)
+        .send()
+        .await?;
+
+    let target_config = wait_for_site_replication_rule(&target_client, bucket).await?;
+    let target_deployment_id = site_replication_info(&target_env)
+        .await?
+        .sites
+        .iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .map(|peer| peer.deployment_id.clone())
+        .ok_or("joined site missing from its own replication info")?;
+    for rule in &target_config.rules {
+        let destination = rule
+            .destination
+            .as_ref()
+            .map(|destination| destination.bucket.as_str())
+            .unwrap_or_default();
+        assert!(
+            !destination.contains(&target_deployment_id),
+            "joined site adopted a rule pointing at itself: {destination}"
+        );
+    }
+
+    target_client
+        .put_object()
+        .bucket(bucket)
+        .key("from-target-after-broadcast.txt")
+        .body(ByteStream::from_static(b"written after the config broadcast"))
+        .send()
+        .await?;
+    assert_eq!(
+        wait_for_object_on_target(&source_client, bucket, "from-target-after-broadcast.txt").await?,
+        b"written after the config broadcast".to_vec(),
+        "config broadcast made replication one-directional"
+    );
+
+    Ok(())
+}
+
+async fn wait_for_site_replication_rule(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> Result<aws_sdk_s3::types::ReplicationConfiguration, Box<dyn Error + Send + Sync>> {
+    for _ in 0..40 {
+        if let Ok(response) = client.get_bucket_replication().bucket(bucket).send().await
+            && let Some(config) = response.replication_configuration
+            && !config.rules.is_empty()
+        {
+            return Ok(config);
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("bucket {bucket} never reported a replication rule").into())
+}
+
 #[tokio::test]
 #[serial]
 async fn test_site_replication_active_active_converges_without_loops_real_dual_node() -> TestResult {

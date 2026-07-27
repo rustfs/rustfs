@@ -1634,6 +1634,13 @@ pub struct UpdateServiceAccountOpts {
     pub description: Option<String>,
     pub expiration: Option<OffsetDateTime>,
     pub status: Option<String>,
+    /// Rebind the account to a different parent.
+    ///
+    /// Only site replication sets this, and only to repair an account left pointing at a
+    /// parent that a root-credential change invalidated. Rebinding an arbitrary service
+    /// account would let it inherit another user's policies, so it is gated behind
+    /// `allow_site_replicator_account` in the same way the account itself is.
+    pub parent_user: Option<String>,
     pub allow_site_replicator_account: bool,
 }
 
@@ -2061,6 +2068,7 @@ mod tests {
                     description: None,
                     expiration: None,
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2090,6 +2098,7 @@ mod tests {
                     description: None,
                     expiration: None,
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2286,6 +2295,7 @@ mod tests {
                     description: None,
                     expiration: Some(updated_expiration),
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2332,6 +2342,7 @@ mod tests {
                     description: None,
                     expiration: Some(updated_expiration),
                     status: None,
+                    parent_user: None,
                     allow_site_replicator_account: false,
                 },
             )
@@ -2383,6 +2394,7 @@ mod tests {
                         description: None,
                         expiration: None,
                         status: Some(STATUS_ENABLED.to_string()),
+                        parent_user: None,
                         allow_site_replicator_account: false,
                     },
                 )
@@ -2401,6 +2413,7 @@ mod tests {
                     description: None,
                     expiration: None,
                     status: Some(STATUS_ENABLED.to_string()),
+                    parent_user: None,
                     allow_site_replicator_account: true,
                 },
             )
@@ -2414,6 +2427,116 @@ mod tests {
                 .expect("internal secret should be readable for canonical account"),
             cred.secret_key
         );
+    }
+
+    /// A root-credential change can leave `site-replicator-0` bound to a parent that no
+    /// longer exists, and the repair must rebind in place: deleting first would leave the
+    /// site with no replication account at all if the recreate failed. The parent also lives
+    /// in the session token, so both copies have to move together or authorization denies
+    /// the account.
+    #[tokio::test]
+    async fn test_site_replicator_parent_rebind_updates_credential_and_claim() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let (cred, _) = iam_sys
+            .new_service_account(
+                "stale-parent-user",
+                None,
+                NewServiceAccountOpts {
+                    access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                    secret_key: "siteReplicatorSecretKeyForTest1234567890".to_string(),
+                    allow_site_replicator_account: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("site replicator account should be created");
+
+        iam_sys
+            .update_service_account(
+                &cred.access_key,
+                UpdateServiceAccountOpts {
+                    session_policy: None,
+                    secret_key: None,
+                    name: None,
+                    description: None,
+                    expiration: None,
+                    status: None,
+                    parent_user: Some("current-parent-user".to_string()),
+                    allow_site_replicator_account: true,
+                },
+            )
+            .await
+            .expect("site replication repair may rebind the parent");
+
+        let (identity, claims) = iam_sys
+            .get_account_with_claims_allow_missing_exp(&cred.access_key)
+            .await
+            .expect("rebound account should still be readable");
+        assert_eq!(identity.credentials.parent_user, "current-parent-user");
+        assert_eq!(
+            claims.get("parent").and_then(Value::as_str),
+            Some("current-parent-user"),
+            "the token claim must follow the credential or authorization denies the account"
+        );
+        assert_eq!(
+            iam_sys
+                .get_site_replicator_service_account_secret(&cred.access_key)
+                .await
+                .expect("secret survives a rebind"),
+            cred.secret_key,
+            "peers keep using the same secret, so a rebind must not rotate it"
+        );
+    }
+
+    /// The rebind is a site-replication repair primitive, not a general capability: letting
+    /// any caller re-parent a service account would let it inherit another user's policies.
+    #[tokio::test]
+    async fn test_parent_rebind_is_rejected_for_ordinary_service_accounts() {
+        ensure_test_global_credentials();
+
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let (cred, _) = iam_sys
+            .new_service_account(
+                "ordinary-parent",
+                None,
+                NewServiceAccountOpts {
+                    access_key: "ordinary-service-account".to_string(),
+                    secret_key: "ordinaryServiceAccountSecret1234567890".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ordinary service account should be created");
+
+        for allow in [false, true] {
+            assert!(
+                iam_sys
+                    .update_service_account(
+                        &cred.access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: None,
+                            secret_key: None,
+                            name: None,
+                            description: None,
+                            expiration: None,
+                            status: None,
+                            parent_user: Some("victim-user".to_string()),
+                            allow_site_replicator_account: allow,
+                        },
+                    )
+                    .await
+                    .is_err(),
+                "re-parenting an ordinary service account must be rejected (allow={allow})"
+            );
+        }
     }
 
     #[tokio::test]
