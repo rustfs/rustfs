@@ -872,6 +872,10 @@ impl<T: Store> IamSys<T> {
         self.store.policy_db_get(name, groups).await
     }
 
+    pub async fn sts_policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
+        self.store.sts_policy_db_get(name, groups).await
+    }
+
     /// Check whether a policy name from a JWT claim is safe to resolve against the IAM store.
     ///
     /// Allowed characters: `[a-zA-Z0-9_:.-]`
@@ -2776,7 +2780,7 @@ mod tests {
     async fn oidc_service_account_uses_verified_policy_and_persisted_boundary() {
         ensure_test_global_credentials();
         let iam_sys = IamSys::new(IamCache::new(StsTestMockStore::new(true)).await.unwrap());
-        let parent_user = "openid=pUmguI1petsjVfDFQppmmR9yqdmWnBAXGJhHV_s9W3I";
+        let parent_user = "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA";
         let mut oidc_claims = HashMap::from([
             ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
             ("oidc_provider".to_string(), Value::String("default".to_string())),
@@ -3464,6 +3468,18 @@ mod tests {
             sts_policies.contains_key("notify-sts-parent"),
             "STS policy mapping notifications must update sts_policies instead of deleting them"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sts_policy_lookup_loads_missing_mapping_without_regular_user() {
+        let store = StsTestMockStore::new(false);
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let policies = iam_sys.sts_policy_db_get("notify-sts-parent", &None).await.unwrap();
+
+        assert_eq!(policies, vec!["readwrite"]);
+        assert!(iam_sys.store.cache.snapshot().sts_policies.contains_key("notify-sts-parent"));
     }
 
     #[tokio::test]

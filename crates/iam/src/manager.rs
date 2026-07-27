@@ -907,7 +907,41 @@ where
             return Err(Error::InvalidArgument);
         }
 
-        let (mut policies, _) = self.policy_db_get_internal(name, false, false).await?;
+        let (policies, _) = self.policy_db_get_internal(name, false, false).await?;
+        self.policy_db_get_with_groups(policies, groups).await
+    }
+
+    pub async fn sts_policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
+        if name.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let cache = self.cache.snapshot();
+        let sts_policies = Arc::clone(&cache.sts_policies);
+        drop(cache);
+        let mapped_policy = match sts_policies.get(name) {
+            Some(policy) => policy.clone(),
+            None => {
+                let mut policies = HashMap::new();
+                if let Err(err) = self.api.load_mapped_policy(name, UserType::Sts, false, &mut policies).await
+                    && !is_err_no_such_policy(&err)
+                {
+                    return Err(err);
+                }
+                match policies.get(name) {
+                    Some(policy) => {
+                        self.cache.add_or_update_sts_policy(name, policy, OffsetDateTime::now_utc());
+                        policy.clone()
+                    }
+                    None => MappedPolicy::default(),
+                }
+            }
+        };
+
+        self.policy_db_get_with_groups(mapped_policy.to_slice(), groups).await
+    }
+
+    async fn policy_db_get_with_groups(&self, mut policies: Vec<String>, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         let present = !policies.is_empty();
 
         if let Some(groups) = groups {
@@ -2583,6 +2617,33 @@ mod tests {
             sync_successes: AtomicU64::new(0),
             last_sync_duration_millis: AtomicU64::new(0),
         }
+    }
+
+    #[tokio::test]
+    async fn sts_policy_lookup_ignores_colliding_regular_user_mapping() {
+        let iam = build_test_iam_cache(FailingInitialLoadStore);
+        let parent = "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA";
+        let user = UserIdentity::new(Credentials {
+            access_key: parent.to_string(),
+            secret_key: "regular-user-secret".to_string(),
+            status: STATUS_ENABLED.to_string(),
+            ..Default::default()
+        });
+        let now = OffsetDateTime::now_utc();
+        iam.cache.add_or_update_user(parent, &user, now);
+        iam.cache
+            .add_or_update_user_policy(parent, &MappedPolicy::new("regular-policy"), now);
+        iam.cache
+            .add_or_update_sts_policy(parent, &MappedPolicy::new("oidc-policy"), now);
+
+        assert_eq!(
+            iam.policy_db_get(parent, &None).await.expect("regular lookup should succeed"),
+            vec!["regular-policy"]
+        );
+        assert_eq!(
+            iam.sts_policy_db_get(parent, &None).await.expect("STS lookup should succeed"),
+            vec!["oidc-policy"]
+        );
     }
 
     #[tokio::test]

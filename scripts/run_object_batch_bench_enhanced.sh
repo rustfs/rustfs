@@ -40,6 +40,7 @@ COOLDOWN_SECS=20
 BASELINE_CSV=""
 EXTRA_ARGS=()
 FAILED_FINAL_ROUNDS=0
+EXTRACT_METRICS_FROM_LOG=""
 SERVICE_METRICS_URL=""
 SERVICE_METRICS_DIR=""
 SERVICE_METRICS_CAPTURE_ATTEMPTS=3
@@ -126,6 +127,8 @@ Enhanced options:
   --server-revision            Source revision built into the benchmarked server
   --require-server-provenance  Fail unless the three server identity fields are set
   --label <key=value>          Repeatable run label written to run_manifest.env
+  --extract-metrics-from-log <log>
+                               Print parsed final Report metrics from one warp log and exit
   --node-metrics-url <node=url>
                                Repeatable node-specific Prometheus scrape URL captured
                                before/after each round attempt
@@ -195,6 +198,7 @@ parse_args() {
       --cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --round-cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --baseline-csv) BASELINE_CSV="$2"; shift 2 ;;
+      --extract-metrics-from-log) EXTRACT_METRICS_FROM_LOG="$2"; shift 2 ;;
       --service-metrics-url) SERVICE_METRICS_URL="$2"; shift 2 ;;
       --service-prometheus-query-url) SERVICE_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
       --service-prometheus-query) SERVICE_PROMETHEUS_QUERY="$2"; SERVICE_PROMETHEUS_QUERY_EXPLICIT=true; shift 2 ;;
@@ -1316,6 +1320,27 @@ compare_baseline() {
 
 main() {
   parse_args "$@"
+  if [[ -n "$EXTRACT_METRICS_FROM_LOG" ]]; then
+    if [[ ! -f "$EXTRACT_METRICS_FROM_LOG" ]]; then
+      echo "ERROR: --extract-metrics-from-log file not found: $EXTRACT_METRICS_FROM_LOG" >&2
+      exit 2
+    fi
+    local metrics throughput_human reqps latency_human req_p90_human req_p99_human
+    local throughput_bps latency_ms req_p90_ms req_p99_ms
+    metrics="$(extract_metrics "$EXTRACT_METRICS_FROM_LOG")"
+    throughput_human="$(echo "$metrics" | cut -d',' -f1)"
+    reqps="$(echo "$metrics" | cut -d',' -f2)"
+    latency_human="$(echo "$metrics" | cut -d',' -f3)"
+    req_p90_human="$(echo "$metrics" | cut -d',' -f4)"
+    req_p99_human="$(echo "$metrics" | cut -d',' -f5)"
+    throughput_bps="$(to_bps "$throughput_human")"
+    latency_ms="$(to_ms "$latency_human")"
+    req_p90_ms="$(to_ms "$req_p90_human")"
+    req_p99_ms="$(to_ms "$req_p99_human")"
+    echo "throughput_human,throughput_bps,reqps,latency_human,latency_ms,req_p90_human,req_p90_ms,req_p99_human,req_p99_ms"
+    echo "$throughput_human,$throughput_bps,$reqps,$latency_human,$latency_ms,$req_p90_human,$req_p90_ms,$req_p99_human,$req_p99_ms"
+    exit 0
+  fi
   validate_args
   require_cmd rg
   require_cmd awk
