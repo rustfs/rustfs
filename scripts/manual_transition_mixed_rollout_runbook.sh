@@ -318,7 +318,7 @@ normalize_object_count() {
   local lower
   raw="$1"
   raw="${raw// /}"
-  lower="${raw,,}"
+  lower="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
 
   if [[ "$lower" =~ ^([0-9]+)$ ]]; then
     echo "$lower"
