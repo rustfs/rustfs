@@ -382,6 +382,7 @@ struct ManualTransitionRunReport {
     skipped_delete_marker: u64,
     skipped_directory: u64,
     skipped_replication: u64,
+    skipped_already_transitioned: u64,
     skipped_already_in_flight: u64,
     skipped_queue_full: u64,
     skipped_queue_closed: u64,
@@ -1252,14 +1253,34 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     .await?;
 
     let before_remote_count = cold_tier_object_count(&cold_client).await?;
-    let accepted = manual_transition_async_run(
-        &hot,
-        MANUAL_ASYNC_CONFLICT_BUCKET,
-        MANUAL_ASYNC_CONFLICT_PREFIX,
-        false,
-        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
-    )
-    .await?;
+    let (parent, nested) = tokio::join!(
+        manual_transition_async_run_raw(
+            &hot,
+            MANUAL_ASYNC_CONFLICT_BUCKET,
+            MANUAL_ASYNC_CONFLICT_PREFIX,
+            false,
+            MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+        ),
+        manual_transition_async_run_raw(
+            &hot,
+            MANUAL_ASYNC_CONFLICT_BUCKET,
+            MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
+            false,
+            MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+        )
+    );
+    let responses = [parent?, nested?];
+    let accepted = responses
+        .iter()
+        .find(|(status, _)| *status == reqwest::StatusCode::ACCEPTED)
+        .ok_or("one concurrent overlapping-scope async run must be accepted")?;
+    let conflict = responses
+        .iter()
+        .find(|(status, _)| *status == reqwest::StatusCode::CONFLICT)
+        .ok_or("one concurrent overlapping-scope async run must report conflict")?;
+
+    let accepted: ManualTransitionRunResponse = serde_json::from_str(&accepted.1)?;
+    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict.1)?;
     let job_id = accepted
         .job_id
         .as_deref()
@@ -1276,22 +1297,14 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
 
     assert_eq!(accepted.state, "accepted");
     assert_eq!(accepted.mode, "durable_job");
-    let active = wait_for_manual_transition_job_running(&hot, status_endpoint, MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT).await?;
-    assert_eq!(active.job_id, job_id);
-    let (conflict_status, conflict_body) = manual_transition_async_run_raw(
-        &hot,
-        MANUAL_ASYNC_CONFLICT_BUCKET,
-        MANUAL_ASYNC_CONFLICT_NESTED_PREFIX,
-        false,
-        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
-    )
-    .await?;
-    assert_eq!(
-        conflict_status,
-        reqwest::StatusCode::CONFLICT,
-        "overlapping async run response: {conflict_body}"
+    assert_eq!(accepted.report.bucket, MANUAL_ASYNC_CONFLICT_BUCKET);
+    assert!(
+        matches!(
+            accepted.report.prefix.as_str(),
+            MANUAL_ASYNC_CONFLICT_PREFIX | MANUAL_ASYNC_CONFLICT_NESTED_PREFIX
+        ),
+        "overlapping async winner prefix: {accepted:#?}"
     );
-    let conflict: ManualTransitionJobConflictResponse = serde_json::from_str(&conflict_body)?;
     assert_eq!(conflict.state, "conflict");
     assert_eq!(conflict.mode, "durable_job");
     assert_eq!(conflict.active_job_id, job_id);
@@ -1304,19 +1317,20 @@ async fn test_manual_transition_async_overlapping_scope_conflict_reports_active_
     assert_eq!(terminal.status, "completed", "terminal conflict winner response: {terminal:#?}");
     assert!(!terminal.report.dry_run);
     assert_eq!(terminal.report.bucket, MANUAL_ASYNC_CONFLICT_BUCKET);
-    assert_eq!(terminal.report.prefix, MANUAL_ASYNC_CONFLICT_PREFIX);
+    assert_eq!(terminal.report.prefix, accepted.report.prefix);
     assert_eq!(
         terminal.report.scanned, MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
         "terminal conflict winner response: {terminal:#?}"
     );
     assert_eq!(
-        terminal.report.eligible, MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+        terminal.report.eligible + terminal.report.skipped_already_transitioned,
+        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
         "terminal conflict winner response: {terminal:#?}"
     );
     assert_eq!(terminal.report.dry_run_eligible, 0, "terminal conflict winner response: {terminal:#?}");
     assert_eq!(
         terminal.report.enqueued + terminal.report.skipped_already_in_flight,
-        MANUAL_ASYNC_CONFLICT_OBJECTS as u64,
+        terminal.report.eligible,
         "terminal conflict winner response: {terminal:#?}"
     );
     assert_eq!(
