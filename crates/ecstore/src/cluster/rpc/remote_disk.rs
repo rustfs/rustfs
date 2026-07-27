@@ -3167,6 +3167,36 @@ mod tests {
     }
 
     #[test]
+    fn rename_data_response_accepts_legacy_json_without_decode_error() {
+        crate::cluster::rpc::runtime_sources::reset_internode_metrics_for_test();
+        let response = RenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![0x14, 0x35]),
+            old_current_size: Some(crate::disk::OldCurrentSize::Present(64 * 1024)),
+        };
+        let json = serde_json::to_string(&response).expect("legacy rename_data JSON response should encode");
+        let decode_before = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
+        let decode_errors_before = crate::cluster::rpc::runtime_sources::internode_msgpack_json_decode_error_total_for_test();
+
+        let decoded = decode_msgpack_or_json::<RenameDataResp>(&[], &json, "RenameDataResp")
+            .expect("legacy rename_data JSON response should decode");
+        let decode_after = rustfs_io_metrics::internode_metrics::global_internode_metrics().msgpack_json_decode_total_for_test();
+        let decode_errors_after = crate::cluster::rpc::runtime_sources::internode_msgpack_json_decode_error_total_for_test();
+
+        assert_eq!(decoded.old_data_dir, response.old_data_dir);
+        assert_eq!(decoded.sign, response.sign);
+        assert_eq!(decoded.old_current_size, response.old_current_size);
+        assert!(
+            decode_after > decode_before,
+            "legacy JSON response should increment successful decode traffic"
+        );
+        assert_eq!(
+            decode_errors_after, decode_errors_before,
+            "legacy JSON compatibility fallback must stay observable without becoming a decode error"
+        );
+    }
+
+    #[test]
     fn read_multiple_response_payload_len_prefers_msgpack_and_falls_back_to_json() {
         let bin_a = encode_msgpack(&sample_read_multiple_resp("a", b"binary")).expect("msgpack should encode");
         let bin_b = encode_msgpack(&sample_read_multiple_resp("b", b"more")).expect("msgpack should encode");

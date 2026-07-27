@@ -617,6 +617,41 @@ fn records_msgpack_decode_metric_with_codec_label() {
 }
 
 #[test]
+fn records_msgpack_fallback_metric_with_direction_and_message_labels() {
+    let export = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: MSGPACK_JSON_FALLBACK_COUNTER.to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![
+                                metric_attribute(DIRECTION_LABEL, FALLBACK_RESPONSE_DIRECTION),
+                                metric_attribute(MESSAGE_LABEL, "RenameDataResp"),
+                            ],
+                            start_time_unix_nano: 7,
+                            time_unix_nano: 11,
+                            value: Some(number_data_point::Value::AsInt(14)),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let mut values = BTreeMap::new();
+
+    record_msgpack_fallback_metrics(&export, &mut values);
+
+    let key = msgpack_fallback_metric_key(FALLBACK_RESPONSE_DIRECTION, "RenameDataResp");
+    assert_eq!(values.get(&key).and_then(|points| points.get(&7)).copied(), Some((11, 14)));
+}
+
+#[test]
 fn records_msgpack_decode_error_metric_with_codec_label() {
     let export = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
