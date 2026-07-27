@@ -2,7 +2,7 @@
 
 This document describes the outbound connection policy that RustFS applies to
 server-initiated HTTP(S) requests, and the `RUSTFS_OUTBOUND_ALLOW_ORIGINS`
-allowlist operators use to reach endpoints on private or container networks.
+allowlist operators can use to reach endpoints on private or container networks.
 
 It is written for operators who upgraded to `1.0.0-beta.11` (or later) and found
 that event-notification webhooks, audit webhooks, or other outbound integrations
@@ -12,10 +12,10 @@ names, `host.docker.internal`, or RFC 1918 addresses.
 ## Background: what the policy protects
 
 Several RustFS subsystems open connections to operator-configured URLs. To close
-a server-side request forgery (SSRF) class of problem, RustFS validates every
-such destination and re-checks the addresses returned by DNS on each new
-connection, so a hostname cannot be rebound to a restricted address after it is
-first accepted.
+a server-side request forgery (SSRF) class of problem, RustFS validates every such
+destination and re-checks the addresses returned by DNS on each new connection,
+so a hostname cannot be rebound to a restricted address after it is first
+accepted.
 
 The policy governs the outbound clients used by:
 
@@ -26,8 +26,7 @@ The policy governs the outbound clients used by:
 - Keystone auth URLs.
 
 The webhook and audit outbound clients also **disable proxies and do not follow
-redirects**, so the destination must be reachable directly at the configured
-URL.
+redirects**, so the destination must be reachable directly at the configured URL.
 
 ## What changed in beta.11
 
@@ -39,7 +38,7 @@ URL.
 | Proxies / redirects for outbound clients | Followed | Disabled |
 
 Before beta.11 a webhook endpoint whose hostname happened to resolve to a
-private address was accepted. Beta.11 fails that resolution closed unless the
+private address was accepted. Beta.11 fails that resolution check unless the
 exact origin is on the allowlist. This is why a Compose setup that delivered
 events on beta.10 can go silent after the upgrade even though the configuration
 is unchanged.
@@ -50,7 +49,7 @@ is unchanged.
 - Uploads and audited API calls succeed.
 - No HTTP POST reaches the internal webhook receiver.
 - The target may appear offline or fail activation when its endpoint resolves to
-  a loopback, private, shared, or reserved address.
+a loopback, private, shared, or reserved address.
 - Startup or target validation reports `webhook endpoint is not allowed: ...`
   with a reason such as `private address` or `loopback host`.
 
