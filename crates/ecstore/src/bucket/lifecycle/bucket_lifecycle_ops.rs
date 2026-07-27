@@ -7759,15 +7759,13 @@ mod tests {
             ManualTransitionWorkerFailureReason::SlowDown
         );
         assert_eq!(
-            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::other(
                 "remote tier request failed with status 403 Forbidden: InvalidAccessKeyId",
             ))),
             ManualTransitionWorkerFailureReason::PermissionDenied
         );
         assert_eq!(
-            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            manual_transition_worker_failure_reason(&Error::Io(std::io::Error::other(
                 "client error (SendRequest)",
             ))),
             ManualTransitionWorkerFailureReason::Network
