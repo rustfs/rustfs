@@ -1898,8 +1898,13 @@ mod tests {
     use crate::disk::DiskAPI as _;
     use crate::disk::{endpoint::Endpoint, format::FormatV3};
     use crate::layout::endpoints::SetupType;
+    // No-locker helpers resolve to the isolated-context variants (see
+    // `hermetic_set_disks_isolated`); the guard-based tests build through
+    // `hermetic_set_disks_with_lockers`, which stays on the bootstrap context
+    // so their own ambient SetupTypeGuard flip remains visible to them.
     use crate::set_disk::ops::object::hermetic_set_disks_support::{
-        hermetic_set_disks, hermetic_set_disks_for_pool_with_default_parity, hermetic_set_disks_with_lockers,
+        hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity,
+        hermetic_set_disks_isolated as hermetic_set_disks, hermetic_set_disks_with_lockers,
     };
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};

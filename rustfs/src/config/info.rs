@@ -787,6 +787,7 @@ fn format_protocol_config_info() -> String {
     const DEFAULT_FTPS_PASSIVE_PORTS: &str = "40000-50000";
     const DEFAULT_WEBDAV_MAX_BODY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
     const DEFAULT_WEBDAV_REQUEST_TIMEOUT_SECS: u64 = 300;
+    const DEFAULT_WEBDAV_MAX_CONNECTIONS: usize = 1024;
 
     let ftps_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_FTPS_ENABLE, false);
     let ftps_address = rustfs_utils::get_env_str(rustfs_config::ENV_FTPS_ADDRESS, rustfs_config::DEFAULT_FTPS_ADDRESS);
@@ -809,6 +810,8 @@ fn format_protocol_config_info() -> String {
     let webdav_max_body_size = rustfs_utils::get_env_u64(rustfs_config::ENV_WEBDAV_MAX_BODY_SIZE, DEFAULT_WEBDAV_MAX_BODY_SIZE);
     let webdav_request_timeout =
         rustfs_utils::get_env_u64(rustfs_config::ENV_WEBDAV_REQUEST_TIMEOUT, DEFAULT_WEBDAV_REQUEST_TIMEOUT_SECS);
+    let webdav_max_connections =
+        rustfs_utils::get_env_usize(rustfs_config::ENV_WEBDAV_MAX_CONNECTIONS, DEFAULT_WEBDAV_MAX_CONNECTIONS);
 
     format!(
         "| FTPS | --- |\n\
@@ -828,7 +831,8 @@ fn format_protocol_config_info() -> String {
          | WebDAV > Certs Dir (`{}`) | {} |\n\
          | WebDAV > CA File (`{}`) | {} |\n\
          | WebDAV > Max Body Size (`{}`) | {} bytes |\n\
-         | WebDAV > Request Timeout (`{}`) | {} seconds |",
+         | WebDAV > Request Timeout (`{}`) | {} seconds |\n\
+         | WebDAV > Max Connections (`{}`) | {} |",
         if cfg!(feature = "ftps") { "enabled" } else { "disabled" },
         rustfs_config::ENV_FTPS_ENABLE,
         ftps_enable,
@@ -858,7 +862,9 @@ fn format_protocol_config_info() -> String {
         rustfs_config::ENV_WEBDAV_MAX_BODY_SIZE,
         webdav_max_body_size,
         rustfs_config::ENV_WEBDAV_REQUEST_TIMEOUT,
-        webdav_request_timeout
+        webdav_request_timeout,
+        rustfs_config::ENV_WEBDAV_MAX_CONNECTIONS,
+        webdav_max_connections
     )
 }
 

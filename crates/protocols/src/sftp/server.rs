@@ -34,7 +34,7 @@ use super::lifecycle::{SessionDiag, SessionRegistry, new_session_registry};
 #[cfg(target_os = "linux")]
 use super::wedge_watchdog;
 use crate::common::client::s3::StorageBackend;
-use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
 use russh::keys::{self, PrivateKey, PublicKeyBase64};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Pty, Sig};
@@ -1094,6 +1094,19 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
                     component = LOG_COMPONENT_PROTOCOLS,
                     subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
                     result = "account_inactive",
+                    user = %masked_user,
+                    peer = %peer_addr,
+                    "sftp auth state changed"
+                );
+                return Ok(Auth::reject());
+            }
+
+            if is_temporary_credential(&identity.credentials) {
+                warn!(
+                    event = EVENT_SFTP_AUTH_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                    result = "temporary_credential_rejected",
                     user = %masked_user,
                     peer = %peer_addr,
                     "sftp auth state changed"

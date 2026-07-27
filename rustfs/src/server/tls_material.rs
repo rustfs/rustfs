@@ -438,6 +438,7 @@ pub(crate) enum TlsHandshakeFailureKind {
     ProtocolVersion,
     Certificate,
     Alert,
+    Timeout,
     Unknown,
 }
 
@@ -462,8 +463,35 @@ impl TlsHandshakeFailureKind {
             Self::ProtocolVersion => "PROTOCOL_VERSION",
             Self::Certificate => "CERTIFICATE",
             Self::Alert => "ALERT",
+            Self::Timeout => "TIMEOUT",
             Self::Unknown => "UNKNOWN",
         }
+    }
+}
+
+/// Why a TLS handshake did not produce a usable stream.
+pub(crate) enum TlsAcceptFailure {
+    Handshake(std::io::Error),
+    Timeout,
+}
+
+/// Run the server-side TLS handshake under `handshake_timeout`.
+///
+/// Security invariant: the peer is unauthenticated at this point and the connection cap is
+/// unlimited by default, so this deadline is the only control that sheds a client which opens a
+/// socket and then stalls the handshake forever.
+pub(crate) async fn accept_tls_with_deadline<IO>(
+    acceptor: &TlsAcceptor,
+    socket: IO,
+    handshake_timeout: Duration,
+) -> Result<tokio_rustls::server::TlsStream<IO>, TlsAcceptFailure>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(handshake_timeout, acceptor.accept(socket)).await {
+        Ok(Ok(tls_socket)) => Ok(tls_socket),
+        Ok(Err(err)) => Err(TlsAcceptFailure::Handshake(err)),
+        Err(_) => Err(TlsAcceptFailure::Timeout),
     }
 }
 
@@ -667,6 +695,35 @@ mod tests {
             .expect("root single-cert TLS acceptor should build");
 
         assert!(acceptor.is_some());
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_deadline_sheds_a_peer_that_never_sends_client_hello() {
+        ensure_rustls_crypto_provider();
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        write_test_cert_pair(temp_dir.path(), "localhost");
+
+        let snapshot = load_tls_material(temp_dir.path().to_str().expect("temp dir path should be utf-8"))
+            .await
+            .expect("TLS material load should succeed");
+        let holder = build_acceptor_from_loaded(snapshot.server, temp_dir.path())
+            .await
+            .expect("TLS acceptor should build")
+            .expect("TLS acceptor should be present");
+
+        // The client half stays open and silent, so no ClientHello ever arrives.
+        let (_client, server) = tokio::io::duplex(1024);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_tls_with_deadline(&holder.get(), server, Duration::from_millis(100)),
+        )
+        .await
+        .expect("a stalled TLS handshake must be shed by the handshake deadline");
+
+        assert!(
+            matches!(outcome, Err(TlsAcceptFailure::Timeout)),
+            "a silent peer must fail the handshake with a timeout"
+        );
     }
 
     #[tokio::test]

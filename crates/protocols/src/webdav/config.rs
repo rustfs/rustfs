@@ -44,6 +44,8 @@ pub struct WebDavConfig {
     pub max_body_size: u64,
     /// Request timeout in seconds (default: 300)
     pub request_timeout_secs: u64,
+    /// Maximum number of connections served concurrently (default: 1024)
+    pub max_connections: usize,
 }
 
 impl WebDavConfig {
@@ -51,6 +53,8 @@ impl WebDavConfig {
     pub const DEFAULT_MAX_BODY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
     /// Default request timeout (300 seconds)
     pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+    /// Default concurrent connection cap
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
     /// Validates the configuration
     pub async fn validate(&self) -> Result<(), WebDavInitError> {
@@ -84,6 +88,13 @@ impl WebDavConfig {
             return Err(WebDavInitError::InvalidConfig("request_timeout_secs cannot be zero".to_string()));
         }
 
+        // Validate connection cap. Zero is rejected rather than treated as
+        // "unlimited": an unbounded accept loop is the resource-exhaustion
+        // hole this cap exists to close.
+        if self.max_connections == 0 {
+            return Err(WebDavInitError::InvalidConfig("max_connections cannot be zero".to_string()));
+        }
+
         Ok(())
     }
 }
@@ -98,6 +109,7 @@ impl Default for WebDavConfig {
             ca_file: None,
             max_body_size: Self::DEFAULT_MAX_BODY_SIZE,
             request_timeout_secs: Self::DEFAULT_REQUEST_TIMEOUT_SECS,
+            max_connections: Self::DEFAULT_MAX_CONNECTIONS,
         }
     }
 }

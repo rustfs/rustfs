@@ -104,7 +104,7 @@ set both `replicaCount` and `drivesPerNode` explicitly.
 | config.rustfs.kms.type | string | `vault`| The kms type that RustFS supported. |
 | config.rustfs.kms.vault.vault_backend | string | `""`| The vault backend, `vault-kv2` or `vault-transit`. |
 | config.rustfs.kms.vault.vault_address | string | `""`| The vault address. |
-| config.rustfs.kms.vault.vault_token | string | `""`| The vault token. |
+| config.rustfs.kms.vault.vault_token | string | `""`| The vault token. Rendered into a dedicated Secret (`<fullname>-kms-secret`), never into the ConfigMap. |
 | config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
 | config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
 | extraEnv | map | `[]` |  Extra environment variables for RustFS container. |

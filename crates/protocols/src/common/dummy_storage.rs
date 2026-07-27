@@ -37,8 +37,8 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
     CopyObjectInput, CopyObjectOutput, CopyPartResult, CreateBucketOutput, CreateMultipartUploadInput,
     CreateMultipartUploadOutput, DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput,
-    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob,
-    Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, ObjectKey, PutObjectInput,
+    PutObjectOutput, StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -121,6 +121,14 @@ pub struct HeadObjectCall {
     pub key: String,
 }
 
+/// Recorded invocation of delete_object. Tests assert on these to observe
+/// which objects a recursive delete path actually removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteObjectCall {
+    pub bucket: String,
+    pub key: String,
+}
+
 struct Inner {
     // Response queues. Each method pops from its own queue. Empty queue
     // plus no default means a configured-miss error.
@@ -148,6 +156,8 @@ struct Inner {
     upload_part_calls: Vec<UploadPartCall>,
     complete_multipart_calls: Vec<CompleteCall>,
     head_object_calls: Vec<HeadObjectCall>,
+    delete_object_calls: Vec<DeleteObjectCall>,
+    delete_bucket_calls: Vec<String>,
 
     // Cancellation-test support. When stall_upload_part is true every
     // upload_part invocation signals upload_part_entered and then awaits
@@ -197,6 +207,8 @@ impl Inner {
             upload_part_calls: Vec::new(),
             complete_multipart_calls: Vec::new(),
             head_object_calls: Vec::new(),
+            delete_object_calls: Vec::new(),
+            delete_bucket_calls: Vec::new(),
             stall_upload_part: false,
             upload_part_entered: None,
             stall_put_object: false,
@@ -213,8 +225,13 @@ impl Inner {
 /// tested, and keep another clone for observation. Method calls are
 /// fire-and-forget from the driver's perspective and synchronous on the
 /// test side.
+///
+/// Cloning shares the same queues and observation logs, so a test can hand
+/// one clone to a driver that takes its backend by value and keep another
+/// for assertions.
+#[derive(Clone)]
 pub struct DummyBackend {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 // Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
@@ -237,7 +254,7 @@ impl DummyBackend {
     /// configured-miss error until a queue is populated.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner::new()),
+            inner: Arc::new(Mutex::new(Inner::new())),
         }
     }
 
@@ -377,6 +394,43 @@ impl DummyBackend {
             .push_back(Ok(ListObjectsV2Output::default()));
     }
 
+    /// Queue a list_objects_v2 Ok response listing the given keys as a
+    /// single, non-truncated page. Recursive-delete tests use this to give
+    /// the delete loop something to iterate over.
+    pub fn queue_list_objects_v2_ok_with_keys(&self, keys: &[&str]) {
+        let contents = keys
+            .iter()
+            .map(|key| Object {
+                key: Some(ObjectKey::from((*key).to_string())),
+                ..Default::default()
+            })
+            .collect();
+        let out = ListObjectsV2Output {
+            contents: Some(contents),
+            is_truncated: Some(false),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").list_objects_v2.push_back(Ok(out));
+    }
+
+    /// Queue a delete_object Ok response.
+    pub fn queue_delete_object_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .delete_object
+            .push_back(Ok(DeleteObjectOutput::default()));
+    }
+
+    /// Queue a delete_bucket Ok response.
+    pub fn queue_delete_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .delete_bucket
+            .push_back(Ok(DeleteBucketOutput::default()));
+    }
+
     /// Queue a list_objects_v2 error. Used to verify that callers do
     /// not fall through to a destructive operation when the empty-check
     /// itself fails.
@@ -497,6 +551,16 @@ impl DummyBackend {
     }
 
     /// Snapshot the head_object call log.
+    /// Snapshot the recorded delete_object invocations.
+    pub fn delete_object_calls(&self) -> Vec<DeleteObjectCall> {
+        self.inner.lock().expect("lock").delete_object_calls.clone()
+    }
+
+    /// Snapshot the buckets passed to delete_bucket.
+    pub fn delete_bucket_calls(&self) -> Vec<String> {
+        self.inner.lock().expect("lock").delete_bucket_calls.clone()
+    }
+
     pub fn head_object_calls(&self) -> Vec<HeadObjectCall> {
         self.inner.lock().expect("lock").head_object_calls.clone()
     }
@@ -565,7 +629,12 @@ impl StorageBackend for DummyBackend {
     }
 
     async fn delete_object(&self, bucket: &str, key: &str, _ak: &str, _sk: &str) -> Result<DeleteObjectOutput, Self::Error> {
-        match self.inner.lock().expect("lock").delete_object.pop_front() {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.delete_object_calls.push(DeleteObjectCall {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        });
+        match inner.delete_object.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchKey(format!("{bucket}/{key}"))),
         }
@@ -636,7 +705,9 @@ impl StorageBackend for DummyBackend {
     }
 
     async fn delete_bucket(&self, bucket: &str, _ak: &str, _sk: &str) -> Result<DeleteBucketOutput, Self::Error> {
-        match self.inner.lock().expect("lock").delete_bucket.pop_front() {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.delete_bucket_calls.push(bucket.to_string());
+        match inner.delete_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchBucket(bucket.to_string())),
         }

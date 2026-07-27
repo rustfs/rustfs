@@ -37,6 +37,9 @@ s3s = { workspace = true, features = ["minio"] }
 base64-simd.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+
 [lints]
 workspace = true
 

@@ -55,6 +55,12 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the durable manual-transition checkpoint test across nextest's
+# process boundary; it mutates bucket lifecycle metadata and is not quarantined.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the 4-disk reliability / degraded-read e2e tests (see the
 # e2e-reliability test-group note above). The matching ci-profile override is at
 # the end of the file, after [profile.ci] is declared.
@@ -128,6 +134,12 @@ test-group = 'e2e-reliability'
 # no retries, just serialized 4-disk cross-disk-commit IO.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the durable manual-transition checkpoint test under the ci profile
+# too. No retries: failures stay visible.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
 test-group = 'ecstore-serial-flaky'
 
 # ---------------------------------------------------------------------------

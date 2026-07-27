@@ -32,11 +32,40 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+/// Reject key identifiers that would not name a single file directly inside the key
+/// directory.
+///
+/// The rule is containment, not a character allowlist: anything that stays inside
+/// `key_dir` is accepted, so identifiers already in use by existing deployments keep
+/// resolving. Only separators, traversal and the degenerate cases are refused, which is
+/// what stops `key_dir.join(...)` from escaping.
+fn validate_key_id(key_id: &str) -> Result<()> {
+    if key_id.is_empty() {
+        return Err(KmsError::invalid_key("key identifier must not be empty"));
+    }
+    if key_id.contains('/') || key_id.contains('\\') || key_id.contains('\0') {
+        return Err(KmsError::invalid_key(format!(
+            "key identifier must not contain path separators or NUL: {key_id:?}"
+        )));
+    }
+
+    // Catches `.`, `..`, absolute paths, and platform-specific forms such as Windows
+    // drive prefixes, all of which would move the join outside key_dir.
+    let file_name = format!("{key_id}.key");
+    let mut components = Path::new(&file_name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(KmsError::invalid_key(format!(
+            "key identifier must name a single file inside the key directory: {key_id:?}"
+        ))),
+    }
+}
 
 const LOCAL_KMS_MASTER_KEY_SALT_FILE: &str = ".master-key.salt";
 const LOCAL_KMS_MASTER_KEY_SALT_LEN: usize = 16;
@@ -187,14 +216,26 @@ impl LocalKmsClient {
         Ok(())
     }
 
-    /// Get the file path for a master key
-    fn master_key_path(&self, key_id: &str) -> PathBuf {
-        self.config.key_dir.join(format!("{key_id}.key"))
+    /// Get the file path for a master key.
+    ///
+    /// Key identifiers reach this from request input (the `name` tag on CreateKey, the
+    /// `keyId` body field or query parameter on DeleteKey), so they are joined onto
+    /// `key_dir` only after being confirmed to name a single file inside it. Without that
+    /// check an identifier such as `../../tmp/evil` escapes the configured key directory,
+    /// turning key creation into a constrained arbitrary-file write and key deletion into
+    /// a cross-directory delete.
+    ///
+    /// Every filesystem path in this backend is derived here, so validating at this one
+    /// point covers `decode_stored_key`, `load_master_key`, `save_master_key`, `create_key`
+    /// and `delete_key`.
+    fn master_key_path(&self, key_id: &str) -> Result<PathBuf> {
+        validate_key_id(key_id)?;
+        Ok(self.config.key_dir.join(format!("{key_id}.key")))
     }
 
     /// Decode and decrypt a stored key file, returning both the metadata and decrypted key material
     async fn decode_stored_key(&self, key_id: &str) -> Result<(StoredMasterKey, Vec<u8>)> {
-        let key_path = self.master_key_path(key_id);
+        let key_path = self.master_key_path(key_id)?;
         if !fs::try_exists(&key_path).await? {
             return Err(KmsError::key_not_found(key_id));
         }
@@ -284,7 +325,7 @@ impl LocalKmsClient {
 
     /// Save a master key to disk
     async fn save_master_key(&self, master_key: &MasterKeyInfo, key_material: &[u8]) -> Result<()> {
-        let key_path = self.master_key_path(&master_key.key_id);
+        let key_path = self.master_key_path(&master_key.key_id)?;
 
         // Encrypt key material if master cipher is available
         let (encrypted_key_material, nonce, at_rest_protection) = if let Some(ref cipher) = self.master_cipher {
@@ -453,7 +494,7 @@ impl KmsClient for LocalKmsClient {
         debug!("Creating master key: {}", key_id);
 
         // Check if key already exists
-        if self.master_key_path(key_id).exists() {
+        if self.master_key_path(key_id)?.exists() {
             return Err(KmsError::key_already_exists(key_id));
         }
 
@@ -704,6 +745,15 @@ impl KmsBackend for LocalKmsBackend {
     async fn create_key(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
         let key_id = request.key_name.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        // `save_master_key` writes through a temp file and renames over the destination, so
+        // creating a key under an existing name would replace its material and silently
+        // destroy the ability to decrypt everything wrapped under it. The sibling
+        // `KmsClient::create_key` has always refused this; the backend path did not, and
+        // this is the path the admin API uses.
+        if self.client.master_key_path(&key_id)?.exists() {
+            return Err(KmsError::key_already_exists(&key_id));
+        }
+
         // Create master key with description directly
         let _master_key = {
             let algorithm = "AES_256";
@@ -833,7 +883,7 @@ impl KmsBackend for LocalKmsBackend {
 
         let (deletion_date_str, deletion_date_dt) = if request.force_immediate.unwrap_or(false) {
             // For immediate deletion, actually delete the key from filesystem
-            let key_path = self.client.master_key_path(key_id);
+            let key_path = self.client.master_key_path(key_id)?;
             tokio::fs::remove_file(&key_path)
                 .await
                 .map_err(|e| KmsError::internal_error(format!("Failed to delete key file: {e}")))?;
@@ -1132,7 +1182,7 @@ mod tests {
         assert_eq!(salt.len(), LOCAL_KMS_MASTER_KEY_SALT_LEN);
 
         let stored: StoredMasterKey = serde_json::from_slice(
-            &fs::read(client.master_key_path("encrypted-key"))
+            &fs::read(client.master_key_path("encrypted-key").expect("valid key id"))
                 .await
                 .expect("stored key should exist"),
         )
@@ -1150,7 +1200,7 @@ mod tests {
             .expect("Failed to create plaintext-dev-only key");
 
         let stored: StoredMasterKey = serde_json::from_slice(
-            &fs::read(client.master_key_path("plaintext-key"))
+            &fs::read(client.master_key_path("plaintext-key").expect("valid key id"))
                 .await
                 .expect("stored key should exist"),
         )
@@ -1208,7 +1258,7 @@ mod tests {
             "nonce": Vec::<u8>::new()
         });
 
-        let key_path = client.master_key_path("legacy-key");
+        let key_path = client.master_key_path("legacy-key").expect("valid key id");
         fs::write(&key_path, serde_json::to_vec_pretty(&stored_key).expect("serialize test key"))
             .await
             .expect("write legacy key");
@@ -1226,7 +1276,7 @@ mod tests {
             .await
             .expect("Failed to create encrypted key");
 
-        let key_path = client.master_key_path("legacy-encrypted-key");
+        let key_path = client.master_key_path("legacy-encrypted-key").expect("valid key id");
         let mut stored_json: serde_json::Value =
             serde_json::from_slice(&fs::read(&key_path).await.expect("stored key should exist"))
                 .expect("stored key should deserialize");
@@ -1321,5 +1371,102 @@ mod tests {
             .await
             .expect_err("wrong beta.5 master key must not decrypt the fixture");
         assert!(matches!(error, KmsError::CryptographicError { .. }));
+    }
+
+    /// R03-CAN-072 / R03-CAN-073: key identifiers arrive from request input, so every path
+    /// derived from one must stay inside the configured key directory. Traversal here would
+    /// turn CreateKey into a constrained arbitrary-file write and DeleteKey into a
+    /// cross-directory delete.
+    #[tokio::test]
+    async fn master_key_path_confines_key_ids_to_the_key_directory() {
+        let (client, temp_dir) = create_test_client().await;
+
+        // The invariant is containment, so assert that directly: whatever the input, the
+        // result is either refused or a path whose parent is exactly the key directory.
+        // Note `.` and `..` are contained rather than refused — the `.key` suffix turns
+        // them into the ordinary filenames `..key` and `...key`.
+        for candidate in [
+            "../escape",
+            "../../etc/rustfs",
+            "sub/dir",
+            "..",
+            ".",
+            "",
+            "/absolute",
+            "back\\slash",
+            "nul\0byte",
+            "....//....//escape",
+        ] {
+            match client.master_key_path(candidate) {
+                Err(KmsError::InvalidKey { .. }) => {}
+                Err(other) => panic!("unexpected error kind for {candidate:?}: {other:?}"),
+                Ok(path) => assert_eq!(
+                    path.parent(),
+                    Some(temp_dir.path()),
+                    "{candidate:?} was accepted but escapes the key directory: {path:?}"
+                ),
+            }
+        }
+
+        // The traversal forms specifically must be refused, not merely contained.
+        for escaping in ["../escape", "sub/dir", "/absolute", "back\\slash", "nul\0byte", ""] {
+            let err = client.master_key_path(escaping).expect_err("traversal must be refused");
+            assert!(
+                matches!(err, KmsError::InvalidKey { .. }),
+                "expected InvalidKey for {escaping:?}, got {err:?}"
+            );
+        }
+
+        // Ordinary identifiers, including the UUID form used when no name is supplied,
+        // must still resolve — and must land directly in the key directory.
+        for ok in ["test-key", "a.b_c-1", "3f2504e0-4f89-11d3-9a0c-0305e82c3301"] {
+            let path = client.master_key_path(ok).expect("valid key id must be accepted");
+            assert_eq!(
+                path.parent(),
+                Some(temp_dir.path()),
+                "{ok:?} must resolve directly inside the key directory"
+            );
+        }
+    }
+
+    /// R07-CAN-103: `save_master_key` writes a temp file and renames over the destination,
+    /// so creating a key under an existing name would replace its material and silently
+    /// destroy the ability to decrypt anything wrapped under it.
+    #[tokio::test]
+    async fn backend_create_key_refuses_to_replace_existing_key_material() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let client = LocalKmsClient::new(LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: Some("test-master-key".to_string()),
+            file_permissions: Some(0o600),
+        })
+        .await
+        .expect("Failed to create client");
+        let backend = LocalKmsBackend { client };
+
+        let request = || CreateKeyRequest {
+            key_name: Some("duplicate-key".to_string()),
+            ..Default::default()
+        };
+
+        backend.create_key(request()).await.expect("first create must succeed");
+        let original = backend
+            .client
+            .get_key_material("duplicate-key")
+            .await
+            .expect("key material must be readable after creation");
+
+        let err = backend
+            .create_key(request())
+            .await
+            .expect_err("creating a key under an existing name must be refused");
+        assert!(matches!(err, KmsError::KeyAlreadyExists { .. }), "expected KeyAlreadyExists, got {err:?}");
+
+        let after = backend
+            .client
+            .get_key_material("duplicate-key")
+            .await
+            .expect("original key material must survive the refused create");
+        assert_eq!(original, after, "existing key material must not be replaced");
     }
 }

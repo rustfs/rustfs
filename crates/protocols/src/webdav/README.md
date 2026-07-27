@@ -59,6 +59,7 @@ Configure WebDAV via environment variables:
 | `RUSTFS_WEBDAV_CA_FILE` | CA file for client verification | - |
 | `RUSTFS_WEBDAV_MAX_BODY_SIZE` | Max upload size (bytes) | 5GB |
 | `RUSTFS_WEBDAV_REQUEST_TIMEOUT` | Request timeout (seconds) | 300 |
+| `RUSTFS_WEBDAV_MAX_CONNECTIONS` | Max concurrently served connections | 1024 |
 
 ## Quick Start
 

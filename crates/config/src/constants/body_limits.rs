@@ -28,6 +28,15 @@ pub const MAX_ADMIN_REQUEST_BODY_SIZE: usize = 1024 * 1024; // 1 MB
 /// Rationale: ZIP archives with hundreds of IAM entities. 10MB allows ~10,000 small configs.
 pub const MAX_IAM_IMPORT_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
+/// Maximum total size the members of an IAM import ZIP may expand to (100 MB).
+/// Used for: bounding decompression of `ImportIam` archive members.
+/// Rationale: `MAX_IAM_IMPORT_SIZE` caps the *compressed* upload only. Deflate
+/// reaches ratios far above 100:1, so without a separate budget a 10 MB archive
+/// can expand without bound. 100 MB keeps a 10x headroom over the compressed cap
+/// — ample for legitimate IAM exports, which are small JSON documents — while
+/// keeping the worst case bounded.
+pub const MAX_IAM_IMPORT_EXPANDED_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
+
 /// Maximum size for bucket metadata import operations (100 MB)
 /// Used for: Bucket metadata import containing configurations for many buckets
 /// Rationale: Large deployments may have thousands of buckets with various configs.
@@ -54,3 +63,12 @@ pub const MAX_HEAL_REQUEST_SIZE: usize = 1024 * 1024; // 1 MB
 /// 10MB provides generous headroom for legitimate responses while preventing
 /// memory exhaustion from malicious or misconfigured remote services.
 pub const MAX_S3_CLIENT_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
+/// Maximum size for OIDC provider response bodies (1 MB)
+/// Used for: discovery documents, JWKS documents and token endpoint responses
+/// Rationale: a hostile or compromised identity provider must not be able to exhaust
+/// memory through an arbitrarily large or endless response body.
+/// - Discovery documents: typically < 10KB
+/// - JWKS documents: typically < 50KB
+/// - Token responses: typically < 10KB
+pub const MAX_OIDC_RESPONSE_SIZE: usize = 1024 * 1024; // 1 MB

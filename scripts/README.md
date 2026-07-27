@@ -86,6 +86,12 @@ their issue closes.
 | `restart_local_single_node_multidisk_rustfs.sh` | dev-tool | Restart a local single-node multi-disk instance | — |
 | `inspect_dashboard.sh` | dev-tool | Sanity-checks the Grafana dashboard JSON | `.docker/observability` |
 | `notify.sh` | dev-tool | Starts a local webhook receiver for notify-target development | — |
+| `manual_transition_debug.sh` | dev-tool | Log/metrics helper for manual transition troubleshooting | — |
+| `manual_transition_journal_audit.sh` | dev-tool | Journal + metrics + log audit for manual transition jobs | — |
+| `manual_transition_mixed_rollout_matrix.sh` | dev-tool | Matrix generator for mixed-version rollout phases | — |
+| `manual_transition_mixed_rollout_runbook.sh` | dev-tool | Reusable mixed-version rollout runbook generator (external run) | — |
+| `manual_transition_soak_matrix.sh` | dev-tool | Matrix generator for nightly stress windows | — |
+| `manual_transition_nightly_stress_runbook.sh` | dev-tool | Nightly stress entrypoint with failure snapshot templates | — |
 | `install-flatc.sh` | dev-tool | Local flatc installer (macOS) | — |
 | `install-protoc.sh` | dev-tool | Local protoc installer (macOS/Linux) | — |
 | `makefile-header.sh` | dev-tool | Generates the `## —— section ——` header lines used in `.config/make/*.mak` | — |

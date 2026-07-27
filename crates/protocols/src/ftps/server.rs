@@ -15,7 +15,7 @@
 use super::config::{FtpsConfig, FtpsInitError};
 use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
-use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
 use libunftp::options::FtpsRequired;
 use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
@@ -464,6 +464,19 @@ impl Authenticator for FtpsAuthenticator {
             );
             AuthenticationError::BadUser
         })?;
+
+        if is_temporary_credential(&identity.credentials) {
+            warn!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "temporary_credential_rejected",
+                phase = "authenticate",
+                username = %masked_username,
+                "FTPS auth rejected temporary credential"
+            );
+            return Err(AuthenticationError::BadUser);
+        }
 
         // Constant-time secret comparison to prevent timing side-channel
         // attacks. Same primitive used by the SFTP handler and rustfs/src/auth.rs.

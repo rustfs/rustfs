@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_credentials::Credentials;
 use rustfs_policy::auth::UserIdentity;
 use std::net::IpAddr;
 #[cfg(test)]
@@ -41,6 +42,21 @@ impl ProtocolPrincipal {
     pub fn access_key(&self) -> &str {
         &self.user_identity.credentials.access_key
     }
+}
+
+/// Returns `true` when `credentials` are short-lived STS/AssumeRole credentials.
+///
+/// SECURITY: password-based protocol logins (FTPS, SFTP, WebDAV Basic) have nowhere to carry the
+/// session token that an STS credential is only valid with, so accepting the access/secret pair
+/// alone would authenticate the holder as the parent user with none of the session-policy
+/// restrictions the token encodes. Such logins must be rejected.
+///
+/// Service accounts also hold a signed token, but their policy is resolved from stored IAM state
+/// rather than from a token the client must present, so they stay eligible for these protocols.
+/// The `is_temp() && !is_service_account()` pairing is the same STS discriminator the IAM manager
+/// uses when routing an identity into the STS account cache.
+pub fn is_temporary_credential(credentials: &Credentials) -> bool {
+    credentials.is_temp() && !credentials.is_service_account()
 }
 
 /// Session context for protocol operations
@@ -85,6 +101,95 @@ pub fn test_session(protocol: Protocol) -> SessionContext {
 #[cfg(test)]
 mod regression_prevention {
     use super::*;
+    use rustfs_credentials::{IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use time::{Duration, OffsetDateTime};
+
+    fn service_account_claims() -> HashMap<String, Value> {
+        let mut claims = HashMap::new();
+        claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), Value::String(INHERITED_POLICY_TYPE.to_string()));
+        claims
+    }
+
+    #[test]
+    fn sts_credentials_are_temporary() {
+        let sts = Credentials {
+            access_key: "VV0V3VYJK2PV6EG45X2Y".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            parent_user: "alice".to_string(),
+            ..Default::default()
+        };
+
+        assert!(is_temporary_credential(&sts));
+    }
+
+    #[test]
+    fn service_accounts_are_not_temporary() {
+        // Service accounts also carry a signed token; they must keep working over FTPS/SFTP/WebDAV.
+        let service_account = Credentials {
+            access_key: "39KNO04Z34D6T4AGL6E6".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            parent_user: "alice".to_string(),
+            claims: Some(service_account_claims()),
+            ..Default::default()
+        };
+
+        assert!(service_account.is_service_account());
+        assert!(!is_temporary_credential(&service_account));
+    }
+
+    #[test]
+    fn long_term_credentials_are_not_temporary() {
+        let long_term = Credentials {
+            access_key: "alice".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!is_temporary_credential(&long_term));
+    }
+
+    #[test]
+    fn expired_sts_credentials_are_rejected_by_the_validity_gate() {
+        // is_temp() goes false once the session expires, so the STS guard alone would let an
+        // expired session in. The `is_valid` check every password path runs first is what covers
+        // this case; assert both halves so neither can be dropped unnoticed.
+        let expired = Credentials {
+            access_key: "VV0V3VYJK2PV6EG45X2Y".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            parent_user: "alice".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() - Duration::hours(1)),
+            ..Default::default()
+        };
+
+        assert!(!is_temporary_credential(&expired));
+        assert!(!expired.is_valid());
+    }
+
+    #[test]
+    fn password_auth_paths_reject_temporary_credentials() {
+        let guard = concat!("is_temporary_credential(&identity.", "credentials)");
+        for (protocol, source) in [
+            ("ftps", include_str!("../ftps/server.rs")),
+            ("webdav", include_str!("../webdav/server.rs")),
+            ("sftp", include_str!("../sftp/server.rs")),
+        ] {
+            let guard_at = source
+                .find(guard)
+                .unwrap_or_else(|| panic!("{protocol} password authentication must reject temporary STS credentials"));
+            let accept_at = source
+                .find(r#"result = "authenticated""#)
+                .unwrap_or_else(|| panic!("{protocol} has no authenticated log line to anchor the guard against"));
+            assert!(
+                guard_at < accept_at,
+                "{protocol} must reject temporary STS credentials before authentication succeeds"
+            );
+        }
+    }
 
     // Compile-time check that every Protocol variant is acknowledged here.
     // This is intentionally an exhaustive match with no wildcard arm: if a

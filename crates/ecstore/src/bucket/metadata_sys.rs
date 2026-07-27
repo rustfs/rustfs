@@ -16,7 +16,7 @@ use super::metadata::{BUCKET_TARGETS_FILE, BucketMetadata, load_bucket_metadata}
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
-use crate::bucket::metadata::load_bucket_metadata_parse;
+use crate::bucket::metadata::{load_bucket_metadata_parse, load_bucket_metadata_parse_with_presence};
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found};
@@ -190,7 +190,7 @@ pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
 // instance cell is not initialized yet (early startup) they fall back to the
 // ambient default — the single-instance legacy behavior.
 
-fn bucket_metadata_sys_of(ctx: &crate::runtime::instance::InstanceContext) -> Result<Arc<RwLock<BucketMetadataSys>>> {
+pub(crate) fn bucket_metadata_sys_of(ctx: &crate::runtime::instance::InstanceContext) -> Result<Arc<RwLock<BucketMetadataSys>>> {
     if let Some(sys) = ctx.bucket_metadata_sys() {
         return Ok(sys);
     }
@@ -422,9 +422,23 @@ pub async fn list_bucket_targets(bucket: &str) -> Result<BucketTargets> {
     bucket_meta_sys.get_bucket_targets_config(bucket).await
 }
 
+/// Bound and lifetime of the negative cache for buckets with no persisted
+/// metadata. Entries are invalidated the moment real metadata is cached, so
+/// the TTL only bounds staleness for out-of-band creations whose reload
+/// notification was lost; the capacity bounds memory under bogus-name floods.
+const ABSENT_BUCKET_METADATA_TTL: Duration = Duration::from_secs(30);
+const ABSENT_BUCKET_METADATA_MAX_ENTRIES: u64 = 10_000;
+
 #[derive(Debug)]
 pub struct BucketMetadataSys {
     metadata_map: RwLock<HashMap<String, Arc<BucketMetadata>>>,
+    /// Buckets recently observed to have no persisted metadata. Serving the
+    /// fabricated default from here (instead of re-reading disk) keeps the
+    /// per-request cost of repeated lookups for such names bounded — without
+    /// this, every request naming a nonexistent bucket pays a namespace-lock
+    /// acquisition plus a full erasure-set metadata fanout (reachable
+    /// pre-auth via CORS preflight, and per-key in DeleteObjects).
+    absent_metadata: moka::future::Cache<String, ()>,
     api: Arc<ECStore>,
     initialized: RwLock<bool>,
 }
@@ -433,6 +447,10 @@ impl BucketMetadataSys {
     pub fn new(api: Arc<ECStore>) -> Self {
         Self {
             metadata_map: RwLock::new(HashMap::new()),
+            absent_metadata: moka::future::Cache::builder()
+                .max_capacity(ABSENT_BUCKET_METADATA_MAX_ENTRIES)
+                .time_to_live(ABSENT_BUCKET_METADATA_TTL)
+                .build(),
             api,
             initialized: RwLock::new(false),
         }
@@ -487,7 +505,7 @@ impl BucketMetadataSys {
                         },
                     )
                     .await;
-                load_bucket_metadata(self.api.clone(), bucket.as_str()).await
+                load_bucket_metadata_parse_with_presence(self.api.clone(), bucket.as_str(), true).await
             });
         }
 
@@ -495,9 +513,24 @@ impl BucketMetadataSys {
 
         for (idx, res) in results.into_iter().enumerate() {
             match res {
-                Ok(res) => {
+                Ok((bm, persisted)) => {
                     if let Some(bucket) = buckets.get(idx) {
-                        self.set(bucket.clone(), Arc::new(res)).await;
+                        if persisted {
+                            self.set(bucket.clone(), Arc::new(bm)).await;
+                        } else {
+                            // A fabricated default (no persisted metadata
+                            // readable right now) must never REPLACE an
+                            // existing entry: the periodic refresh would
+                            // otherwise downgrade a lock-enabled bucket to an
+                            // authoritative "no lock" default on a transient
+                            // ConfigNotFound, disabling the object-lock
+                            // delete gate and wiping its target/durability
+                            // sync state. Insert-if-vacant keeps the startup
+                            // behavior for legacy buckets without a metadata
+                            // file, atomically under the map write lock.
+                            let mut map = self.metadata_map.write().await;
+                            map.entry(bucket.clone()).or_insert_with(|| Arc::new(bm));
+                        }
                     }
                 }
                 Err(e) => {
@@ -528,6 +561,8 @@ impl BucketMetadataSys {
             let mut map = self.metadata_map.write().await;
             map.insert(bucket.clone(), bm.clone());
             drop(map);
+            // Real metadata supersedes any recorded absence immediately.
+            self.absent_metadata.invalidate(&bucket).await;
             sync_bucket_target_sys(&bucket, &bm).await;
             sync_bucket_durability(&bucket, &bm);
         }
@@ -630,13 +665,22 @@ impl BucketMetadataSys {
     pub async fn get_config(&self, bucket: &str) -> Result<(Arc<BucketMetadata>, bool)> {
         let has_bm = {
             let map = self.metadata_map.read().await;
-            map.get(&bucket.to_string()).cloned()
+            map.get(bucket).cloned()
         };
 
         if let Some(bm) = has_bm {
             Ok((bm, false))
         } else {
-            let bm = match load_bucket_metadata(self.api.clone(), bucket).await {
+            // A recent lookup already established there is no persisted
+            // metadata: serve the fabricated default without another
+            // namespace-lock + erasure-set fanout.
+            if self.absent_metadata.get(bucket).await.is_some() {
+                let mut bm = BucketMetadata::new(bucket);
+                bm.default_timestamps();
+                return Ok((Arc::new(bm), true));
+            }
+
+            let (bm, persisted) = match load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true).await {
                 Ok(res) => res,
                 Err(err) => {
                     return if *self.initialized.read().await {
@@ -647,13 +691,27 @@ impl BucketMetadataSys {
                 }
             };
 
-            let mut map = self.metadata_map.write().await;
-
             let bm = Arc::new(bm);
-            map.insert(bucket.to_string(), bm.clone());
-            drop(map);
-            sync_bucket_target_sys(bucket, &bm).await;
-            sync_bucket_durability(bucket, &bm);
+
+            // This lazy path caches only metadata that actually exists on
+            // this store. A fabricated default must not enter the map:
+            // `get()` is map-only and fail-closed — the object-lock delete
+            // gate (`object_lock_delete_check_required`) skips its per-object
+            // protection stat exactly when the map serves metadata saying the
+            // bucket has no Object Lock, so caching a fabricated default here
+            // would turn a metadata miss into an authoritative "no lock"
+            // answer. (Startup `concurrent_load` still caches fabricated
+            // defaults for buckets listed on disk — legacy buckets without a
+            // metadata file — but never lets one replace an existing entry.)
+            if persisted {
+                let mut map = self.metadata_map.write().await;
+                map.insert(bucket.to_string(), bm.clone());
+                drop(map);
+                sync_bucket_target_sys(bucket, &bm).await;
+                sync_bucket_durability(bucket, &bm);
+            } else {
+                self.absent_metadata.insert(bucket.to_string(), ()).await;
+            }
 
             Ok((bm, true))
         }
@@ -873,12 +931,125 @@ impl BucketMetadataSys {
     }
 }
 
+/// Test-only fixture shared with sibling modules (e.g. the quota checker
+/// tests): a 4-disk `ECStore` on an isolated instance context, so tests
+/// exercising the metadata system never touch ambient process state.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::disk::endpoint::Endpoint;
+    use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::runtime::instance::InstanceContext;
+    use crate::store::init_local_disks_with_instance_ctx;
+
+    pub(crate) async fn isolated_store_over_temp_disks() -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        let mut dirs = Vec::with_capacity(4);
+        let mut endpoints = Vec::with_capacity(4);
+        for disk_idx in 0..4 {
+            let dir = tempfile::tempdir().expect("tempdir should be created");
+            let mut endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_idx);
+            dirs.push(dir);
+            endpoints.push(endpoint);
+        }
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "metadata-sys-cache-test".to_string(),
+            platform: "test".to_string(),
+        }]);
+        let instance_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("local disks should initialize");
+        let ecstore = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            endpoint_pools,
+            CancellationToken::new(),
+            instance_ctx,
+        )
+        .await
+        .expect("ECStore should initialize");
+        (dirs, ecstore)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::isolated_store_over_temp_disks;
     use super::*;
     use crate::bucket::target::{BucketTarget, BucketTargetType, Credentials};
     use serial_test::serial;
     use tokio::time::timeout;
+
+    /// Pins the fail-closed caching contract of the lazy `get_config` path
+    /// and the refresh no-replace rule: fabricated defaults are returned but
+    /// never served by the map-only `get()`, persisted metadata is cached on
+    /// lazy load (superseding a recorded absence), and a refresh-load miss
+    /// never replaces an existing entry.
+    #[tokio::test]
+    async fn get_config_never_caches_fabricated_defaults_as_authoritative() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+
+        // (a) Miss: the fabricated default is returned but not cached.
+        let (bm, _) = sys
+            .get_config("absent-bucket")
+            .await
+            .expect("fabricated default should be returned");
+        assert!(bm.object_lock_config_xml.is_empty());
+        assert!(
+            sys.get("absent-bucket").await.is_err(),
+            "a fabricated default must never be served by the map-only get()"
+        );
+
+        // The repeat lookup is served from the negative cache, same answer.
+        let (bm, _) = sys
+            .get_config("absent-bucket")
+            .await
+            .expect("negative-cached default should be returned");
+        assert!(bm.object_lock_config_xml.is_empty());
+        assert!(sys.get("absent-bucket").await.is_err());
+
+        // (b) Persisting real metadata supersedes the recorded absence, and a
+        // lazy reload after a map wipe re-caches it.
+        let mut persisted = BucketMetadata::new("absent-bucket");
+        persisted.policy_config_json = b"persisted-marker".to_vec();
+        sys.persist_and_set(persisted).await.expect("metadata should persist");
+        sys.metadata_map.write().await.clear();
+        let _ = sys
+            .get_config("absent-bucket")
+            .await
+            .expect("persisted metadata should lazily reload");
+        let cached = sys
+            .get("absent-bucket")
+            .await
+            .expect("lazily loaded persisted metadata must be cached");
+        assert_eq!(cached.policy_config_json, b"persisted-marker".to_vec());
+
+        // (c) A refresh-load miss (no persisted metadata readable) must not
+        // replace an existing entry.
+        let mut kept = BucketMetadata::new("kept-bucket");
+        kept.policy_config_json = b"kept-marker".to_vec();
+        sys.set("kept-bucket".to_string(), Arc::new(kept)).await;
+        let mut failed = HashSet::new();
+        let refresh_targets = vec!["kept-bucket".to_string()];
+        sys.concurrent_load(&refresh_targets, &mut failed).await;
+        let kept = sys
+            .get("kept-bucket")
+            .await
+            .expect("existing entry must survive a refresh miss");
+        assert_eq!(
+            kept.policy_config_json,
+            b"kept-marker".to_vec(),
+            "a fabricated refresh default must not replace real metadata"
+        );
+    }
 
     fn target(bucket: &str, id: &str) -> BucketTarget {
         BucketTarget {

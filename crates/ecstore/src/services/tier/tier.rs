@@ -6749,6 +6749,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_fanout_converges_four_hot_reporter_committed_prepare_replay() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        empty_mgr()
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("empty tier config fixture should persist");
+        let (candidate, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should reload");
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![
+                    FakeTierMutationPeer::boxed_with_prepare_commit(
+                        "peer-a",
+                        calls.clone(),
+                        Ok(PeerTierMutationState::Committed),
+                        Ok(PeerTierMutationState::Committed),
+                    ),
+                    FakeTierMutationPeer::boxed_with_prepare_commit(
+                        "peer-b",
+                        calls.clone(),
+                        Ok(PeerTierMutationState::Prepared),
+                        Ok(PeerTierMutationState::Committed),
+                    ),
+                    FakeTierMutationPeer::boxed_with_prepare_commit(
+                        "peer-c",
+                        calls.clone(),
+                        Ok(PeerTierMutationState::Prepared),
+                        Ok(PeerTierMutationState::Committed),
+                    ),
+                ],
+                async {
+                    TierConfigMgr::update_candidate_owned(
+                        &manager,
+                        store.clone(),
+                        candidate,
+                        version,
+                        TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true),
+                        update,
+                        None,
+                    )
+                    .await
+                    .expect("four-hot AddTier reporter replay should publish after prepared peers commit");
+                },
+            )
+            .await;
+
+        let calls = lock_unpoisoned(&calls).clone();
+        let reporter_prepare_call = calls
+            .iter()
+            .find(|call| call.starts_with("peer-a:prepare:"))
+            .expect("reporter peer should receive prepare replay");
+        let reporter_mutation_id = reporter_prepare_call
+            .split(':')
+            .nth(2)
+            .expect("reporter prepare call should record the mutation id");
+        assert!(
+            !calls.iter().any(|call| call.starts_with("peer-a:commit:")),
+            "already-committed reporter must not receive a duplicate commit: {calls:?}"
+        );
+
+        let saved_etag = load_tier_config_for_update(store)
+            .await
+            .expect("saved tier config should reload")
+            .1
+            .expect("saved tier config should have an ETag");
+        for peer in ["peer-b", "peer-c"] {
+            let prepare_index = calls
+                .iter()
+                .position(|call| call.starts_with(&format!("{peer}:prepare:")))
+                .expect("prepared peer should receive prepare");
+            let commit_index = calls
+                .iter()
+                .position(|call| call.starts_with(&format!("{peer}:commit:")))
+                .expect("prepared peer should receive commit");
+            assert!(prepare_index < commit_index, "{peer} commit must follow prepare: {calls:?}");
+            let prepared_mutation_id = calls[prepare_index]
+                .split(':')
+                .nth(2)
+                .expect("prepare call should record the mutation id");
+            let committed_mutation_id = calls[commit_index]
+                .split(':')
+                .nth(2)
+                .expect("commit call should record the mutation id");
+            assert_eq!(
+                prepared_mutation_id, reporter_mutation_id,
+                "{peer} prepare should share the reporter mutation id"
+            );
+            assert_eq!(
+                committed_mutation_id, reporter_mutation_id,
+                "{peer} commit should share the reporter mutation id"
+            );
+            assert!(
+                calls[commit_index].ends_with(&format!(":{saved_etag}")),
+                "{peer} commit should carry the saved tier config ETag: {calls:?}"
+            );
+        }
+        assert!(
+            manager.read().await.tiers.contains_key("COLD-A"),
+            "local manager should publish the AddTier candidate after peer convergence"
+        );
+    }
+
+    #[tokio::test]
     async fn reload_handle_replays_committed_mutation_and_removes_intent_record() {
         let store = Arc::new(CasConfigStore::default());
         let mut persisted = empty_mgr();

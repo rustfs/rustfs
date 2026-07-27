@@ -86,6 +86,27 @@ Return the secret name
 {{- end }}
 
 {{/*
+Return the name of the Secret holding the Vault KMS token.
+The token is a credential, so it never belongs in the config ConfigMap. It also lives in
+its own Secret rather than in "rustfs.secretName", which may point at an operator-owned
+existingSecret that the chart must not assume contains a KMS key.
+*/}}
+{{- define "rustfs.kmsSecretName" -}}
+{{- printf "%s-kms-secret" (include "rustfs.fullname" .) }}
+{{- end }}
+
+{{/*
+Return the configured Vault KMS token, or the empty string when KMS is disabled, uses a
+different backend type, or no token was supplied. Callers use emptiness to decide whether
+the KMS Secret is rendered and mounted.
+*/}}
+{{- define "rustfs.kmsVaultToken" -}}
+{{- if and .Values.config.rustfs.kms.enabled (eq .Values.config.rustfs.kms.type "vault") -}}
+{{- .Values.config.rustfs.kms.vault.vault_token | default "" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Return image pull secret content
 */}}
 {{- define "imagePullSecret" }}
