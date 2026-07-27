@@ -3383,7 +3383,7 @@ impl ManualTransitionRunReport {
         let mut tier_failure_by_reason = self.tier_failure_by_reason.clone();
         for (reason, count) in &scan_report.tier_failure_by_reason {
             let current = tier_failure_by_reason.get(reason).copied().unwrap_or_default();
-            tier_failure_by_reason.insert(reason.clone(), current.max(*count));
+            tier_failure_by_reason.insert(*reason, current.max(*count));
         }
         let transition_completed = self.transition_completed;
         let transition_failed = self.transition_failed;

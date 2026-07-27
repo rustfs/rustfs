@@ -253,7 +253,7 @@ impl ManualTransitionJobRecord {
         let mut scan_tier_failure_by_reason = self.report.tier_failure_by_reason.clone();
         for (reason, count) in failure_reasons {
             let current = scan_tier_failure_by_reason.get(reason).copied().unwrap_or_default();
-            scan_tier_failure_by_reason.insert(reason.clone(), current.max(*count));
+            scan_tier_failure_by_reason.insert(*reason, current.max(*count));
         }
         let scan_tier_failure = self.report.tier_failure.saturating_sub(self.report.transition_failed);
         self.report.enqueued = enqueued;
