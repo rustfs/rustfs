@@ -22,11 +22,18 @@ use super::storage_api::container::{
 };
 use super::types::Container;
 use super::{SwiftError, SwiftResult};
-use super::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
+use super::{get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, set_swift_bucket_metadata};
 use rustfs_credentials::Credentials;
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error};
+
+fn required_bucket_usage(usage: &std::collections::HashMap<String, (u64, u64)>, bucket: &str) -> SwiftResult<(u64, u64)> {
+    usage
+        .get(bucket)
+        .copied()
+        .ok_or_else(|| SwiftError::ServiceUnavailable("Container usage is unavailable".to_string()))
+}
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_CONTAINER: &str = "swift_container";
@@ -252,13 +259,24 @@ pub async fn list_containers(account: &str, credentials: &Credentials) -> SwiftR
         .list_bucket(&BucketOptions::default())
         .await
         .map_err(|e| sanitize_storage_error("Container listing", e))?;
+    let usage = get_swift_bucket_usage()
+        .await
+        .map_err(|e| sanitize_storage_error("Container usage retrieval", e))?
+        .ok_or_else(|| SwiftError::ServiceUnavailable("Container usage is unavailable".to_string()))?;
 
     // Filter and convert buckets to containers
     let containers: Vec<Container> = bucket_infos
         .iter()
         .filter(|info| mapper.bucket_belongs_to_project(&info.name, &project_id))
-        .filter_map(|info| bucket_info_to_container(info, &mapper, &project_id))
-        .collect();
+        .filter_map(|info| {
+            bucket_info_to_container(info, &mapper, &project_id).map(|mut container| {
+                let (count, bytes) = required_bucket_usage(&usage, &info.name)?;
+                container.count = count;
+                container.bytes = bytes;
+                Ok(container)
+            })
+        })
+        .collect::<SwiftResult<Vec<_>>>()?;
 
     debug!(
         event = EVENT_SWIFT_CONTAINER_STORAGE_STATE,
@@ -368,6 +386,44 @@ pub struct ContainerMetadata {
     pub custom_metadata: std::collections::HashMap<String, String>,
 }
 
+async fn get_container_metadata_base(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+) -> SwiftResult<(String, BucketInfo, std::collections::HashMap<String, String>)> {
+    let project_id = validate_account_access(account, credentials)?;
+    validate_container_name(container)?;
+    let bucket_name = ContainerMapper::default().swift_to_s3_bucket(container, &project_id);
+    let Some(store) = resolve_swift_object_store_handle() else {
+        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
+    };
+    let bucket_info = store
+        .get_bucket_info(&bucket_name, &BucketOptions::default())
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
+                SwiftError::NotFound(format!("Container '{}' not found", container))
+            } else {
+                sanitize_storage_error("Container metadata retrieval", e)
+            }
+        })?;
+    let custom_metadata = get_swift_bucket_metadata(&bucket_name)
+        .await
+        .ok()
+        .and_then(|bucket_meta| bucket_meta.tagging_config.as_ref().map(s3_tags_to_swift_metadata))
+        .unwrap_or_default();
+    Ok((bucket_name, bucket_info, custom_metadata))
+}
+
+pub(crate) async fn get_container_custom_metadata(
+    account: &str,
+    container: &str,
+    credentials: &Credentials,
+) -> SwiftResult<std::collections::HashMap<String, String>> {
+    let (_, _, custom_metadata) = get_container_metadata_base(account, container, credentials).await?;
+    Ok(custom_metadata)
+}
+
 /// Get container metadata (for HEAD operation)
 ///
 /// This function:
@@ -382,60 +438,22 @@ pub struct ContainerMetadata {
 /// - Returns 404 Not Found if container doesn't exist
 #[allow(dead_code)] // Used by handler
 pub async fn get_container_metadata(account: &str, container: &str, credentials: &Credentials) -> SwiftResult<ContainerMetadata> {
-    // Validate account access and extract project_id
-    let project_id = validate_account_access(account, credentials)?;
+    let (bucket_name, bucket_info, custom_metadata) = get_container_metadata_base(account, container, credentials).await?;
 
-    // Validate container name
-    validate_container_name(container)?;
-
-    // Create mapper with default config (tenant prefixing enabled)
-    let mapper = ContainerMapper::default();
-
-    // Convert Swift container name to S3 bucket name
-    let bucket_name = mapper.swift_to_s3_bucket(container, &project_id);
-
-    // Get storage layer
-    let Some(store) = resolve_swift_object_store_handle() else {
-        return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
-    };
-
-    // Get bucket info
-    let bucket_info = store
-        .get_bucket_info(&bucket_name, &BucketOptions::default())
+    // Ecstore serves the persisted scanner snapshot through a bounded in-process cache.
+    // Single-node deployments overlay successful in-process mutations; distributed
+    // deployments use only the cluster-wide persisted snapshot.
+    let usage = get_swift_bucket_usage()
         .await
-        .map_err(|e| {
-            // Check if bucket not found
-            if e.to_string().contains("not found") || e.to_string().contains("NoSuchBucket") {
-                SwiftError::NotFound(format!("Container '{}' not found", container))
-            } else {
-                sanitize_storage_error("Container metadata retrieval", e)
-            }
-        })?;
+        .map_err(|e| sanitize_storage_error("Container usage retrieval", e))?
+        .ok_or_else(|| SwiftError::ServiceUnavailable("Container usage is unavailable".to_string()))?;
+    let (object_count, bytes_used) = required_bucket_usage(&usage, &bucket_name)?;
 
-    // Load bucket metadata to get custom metadata from tags
-    let custom_metadata = match get_swift_bucket_metadata(&bucket_name).await {
-        Ok(bucket_meta) => {
-            if let Some(tagging) = &bucket_meta.tagging_config {
-                s3_tags_to_swift_metadata(tagging)
-            } else {
-                std::collections::HashMap::new()
-            }
-        }
-        Err(_) => {
-            // If metadata not available, return empty (container may be newly created)
-            std::collections::HashMap::new()
-        }
-    };
-
-    // Currently returns basic metadata with limitations:
-    // 1. Object count requires iterating all objects (expensive)
-    // 2. Bytes used requires summing all object sizes (expensive)
-    // 3. Custom metadata is now loaded from bucket tags ✅
     Ok(ContainerMetadata {
-        object_count: 0, // TODO: implement object counting in backend
-        bytes_used: 0,   // TODO: implement size aggregation in backend
+        object_count,
+        bytes_used,
         created: bucket_info.created,
-        custom_metadata, // ✅ Now populated from bucket tags!
+        custom_metadata,
     })
 }
 
@@ -1842,5 +1860,25 @@ mod tests {
         // Verify update
         assert_eq!(tagging.tag_set.len(), 1);
         assert_eq!(tagging.tag_set[0].value.as_deref(), Some("new-archive"));
+    }
+
+    #[test]
+    fn nonempty_container_usage_preserves_authoritative_totals() {
+        let usage = std::collections::HashMap::from([("tenant-container".to_string(), (7, 4097))]);
+
+        assert_eq!(
+            required_bucket_usage(&usage, "tenant-container").expect("authoritative bucket usage"),
+            (7, 4097)
+        );
+    }
+
+    #[test]
+    fn missing_container_usage_fails_closed() {
+        let usage = std::collections::HashMap::new();
+
+        assert!(matches!(
+            required_bucket_usage(&usage, "tenant-container"),
+            Err(SwiftError::ServiceUnavailable(_))
+        ));
     }
 }

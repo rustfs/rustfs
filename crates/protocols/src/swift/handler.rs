@@ -652,14 +652,11 @@ async fn handle_authenticated_request(
                             .await;
                     }
 
-                    // Check quota before upload (if Content-Length provided)
-                    if let Some(content_length) = headers.get("content-length")
-                        && let Ok(size_str) = content_length.to_str()
-                        && let Ok(object_size) = size_str.parse::<u64>()
-                    {
-                        // Check if upload would exceed quota
-                        super::quota::check_upload_quota(&account, &container, object_size, &credentials).await?;
-                    }
+                    let object_size = headers
+                        .get("content-length")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    super::quota::check_upload_quota(&account, &container, object_size, &credentials).await?;
 
                     // Check if versioning is enabled for this container
                     if let Some(archive_container) = container::get_versions_location(&account, &container, &credentials).await? {
@@ -1486,6 +1483,7 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
         SwiftError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.as_str()),
         SwiftError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
         SwiftError::Conflict(msg) => (StatusCode::CONFLICT, msg.as_str()),
+        SwiftError::LengthRequired(msg) => (StatusCode::LENGTH_REQUIRED, msg.as_str()),
         SwiftError::RequestEntityTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.as_str()),
         SwiftError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.as_str()),
         SwiftError::TooManyRequests { .. } => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
