@@ -2147,6 +2147,128 @@ mod tests {
         }
     }
 
+    async fn put_two_part_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, first: &[u8], second: &[u8]) {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+        let mut completed = Vec::new();
+        for (part_number, payload) in [(1, first), (2, second)] {
+            let payload_len = i64::try_from(payload.len()).expect("test payload length should fit i64");
+            let mut reader = PutObjReader::new(
+                HashReader::from_stream(Cursor::new(payload.to_vec()), payload_len, payload_len, None, None, false)
+                    .expect("part hash reader should be created"),
+            );
+            let part = set_disks
+                .put_object_part(bucket, object, &upload.upload_id, part_number, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("multipart part should be written");
+            completed.push(CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, completed, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should complete");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn multipart_get_keeps_delete_blocked_at_part_boundary_in_both_lock_modes() {
+        use crate::set_disk::read::get_part_boundary_barrier;
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt as _;
+
+        for enabled in ["false", "true"] {
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some(enabled)),
+                    (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("false")),
+                ],
+                async {
+                    let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                    let bucket = format!("get-delete-part-boundary-{enabled}");
+                    let object = "object";
+                    make_bucket_on_all(&disk_stores, &bucket).await;
+
+                    let first = vec![0x41; GLOBAL_MIN_PART_SIZE.as_u64() as usize];
+                    let second = vec![0x42; 64 * 1024];
+                    let expected: Vec<u8> = first.iter().chain(&second).copied().collect();
+                    put_two_part_object(&set_disks, &bucket, object, &first, &second).await;
+
+                    let barrier = get_part_boundary_barrier::arm(&bucket, object, 0);
+                    let mut reader = set_disks
+                        .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("GET should return a body reader");
+                    let content_length = usize::try_from(reader.object_info.size).expect("object size should fit usize");
+                    let read = tokio::spawn(async move {
+                        let mut body = Vec::new();
+                        reader.stream.read_to_end(&mut body).await.map(|_| body)
+                    });
+                    barrier.wait_until_paused().await;
+
+                    let delete_set = Arc::clone(&set_disks);
+                    let delete_bucket = bucket.clone();
+                    let delete_started = Arc::new(Notify::new());
+                    let delete_started_task = Arc::clone(&delete_started);
+                    let delete = tokio::spawn(async move {
+                        delete_started_task.notify_one();
+                        delete_set
+                            .delete_object(&delete_bucket, object, ObjectOptions::default())
+                            .await
+                    });
+                    delete_started.notified().await;
+                    tokio::task::yield_now().await;
+                    assert!(!delete.is_finished(), "DELETE must wait behind the streaming GET read lock");
+
+                    barrier.release();
+                    let body = read
+                        .await
+                        .expect("GET task should not panic")
+                        .expect("GET stream should reach EOF");
+                    assert_eq!(body.len(), content_length, "successful GET body must match Content-Length");
+                    assert_eq!(body, expected, "DELETE must not truncate or mix the multipart snapshot");
+                    delete
+                        .await
+                        .expect("DELETE task should not panic")
+                        .expect("DELETE should proceed after GET reaches EOF");
+
+                    let cancelled_object = "cancelled-object";
+                    put_two_part_object(&set_disks, &bucket, cancelled_object, &first, &second).await;
+                    let cancel_barrier = get_part_boundary_barrier::arm(&bucket, cancelled_object, 0);
+                    let mut cancelled_reader = set_disks
+                        .get_object_reader(&bucket, cancelled_object, None, HeaderMap::new(), &ObjectOptions::default())
+                        .await
+                        .expect("cancelled GET should return a body reader");
+                    let cancelled_read = tokio::spawn(async move {
+                        let mut body = Vec::new();
+                        cancelled_reader.stream.read_to_end(&mut body).await
+                    });
+                    cancel_barrier.wait_until_paused().await;
+                    cancelled_read.abort();
+                    cancelled_read.await.expect_err("aborted GET task should report cancellation");
+                    cancel_barrier.release();
+
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        set_disks.delete_object(&bucket, cancelled_object, ObjectOptions::default()),
+                    )
+                    .await
+                    .expect("DELETE should promptly acquire the lock after GET cancellation")
+                    .expect("DELETE after cancellation should succeed");
+                },
+            )
+            .await;
+        }
+    }
+
     async fn stage_upload_with_create_opts(
         set_disks: &Arc<SetDisks>,
         bucket: &str,

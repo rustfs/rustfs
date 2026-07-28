@@ -16,7 +16,7 @@ use super::*;
 use crate::disk::OldCurrentSize;
 use crate::set_disk::{
     get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
-    is_lock_optimization_enabled, is_object_lock_diag_enabled,
+    is_object_lock_diag_enabled,
 };
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 use rustfs_io_metrics::{
@@ -641,7 +641,7 @@ impl ECStore {
     }
 
     fn attach_read_lock_guard(mut reader: GetObjectReader, guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
-        if is_lock_optimization_enabled() || reader.buffered_body.is_some() {
+        if reader.buffered_body.is_some() {
             return reader;
         }
 
@@ -2670,7 +2670,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn reader_lock_is_not_held_for_stream_when_optimization_is_enabled() {
+    async fn reader_lock_is_held_for_stream_when_optimization_is_enabled() {
         temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
             let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
             let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
@@ -2697,10 +2697,13 @@ mod tests {
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
 
+            lock.get_write_lock(key.clone(), "writer", Duration::from_millis(20))
+                .await
+                .expect_err("streaming readers must retain the read lock when lock optimization is enabled");
+            drop(reader);
             lock.get_write_lock(key, "writer", Duration::from_secs(1))
                 .await
-                .expect("lock optimization should release the read lock before returning the stream");
-            drop(reader);
+                .expect("cancelling the reader should release the read lock");
         })
         .await;
     }
@@ -2744,41 +2747,43 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn reader_lock_is_released_after_stream_eof() {
-        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
-            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
-            let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
-            let key = rustfs_lock::ObjectKey::new("bucket", "object");
-            let read_guard = lock
-                .get_read_lock(key.clone(), "reader", Duration::from_secs(1))
-                .await
-                .expect("read lock should be acquired");
-            let read_guard = ObjectLockDiagGuard::new(
-                read_guard,
-                true,
-                "test_get_object",
-                Some("bucket".to_string()),
-                Some("object".to_string()),
-                Some("reader".to_string()),
-                ObjectLockDiagMode::Read,
-            );
-            let reader = GetObjectReader {
-                stream: Box::new(Cursor::new(vec![1, 2, 3])),
-                object_info: ObjectInfo::default(),
-                buffered_body: None,
-                body_source: Default::default(),
-            };
+    async fn reader_lock_is_released_after_stream_eof_in_both_optimization_states() {
+        for enabled in ["false", "true"] {
+            temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some(enabled))], async {
+                let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+                let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
+                let key = rustfs_lock::ObjectKey::new("bucket", "object");
+                let read_guard = lock
+                    .get_read_lock(key.clone(), "reader", Duration::from_secs(1))
+                    .await
+                    .expect("read lock should be acquired");
+                let read_guard = ObjectLockDiagGuard::new(
+                    read_guard,
+                    true,
+                    "test_get_object",
+                    Some("bucket".to_string()),
+                    Some("object".to_string()),
+                    Some("reader".to_string()),
+                    ObjectLockDiagMode::Read,
+                );
+                let reader = GetObjectReader {
+                    stream: Box::new(Cursor::new(vec![1, 2, 3])),
+                    object_info: ObjectInfo::default(),
+                    buffered_body: None,
+                    body_source: Default::default(),
+                };
 
-            let mut reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
-            let mut output = Vec::new();
-            reader.stream.read_to_end(&mut output).await.expect("reader should reach EOF");
-            assert_eq!(output, vec![1, 2, 3]);
+                let mut reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
+                let mut output = Vec::new();
+                reader.stream.read_to_end(&mut output).await.expect("reader should reach EOF");
+                assert_eq!(output, vec![1, 2, 3]);
 
-            lock.get_write_lock(key, "writer", Duration::from_secs(1))
-                .await
-                .expect("EOF should release the read lock before the reader is dropped");
-            drop(reader);
-        })
-        .await;
+                lock.get_write_lock(key, "writer", Duration::from_secs(1))
+                    .await
+                    .expect("EOF should release the read lock before the reader is dropped");
+                drop(reader);
+            })
+            .await;
+        }
     }
 }

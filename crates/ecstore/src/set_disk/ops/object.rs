@@ -426,13 +426,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 &self.ctx.tier_config_mgr(),
             )
             .await?;
-            return Ok(finish_set_disk_read_lock(
-                gr,
-                read_lock_guard.take(),
-                lock_optimization_enabled,
-                bucket,
-                object,
-            ));
+            return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), bucket, object));
         }
 
         // App-layer object data cache probe: metadata (etag/size) is resolved
@@ -587,13 +581,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         // Carry the hook probe result so the app layer skips its
                         // now-redundant lookup on the streaming miss path (ODC-16).
                         reader.body_source = body_source;
-                        return Ok(finish_set_disk_read_lock(
-                            reader,
-                            read_lock_guard.take(),
-                            lock_optimization_enabled,
-                            bucket,
-                            object,
-                        ));
+                        return Ok(finish_set_disk_read_lock(reader, read_lock_guard.take(), bucket, object));
                     }
                     core::io_primitives::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
@@ -632,13 +620,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
-        if lock_optimization_enabled {
-            release_materialized_read_lock(&bucket, &object, read_lock_guard.take());
-            debug!(bucket, object, "Lock optimization: released read lock before streaming read");
-        }
-
-        // When lock optimization is disabled, keep the read-lock guard in the
-        // task so it lives for the duration of the streaming read.
+        // Keep the read lock until the producer reaches EOF or observes that
+        // the downstream reader was cancelled.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
             let mut writer = GetObjectDownstreamWriter::new(wd);

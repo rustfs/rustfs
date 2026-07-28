@@ -1117,6 +1117,10 @@ impl SetDisks {
 
             total_read += part_length;
             part_offset = 0;
+            #[cfg(test)]
+            if current_part < last_part_index {
+                get_part_boundary_barrier::checkpoint(bucket, object, current_part).await;
+            }
         }
 
         // debug!("read end");
@@ -1818,6 +1822,79 @@ fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOp
 
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
     get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data).is_none()
+}
+
+#[cfg(test)]
+pub(in crate::set_disk) mod get_part_boundary_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+
+    struct Armed {
+        part_index: usize,
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<(String, String), Armed>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<(String, String), Armed>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub struct BarrierHandle {
+        key: (String, String),
+        arrived: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    pub fn arm(bucket: &str, object: &str, part_index: usize) -> BarrierHandle {
+        let key = (bucket.to_string(), object.to_string());
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let previous = registry().lock().expect("GET part barrier registry poisoned").insert(
+            key.clone(),
+            Armed {
+                part_index,
+                arrived: Arc::clone(&arrived),
+                release: Arc::clone(&release),
+            },
+        );
+        assert!(previous.is_none(), "GET part barrier already armed for object");
+        BarrierHandle { key, arrived, release }
+    }
+
+    impl BarrierHandle {
+        pub async fn wait_until_paused(&self) {
+            self.arrived.notified().await;
+        }
+
+        pub fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl Drop for BarrierHandle {
+        fn drop(&mut self) {
+            self.release.notify_one();
+            registry()
+                .lock()
+                .expect("GET part barrier registry poisoned")
+                .remove(&self.key);
+        }
+    }
+
+    pub async fn checkpoint(bucket: &str, object: &str, part_index: usize) {
+        let state = registry()
+            .lock()
+            .expect("GET part barrier registry poisoned")
+            .get(&(bucket.to_string(), object.to_string()))
+            .filter(|armed| armed.part_index == part_index)
+            .map(|armed| (Arc::clone(&armed.arrived), Arc::clone(&armed.release)));
+        if let Some((arrived, release)) = state {
+            arrived.notify_one();
+            release.notified().await;
+        }
+    }
 }
 
 #[cfg(test)]

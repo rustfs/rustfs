@@ -374,11 +374,10 @@ impl AsyncRead for SetDiskLockGuardedReader {
 fn finish_set_disk_read_lock(
     mut reader: GetObjectReader,
     read_lock_guard: Option<ObjectLockDiagGuard>,
-    lock_optimization_enabled: bool,
     bucket: &str,
     object: &str,
 ) -> GetObjectReader {
-    if lock_optimization_enabled || reader.buffered_body.is_some() {
+    if reader.buffered_body.is_some() {
         release_materialized_read_lock(bucket, object, read_lock_guard);
         return reader;
     }
