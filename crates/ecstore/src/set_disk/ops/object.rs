@@ -4700,7 +4700,13 @@ mod transition_commit_failure_tests {
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
             .expect("successful multipart restore must leave the committed object intact");
-        assert_ne!(restored.transitioned_object.status, TRANSITION_COMPLETE);
+        assert_eq!(
+            restored
+                .user_defined
+                .get(s3s::header::X_AMZ_RESTORE.as_str())
+                .map(String::as_str),
+            Some("ongoing-request=\"false\"")
+        );
     }
 
     #[tokio::test]
