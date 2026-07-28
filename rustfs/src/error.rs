@@ -495,6 +495,14 @@ mod tests {
     }
 
     #[test]
+    fn policy_metadata_read_failure_maps_to_internal_error() {
+        let api_error = ApiError::from(StorageError::Io(IoError::other("policy read failed")));
+
+        assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        assert!(api_error.source.is_some());
+    }
+
+    #[test]
     fn test_kms_service_unavailable_maps_to_retryable_error() {
         let api_error = ApiError::from(StorageError::other(KmsUnavailableError));
 
