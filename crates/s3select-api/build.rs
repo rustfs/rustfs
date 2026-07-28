@@ -14,8 +14,12 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_VENDOR");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS");
+    let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR");
+
+    if target_os.as_deref() == Ok("macos") && target_vendor.as_deref() == Ok("apple") {
         println!("cargo:rustc-link-arg-tests=-Wl,-no_compact_unwind");
     }
 }
