@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::*;
+use crate::bucket::lifecycle::lifecycle;
 use rustfs_utils::http::headers::{AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
+use s3s::dto::{RestoreStatus, Timestamp};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RestoreCleanupIdentity {
@@ -43,7 +45,7 @@ impl RestoreCleanupIdentity {
 }
 
 impl SetDisks {
-    async fn finalize_restore_metadata(
+    pub(super) async fn finalize_restore_metadata(
         &self,
         bucket: &str,
         object: &str,
