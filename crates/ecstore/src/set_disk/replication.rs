@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::bucket::lifecycle::lifecycle;
+use rustfs_filemeta::RestoreStatusOps;
 use rustfs_utils::http::headers::{AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
 use s3s::dto::{RestoreStatus, Timestamp};
 
