@@ -4381,10 +4381,11 @@ mod tests {
     #[test]
     fn object_lambda_auth_headers_use_constant_time_helper() {
         let source = include_str!("router.rs");
-        assert!(!source.contains("route == Some(output_route)"));
-        assert!(!source.contains("token == Some(output_token)"));
-        assert!(source.contains("constant_time_eq(route, output_route)"));
-        assert!(source.contains("constant_time_eq(token, output_token)"));
+        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        assert!(!production.contains("route == Some(output_route)"));
+        assert!(!production.contains("token == Some(output_token)"));
+        assert!(production.contains("constant_time_eq(route, output_route)"));
+        assert!(production.contains("constant_time_eq(token, output_token)"));
     }
 
     #[test]
