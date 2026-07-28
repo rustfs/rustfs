@@ -116,13 +116,24 @@ fn first_unhealthy_part_summary(
 
 impl SetDisks {
     #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
-    #[allow(clippy::too_many_lines)]
     pub(in crate::set_disk) async fn heal_object(
         &self,
         bucket: &str,
         object: &str,
         version_id: &str,
         opts: &HealOpts,
+    ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
+        Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, true)).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn heal_object_with_explicit_version_regen(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        allow_explicit_version_regen: bool,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
         info!(?opts, "Starting heal_object");
 
@@ -783,6 +794,15 @@ impl SetDisks {
                 }
             }
             Err(err) => {
+                if allow_explicit_version_regen
+                    && !version_id.is_empty()
+                    && self
+                        .try_regenerate_explicit_version_meta(bucket, object, version_id, &parts_metadata, &errs, &disks)
+                        .await?
+                {
+                    return Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, false)).await;
+                }
+
                 if self
                     .dangling_delete_safety(bucket, object, &parts_metadata, &errs, &disks)
                     .await?
@@ -826,6 +846,100 @@ impl SetDisks {
                 }
             }
         }
+    }
+
+    async fn try_regenerate_explicit_version_meta(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<bool> {
+        let Ok(version_id) = Uuid::parse_str(version_id) else {
+            return Ok(false);
+        };
+        let candidates = parts_metadata
+            .iter()
+            .zip(errs.iter())
+            .filter_map(|(file_info, err)| {
+                (err.is_none()
+                    && file_info_is_valid_for_metadata(file_info)
+                    && file_info.version_id == Some(version_id)
+                    && file_info.has_valid_erasure_geometry()
+                    && !file_info.deleted
+                    && !file_info.is_remote()
+                    && file_info.data_dir.is_some()
+                    && !file_info.parts.is_empty()
+                    && file_info.erasure.data_blocks > 0
+                    && file_info
+                        .erasure
+                        .data_blocks
+                        .checked_add(file_info.erasure.parity_blocks)
+                        .is_some_and(|shards| shards == disks.len()))
+                .then_some(file_info)
+            })
+            .collect::<Vec<_>>();
+        let Some(candidate) = candidates.first().copied() else {
+            return Ok(false);
+        };
+        let identity = Self::file_info_quorum_hash(candidate);
+        if candidates
+            .iter()
+            .any(|file_info| Self::file_info_quorum_hash(file_info) != identity)
+        {
+            return Ok(false);
+        }
+
+        let mut available = 0usize;
+        for disk in disks {
+            let Some(disk) = disk else {
+                return Ok(false);
+            };
+            match disk.check_parts(bucket, object, candidate).await {
+                Ok(response)
+                    if !response.results.is_empty() && response.results.iter().all(|result| *result == CHECK_PART_SUCCESS) =>
+                {
+                    available += 1;
+                }
+                Ok(_)
+                | Err(
+                    DiskError::FileNotFound
+                    | DiskError::FileVersionNotFound
+                    | DiskError::PathNotFound
+                    | DiskError::VolumeNotFound,
+                ) => {}
+                Err(_) => return Ok(false),
+            }
+        }
+        if available < candidate.erasure.data_blocks {
+            return Ok(false);
+        }
+
+        let mut wrote = 0usize;
+        for (index, disk) in disks.iter().enumerate() {
+            let Some(disk) = disk else {
+                return Ok(false);
+            };
+            let metadata_absent = matches!(
+                errs.get(index).and_then(Option::as_ref),
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            );
+            if !metadata_absent {
+                continue;
+            }
+            let Some(&shard_index) = candidate.erasure.distribution.get(index) else {
+                return Ok(false);
+            };
+            let mut regenerated = candidate.clone();
+            regenerated.fresh = false;
+            regenerated.erasure.index = shard_index;
+            if disk.write_metadata("", bucket, object, regenerated).await.is_ok() {
+                wrote += 1;
+            }
+        }
+        Ok(wrote > 0)
     }
 
     /// Best-effort orphan-data-dir reclaim for an object that is healthy on this
@@ -1596,12 +1710,15 @@ mod heal_result_report_tests {
         let old_data_dir = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("old data dir should parse");
         let new_data_dir = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("new data dir should parse");
         let (_temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[(old_data_dir, 4), (new_data_dir, 2)]).await;
-        let metadata = vec![
+        let version_id = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("version id should parse");
+        let mut metadata = vec![
             meta_regen_test_fileinfo(object, old_data_dir, 9, 0),
             meta_regen_test_fileinfo(object, new_data_dir, 10, 1),
             FileInfo::default(),
             FileInfo::default(),
         ];
+        metadata[0].version_id = Some(version_id);
+        metadata[1].version_id = Some(version_id);
         assert_eq!(
             metadata[0].version_id, metadata[1].version_id,
             "the conflicting candidates must share one version id"
@@ -1627,6 +1744,13 @@ mod heal_result_report_tests {
                 .await
                 .expect("reversed identities should be classified")
                 == DanglingDeleteSafety::UnsafeToDelete
+        );
+        let version_id = version_id.to_string();
+        assert!(
+            !set.try_regenerate_explicit_version_meta(bucket, object, &version_id, &metadata, &errs, &disks)
+                .await
+                .expect("conflicting explicit-version candidates should be rejected"),
+            "an explicit version must not select between conflicting metadata identities"
         );
         for disk_index in [2, 3] {
             assert!(
