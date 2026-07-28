@@ -851,7 +851,17 @@ impl SetDisks {
         errs: &[Option<DiskError>],
         disks: &[Option<DiskStore>],
     ) -> disk::error::Result<DanglingDeleteSafety> {
-        if disks.iter().any(Option::is_none) {
+        if disks.iter().any(Option::is_none)
+            || errs.iter().flatten().any(|err| {
+                !matches!(
+                    err,
+                    DiskError::FileNotFound
+                        | DiskError::FileVersionNotFound
+                        | DiskError::PathNotFound
+                        | DiskError::VolumeNotFound
+                )
+            })
+        {
             return Ok(DanglingDeleteSafety::UnsafeToDelete);
         }
 
@@ -1677,7 +1687,7 @@ mod heal_result_report_tests {
             )
             .await
             .expect("unsafe dangling state should be reported without deletion");
-        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
+        assert_eq!(err, Some(DiskError::FileNotFound));
         let surviving = disks[0]
             .as_ref()
             .expect("first test disk should be online")
@@ -1720,7 +1730,7 @@ mod heal_result_report_tests {
             )
             .await
             .expect("offline shard state should be reported without deletion");
-        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
+        assert_eq!(err, Some(DiskError::FileNotFound));
         let surviving = disks[0]
             .as_ref()
             .expect("first test disk should be online")
@@ -1762,7 +1772,7 @@ mod heal_result_report_tests {
             )
             .await
             .expect("part probe timeout should be reported without deletion");
-        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
+        assert_eq!(err, Some(DiskError::FileNotFound));
         let surviving = disks[0]
             .as_ref()
             .expect("first test disk should be online")
@@ -1846,6 +1856,25 @@ mod heal_result_report_tests {
                 set.dangling_delete_safety(bucket, object, &candidates, &errs, &disks)
                     .await
                     .expect("non-local metadata should be classified"),
+                DanglingDeleteSafety::UnsafeToDelete
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dangling_delete_guard_preserves_metadata_read_uncertainty() {
+        let bucket = "bucket-delete-guard-read-error";
+        let object = "object.bin";
+        let (_temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[]).await;
+        let metadata = vec![FileInfo::default(); disks.len()];
+
+        for read_error in [DiskError::Timeout, DiskError::DiskAccessDenied, DiskError::DiskNotFound] {
+            let mut errs = vec![Some(DiskError::FileNotFound); disks.len()];
+            errs[0] = Some(read_error);
+            assert_eq!(
+                set.dangling_delete_safety(bucket, object, &metadata, &errs, &disks)
+                    .await
+                    .expect("metadata read uncertainty should be classified"),
                 DanglingDeleteSafety::UnsafeToDelete
             );
         }
