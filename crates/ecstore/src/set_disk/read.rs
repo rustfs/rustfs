@@ -2020,6 +2020,33 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    async fn get_object_with_fileinfo_rejects_positive_size_without_parts() {
+        let mut output = Vec::new();
+        let err = SetDisks::get_object_with_fileinfo(
+            "bucket",
+            "object",
+            0,
+            1,
+            &mut output,
+            valid_test_fileinfo("object"),
+            Vec::new(),
+            &[],
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect_err("positive-size metadata without parts must fail without panicking");
+
+        assert_eq!(err, Error::FileCorrupt);
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
     async fn get_object_with_fileinfo_rejects_invalid_ranges_before_reader_setup() {
         let bucket = "bucket";
         let object = "object";
@@ -2092,6 +2119,12 @@ mod metadata_cache_tests {
 
         let mut invalid_erasure = valid_test_fileinfo(object);
         invalid_erasure.erasure.block_size = 0;
+        invalid_erasure.parts.push(ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        });
         let err = SetDisks::get_object_with_fileinfo(
             bucket,
             object,
@@ -2117,6 +2150,37 @@ mod metadata_cache_tests {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<crate::erasure::coding::ErasureConstructionError>());
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_object_with_fileinfo_accepts_zero_size_without_parts() {
+        let bucket = "bucket";
+        let object = "empty";
+        let mut fi = valid_test_fileinfo(object);
+        fi.size = 0;
+
+        let mut output = Vec::new();
+        SetDisks::get_object_with_fileinfo(
+            bucket,
+            object,
+            0,
+            0,
+            &mut output,
+            fi,
+            Vec::new(),
+            &[],
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "empty",
+        )
+        .await
+        .expect("zero-byte object without parts must remain readable");
+
         assert!(output.is_empty());
     }
 
@@ -2166,6 +2230,7 @@ mod metadata_cache_tests {
         let object = "object";
         let (_dir, disk) = new_read_version_test_disk(bucket).await;
         let mut fi = valid_test_fileinfo(object);
+        fi.size = 0;
         fi.mod_time = Some(OffsetDateTime::now_utc());
         disk.write_metadata(bucket, bucket, object, fi.clone())
             .await
