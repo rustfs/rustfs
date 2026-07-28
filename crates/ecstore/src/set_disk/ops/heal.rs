@@ -27,6 +27,64 @@ struct PartFailureSummary {
     bitrot_failure: bool,
 }
 
+#[derive(Clone)]
+struct RecoverableMetaCandidate {
+    identity: [u8; 32],
+    file_info: FileInfo,
+    data_count: usize,
+    local_payload: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DanglingDeleteSafety {
+    UnsafeToDelete,
+    NoRecoverableCandidate,
+}
+
+#[cfg(test)]
+struct DanglingCheckPartsFailure {
+    key: (String, String, usize),
+}
+
+#[cfg(test)]
+fn dangling_check_parts_failures() -> &'static std::sync::Mutex<HashMap<(String, String, usize), DiskError>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String, usize), DiskError>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+impl DanglingCheckPartsFailure {
+    fn install(bucket: &str, object: &str, disk_index: usize, error: DiskError) -> Self {
+        let key = (bucket.to_string(), object.to_string(), disk_index);
+        let previous = dangling_check_parts_failures()
+            .lock()
+            .expect("dangling check-parts failure registry should not poison")
+            .insert(key.clone(), error);
+        assert!(previous.is_none(), "dangling check-parts failure already installed");
+        Self { key }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DanglingCheckPartsFailure {
+    fn drop(&mut self) {
+        dangling_check_parts_failures()
+            .lock()
+            .expect("dangling check-parts failure registry should not poison")
+            .remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+fn injected_dangling_check_parts_error(bucket: &str, object: &str, disk_index: usize) -> Option<DiskError> {
+    dangling_check_parts_failures()
+        .lock()
+        .expect("dangling check-parts failure registry should not poison")
+        .get(&(bucket.to_string(), object.to_string(), disk_index))
+        .cloned()
+}
+
 fn first_unhealthy_part_summary(
     data_errs_by_part: &HashMap<usize, Vec<usize>>,
     parts: &[ObjectPartInfo],
@@ -53,46 +111,13 @@ fn first_unhealthy_part_summary(
 
 impl SetDisks {
     #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
+    #[allow(clippy::too_many_lines)]
     pub(in crate::set_disk) async fn heal_object(
         &self,
         bucket: &str,
         object: &str,
         version_id: &str,
         opts: &HealOpts,
-    ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
-        // `allow_meta_regen` is true on the first pass: a version whose data shards
-        // physically survive (>= data_blocks) but whose xl.meta fell below
-        // read-quorum is RESCUED (missing xl.meta regenerated) rather than
-        // dangling-deleted. The re-drive after a rescue sets it false so the
-        // regeneration can happen at most once (no unbounded recursion).
-        Box::pin(self.heal_object_with_regen(bucket, object, version_id, opts, true)).await
-    }
-
-    /// Best-effort orphan-data-dir reclaim for an object that is healthy on this
-    /// set. Wraps [`Self::reclaim_orphan_data_dirs`] with the shared logging so
-    /// both `heal_object` exits — the already-healthy early return and the
-    /// post-heal tail — reclaim identically. Never fails the heal: delete errors
-    /// are logged and swallowed. Callers must gate this on `!opts.dry_run`.
-    async fn reclaim_orphan_data_dirs_best_effort(&self, bucket: &str, object: &str) {
-        match self.reclaim_orphan_data_dirs(bucket, object).await {
-            Ok(removed) if removed > 0 => {
-                info!(bucket, object, removed, "heal_object: reclaimed orphaned data directories");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(bucket, object, error = %e, "heal_object: orphan data-dir reclaim failed");
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn heal_object_with_regen(
-        &self,
-        bucket: &str,
-        object: &str,
-        version_id: &str,
-        opts: &HealOpts,
-        allow_meta_regen: bool,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
         info!(?opts, "Starting heal_object");
 
@@ -289,22 +314,6 @@ impl SetDisks {
                             }
                         }
 
-                        // DATA-SAFETY GUARD (backlog#920, decision 1): before any
-                        // dangling delete, if the version's DATA shards physically
-                        // survive on >= data_blocks disks it is RECONSTRUCTABLE.
-                        // Regenerate the missing xl.meta from a surviving valid
-                        // FileInfo and re-drive the heal instead of destroying a
-                        // recoverable version. Torn writes (< data_blocks data
-                        // shards) fall through to the existing dangling behavior.
-                        if cannot_heal
-                            && allow_meta_regen
-                            && self
-                                .try_regenerate_recoverable_meta(bucket, object, &parts_metadata, &errs, &disks)
-                                .await?
-                        {
-                            return Box::pin(self.heal_object_with_regen(bucket, object, version_id, opts, false)).await;
-                        }
-
                         if cannot_heal {
                             let total_disks = parts_metadata.len();
                             let healthy_count = total_disks.saturating_sub(disks_to_heal_count);
@@ -355,6 +364,20 @@ impl SetDisks {
                                     parity_shards = latest_meta.erasure.parity_blocks,
                                     "Heal object cannot reconstruct with available shards"
                                 );
+                            }
+
+                            // `disks_with_all_parts` normalizes conflicting entries
+                            // in `parts_metadata` to defaults. Re-read only before
+                            // destructive cleanup so the guard sees every original
+                            // identity.
+                            let (delete_guard_metadata, delete_guard_errs) =
+                                Self::read_all_fileinfo(&disks, "", bucket, object, version_id, true, true, false).await?;
+                            if self
+                                .dangling_delete_safety(bucket, object, &delete_guard_metadata, &delete_guard_errs, &disks)
+                                .await?
+                                == DanglingDeleteSafety::UnsafeToDelete
+                            {
+                                return Ok((result, Some(cannot_heal_err)));
                             }
 
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
@@ -755,17 +778,16 @@ impl SetDisks {
                 }
             }
             Err(err) => {
-                // DATA-SAFETY GUARD (backlog#920, decision 1): meta quorum failed,
-                // but the version's DATA may still physically survive on enough
-                // disks (xl.meta lost on > parity disks while part files remain).
-                // Rescue it by regenerating the missing xl.meta and re-driving heal
-                // instead of dangling-deleting a reconstructable version.
-                if allow_meta_regen
-                    && self
-                        .try_regenerate_recoverable_meta(bucket, object, &parts_metadata, &errs, &disks)
-                        .await?
+                if self
+                    .dangling_delete_safety(bucket, object, &parts_metadata, &errs, &disks)
+                    .await?
+                    == DanglingDeleteSafety::UnsafeToDelete
                 {
-                    return Box::pin(self.heal_object_with_regen(bucket, object, version_id, opts, false)).await;
+                    return Ok((
+                        self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
+                            .await,
+                        Some(err),
+                    ));
                 }
 
                 let data_errs_by_part = HashMap::new();
@@ -801,129 +823,113 @@ impl SetDisks {
         }
     }
 
-    /// backlog#920 (decision 1): rescue a version that meta-quorum logic would
-    /// otherwise dangling-DELETE, when its DATA is still reconstructable.
-    ///
-    /// Returns `Ok(true)` if the version was rescued (missing xl.meta regenerated
-    /// on at least one disk, so a re-driven heal can reconstruct it), `Ok(false)`
-    /// to fall through to the existing dangling-delete behavior.
-    ///
-    /// Recoverability is computed by physically probing part files across ALL
-    /// disks in the set with `check_parts` — including disks whose xl.meta is
-    /// absent (a lost xl.meta does not lose the sibling `part.*` data). If at
-    /// least `data_blocks` disks hold every part of a surviving valid FileInfo,
-    /// the object is EC-reconstructable, so we regenerate that FileInfo's xl.meta
-    /// on every disk whose metadata is absent (via `write_metadata`, which merges
-    /// into any existing xl.meta). Delete markers, remote/transitioned versions,
-    /// and genuine torn writes (< `data_blocks` surviving data shards) are NOT
-    /// rescued — they keep the current dangling-delete-after-grace behavior, so no
-    /// regression on those paths.
-    async fn try_regenerate_recoverable_meta(
+    /// Best-effort orphan-data-dir reclaim for an object that is healthy on this
+    /// set. Wraps [`Self::reclaim_orphan_data_dirs`] with the shared logging so
+    /// both `heal_object` exits — the already-healthy early return and the
+    /// post-heal tail — reclaim identically. Never fails the heal: delete errors
+    /// are logged and swallowed. Callers must gate this on `!opts.dry_run`.
+    async fn reclaim_orphan_data_dirs_best_effort(&self, bucket: &str, object: &str) {
+        match self.reclaim_orphan_data_dirs(bucket, object).await {
+            Ok(removed) if removed > 0 => {
+                info!(bucket, object, removed, "heal_object: reclaimed orphaned data directories");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(bucket, object, error = %e, "heal_object: orphan data-dir reclaim failed");
+            }
+        }
+    }
+
+    /// Prevent dangling cleanup when surviving state cannot prove that deletion
+    /// is safe. Part presence proves only recoverability, never commit: the write
+    /// path can durably rename data before xl.meta is committed.
+    async fn dangling_delete_safety(
         &self,
         bucket: &str,
         object: &str,
         parts_metadata: &[FileInfo],
         errs: &[Option<DiskError>],
         disks: &[Option<DiskStore>],
-    ) -> disk::error::Result<bool> {
-        // A surviving valid, non-deleted, non-remote data FileInfo to rebuild from.
-        let Some(surviving) = parts_metadata
+    ) -> disk::error::Result<DanglingDeleteSafety> {
+        if disks.iter().any(Option::is_none) {
+            return Ok(DanglingDeleteSafety::UnsafeToDelete);
+        }
+
+        let mut candidates = Vec::<RecoverableMetaCandidate>::with_capacity(parts_metadata.len());
+        for (fi, err) in parts_metadata.iter().zip(errs.iter()) {
+            if err.is_some() || !file_info_is_valid_for_metadata(fi) {
+                continue;
+            }
+
+            let identity = Self::file_info_quorum_hash(fi);
+            if !candidates.iter().any(|candidate| candidate.identity == identity) {
+                let local_payload = fi.has_valid_erasure_geometry()
+                    && !fi.deleted
+                    && !fi.is_remote()
+                    && fi.data_dir.is_some()
+                    && !fi.parts.is_empty()
+                    && fi.erasure.data_blocks > 0
+                    && fi
+                        .erasure
+                        .data_blocks
+                        .checked_add(fi.erasure.parity_blocks)
+                        .is_some_and(|shards| shards == disks.len());
+                candidates.push(RecoverableMetaCandidate {
+                    identity,
+                    file_info: fi.clone(),
+                    data_count: 0,
+                    local_payload,
+                });
+            }
+        }
+
+        if candidates
             .iter()
-            .find(|fi| fi.has_valid_erasure_geometry() && !fi.deleted && !fi.is_remote())
-            .cloned()
-        else {
-            return Ok(false);
-        };
-
-        // Without a data_dir + parts there is no data to prove recoverable.
-        if surviving.data_dir.is_none() || surviving.parts.is_empty() {
-            return Ok(false);
-        }
-        let data_blocks = surviving.erasure.data_blocks;
-        if data_blocks == 0 {
-            return Ok(false);
+            .any(|candidate| candidate.file_info.deleted || candidate.file_info.is_remote())
+            || candidates.len() > 1
+        {
+            return Ok(DanglingDeleteSafety::UnsafeToDelete);
         }
 
-        // Physically probe part presence on EVERY online disk using the surviving
-        // FileInfo's data_dir/parts. `check_parts` stats `object/<data_dir>/part.N`
-        // directly, so it counts disks that still hold the data even if their
-        // xl.meta was deleted.
-        let mut available = 0usize;
-        for disk in disks.iter().flatten() {
-            if let Ok(resp) = disk.check_parts(bucket, object, &surviving).await
-                && !resp.results.is_empty()
-                && resp.results.iter().all(|r| *r == CHECK_PART_SUCCESS)
-            {
-                available += 1;
-            }
-        }
+        for candidate in candidates.iter_mut().filter(|candidate| candidate.local_payload) {
+            for (disk_index, disk) in disks.iter().enumerate() {
+                let Some(disk) = disk else {
+                    return Ok(DanglingDeleteSafety::UnsafeToDelete);
+                };
+                #[cfg(test)]
+                let check_result = match injected_dangling_check_parts_error(bucket, object, disk_index) {
+                    Some(error) => Err(error),
+                    None => disk.check_parts(bucket, object, &candidate.file_info).await,
+                };
+                #[cfg(not(test))]
+                let check_result = disk.check_parts(bucket, object, &candidate.file_info).await;
 
-        // Torn write: fewer than data_blocks surviving data shards is genuinely
-        // unrecoverable — preserve the current dangling behavior (no resurrection).
-        if available < data_blocks {
-            debug!(
-                bucket,
-                object,
-                available,
-                data_blocks,
-                "heal_object: version not reconstructable (torn write), keeping dangling behavior"
-            );
-            return Ok(false);
-        }
-
-        // Reconstructable: regenerate the surviving xl.meta on every disk whose
-        // metadata is absent so the version regains read-quorum. Each disk gets its
-        // OWN shard index: the disk at physical position `index` holds shard
-        // `distribution[index]` (mirrors `shuffle_disks` + the write path's
-        // `erasure.index = shuffled_pos + 1`). Copying the surviving disk's index
-        // verbatim would write an inconsistent xl.meta that the re-heal then treats
-        // as corrupt.
-        let distribution = &surviving.erasure.distribution;
-        let mut wrote = 0usize;
-        for (index, disk) in disks.iter().enumerate() {
-            let Some(disk) = disk else { continue };
-            let meta_absent = matches!(
-                errs.get(index).and_then(Option::as_ref),
-                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
-            ) || !parts_metadata.get(index).map(FileInfo::is_valid).unwrap_or(false);
-            if !meta_absent {
-                continue;
-            }
-            // Without a known shard index for this position we cannot write a
-            // consistent xl.meta; leave it for the normal heal to reconstruct.
-            let Some(&shard_index) = distribution.get(index) else {
-                continue;
-            };
-            let mut regen = surviving.clone();
-            regen.fresh = false; // merge into any existing xl.meta on the disk
-            regen.erasure.index = shard_index;
-            match disk.write_metadata("", bucket, object, regen).await {
-                Ok(()) => wrote += 1,
-                Err(e) => {
-                    warn!(
-                        bucket,
-                        object,
-                        disk_index = index,
-                        error = %e,
-                        "heal_object: failed to regenerate recoverable xl.meta on disk"
-                    );
+                match check_result {
+                    Ok(resp) if !resp.results.is_empty() && resp.results.iter().all(|result| *result == CHECK_PART_SUCCESS) => {
+                        candidate.data_count += 1;
+                    }
+                    Ok(_) => {}
+                    Err(
+                        DiskError::FileNotFound
+                        | DiskError::FileVersionNotFound
+                        | DiskError::PathNotFound
+                        | DiskError::VolumeNotFound,
+                    ) => {}
+                    Err(_) => return Ok(DanglingDeleteSafety::UnsafeToDelete),
                 }
             }
         }
 
-        if wrote == 0 {
-            return Ok(false);
-        }
-
-        info!(
-            bucket,
-            object,
-            available,
-            data_blocks,
-            regenerated_meta_disks = wrote,
-            "heal_object: rescued reconstructable sub-quorum version by regenerating xl.meta"
-        );
-        Ok(true)
+        Ok(
+            if candidates
+                .iter()
+                .any(|candidate| candidate.local_payload && candidate.data_count >= candidate.file_info.erasure.data_blocks)
+            {
+                DanglingDeleteSafety::UnsafeToDelete
+            } else {
+                DanglingDeleteSafety::NoRecoverableCandidate
+            },
+        )
     }
 
     pub(in crate::set_disk) async fn heal_object_dir_locked(
@@ -1311,20 +1317,22 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
 #[cfg(test)]
 mod heal_result_report_tests {
-    use super::SetDisks;
+    use super::{DanglingCheckPartsFailure, DanglingDeleteSafety, SetDisks};
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
-    use crate::disk::{DiskOption, DiskStore, new_disk};
+    use crate::disk::{DiskAPI as _, DiskOption, DiskStore, ReadOptions, new_disk};
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::{config::storageclass, store::init_format::save_format_file};
     use rustfs_common::heal_channel::{DriveState, HealOpts, HealScanMode};
-    use rustfs_filemeta::{BLOCK_SIZE_V2, FileInfo};
+    use rustfs_filemeta::{BLOCK_SIZE_V2, FileInfo, ObjectPartInfo, TRANSITION_COMPLETE};
     use std::sync::Arc;
     use tempfile::TempDir;
+    use time::OffsetDateTime;
     use tokio::sync::RwLock;
+    use uuid::Uuid;
 
     async fn real_disk() -> (TempDir, Endpoint, DiskStore) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
@@ -1360,6 +1368,68 @@ mod heal_result_report_tests {
             vec![],
         )
         .await
+    }
+
+    fn meta_regen_test_fileinfo(object: &str, data_dir: Uuid, mod_time: i64, disk_index: usize) -> FileInfo {
+        let mut fi = FileInfo::new(object, 2, 2);
+        fi.data_dir = Some(data_dir);
+        fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(mod_time).expect("test timestamp should parse"));
+        fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        fi.erasure.index = fi.erasure.distribution[disk_index];
+        fi
+    }
+
+    async fn meta_regen_test_set(
+        bucket: &str,
+        object: &str,
+        data_dirs: &[(Uuid, usize)],
+    ) -> (Vec<TempDir>, Arc<SetDisks>, Vec<Option<DiskStore>>) {
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for disk_index in 0..4 {
+            let (temp_dir, endpoint, disk) = real_disk().await;
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+            for (data_dir, shard_count) in data_dirs {
+                if disk_index >= *shard_count {
+                    continue;
+                }
+                let part_dir = temp_dir.path().join(bucket).join(object).join(data_dir.to_string());
+                tokio::fs::create_dir_all(&part_dir)
+                    .await
+                    .expect("test data directory should be created");
+                tokio::fs::write(part_dir.join("part.1"), [1u8; 2])
+                    .await
+                    .expect("test data shard should be written");
+            }
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set = set_disks_with(disks.clone(), endpoints, 2).await;
+        (temp_dirs, set, disks)
+    }
+
+    async fn seed_meta_regen_test_metadata(
+        disks: &[Option<DiskStore>],
+        disk_index: usize,
+        bucket: &str,
+        object: &str,
+        file_info: &FileInfo,
+    ) {
+        disks[disk_index]
+            .as_ref()
+            .expect("metadata test disk should be online")
+            .write_metadata("", bucket, object, file_info.clone())
+            .await
+            .expect("test metadata should be written");
     }
 
     async fn formatted_single_disk_no_parity_set() -> (TempDir, Arc<SetDisks>) {
@@ -1502,6 +1572,283 @@ mod heal_result_report_tests {
         assert_eq!(result.before.drives[1].state, DriveState::Ok.to_string());
         assert_eq!(result.before.drives[2].state, DriveState::Offline.to_string());
         assert_eq!(result.before.drives[3].state, DriveState::Ok.to_string());
+    }
+
+    #[tokio::test]
+    async fn dangling_delete_guard_preserves_conflicting_identities_without_writing_metadata() {
+        let bucket = "bucket-delete-guard-conflict";
+        let object = "object.bin";
+        let old_data_dir = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("new data dir should parse");
+        let (_temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[(old_data_dir, 4), (new_data_dir, 2)]).await;
+        let metadata = vec![
+            meta_regen_test_fileinfo(object, old_data_dir, 9, 0),
+            meta_regen_test_fileinfo(object, new_data_dir, 10, 1),
+            FileInfo::default(),
+            FileInfo::default(),
+        ];
+        assert_eq!(
+            metadata[0].version_id, metadata[1].version_id,
+            "the conflicting candidates must share one version id"
+        );
+        seed_meta_regen_test_metadata(&disks, 0, bucket, object, &metadata[0]).await;
+        seed_meta_regen_test_metadata(&disks, 1, bucket, object, &metadata[1]).await;
+        let errs = vec![None, None, Some(DiskError::FileNotFound), Some(DiskError::FileNotFound)];
+
+        assert!(
+            set.dangling_delete_safety(bucket, object, &metadata, &errs, &disks)
+                .await
+                .expect("conflicting identities should be classified")
+                == DanglingDeleteSafety::UnsafeToDelete
+        );
+        let reversed = vec![
+            metadata[1].clone(),
+            metadata[0].clone(),
+            FileInfo::default(),
+            FileInfo::default(),
+        ];
+        assert!(
+            set.dangling_delete_safety(bucket, object, &reversed, &errs, &disks)
+                .await
+                .expect("reversed identities should be classified")
+                == DanglingDeleteSafety::UnsafeToDelete
+        );
+        for disk_index in [2, 3] {
+            assert!(
+                matches!(
+                    disks[disk_index]
+                        .as_ref()
+                        .expect("test disk should be online")
+                        .read_version("", bucket, object, "", &ReadOptions::default())
+                        .await,
+                    Err(DiskError::FileNotFound)
+                ),
+                "the delete guard must not manufacture metadata on missing disks"
+            );
+        }
+        let old = disks[0]
+            .as_ref()
+            .expect("first test disk should be online")
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("old metadata should remain readable");
+        let new = disks[1]
+            .as_ref()
+            .expect("second test disk should be online")
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("new metadata should remain readable");
+        assert_eq!(old.data_dir, Some(old_data_dir));
+        assert_eq!(new.data_dir, Some(new_data_dir));
+    }
+
+    #[tokio::test]
+    async fn heal_meta_quorum_failure_preserves_reconstructable_uncommitted_candidate() {
+        let bucket = "bucket-delete-guard-reconstructable";
+        let object = "object.bin";
+        let data_dir = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("data dir should parse");
+        let (_temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[(data_dir, 2)]).await;
+        let metadata = vec![
+            meta_regen_test_fileinfo(object, data_dir, 3, 0),
+            FileInfo::default(),
+            FileInfo::default(),
+            FileInfo::default(),
+        ];
+        seed_meta_regen_test_metadata(&disks, 0, bucket, object, &metadata[0]).await;
+        let (observed_metadata, observed_errs) = SetDisks::read_all_fileinfo(&disks, "", bucket, object, "", true, true, false)
+            .await
+            .expect("test metadata should be readable across the set");
+        assert_eq!(
+            set.dangling_delete_safety(bucket, object, &observed_metadata, &observed_errs, &disks)
+                .await
+                .expect("observed reconstructable candidate should be classified"),
+            DanglingDeleteSafety::UnsafeToDelete
+        );
+
+        let (_, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unsafe dangling state should be reported without deletion");
+        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
+        let surviving = disks[0]
+            .as_ref()
+            .expect("first test disk should be online")
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("the only metadata copy must be preserved");
+        assert_eq!(surviving.data_dir, Some(data_dir));
+        assert!(
+            matches!(
+                disks[1]
+                    .as_ref()
+                    .expect("second test disk should be online")
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await,
+                Err(DiskError::FileNotFound)
+            ),
+            "the delete guard must not propagate metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_meta_quorum_failure_preserves_candidate_when_required_shard_disk_is_offline() {
+        let bucket = "bucket-delete-guard-offline";
+        let object = "object.bin";
+        let data_dir = Uuid::parse_str("44444444-4444-4444-4444-444444444444").expect("data dir should parse");
+        let (temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[(data_dir, 2)]).await;
+        let metadata = meta_regen_test_fileinfo(object, data_dir, 4, 0);
+        seed_meta_regen_test_metadata(&disks, 0, bucket, object, &metadata).await;
+        set.disks.write().await[1] = None;
+
+        let (_, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("offline shard state should be reported without deletion");
+        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
+        let surviving = disks[0]
+            .as_ref()
+            .expect("first test disk should be online")
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("offline uncertainty must preserve the surviving metadata");
+        assert_eq!(surviving.data_dir, Some(data_dir));
+        assert!(
+            temp_dirs[0]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(data_dir.to_string())
+                .join("part.1")
+                .is_file(),
+            "offline uncertainty must preserve the last online shard"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_meta_quorum_failure_preserves_candidate_when_part_probe_times_out() {
+        let bucket = "bucket-delete-guard-timeout";
+        let object = "object.bin";
+        let data_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("data dir should parse");
+        let (temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[(data_dir, 2)]).await;
+        let metadata = meta_regen_test_fileinfo(object, data_dir, 5, 0);
+        seed_meta_regen_test_metadata(&disks, 0, bucket, object, &metadata).await;
+        let _failure = DanglingCheckPartsFailure::install(bucket, object, 1, DiskError::Timeout);
+
+        let (_, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("part probe timeout should be reported without deletion");
+        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
+        let surviving = disks[0]
+            .as_ref()
+            .expect("first test disk should be online")
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("probe uncertainty must preserve the surviving metadata");
+        assert_eq!(surviving.data_dir, Some(data_dir));
+        assert!(
+            temp_dirs[0]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(data_dir.to_string())
+                .join("part.1")
+                .is_file(),
+            "probe uncertainty must preserve the last confirmed shard"
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_delete_guard_ignores_set_incompatible_geometry() {
+        let bucket = "bucket-delete-guard-short-geometry";
+        let object = "object.bin";
+        let data_dir = Uuid::parse_str("abababab-abab-abab-abab-abababababab").expect("data dir should parse");
+        let (_temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[(data_dir, 1)]).await;
+        let mut candidate = FileInfo::new(object, 1, 0);
+        candidate.data_dir = Some(data_dir);
+        candidate.mod_time = Some(OffsetDateTime::from_unix_timestamp(18).expect("timestamp should parse"));
+        candidate.size = 1;
+        candidate.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
+        candidate.erasure.index = candidate.erasure.distribution[0];
+        seed_meta_regen_test_metadata(&disks, 0, bucket, object, &candidate).await;
+        let metadata = vec![candidate, FileInfo::default(), FileInfo::default(), FileInfo::default()];
+        let errs = vec![
+            None,
+            Some(DiskError::FileNotFound),
+            Some(DiskError::FileNotFound),
+            Some(DiskError::FileNotFound),
+        ];
+
+        assert!(
+            set.dangling_delete_safety(bucket, object, &metadata, &errs, &disks)
+                .await
+                .expect("set-incompatible geometry should be classified")
+                == DanglingDeleteSafety::NoRecoverableCandidate
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_delete_guard_preserves_delete_marker_and_remote_metadata() {
+        let bucket = "bucket-delete-guard-nonlocal";
+        let object = "object.bin";
+        let (_temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[]).await;
+        let marker = FileInfo {
+            name: object.to_string(),
+            version_id: Some(Uuid::parse_str("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee").expect("version id should parse")),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(14).expect("marker timestamp should parse")),
+            ..Default::default()
+        };
+        let remote_dir = Uuid::parse_str("89898989-8989-8989-8989-898989898989").expect("remote data dir should parse");
+        let mut remote = meta_regen_test_fileinfo(object, remote_dir, 15, 1);
+        remote.transition_status = TRANSITION_COMPLETE.to_string();
+        remote.transition_tier = "WARM".to_string();
+        remote.transitioned_objname = "remote/object.bin".to_string();
+
+        for metadata in [marker, remote] {
+            let candidates = vec![metadata, FileInfo::default(), FileInfo::default(), FileInfo::default()];
+            let errs = vec![
+                None,
+                Some(DiskError::FileNotFound),
+                Some(DiskError::FileNotFound),
+                Some(DiskError::FileNotFound),
+            ];
+            assert_eq!(
+                set.dangling_delete_safety(bucket, object, &candidates, &errs, &disks)
+                    .await
+                    .expect("non-local metadata should be classified"),
+                DanglingDeleteSafety::UnsafeToDelete
+            );
+        }
     }
 
     #[tokio::test]
