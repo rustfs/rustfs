@@ -5702,11 +5702,13 @@ mod transition_upload_integrity_tests {
         fn drop(&mut self) {
             let previous = self.previous.clone();
             let handle = tokio::runtime::Handle::current();
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
+            std::thread::spawn(move || {
+                handle.block_on(async {
                     runtime_sources::set_setup_type(previous).await;
                 });
-            });
+            })
+            .join()
+            .expect("setup type restore thread should not panic");
         }
     }
 
