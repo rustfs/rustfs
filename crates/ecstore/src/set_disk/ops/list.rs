@@ -79,6 +79,9 @@ impl<'a> ListOperations<'a> {
                 Ok(_) => {
                     errors.push(None);
                 }
+                Err(DiskError::FileNotFound | DiskError::PathNotFound | DiskError::VolumeNotFound) => {
+                    errors.push(None);
+                }
                 Err(e) => {
                     errors.push(Some(e));
                 }
@@ -95,6 +98,10 @@ impl<'a> ListOperations<'a> {
                 errors = ?errors,
                 "delete_all completed with disk errors"
             );
+        }
+
+        if let Some(err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, self.ctx.core().default_write_quorum()) {
+            return Err(err.into());
         }
 
         Ok(())
