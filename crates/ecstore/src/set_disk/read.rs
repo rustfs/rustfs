@@ -1971,6 +1971,17 @@ mod metadata_cache_tests {
                 let mut fi = valid_test_fileinfo(object);
                 fi.mod_time = Some(OffsetDateTime::now_utc());
                 fi.erasure.index = fi.erasure.distribution[disk_index];
+                // `valid_test_fileinfo` carries a positive size with no parts —
+                // the shape `validate_collection_contents` rejects as
+                // `FileCorrupt` — so it can drive
+                // `get_object_with_fileinfo_rejects_positive_size_without_parts`.
+                // Metadata that has to survive a write needs the matching part.
+                fi.parts.push(ObjectPartInfo {
+                    number: 1,
+                    size: 1,
+                    actual_size: 1,
+                    ..Default::default()
+                });
                 disk.write_metadata(bucket, bucket, object, fi)
                     .await
                     .expect("metadata should be written before quorum read");
