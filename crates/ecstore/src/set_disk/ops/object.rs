@@ -25,7 +25,10 @@ use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
-    tier_sweeper::{Jentry, RemoteTierDeleteOutcome, delete_object_from_remote_tier_with_lease_idempotent},
+    tier_sweeper::{
+        Jentry, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_lease_idempotent,
+        delete_object_from_remote_tier_with_lease_idempotent,
+    },
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
         TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
@@ -34,6 +37,7 @@ use crate::bucket::lifecycle::{
 };
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
+use crate::error::is_err_invalid_upload_id;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
@@ -96,6 +100,126 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
     }
 
     Some(object_info.size)
+}
+
+const RESTORE_MULTIPART_ABORT_FAILURES_TOTAL: &str = "rustfs_restore_multipart_abort_failures_total";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreMultipartFailurePoint {
+    InvalidPartSize,
+    RangeOverflow,
+    TierGet,
+    HashReader,
+    PutPart,
+    SizeMismatch,
+    Complete,
+}
+
+#[cfg(test)]
+static RESTORE_MULTIPART_FAILURE_POINT: std::sync::Mutex<Option<RestoreMultipartFailurePoint>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static RESTORE_MULTIPART_UPLOAD_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static RESTORE_MULTIPART_ABORT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn restore_multipart_failure_is(point: RestoreMultipartFailurePoint) -> bool {
+    *RESTORE_MULTIPART_FAILURE_POINT
+        .lock()
+        .expect("restore multipart failure-point lock must not be poisoned")
+        == Some(point)
+}
+
+#[cfg(test)]
+fn fail_restore_multipart_at(point: RestoreMultipartFailurePoint) -> Result<()> {
+    if restore_multipart_failure_is(point) {
+        return Err(StorageError::Unexpected);
+    }
+    Ok(())
+}
+
+struct RestoreMultipartUploadCleanup {
+    store: Arc<SetDisks>,
+    bucket: String,
+    object: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl RestoreMultipartUploadCleanup {
+    fn new(store: Arc<SetDisks>, bucket: &str, object: &str, upload_id: &str) -> Self {
+        Self {
+            store,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            upload_id: upload_id.to_string(),
+            armed: true,
+        }
+    }
+
+    async fn abort(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        #[cfg(test)]
+        RESTORE_MULTIPART_ABORT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = self
+            .store
+            .abort_multipart_upload(&self.bucket, &self.object, &self.upload_id, &ObjectOptions::default())
+            .await
+            && !is_err_invalid_upload_id(&err)
+        {
+            metrics::counter!(RESTORE_MULTIPART_ABORT_FAILURES_TOTAL).increment(1);
+            warn!(
+                bucket = self.bucket,
+                object = self.object,
+                upload_id = self.upload_id,
+                error = ?err,
+                "failed to abort incomplete multipart restore"
+            );
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestoreMultipartUploadCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let bucket = self.bucket.clone();
+        let object = self.object.clone();
+        let upload_id = self.upload_id.clone();
+        #[cfg(test)]
+        RESTORE_MULTIPART_ABORT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        // Cancellation while the restore runtime is alive is cleaned
+        // asynchronously. Runtime teardown itself is only best-effort because
+        // Drop cannot await storage IO; normal error exits use abort() above.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(err) = store
+                    .abort_multipart_upload(&bucket, &object, &upload_id, &ObjectOptions::default())
+                    .await
+                    && !is_err_invalid_upload_id(&err)
+                {
+                    metrics::counter!(RESTORE_MULTIPART_ABORT_FAILURES_TOTAL).increment(1);
+                    warn!(
+                        bucket,
+                        object,
+                        upload_id,
+                        error = ?err,
+                        "failed to abort cancelled multipart restore"
+                    );
+                }
+            });
+        }
+    }
 }
 
 pub(crate) fn body_cache_plaintext_len(
@@ -1542,7 +1666,11 @@ pub(crate) async fn cleanup_uncommitted_transition_upload(
     cleanup_version: &str,
     version_id_exact: bool,
 ) -> std::io::Result<RemoteTierDeleteOutcome> {
-    delete_object_from_remote_tier_with_lease_idempotent(object, cleanup_version, lease, version_id_exact).await
+    if version_id_exact {
+        delete_confirmed_transition_candidate_exact_with_lease_idempotent(object, cleanup_version, lease).await
+    } else {
+        delete_object_from_remote_tier_with_lease_idempotent(object, cleanup_version, lease, false).await
+    }
 }
 
 fn log_transition_upload_cleanup_failure(lease: &TierOperationLease, object: &str, cleanup_version: &str, err: &std::io::Error) {
@@ -1679,7 +1807,7 @@ impl Drop for TransitionUploadCleanup {
     }
 }
 
-async fn cleanup_rejected_transition_upload_durably(
+pub(crate) async fn cleanup_rejected_transition_upload_durably(
     lease: &TierOperationLease,
     object: &str,
     cleanup_version: &str,
@@ -1858,10 +1986,81 @@ async fn advance_and_save_transition_transaction(
     next: TransitionTransactionState,
     remote_version: Option<TransitionRemoteVersion>,
 ) -> Result<()> {
+    #[cfg(test)]
+    record_transition_uploaded_save_attempt(transaction, next);
     transaction
         .advance(transaction.fence(), next, remote_version)
         .map_err(Error::other)?;
     save_transition_transaction_if_available(api, transaction).await
+}
+
+#[cfg(test)]
+struct TransitionUploadedSaveProbeState {
+    bucket: String,
+    object: String,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+struct TransitionUploadedSaveProbe {
+    state: Arc<TransitionUploadedSaveProbeState>,
+}
+
+#[cfg(test)]
+static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionUploadedSaveProbeState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl TransitionUploadedSaveProbe {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TransitionUploadedSaveProbeState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded-save probe mutex should not poison");
+        assert!(slot.is_none(), "transition uploaded-save probe must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    fn attempts(&self) -> usize {
+        self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TransitionUploadedSaveProbe {
+    fn drop(&mut self) {
+        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded-save probe mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, next: TransitionTransactionState) {
+    if next != TransitionTransactionState::Uploaded {
+        return;
+    }
+    let state = TRANSITION_UPLOADED_SAVE_PROBE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition uploaded-save probe mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == transaction.source.bucket && state.object == transaction.source.object)
+        .cloned();
+    if let Some(state) = state {
+        state.attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
@@ -2142,10 +2341,7 @@ fn persisted_transition_version_with_gate(
     remote_version_state_writer_enabled: bool,
 ) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
     if remote_version.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "a missing remote tier object version does not prove that bucket versioning is disabled",
-        ));
+        return Ok((None, rustfs_filemeta::TransitionVersionState::KnownDisabled));
     }
 
     match Uuid::parse_str(remote_version) {
@@ -2162,6 +2358,82 @@ fn persisted_transition_version_with_gate(
             Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::SuspendedNull))
         }
         Err(_) => Ok((Some(remote_version.to_string()), rustfs_filemeta::TransitionVersionState::Exact)),
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ObjectTaggingCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct ObjectTaggingCommitBarrier {
+    state: Arc<ObjectTaggingCommitBarrierState>,
+}
+
+#[cfg(test)]
+static OBJECT_TAGGING_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<ObjectTaggingCommitBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl ObjectTaggingCommitBarrier {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(ObjectTaggingCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            ..Default::default()
+        });
+        let mut slot = OBJECT_TAGGING_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("object tagging commit barrier mutex should not poison");
+        assert!(slot.is_none(), "object tagging commit barrier must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("object tagging should reach the deterministic commit barrier");
+    }
+
+    fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObjectTaggingCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = OBJECT_TAGGING_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("object tagging commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_object_tagging_commit(bucket: &str, object: &str) {
+    let barrier = OBJECT_TAGGING_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("object tagging commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
     }
 }
 
@@ -2333,7 +2605,10 @@ mod transition_version_id_tests {
 
     #[test]
     fn normalizes_persisted_unversioned_ids_and_preserves_put_constraints() {
-        assert!(persisted_transition_version("").is_err());
+        assert_eq!(
+            persisted_transition_version("").expect("empty remote version identifies an unversioned tier"),
+            (None, TransitionVersionState::KnownDisabled)
+        );
         assert!(persisted_transition_version(&Uuid::nil().to_string()).is_err());
         let nil_put_response = Uuid::nil().to_string();
         let nil_candidate = TransitionUploadCandidate::from_put_response(nil_put_response.clone());
@@ -2396,10 +2671,51 @@ mod transition_version_id_tests {
                 expected
             );
         }
-        assert!(
-            persisted_transition_version_with_gate("", true).is_err(),
-            "an empty PUT response must remain unknown without authoritative bucket state"
+        assert_eq!(
+            persisted_transition_version_with_gate("", true).expect("empty remote version identifies an unversioned tier"),
+            (None, TransitionVersionState::KnownDisabled)
         );
+    }
+}
+
+impl SetDisks {
+    async fn update_object_tags_locked(
+        &self,
+        operation: &'static str,
+        bucket: &str,
+        object: &str,
+        tags: &str,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let object_lock_guard = if opts.no_lock {
+            None
+        } else {
+            Some(self.acquire_write_lock_diag(operation, bucket, object).await?)
+        };
+        // Force the full quorum fanout (allow_early_stop=false): `disks` is the
+        // write target below, and an early-stop subset would only carry read
+        // quorum, failing write quorum on update_object_meta (backlog#872).
+        let (mut fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
+
+        fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
+
+        #[cfg(test)]
+        pause_object_tagging_commit(bucket, object).await;
+        // Fence the read-modify-write before any disk can merge metadata derived
+        // from this read after another writer has reacquired the same key.
+        if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: operation,
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+
+        self.update_object_meta(bucket, object, fi.clone(), disks.as_slice()).await?;
+
+        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
 }
 
@@ -3628,6 +3944,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err.into());
         }
+        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
+            Ok(version) => version,
+            Err(err) => {
+                let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                    return Err(StorageError::Io(std::io::Error::other(format!(
+                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
+                    ))));
+                }
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+                return Err(err.into());
+            }
+        };
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -3645,20 +3975,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err);
         }
-        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
-            Ok(version) => version,
-            Err(err) => {
-                let cleanup_api = transition_cleanup_store(&self.ctx).await;
-                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
-                    return Err(StorageError::Io(std::io::Error::other(format!(
-                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
-                    ))));
-                }
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
-                return Err(err.into());
-            }
-        };
 
         let mut commit_opts = opts.clone();
         commit_opts.no_lock = true;
@@ -3952,116 +4268,124 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let res = self_.clone().new_multipart_upload(bucket, object, &ropts).await?;
-        //if err != nil {
-        //    return set_restore_header_fn(&mut oi, err).await;
-        //}
-
-        let mut uploaded_parts: Vec<CompletePart> = vec![];
-        let parts = Arc::clone(&oi.parts);
-        let mut part_offset: i64 = 0;
-        for part_info in parts.iter() {
-            let mut part_opts = opts.clone();
-            part_opts.part_number = Some(part_info.number);
-            if part_info.actual_size <= 0 {
-                return set_restore_header_fn(
-                    &mut oi,
-                    Some(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size))),
+        #[cfg(test)]
+        {
+            *RESTORE_MULTIPART_UPLOAD_ID
+                .lock()
+                .expect("restore multipart upload-id lock must not be poisoned") = Some(res.upload_id.clone());
+        }
+        let mut upload_cleanup = RestoreMultipartUploadCleanup::new(self_.clone(), bucket, object, &res.upload_id);
+        let restore_result: Result<ObjectInfo> = async {
+            let mut uploaded_parts: Vec<CompletePart> = vec![];
+            let parts = Arc::clone(&oi.parts);
+            let mut part_offset: i64 = 0;
+            for part_info in parts.iter() {
+                let mut part_opts = opts.clone();
+                part_opts.part_number = Some(part_info.number);
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::InvalidPartSize)?;
+                if part_info.actual_size <= 0 {
+                    return Err(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size)));
+                }
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::RangeOverflow)?;
+                let part_end = part_offset
+                    .checked_add(part_info.actual_size - 1)
+                    .ok_or_else(|| Error::other("multipart restore part range overflow".to_string()))?;
+                let rs = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: part_offset,
+                    end: part_end,
+                });
+                part_offset = part_end
+                    .checked_add(1)
+                    .ok_or_else(|| Error::other("multipart restore part offset overflow".to_string()))?;
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::TierGet)?;
+                let gr = get_transitioned_object_reader_with_tier_manager(
+                    bucket,
+                    object,
+                    &rs,
+                    &HeaderMap::new(),
+                    &oi,
+                    &part_opts,
+                    &self_.ctx.tier_config_mgr(),
                 )
-                .await;
-            }
-            let part_end = match part_offset.checked_add(part_info.actual_size - 1) {
-                Some(end) => end,
-                None => {
-                    return set_restore_header_fn(
-                        &mut oi,
-                        Some(Error::other("multipart restore part range overflow".to_string())),
-                    )
-                    .await;
-                }
-            };
-            let rs = Some(HTTPRangeSpec {
-                is_suffix_length: false,
-                start: part_offset,
-                end: part_end,
-            });
-            part_offset = match part_end.checked_add(1) {
-                Some(next) => next,
-                None => {
-                    return set_restore_header_fn(
-                        &mut oi,
-                        Some(Error::other("multipart restore part offset overflow".to_string())),
-                    )
-                    .await;
-                }
-            };
-            let gr = match get_transitioned_object_reader_with_tier_manager(
-                bucket,
-                object,
-                &rs,
-                &HeaderMap::new(),
-                &oi,
-                &part_opts,
-                &self_.ctx.tier_config_mgr(),
-            )
-            .await
-            {
-                Ok(reader) => reader,
-                Err(err) => {
-                    return set_restore_header_fn(&mut oi, Some(StorageError::Io(err))).await;
-                }
-            };
-            let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
-            let mut p_reader = PutObjReader::new(hash_reader);
-            let p_info = self_
-                .clone()
-                .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
-                .await?;
-            //if let Err(err) = p_info {
-            //    return set_restore_header_fn(&mut oi, err).await;
-            //}
-            if p_info.size as i64 != part_info.actual_size {
-                return set_restore_header_fn(
-                    &mut oi,
-                    Some(Error::other(ObjectApiError::InvalidObjectState(GenericError {
+                .await
+                .map_err(StorageError::Io)?;
+                let reader = BufReader::new(gr.stream);
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::HashReader)?;
+                let hash_reader =
+                    HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
+                let mut p_reader = PutObjReader::new(hash_reader);
+                #[cfg(test)]
+                fail_restore_multipart_at(RestoreMultipartFailurePoint::PutPart)?;
+                let p_info = self_
+                    .clone()
+                    .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ObjectOptions::default())
+                    .await?;
+                #[cfg(test)]
+                let p_info = if restore_multipart_failure_is(RestoreMultipartFailurePoint::SizeMismatch) {
+                    let mut injected = p_info;
+                    injected.size = 0;
+                    injected
+                } else {
+                    p_info
+                };
+                if p_info.size as i64 != part_info.actual_size {
+                    return Err(Error::other(ObjectApiError::InvalidObjectState(GenericError {
                         bucket: bucket.to_string(),
                         object: object.to_string(),
                         ..Default::default()
-                    }))),
-                )
-                .await;
+                    })));
+                }
+                uploaded_parts.push(CompletePart {
+                    part_num: p_info.part_num,
+                    etag: p_info.etag,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    checksum_crc64nvme: None,
+                });
             }
-            uploaded_parts.push(CompletePart {
-                part_num: p_info.part_num,
-                etag: p_info.etag,
-                checksum_crc32: None,
-                checksum_crc32c: None,
-                checksum_sha1: None,
-                checksum_sha256: None,
-                checksum_crc64nvme: None,
-            });
+            #[cfg(test)]
+            if restore_multipart_failure_is(RestoreMultipartFailurePoint::Complete) {
+                uploaded_parts
+                    .first_mut()
+                    .expect("multipart restore must contain at least one uploaded part")
+                    .etag = Some("injected-invalid-complete-etag".to_string());
+            }
+            self_
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    object,
+                    &res.upload_id,
+                    uploaded_parts,
+                    &ObjectOptions {
+                        mod_time: oi.mod_time,
+                        version_id: oi.version_id.map(|version| version.to_string()),
+                        user_defined: restore_commit_metadata,
+                        // Inherit the restore write lock (see ropts.no_lock above):
+                        // the commit phase re-acquires this object's write lock.
+                        no_lock: opts.no_lock,
+                        ..Default::default()
+                    },
+                )
+                .await
         }
-        let restored_info = match self_
-            .clone()
-            .complete_multipart_upload(
-                bucket,
-                object,
-                &res.upload_id,
-                uploaded_parts,
-                &ObjectOptions {
-                    mod_time: oi.mod_time,
-                    version_id: oi.version_id.map(|version| version.to_string()),
-                    user_defined: restore_commit_metadata,
-                    // Inherit the restore write lock (see ropts.no_lock above):
-                    // the commit phase re-acquires this object's write lock.
-                    no_lock: opts.no_lock,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(info) => info,
-            Err(err) => return set_restore_header_fn(&mut oi, Some(err)).await,
+        .await;
+        let restored_info = match restore_result {
+            Ok(info) => {
+                upload_cleanup.disarm();
+                info
+            }
+            Err(err) => {
+                upload_cleanup.abort().await;
+                return set_restore_header_fn(&mut oi, Some(err)).await;
+            }
         };
         send_event(EventArgs {
             event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
@@ -4076,32 +4400,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        // Acquire write-lock for tag update (metadata write)
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _lock_guard = guard_opt;
-        // }
-        // Force the full quorum fanout (allow_early_stop=false): `disks` is the
-        // write target below, and an early-stop subset would only carry read
-        // quorum, failing write quorum on update_object_meta (backlog#872).
-        let (mut fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
-
-        fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
-
-        self.update_object_meta(bucket, object, fi.clone(), disks.as_slice()).await?;
-
-        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
+        self.update_object_tags_locked("put_object_tags", bucket, object, tags, opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.put_object_tags(bucket, object, "", opts).await
+        self.update_object_tags_locked("delete_object_tags", bucket, object, "", opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -4515,8 +4821,10 @@ mod transition_commit_failure_tests {
     use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
     use crate::services::tier::tier::TierConfigMgr;
+    use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
+    use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
     use s3s::dto::RestoreRequest;
     use tokio::io::AsyncReadExt;
 
@@ -4538,7 +4846,7 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     async fn rejected_unsupported_remote_versions_are_cleaned_up() {
-        for remote_version in ["", "null", "opaque-version-token"] {
+        for remote_version in ["null", "opaque-version-token"] {
             let manager = TierConfigMgr::new();
             let backend = register_mock_tier(&manager, "WARM").await;
             let lease = TierConfigMgr::acquire_operation_lease(&manager, "WARM")
@@ -4562,6 +4870,150 @@ mod transition_commit_failure_tests {
                 vec![("remote/object".to_string(), candidate.cleanup_version().to_string())]
             );
         }
+    }
+
+    #[serial_test::serial(restore_multipart_failure_point)]
+    async fn multipart_restore_aborts_every_post_create_failure() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        RESTORE_MULTIPART_ABORT_ATTEMPTS.store(0, Ordering::Relaxed);
+        let bucket = "restore-multipart-failure-cleanup-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let source_upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("source multipart upload should be created");
+        let mut first_reader = PutObjReader::from_vec(vec![b'a'; 5 * 1024 * 1024]);
+        let first = set_disks
+            .put_object_part(bucket, object, &source_upload.upload_id, 1, &mut first_reader, &ObjectOptions::default())
+            .await
+            .expect("first source part should be staged");
+        let mut second_reader = PutObjReader::from_vec(vec![b'b'; 1024 * 1024]);
+        let second = set_disks
+            .put_object_part(bucket, object, &source_upload.upload_id, 2, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect("second source part should be staged");
+        let original = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &source_upload.upload_id,
+                vec![
+                    CompletePart {
+                        part_num: first.part_num,
+                        etag: first.etag,
+                        ..Default::default()
+                    },
+                    CompletePart {
+                        part_num: second.part_num,
+                        etag: second.etag,
+                        ..Default::default()
+                    },
+                ],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("source multipart upload should complete");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart source should transition before restore");
+
+        for point in [
+            RestoreMultipartFailurePoint::InvalidPartSize,
+            RestoreMultipartFailurePoint::RangeOverflow,
+            RestoreMultipartFailurePoint::TierGet,
+            RestoreMultipartFailurePoint::HashReader,
+            RestoreMultipartFailurePoint::PutPart,
+            RestoreMultipartFailurePoint::SizeMismatch,
+            RestoreMultipartFailurePoint::Complete,
+        ] {
+            *RESTORE_MULTIPART_FAILURE_POINT
+                .lock()
+                .expect("restore multipart failure-point lock must not be poisoned") = Some(point);
+            *RESTORE_MULTIPART_UPLOAD_ID
+                .lock()
+                .expect("restore multipart upload-id lock must not be poisoned") = None;
+            let mut opts = ObjectOptions::default();
+            opts.transition.restore_request.days = Some(1);
+            set_disks
+                .clone()
+                .restore_transitioned_object(bucket, object, &opts)
+                .await
+                .expect_err("injected post-create restore failure must surface");
+            let upload_id = RESTORE_MULTIPART_UPLOAD_ID
+                .lock()
+                .expect("restore multipart upload-id lock must not be poisoned")
+                .clone()
+                .expect("restore must create an upload before the injected failure");
+            let err = set_disks
+                .get_multipart_info(bucket, object, &upload_id, &ObjectOptions::default())
+                .await
+                .expect_err("failed restore upload must immediately disappear");
+            assert!(is_err_invalid_upload_id(&err), "{point:?}: unexpected upload lookup error: {err:?}");
+            let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+            for temp_dir in &temp_dirs {
+                assert!(
+                    !temp_dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path).exists(),
+                    "{point:?}: failed restore must remove staged multipart data"
+                );
+            }
+        }
+        assert_eq!(
+            RESTORE_MULTIPART_ABORT_ATTEMPTS.load(Ordering::Relaxed),
+            7,
+            "every injected post-create failure must attempt an abort"
+        );
+        *RESTORE_MULTIPART_FAILURE_POINT
+            .lock()
+            .expect("restore multipart failure-point lock must not be poisoned") = None;
+        let mut opts = ObjectOptions::default();
+        opts.transition.restore_request.days = Some(1);
+        set_disks
+            .clone()
+            .restore_transitioned_object(bucket, object, &opts)
+            .await
+            .expect("multipart restore should complete after failure injection is cleared");
+        assert_eq!(
+            RESTORE_MULTIPART_ABORT_ATTEMPTS.load(Ordering::Relaxed),
+            7,
+            "successful multipart completion must disarm cleanup without aborting"
+        );
+        let restored = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("successful multipart restore must leave the committed object intact");
+        let restore_header = restored
+            .user_defined
+            .get(s3s::header::X_AMZ_RESTORE.as_str())
+            .expect("successful multipart restore must persist restore status");
+        let restore_status = parse_restore_obj_status(restore_header).expect("successful restore status must be valid");
+        assert!(!restore_status.on_going(), "successful multipart restore must not remain in progress");
+        assert!(
+            restore_status.expiry().is_some(),
+            "successful multipart restore must retain its expiry date"
+        );
     }
 
     #[tokio::test]
@@ -5730,11 +6182,13 @@ mod transition_upload_integrity_tests {
         fn drop(&mut self) {
             let previous = self.previous.clone();
             let handle = tokio::runtime::Handle::current();
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
+            std::thread::spawn(move || {
+                handle.block_on(async {
                     runtime_sources::set_setup_type(previous).await;
                 });
-            });
+            })
+            .join()
+            .expect("setup type restore thread should not panic");
         }
     }
 
@@ -6139,8 +6593,7 @@ mod transition_upload_integrity_tests {
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        let previous_setup_type = runtime_sources::current_setup_type().await;
-        runtime_sources::set_setup_type(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let mut opts = transition_options(&original, tier_name);
         opts.no_lock = false;
         let barrier = TransitionCommitBarrier::install_before_lock_lost_check(bucket, object);
@@ -6164,7 +6617,6 @@ mod transition_upload_integrity_tests {
             matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
             "unexpected transition lock-lost error: {error:?}"
         );
-        runtime_sources::set_setup_type(previous_setup_type).await;
         assert_eq!(backend.put_count().await, 1);
         assert_eq!(
             backend.remove_count().await,
@@ -6369,20 +6821,21 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn opaque_remote_version_is_persisted_exactly() {
+    async fn unversioned_remote_version_is_persisted_without_version_id() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
-        let bucket = "transition-unknown-version-bucket";
+        let bucket = "transition-unversioned-tier-bucket";
         let object = "object.bin";
-        let payload = b"unknown remote version must retain local data".repeat(1024);
+        let payload = b"unversioned remote tier must commit without a version id".repeat(1024);
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        backend.set_put_remote_version(Some("opaque-version-token".to_string())).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
             .await
-            .expect("an accepted opaque remote version must commit");
+            .expect("an unversioned remote version must commit");
         let (fi, _, _) = set_disks
             .get_object_fileinfo(
                 bucket,
@@ -6396,11 +6849,68 @@ mod transition_upload_integrity_tests {
                 false,
             )
             .await
-            .expect("committed opaque transition metadata should be readable");
+            .expect("committed unversioned transition metadata should be readable");
         assert_eq!(fi.transition_version_id, None);
-        assert_eq!(fi.transition_version.as_deref(), Some("opaque-version-token"));
+        assert_eq!(fi.transition_version, None);
+        assert_eq!(fi.transition_version_state, rustfs_filemeta::TransitionVersionState::KnownDisabled);
+        assert_eq!(save_probe.attempts(), 1);
         assert_eq!(backend.remove_count().await, 0);
         assert_eq!(backend.object_count().await, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn opaque_remote_version_is_cleaned_before_parse_failure() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-unknown-version-bucket";
+        let object = "object.bin";
+        let payload = b"unknown remote version must retain local data".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some("opaque-version-token".to_string())).await;
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("an opaque remote version must fail closed until the capability gate is active");
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(removed_versions[0].1, "opaque-version-token");
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn nil_remote_version_is_cleaned_exactly_before_transaction_persistence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-nil-version-bucket";
+        let object = "object.bin";
+        let payload = b"nil remote version must retain local data".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let remote_version = Uuid::nil().to_string();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("a nil remote version must fail closed before transaction persistence");
+        let put_versions = backend.put_versions().await;
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions, put_versions);
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(
+            removed_versions.first().map(|(_, version)| version.as_str()),
+            Some(remote_version.as_str())
+        );
+        assert_eq!(save_probe.attempts(), 0, "nil remote version must be rejected before saving Uploaded");
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
     #[tokio::test]
@@ -6508,6 +7018,63 @@ mod transition_upload_integrity_tests {
         assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial]
+    async fn tagging_lock_lost_before_metadata_write_fails_closed() {
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| Arc::new(LockLostRefreshClient::new(Arc::clone(&refresh_calls))) as Arc<dyn LockClient>)
+            .collect();
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "tagging-lock-lost-bucket";
+        let object = "object.bin";
+        write_source(&set_disks, &disk_stores, bucket, object, b"tagging source").await;
+
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = ObjectTaggingCommitBarrier::install(bucket, object);
+        let tagging_set = Arc::clone(&set_disks);
+        let tagging = tokio::spawn(async move {
+            tagging_set
+                .put_object_tags(bucket, object, "must=not-commit", &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            refresh_calls.load(Ordering::SeqCst) > 0,
+            "test must drive the real distributed-lock heartbeat before the tagging commit fence"
+        );
+        barrier.release();
+
+        let error = tagging
+            .await
+            .expect("tagging task should not panic")
+            .expect_err("tagging must fail after its namespace lock loses refresh quorum");
+        assert!(
+            matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
+            "unexpected tagging lock-lost error: {error:?}"
+        );
+        let (fi, _, _) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                false,
+                false,
+            )
+            .await
+            .expect("source metadata should remain readable");
+        assert!(
+            !fi.metadata.contains_key(AMZ_OBJECT_TAGGING),
+            "a stale tagging writer must not write metadata after refresh-quorum loss"
+        );
     }
 
     #[tokio::test]
@@ -6992,6 +7559,217 @@ mod put_object_tags_early_stop_regression_tests {
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod object_tagging_namespace_lock_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
+    use super::*;
+    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use tokio::io::AsyncReadExt as _;
+
+    #[derive(Clone, Copy, Debug)]
+    enum CompetingMutation {
+        Put,
+        Delete,
+    }
+
+    async fn read_body(set_disks: &SetDisks, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), opts)
+            .await?
+            .stream
+            .read_to_end(&mut body)
+            .await?;
+        Ok(body)
+    }
+
+    #[tokio::test]
+    async fn tagging_honors_an_inherited_namespace_write_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "tag-lock-inherited";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(b"body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("object should be written");
+
+        let outer_lock = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("outer namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer namespace write lock should be acquired");
+        set_disks
+            .put_object_tags(
+                bucket,
+                object,
+                "lock=inherited",
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tagging should not reacquire an inherited namespace lock");
+        drop(outer_lock);
+
+        assert_eq!(
+            set_disks
+                .get_object_tags(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("persisted tags should remain readable"),
+            "lock=inherited"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tagging_serializes_with_put_and_delete_for_versioned_and_unversioned_objects() {
+        for versioned in [false, true] {
+            for mutation in [CompetingMutation::Put, CompetingMutation::Delete] {
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = format!("tag-lock-{}-{mutation:?}", if versioned { "versioned" } else { "plain" }).to_lowercase();
+                let object = "object";
+                for disk in &disk_stores {
+                    disk.make_volume(&bucket).await.expect("bucket volume should be created");
+                }
+
+                let object_opts = ObjectOptions {
+                    versioned,
+                    ..Default::default()
+                };
+                let original_body = b"original body".to_vec();
+                let mut original_reader = PutObjReader::from_vec(original_body.clone());
+                let original = set_disks
+                    .put_object(&bucket, object, &mut original_reader, &object_opts)
+                    .await
+                    .expect("original object should be written");
+                let original_version = original.version_id.map(|version| version.to_string());
+                set_disks
+                    .put_object_tags(&bucket, object, "stage=initial", &object_opts)
+                    .await
+                    .expect("initial tags should be written");
+
+                let barrier = ObjectTaggingCommitBarrier::install(&bucket, object);
+                let tagging_set = Arc::clone(&set_disks);
+                let tagging_bucket = bucket.clone();
+                let tagging_opts = object_opts.clone();
+                let tagging = tokio::spawn(async move {
+                    match mutation {
+                        CompetingMutation::Put => {
+                            tagging_set
+                                .put_object_tags(&tagging_bucket, object, "stage=before-mutation", &tagging_opts)
+                                .await
+                        }
+                        CompetingMutation::Delete => tagging_set.delete_object_tags(&tagging_bucket, object, &tagging_opts).await,
+                    }
+                });
+                barrier.wait_until_paused().await;
+
+                let mutation_set = Arc::clone(&set_disks);
+                let mutation_bucket = bucket.clone();
+                let mutation_opts = object_opts.clone();
+                let (mutation_started_tx, mutation_started_rx) = tokio::sync::oneshot::channel();
+                let competing = tokio::spawn(async move {
+                    mutation_started_tx
+                        .send(())
+                        .expect("tagging test should wait for the competing mutation");
+                    match mutation {
+                        CompetingMutation::Put => {
+                            let mut replacement = PutObjReader::from_vec(b"replacement body".to_vec());
+                            mutation_set
+                                .put_object(&mutation_bucket, object, &mut replacement, &mutation_opts)
+                                .await
+                                .map(Some)
+                        }
+                        CompetingMutation::Delete => mutation_set
+                            .delete_object(&mutation_bucket, object, mutation_opts)
+                            .await
+                            .map(|_| None),
+                    }
+                });
+                mutation_started_rx
+                    .await
+                    .expect("competing mutation should reach the namespace operation while tagging is paused");
+
+                barrier.release();
+                tagging
+                    .await
+                    .expect("tagging task should not panic")
+                    .expect("tagging should commit before the queued mutation");
+                let competing_result = competing
+                    .await
+                    .expect("competing mutation task should not panic")
+                    .expect("competing mutation should commit after tagging releases the lock");
+
+                match mutation {
+                    CompetingMutation::Put => {
+                        let replacement = competing_result.expect("put mutation should return the replacement object");
+                        let current = set_disks
+                            .get_object_info(&bucket, object, &object_opts)
+                            .await
+                            .expect("replacement metadata should remain readable");
+                        assert_eq!(
+                            read_body(&set_disks, &bucket, object, &object_opts)
+                                .await
+                                .expect("replacement version should remain readable"),
+                            b"replacement body"
+                        );
+                        assert_eq!(current.etag, replacement.etag, "tagging must not restore the previous version's ETag");
+                        assert!(
+                            current.user_tags.is_empty(),
+                            "a tag update ordered before the replacement must not leak onto the replacement version"
+                        );
+                    }
+                    CompetingMutation::Delete if versioned => {
+                        let old_version_opts = ObjectOptions {
+                            versioned: true,
+                            version_id: original_version,
+                            ..Default::default()
+                        };
+                        assert_eq!(
+                            read_body(&set_disks, &bucket, object, &old_version_opts)
+                                .await
+                                .expect("the version hidden by the delete marker should remain readable"),
+                            original_body
+                        );
+                        let old_version = set_disks
+                            .get_object_info(&bucket, object, &old_version_opts)
+                            .await
+                            .expect("the historical version metadata should remain readable");
+                        assert!(
+                            old_version.user_tags.is_empty(),
+                            "delete-tagging ordered before the delete marker must persist on the historical version"
+                        );
+                        for disk in &disk_stores {
+                            let current = disk
+                                .read_version("", &bucket, object, "", &ReadOptions::default())
+                                .await
+                                .expect("the current delete marker should remain visible on every disk");
+                            assert!(current.deleted);
+                        }
+                    }
+                    CompetingMutation::Delete => {
+                        let error = read_body(&set_disks, &bucket, object, &object_opts)
+                            .await
+                            .expect_err("unversioned deletion must not be undone by a stale tagging write");
+                        assert!(
+                            is_err_object_not_found(&error) || is_err_version_not_found(&error),
+                            "unexpected error after unversioned delete: {error:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

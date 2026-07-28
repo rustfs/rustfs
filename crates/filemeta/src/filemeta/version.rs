@@ -2509,6 +2509,8 @@ impl MetaObject {
         );
         if let Some(transition_version) = transitioned_version_bytes(fi) {
             insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
+        } else {
+            remove_bytes(&mut self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID);
         }
         set_transition_version_state(&mut self.meta_sys, fi.transition_version_state);
         insert_bytes(&mut self.meta_sys, SUFFIX_TRANSITION_TIER, fi.transition_tier.as_bytes().to_vec());
@@ -4246,6 +4248,37 @@ mod tests {
         let decoded = object.into_fileinfo("b", "k", false).expect("exact state should round trip");
         assert_eq!(decoded.transition_version_state, TransitionVersionState::Exact);
         assert_eq!(decoded.transition_version.as_deref(), Some(expected_version.as_str()));
+    }
+
+    #[test]
+    fn set_transition_known_disabled_removes_stale_version_dual_keys() {
+        let mut meta_sys = HashMap::new();
+        insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, b"stale-legacy-version".to_vec());
+        let mut object = make_meta_object_with_sys(meta_sys);
+        object.set_transition(&FileInfo {
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_state: TransitionVersionState::KnownDisabled,
+            transition_tier: "WARM".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(get_bytes(&object.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID), None);
+        assert!(
+            !object
+                .meta_sys
+                .contains_key(&format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_ID}"))
+        );
+        assert!(
+            !object
+                .meta_sys
+                .contains_key(&format!("{}{SUFFIX_TRANSITIONED_VERSION_ID}", rustfs_utils::http::MINIO_INTERNAL_PREFIX))
+        );
+        let decoded = object
+            .into_fileinfo("b", "k", false)
+            .expect("known-disabled transition must remain readable after replacing stale metadata");
+        assert_eq!(decoded.transition_version, None);
+        assert_eq!(decoded.transition_version_state, TransitionVersionState::KnownDisabled);
     }
 
     #[test]

@@ -177,7 +177,7 @@ fn every_rule_has_a_positive_sample() {
             msg("heal: latest metadata for b/o has no data_dir, cannot heal object data"),
         ),
         ("heal-all-writes-failed", msg("all drives had write errors, unable to heal b/o")),
-        ("heal-rename-failed", msg("all healed data rename attempts failed for b/o")),
+        ("heal-rename-failed", msg("heal rename incomplete: 1 of 2 targets committed for b/o")),
         (
             "heal-xlmeta-regen-failed",
             msg("heal_object: failed to regenerate recoverable xl.meta on disk"),

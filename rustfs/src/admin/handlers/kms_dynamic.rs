@@ -36,6 +36,8 @@ use tracing::{error, info, instrument, warn};
 
 /// Path to store KMS configuration in the cluster metadata
 const KMS_CONFIG_PATH: &str = "config/kms_config.json";
+const STATIC_KMS_LOCAL_CONFIG_REQUIRED: &str =
+    "Static KMS must be configured through RUSTFS_KMS_STATIC_SECRET_KEY or RUSTFS_KMS_STATIC_SECRET_KEY_FILE";
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_KMS: &str = "kms";
 const EVENT_ADMIN_KMS_DYNAMIC_STATE: &str = "admin_kms_dynamic_state";
@@ -106,9 +108,25 @@ fn normalize_configure_request_auth(
     Ok(())
 }
 
+fn ensure_kms_config_persistable(config: &KmsConfig) -> Result<(), String> {
+    if matches!(&config.backend_config, rustfs_kms::BackendConfig::Static(_)) {
+        return Err(STATIC_KMS_LOCAL_CONFIG_REQUIRED.to_string());
+    }
+    Ok(())
+}
+
+fn ensure_kms_request_persistable(request: &ConfigureKmsRequest) -> Result<(), String> {
+    if matches!(request, ConfigureKmsRequest::Static(_)) {
+        return Err(STATIC_KMS_LOCAL_CONFIG_REQUIRED.to_string());
+    }
+    Ok(())
+}
+
 /// Save KMS configuration to cluster storage
 #[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
+    ensure_kms_config_persistable(config)?;
+
     let context = current_app_context();
     let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
         return Err("Storage layer not initialized".to_string());
@@ -332,9 +350,13 @@ impl Operation for ConfigureKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-        let existing_config = service_manager.get_config().await;
+        let existing_config = service_manager.get_redacted_config().await;
 
         if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+        }
+
+        if let Err(e) = ensure_kms_request_persistable(&configure_request) {
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
         }
 
@@ -753,7 +775,7 @@ impl Operation for GetKmsStatusHandler {
         let service_manager = kms_service_manager_from_context();
 
         let status = service_manager.get_status().await;
-        let config = service_manager.get_config().await;
+        let config = service_manager.get_redacted_config().await;
 
         // Get backend type and health status
         let backend_type = config.as_ref().map(|c| c.backend.clone());
@@ -873,9 +895,13 @@ impl Operation for ReconfigureKmsHandler {
         );
 
         let service_manager = kms_service_manager_from_context();
-        let existing_config = service_manager.get_config().await;
+        let existing_config = service_manager.get_redacted_config().await;
 
         if let Err(e) = normalize_configure_request_auth(&mut configure_request, existing_config.as_ref()) {
+            return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
+        }
+
+        if let Err(e) = ensure_kms_request_persistable(&configure_request) {
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from(e))));
         }
 
@@ -960,7 +986,7 @@ impl Operation for ReconfigureKmsHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_persisted_kms_config, kms_configure_actions, kms_service_control_actions};
+    use super::{decode_persisted_kms_config, ensure_kms_config_persistable, kms_configure_actions, kms_service_control_actions};
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use tempfile::TempDir;
 
@@ -1045,5 +1071,17 @@ mod tests {
         assert!(!migrated);
         assert!(!config.allow_insecure_dev_defaults);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn static_kms_config_is_not_persisted_with_cluster_configuration() {
+        use base64::Engine as _;
+
+        let config = rustfs_kms::KmsConfig::static_kms(
+            "static-key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]),
+        );
+
+        assert!(ensure_kms_config_persistable(&config).is_err());
     }
 }

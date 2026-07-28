@@ -763,7 +763,7 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object, existing.transition_version_state)
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
         tier_sweeper::transitioned_delete_journal_entry(
@@ -771,6 +771,7 @@ async fn enqueue_transitioned_delete_cleanup(
             opts.versioned,
             opts.version_suspended,
             &existing.transitioned_object,
+            existing.transition_version_state,
         )
     };
     let Some(mut je) = je else {
@@ -3049,6 +3050,25 @@ fn can_skip_delete_objects_pre_stat(
     accounting_creates_delete_marker: bool,
 ) -> bool {
     !bucket_lock_enabled && !replicate_deletes && delete_creates_delete_marker(opts) && accounting_creates_delete_marker
+}
+
+fn complete_delete_noop(
+    helper: OperationHelper,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+) -> (S3Result<S3Response<DeleteObjectOutput>>, OperationHelper) {
+    let helper = helper
+        .event_name(EventName::ObjectRemovedNoOP)
+        .object(ObjectInfo {
+            name: key,
+            bucket,
+            ..Default::default()
+        })
+        .version_id(version_id.unwrap_or_default());
+    let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+    let helper = helper.complete(&result);
+    (result, helper)
 }
 
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
@@ -7057,7 +7077,7 @@ impl DefaultObjectUsecase {
         // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
         // 1. Add a lightweight get_object_lock_info() that only fetches retention metadata
         // 2. Or use combined get-and-delete in storage layer with retention check callback
-        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
+        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
         let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
@@ -7100,9 +7120,8 @@ impl DefaultObjectUsecase {
                     }
 
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                        // TODO: send event
-
-                        return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+                        let (result, _helper) = complete_delete_noop(helper, bucket, key, version_id_clone);
+                        return result;
                     }
 
                     return Err(ApiError::from(err).into());
@@ -9665,7 +9684,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn transitioned_delete_cleanup_persists_identity_bound_and_legacy_journals() {
+    async fn transitioned_delete_cleanup_persists_known_state_and_rejects_unknown_state() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         if current_app_context().is_none() {
             crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
@@ -9685,8 +9704,9 @@ mod tests {
         current.transitioned_object.tier = "WARM".to_string();
         current.transitioned_object.name = "remote/identity-bound".to_string();
         current.transitioned_object.version_id = "remote-version".to_string();
+        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
 
-        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>| {
+        let journal_name = |remote_object: &str, backend_identity: Option<[u8; 32]>, version_id_exact: bool| {
             use sha2::{Digest, Sha256};
 
             let mut hasher = Sha256::new();
@@ -9699,6 +9719,10 @@ mod tests {
                 hasher.update([0]);
                 hasher.update(backend_identity);
             }
+            if version_id_exact {
+                hasher.update([0]);
+                hasher.update(b"exact-version-id");
+            }
             format!("ilm/tier-delete-journal/{}.json", rustfs_utils::crypto::hex(hasher.finalize().as_slice()))
         };
 
@@ -9708,7 +9732,7 @@ mod tests {
         let mut identity_bound = store
             .get_object_reader(
                 ".rustfs.sys",
-                &journal_name("remote/identity-bound", Some(identity)),
+                &journal_name("remote/identity-bound", Some(identity), true),
                 None,
                 http::HeaderMap::new(),
                 &ObjectOptions::default(),
@@ -9721,11 +9745,14 @@ mod tests {
             .expect("identity-bound journal body should be readable");
         let identity_bound: serde_json::Value =
             serde_json::from_slice(&identity_bound_data).expect("identity-bound journal should decode as JSON");
-        assert_eq!(identity_bound["version"], serde_json::json!(2));
+        assert_eq!(identity_bound["version"], serde_json::json!(4));
         assert_eq!(identity_bound["backend_identity"], serde_json::json!(identity));
+        assert_eq!(identity_bound["version_id_exact"], serde_json::json!(true));
+        assert_eq!(identity_bound["version_state"], serde_json::json!("exact"));
 
         current.user_defined = Arc::new(HashMap::new());
         current.transitioned_object.name = "remote/legacy".to_string();
+        current.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
         enqueue_transitioned_delete_cleanup(
             store.clone(),
             "bucket",
@@ -9737,24 +9764,31 @@ mod tests {
             Some(&current),
         )
         .await
-        .expect("legacy force-delete cleanup should persist a fail-closed v1 journal");
-        let mut legacy = store
+        .expect("unknown force-delete cleanup should fail closed without a journal");
+        let legacy_err = match store
             .get_object_reader(
                 ".rustfs.sys",
-                &journal_name("remote/legacy", None),
+                &journal_name("remote/legacy", None, false),
                 None,
                 http::HeaderMap::new(),
                 &ObjectOptions::default(),
             )
             .await
-            .expect("legacy journal should be readable");
-        let mut legacy_data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut legacy.stream, &mut legacy_data)
-            .await
-            .expect("legacy journal body should be readable");
-        let legacy: serde_json::Value = serde_json::from_slice(&legacy_data).expect("legacy journal should decode as JSON");
-        assert_eq!(legacy["version"], serde_json::json!(1));
-        assert_eq!(legacy["backend_identity"], serde_json::Value::Null);
+        {
+            Ok(_) => panic!("unknown remote version state must not persist a delete journal"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                &legacy_err,
+                StorageError::FileNotFound
+                    | StorageError::ObjectNotFound(_, _)
+                    | StorageError::FileVersionNotFound
+                    | StorageError::VersionNotFound(_, _, _)
+                    | StorageError::VolumeNotFound
+            ),
+            "unknown remote version state must leave no journal, got {legacy_err:?}"
+        );
     }
 
     async fn put_real_cold_fill_object(store: &Arc<ECStore>, bucket: &str, object: &str, body: &[u8]) -> ObjectInfo {
@@ -13085,6 +13119,40 @@ mod tests {
 
         let err = Box::pin(usecase.execute_delete_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn delete_not_found_completes_noop_event_with_version_context() {
+        temp_env::with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
+            crate::server::refresh_notify_module_enabled();
+            for (version_id, expected_version) in [(None, ""), (Some("requested-version".to_string()), "requested-version")] {
+                let input = DeleteObjectInput::builder()
+                    .bucket("test-bucket".to_string())
+                    .key("missing-key".to_string())
+                    .version_id(version_id.clone())
+                    .build()
+                    .expect("delete input should build");
+                let mut req = build_request(input, Method::DELETE);
+                req.extensions.insert(crate::storage::access::ReqInfo {
+                    bucket: Some("test-bucket".to_string()),
+                    object: Some("missing-key".to_string()),
+                    version_id: version_id.clone(),
+                    ..Default::default()
+                });
+                let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
+
+                let (result, helper) =
+                    complete_delete_noop(helper, "test-bucket".to_string(), "missing-key".to_string(), version_id);
+                let event = helper.event_args().expect("successful no-op delete should retain an event");
+
+                assert_eq!(result.expect("no-op delete should succeed").status, Some(StatusCode::NO_CONTENT));
+                assert_eq!(event.event_name, EventName::ObjectRemovedNoOP);
+                assert_eq!(event.bucket_name, "test-bucket");
+                assert_eq!(event.object.name, "missing-key");
+                assert_eq!(event.version_id, expected_version);
+            }
+        });
+        crate::server::refresh_notify_module_enabled();
     }
 
     #[test]

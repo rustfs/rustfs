@@ -429,6 +429,10 @@ impl FileInfo {
     }
 
     fn validate_collection_contents(&self, layout: Option<&ValidatedErasureLayout>) -> Result<()> {
+        if layout.is_some() && self.size > 0 && self.parts.is_empty() {
+            return Err(Error::FileCorrupt);
+        }
+
         let mut part_numbers = [0u64; FILEINFO_PART_BITMAP_WORDS];
         for part in &self.parts {
             if let Some(layout) = layout {
@@ -730,6 +734,10 @@ impl FileInfo {
 
     // to_part_offset gets the part index where offset is located, returns part index and offset
     pub fn to_part_offset(&self, offset: usize) -> Result<(usize, usize)> {
+        if self.size > 0 && self.parts.is_empty() {
+            return Err(Error::FileCorrupt);
+        }
+
         if offset == 0 {
             return Ok((0, 0));
         }
@@ -1223,6 +1231,21 @@ mod tests {
             .validate(ValidationMode::RequireErasure)
             .expect("zero parity is a valid storage layout");
         assert_eq!(layout.expect("strict layout must be present").data_blocks, 16);
+    }
+
+    #[test]
+    fn validate_require_erasure_rejects_positive_size_without_parts() {
+        let mut fi = FileInfo::new("bucket/object", 4, 2);
+        fi.erasure.index = 1;
+        fi.size = 1;
+
+        assert_eq!(fi.validate_for_metadata_read(), Err(Error::FileCorrupt));
+        assert_eq!(fi.to_part_offset(0), Err(Error::FileCorrupt));
+
+        fi.size = 0;
+        fi.validate_for_metadata_read()
+            .expect("zero-byte object metadata may omit parts");
+        assert_eq!(fi.to_part_offset(0), Ok((0, 0)));
     }
 
     #[test]

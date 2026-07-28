@@ -27,6 +27,7 @@ documentation = "https://docs.rs/rustfs-lifecycle/latest/rustfs_lifecycle/"
 
 [dependencies]
 async-trait.workspace = true
+metrics.workspace = true
 rustfs-common.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-replication.workspace = true
@@ -38,6 +39,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 
 [dev-dependencies]
+metrics-util = { version = "0.20", features = ["debugging"] }
 proptest = "1"
 serial_test.workspace = true
 temp-env.workspace = true

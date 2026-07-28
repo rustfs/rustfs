@@ -1182,8 +1182,12 @@ impl TransitionState {
     }
 
     fn new_with_capacity(capacity: usize) -> Arc<Self> {
-        let capacity = capacity.max(1);
         let queue_send_timeout = resolve_transition_queue_send_timeout();
+        Self::new_with_capacity_and_timeout(capacity, queue_send_timeout)
+    }
+
+    fn new_with_capacity_and_timeout(capacity: usize, queue_send_timeout: StdDuration) -> Arc<Self> {
+        let capacity = capacity.max(1);
         let (tx1, rx1) = bounded(capacity);
         Arc::new(Self {
             transition_tx: tx1,
@@ -1250,13 +1254,12 @@ impl TransitionState {
             return false;
         }
         let bucket = bucket.to_string();
-        let scheduled = Arc::clone(&self.compensation_buckets);
         let state = Arc::clone(self);
         tokio::spawn(async move {
             Self::inc_counter(&state.compensation_running_tasks);
             state.record_scanner_transition_state();
             let Some(api) = runtime_sources::object_store_handle() else {
-                scheduled.lock().unwrap().remove(&bucket);
+                state.finish_bucket_compensation(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
                 state.record_scanner_transition_state();
                 debug!(
@@ -1292,11 +1295,23 @@ impl TransitionState {
                 );
             }
 
-            scheduled.lock().unwrap().remove(&bucket);
+            state.finish_bucket_compensation(&bucket);
             Self::add_counter(&state.compensation_running_tasks, -1);
             state.record_scanner_transition_state();
         });
         true
+    }
+
+    fn finish_bucket_compensation(&self, bucket: &str) {
+        match self.compensation_buckets.lock() {
+            Ok(mut scheduled) => {
+                scheduled.remove(bucket);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(bucket);
+                self.compensation_buckets.clear_poison();
+            }
+        }
     }
 
     #[inline]
@@ -1535,17 +1550,35 @@ impl TransitionState {
 
         let outcome = match self.transition_tx.try_send(Some(task)) {
             Ok(()) => TransitionEnqueueOutcome::Queued,
-            Err(async_channel::TrySendError::Full(_)) => {
+            Err(async_channel::TrySendError::Full(task)) => {
                 Self::inc_counter(&self.queue_full_tasks);
-                debug!(
-                    bucket = %oi.bucket,
-                    object = %oi.name,
-                    source = ?src,
-                    "transition queue is full; deferring to scanner/backfill"
-                );
-                TransitionEnqueueOutcome::QueueFull
+                let send_timeout = self.transition_queue_send_timeout;
+                match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
+                    Ok(Ok(())) => TransitionEnqueueOutcome::Queued,
+                    Ok(Err(_)) => {
+                        self.schedule_bucket_compensation(&oi.bucket);
+                        TransitionEnqueueOutcome::QueueClosed
+                    }
+                    Err(_) => {
+                        Self::inc_counter(&self.queue_send_timeout_tasks);
+                        self.schedule_bucket_compensation(&oi.bucket);
+                        debug!(
+                            bucket = %oi.bucket,
+                            object = %oi.name,
+                            source = ?src,
+                            timeout_ms = send_timeout.as_millis() as u64,
+                            event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            state = "queue_send_timed_out",
+                            "Scanner transition enqueue timed out; scheduled bucket compensation"
+                        );
+                        TransitionEnqueueOutcome::QueueFull
+                    }
+                }
             }
             Err(async_channel::TrySendError::Closed(_)) => {
+                self.schedule_bucket_compensation(&oi.bucket);
                 debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
@@ -1730,7 +1763,7 @@ impl TransitionState {
     }
 
     pub fn add_lastday_stats(&self, tier: &str, ts: TierStats) {
-        let mut tier_stats = self.last_day_stats.lock().unwrap();
+        let mut tier_stats = self.lock_last_day_stats();
         tier_stats
             .entry(tier.to_string())
             .and_modify(|e| e.add_stats(ts))
@@ -1738,12 +1771,24 @@ impl TransitionState {
     }
 
     pub fn get_daily_all_tier_stats(&self) -> DailyAllTierStats {
-        let tier_stats = self.last_day_stats.lock().unwrap();
+        let tier_stats = self.lock_last_day_stats();
         let mut res = DailyAllTierStats::with_capacity(tier_stats.len());
         for (tier, st) in tier_stats.iter() {
             res.insert(tier.clone(), st.clone());
         }
         res
+    }
+
+    fn lock_last_day_stats(&self) -> std::sync::MutexGuard<'_, HashMap<String, LastDayTierStats>> {
+        match self.last_day_stats.lock() {
+            Ok(stats) => stats,
+            Err(poisoned) => {
+                let mut stats = poisoned.into_inner();
+                stats.clear();
+                self.last_day_stats.clear_poison();
+                stats
+            }
+        }
     }
 
     pub async fn update_workers(api: Arc<ECStore>, n: i64) {
@@ -1767,7 +1812,27 @@ impl TransitionState {
     fn resize_workers_to(api: Arc<ECStore>, n: i64, requested: i64, absolute_max: i64) {
         let target = n as usize;
         let transition_state = runtime_sources::transition_state_handle();
-        let mut workers = transition_state.workers.lock().unwrap();
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                warn!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    error = %err,
+                    state = "resize_failed",
+                    "Lifecycle worker pool requires a Tokio runtime"
+                );
+                return;
+            }
+        };
+        // Runtime lookup happens before locking, and the guard is dropped before
+        // metrics/logging callbacks. Poison therefore means a Vec mutation may
+        // have unwound and worker tracking cannot be reconstructed safely.
+        let mut workers = transition_state
+            .workers
+            .lock()
+            .expect("transition worker tracking mutex poisoned");
         let tracked_workers = workers.len();
         workers.retain(|worker| !worker.handle.is_finished());
         let pruned_finished_workers = tracked_workers.saturating_sub(workers.len());
@@ -1777,7 +1842,7 @@ impl TransitionState {
             let clone_api = api.clone();
             let cancel = CancellationToken::new();
             let worker_cancel = cancel.clone();
-            let handle = tokio::spawn(async move {
+            let handle = runtime.spawn(async move {
                 TransitionState::worker_with_cancel(clone_api, worker_cancel).await;
             });
             workers.push(TransitionWorker { cancel, handle });
@@ -1791,6 +1856,7 @@ impl TransitionState {
 
         let current_workers = workers.len() as i64;
         transition_state.num_workers.store(current_workers, Ordering::SeqCst);
+        drop(workers);
         transition_state.record_scanner_transition_state();
 
         debug!(
@@ -4903,6 +4969,7 @@ mod tests {
         FreeVersionRecoveryStats, RecoveryWalkTestAction, list_tier_free_versions, recover_tier_free_versions_with_cancel,
         set_recovery_bucket_list_wait_hook, set_recovery_walk_test_hook,
     };
+    use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -4936,6 +5003,7 @@ mod tests {
     use http::HeaderMap;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
+    use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
     use s3s::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
@@ -5657,6 +5725,7 @@ mod tests {
         oi.transitioned_object.tier = "WARM".to_string();
         oi.transitioned_object.name = "remote/object".to_string();
         oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
         let local_delete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let legacy_err = delete_free_version_remote_object_then(&oi, &manager, {
@@ -5667,7 +5736,8 @@ mod tests {
         })
         .await
         .expect_err("legacy free-version without identity must be retained");
-        assert!(legacy_err.to_string().contains("no durable backend identity"));
+        assert_eq!(legacy_err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(old_backend.remove_count().await, 0);
         assert_eq!(local_delete_calls.load(Ordering::Relaxed), 0);
 
         let mut invalid_metadata = HashMap::new();
@@ -6548,6 +6618,96 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn scanner_transition_enqueue_waits_for_saturated_queue_to_recover() {
+        let state = TransitionState::new_with_capacity(1);
+        let first_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "first".to_string(),
+            ..Default::default()
+        };
+        let deferred_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "deferred".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        assert!(
+            state.queue_transition_task(&first_object, &event, &LcEventSrc::Scanner).await,
+            "first scanner transition should fill the queue"
+        );
+
+        let deferred = state.queue_transition_task(&deferred_object, &event, &LcEventSrc::Scanner);
+        tokio::pin!(deferred);
+        assert!(
+            (&mut deferred).now_or_never().is_none(),
+            "a saturated scanner queue should apply bounded backpressure instead of dropping the task"
+        );
+
+        let first_task = state
+            .transition_rx
+            .recv()
+            .await
+            .expect("queue should remain open")
+            .expect("first queued transition task should be present");
+        state.release_transition(&first_task.obj_info);
+
+        assert!(
+            deferred.await,
+            "the deferred scanner transition should enqueue as soon as capacity recovers"
+        );
+        let recovered_task = state
+            .transition_rx
+            .recv()
+            .await
+            .expect("queue should remain open")
+            .expect("deferred transition task should be present");
+        assert_eq!(recovered_task.obj_info.name, deferred_object.name);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_transition_sustained_saturation_schedules_compensation() {
+        let state = TransitionState::new_with_capacity_and_timeout(1, StdDuration::ZERO);
+        let first_object = ObjectInfo {
+            bucket: "saturated-bucket".to_string(),
+            name: "first".to_string(),
+            ..Default::default()
+        };
+        let missed_object = ObjectInfo {
+            bucket: "saturated-bucket".to_string(),
+            name: "missed".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        assert!(
+            state.queue_transition_task(&first_object, &event, &LcEventSrc::Scanner).await,
+            "first scanner transition should fill the queue"
+        );
+        assert!(
+            !state
+                .queue_transition_task(&missed_object, &event, &LcEventSrc::Scanner)
+                .await,
+            "a continuously saturated queue should report that the object was not admitted"
+        );
+        assert_eq!(state.queue_full_tasks(), 1);
+        assert_eq!(state.queue_send_timeout_tasks(), 1);
+        assert_eq!(
+            state.compensation_scheduled_tasks(),
+            1,
+            "timed-out scanner work must schedule a bounded bucket backfill"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn scanner_transition_enqueue_updates_transition_status() {
         let before = global_metrics().report().await.lifecycle_transition;
         let state = TransitionState::new_with_capacity(1);
@@ -7071,6 +7231,46 @@ mod tests {
         assert_eq!(state.compensation_pending_tasks(), 1);
     }
 
+    #[test]
+    fn poisoned_compensation_set_can_release_completed_bucket() {
+        let state = TransitionState::new_with_capacity(1);
+        state
+            .compensation_buckets
+            .lock()
+            .expect("fresh mutex should lock")
+            .insert("bucket-a".to_string());
+        let poison_target = Arc::clone(&state.compensation_buckets);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.lock().expect("fresh mutex should lock");
+            panic!("poison compensation set");
+        })
+        .join();
+
+        state.finish_bucket_compensation("bucket-a");
+        assert_eq!(state.compensation_pending_tasks(), 0);
+        assert!(
+            state.compensation_buckets.lock().is_ok(),
+            "validated compensation state must clear poison"
+        );
+    }
+
+    #[test]
+    fn poisoned_tier_stats_are_reset_before_reuse() {
+        let state = TransitionState::new_with_capacity(1);
+        let poison_target = Arc::clone(&state.last_day_stats);
+        let _ = std::thread::spawn(move || {
+            let mut stats = poison_target.lock().expect("fresh mutex should lock");
+            stats.insert("stale".to_string(), LastDayTierStats::default());
+            panic!("poison tier stats");
+        })
+        .join();
+
+        state.add_lastday_stats("fresh", TierStats::default());
+        let stats = state.get_daily_all_tier_stats();
+        assert!(!stats.contains_key("stale"), "possibly partial statistics must be discarded");
+        assert!(stats.contains_key("fresh"), "statistics must accept new samples after recovery");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn scanner_transition_state_reports_compensation_pending_buckets() {
         let state = TransitionState::new_with_capacity(1);
@@ -7359,6 +7559,23 @@ mod tests {
         assert!(remaining_token.is_cancelled());
 
         TransitionState::resize_workers_to(ecstore, original_workers, original_workers, absolute_max);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transition_worker_resize_without_runtime_does_not_poison_tracking() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let transition_state = runtime_sources::transition_state_handle();
+        let resize = std::thread::spawn(move || {
+            TransitionState::resize_workers_to(ecstore, 1, 1, resolve_transition_workers_absolute_max());
+        })
+        .join();
+
+        assert!(resize.is_ok(), "missing Tokio runtime must not panic while worker tracking is locked");
+        assert!(
+            transition_state.workers.lock().is_ok(),
+            "failed resize must leave worker tracking unpoisoned"
+        );
     }
 
     #[test]
@@ -9977,6 +10194,61 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_replay_deletes_confirmed_exact_provider_token() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let (backend, _) = register_recovery_mock_tier(&ecstore).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("mock tier lease should be available");
+        let identity = lease.backend_identity();
+        backend
+            .set_put_remote_version(Some("provider-version-token".to_string()))
+            .await;
+        lease
+            .put(
+                "remote/object",
+                crate::client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
+                9,
+            )
+            .await
+            .expect("confirmed remote candidate should be seeded");
+        backend.set_remove_failure(true);
+        backend.set_reject_non_empty_remote_versions(true);
+        let je = Jentry {
+            obj_name: "remote/object".to_string(),
+            version_id: "provider-version-token".to_string(),
+            tier_name: "WARM".to_string(),
+            backend_identity: Some(identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+        };
+
+        crate::set_disk::cleanup_rejected_transition_upload_durably(
+            &lease,
+            &je.obj_name,
+            &je.version_id,
+            true,
+            Some(ecstore.clone()),
+        )
+        .await
+        .expect("failed immediate cleanup should remain durable in the journal");
+        assert!(backend.contains(&je.obj_name).await);
+
+        backend.set_remove_failure(false);
+        crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
+            .await
+            .expect("identity-bound exact journal must retry confirmed candidate cleanup");
+
+        assert!(!backend.contains(&je.obj_name).await);
+        assert_eq!(backend.exact_remove_count(), 2);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![("remote/object".to_string(), "provider-version-token".to_string())]
+        );
     }
 
     async fn seed_recoverable_free_version(

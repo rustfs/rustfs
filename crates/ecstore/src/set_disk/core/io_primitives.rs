@@ -46,7 +46,10 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::OldCurrentSize;
+use crate::disk::{
+    OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction,
+    part_transaction_path,
+};
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
@@ -3176,6 +3179,155 @@ impl SetDisks {
         }
     }
 
+    async fn recover_part_transaction(&self, dst_object: &str, write_quorum: usize) -> disk::error::Result<bool> {
+        let disks = self.get_disks_internal().await;
+        let transaction_path = part_transaction_path(dst_object);
+        let transaction_meta_path = format!("{transaction_path}/{PART_TRANSACTION_NEW_META}");
+        let rollback_path = format!("{transaction_path}/{PART_TRANSACTION_ROLLBACK}");
+        let current_meta_path = format!("{dst_object}.meta");
+
+        let reads = disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let transaction_meta_path = transaction_meta_path.clone();
+            let rollback_path = rollback_path.clone();
+            let current_meta_path = current_meta_path.clone();
+            async move {
+                let Some(disk) = disk else {
+                    return Ok((None, None, false));
+                };
+                let transaction_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &transaction_meta_path).await {
+                    Ok(meta) => Some(meta),
+                    Err(DiskError::FileNotFound) => None,
+                    Err(err) => return Err(err),
+                };
+                let rollback = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &rollback_path).await {
+                    Ok(_) => true,
+                    Err(DiskError::FileNotFound) => false,
+                    Err(err) => return Err(err),
+                };
+                let current_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &current_meta_path).await {
+                    Ok(meta) => Some(meta),
+                    Err(DiskError::FileNotFound | DiskError::DiskNotFound) => None,
+                    Err(_) => None,
+                };
+                Ok((transaction_meta, current_meta, rollback))
+            }
+        });
+        let observations = join_all(reads).await.into_iter().collect::<disk::error::Result<Vec<_>>>()?;
+        if observations.iter().all(|(transaction, _, _)| transaction.is_none()) {
+            return Ok(false);
+        }
+
+        let mut current_counts: HashMap<Bytes, usize> = HashMap::new();
+        for (_, current, _) in &observations {
+            if let Some(current) = current {
+                *current_counts.entry(current.clone()).or_default() += 1;
+            }
+        }
+        let current_quorum = current_counts
+            .into_iter()
+            .find_map(|(meta, count)| (count >= write_quorum).then_some(meta));
+
+        let old_meta_path = format!("{transaction_path}/{PART_TRANSACTION_OLD_META}");
+        let old_meta_absent_path = format!("{transaction_path}/old.meta.absent");
+        let decisions = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (transaction_meta, _, rollback))| {
+                transaction_meta.as_ref().map(|meta| (index, meta.clone(), *rollback))
+            })
+            .map(|(index, transaction_meta, rollback)| {
+                let disk = disks[index].clone();
+                let old_meta_path = old_meta_path.clone();
+                let old_meta_absent_path = old_meta_absent_path.clone();
+                let current_quorum = current_quorum.clone();
+                async move {
+                    let Some(disk) = disk else {
+                        return Err(DiskError::DiskNotFound);
+                    };
+                    let action = if rollback {
+                        PartTransactionAction::Rollback
+                    } else if current_quorum.as_ref() == Some(&transaction_meta) {
+                        PartTransactionAction::Commit
+                    } else if let Some(current_quorum) = current_quorum {
+                        match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_path).await {
+                            Ok(old_meta) if old_meta == current_quorum => PartTransactionAction::Rollback,
+                            Ok(_) => PartTransactionAction::Commit,
+                            Err(DiskError::FileNotFound) => {
+                                match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &old_meta_absent_path).await {
+                                    Ok(_) => PartTransactionAction::Commit,
+                                    Err(_) => return Err(DiskError::FileCorrupt),
+                                }
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        PartTransactionAction::Rollback
+                    };
+                    disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, dst_object, action)
+                        .await?;
+                    Ok(action == PartTransactionAction::Commit)
+                }
+            });
+
+        let results = join_all(decisions).await;
+        if let Some(err) = results.iter().find_map(|result| result.as_ref().err()) {
+            return Err(err.clone());
+        }
+        Ok(results.iter().any(|result| matches!(result, Ok(true))))
+    }
+
+    pub(in crate::set_disk) async fn recover_part_transactions(
+        &self,
+        part_path: &str,
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<()> {
+        let disks = self.get_disks_internal().await;
+        let listings = join_all(disks.iter().map(|disk| {
+            let disk = disk.clone();
+            async move {
+                let Some(disk) = disk else {
+                    return Err(DiskError::DiskNotFound);
+                };
+                disk.list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path, -1)
+                    .await
+            }
+        }))
+        .await;
+
+        let mut transaction_parts = HashSet::new();
+        let mut errs = Vec::with_capacity(listings.len());
+        for listing in listings {
+            match listing {
+                Ok(entries) => {
+                    errs.push(None);
+                    for entry in entries {
+                        let name = entry.trim_end_matches('/');
+                        let Some(part_number) = name
+                            .strip_prefix(".part.")
+                            .and_then(|name| name.strip_suffix(".rustfs-txn"))
+                            .and_then(|number| number.parse::<usize>().ok())
+                        else {
+                            continue;
+                        };
+                        transaction_parts.insert(part_number);
+                    }
+                }
+                Err(err) => errs.push(Some(err)),
+            }
+        }
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            return Err(err);
+        }
+
+        for part_number in transaction_parts {
+            self.recover_part_transaction(&format!("{part_path}part.{part_number}"), write_quorum)
+                .await?;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(skip(disks, meta))]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::set_disk) async fn rename_part(
@@ -3189,23 +3341,46 @@ impl SetDisks {
         write_quorum: usize,
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
+        self.recover_part_transaction(dst_object, write_quorum).await?;
+
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
         let dst_bucket = Arc::new(dst_bucket.to_string());
         let dst_object = Arc::new(dst_object.to_string());
 
-        // Do NOT pre-delete the destination part before renaming: the per-disk
-        // `rename_part` replaces `part.N` atomically (std::fs::rename) and rewrites
-        // `part.N.meta`, so the pre-delete is redundant — and destructive. It
-        // opened a window where an already-committed (ACKed) part was removed on
-        // every disk before the new rename landed, so a re-upload that then failed
-        // quorum destroyed the committed part outright (backlog#853 / #799 B4).
-        // The atomic rename overwrites in place; on quorum failure below we roll
-        // the destination back.
+        let prepare_tasks = disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let src_bucket = src_bucket.clone();
+            let src_object = src_object.clone();
+            let dst_bucket = dst_bucket.clone();
+            let dst_object = dst_object.clone();
+            let meta = meta.clone();
+            async move {
+                let disk = disk?;
+                Some(
+                    disk.prepare_part_transaction(&src_bucket, &src_object, &dst_bucket, &dst_object, meta)
+                        .await,
+                )
+            }
+        });
+        let prepare_results = join_all(prepare_tasks).await;
+        let prepare_errs = prepare_results
+            .into_iter()
+            .map(|result| match result {
+                Some(Ok(())) => None,
+                Some(Err(err)) => Some(err),
+                None => Some(DiskError::DiskNotFound),
+            })
+            .collect::<Vec<_>>();
+        let prepared_disks = Self::eval_disks(disks, &prepare_errs);
+        if reduce_write_quorum_errs(&prepare_errs, OBJECT_OP_IGNORED_ERRS, write_quorum).is_some() {
+            self.recover_part_transaction(&dst_object, write_quorum).await?;
+            return Err(DiskError::ErasureWriteQuorum);
+        }
 
         let mut errs = Vec::with_capacity(disks.len());
 
-        let futures = disks.iter().map(|disk| {
+        let futures = prepared_disks.iter().map(|disk| {
             let disk = disk.clone();
             let meta = meta.clone();
             let src_bucket = src_bucket.clone();
@@ -3255,19 +3430,42 @@ impl SetDisks {
             );
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+        let reduced_err = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
+        if let Some(err) = reduced_err {
+            let rollbacks = prepared_disks.iter().filter_map(|disk| {
+                disk.clone().map(|disk| {
+                    let dst_object = dst_object.clone();
+                    async move {
+                        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &dst_object, PartTransactionAction::Rollback)
+                            .await
+                    }
+                })
+            });
+            let rollback_results = join_all(rollbacks).await;
+            self.recover_part_transaction(&dst_object, write_quorum).await?;
+            if let Some(rollback_err) = rollback_results.iter().find_map(|result| result.as_ref().err()) {
+                warn!(error = %rollback_err, "rename_part rollback did not settle on every prepared disk");
+            }
             if let Some(context) = quorum_context {
                 log_multipart_write_quorum_failure(context, &errs, write_quorum, &err);
             } else {
                 warn!("rename_part errs {:?}", &errs);
             }
-            self.cleanup_multipart_path(&[dst_object.to_string(), format!("{dst_object}.meta")])
-                .await;
             return Err(err);
         }
 
-        let disks = Self::eval_disks(disks, &errs);
-        Ok(disks)
+        let committed = self.recover_part_transaction(&dst_object, write_quorum).await?;
+        if !committed {
+            let err = DiskError::ErasureWriteQuorum;
+            if let Some(context) = quorum_context {
+                log_multipart_write_quorum_failure(context, &errs, write_quorum, &err);
+            } else {
+                warn!("rename_part errs {:?}", &errs);
+            }
+            return Err(err);
+        }
+
+        Ok(Self::eval_disks(&prepared_disks, &errs))
     }
 
     pub(in crate::set_disk) fn eval_disks(disks: &[Option<DiskStore>], errs: &[Option<DiskError>]) -> Vec<Option<DiskStore>> {

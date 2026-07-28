@@ -182,14 +182,9 @@ impl FileMeta {
         // TODO: use old buf
         let meta_buf = ver.marshal_msg()?;
 
-        let pre_mod_time = self.versions[idx].header.mod_time;
-
         self.versions[idx].header = ver.header();
         self.versions[idx].meta = meta_buf;
-
-        if pre_mod_time != self.versions[idx].header.mod_time {
-            self.sort_by_mod_time();
-        }
+        self.sort_by_mod_time();
 
         Ok(())
     }
@@ -356,15 +351,10 @@ impl FileMeta {
             return self.set_idx(fidx, version);
         }
 
-        let mod_time = version.get_mod_time();
         let new_shallow = FileMetaShallowVersion::try_from(version)?;
-        let insert_pos = match mod_time {
-            Some(nm) => self.versions.partition_point(|exist| match exist.header.mod_time {
-                Some(em) => em > nm,
-                None => false,
-            }),
-            None => self.versions.partition_point(|exist| exist.header.mod_time.is_some()),
-        };
+        let insert_pos = self
+            .versions
+            .partition_point(|existing| existing.header.sorts_before(&new_shallow.header));
         self.versions.insert(insert_pos, new_shallow);
         Ok(())
 
@@ -1110,6 +1100,119 @@ mod test {
         );
         assert_eq!(fm.versions[1].header.version_type, VersionType::Delete);
         assert!(fm.is_sorted_by_mod_time());
+    }
+
+    fn version_for_ordering(
+        version_type: VersionType,
+        version_id: Uuid,
+        mod_time: OffsetDateTime,
+        marker: u8,
+    ) -> FileMetaVersion {
+        match version_type {
+            VersionType::Object => FileMetaVersion {
+                version_type,
+                object: Some(MetaObject {
+                    version_id: Some(version_id),
+                    erasure_algorithm: ErasureAlgo::ReedSolomon,
+                    erasure_m: 2,
+                    erasure_n: 2,
+                    erasure_block_size: 1 << 20,
+                    bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                    mod_time: Some(mod_time),
+                    meta_sys: HashMap::from([("ordering-marker".to_string(), vec![marker])]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            VersionType::Delete => FileMetaVersion {
+                version_type,
+                delete_marker: Some(MetaDeleteMarker {
+                    version_id: Some(version_id),
+                    mod_time: Some(mod_time),
+                    meta_sys: HashMap::from([("ordering-marker".to_string(), vec![marker])]),
+                }),
+                ..Default::default()
+            },
+            _ => unreachable!("ordering regression only constructs object and delete versions"),
+        }
+    }
+
+    #[test]
+    fn add_version_filemata_uses_canonical_equal_time_order() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid test timestamp");
+        let object = version_for_ordering(VersionType::Object, Uuid::from_u128(1), mod_time, 1);
+        let delete_marker = version_for_ordering(VersionType::Delete, Uuid::from_u128(2), mod_time, 2);
+
+        for versions in [[object.clone(), delete_marker.clone()], [delete_marker, object]] {
+            let mut fm = FileMeta::new();
+            for version in versions {
+                fm.add_version_filemata(version).expect("add equal-time version");
+            }
+
+            assert_eq!(fm.versions[0].header.version_type, VersionType::Object);
+            assert_eq!(fm.versions[1].header.version_type, VersionType::Delete);
+            assert!(fm.versions[0].header.sorts_before(&fm.versions[1].header));
+        }
+    }
+
+    #[test]
+    fn add_version_filemata_preserves_tie_breaks_after_reload() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid test timestamp");
+        let versions = [
+            version_for_ordering(VersionType::Object, Uuid::from_u128(10), mod_time, 10),
+            version_for_ordering(VersionType::Object, Uuid::from_u128(20), mod_time, 20),
+            version_for_ordering(VersionType::Delete, Uuid::from_u128(30), mod_time, 30),
+        ];
+        let mut expected = versions.iter().map(FileMetaVersion::header).collect::<Vec<_>>();
+        expected.sort_by(|a, b| {
+            if a.sorts_before(b) {
+                Ordering::Less
+            } else if b.sorts_before(a) {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        });
+
+        let mut fm = FileMeta::new();
+        for version in versions.into_iter().rev() {
+            fm.add_version_filemata(version).expect("add equal-time version");
+        }
+        let loaded = FileMeta::load(&fm.marshal_msg().expect("serialize file metadata")).expect("reload file metadata");
+        let actual = loaded
+            .versions
+            .iter()
+            .map(|version| version.header.clone())
+            .collect::<Vec<_>>();
+
+        assert_ne!(expected[0].signature, expected[1].signature, "fixture must exercise signature ordering");
+        assert_eq!(actual, expected);
+        assert!(actual.windows(2).all(|pair| pair[0].sorts_before(&pair[1])));
+    }
+
+    #[test]
+    fn add_version_filemata_reorders_equal_time_replacement() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid test timestamp");
+        let first = version_for_ordering(VersionType::Object, Uuid::from_u128(40), mod_time, 40);
+        let second = version_for_ordering(VersionType::Object, Uuid::from_u128(50), mod_time, 50);
+        let (target, peer) = if first.header().sorts_before(&second.header()) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let target_id = target.header().version_id.expect("test version id");
+
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(peer).expect("add peer object");
+        fm.add_version_filemata(target).expect("add target object");
+        assert_eq!(fm.versions[0].header.version_id, Some(target_id));
+
+        fm.add_version_filemata(version_for_ordering(VersionType::Delete, target_id, mod_time, 60))
+            .expect("replace target with equal-time delete marker");
+
+        assert_eq!(fm.versions[0].header.version_type, VersionType::Object);
+        assert_eq!(fm.versions[1].header.version_type, VersionType::Delete);
+        assert!(fm.versions[0].header.sorts_before(&fm.versions[1].header));
     }
 
     /// Regression for backlog#799 B16: replication reset state must be
