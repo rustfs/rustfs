@@ -43,13 +43,18 @@ enum DanglingDeleteSafety {
 
 #[cfg(test)]
 struct DanglingCheckPartsFailure {
-    key: (String, String, usize),
+    key: DanglingCheckPartsFailureKey,
 }
 
 #[cfg(test)]
-fn dangling_check_parts_failures() -> &'static std::sync::Mutex<HashMap<(String, String, usize), DiskError>> {
-    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String, usize), DiskError>>> =
-        std::sync::OnceLock::new();
+type DanglingCheckPartsFailureKey = (String, String, usize);
+
+#[cfg(test)]
+type DanglingCheckPartsFailures = HashMap<DanglingCheckPartsFailureKey, DiskError>;
+
+#[cfg(test)]
+fn dangling_check_parts_failures() -> &'static std::sync::Mutex<DanglingCheckPartsFailures> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<DanglingCheckPartsFailures>> = std::sync::OnceLock::new();
     FAILURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -1658,7 +1663,7 @@ mod heal_result_report_tests {
         let object = "object.bin";
         let data_dir = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("data dir should parse");
         let (_temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[(data_dir, 2)]).await;
-        let metadata = vec![
+        let metadata = [
             meta_regen_test_fileinfo(object, data_dir, 3, 0),
             FileInfo::default(),
             FileInfo::default(),
