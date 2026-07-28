@@ -35,7 +35,7 @@ use std::{
         Arc,
         atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::RwLock, time};
 use tokio_util::sync::CancellationToken;
@@ -339,21 +339,19 @@ impl Drop for DiskHealthWaitingGuard<'_> {
 impl DiskHealthTracker {
     /// Create a new disk health tracker
     pub fn new() -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
+        let now = current_unix_time();
+        let now_nanos = unix_nanos(now);
 
         Self {
-            last_success: AtomicI64::new(now),
-            last_started: AtomicI64::new(now),
+            last_success: AtomicI64::new(now_nanos),
+            last_started: AtomicI64::new(now_nanos),
             status: AtomicU32::new(DISK_HEALTH_OK),
             waiting: AtomicU32::new(0),
             runtime_state: AtomicU32::new(RuntimeDriveHealthState::Online as u32),
             consecutive_failures: AtomicU32::new(0),
             consecutive_successes: AtomicU32::new(0),
             offline_since_unix_secs: AtomicI64::new(0),
-            last_transition_unix_secs: AtomicI64::new(now / 1_000_000_000),
+            last_transition_unix_secs: AtomicI64::new(unix_secs_i64(now)),
             last_capacity_total: AtomicU64::new(0),
             last_capacity_used: AtomicU64::new(0),
             last_capacity_free: AtomicU64::new(0),
@@ -363,11 +361,7 @@ impl DiskHealthTracker {
 
     /// Log a successful operation
     pub fn log_success(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        self.last_success.store(now, Ordering::Relaxed);
+        self.last_success.store(current_unix_nanos(), Ordering::Relaxed);
     }
 
     pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
@@ -429,11 +423,14 @@ impl DiskHealthTracker {
     }
 
     pub fn offline_duration(&self) -> Option<Duration> {
+        self.offline_duration_at(current_unix_secs())
+    }
+
+    fn offline_duration_at(&self, now: u64) -> Option<Duration> {
         let offline_since = self.offline_since_unix_secs.load(Ordering::Acquire);
         if offline_since <= 0 {
             return None;
         }
-        let now = current_unix_secs();
         Some(Duration::from_secs(now.saturating_sub(offline_since as u64)))
     }
 
@@ -492,6 +489,12 @@ impl DiskHealthTracker {
     /// Remote disks are marked faulty on timeout/network errors; the init loop retries with the
     /// same [`DiskStore`] handles, which would otherwise fail immediately at `is_faulty()`.
     pub fn reset_for_store_init_retry(&self, endpoint: &Endpoint) {
+        self.reset_for_store_init_retry_at(endpoint, current_unix_time());
+    }
+
+    fn reset_for_store_init_retry_at(&self, endpoint: &Endpoint, now: Duration) {
+        let now_nanos = unix_nanos(now);
+        let now_secs = unix_secs_i64(now);
         self.status.store(DISK_HEALTH_OK, Ordering::Release);
         self.runtime_state
             .store(RuntimeDriveHealthState::Online as u32, Ordering::Release);
@@ -499,11 +502,9 @@ impl DiskHealthTracker {
         self.consecutive_successes.store(0, Ordering::Release);
         self.offline_since_unix_secs.store(0, Ordering::Release);
         self.waiting.store(0, Ordering::Release);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-        let now_nanos = now.as_nanos() as i64;
         self.last_success.store(now_nanos, Ordering::Relaxed);
         self.last_started.store(now_nanos, Ordering::Relaxed);
-        self.last_transition_unix_secs.store(now.as_secs() as i64, Ordering::Release);
+        self.last_transition_unix_secs.store(now_secs, Ordering::Release);
         record_drive_runtime_state(endpoint, RuntimeDriveHealthState::Online);
     }
 
@@ -612,10 +613,33 @@ impl DiskHealthTracker {
 }
 
 fn current_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    // Zero is reserved as "not recorded" by health timestamp atomics.
+    current_unix_time().as_secs().max(1)
+}
+
+fn current_unix_nanos() -> i64 {
+    unix_nanos(current_unix_time())
+}
+
+fn current_unix_time() -> Duration {
+    unix_time_since_epoch(SystemTime::now())
+}
+
+fn unix_time_since_epoch(time: SystemTime) -> Duration {
+    time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO)
+}
+
+fn unix_nanos(time: Duration) -> i64 {
+    i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
+}
+
+fn unix_secs_i64(time: Duration) -> i64 {
+    i64::try_from(time.as_secs()).unwrap_or(i64::MAX)
+}
+
+fn elapsed_since(last_nanos: i64, now_nanos: i64) -> Duration {
+    let elapsed_nanos = now_nanos.saturating_sub(last_nanos).max(0);
+    Duration::from_nanos(u64::try_from(elapsed_nanos).unwrap_or(u64::MAX))
 }
 
 impl Default for DiskHealthTracker {
@@ -635,11 +659,7 @@ struct HealthDiskCtxValue {
 
 impl HealthDiskCtxValue {
     fn log_success(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        self.last_success.store(now, Ordering::Relaxed);
+        self.last_success.store(current_unix_nanos(), Ordering::Relaxed);
     }
 }
 
@@ -774,12 +794,7 @@ impl LocalDiskWrapper {
                     }
 
                     let last_success_nanos = health.last_success.load(Ordering::Relaxed);
-                    let elapsed = Duration::from_nanos(
-                        (std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_nanos() as i64 - last_success_nanos) as u64
-                    );
+                    let elapsed = elapsed_since(last_success_nanos, current_unix_nanos());
 
                     if elapsed < SKIP_IF_SUCCESS_BEFORE {
                         continue;
@@ -1091,11 +1106,7 @@ impl LocalDiskWrapper {
         self.check_disk_stale().await?;
 
         // Record operation start
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        self.health.last_started.store(now, Ordering::Relaxed);
+        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         let _waiting_guard = self.health.waiting_guard();
 
         if timeout_duration == Duration::ZERO {
@@ -1317,11 +1328,7 @@ impl DiskAPI for LocalDiskWrapper {
         }
 
         // Record operation start
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        self.health.last_started.store(now, Ordering::Relaxed);
+        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
         self.health.increment_waiting();
 
         // Execute the operation
@@ -2269,5 +2276,54 @@ mod tests {
 
         assert!(health.mark_offline(&endpoint, "again"));
         assert!(health.is_faulty());
+    }
+
+    #[test]
+    fn unix_time_clamps_epoch_and_pre_epoch_to_zero() {
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_nanos(1))
+            .expect("one nanosecond before the Unix epoch should be representable");
+
+        assert_eq!(unix_time_since_epoch(UNIX_EPOCH), Duration::ZERO);
+        assert_eq!(unix_time_since_epoch(before_epoch), Duration::ZERO);
+    }
+
+    #[test]
+    fn elapsed_and_offline_duration_saturate_on_clock_rollback() {
+        let health = DiskHealthTracker::new();
+        health.offline_since_unix_secs.store(10, Ordering::Release);
+
+        assert_eq!(elapsed_since(10, 12), Duration::from_nanos(2));
+        assert_eq!(elapsed_since(10, 9), Duration::ZERO);
+        assert_eq!(health.offline_duration_at(9), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn pre_epoch_retry_reset_updates_the_complete_health_state() {
+        let endpoint = Endpoint::try_from("/tmp/reset-store-init-retry-pre-epoch").expect("endpoint should parse");
+        let health = DiskHealthTracker::new();
+        health.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
+        health
+            .runtime_state
+            .store(RuntimeDriveHealthState::Offline as u32, Ordering::Release);
+        health.consecutive_failures.store(3, Ordering::Release);
+        health.consecutive_successes.store(2, Ordering::Release);
+        health.offline_since_unix_secs.store(11, Ordering::Release);
+        health.waiting.store(4, Ordering::Release);
+        health.last_success.store(12, Ordering::Release);
+        health.last_started.store(13, Ordering::Release);
+        health.last_transition_unix_secs.store(14, Ordering::Release);
+
+        health.reset_for_store_init_retry_at(&endpoint, unix_time_since_epoch(UNIX_EPOCH - Duration::from_nanos(1)));
+
+        assert_eq!(health.status.load(Ordering::Acquire), DISK_HEALTH_OK);
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+        assert_eq!(health.consecutive_failures.load(Ordering::Acquire), 0);
+        assert_eq!(health.consecutive_successes.load(Ordering::Acquire), 0);
+        assert_eq!(health.offline_since_unix_secs.load(Ordering::Acquire), 0);
+        assert_eq!(health.waiting.load(Ordering::Acquire), 0);
+        assert_eq!(health.last_success.load(Ordering::Acquire), 0);
+        assert_eq!(health.last_started.load(Ordering::Acquire), 0);
+        assert_eq!(health.last_transition_unix_secs.load(Ordering::Acquire), 0);
     }
 }
