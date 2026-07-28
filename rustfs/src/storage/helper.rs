@@ -243,6 +243,14 @@ impl OperationHelper {
         matches!(self, Self::Enabled(state) if state.event_builder.is_some())
     }
 
+    #[cfg(test)]
+    pub(crate) fn event_args(&self) -> Option<rustfs_notify::EventArgs> {
+        match self {
+            Self::Enabled(state) => state.event_builder.clone().map(|builder| builder.build()),
+            Self::Disabled => None,
+        }
+    }
+
     /// Sets the ObjectInfo for event notification.
     pub fn object(mut self, object_info: ObjectInfo) -> Self {
         if let Self::Enabled(state) = &mut self

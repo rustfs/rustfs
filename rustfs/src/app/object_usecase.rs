@@ -3051,6 +3051,25 @@ fn can_skip_delete_objects_pre_stat(
     !bucket_lock_enabled && !replicate_deletes && delete_creates_delete_marker(opts) && accounting_creates_delete_marker
 }
 
+fn complete_delete_noop(
+    helper: OperationHelper,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+) -> (S3Result<S3Response<DeleteObjectOutput>>, OperationHelper) {
+    let helper = helper
+        .event_name(EventName::ObjectRemovedNoOP)
+        .object(ObjectInfo {
+            name: key,
+            bucket,
+            ..Default::default()
+        })
+        .version_id(version_id.unwrap_or_default());
+    let result = Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+    let helper = helper.complete(&result);
+    (result, helper)
+}
+
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .map(|value| normalize_snowball_prefix(&value))
@@ -7057,7 +7076,7 @@ impl DefaultObjectUsecase {
         // TODO: Future optimization (separate PR) - If performance becomes critical under high delete load:
         // 1. Add a lightweight get_object_lock_info() that only fetches retention metadata
         // 2. Or use combined get-and-delete in storage layer with retention check callback
-        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone, None, &req.headers)
+        let get_opts: ObjectOptions = get_opts(&bucket, &key, version_id_clone.clone(), None, &req.headers)
             .await
             .map_err(ApiError::from)?;
         let existing_object_info = match store.get_object_info(&bucket, &key, &get_opts).await {
@@ -7100,9 +7119,8 @@ impl DefaultObjectUsecase {
                     }
 
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                        // TODO: send event
-
-                        return Ok(S3Response::with_status(DeleteObjectOutput::default(), StatusCode::NO_CONTENT));
+                        let (result, _helper) = complete_delete_noop(helper, bucket, key, version_id_clone);
+                        return result;
                     }
 
                     return Err(ApiError::from(err).into());
@@ -13085,6 +13103,40 @@ mod tests {
 
         let err = Box::pin(usecase.execute_delete_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn delete_not_found_completes_noop_event_with_version_context() {
+        temp_env::with_var(rustfs_config::ENV_NOTIFY_ENABLE, Some("true"), || {
+            crate::server::refresh_notify_module_enabled();
+            for (version_id, expected_version) in [(None, ""), (Some("requested-version".to_string()), "requested-version")] {
+                let input = DeleteObjectInput::builder()
+                    .bucket("test-bucket".to_string())
+                    .key("missing-key".to_string())
+                    .version_id(version_id.clone())
+                    .build()
+                    .expect("delete input should build");
+                let mut req = build_request(input, Method::DELETE);
+                req.extensions.insert(crate::storage::access::ReqInfo {
+                    bucket: Some("test-bucket".to_string()),
+                    object: Some("missing-key".to_string()),
+                    version_id: version_id.clone(),
+                    ..Default::default()
+                });
+                let helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
+
+                let (result, helper) =
+                    complete_delete_noop(helper, "test-bucket".to_string(), "missing-key".to_string(), version_id);
+                let event = helper.event_args().expect("successful no-op delete should retain an event");
+
+                assert_eq!(result.expect("no-op delete should succeed").status, Some(StatusCode::NO_CONTENT));
+                assert_eq!(event.event_name, EventName::ObjectRemovedNoOP);
+                assert_eq!(event.bucket_name, "test-bucket");
+                assert_eq!(event.object.name, "missing-key");
+                assert_eq!(event.version_id, expected_version);
+            }
+        });
+        crate::server::refresh_notify_module_enabled();
     }
 
     #[test]
