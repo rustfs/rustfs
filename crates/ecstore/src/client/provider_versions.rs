@@ -46,11 +46,33 @@ impl RemoteVersion {
             Self::Unknown | Self::Disabled => None,
         }
     }
+
+    pub(crate) fn exact_request_id(&self) -> Result<Option<&str>, Error> {
+        match self {
+            Self::Unknown => Err(Error::new(
+                ErrorKind::InvalidData,
+                "remote object version is unknown; exact version routing is unsafe",
+            )),
+            Self::Disabled => Ok(None),
+            Self::SuspendedNull => Ok(Some("null")),
+            Self::Exact(version_id) => Ok(Some(version_id)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConditionalCreateCapability {
+    Unsupported,
+    IfNoneMatchStar,
+    GenerationMatchZero,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderVersionCapabilities {
     raw_version_header: Option<&'static str>,
+    pub(crate) bucket_versioning_state: bool,
+    pub(crate) list_object_versions: bool,
+    pub(crate) conditional_create: ConditionalCreateCapability,
     pub(crate) exact_get_delete: bool,
 }
 
@@ -62,28 +84,59 @@ impl ProviderVersionCapabilities {
             || tier_type.eq_ignore_ascii_case("r2")
             || tier_type.eq_ignore_ascii_case("wasabi")
         {
+            let list_object_versions = tier_type.eq_ignore_ascii_case("s3")
+                || tier_type.eq_ignore_ascii_case("rustfs")
+                || tier_type.eq_ignore_ascii_case("minio")
+                || tier_type.eq_ignore_ascii_case("r2");
             Self {
                 raw_version_header: Some(X_AMZ_VERSION_ID),
+                bucket_versioning_state: list_object_versions,
+                list_object_versions,
+                conditional_create: if tier_type.eq_ignore_ascii_case("s3") || tier_type.eq_ignore_ascii_case("r2") {
+                    ConditionalCreateCapability::IfNoneMatchStar
+                } else {
+                    ConditionalCreateCapability::Unsupported
+                },
                 exact_get_delete: true,
             }
         } else if tier_type.eq_ignore_ascii_case("aliyun") {
             Self {
                 raw_version_header: Some(X_OSS_VERSION_ID),
+                bucket_versioning_state: false,
+                list_object_versions: false,
+                conditional_create: ConditionalCreateCapability::Unsupported,
                 exact_get_delete: true,
             }
         } else if tier_type.eq_ignore_ascii_case("tencent") {
             Self {
                 raw_version_header: Some(X_COS_VERSION_ID),
+                bucket_versioning_state: false,
+                list_object_versions: false,
+                conditional_create: ConditionalCreateCapability::Unsupported,
                 exact_get_delete: true,
             }
         } else if tier_type.eq_ignore_ascii_case("huaweicloud") {
             Self {
                 raw_version_header: Some(X_OBS_VERSION_ID),
+                bucket_versioning_state: false,
+                list_object_versions: false,
+                conditional_create: ConditionalCreateCapability::Unsupported,
                 exact_get_delete: true,
+            }
+        } else if tier_type.eq_ignore_ascii_case("gcs") {
+            Self {
+                raw_version_header: None,
+                bucket_versioning_state: false,
+                list_object_versions: false,
+                conditional_create: ConditionalCreateCapability::GenerationMatchZero,
+                exact_get_delete: false,
             }
         } else {
             Self {
                 raw_version_header: None,
+                bucket_versioning_state: false,
+                list_object_versions: false,
+                conditional_create: ConditionalCreateCapability::Unsupported,
                 exact_get_delete: false,
             }
         }
@@ -143,7 +196,7 @@ fn validate_remote_version_id(version_id: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BucketVersioningState, ProviderVersionCapabilities, RemoteVersion};
+    use super::{BucketVersioningState, ConditionalCreateCapability, ProviderVersionCapabilities, RemoteVersion};
     use http::{HeaderMap, HeaderValue};
 
     #[test]
@@ -217,6 +270,71 @@ mod tests {
                 .expect("disabled versioning"),
             RemoteVersion::Disabled
         );
+    }
+
+    #[test]
+    fn provider_capability_matrix_is_conservative_and_provider_specific() {
+        for (tier_type, state, list, conditional_create, exact_get_delete) in [
+            ("s3", true, true, ConditionalCreateCapability::IfNoneMatchStar, true),
+            ("rustfs", true, true, ConditionalCreateCapability::Unsupported, true),
+            ("minio", true, true, ConditionalCreateCapability::Unsupported, true),
+            ("r2", true, true, ConditionalCreateCapability::IfNoneMatchStar, true),
+            ("wasabi", false, false, ConditionalCreateCapability::Unsupported, true),
+            ("aliyun", false, false, ConditionalCreateCapability::Unsupported, true),
+            ("tencent", false, false, ConditionalCreateCapability::Unsupported, true),
+            ("huaweicloud", false, false, ConditionalCreateCapability::Unsupported, true),
+            ("gcs", false, false, ConditionalCreateCapability::GenerationMatchZero, false),
+            ("azure", false, false, ConditionalCreateCapability::Unsupported, false),
+            ("unsupported", false, false, ConditionalCreateCapability::Unsupported, false),
+        ] {
+            let capabilities = ProviderVersionCapabilities::for_tier_type(tier_type);
+            assert_eq!(capabilities.bucket_versioning_state, state, "{tier_type} versioning state");
+            assert_eq!(capabilities.list_object_versions, list, "{tier_type} version listing");
+            assert_eq!(capabilities.conditional_create, conditional_create, "{tier_type} conditional create");
+            assert_eq!(capabilities.exact_get_delete, exact_get_delete, "{tier_type} exact routing");
+        }
+    }
+
+    #[test]
+    fn remote_version_states_preserve_unknown_disabled_suspended_and_exact() {
+        let capabilities = ProviderVersionCapabilities::for_tier_type("s3");
+        let empty = HeaderMap::new();
+        let mut null = HeaderMap::new();
+        null.insert("x-amz-version-id", HeaderValue::from_static("null"));
+        let mut exact = HeaderMap::new();
+        exact.insert("x-amz-version-id", HeaderValue::from_static("opaque.generation-7"));
+
+        for (headers, state, expected) in [
+            (&empty, BucketVersioningState::Unknown, RemoteVersion::Unknown),
+            (&empty, BucketVersioningState::Disabled, RemoteVersion::Disabled),
+            (&empty, BucketVersioningState::Suspended, RemoteVersion::Unknown),
+            (&empty, BucketVersioningState::Enabled, RemoteVersion::Unknown),
+            (&null, BucketVersioningState::Suspended, RemoteVersion::SuspendedNull),
+            (
+                &exact,
+                BucketVersioningState::Enabled,
+                RemoteVersion::Exact("opaque.generation-7".to_string()),
+            ),
+        ] {
+            assert_eq!(
+                capabilities
+                    .remote_version(headers, state)
+                    .expect("version state should normalize"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn exact_request_routing_fails_closed_for_unknown_versions() {
+        for (version, expected) in [
+            (RemoteVersion::Disabled, None),
+            (RemoteVersion::SuspendedNull, Some("null")),
+            (RemoteVersion::Exact("opaque-v1".to_string()), Some("opaque-v1")),
+        ] {
+            assert_eq!(version.exact_request_id().expect("known version state"), expected);
+        }
+        assert!(RemoteVersion::Unknown.exact_request_id().is_err());
     }
 
     #[test]

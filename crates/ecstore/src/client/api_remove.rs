@@ -201,7 +201,7 @@ impl TransitionClient {
             object_name: object_name.to_string(),
             object_version_id: opts.version_id,
             delete_marker: resp.headers().get(X_AMZ_DELETE_MARKER).map_or(false, |v| v == "true"),
-            delete_marker_version_id: self.raw_version_id(resp.headers())?.unwrap_or_default().to_string(),
+            delete_marker_version_id: self.legacy_remote_version_id(resp.headers())?,
             ..Default::default()
         })
     }
