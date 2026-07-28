@@ -43,6 +43,69 @@ impl RestoreCleanupIdentity {
 }
 
 impl SetDisks {
+    async fn finalize_restore_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        obj_info: &ObjectInfo,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let expected = RestoreCleanupIdentity::from_object_info(obj_info);
+        let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
+        let expected_etag = obj_info
+            .etag
+            .clone()
+            .unwrap_or_else(|| get_raw_etag(obj_info.user_defined.as_ref()));
+        let version_id = expected.version_id.map(|v| v.to_string());
+        let _lock_guard = if !opts.no_lock {
+            Some(
+                self.acquire_write_lock_diag("restore_finalize_metadata", bucket, object)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let read_opts = ObjectOptions {
+            version_id,
+            versioned: opts.versioned,
+            version_suspended: opts.version_suspended,
+            ..Default::default()
+        };
+        let (mut fi, _, disks) = self
+            .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
+            .await?;
+        if let Some(expected_operation_id) = expected_operation_id {
+            require_restore_operation_id(&fi.metadata, expected_operation_id)?;
+        }
+        if !expected.matches_file_info(&fi, &expected_etag) {
+            return Err(Error::other("restored object changed before restore metadata finalization"));
+        }
+        let restore_expiry =
+            lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), opts.transition.restore_request.days.unwrap_or(1));
+        fi.metadata.insert(
+            X_AMZ_RESTORE.as_str().to_string(),
+            RestoreStatus {
+                is_restore_in_progress: Some(false),
+                restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+            }
+            .to_string(),
+        );
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        self.update_object_meta_with_opts(
+            bucket,
+            object,
+            fi.clone(),
+            disks.as_slice(),
+            &UpdateMetadataOpts {
+                replace_user_metadata: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
+    }
+
     pub async fn update_restore_metadata(
         &self,
         bucket: &str,
