@@ -207,11 +207,9 @@ impl SetDisks {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<Vec<FileInfo>> {
-        // Use existing disk selection logic
-        let disks = self.disks.read().await;
-        let required_reads = self.format.erasure.sets.len();
+        let disks = self.disks.read().await.clone();
+        let required_reads = self.default_read_quorum();
 
-        // Clone parameters outside the closure to avoid lifetime issues
         let bucket = bucket.to_string();
         let object = object.to_string();
         let version_id = version_id.to_string();
@@ -220,7 +218,6 @@ impl SetDisks {
         let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
             .iter()
-            .take(required_reads + 2) // Read a few extra for reliability
             .filter_map(|disk| {
                 disk.as_ref().map(|d| {
                     let disk = d.clone();
@@ -234,10 +231,10 @@ impl SetDisks {
             })
             .collect();
 
-        match processor.execute_batch_with_quorum(tasks, required_reads).await {
-            Ok(results) => Ok(results),
-            Err(_) => Err(DiskError::FileNotFound.into()), // Use existing error type
-        }
+        processor
+            .execute_batch_with_quorum(tasks, required_reads)
+            .await
+            .map_err(Into::into)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1960,6 +1957,42 @@ mod metadata_cache_tests {
         (dir, disk)
     }
 
+    async fn read_version_quorum_test_set(
+        bucket: &str,
+        object: &str,
+        pool_set_count: usize,
+        readable_disks: usize,
+    ) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        for disk_index in 0..4 {
+            let (dir, disk) = new_read_version_test_disk(bucket).await;
+            if disk_index < readable_disks {
+                let mut fi = valid_test_fileinfo(object);
+                fi.mod_time = Some(OffsetDateTime::now_utc());
+                fi.erasure.index = fi.erasure.distribution[disk_index];
+                disk.write_metadata(bucket, bucket, object, fi)
+                    .await
+                    .expect("metadata should be written before quorum read");
+            }
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        let set = SetDisks::new(
+            "read-version-quorum-test".to_string(),
+            Arc::new(RwLock::new(disks)),
+            4,
+            2,
+            0,
+            0,
+            Vec::new(),
+            FormatV3::new(pool_set_count, 4),
+            Vec::new(),
+        )
+        .await;
+        (dirs, set)
+    }
+
     #[test]
     #[serial]
     fn get_object_metadata_cache_capacity_uses_default_and_env_override() {
@@ -2165,9 +2198,68 @@ mod metadata_cache_tests {
             .await
             .expect_err("empty disk set must fail closed");
         assert!(
-            missing_quorum.to_string().to_ascii_lowercase().contains("file"),
-            "optimized read failure should map to file-not-found style error: {missing_quorum}"
+            missing_quorum.to_string().contains("Insufficient successful results"),
+            "optimized read failure should preserve the batch quorum diagnostic: {missing_quorum}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_version_optimized_uses_current_set_drive_quorum_not_pool_set_count() {
+        let bucket = "read-version-layout-quorum-bucket";
+        let object = "object";
+
+        let (_single_set_dirs, single_set) = read_version_quorum_test_set(bucket, object, 1, 1).await;
+        single_set
+            .read_version_optimized(bucket, object, "", &ReadOptions::default())
+            .await
+            .expect_err("one metadata copy must not satisfy a four-drive 2+2 set");
+
+        let (_multi_set_dirs, multi_set) = read_version_quorum_test_set(bucket, object, 3, 2).await;
+        let versions = multi_set
+            .read_version_optimized(bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("two metadata copies should satisfy the current set's read quorum");
+        assert_eq!(versions.len(), 2);
+        assert!(versions.iter().all(|version| version.name == object));
+    }
+
+    #[tokio::test]
+    async fn read_version_optimized_counts_only_valid_metadata_toward_quorum() {
+        let bucket = "read-version-corrupt-quorum-bucket";
+        let object = "object";
+
+        let (quorum_minus_one_dirs, quorum_minus_one) = read_version_quorum_test_set(bucket, object, 1, 2).await;
+        tokio::fs::write(
+            quorum_minus_one_dirs[1]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(crate::disk::STORAGE_FORMAT_FILE),
+            b"corrupt metadata",
+        )
+        .await
+        .expect("metadata should be corrupted for the test");
+        quorum_minus_one
+            .read_version_optimized(bucket, object, "", &ReadOptions::default())
+            .await
+            .expect_err("one valid and one corrupt metadata copy must not satisfy read quorum");
+
+        let (quorum_dirs, quorum) = read_version_quorum_test_set(bucket, object, 1, 3).await;
+        tokio::fs::write(
+            quorum_dirs[2]
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(crate::disk::STORAGE_FORMAT_FILE),
+            b"corrupt metadata",
+        )
+        .await
+        .expect("metadata should be corrupted for the test");
+        let versions = quorum
+            .read_version_optimized(bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("two valid metadata copies must satisfy read quorum despite one corrupt copy");
+        assert_eq!(versions.len(), 2);
     }
 
     #[tokio::test]
