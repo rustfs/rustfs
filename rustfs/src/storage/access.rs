@@ -2814,7 +2814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_part_copy_rejects_unauthorized_request() {
+    async fn upload_part_copy_fails_closed_when_policy_metadata_is_unavailable() {
         let fs = FS::new();
         let mut req = build_request(
             UploadPartCopyInput::builder()
@@ -2836,7 +2836,7 @@ mod tests {
         let err = fs
             .upload_part_copy(&mut req)
             .await
-            .expect_err("missing credentials should reject access");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            .expect_err("unavailable policy metadata must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 }
