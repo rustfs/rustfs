@@ -1181,8 +1181,12 @@ impl TransitionState {
     }
 
     fn new_with_capacity(capacity: usize) -> Arc<Self> {
-        let capacity = capacity.max(1);
         let queue_send_timeout = resolve_transition_queue_send_timeout();
+        Self::new_with_capacity_and_timeout(capacity, queue_send_timeout)
+    }
+
+    fn new_with_capacity_and_timeout(capacity: usize, queue_send_timeout: StdDuration) -> Arc<Self> {
+        let capacity = capacity.max(1);
         let (tx1, rx1) = bounded(capacity);
         Arc::new(Self {
             transition_tx: tx1,
@@ -1545,17 +1549,35 @@ impl TransitionState {
 
         let outcome = match self.transition_tx.try_send(Some(task)) {
             Ok(()) => TransitionEnqueueOutcome::Queued,
-            Err(async_channel::TrySendError::Full(_)) => {
+            Err(async_channel::TrySendError::Full(task)) => {
                 Self::inc_counter(&self.queue_full_tasks);
-                debug!(
-                    bucket = %oi.bucket,
-                    object = %oi.name,
-                    source = ?src,
-                    "transition queue is full; deferring to scanner/backfill"
-                );
-                TransitionEnqueueOutcome::QueueFull
+                let send_timeout = self.transition_queue_send_timeout;
+                match tokio::time::timeout(send_timeout, self.transition_tx.send(task)).await {
+                    Ok(Ok(())) => TransitionEnqueueOutcome::Queued,
+                    Ok(Err(_)) => {
+                        self.schedule_bucket_compensation(&oi.bucket);
+                        TransitionEnqueueOutcome::QueueClosed
+                    }
+                    Err(_) => {
+                        Self::inc_counter(&self.queue_send_timeout_tasks);
+                        self.schedule_bucket_compensation(&oi.bucket);
+                        debug!(
+                            bucket = %oi.bucket,
+                            object = %oi.name,
+                            source = ?src,
+                            timeout_ms = send_timeout.as_millis() as u64,
+                            event = EVENT_LIFECYCLE_TRANSITION_COMPENSATION,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            state = "queue_send_timed_out",
+                            "Scanner transition enqueue timed out; scheduled bucket compensation"
+                        );
+                        TransitionEnqueueOutcome::QueueFull
+                    }
+                }
             }
             Err(async_channel::TrySendError::Closed(_)) => {
+                self.schedule_bucket_compensation(&oi.bucket);
                 debug!(
                     bucket = %oi.bucket,
                     object = %oi.name,
@@ -6503,6 +6525,96 @@ mod tests {
         assert!(first);
         assert!(!second);
         assert_eq!(state.transition_rx.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_transition_enqueue_waits_for_saturated_queue_to_recover() {
+        let state = TransitionState::new_with_capacity(1);
+        let first_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "first".to_string(),
+            ..Default::default()
+        };
+        let deferred_object = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "deferred".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        assert!(
+            state.queue_transition_task(&first_object, &event, &LcEventSrc::Scanner).await,
+            "first scanner transition should fill the queue"
+        );
+
+        let deferred = state.queue_transition_task(&deferred_object, &event, &LcEventSrc::Scanner);
+        tokio::pin!(deferred);
+        assert!(
+            (&mut deferred).now_or_never().is_none(),
+            "a saturated scanner queue should apply bounded backpressure instead of dropping the task"
+        );
+
+        let first_task = state
+            .transition_rx
+            .recv()
+            .await
+            .expect("queue should remain open")
+            .expect("first queued transition task should be present");
+        state.release_transition(&first_task.obj_info);
+
+        assert!(
+            deferred.await,
+            "the deferred scanner transition should enqueue as soon as capacity recovers"
+        );
+        let recovered_task = state
+            .transition_rx
+            .recv()
+            .await
+            .expect("queue should remain open")
+            .expect("deferred transition task should be present");
+        assert_eq!(recovered_task.obj_info.name, deferred_object.name);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_transition_sustained_saturation_schedules_compensation() {
+        let state = TransitionState::new_with_capacity_and_timeout(1, StdDuration::ZERO);
+        let first_object = ObjectInfo {
+            bucket: "saturated-bucket".to_string(),
+            name: "first".to_string(),
+            ..Default::default()
+        };
+        let missed_object = ObjectInfo {
+            bucket: "saturated-bucket".to_string(),
+            name: "missed".to_string(),
+            ..Default::default()
+        };
+        let event = crate::bucket::lifecycle::lifecycle::Event {
+            action: IlmAction::TransitionAction,
+            ..Default::default()
+        };
+
+        assert!(
+            state.queue_transition_task(&first_object, &event, &LcEventSrc::Scanner).await,
+            "first scanner transition should fill the queue"
+        );
+        assert!(
+            !state
+                .queue_transition_task(&missed_object, &event, &LcEventSrc::Scanner)
+                .await,
+            "a continuously saturated queue should report that the object was not admitted"
+        );
+        assert_eq!(state.queue_full_tasks(), 1);
+        assert_eq!(state.queue_send_timeout_tasks(), 1);
+        assert_eq!(
+            state.compensation_scheduled_tasks(),
+            1,
+            "timed-out scanner work must schedule a bounded bucket backfill"
+        );
     }
 
     #[tokio::test]
