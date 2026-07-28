@@ -935,8 +935,17 @@ impl SetDisks {
             let mut regenerated = candidate.clone();
             regenerated.fresh = false;
             regenerated.erasure.index = shard_index;
-            if disk.write_metadata("", bucket, object, regenerated).await.is_ok() {
-                wrote += 1;
+            match disk.write_metadata("", bucket, object, regenerated).await {
+                Ok(()) => wrote += 1,
+                Err(error) => {
+                    warn!(
+                        bucket,
+                        object,
+                        disk_index = index,
+                        error = %error,
+                        "failed to regenerate recoverable xl.meta"
+                    );
+                }
             }
         }
         Ok(wrote > 0)
