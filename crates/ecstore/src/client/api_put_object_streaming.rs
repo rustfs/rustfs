@@ -22,7 +22,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::io::Error;
-use std::sync::RwLock;
+use std::sync::{Mutex, MutexGuard, RwLock};
 use std::{collections::HashMap, sync::Arc};
 use time::{OffsetDateTime, format_description};
 use tokio::io::AsyncReadExt;
@@ -45,6 +45,14 @@ use crate::client::{
 use crate::client::utils::base64_encode;
 use rustfs_utils::path::trim_etag;
 use s3s::header::X_AMZ_EXPIRATION;
+
+fn lock_md5_hasher(
+    md5_hasher: &Mutex<Option<rustfs_utils::hash::HashAlgorithm>>,
+) -> Result<MutexGuard<'_, Option<rustfs_utils::hash::HashAlgorithm>>, std::io::Error> {
+    md5_hasher
+        .lock()
+        .map_err(|_| std::io::Error::other("MD5 hasher state is unavailable"))
+}
 
 /// Read exactly `want` bytes for a single multipart part, or fewer if the reader
 /// reaches EOF first. Advances the reader so the next call returns the following
@@ -177,7 +185,7 @@ impl TransitionClient {
             let length = buf.len();
 
             if opts.send_content_md5 {
-                let mut md5_hasher = self.md5_hasher.lock().unwrap();
+                let mut md5_hasher = lock_md5_hasher(&self.md5_hasher)?;
                 let md5_hash = match md5_hasher.as_mut() {
                     Some(hasher) => hasher,
                     None => return Err(std::io::Error::other("MD5 hasher not initialized")),
@@ -370,7 +378,7 @@ impl TransitionClient {
                 let mut md5_base64: String = "".to_string();
 
                 if opts.send_content_md5 {
-                    let mut md5_hasher = clone_self.md5_hasher.lock().unwrap();
+                    let mut md5_hasher = lock_md5_hasher(&clone_self.md5_hasher)?;
                     let md5_hash = match md5_hasher.as_mut() {
                         Some(hasher) => hasher,
                         None => {
@@ -418,6 +426,9 @@ impl TransitionClient {
         }
 
         let results = join_all(futures).await;
+        for result in results {
+            result?;
+        }
 
         select! {
             err = err_rx.recv() => {
@@ -620,10 +631,12 @@ fn collect_complete_parts(parts_info: &HashMap<i64, ObjectPart>, total_parts_cou
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectPart, ReaderImpl, collect_complete_parts, read_multipart_part};
+    use super::{ObjectPart, ReaderImpl, collect_complete_parts, lock_md5_hasher, read_multipart_part};
     use crate::object_api::GetObjectReader;
     use bytes::Bytes;
+    use rustfs_utils::hash::HashAlgorithm;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     // Drive a reader through the same per-part loop the multipart stream uses and
     // collect the size of every part. Regression for rustfs/rustfs#4811: the old
@@ -732,5 +745,19 @@ mod tests {
             collect_complete_parts(&m, 3).is_err(),
             "a gap in the parts map must be an error, not a panic"
         );
+    }
+
+    #[test]
+    fn poisoned_md5_state_fails_closed() {
+        let hasher = Arc::new(Mutex::new(Some(HashAlgorithm::Md5)));
+        let poison_target = Arc::clone(&hasher);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.lock().expect("fresh mutex should lock");
+            panic!("poison MD5 state");
+        })
+        .join();
+
+        let error = lock_md5_hasher(&hasher).expect_err("poisoned hash state must not be reused");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 }
