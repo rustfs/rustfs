@@ -1310,7 +1310,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let upload_guard = self
             .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)
             .await?;
-        let (mut fi, mut files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let quorum_validated_layout_token = upload_guard.as_ref().filter(|_| range_seek_rollout_enabled).and_then(|_| {
             fi.data_dir
                 .filter(|data_dir| !data_dir.is_nil())
