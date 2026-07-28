@@ -19,7 +19,8 @@ use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_r
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
+    FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize, PART_TRANSACTION_NEW_META,
+    PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
     RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
     STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
@@ -80,6 +81,10 @@ const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_
 const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT: u64 = 2;
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: u64 = 100;
+const PART_TRANSACTION_OLD_DATA: &str = "old.data";
+const PART_TRANSACTION_OLD_DATA_ABSENT: &str = "old.data.absent";
+const PART_TRANSACTION_OLD_META_ABSENT: &str = "old.meta.absent";
+const PART_TRANSACTION_PUBLISH_META: &str = "publish.meta";
 enum ReadAllError {
     Open(std::io::Error),
     Disk(DiskError),
@@ -137,6 +142,28 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn snapshot_part_transaction_file(src: &Path, backup: &Path, absent: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(src) {
+        Ok(metadata) if metadata.is_file() => std::fs::hard_link(src, backup),
+        Ok(_) => Err(std::io::Error::new(ErrorKind::InvalidData, "multipart transaction source is not a file")),
+        Err(err) if err.kind() == ErrorKind::NotFound => std::fs::write(absent, []),
+        Err(err) => Err(err),
+    }
+}
+
+fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, restore: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(backup) {
+        Ok(metadata) if metadata.is_file() => {
+            remove_file_if_exists(restore)?;
+            std::fs::hard_link(backup, restore)?;
+            std::fs::rename(restore, current)
+        }
+        Ok(_) => Err(std::io::Error::new(ErrorKind::InvalidData, "multipart transaction backup is not a file")),
+        Err(err) if err.kind() == ErrorKind::NotFound && absent.is_file() => remove_file_if_exists(current),
         Err(err) => Err(err),
     }
 }
@@ -6448,6 +6475,151 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: Bytes,
+    ) -> Result<()> {
+        let src_volume_dir = self.get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.get_bucket_path(dst_volume)?;
+        if !skip_access_checks(src_volume) {
+            super::fs::access_std(&src_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
+        }
+        if !skip_access_checks(dst_volume) {
+            super::fs::access_std(&dst_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
+        }
+
+        let src_file_path = self.get_object_path(src_volume, src_path)?;
+        let dst_file_path = self.get_object_path(dst_volume, dst_path)?;
+        let dst_meta_path = self.get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
+        let transaction_path = self.get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
+        for path in [&src_file_path, &dst_file_path, &dst_meta_path, &transaction_path] {
+            check_path_length(path.to_string_lossy().as_ref())?;
+        }
+
+        let durability = effective_durability(dst_volume);
+        tokio::task::spawn_blocking(move || {
+            let source = std::fs::symlink_metadata(&src_file_path).map_err(to_file_error)?;
+            if !source.is_file() {
+                return Err(DiskError::FileAccessDenied);
+            }
+            if transaction_path.exists() {
+                return Err(DiskError::FileAccessDenied);
+            }
+
+            let Some(transaction_parent) = transaction_path.parent() else {
+                return Err(DiskError::InvalidPath);
+            };
+            std::fs::create_dir_all(transaction_parent).map_err(to_file_error)?;
+            let staging_path = transaction_parent.join(format!(".part-txn-{}", Uuid::new_v4()));
+            std::fs::create_dir(&staging_path).map_err(to_file_error)?;
+
+            let prepare_result = (|| -> std::io::Result<()> {
+                snapshot_part_transaction_file(
+                    &dst_file_path,
+                    &staging_path.join(PART_TRANSACTION_OLD_DATA),
+                    &staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
+                )?;
+                snapshot_part_transaction_file(
+                    &dst_meta_path,
+                    &staging_path.join(PART_TRANSACTION_OLD_META),
+                    &staging_path.join(PART_TRANSACTION_OLD_META_ABSENT),
+                )?;
+
+                let mut new_meta = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(staging_path.join(PART_TRANSACTION_NEW_META))?;
+                std::io::Write::write_all(&mut new_meta, &meta)?;
+                if durability.syncs_commit_metadata() {
+                    new_meta.sync_data()?;
+                    os::fsync_dir_std(&staging_path)?;
+                }
+                std::fs::rename(&staging_path, &transaction_path)?;
+                if durability.syncs_commit_metadata() {
+                    os::fsync_dir_std(transaction_parent)?;
+                }
+                Ok(())
+            })();
+
+            if let Err(err) = prepare_result {
+                let _ = remove_dir_all_if_exists(&staging_path);
+                return Err(to_file_error(err).into());
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)?
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
+        self.get_bucket_path(volume)?;
+        let current_data_path = self.get_object_path(volume, path)?;
+        let current_meta_path = self.get_object_path(volume, &format!("{path}.meta"))?;
+        let transaction_path = self.get_object_path(volume, &crate::disk::part_transaction_path(path))?;
+        for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
+            check_path_length(candidate.to_string_lossy().as_ref())?;
+        }
+        let durability = effective_durability(volume);
+
+        tokio::task::spawn_blocking(move || {
+            match std::fs::symlink_metadata(&transaction_path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err(DiskError::FileCorrupt),
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+
+            if action == PartTransactionAction::Rollback {
+                std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []).map_err(to_file_error)?;
+                if durability.syncs_commit_metadata() {
+                    os::fsync_dir_std(&transaction_path).map_err(to_file_error)?;
+                }
+                restore_part_transaction_file(
+                    &current_data_path,
+                    &transaction_path.join(PART_TRANSACTION_OLD_DATA),
+                    &transaction_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
+                    &transaction_path.join("restore.data"),
+                )
+                .map_err(to_file_error)?;
+                restore_part_transaction_file(
+                    &current_meta_path,
+                    &transaction_path.join(PART_TRANSACTION_OLD_META),
+                    &transaction_path.join(PART_TRANSACTION_OLD_META_ABSENT),
+                    &transaction_path.join("restore.meta"),
+                )
+                .map_err(to_file_error)?;
+                if durability.syncs_commit_metadata()
+                    && let Some(parent) = current_data_path.parent()
+                {
+                    os::fsync_dir_std(parent).map_err(to_file_error)?;
+                }
+            }
+
+            let Some(parent) = transaction_path.parent() else {
+                return Err(DiskError::InvalidPath);
+            };
+            let cleanup_path = parent.join(format!(".part-txn-settled-{}", Uuid::new_v4()));
+            std::fs::rename(&transaction_path, &cleanup_path).map_err(to_file_error)?;
+            if durability.syncs_commit_metadata() {
+                os::fsync_dir_std(parent).map_err(to_file_error)?;
+            }
+            remove_dir_all_if_exists(&cleanup_path).map_err(to_file_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)??;
+
+        self.io_backend.invalidate_cached_fd(volume, path).await;
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
@@ -6528,6 +6700,42 @@ impl DiskAPI for LocalDisk {
             }
         }
 
+        let transaction_publish_meta = if src_is_dir {
+            None
+        } else {
+            let transaction_path = self.get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
+            let transaction_meta_path = transaction_path.join(PART_TRANSACTION_NEW_META);
+            match fs::read(&transaction_meta_path).await {
+                Ok(expected_meta) => {
+                    if expected_meta.as_slice() != meta.as_ref() {
+                        return Err(DiskError::FileCorrupt);
+                    }
+
+                    let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
+                    let source_meta_path = transaction_meta_path.clone();
+                    let publish_path = publish_meta_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        remove_file_if_exists(&publish_path)?;
+                        std::fs::hard_link(source_meta_path, &publish_path)
+                    })
+                    .await
+                    .map_err(DiskError::from)?
+                    .map_err(to_file_error)?;
+                    Some(publish_meta_path)
+                }
+                // Old peers know only RenamePart. The new coordinator never
+                // reaches rename unless prepare succeeded, so an absent
+                // transaction directory identifies the rolling-upgrade legacy
+                // path. A present directory without new.meta is corruption.
+                Err(err) if err.kind() == ErrorKind::NotFound => match fs::metadata(&transaction_path).await {
+                    Ok(_) => return Err(DiskError::FileCorrupt),
+                    Err(meta_err) if meta_err.kind() == ErrorKind::NotFound => None,
+                    Err(meta_err) => return Err(to_file_error(meta_err).into()),
+                },
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        };
+
         // UploadPart is acknowledged once this rename lands, so the part data and
         // its directory entry must be durable before we return. Relaxed keeps the
         // part payload fdatasync but leaves the directory entry to the page cache.
@@ -6561,7 +6769,17 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileAccessDenied);
         }
 
-        self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
+        if let Some(transaction_publish_meta) = transaction_publish_meta {
+            let dst_meta_path = self.get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
+            rename_all(&transaction_publish_meta, &dst_meta_path, &dst_volume_dir).await?;
+            if durability.syncs_commit_metadata()
+                && let Some(parent) = dst_meta_path.parent()
+            {
+                os::fsync_dir(parent).await.map_err(to_file_error)?;
+            }
+        } else {
+            self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
+        }
 
         if let Some(parent) = src_file_path.parent() {
             self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await?;
@@ -8282,6 +8500,12 @@ mod test {
         file_info.data_dir = data_dir;
         file_info.data = data;
         file_info.size = size;
+        file_info.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: usize::try_from(size).expect("test object size should fit usize"),
+            actual_size: size,
+            ..Default::default()
+        }];
         file_info.mod_time = Some(OffsetDateTime::now_utc());
         file_info
     }
@@ -9370,9 +9594,15 @@ mod test {
             .await
             .expect("source part should be written");
 
+        disk.prepare_part_transaction(tmp_volume, "upload/part.1", bucket, "object/part.1", meta.clone())
+            .await
+            .expect("part transaction should be prepared");
         disk.rename_part(tmp_volume, "upload/part.1", bucket, "object/part.1", meta.clone())
             .await
             .expect("rename_part should commit part");
+        disk.settle_part_transaction(bucket, "object/part.1", PartTransactionAction::Commit)
+            .await
+            .expect("part transaction should be committed");
 
         assert_eq!(
             disk.read_all(bucket, "object/part.1")
@@ -9389,6 +9619,71 @@ mod test {
         assert!(
             matches!(disk.read_all(tmp_volume, "upload/part.1").await, Err(DiskError::FileNotFound)),
             "source part must be removed after a successful commit"
+        );
+
+        let legacy_payload = Bytes::from_static(b"legacy peer payload");
+        let legacy_meta = Bytes::from_static(b"legacy peer metadata");
+        disk.write_all(tmp_volume, "legacy/part.1", legacy_payload.clone())
+            .await
+            .expect("legacy source part should be written");
+        disk.rename_part(tmp_volume, "legacy/part.1", bucket, "object/part.1", legacy_meta.clone())
+            .await
+            .expect("pre-transaction peer RenamePart should remain supported");
+        assert_eq!(
+            disk.read_all(bucket, "object/part.1")
+                .await
+                .expect("legacy destination part should be readable"),
+            legacy_payload
+        );
+        assert_eq!(
+            disk.read_all(bucket, "object/part.1.meta")
+                .await
+                .expect("legacy destination metadata should be readable"),
+            legacy_meta
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_transaction_rolls_back_data_published_before_metadata() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, "tmp").await;
+        ensure_test_volume(&disk, "bucket").await;
+
+        disk.write_all("tmp", "upload/part.1", Bytes::from_static(b"new data"))
+            .await
+            .expect("new part should be staged");
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"old data"))
+            .await
+            .expect("old part data should be staged");
+        disk.write_all("bucket", "object/part.1.meta", Bytes::from_static(b"old metadata"))
+            .await
+            .expect("old part metadata should be staged");
+
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", Bytes::from_static(b"new metadata"))
+            .await
+            .expect("part transaction should be prepared");
+        disk.rename_file("tmp", "upload/part.1", "bucket", "object/part.1")
+            .await
+            .expect("data publication should succeed");
+        disk.settle_part_transaction("bucket", "object/part.1", PartTransactionAction::Rollback)
+            .await
+            .expect("part transaction should roll back");
+
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1")
+                .await
+                .expect("old part data should be restored"),
+            Bytes::from_static(b"old data")
+        );
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1.meta")
+                .await
+                .expect("old part metadata should be restored"),
+            Bytes::from_static(b"old metadata")
         );
     }
 

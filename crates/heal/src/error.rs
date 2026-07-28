@@ -144,6 +144,7 @@ fn is_recoverable_heal_error_message(error: &str) -> bool {
         "connection refused",
         "operation canceled",
         "quorum not reached",
+        "heal rename incomplete",
     ]
     .iter()
     .any(|pattern| error.contains(pattern))
@@ -152,5 +153,24 @@ fn is_recoverable_heal_error_message(error: &str) -> bool {
 impl From<Error> for std::io::Error {
     fn from(err: Error) -> Self {
         std::io::Error::other(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use crate::heal::EcstoreError;
+
+    #[test]
+    fn incomplete_target_rename_is_recoverable() {
+        let task_error = Error::TaskExecutionFailed {
+            message: "heal rename incomplete: 1 of 2 targets committed".to_string(),
+        };
+        let storage_error = Error::Storage(EcstoreError::Io(std::io::Error::other(
+            "heal rename incomplete: 1 of 2 targets committed",
+        )));
+
+        assert!(task_error.is_recoverable_heal());
+        assert!(storage_error.is_recoverable_heal());
     }
 }

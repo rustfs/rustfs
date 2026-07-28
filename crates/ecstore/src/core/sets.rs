@@ -16,6 +16,7 @@
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
+use crate::multipart_listing::paginate_multipart_listing;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -49,7 +50,10 @@ use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
@@ -62,6 +66,8 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+const LIST_MULTIPART_SETS_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -799,9 +805,52 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
         delimiter: Option<String>,
         max_uploads: usize,
     ) -> Result<ListMultipartsInfo> {
-        self.get_disks_by_key(prefix)
-            .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
-            .await
+        let per_set_limit = max_uploads.saturating_add(1);
+        let results = futures::stream::iter(self.disk_set.iter().cloned())
+            .map(|set| {
+                let key_marker = key_marker.clone();
+                let upload_id_marker = upload_id_marker.clone();
+                let delimiter = delimiter.clone();
+                async move {
+                    set.list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, per_set_limit)
+                        .await
+                }
+            })
+            .buffer_unordered(LIST_MULTIPART_SETS_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut uploads = Vec::new();
+        let mut common_prefixes = HashSet::new();
+        let mut source_truncated = false;
+        for result in results {
+            let page = result?;
+            uploads.extend(page.uploads);
+            common_prefixes.extend(page.common_prefixes);
+            source_truncated |= page.is_truncated;
+        }
+
+        let page = paginate_multipart_listing(
+            uploads,
+            common_prefixes.into_iter().collect(),
+            key_marker.as_deref(),
+            key_marker.as_ref().and(upload_id_marker.as_deref()),
+            max_uploads,
+            source_truncated,
+        );
+
+        Ok(ListMultipartsInfo {
+            key_marker,
+            upload_id_marker,
+            next_key_marker: page.next_key_marker,
+            next_upload_id_marker: page.next_upload_id_marker,
+            max_uploads,
+            is_truncated: page.is_truncated,
+            uploads: page.uploads,
+            common_prefixes: page.common_prefixes,
+            prefix: prefix.to_owned(),
+            delimiter,
+        })
     }
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
@@ -1111,6 +1160,7 @@ mod tests {
     use crate::layout::endpoints::SetupType;
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::list::ListOperations as _;
+    use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use rustfs_lock::client::local::LocalClient;
     use serial_test::serial;
 
@@ -1246,6 +1296,194 @@ mod tests {
             .expect("disk id should resolve within the pool");
 
         assert_eq!(result, (Some(3), Some(1), Some(0)));
+    }
+
+    async fn multipart_listing_test_sets() -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+        let format = FormatV3::new(2, 2);
+        let mut temp_dirs = Vec::new();
+        let mut all_endpoints = Vec::new();
+        let mut disk_sets = Vec::new();
+
+        for set_index in 0..2 {
+            let mut endpoints = Vec::new();
+            let mut disks = Vec::new();
+            for disk_index in 0..2 {
+                let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+                let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("tempdir path should be utf8"))
+                    .expect("endpoint should parse");
+                endpoint.set_pool_index(0);
+                endpoint.set_set_index(set_index);
+                endpoint.set_disk_index(disk_index);
+                let disk = new_disk(
+                    &endpoint,
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("disk should be created");
+                let mut disk_format = format.clone();
+                disk_format.erasure.this = format.erasure.sets[set_index][disk_index];
+                save_format_file(&Some(disk.clone()), &Some(disk_format))
+                    .await
+                    .expect("format should be saved");
+                temp_dirs.push(temp_dir);
+                all_endpoints.push(endpoint.clone());
+                endpoints.push(endpoint);
+                disks.push(Some(disk));
+            }
+            disk_sets.push(
+                SetDisks::new(
+                    "test-owner".to_string(),
+                    Arc::new(RwLock::new(disks)),
+                    2,
+                    1,
+                    0,
+                    set_index,
+                    endpoints,
+                    format.clone(),
+                    vec![Arc::new(LocalClient::new()), Arc::new(LocalClient::new())],
+                )
+                .await,
+            );
+        }
+
+        let sets = Arc::new(Sets {
+            id: format.id,
+            disk_set: disk_sets,
+            pool_idx: 0,
+            endpoints: PoolEndpoints {
+                legacy: false,
+                set_count: 2,
+                drives_per_set: 2,
+                endpoints: Endpoints::from(all_endpoints),
+                cmd_line: String::new(),
+                platform: String::new(),
+            },
+            format,
+            parity_count: 1,
+            set_count: 2,
+            set_drive_count: 2,
+            default_parity_count: 1,
+            distribution_algo: DistributionAlgoVersion::V1,
+            exit_signal: None,
+            ctx: bootstrap_ctx(),
+        });
+        (temp_dirs, sets)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn list_multipart_uploads_merges_all_sets_without_pagination_loss() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
+        let (_temp_dirs, sets) = multipart_listing_test_sets().await;
+        let bucket = format!("multipart-list-{}", Uuid::new_v4().simple());
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut keys_by_set = [Vec::new(), Vec::new()];
+        for index in 0..100 {
+            let key = format!("logs/{index:03}.bin");
+            let set_index = sets.get_hashed_set_index(&key);
+            if keys_by_set[set_index].len() < 2 {
+                keys_by_set[set_index].push(key);
+            }
+            if keys_by_set.iter().all(|keys| keys.len() == 2) {
+                break;
+            }
+        }
+        assert!(keys_by_set.iter().all(|keys| keys.len() == 2), "test keys must span both sets");
+
+        let repeated_key = keys_by_set[0][0].clone();
+        let mut expected = Vec::new();
+        for key in keys_by_set.iter().flatten() {
+            let upload = sets
+                .new_multipart_upload(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+            expected.push((key.clone(), upload.upload_id));
+        }
+        let second = sets
+            .new_multipart_upload(&bucket, &repeated_key, &ObjectOptions::default())
+            .await
+            .expect("second upload for the same key should be created");
+        expected.push((repeated_key, second.upload_id));
+        expected.sort();
+
+        let mut actual = Vec::new();
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+        for _ in 0..expected.len() + 1 {
+            let page = sets
+                .list_multipart_uploads(&bucket, "logs/", key_marker.clone(), upload_id_marker.clone(), None, 2)
+                .await
+                .expect("multipart page should list across every set");
+            assert!(page.uploads.len() <= 2);
+            actual.extend(
+                page.uploads
+                    .iter()
+                    .map(|upload| (upload.object.clone(), upload.upload_id.clone())),
+            );
+            if !page.is_truncated {
+                break;
+            }
+            key_marker = page.next_key_marker;
+            upload_id_marker = page.next_upload_id_marker;
+        }
+
+        assert_eq!(actual, expected, "set-level merge must return every upload exactly once");
+        let mut deduped = actual.clone();
+        deduped.dedup();
+        assert_eq!(deduped.len(), actual.len(), "set-level pagination must not duplicate uploads");
+
+        let mut nested_by_set = [None, None];
+        for index in 0..100 {
+            let key = format!("nested/group-{index:03}/file.bin");
+            let set_index = sets.get_hashed_set_index(&key);
+            nested_by_set[set_index].get_or_insert(key);
+            if nested_by_set.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        for key in nested_by_set.iter().flatten() {
+            sets.new_multipart_upload(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect("nested multipart upload should be created");
+        }
+        let mut expected_prefixes = nested_by_set
+            .iter()
+            .flatten()
+            .map(|key| {
+                key.rsplit_once('/')
+                    .expect("nested key should contain a delimiter")
+                    .0
+                    .to_string()
+                    + "/"
+            })
+            .collect::<Vec<_>>();
+        expected_prefixes.sort();
+
+        let first = sets
+            .list_multipart_uploads(&bucket, "nested/", None, None, Some("/".to_string()), 1)
+            .await
+            .expect("first delimiter page should list across every set");
+        assert!(first.is_truncated);
+        assert_eq!(first.common_prefixes, expected_prefixes[..1]);
+        let second = sets
+            .list_multipart_uploads(
+                &bucket,
+                "nested/",
+                first.next_key_marker,
+                first.next_upload_id_marker,
+                Some("/".to_string()),
+                1,
+            )
+            .await
+            .expect("second delimiter page should list across every set");
+        assert!(!second.is_truncated);
+        assert_eq!(second.common_prefixes, expected_prefixes[1..]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
