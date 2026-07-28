@@ -31,7 +31,7 @@ use crate::client::{
     },
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
-    provider_versions::{BucketVersioningState, ProviderVersionCapabilities},
+    provider_versions::{BucketVersioningState, ProviderVersionCapabilities, RemoteVersion},
     signer_error,
 };
 use crate::{client::checksum::ChecksumMode, object_api::GetObjectReader};
@@ -330,6 +330,22 @@ impl TransitionClient {
 
     pub(crate) fn raw_version_id<'a>(&self, headers: &'a HeaderMap) -> Result<Option<&'a str>, std::io::Error> {
         self.provider_version_capabilities().raw_version_id(headers)
+    }
+
+    pub(crate) fn remote_version(
+        &self,
+        headers: &HeaderMap,
+        versioning: BucketVersioningState,
+    ) -> Result<RemoteVersion, std::io::Error> {
+        self.provider_version_capabilities().remote_version(headers, versioning)
+    }
+
+    pub(crate) fn legacy_remote_version_id(&self, headers: &HeaderMap) -> Result<String, std::io::Error> {
+        Ok(self
+            .remote_version(headers, BucketVersioningState::Unknown)?
+            .exact_id()
+            .unwrap_or_default()
+            .to_string())
     }
 
     fn trace_errors_only_off(&self) {
@@ -1095,6 +1111,16 @@ impl Default for ObjectInfo {
     }
 }
 
+impl ObjectInfo {
+    pub(crate) fn remote_version(
+        &self,
+        capabilities: ProviderVersionCapabilities,
+        versioning: BucketVersioningState,
+    ) -> Result<RemoteVersion, std::io::Error> {
+        capabilities.remote_version(&self.metadata, versioning)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RestoreInfo {
     ongoing_restore: bool,
@@ -1414,7 +1440,7 @@ mod tests {
         MAX_S3_CLIENT_RESPONSE_SIZE, MAX_S3_ERROR_RESPONSE_SIZE, SignatureType, build_tls_config, collect_response_body,
         signer_error_to_io_error, to_object_info_for_provider, validate_header_values, with_rustls_init_guard,
     };
-    use crate::client::provider_versions::ProviderVersionCapabilities;
+    use crate::client::provider_versions::{BucketVersioningState, ProviderVersionCapabilities, RemoteVersion};
     use http::{HeaderMap, HeaderValue};
     use http_body_util::Full;
     use hyper::body::Bytes;
@@ -1539,6 +1565,11 @@ mod tests {
                 .expect("opaque provider version should parse");
 
         assert_eq!(info.version_id, None);
+        assert_eq!(
+            info.remote_version(ProviderVersionCapabilities::for_tier_type("tencent"), BucketVersioningState::Enabled,)
+                .expect("opaque response version should remain available"),
+            RemoteVersion::Exact("opaque.version_01".to_string())
+        );
         assert_eq!(
             info.metadata.get("x-cos-version-id").and_then(|value| value.to_str().ok()),
             Some("opaque.version_01")
