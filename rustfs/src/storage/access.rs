@@ -505,7 +505,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         let owner_can_bypass_deny = owner_can_bypass_policy_deny(is_owner, &action);
         if !bucket_name.is_empty()
             && !owner_can_bypass_deny
-            && !PolicySys::is_allowed(&BucketPolicyArgs {
+            && !PolicySys::try_is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
                 // Early explicit-deny gate for bucket policy: use owner short-circuit path so
@@ -517,6 +517,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 object: object.as_str(),
             })
             .await
+            .map_err(ApiError::from)?
         {
             return Err(s3_error!(AccessDenied, "Access Denied"));
         }
@@ -535,7 +536,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             };
             let delete_version_allowed = iam_store.eval_prepared(&prepared, &delete_version_args).await;
             if !delete_version_allowed
-                && !PolicySys::is_allowed(&BucketPolicyArgs {
+                && !PolicySys::try_is_allowed(&BucketPolicyArgs {
                     bucket: bucket.as_str(),
                     action: Action::S3Action(S3Action::DeleteObjectVersionAction),
                     is_owner,
@@ -545,6 +546,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     object: object.as_str(),
                 })
                 .await
+                .map_err(ApiError::from)?
             {
                 return Err(s3_error!(AccessDenied, "Access Denied"));
             }
@@ -571,7 +573,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             return Ok(());
         }
 
-        let policy_allowed_fallback = PolicySys::is_allowed(&BucketPolicyArgs {
+        let policy_allowed_fallback = PolicySys::try_is_allowed(&BucketPolicyArgs {
             bucket: bucket.as_str(),
             action,
             is_owner,
@@ -580,7 +582,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             conditions: &conditions,
             object: object.as_str(),
         })
-        .await;
+        .await
+        .map_err(ApiError::from)?;
 
         if policy_allowed_fallback {
             authorize_table_data_plane_if_needed(action, bucket.as_str(), object.as_str(), cred, is_owner, &conditions, claims)
@@ -605,7 +608,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 return Ok(());
             }
 
-            if PolicySys::is_allowed(&BucketPolicyArgs {
+            if PolicySys::try_is_allowed(&BucketPolicyArgs {
                 bucket: bucket.as_str(),
                 action: Action::S3Action(S3Action::ListBucketAction),
                 is_owner,
@@ -615,6 +618,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 object: object.as_str(),
             })
             .await
+            .map_err(ApiError::from)?
             {
                 return Ok(());
             }
@@ -688,7 +692,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         let bucket_name = bucket.as_str();
 
         if !bucket_name.is_empty()
-            && !PolicySys::is_allowed(&BucketPolicyArgs {
+            && !PolicySys::try_is_allowed(&BucketPolicyArgs {
                 bucket: bucket_name,
                 action,
                 // Early explicit-deny gate for bucket policy in anonymous path.
@@ -699,13 +703,14 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 object: object.as_str(),
             })
             .await
+            .map_err(ApiError::from)?
         {
             return Err(s3_error!(AccessDenied, "Access Denied"));
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
             if action == Action::S3Action(S3Action::DeleteObjectAction) && version_id.is_some() {
-                let delete_version_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+                let delete_version_allowed = PolicySys::try_is_allowed(&BucketPolicyArgs {
                     bucket: bucket.as_str(),
                     action: Action::S3Action(S3Action::DeleteObjectVersionAction),
                     is_owner: false,
@@ -714,13 +719,14 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                     conditions: &conditions,
                     object: object.as_str(),
                 })
-                .await;
+                .await
+                .map_err(ApiError::from)?;
                 if !delete_version_allowed {
                     return Err(s3_error!(AccessDenied, "Access Denied"));
                 }
             }
 
-            let policy_allowed = PolicySys::is_allowed(&BucketPolicyArgs {
+            let policy_allowed = PolicySys::try_is_allowed(&BucketPolicyArgs {
                 bucket: bucket.as_str(),
                 action,
                 is_owner: false,
@@ -729,7 +735,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 conditions: &conditions,
                 object: object.as_str(),
             })
-            .await;
+            .await
+            .map_err(ApiError::from)?;
 
             // A bucket policy granting s3:ListBucket also covers listing versions. This
             // fallback has to feed the same post-authorization gates as the direct grant
@@ -737,7 +744,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             // ListObjectVersions after RestrictPublicBuckets is turned on.
             let policy_allowed = policy_allowed
                 || (action == Action::S3Action(S3Action::ListBucketVersionsAction)
-                    && PolicySys::is_allowed(&BucketPolicyArgs {
+                    && PolicySys::try_is_allowed(&BucketPolicyArgs {
                         bucket: bucket.as_str(),
                         action: Action::S3Action(S3Action::ListBucketAction),
                         is_owner: false,
@@ -746,7 +753,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                         conditions: &conditions,
                         object: "",
                     })
-                    .await);
+                    .await
+                    .map_err(ApiError::from)?);
 
             if policy_allowed {
                 deny_anonymous_table_data_plane_if_needed(action, bucket.as_str(), object.as_str()).await?;
