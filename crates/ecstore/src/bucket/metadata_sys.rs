@@ -726,6 +726,10 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_config(&self, bucket: &str) -> Result<(Arc<BucketMetadata>, bool)> {
+        if bucket.is_empty() {
+            return Err(Error::other("invalid argument"));
+        }
+
         let has_bm = {
             let map = self.metadata_map.read().await;
             map.get(bucket).cloned()
@@ -1096,6 +1100,12 @@ mod tests {
     async fn get_config_never_caches_fabricated_defaults_as_authoritative() {
         let (dirs, ecstore) = isolated_store_over_temp_disks().await;
         let sys = Arc::new(BucketMetadataSys::new(ecstore));
+
+        let err = sys
+            .get_config("")
+            .await
+            .expect_err("an empty bucket name must fail before namespace locking");
+        assert!(matches!(err, Error::Io(ref source) if source.to_string() == "invalid argument"));
 
         // (a) Miss: the fabricated default is returned but not cached.
         let (bm, _) = sys
