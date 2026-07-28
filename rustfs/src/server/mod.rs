@@ -61,8 +61,8 @@ pub(crate) use http::active_http_requests;
 pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
 pub(crate) use module_switch::{
     MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
-    current_module_switch_snapshot, refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store,
-    save_persisted_module_switches_to, validate_module_switch_update,
+    current_module_switch_snapshot, persisted_module_switches_configured, refresh_persisted_module_switches_from,
+    refresh_persisted_module_switches_from_store, save_persisted_module_switches_to, validate_module_switch_update,
 };
 pub(crate) use prefix::{
     ADMIN_PREFIX, APPLE_TOUCH_ICON_PATH, APPLE_TOUCH_ICON_PRECOMPOSED_PATH, CONSOLE_PREFIX, FAVICON_PATH,
