@@ -230,6 +230,8 @@ pub struct FileInfo {
     pub transitioned_objname: String,
     pub transition_tier: String,
     pub transition_version_id: Option<Uuid>,
+    #[serde(default)]
+    pub transition_version: Option<String>,
     pub expire_restored: bool,
     pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
@@ -455,6 +457,10 @@ impl FileInfo {
         if self.mod_time.is_none_or(|mod_time| mod_time <= OffsetDateTime::UNIX_EPOCH)
             || (!allow_nil_version_id && self.version_id.is_some_and(|version_id| version_id.is_nil()))
             || self.transition_version_id.is_some_and(|version_id| version_id.is_nil())
+            || self
+                .transition_version
+                .as_ref()
+                .is_some_and(|version_id| version_id.is_empty())
             || self.size != 0
             || self.data_dir.is_some()
             || self.mode.is_some()
@@ -488,6 +494,7 @@ impl FileInfo {
             || !self.transitioned_objname.is_empty()
             || !self.transition_tier.is_empty()
             || self.transition_version_id.is_some()
+            || self.transition_version.is_some()
             || self.expire_restored
             || self.size != 0
             || self.data_dir.is_some()
@@ -532,6 +539,11 @@ impl FileInfo {
     /// return `None`.
     pub fn validate(&self, mode: ValidationMode) -> Result<Option<ValidatedErasureLayout>> {
         self.validate_collection_bounds()?;
+        if let (Some(version), Some(version_id)) = (&self.transition_version, self.transition_version_id)
+            && Uuid::parse_str(version).ok() != Some(version_id)
+        {
+            return Err(Error::FileCorrupt);
+        }
 
         let erasure_layout = match mode {
             ValidationMode::RequireErasure => Some(self.validate_erasure_geometry()?),
@@ -824,6 +836,7 @@ impl FileInfo {
             && self.transition_tier == other.transition_tier
             && self.transitioned_objname == other.transitioned_objname
             && self.transition_version_id == other.transition_version_id
+            && self.transition_version == other.transition_version
     }
 
     /// Check if metadata maps are equal
@@ -1329,6 +1342,15 @@ mod tests {
     }
 
     #[test]
+    fn metadata_read_validation_rejects_conflicting_transition_versions() {
+        let mut fi = one_shard_validation_fileinfo(1);
+        fi.transition_version_id = Some(Uuid::new_v4());
+        fi.transition_version = Some(Uuid::new_v4().to_string());
+
+        assert_file_corrupt(&fi, ValidationMode::RequireErasure);
+    }
+
+    #[test]
     fn metadata_read_validation_requires_canonical_delete_marker_shape() {
         let marker = FileInfo {
             volume: "bucket".to_string(),
@@ -1699,6 +1721,7 @@ mod tests {
                     transitioned_objname,
                     transition_tier,
                     transition_version_id,
+                    transition_version: transition_version_id.map(|version_id| version_id.to_string()),
                     expire_restored,
                     data_dir,
                     mod_time,

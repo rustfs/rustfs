@@ -464,11 +464,11 @@ impl ObjectInfo {
 
         let transitioned_object = TransitionedObject {
             name: fi.transitioned_objname.clone(),
-            version_id: if let Some(transition_version_id) = fi.transition_version_id {
-                transition_version_id.to_string()
-            } else {
-                "".to_string()
-            },
+            version_id: fi
+                .transition_version
+                .clone()
+                .or_else(|| fi.transition_version_id.map(|version_id| version_id.to_string()))
+                .unwrap_or_default(),
             status: fi.transition_status.clone(),
             free_version: fi.tier_free_version(),
             tier: fi.transition_tier.clone(),

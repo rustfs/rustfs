@@ -2107,11 +2107,12 @@ async fn pause_transition_commit(bucket: &str, object: &str, pause: TransitionCo
     }
 }
 
-fn parse_transition_version_id(remote_version: &str) -> std::result::Result<Option<Uuid>, uuid::Error> {
-    if remote_version.is_empty() {
-        return Ok(None);
+fn parse_transition_version_id(remote_version: &str) -> Option<String> {
+    if remote_version.is_empty() || Uuid::parse_str(remote_version).is_ok_and(|version_id| version_id.is_nil()) {
+        None
+    } else {
+        Some(remote_version.to_string())
     }
-    Uuid::parse_str(remote_version).map(|version_id| (!version_id.is_nil()).then_some(version_id))
 }
 
 #[cfg(test)]
@@ -2278,11 +2279,8 @@ mod transition_version_id_tests {
 
     #[test]
     fn normalizes_persisted_unversioned_ids_and_preserves_put_constraints() {
-        assert_eq!(parse_transition_version_id("").expect("empty remote version should be valid"), None);
-        assert_eq!(
-            parse_transition_version_id(&Uuid::nil().to_string()).expect("nil remote version should be valid"),
-            None
-        );
+        assert_eq!(parse_transition_version_id(""), None);
+        assert_eq!(parse_transition_version_id(&Uuid::nil().to_string()), None);
         let nil_put_response = Uuid::nil().to_string();
         let nil_candidate = TransitionUploadCandidate::from_put_response(nil_put_response.clone());
         assert_eq!(nil_candidate.cleanup_version(), nil_put_response);
@@ -2294,11 +2292,12 @@ mod transition_version_id_tests {
     }
 
     #[test]
-    fn preserves_valid_remote_id_and_rejects_invalid_text() {
+    fn preserves_uuid_and_opaque_remote_ids() {
         let version_id = Uuid::new_v4();
+        assert_eq!(parse_transition_version_id(&version_id.to_string()), Some(version_id.to_string()));
         assert_eq!(
-            parse_transition_version_id(&version_id.to_string()).expect("UUID remote version should be valid"),
-            Some(version_id)
+            parse_transition_version_id("opaque-version-token"),
+            Some("opaque-version-token".to_string())
         );
         assert_eq!(
             TransitionUploadCandidate::from_put_response(version_id.to_string()).cleanup_version(),
@@ -2308,7 +2307,6 @@ mod transition_version_id_tests {
             TransitionUploadCandidate::from_put_response("opaque-version-token".to_string()).cleanup_version(),
             "opaque-version-token"
         );
-        assert!(parse_transition_version_id("not-a-uuid").is_err());
     }
 }
 
@@ -3554,16 +3552,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err);
         }
-        let transition_version_id = match parse_transition_version_id(candidate.remote_version()) {
-            Ok(version_id) => version_id,
-            Err(err) => {
-                if upload_cleanup.cleanup().await.is_ok() {
-                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                        .await;
-                }
-                return Err(err.into());
-            }
-        };
+        let transition_version_id = parse_transition_version_id(candidate.remote_version());
 
         let mut commit_opts = opts.clone();
         commit_opts.no_lock = true;
@@ -3621,7 +3610,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         current_fi.transition_status = TRANSITION_COMPLETE.to_string();
         current_fi.transitioned_objname = dest_obj;
         current_fi.transition_tier = opts.transition.tier.clone();
-        current_fi.transition_version_id = transition_version_id;
+        current_fi.transition_version_id = transition_version_id
+            .as_deref()
+            .and_then(|version_id| Uuid::parse_str(version_id).ok());
+        current_fi.transition_version = transition_version_id;
         rustfs_utils::http::metadata_compat::insert_str(
             &mut current_fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
@@ -6242,7 +6234,7 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn opaque_remote_version_is_cleaned_before_parse_failure() {
+    async fn opaque_remote_version_is_persisted_exactly() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transition-unknown-version-bucket";
         let object = "object.bin";
@@ -6255,12 +6247,25 @@ mod transition_upload_integrity_tests {
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
             .await
-            .expect_err("an unparseable remote version must fail closed");
-        let removed_versions = backend.remove_versions().await;
-        assert_eq!(removed_versions.len(), 1);
-        assert_eq!(removed_versions[0].1, "opaque-version-token");
-        assert_eq!(backend.object_count().await, 0);
-        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+            .expect("an accepted opaque remote version must commit");
+        let (fi, _, _) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("committed opaque transition metadata should be readable");
+        assert_eq!(fi.transition_version_id, None);
+        assert_eq!(fi.transition_version.as_deref(), Some("opaque-version-token"));
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(backend.object_count().await, 1);
     }
 
     #[tokio::test]
