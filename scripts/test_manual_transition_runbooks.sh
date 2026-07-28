@@ -209,6 +209,9 @@ rg -q "mixed_version_docker_harness" /tmp/manual_transition_mixed_version_docker
 rg -q -- "--old-image" /tmp/manual_transition_mixed_version_docker_harness.help
 rg -q -- "--new-image" /tmp/manual_transition_mixed_version_docker_harness.help
 rg -q -- "--no-rollback" /tmp/manual_transition_mixed_version_docker_harness.help
+rg -q "strict_mixed_rollout_pass" /tmp/manual_transition_mixed_version_docker_harness.help
+rg -q "baseline_tiered_storage_pass" /tmp/manual_transition_mixed_version_docker_harness.help
+rg -q "blocked_manual_api_not_implemented" /tmp/manual_transition_mixed_version_docker_harness.help
 if bash "$FAILURE_SAMPLES" --endpoint http://127.0.0.1:9000 --sample >/tmp/manual_transition_failure_samples.err 2>&1; then
   echo "failure samples script should fail when --sample has no value" >&2
   exit 1

@@ -70,6 +70,14 @@ Environment:
 Artifacts:
   compose.yml, image inspect files, health/readiness logs, API responses,
   terminal status, old-node readback, container logs, summary.env.
+
+Result classifications:
+  strict_mixed_rollout_pass          Real old/new images, non-empty completed transition, zero failures
+  baseline_tiered_storage_pass      Same old/new image completed transition; useful baseline, not #1508 closure
+  blocked_manual_api_not_implemented Manual transition API returned 501 before job admission
+  blocked_manual_api_unavailable    Manual transition API did not return a usable job_id
+  blocked_empty_scan_or_lifecycle   Job completed without lifecycle-matching transition work
+  strict_mixed_rollout_fail         Mixed rollout ran but did not satisfy the strict #1508 gate
 USAGE
 }
 
@@ -433,16 +441,19 @@ seed_objects() {
 }
 
 start_transition_job() {
-  local query response job_id
+  local query response job_id run_http_code
   query="bucket=$(url_encode "$JOB_BUCKET")"
   query="${query}&prefix=$(url_encode "${JOB_PREFIX}/")"
   query="${query}&tier=$(url_encode "$TIER_NAME")"
   query="${query}&dryRun=false&maxObjects=${OBJECT_COUNT}&mode=async"
-  response="$(curl_hot POST "$(hot_endpoint 2)/rustfs/admin/v3/ilm/transition/run?${query}")"
-  printf '%s\n' "$response" >"${OUT_DIR}/run-response.json"
+  curl_hot POST "$(hot_endpoint 2)/rustfs/admin/v3/ilm/transition/run?${query}" \
+    -o "${OUT_DIR}/run-response.json" \
+    -w "%{http_code}\n" >"${OUT_DIR}/run-response.http_code" || true
+  response="$(cat "${OUT_DIR}/run-response.json" 2>/dev/null || true)"
+  run_http_code="$(cat "${OUT_DIR}/run-response.http_code" 2>/dev/null || true)"
   job_id="$(printf '%s' "$response" | jq -r '.job_id // empty')"
   if [[ -z "$job_id" ]]; then
-    log_error "manual transition response omitted job_id"
+    log_warn "manual transition response omitted job_id, http_code=${run_http_code:-unknown}"
     return 1
   fi
   printf '%s\n' "$job_id" >"${OUT_DIR}/job-id.txt"
@@ -512,6 +523,72 @@ head_probe() {
     -w "%{http_code}\n" >"${OUT_DIR}/head-object.http_code" || true
 }
 
+image_id() {
+  local file="$1"
+  jq -r '.[0].Id // ""' "$file" 2>/dev/null || true
+}
+
+is_compat_readback_code() {
+  case "$1" in
+    200|501)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+classify_result() {
+  local terminal_state="$1"
+  local transition_completed="$2"
+  local transition_failed="$3"
+  local tier_failure="$4"
+  local old_code="$5"
+  local rollback_code="$6"
+  local run_http_code="$7"
+  local lifecycle_config_found="$8"
+  local scanned="$9"
+  local eligible="${10}"
+  local old_image_id new_image_id images_are_mixed readback_ok
+
+  old_image_id="$(image_id "${OUT_DIR}/old-image.inspect.json")"
+  new_image_id="$(image_id "${OUT_DIR}/new-image.inspect.json")"
+  images_are_mixed=false
+  if [[ "$OLD_IMAGE" != "$NEW_IMAGE" && -n "$old_image_id" && -n "$new_image_id" && "$old_image_id" != "$new_image_id" ]]; then
+    images_are_mixed=true
+  fi
+
+  readback_ok=false
+  if is_compat_readback_code "$old_code"; then
+    if [[ "$ROLLBACK_NEW2_TO_OLD" != "true" ]] || is_compat_readback_code "$rollback_code"; then
+      readback_ok=true
+    fi
+  fi
+
+  if [[ "$run_http_code" == "501" ]]; then
+    printf 'blocked_manual_api_not_implemented\n'
+    return
+  fi
+  if [[ -z "$(cat "${OUT_DIR}/job-id.txt" 2>/dev/null || true)" ]]; then
+    printf 'blocked_manual_api_unavailable\n'
+    return
+  fi
+  if [[ "$terminal_state" == "completed" && ( "$lifecycle_config_found" != "true" || "$scanned" == "0" || "$eligible" == "0" || "$transition_completed" == "0" ) ]]; then
+    printf 'blocked_empty_scan_or_lifecycle\n'
+    return
+  fi
+  if [[ "$terminal_state" == "completed" && "$transition_completed" != "0" && "$transition_failed" == "0" && "$tier_failure" == "0" ]]; then
+    if [[ "$images_are_mixed" == "true" && "$readback_ok" == "true" ]]; then
+      printf 'strict_mixed_rollout_pass\n'
+      return
+    fi
+    printf 'baseline_tiered_storage_pass\n'
+    return
+  fi
+  printf 'strict_mixed_rollout_fail\n'
+}
+
 collect_logs() {
   local service
   if [[ -z "$COMPOSE_FILE" || ! -f "$COMPOSE_FILE" ]]; then
@@ -524,33 +601,45 @@ collect_logs() {
 }
 
 summarize() {
-  local terminal_state transition_completed tier_failure transition_failed old_code rollback_code
+  local terminal_state transition_completed tier_failure transition_failed old_code rollback_code run_http_code lifecycle_config_found scanned eligible result_classification
   terminal_state="$(cat "${OUT_DIR}/terminal-state.txt" 2>/dev/null || true)"
   transition_completed="$(jq -r '.report.transition_completed // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
   tier_failure="$(jq -r '.report.tier_failure // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
   transition_failed="$(jq -r '.report.transition_failed // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
   old_code="$(cat "${OUT_DIR}/old-node-status.http_code" 2>/dev/null || true)"
   rollback_code="$(cat "${OUT_DIR}/rollback-node2-status.http_code" 2>/dev/null || true)"
+  run_http_code="$(cat "${OUT_DIR}/run-response.http_code" 2>/dev/null || true)"
+  lifecycle_config_found="$(jq -r '.report.lifecycle_config_found // false' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf 'false')"
+  scanned="$(jq -r '.report.scanned // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
+  eligible="$(jq -r '.report.eligible // 0' "${OUT_DIR}/status-terminal.json" 2>/dev/null || printf '0')"
+  result_classification="$(classify_result "$terminal_state" "$transition_completed" "$transition_failed" "$tier_failure" "$old_code" "$rollback_code" "$run_http_code" "$lifecycle_config_found" "$scanned" "$eligible")"
   cat >"${OUT_DIR}/summary.env" <<EOF
 project_name=${PROJECT_NAME}
 old_image=${OLD_IMAGE}
 new_image=${NEW_IMAGE}
 cold_image=${COLD_IMAGE}
+old_image_id=$(image_id "${OUT_DIR}/old-image.inspect.json")
+new_image_id=$(image_id "${OUT_DIR}/new-image.inspect.json")
 base_port=${BASE_PORT}
 tier=${TIER_NAME}
 job_bucket=${JOB_BUCKET}
 job_prefix=${JOB_PREFIX}
 object_count=${OBJECT_COUNT}
+run_http_code=${run_http_code}
 terminal_state=${terminal_state}
+lifecycle_config_found=${lifecycle_config_found}
+scanned=${scanned}
+eligible=${eligible}
 transition_completed=${transition_completed}
 transition_failed=${transition_failed}
 tier_failure=${tier_failure}
 old_node_status_http_code=${old_code}
 rollback_node2_status_http_code=${rollback_code}
 rollback_new2_to_old=${ROLLBACK_NEW2_TO_OLD}
+result_classification=${result_classification}
 EOF
   cat "${OUT_DIR}/summary.env"
-  if [[ "$terminal_state" != "completed" || "$transition_completed" == "0" || "$transition_failed" != "0" || "$tier_failure" != "0" ]]; then
+  if [[ "$result_classification" != "strict_mixed_rollout_pass" ]]; then
     log_error "strict #1508 mixed-version transition gate failed; see ${OUT_DIR}"
     return 1
   fi
@@ -581,13 +670,16 @@ main() {
   add_tier
   put_lifecycle
   seed_objects
-  start_transition_job
-  if [[ "$ROLLBACK_NEW2_TO_OLD" == "true" ]]; then
-    replace_node2_with_old_image
+  if start_transition_job; then
+    if [[ "$ROLLBACK_NEW2_TO_OLD" == "true" ]]; then
+      replace_node2_with_old_image
+    fi
+    poll_terminal_status "$(cat "${OUT_DIR}/job-id.txt")" || true
+    capture_old_node_readback "$(cat "${OUT_DIR}/job-id.txt")"
+    head_probe
+  else
+    log_warn "Skipping terminal polling because no manual transition job was admitted"
   fi
-  poll_terminal_status "$(cat "${OUT_DIR}/job-id.txt")"
-  capture_old_node_readback "$(cat "${OUT_DIR}/job-id.txt")"
-  head_probe
   collect_logs
   summarize
 }
