@@ -3435,12 +3435,8 @@ impl SetDisks {
                 disk.clone().map(|disk| {
                     let dst_object = dst_object.clone();
                     async move {
-                        disk.settle_part_transaction(
-                            RUSTFS_META_MULTIPART_BUCKET,
-                            &dst_object,
-                            PartTransactionAction::Rollback,
-                        )
-                        .await
+                        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &dst_object, PartTransactionAction::Rollback)
+                            .await
                     }
                 })
             });
