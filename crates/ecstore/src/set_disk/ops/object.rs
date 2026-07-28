@@ -1807,7 +1807,7 @@ impl Drop for TransitionUploadCleanup {
     }
 }
 
-async fn cleanup_rejected_transition_upload_durably(
+pub(crate) async fn cleanup_rejected_transition_upload_durably(
     lease: &TierOperationLease,
     object: &str,
     cleanup_version: &str,

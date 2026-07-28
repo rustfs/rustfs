@@ -20,7 +20,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bucket::lifecycle::config_boundary;
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
+use crate::bucket::lifecycle::tier_sweeper::{
+    Jentry, delete_confirmed_transition_candidate_exact_with_manager_and_identity,
+    delete_object_from_remote_tier_idempotent_with_manager_and_identity,
+};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -270,15 +273,26 @@ pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -
     let backend_identity = je
         .backend_identity
         .ok_or_else(|| std::io::Error::other("legacy tier delete journal has no durable backend identity"))?;
-    delete_object_from_remote_tier_idempotent_with_manager_and_identity(
-        &je.obj_name,
-        &je.version_id,
-        &je.tier_name,
-        backend_identity,
-        &api.tier_config_mgr(),
-        je.version_id_exact,
-    )
-    .await?;
+    if je.version_id_exact {
+        delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+            &je.obj_name,
+            &je.version_id,
+            &je.tier_name,
+            backend_identity,
+            &api.tier_config_mgr(),
+        )
+        .await?;
+    } else {
+        delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            &je.obj_name,
+            &je.version_id,
+            &je.tier_name,
+            backend_identity,
+            &api.tier_config_mgr(),
+            false,
+        )
+        .await?;
+    }
     remove_tier_delete_journal_entry(api, je).await
 }
 

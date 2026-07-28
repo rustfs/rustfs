@@ -10194,6 +10194,61 @@ mod tests {
         assert_eq!(backend.remove_count().await, 0);
     }
 
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_replay_deletes_confirmed_exact_provider_token() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let (backend, _) = register_recovery_mock_tier(&ecstore).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("mock tier lease should be available");
+        let identity = lease.backend_identity();
+        backend
+            .set_put_remote_version(Some("provider-version-token".to_string()))
+            .await;
+        lease
+            .put(
+                "remote/object",
+                crate::client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
+                9,
+            )
+            .await
+            .expect("confirmed remote candidate should be seeded");
+        backend.set_remove_failure(true);
+        backend.set_reject_non_empty_remote_versions(true);
+        let je = Jentry {
+            obj_name: "remote/object".to_string(),
+            version_id: "provider-version-token".to_string(),
+            tier_name: "WARM".to_string(),
+            backend_identity: Some(identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+        };
+
+        crate::set_disk::cleanup_rejected_transition_upload_durably(
+            &lease,
+            &je.obj_name,
+            &je.version_id,
+            true,
+            Some(ecstore.clone()),
+        )
+        .await
+        .expect("failed immediate cleanup should remain durable in the journal");
+        assert!(backend.contains(&je.obj_name).await);
+
+        backend.set_remove_failure(false);
+        crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
+            .await
+            .expect("identity-bound exact journal must retry confirmed candidate cleanup");
+
+        assert!(!backend.contains(&je.obj_name).await);
+        assert_eq!(backend.exact_remove_count(), 2);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![("remote/object".to_string(), "provider-version-token".to_string())]
+        );
+    }
+
     async fn seed_recoverable_free_version(
         disk_paths: &[PathBuf],
         bucket: &str,

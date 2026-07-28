@@ -793,6 +793,18 @@ mod test {
             backend.remove_versions().await,
             vec![("remote/object".to_string(), "provider-version-token".to_string())]
         );
+
+        let err = delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+            "remote/object",
+            "",
+            "WARM",
+            identity,
+            &manager,
+        )
+        .await
+        .expect_err("confirmed versioned cleanup must reject an empty token");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(backend.remove_count().await, 1);
     }
 
     #[test]
