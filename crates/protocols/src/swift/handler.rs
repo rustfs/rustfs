@@ -28,7 +28,9 @@ use axum::http::{Method, Request, Response, StatusCode};
 use futures::Future;
 use rustfs_credentials::Credentials;
 use rustfs_keystone::KEYSTONE_CREDENTIALS;
+use rustfs_trusted_proxies::ClientInfo;
 use s3s::Body;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_util::io::StreamReader;
@@ -39,6 +41,14 @@ const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_HANDLER: &str = "swift_handler";
 const EVENT_SWIFT_ROUTE_STATE: &str = "swift_route_state";
 const EVENT_SWIFT_TEMPURL_STATE: &str = "swift_tempurl_state";
+
+fn trusted_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ClientInfo>()
+        .map(|info| info.real_ip)
+        .or_else(|| req.extensions().get::<SocketAddr>().map(SocketAddr::ip))
+        .filter(|ip| !ip.is_unspecified())
+}
 
 /// Swift-aware service that routes to Swift handlers or S3 service
 #[derive(Clone)]
@@ -128,6 +138,7 @@ async fn handle_swift_request(
     route: SwiftRoute,
     credentials: Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
+    let client_ip = trusted_client_ip(&req);
     // Extract parts
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
@@ -164,7 +175,7 @@ async fn handle_swift_request(
             let tempurl = tempurl::TempURL::new(key);
             let path = uri.path();
 
-            tempurl.validate_request(method.as_str(), path, &tempurl_params)?;
+            tempurl.validate_request(method.as_str(), path, &tempurl_params, client_ip)?;
 
             // TempURL is valid - proceed with request (no credentials needed)
             debug!(
@@ -1497,7 +1508,10 @@ fn swift_error_to_response(error: SwiftError) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range_header;
+    use super::{parse_range_header, trusted_client_ip};
+    use axum::http::Request;
+    use rustfs_trusted_proxies::ClientInfo;
+    use std::net::SocketAddr;
     #[test]
     fn test_parse_range_header_start_end() {
         // bytes=100-199
@@ -1587,5 +1601,42 @@ mod tests {
         // bytes=0-999 (entire 1000-byte file)
         let result = parse_range_header("bytes=0-999", 1000);
         assert_eq!(result, Some((0, 999)));
+    }
+
+    #[test]
+    fn trusted_client_ip_ignores_untrusted_forwarded_headers() {
+        let mut request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.9")
+            .header("x-real-ip", "198.51.100.10")
+            .body(())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert("192.0.2.7:9000".parse::<SocketAddr>().expect("socket address"));
+
+        assert_eq!(trusted_client_ip(&request), Some("192.0.2.7".parse().expect("peer IP address")));
+    }
+
+    #[test]
+    fn trusted_client_ip_prefers_validated_proxy_identity() {
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .insert("192.0.2.7:9000".parse::<SocketAddr>().expect("socket address"));
+        request.extensions_mut().insert(ClientInfo::direct(
+            "203.0.113.8:443".parse::<SocketAddr>().expect("validated client address"),
+        ));
+
+        assert_eq!(trusted_client_ip(&request), Some("203.0.113.8".parse().expect("validated client IP")));
+    }
+
+    #[test]
+    fn trusted_client_ip_rejects_unspecified_fallback() {
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .insert(ClientInfo::direct("0.0.0.0:0".parse::<SocketAddr>().expect("unspecified fallback")));
+
+        assert_eq!(trusted_client_ip(&request), None);
     }
 }
