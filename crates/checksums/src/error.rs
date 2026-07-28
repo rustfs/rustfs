@@ -30,6 +30,10 @@ impl UnknownChecksumAlgorithmError {
     pub fn checksum_algorithm(&self) -> &str {
         &self.checksum_algorithm
     }
+
+    pub fn into_checksum_algorithm(self) -> String {
+        self.checksum_algorithm
+    }
 }
 
 impl fmt::Display for UnknownChecksumAlgorithmError {
