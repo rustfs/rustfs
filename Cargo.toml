@@ -288,7 +288,7 @@ redis = { version = "1.4.1" }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/cxymds/s3s.git", rev = "b0c2d740d4277d05de17bf5932a99f7cfe8ebe22" }
+s3s = { git = "https://github.com/cxymds/s3s.git", rev = "afa1796ec64cd1e1c78dfee46c4b4b72bbc7b39d" }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
