@@ -1249,13 +1249,12 @@ impl TransitionState {
             return false;
         }
         let bucket = bucket.to_string();
-        let scheduled = Arc::clone(&self.compensation_buckets);
         let state = Arc::clone(self);
         tokio::spawn(async move {
             Self::inc_counter(&state.compensation_running_tasks);
             state.record_scanner_transition_state();
             let Some(api) = runtime_sources::object_store_handle() else {
-                scheduled.lock().unwrap().remove(&bucket);
+                state.finish_bucket_compensation(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
                 state.record_scanner_transition_state();
                 debug!(
@@ -1291,11 +1290,23 @@ impl TransitionState {
                 );
             }
 
-            scheduled.lock().unwrap().remove(&bucket);
+            state.finish_bucket_compensation(&bucket);
             Self::add_counter(&state.compensation_running_tasks, -1);
             state.record_scanner_transition_state();
         });
         true
+    }
+
+    fn finish_bucket_compensation(&self, bucket: &str) {
+        match self.compensation_buckets.lock() {
+            Ok(mut scheduled) => {
+                scheduled.remove(bucket);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(bucket);
+                self.compensation_buckets.clear_poison();
+            }
+        }
     }
 
     #[inline]
@@ -1729,7 +1740,7 @@ impl TransitionState {
     }
 
     pub fn add_lastday_stats(&self, tier: &str, ts: TierStats) {
-        let mut tier_stats = self.last_day_stats.lock().unwrap();
+        let mut tier_stats = self.lock_last_day_stats();
         tier_stats
             .entry(tier.to_string())
             .and_modify(|e| e.add_stats(ts))
@@ -1737,12 +1748,24 @@ impl TransitionState {
     }
 
     pub fn get_daily_all_tier_stats(&self) -> DailyAllTierStats {
-        let tier_stats = self.last_day_stats.lock().unwrap();
+        let tier_stats = self.lock_last_day_stats();
         let mut res = DailyAllTierStats::with_capacity(tier_stats.len());
         for (tier, st) in tier_stats.iter() {
             res.insert(tier.clone(), st.clone());
         }
         res
+    }
+
+    fn lock_last_day_stats(&self) -> std::sync::MutexGuard<'_, HashMap<String, LastDayTierStats>> {
+        match self.last_day_stats.lock() {
+            Ok(stats) => stats,
+            Err(poisoned) => {
+                let mut stats = poisoned.into_inner();
+                stats.clear();
+                self.last_day_stats.clear_poison();
+                stats
+            }
+        }
     }
 
     pub async fn update_workers(api: Arc<ECStore>, n: i64) {
@@ -1766,7 +1789,27 @@ impl TransitionState {
     fn resize_workers_to(api: Arc<ECStore>, n: i64, requested: i64, absolute_max: i64) {
         let target = n as usize;
         let transition_state = runtime_sources::transition_state_handle();
-        let mut workers = transition_state.workers.lock().unwrap();
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                warn!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    error = %err,
+                    state = "resize_failed",
+                    "Lifecycle worker pool requires a Tokio runtime"
+                );
+                return;
+            }
+        };
+        // Runtime lookup happens before locking, and the guard is dropped before
+        // metrics/logging callbacks. Poison therefore means a Vec mutation may
+        // have unwound and worker tracking cannot be reconstructed safely.
+        let mut workers = transition_state
+            .workers
+            .lock()
+            .expect("transition worker tracking mutex poisoned");
         let tracked_workers = workers.len();
         workers.retain(|worker| !worker.handle.is_finished());
         let pruned_finished_workers = tracked_workers.saturating_sub(workers.len());
@@ -1776,7 +1819,7 @@ impl TransitionState {
             let clone_api = api.clone();
             let cancel = CancellationToken::new();
             let worker_cancel = cancel.clone();
-            let handle = tokio::spawn(async move {
+            let handle = runtime.spawn(async move {
                 TransitionState::worker_with_cancel(clone_api, worker_cancel).await;
             });
             workers.push(TransitionWorker { cancel, handle });
@@ -1790,6 +1833,7 @@ impl TransitionState {
 
         let current_workers = workers.len() as i64;
         transition_state.num_workers.store(current_workers, Ordering::SeqCst);
+        drop(workers);
         transition_state.record_scanner_transition_state();
 
         debug!(
@@ -4884,6 +4928,7 @@ mod tests {
         FreeVersionRecoveryStats, RecoveryWalkTestAction, list_tier_free_versions, recover_tier_free_versions_with_cancel,
         set_recovery_bucket_list_wait_hook, set_recovery_walk_test_hook,
     };
+    use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -4917,6 +4962,7 @@ mod tests {
     use http::HeaderMap;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
+    use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
     use s3s::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
@@ -6984,6 +7030,46 @@ mod tests {
         assert_eq!(state.compensation_pending_tasks(), 1);
     }
 
+    #[test]
+    fn poisoned_compensation_set_can_release_completed_bucket() {
+        let state = TransitionState::new_with_capacity(1);
+        state
+            .compensation_buckets
+            .lock()
+            .expect("fresh mutex should lock")
+            .insert("bucket-a".to_string());
+        let poison_target = Arc::clone(&state.compensation_buckets);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.lock().expect("fresh mutex should lock");
+            panic!("poison compensation set");
+        })
+        .join();
+
+        state.finish_bucket_compensation("bucket-a");
+        assert_eq!(state.compensation_pending_tasks(), 0);
+        assert!(
+            state.compensation_buckets.lock().is_ok(),
+            "validated compensation state must clear poison"
+        );
+    }
+
+    #[test]
+    fn poisoned_tier_stats_are_reset_before_reuse() {
+        let state = TransitionState::new_with_capacity(1);
+        let poison_target = Arc::clone(&state.last_day_stats);
+        let _ = std::thread::spawn(move || {
+            let mut stats = poison_target.lock().expect("fresh mutex should lock");
+            stats.insert("stale".to_string(), LastDayTierStats::default());
+            panic!("poison tier stats");
+        })
+        .join();
+
+        state.add_lastday_stats("fresh", TierStats::default());
+        let stats = state.get_daily_all_tier_stats();
+        assert!(!stats.contains_key("stale"), "possibly partial statistics must be discarded");
+        assert!(stats.contains_key("fresh"), "statistics must accept new samples after recovery");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn scanner_transition_state_reports_compensation_pending_buckets() {
         let state = TransitionState::new_with_capacity(1);
@@ -7272,6 +7358,23 @@ mod tests {
         assert!(remaining_token.is_cancelled());
 
         TransitionState::resize_workers_to(ecstore, original_workers, original_workers, absolute_max);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transition_worker_resize_without_runtime_does_not_poison_tracking() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let transition_state = runtime_sources::transition_state_handle();
+        let resize = std::thread::spawn(move || {
+            TransitionState::resize_workers_to(ecstore, 1, 1, resolve_transition_workers_absolute_max());
+        })
+        .join();
+
+        assert!(resize.is_ok(), "missing Tokio runtime must not panic while worker tracking is locked");
+        assert!(
+            transition_state.workers.lock().is_ok(),
+            "failed resize must leave worker tracking unpoisoned"
+        );
     }
 
     #[test]

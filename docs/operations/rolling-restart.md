@@ -9,6 +9,16 @@ failure pattern reported in rustfs/rustfs#4304.
 > format. Replacing the executable and restarting is safe; no migration step
 > runs on startup.
 
+> [!WARNING]
+> The release that switches local SSE wrapped DEKs from the legacy
+> `base64(nonce):base64(ciphertext)` representation to the versioned JSON
+> envelope is a deliberate exception. Do not run that release together with
+> an older RustFS version: older nodes cannot read objects written with the
+> JSON envelope. Freeze every source of object mutation, including client
+> writes and background lifecycle or replication work, upgrade every node,
+> and then resume traffic. Downgrading or rolling back after new encrypted
+> objects are written is not supported.
+
 ## TL;DR
 
 - **Rolling restart (no downtime):** restart **one node at a time**, and wait

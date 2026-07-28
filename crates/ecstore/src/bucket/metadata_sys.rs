@@ -741,6 +741,8 @@ impl BucketMetadataSys {
 
         if let Some(config) = &bm.policy_config {
             Ok((config.clone(), bm.policy_config_updated_at))
+        } else if !bm.policy_config_json.is_empty() {
+            Ok((serde_json::from_slice(&bm.policy_config_json)?, bm.policy_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
         }
@@ -1049,6 +1051,22 @@ mod tests {
             b"kept-marker".to_vec(),
             "a fabricated refresh default must not replace real metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn get_bucket_policy_rejects_malformed_cached_policy() {
+        let (_dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let mut metadata = BucketMetadata::new("malformed-policy");
+        metadata.policy_config_json = b"{".to_vec();
+        sys.set("malformed-policy".to_string(), Arc::new(metadata)).await;
+
+        let err = sys
+            .get_bucket_policy("malformed-policy")
+            .await
+            .expect_err("malformed persisted policy must not be treated as missing");
+
+        assert!(matches!(err, Error::Io(_)), "malformed persisted policy must surface its parse failure");
     }
 
     fn target(bucket: &str, id: &str) -> BucketTarget {

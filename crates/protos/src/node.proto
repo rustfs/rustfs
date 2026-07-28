@@ -170,6 +170,32 @@ message RenamePartResponse {
   optional Error error = 2;
 }
 
+message PreparePartTransactionRequest {
+  string disk = 1;
+  string src_volume = 2;
+  string src_path = 3;
+  string dst_volume = 4;
+  string dst_path = 5;
+  bytes meta = 6;
+}
+
+message PreparePartTransactionResponse {
+  bool success = 1;
+  optional Error error = 2;
+}
+
+message SettlePartTransactionRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  bool rollback = 4;
+}
+
+message SettlePartTransactionResponse {
+  bool success = 1;
+  optional Error error = 2;
+}
+
 message RenameFileRequest {
   string disk = 1;
   string src_volume = 2;
@@ -943,7 +969,9 @@ service NodeService {
   rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {};
   rpc ReadParts(ReadPartsRequest) returns (ReadPartsResponse) {};
   rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {};
+  rpc PreparePartTransaction(PreparePartTransactionRequest) returns (PreparePartTransactionResponse) {};
   rpc RenamePart(RenamePartRequest) returns (RenamePartResponse) {};
+  rpc SettlePartTransaction(SettlePartTransactionRequest) returns (SettlePartTransactionResponse) {};
   rpc RenameFile(RenameFileRequest) returns (RenameFileResponse) {};
   rpc Write(WriteRequest) returns (WriteResponse) {};
   rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {};
