@@ -34,6 +34,7 @@ use crate::bucket::lifecycle::{
 };
 use crate::diagnostics::get::GetObjectFailureReason;
 use crate::disk::OldCurrentSize;
+use crate::error::is_err_invalid_upload_id;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::store::ECStore;
@@ -4060,7 +4061,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 uploaded_parts
                     .first_mut()
                     .expect("multipart restore must contain at least one uploaded part")
-                    .etag = "injected-invalid-complete-etag".to_string();
+                    .etag = Some("injected-invalid-complete-etag".to_string());
             }
             self_
                 .clone()
