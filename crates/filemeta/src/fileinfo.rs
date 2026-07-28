@@ -219,6 +219,16 @@ impl ErasureInfo {
 }
 
 // #[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransitionVersionState {
+    #[default]
+    Unknown,
+    KnownDisabled,
+    SuspendedNull,
+    Exact,
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct FileInfo {
     pub volume: String,
@@ -232,6 +242,8 @@ pub struct FileInfo {
     pub transition_version_id: Option<Uuid>,
     #[serde(default)]
     pub transition_version: Option<String>,
+    #[serde(default)]
+    pub transition_version_state: TransitionVersionState,
     pub expire_restored: bool,
     pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
@@ -544,6 +556,20 @@ impl FileInfo {
         {
             return Err(Error::FileCorrupt);
         }
+        let transition_state_valid = match self.transition_version_state {
+            TransitionVersionState::Unknown => true,
+            TransitionVersionState::KnownDisabled => self.transition_version.is_none() && self.transition_version_id.is_none(),
+            TransitionVersionState::SuspendedNull => {
+                self.transition_version.as_deref() == Some("null") && self.transition_version_id.is_none()
+            }
+            TransitionVersionState::Exact => self
+                .transition_version
+                .as_deref()
+                .is_some_and(|version| version != "null" && !version.is_empty()),
+        };
+        if !transition_state_valid {
+            return Err(Error::FileCorrupt);
+        }
 
         let erasure_layout = match mode {
             ValidationMode::RequireErasure => Some(self.validate_erasure_geometry()?),
@@ -837,6 +863,7 @@ impl FileInfo {
             && self.transitioned_objname == other.transitioned_objname
             && self.transition_version_id == other.transition_version_id
             && self.transition_version == other.transition_version
+            && self.transition_version_state == other.transition_version_state
     }
 
     /// Check if metadata maps are equal
@@ -1722,6 +1749,11 @@ mod tests {
                     transition_tier,
                     transition_version_id,
                     transition_version: transition_version_id.map(|version_id| version_id.to_string()),
+                    transition_version_state: if transition_version_id.is_some() {
+                        TransitionVersionState::Exact
+                    } else {
+                        TransitionVersionState::Unknown
+                    },
                     expire_restored,
                     data_dir,
                     mod_time,

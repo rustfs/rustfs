@@ -185,6 +185,7 @@ struct ObjSweeper {
     transition_status: String,
     transition_tier: String,
     transition_version_id: String,
+    transition_version_state: rustfs_filemeta::TransitionVersionState,
     remote_object: String,
 }
 
@@ -231,7 +232,9 @@ impl ObjSweeper {
     }
 
     pub fn should_remove_remote_object(&self) -> Option<Jentry> {
-        if self.transition_status != lifecycle::TRANSITION_COMPLETE {
+        if self.transition_status != lifecycle::TRANSITION_COMPLETE
+            || self.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+        {
             return None;
         }
 
@@ -250,6 +253,7 @@ impl ObjSweeper {
                 tier_name: self.transition_tier.clone(),
                 backend_identity: None,
                 version_id_exact: false,
+                version_state: self.transition_version_state,
             });
         }
         None
@@ -286,6 +290,7 @@ pub struct Jentry {
     pub(crate) tier_name: String,
     pub(crate) backend_identity: Option<TierDestinationId>,
     pub(crate) version_id_exact: bool,
+    pub(crate) version_state: rustfs_filemeta::TransitionVersionState,
 }
 
 impl ExpiryOp for Jentry {
@@ -486,6 +491,7 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
         tier_name: transitioned.tier.clone(),
         backend_identity: None,
         version_id_exact: false,
+        version_state: rustfs_filemeta::TransitionVersionState::Unknown,
     })
 }
 

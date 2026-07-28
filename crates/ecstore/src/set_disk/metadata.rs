@@ -579,6 +579,12 @@ impl SetDisks {
         Self::update_hash_str(hasher, &meta.transitioned_objname);
         Self::update_hash_optional_uuid(hasher, meta.transition_version_id);
         Self::update_hash_optional_str(hasher, meta.transition_version.as_deref());
+        hasher.update([match meta.transition_version_state {
+            rustfs_filemeta::TransitionVersionState::Unknown => 0,
+            rustfs_filemeta::TransitionVersionState::KnownDisabled => 1,
+            rustfs_filemeta::TransitionVersionState::SuspendedNull => 2,
+            rustfs_filemeta::TransitionVersionState::Exact => 3,
+        }]);
         Self::update_hash_optional_u32(hasher, meta.mode);
         Self::update_hash_optional_u64(hasher, meta.written_by_version);
 

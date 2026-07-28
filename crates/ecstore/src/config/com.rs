@@ -2543,6 +2543,7 @@ mod tests {
                 data_dir: None,
                 delete_marker: false,
                 transitioned_object: Default::default(),
+                transition_version_state: Default::default(),
                 restore_ongoing: false,
                 restore_expires: None,
                 user_tags: Arc::new(String::new()),

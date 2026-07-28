@@ -545,6 +545,7 @@ pub(in crate::set_disk) fn metadata_early_stop_candidate_matches(left: &FileInfo
         && left.transition_tier == right.transition_tier
         && left.transition_version_id == right.transition_version_id
         && left.transition_version == right.transition_version
+        && left.transition_version_state == right.transition_version_state
         && left.expire_restored == right.expire_restored
         && left.size == right.size
         && left.mod_time == right.mod_time
