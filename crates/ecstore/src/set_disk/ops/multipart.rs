@@ -777,6 +777,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         mut max_parts: usize,
         opts: &ObjectOptions,
     ) -> Result<ListPartsInfo> {
+        let _upload_guard = self
+            .acquire_multipart_upload_read_lock("list_object_parts", bucket, object, upload_id, opts)
+            .await?;
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, false).await?;
 
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
@@ -1254,10 +1257,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let _upload_guard = self
             .acquire_multipart_upload_write_lock("abort_multipart_upload", bucket, object, upload_id, opts)
             .await?;
-        self.check_upload_id_exists(bucket, object, upload_id, false).await?;
+        let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
-        self.delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path).await
+        self.delete_all_with_quorum(
+            RUSTFS_META_MULTIPART_BUCKET,
+            &upload_id_path,
+            fi.write_quorum(self.default_write_quorum()),
+        )
+        .await
     }
     // complete_multipart_upload finished
     #[tracing::instrument(skip(self))]
@@ -1290,33 +1298,20 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
-        let (mut fi, mut files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
-        let has_layout_candidate = range_seek_rollout_enabled
-            && fi
-                .data_dir
-                .filter(|data_dir| !data_dir.is_nil())
-                .map(|data_dir| data_dir.to_string())
-                .is_some_and(|token| {
-                    crate::object_api::has_encrypted_part_layout_marker(
-                        &fi.metadata,
-                        crate::object_api::ENCRYPTED_PART_LAYOUT_CANDIDATE_SUFFIX,
-                        &token,
-                    )
-                });
-        let mut upload_guard = None;
-        if has_layout_candidate {
-            if object_lock_guard.is_none() {
-                object_lock_guard = Some(
-                    self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
-                        .await?,
-                );
-            }
-            upload_guard = self
-                .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)
-                .await?;
-            (fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        // Multipart finalization always acquires the object lock before the
+        // upload lock. UploadPart, Abort, ListParts, and GetMultipartInfo take
+        // only the upload lock and therefore cannot introduce the reverse edge.
+        if !opts.no_lock && object_lock_guard.is_none() {
+            object_lock_guard = Some(
+                self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
+                    .await?,
+            );
         }
-        let quorum_validated_layout_token = upload_guard.as_ref().and_then(|_| {
+        let upload_guard = self
+            .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)
+            .await?;
+        let (mut fi, mut files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        let quorum_validated_layout_token = upload_guard.as_ref().filter(|_| range_seek_rollout_enabled).and_then(|_| {
             fi.data_dir
                 .filter(|data_dir| !data_dir.is_nil())
                 .map(|data_dir| data_dir.to_string())
@@ -1711,18 +1706,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
-        if !opts.no_lock && object_lock_guard.is_none() {
-            object_lock_guard = Some(
-                self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
-                    .await?,
-            );
-        }
-        if upload_guard.is_none() {
-            upload_guard = self
-                .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)
-                .await?;
-            self.check_upload_id_exists(bucket, object, upload_id, false).await?;
-        }
         // Phase 2 (backlog#899): fence the commit on lock loss before any destructive
         // step. If the refresh heartbeat has observed a refresh-quorum loss, another
         // writer may have re-acquired this object's lock; proceeding would race a
@@ -1825,7 +1808,36 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         #[cfg(test)]
         pause_multipart_commit(bucket, object, MultipartCommitPause::AfterRename).await;
-        drop(upload_guard);
+
+        let cleanup_store = self.clone();
+        let cleanup_upload_id_path = upload_id_path.clone();
+        let cleanup_bucket = bucket.to_owned();
+        let cleanup_object = object.to_owned();
+        let cleanup_upload_id = upload_id.to_owned();
+        let cleanup_handle = tokio::spawn(async move {
+            let _upload_guard = upload_guard;
+            if let Err(err) = cleanup_store
+                .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &cleanup_upload_id_path, write_quorum)
+                .await
+            {
+                warn!(
+                    bucket = %cleanup_bucket,
+                    object = %cleanup_object,
+                    upload_id = %cleanup_upload_id,
+                    error = ?err,
+                    "completed multipart upload staging cleanup did not reach write quorum"
+                );
+            }
+        });
+        if let Err(err) = cleanup_handle.await {
+            warn!(
+                bucket = %bucket,
+                object = %object,
+                upload_id = %upload_id,
+                error = ?err,
+                "completed multipart upload staging cleanup task failed"
+            );
+        }
         drop(object_lock_guard); // drop object lock guard to release the lock
 
         // backlog#1321: enqueue heal only when the committed replicas actually
@@ -1869,12 +1881,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .await;
             });
         }
-
-        let upload_id_path = upload_id_path.clone();
-        let store = self.clone();
-        let _cleanup_handle = tokio::spawn(async move {
-            let _ = store.delete_all(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path).await;
-        });
 
         for (i, op_disk) in online_disks.iter().enumerate() {
             if let Some(disk) = op_disk
@@ -2248,6 +2254,13 @@ mod tests {
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let object_holder = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("object namespace lock should be created")
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("test should hold the object lock");
         let holder = set_disks
             .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
             .await
@@ -2273,13 +2286,13 @@ mod tests {
                 .complete_multipart_upload(bucket, object, &complete_upload_id, parts, &ObjectOptions::default())
                 .await
         });
-        signaling.wait_for_attempts(3).await;
         drop(holder);
 
         abort
             .await
             .expect("abort task should not panic")
             .expect("abort should win the upload finalization");
+        drop(object_holder);
         let complete_err = complete
             .await
             .expect("completion task should not panic")
@@ -3169,6 +3182,17 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(!abort.is_finished(), "abort must wait until completion releases the upload lock");
 
+            let list_store = set_disks.clone();
+            let list_upload_id = upload_id.clone();
+            let list = tokio::spawn(async move {
+                list_store
+                    .list_object_parts(bucket, object, &list_upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+                    .await
+            });
+            signaling.wait_for_attempts(3).await;
+            tokio::task::yield_now().await;
+            assert!(!list.is_finished(), "ListParts must wait until completion releases the upload lock");
+
             barrier.release();
             complete
                 .await
@@ -3179,8 +3203,66 @@ mod tests {
                 .expect("abort task should not panic")
                 .expect_err("the committed upload should no longer exist when abort acquires the lock");
             assert!(matches!(abort_err, StorageError::InvalidUploadID(..)));
+            let list_err = list
+                .await
+                .expect("ListParts task should not panic")
+                .expect_err("the committed upload should no longer exist when ListParts acquires the lock");
+            assert!(matches!(list_err, StorageError::InvalidUploadID(..)));
         })
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn complete_validates_parts_after_an_inflight_upload_part_commit() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let signaling = Arc::new(SignalingLockClient::new(Arc::new(LocalClient::with_manager(manager))));
+        let lockers: Vec<Arc<dyn LockClient>> = vec![signaling.clone()];
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "multipart-complete-put-part-race-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+        let (upload_id, original_parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, &[0x49; 4096], &ObjectOptions::default()).await;
+        let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
+
+        let put_store = set_disks.clone();
+        let put_upload_id = upload_id.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x4a; 4096]);
+            put_store
+                .put_object_part(bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let complete_store = set_disks.clone();
+        let complete_upload_id = upload_id.clone();
+        let complete = tokio::spawn(async move {
+            complete_store
+                .complete_multipart_upload(bucket, object, &complete_upload_id, original_parts, &ObjectOptions::default())
+                .await
+        });
+        signaling.wait_for_attempts(2).await;
+        tokio::task::yield_now().await;
+        assert!(!complete.is_finished(), "completion must wait for the UploadPart commit lock");
+
+        barrier.release();
+        put.await
+            .expect("UploadPart task should not panic")
+            .expect("UploadPart replacement should commit");
+        let err = complete
+            .await
+            .expect("completion task should not panic")
+            .expect_err("completion must reject the stale ETag after UploadPart wins");
+        assert!(matches!(err, StorageError::InvalidPart(..)));
+        set_disks
+            .list_object_parts(bucket, object, &upload_id, None, MAX_PARTS_COUNT, &ObjectOptions::default())
+            .await
+            .expect("failed completion must leave the upload retryable");
     }
 
     #[tokio::test(start_paused = true)]
