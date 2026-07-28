@@ -338,7 +338,7 @@ async fn delete_object_from_remote_tier_raw_with_manager(
     let lease = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, tier_name)
         .await
         .map_err(std::io::Error::other)?;
-    delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease, false).await
+    delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease, false, true).await
 }
 
 async fn delete_object_from_remote_tier_raw_with_lease(
@@ -346,8 +346,11 @@ async fn delete_object_from_remote_tier_raw_with_lease(
     rv_id: &str,
     lease: &TierOperationLease,
     version_id_exact: bool,
+    validate_remote_version_id: bool,
 ) -> Result<(), std::io::Error> {
-    lease.validate_remote_version_id(rv_id)?;
+    if validate_remote_version_id {
+        lease.validate_remote_version_id(rv_id)?;
+    }
 
     if remote_delete_breaker_is_open(Instant::now()).await {
         metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
@@ -443,7 +446,46 @@ pub(crate) async fn delete_object_from_remote_tier_with_lease_idempotent(
     lease: &TierOperationLease,
     version_id_exact: bool,
 ) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
-    match delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, lease, version_id_exact).await {
+    delete_object_from_remote_tier_with_lease_idempotent_inner(obj_name, rv_id, lease, version_id_exact, true).await
+}
+
+pub(crate) async fn delete_confirmed_transition_candidate_exact_with_lease_idempotent(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    if rv_id.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "confirmed versioned transition candidate requires a non-empty remote version",
+        ));
+    }
+    delete_object_from_remote_tier_with_lease_idempotent_inner(obj_name, rv_id, lease, true, false).await
+}
+
+pub(crate) async fn delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    backend_identity: TierDestinationId,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, tier_name, backend_identity)
+        .await
+        .map_err(std::io::Error::other)?;
+    delete_confirmed_transition_candidate_exact_with_lease_idempotent(obj_name, rv_id, &lease).await
+}
+
+async fn delete_object_from_remote_tier_with_lease_idempotent_inner(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+    version_id_exact: bool,
+    validate_remote_version_id: bool,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    match delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, lease, version_id_exact, validate_remote_version_id)
+        .await
+    {
         Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
         Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
         Err(err) => {
@@ -514,9 +556,10 @@ mod test {
 
     use super::{
         ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, RemoteDeleteBreaker, RemoteTierDeleteOutcome,
-        delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
-        is_remote_tier_not_found_error, is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook,
-        should_record_remote_delete_failure, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
+        delete_confirmed_transition_candidate_exact_with_manager_and_identity, delete_object_from_remote_tier_idempotent,
+        delete_object_from_remote_tier_idempotent_with_manager_and_identity, is_remote_tier_not_found_error,
+        is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook, should_record_remote_delete_failure,
+        transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
     };
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use rustfs_filemeta::TransitionVersionState;
@@ -720,6 +763,36 @@ mod test {
         .expect("unversioned remote delete should continue without a version ID");
 
         assert_eq!(backend.remove_versions().await, vec![("remote/object".to_string(), String::new())]);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn confirmed_transition_cleanup_deletes_exact_provider_token() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        let backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let identity = lease.backend_identity();
+        drop(lease);
+        backend.set_reject_non_empty_remote_versions(true);
+
+        let outcome = delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+            "remote/object",
+            "provider-version-token",
+            "WARM",
+            identity,
+            &manager,
+        )
+        .await
+        .expect("confirmed upload compensation should delete the exact provider token");
+
+        assert_eq!(outcome, RemoteTierDeleteOutcome::Deleted);
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![("remote/object".to_string(), "provider-version-token".to_string())]
+        );
     }
 
     #[test]

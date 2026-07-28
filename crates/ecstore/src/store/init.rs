@@ -2722,10 +2722,12 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn transition_transaction_recovery_deletes_provider_recovered_unknown_upload() {
         let versioned_remote = uuid::Uuid::new_v4().to_string();
+        let nil_remote = uuid::Uuid::nil().to_string();
         for (case, tier_name, remote_version) in [
             ("missing", "TXPROBEMISSING", None),
             ("unversioned", "TXPROBEUNVERSIONED", Some(String::new())),
             ("versioned", "TXPROBEVERSIONED", Some(versioned_remote)),
+            ("nil-version", "TXPROBENILVERSION", Some(nil_remote)),
         ] {
             let temp_dir = tempfile::tempdir().expect("create temp store dir");
             let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(

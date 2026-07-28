@@ -25,7 +25,10 @@ use crate::set_disk::read::GetObjectDownstreamWriter;
 
 use crate::bucket::lifecycle::{
     tier_delete_journal::{persist_tier_delete_journal_entry, remove_tier_delete_journal_entry},
-    tier_sweeper::{Jentry, RemoteTierDeleteOutcome, delete_object_from_remote_tier_with_lease_idempotent},
+    tier_sweeper::{
+        Jentry, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_lease_idempotent,
+        delete_object_from_remote_tier_with_lease_idempotent,
+    },
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
         TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
@@ -1663,7 +1666,11 @@ pub(crate) async fn cleanup_uncommitted_transition_upload(
     cleanup_version: &str,
     version_id_exact: bool,
 ) -> std::io::Result<RemoteTierDeleteOutcome> {
-    delete_object_from_remote_tier_with_lease_idempotent(object, cleanup_version, lease, version_id_exact).await
+    if version_id_exact {
+        delete_confirmed_transition_candidate_exact_with_lease_idempotent(object, cleanup_version, lease).await
+    } else {
+        delete_object_from_remote_tier_with_lease_idempotent(object, cleanup_version, lease, false).await
+    }
 }
 
 fn log_transition_upload_cleanup_failure(lease: &TierOperationLease, object: &str, cleanup_version: &str, err: &std::io::Error) {
@@ -1979,10 +1986,81 @@ async fn advance_and_save_transition_transaction(
     next: TransitionTransactionState,
     remote_version: Option<TransitionRemoteVersion>,
 ) -> Result<()> {
+    #[cfg(test)]
+    record_transition_uploaded_save_attempt(transaction, next);
     transaction
         .advance(transaction.fence(), next, remote_version)
         .map_err(Error::other)?;
     save_transition_transaction_if_available(api, transaction).await
+}
+
+#[cfg(test)]
+struct TransitionUploadedSaveProbeState {
+    bucket: String,
+    object: String,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+struct TransitionUploadedSaveProbe {
+    state: Arc<TransitionUploadedSaveProbeState>,
+}
+
+#[cfg(test)]
+static TRANSITION_UPLOADED_SAVE_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionUploadedSaveProbeState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl TransitionUploadedSaveProbe {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TransitionUploadedSaveProbeState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded-save probe mutex should not poison");
+        assert!(slot.is_none(), "transition uploaded-save probe must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    fn attempts(&self) -> usize {
+        self.state.attempts.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TransitionUploadedSaveProbe {
+    fn drop(&mut self) {
+        let mut slot = TRANSITION_UPLOADED_SAVE_PROBE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded-save probe mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, next: TransitionTransactionState) {
+    if next != TransitionTransactionState::Uploaded {
+        return;
+    }
+    let state = TRANSITION_UPLOADED_SAVE_PROBE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition uploaded-save probe mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == transaction.source.bucket && state.object == transaction.source.object)
+        .cloned();
+    if let Some(state) = state {
+        state.attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
@@ -2239,10 +2317,7 @@ fn persisted_transition_version(
     remote_version: &str,
 ) -> std::io::Result<(Option<String>, rustfs_filemeta::TransitionVersionState)> {
     if remote_version.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "a missing remote tier object version remains unknown until the cluster capability gate is active",
-        ));
+        return Ok((None, rustfs_filemeta::TransitionVersionState::KnownDisabled));
     }
     let version_id = Uuid::parse_str(remote_version).map_err(|_| {
         std::io::Error::new(
@@ -2500,7 +2575,10 @@ mod transition_version_id_tests {
 
     #[test]
     fn normalizes_persisted_unversioned_ids_and_preserves_put_constraints() {
-        assert!(persisted_transition_version("").is_err());
+        assert_eq!(
+            persisted_transition_version("").expect("empty remote version identifies an unversioned tier"),
+            (None, TransitionVersionState::KnownDisabled)
+        );
         assert!(persisted_transition_version(&Uuid::nil().to_string()).is_err());
         let nil_put_response = Uuid::nil().to_string();
         let nil_candidate = TransitionUploadCandidate::from_put_response(nil_put_response.clone());
@@ -3798,6 +3876,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err.into());
         }
+        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
+            Ok(version) => version,
+            Err(err) => {
+                let cleanup_api = transition_cleanup_store(&self.ctx).await;
+                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                    return Err(StorageError::Io(std::io::Error::other(format!(
+                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
+                    ))));
+                }
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    .await;
+                return Err(err.into());
+            }
+        };
         if let Err(err) = advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -3815,20 +3907,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
             return Err(err);
         }
-        let (transition_version_id, transition_version_state) = match persisted_transition_version(candidate.remote_version()) {
-            Ok(version) => version,
-            Err(err) => {
-                let cleanup_api = transition_cleanup_store(&self.ctx).await;
-                if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
-                    return Err(StorageError::Io(std::io::Error::other(format!(
-                        "{err}; rejected remote upload cleanup failed: {cleanup_err}"
-                    ))));
-                }
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
-                return Err(err.into());
-            }
-        };
 
         let mut commit_opts = opts.clone();
         commit_opts.no_lock = true;
@@ -4700,7 +4778,7 @@ mod transition_commit_failure_tests {
 
     #[tokio::test]
     async fn rejected_unsupported_remote_versions_are_cleaned_up() {
-        for remote_version in ["", "null", "opaque-version-token"] {
+        for remote_version in ["null", "opaque-version-token"] {
             let manager = TierConfigMgr::new();
             let backend = register_mock_tier(&manager, "WARM").await;
             let lease = TierConfigMgr::acquire_operation_lease(&manager, "WARM")
@@ -6675,20 +6753,21 @@ mod transition_upload_integrity_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn opaque_remote_version_is_persisted_exactly() {
+    async fn unversioned_remote_version_is_persisted_without_version_id() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
-        let bucket = "transition-unknown-version-bucket";
+        let bucket = "transition-unversioned-tier-bucket";
         let object = "object.bin";
-        let payload = b"unknown remote version must retain local data".repeat(1024);
+        let payload = b"unversioned remote tier must commit without a version id".repeat(1024);
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        backend.set_put_remote_version(Some("opaque-version-token".to_string())).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
 
         set_disks
             .transition_object(bucket, object, &transition_options(&original, tier_name))
             .await
-            .expect("an accepted opaque remote version must commit");
+            .expect("an unversioned remote version must commit");
         let (fi, _, _) = set_disks
             .get_object_fileinfo(
                 bucket,
@@ -6702,11 +6781,68 @@ mod transition_upload_integrity_tests {
                 false,
             )
             .await
-            .expect("committed opaque transition metadata should be readable");
+            .expect("committed unversioned transition metadata should be readable");
         assert_eq!(fi.transition_version_id, None);
-        assert_eq!(fi.transition_version.as_deref(), Some("opaque-version-token"));
+        assert_eq!(fi.transition_version, None);
+        assert_eq!(fi.transition_version_state, rustfs_filemeta::TransitionVersionState::KnownDisabled);
+        assert_eq!(save_probe.attempts(), 1);
         assert_eq!(backend.remove_count().await, 0);
         assert_eq!(backend.object_count().await, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn opaque_remote_version_is_cleaned_before_parse_failure() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-unknown-version-bucket";
+        let object = "object.bin";
+        let payload = b"unknown remote version must retain local data".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some("opaque-version-token".to_string())).await;
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("an opaque remote version must fail closed until the capability gate is active");
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(removed_versions[0].1, "opaque-version-token");
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn nil_remote_version_is_cleaned_exactly_before_transaction_persistence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "transition-nil-version-bucket";
+        let object = "object.bin";
+        let payload = b"nil remote version must retain local data".repeat(1024);
+        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let remote_version = Uuid::nil().to_string();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        backend.set_put_remote_version(Some(remote_version.clone())).await;
+        let save_probe = TransitionUploadedSaveProbe::install(bucket, object);
+
+        set_disks
+            .transition_object(bucket, object, &transition_options(&original, tier_name))
+            .await
+            .expect_err("a nil remote version must fail closed before transaction persistence");
+        let put_versions = backend.put_versions().await;
+        let removed_versions = backend.remove_versions().await;
+        assert_eq!(removed_versions, put_versions);
+        assert_eq!(removed_versions.len(), 1);
+        assert_eq!(
+            removed_versions.first().map(|(_, version)| version.as_str()),
+            Some(remote_version.as_str())
+        );
+        assert_eq!(save_probe.attempts(), 0, "nil remote version must be rejected before saving Uploaded");
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 0);
+        assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
     #[tokio::test]
