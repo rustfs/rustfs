@@ -5725,6 +5725,7 @@ mod tests {
         oi.transitioned_object.tier = "WARM".to_string();
         oi.transitioned_object.name = "remote/object".to_string();
         oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
         let local_delete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let legacy_err = delete_free_version_remote_object_then(&oi, &manager, {
@@ -5735,7 +5736,8 @@ mod tests {
         })
         .await
         .expect_err("legacy free-version without identity must be retained");
-        assert!(legacy_err.to_string().contains("no durable backend identity"));
+        assert_eq!(legacy_err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(old_backend.remove_count().await, 0);
         assert_eq!(local_delete_calls.load(Ordering::Relaxed), 0);
 
         let mut invalid_metadata = HashMap::new();
