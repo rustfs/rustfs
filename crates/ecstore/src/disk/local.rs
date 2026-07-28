@@ -8282,6 +8282,12 @@ mod test {
         file_info.data_dir = data_dir;
         file_info.data = data;
         file_info.size = size;
+        file_info.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: usize::try_from(size).expect("test object size should fit usize"),
+            actual_size: size,
+            ..Default::default()
+        }];
         file_info.mod_time = Some(OffsetDateTime::now_utc());
         file_info
     }
