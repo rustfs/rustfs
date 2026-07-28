@@ -5868,6 +5868,7 @@ mod tests {
         oi.transitioned_object.tier = "WARM".to_string();
         oi.transitioned_object.name = "remote/object".to_string();
         oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
 
         let err = match get_transitioned_object_reader_with_tier_manager(
             "bucket",
@@ -5883,7 +5884,12 @@ mod tests {
             Ok(_) => panic!("identity-bound GET must reject a same-name tier rebind"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("identity no longer matches"));
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let admin_err = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::client::admin_handler_utils::AdminError>())
+            .expect("identity mismatch should retain the typed tier error");
+        assert_eq!(admin_err.code, crate::services::tier::tier::ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(new_backend.get_count().await, 0);
 
         oi.user_defined = Arc::new(HashMap::new());
