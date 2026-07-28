@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata as SwiftBucketMetadata;
@@ -43,7 +44,9 @@ pub(crate) mod object {
 
 pub(crate) mod public_api {
     pub use super::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
-    pub(crate) use super::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
+    pub(crate) use super::{
+        get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, set_swift_bucket_metadata,
+    };
 }
 
 pub(crate) mod versioning {
@@ -61,4 +64,19 @@ pub(crate) async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResul
 
 pub(crate) async fn set_swift_bucket_metadata(bucket: String, metadata: SwiftBucketMetadata) -> SwiftStorageResult<()> {
     set_swift_bucket_metadata_in_backend(bucket, metadata).await
+}
+
+pub(crate) async fn get_swift_bucket_usage() -> SwiftStorageResult<Option<HashMap<String, (u64, u64)>>> {
+    let Some(store) = resolve_swift_object_store_handle() else {
+        return Ok(None);
+    };
+    let mut data_usage = rustfs_ecstore::api::data_usage::load_data_usage_from_backend_cached(store).await?;
+    rustfs_ecstore::api::data_usage::apply_bucket_usage_memory_overlay(&mut data_usage).await;
+    Ok(Some(
+        data_usage
+            .buckets_usage
+            .into_iter()
+            .map(|(bucket, usage)| (bucket, (usage.objects_count, usage.size)))
+            .collect(),
+    ))
 }

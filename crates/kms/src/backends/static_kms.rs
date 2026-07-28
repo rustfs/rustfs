@@ -23,16 +23,17 @@
 
 use crate::backends::{BackendInfo, KmsBackend, KmsClient};
 use crate::config::{BackendConfig, KmsConfig};
+use crate::encryption::DataKeyEnvelope;
 use crate::error::{KmsError, Result};
 use crate::types::*;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
 };
 use async_trait::async_trait;
 use jiff::Zoned;
 use rand::RngExt;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::debug;
 use zeroize::Zeroizing;
 
@@ -40,6 +41,11 @@ use zeroize::Zeroizing;
 const NONCE_SIZE: usize = 12;
 /// AES-256 key size in bytes.
 const KEY_SIZE: usize = 32;
+
+fn context_aad(context: &HashMap<String, String>) -> Result<Vec<u8>> {
+    let canonical: BTreeMap<&str, &str> = context.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+    serde_json::to_vec(&canonical).map_err(Into::into)
+}
 
 /// Static single-key KMS backend.
 ///
@@ -111,21 +117,35 @@ impl KmsClient for StaticKmsBackend {
         let key = Key::<Aes256Gcm>::from(*self.key);
         let cipher = Aes256Gcm::new(&key);
         let nonce = Nonce::from(nonce_bytes);
+        let aad = context_aad(&request.encryption_context)?;
 
         let encrypted = cipher
-            .encrypt(&nonce, plaintext.as_ref())
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| KmsError::cryptographic_error("AES-256-GCM encrypt", e.to_string()))?;
 
-        // Ciphertext format: encrypted_dek || nonce
-        let mut ciphertext = encrypted;
-        ciphertext.extend_from_slice(&nonce_bytes);
+        let envelope = DataKeyEnvelope {
+            key_id: uuid::Uuid::new_v4().to_string(),
+            master_key_id: request.master_key_id.clone(),
+            key_spec: request.key_spec.clone(),
+            encrypted_key: encrypted,
+            nonce: nonce_bytes.to_vec(),
+            encryption_context: request.encryption_context.clone(),
+            created_at: Zoned::now(),
+        };
+        let ciphertext = serde_json::to_vec(&envelope)?;
 
         Ok(DataKeyInfo::new(
             self.key_id.clone(),
-            0, // version is always 0 for static KMS
+            0,
             Some(plaintext.to_vec()),
             ciphertext,
-            "AES_256".to_string(),
+            request.key_spec.clone(),
         ))
     }
 
@@ -141,14 +161,28 @@ impl KmsClient for StaticKmsBackend {
         let key = Key::<Aes256Gcm>::from(*self.key);
         let cipher = Aes256Gcm::new(&key);
         let nonce = Nonce::from(nonce_bytes);
+        let aad = context_aad(&request.encryption_context)?;
 
         let encrypted = cipher
-            .encrypt(&nonce, request.plaintext.as_ref())
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: request.plaintext.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| KmsError::cryptographic_error("AES-256-GCM encrypt", e.to_string()))?;
 
-        // Ciphertext format: encrypted_data || nonce
-        let mut ciphertext = encrypted;
-        ciphertext.extend_from_slice(&nonce_bytes);
+        let envelope = DataKeyEnvelope {
+            key_id: uuid::Uuid::new_v4().to_string(),
+            master_key_id: request.key_id.clone(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: encrypted,
+            nonce: nonce_bytes.to_vec(),
+            encryption_context: request.encryption_context.clone(),
+            created_at: Zoned::now(),
+        };
+        let ciphertext = serde_json::to_vec(&envelope)?;
 
         Ok(EncryptResponse {
             ciphertext,
@@ -159,21 +193,39 @@ impl KmsClient for StaticKmsBackend {
     }
 
     async fn decrypt(&self, request: &DecryptRequest, _context: Option<&OperationContext>) -> Result<Vec<u8>> {
-        if request.ciphertext.len() < NONCE_SIZE + 1 {
-            return Err(KmsError::cryptographic_error("decrypt", "Ciphertext too short for static KMS format"));
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
+            .map_err(|error| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {error}")))?;
+        if envelope.master_key_id != self.key_id {
+            return Err(KmsError::key_not_found(&envelope.master_key_id));
         }
 
-        // Split ciphertext: encrypted_data || nonce(12)
-        let split_at = request.ciphertext.len() - NONCE_SIZE;
-        let encrypted = &request.ciphertext[..split_at];
-        let nonce_slice = &request.ciphertext[split_at..];
+        for (key, expected_value) in &envelope.encryption_context {
+            match request.encryption_context.get(key) {
+                Some(actual_value) if actual_value == expected_value => {}
+                Some(actual_value) => {
+                    return Err(KmsError::context_mismatch(format!(
+                        "Context mismatch for key '{key}': expected '{expected_value}', got '{actual_value}'"
+                    )));
+                }
+                None if request.encryption_context.is_empty() => {}
+                None => return Err(KmsError::context_mismatch(format!("Missing context key '{key}'"))),
+            }
+        }
 
         let key = Key::<Aes256Gcm>::from(*self.key);
         let cipher = Aes256Gcm::new(&key);
-        let nonce = Nonce::try_from(nonce_slice).map_err(|_| KmsError::cryptographic_error("nonce", "invalid nonce length"))?;
+        let nonce = Nonce::try_from(envelope.nonce.as_slice())
+            .map_err(|_| KmsError::cryptographic_error("nonce", "invalid nonce length"))?;
+        let aad = context_aad(&envelope.encryption_context)?;
 
         let plaintext = cipher
-            .decrypt(&nonce, encrypted)
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: envelope.encrypted_key.as_ref(),
+                    aad: &aad,
+                },
+            )
             .map_err(|e| KmsError::cryptographic_error("AES-256-GCM decrypt", e.to_string()))?;
 
         Ok(plaintext)
@@ -317,7 +369,13 @@ impl KmsBackend for StaticKmsBackend {
     }
 
     async fn generate_data_key(&self, request: GenerateDataKeyRequest) -> Result<GenerateDataKeyResponse> {
-        let gen_req = GenerateKeyRequest::new(request.key_id.clone(), request.key_spec.as_str().to_string());
+        let gen_req = GenerateKeyRequest {
+            master_key_id: request.key_id.clone(),
+            key_spec: request.key_spec.as_str().to_string(),
+            key_length: None,
+            encryption_context: request.encryption_context,
+            grant_tokens: Vec::new(),
+        };
         let data_key = <Self as KmsClient>::generate_data_key(self, &gen_req, None).await?;
 
         let plaintext_key = data_key
@@ -378,8 +436,9 @@ impl KmsBackend for StaticKmsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::KmsClient;
+    use crate::backends::{KmsBackend as KmsBackendTrait, KmsClient};
     use crate::config::{BackendConfig, KmsBackend, StaticConfig};
+    use crate::encryption::is_data_key_envelope;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -430,8 +489,12 @@ mod tests {
         assert_eq!(data_key.version, 0);
         assert!(data_key.plaintext.is_some());
         assert_eq!(data_key.plaintext.as_ref().expect("plaintext should be set").len(), 32);
-        // Ciphertext should be: encrypted(32) + tag(16) + nonce(12)
-        assert_eq!(data_key.ciphertext.len(), 32 + 16 + NONCE_SIZE);
+        let envelope: DataKeyEnvelope =
+            serde_json::from_slice(&data_key.ciphertext).expect("static data key should use a KMS envelope");
+        assert_eq!(envelope.master_key_id, key_id);
+        assert_eq!(envelope.encrypted_key.len(), 32 + 16);
+        assert_eq!(envelope.nonce.len(), NONCE_SIZE);
+        assert_eq!(envelope.encryption_context.get("bucket").map(String::as_str), Some("test-bucket"));
 
         // Decrypt the data key
         let decrypt_request =
@@ -441,6 +504,75 @@ mod tests {
             .expect("Failed to decrypt");
 
         assert_eq!(decrypted.as_slice(), data_key.plaintext.as_deref().expect("plaintext should exist"));
+    }
+
+    #[tokio::test]
+    async fn generated_data_key_uses_kms_envelope_for_sse_read_routing() {
+        let (backend, key_id, _key) = create_test_backend().await;
+        let request = GenerateKeyRequest::new(key_id, "AES_256".to_string())
+            .with_context("bucket".to_string(), "source-bucket".to_string())
+            .with_context("object".to_string(), "source-object".to_string());
+
+        let data_key = KmsClient::generate_data_key(&backend, &request, None)
+            .await
+            .expect("generate static KMS data key");
+
+        assert!(
+            is_data_key_envelope(&data_key.ciphertext),
+            "static KMS ciphertext must use the KMS envelope recognized by the SSE read path"
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_data_key_rejects_a_different_encryption_context() {
+        let (backend, key_id, _key) = create_test_backend().await;
+        let generate_request = GenerateDataKeyRequest {
+            key_id,
+            key_spec: KeySpec::Aes256,
+            encryption_context: HashMap::from([
+                ("bucket".to_string(), "source-bucket".to_string()),
+                ("object".to_string(), "source-object".to_string()),
+            ]),
+        };
+        let generated = KmsBackendTrait::generate_data_key(&backend, generate_request)
+            .await
+            .expect("generate context-bound static KMS data key");
+        let decrypt_request = DecryptRequest {
+            ciphertext: generated.ciphertext_blob,
+            encryption_context: HashMap::from([
+                ("bucket".to_string(), "different-bucket".to_string()),
+                ("object".to_string(), "different-object".to_string()),
+            ]),
+            grant_tokens: Vec::new(),
+        };
+
+        let error = KmsBackendTrait::decrypt(&backend, decrypt_request)
+            .await
+            .expect_err("a static KMS data key must not decrypt under a different object context");
+
+        assert!(matches!(error, KmsError::ContextMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn generated_data_key_rejects_tampered_envelope_context() {
+        let (backend, key_id, _key) = create_test_backend().await;
+        let request = GenerateKeyRequest::new(key_id, "AES_256".to_string())
+            .with_context("bucket".to_string(), "source-bucket".to_string());
+        let generated = KmsClient::generate_data_key(&backend, &request, None)
+            .await
+            .expect("generate context-bound data key");
+        let mut envelope: DataKeyEnvelope = serde_json::from_slice(&generated.ciphertext).expect("parse static KMS envelope");
+        envelope
+            .encryption_context
+            .insert("bucket".to_string(), "different-bucket".to_string());
+        let decrypt_request = DecryptRequest::new(serde_json::to_vec(&envelope).expect("serialize tampered envelope"))
+            .with_context("bucket".to_string(), "different-bucket".to_string());
+
+        let error = KmsClient::decrypt(&backend, &decrypt_request, None)
+            .await
+            .expect_err("tampering with authenticated envelope context must fail");
+
+        assert!(matches!(error, KmsError::CryptographicError { .. }));
     }
 
     #[tokio::test]

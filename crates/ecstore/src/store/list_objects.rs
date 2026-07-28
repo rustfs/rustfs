@@ -6696,7 +6696,7 @@ mod test {
     use crate::object_api::ObjectInfo;
     use rustfs_filemeta::{
         FileInfo, FileMeta, FileMetaVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetaDeleteMarker,
-        VersionType,
+        ObjectPartInfo, VersionType,
     };
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
@@ -6899,6 +6899,12 @@ mod test {
         fi.volume = "bucket".to_owned();
         fi.name = "object".to_owned();
         fi.size = 1;
+        fi.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        }];
         fi.fresh = true;
         fi.erasure.index = 1;
         fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
@@ -6954,6 +6960,12 @@ mod test {
             fi.version_id = Some(Uuid::from_u128(version_idx));
             fi.versioned = true;
             fi.size = 1;
+            fi.parts = vec![ObjectPartInfo {
+                number: 1,
+                size: 1,
+                actual_size: 1,
+                ..Default::default()
+            }];
             fi.mod_time = Some(*mod_time);
             fi.metadata = metadata;
 

@@ -40,6 +40,9 @@ allow-git = [
     # SigV4 payload-checksum fix until it is available in a crates.io release.
     # owner: marshawcoco  review: 2026-10
     "https://github.com/s3s-project/s3s.git",
+    # Presigned URL expiry validation pending upstream submission.
+    # owner: cxymds  review: 2026-10
+    "https://github.com/cxymds/s3s.git",
     "https://github.com/apache/datafusion.git",
 ]
 
