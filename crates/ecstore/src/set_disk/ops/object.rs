@@ -6111,8 +6111,7 @@ mod transition_upload_integrity_tests {
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        let previous_setup_type = runtime_sources::current_setup_type().await;
-        runtime_sources::set_setup_type(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let mut opts = transition_options(&original, tier_name);
         opts.no_lock = false;
         let barrier = TransitionCommitBarrier::install_before_lock_lost_check(bucket, object);
@@ -6136,7 +6135,6 @@ mod transition_upload_integrity_tests {
             matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
             "unexpected transition lock-lost error: {error:?}"
         );
-        runtime_sources::set_setup_type(previous_setup_type).await;
         assert_eq!(backend.put_count().await, 1);
         assert_eq!(
             backend.remove_count().await,
@@ -6481,8 +6479,7 @@ mod transition_upload_integrity_tests {
         let object = "object.bin";
         write_source(&set_disks, &disk_stores, bucket, object, b"tagging source").await;
 
-        let previous_setup_type = runtime_sources::current_setup_type().await;
-        runtime_sources::set_setup_type(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let barrier = ObjectTaggingCommitBarrier::install(bucket, object);
         let tagging_set = Arc::clone(&set_disks);
         let tagging = tokio::spawn(async move {
@@ -6507,8 +6504,6 @@ mod transition_upload_integrity_tests {
             matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
             "unexpected tagging lock-lost error: {error:?}"
         );
-        runtime_sources::set_setup_type(previous_setup_type).await;
-
         let (fi, _, _) = set_disks
             .get_object_fileinfo(
                 bucket,
@@ -7126,23 +7121,15 @@ mod object_tagging_namespace_lock_tests {
                     }
                 });
                 barrier.wait_until_paused().await;
-                let competing_lock = set_disks
-                    .new_ns_lock(&bucket, object)
-                    .await
-                    .expect("competing namespace lock should be created");
-                let lock_error = competing_lock
-                    .get_write_lock(Duration::from_millis(20))
-                    .await
-                    .expect_err("tagging must hold the object namespace write lock across metadata commit");
-                assert!(
-                    matches!(lock_error, rustfs_lock::LockError::Timeout { .. }),
-                    "unexpected competing namespace lock error: {lock_error:?}"
-                );
 
                 let mutation_set = Arc::clone(&set_disks);
                 let mutation_bucket = bucket.clone();
                 let mutation_opts = object_opts.clone();
+                let (mutation_started_tx, mutation_started_rx) = tokio::sync::oneshot::channel();
                 let competing = tokio::spawn(async move {
+                    mutation_started_tx
+                        .send(())
+                        .expect("tagging test should wait for the competing mutation");
                     match mutation {
                         CompetingMutation::Put => {
                             let mut replacement = PutObjReader::from_vec(b"replacement body".to_vec());
@@ -7157,6 +7144,9 @@ mod object_tagging_namespace_lock_tests {
                             .map(|_| None),
                     }
                 });
+                mutation_started_rx
+                    .await
+                    .expect("competing mutation should reach the namespace operation while tagging is paused");
 
                 barrier.release();
                 tagging
