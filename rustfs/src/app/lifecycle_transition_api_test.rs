@@ -313,6 +313,7 @@ async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str,
 
 async fn wait_for_restore_completion(
     ecstore: &Arc<ECStore>,
+    backend: &MockWarmBackend,
     bucket: &str,
     object: &str,
     timeout: Duration,
@@ -322,8 +323,10 @@ async fn wait_for_restore_completion(
 
     loop {
         if tokio::time::Instant::now() >= deadline {
+            let tier_gets = backend.get_count().await;
+            let op_log = backend.op_log().await;
             return Err(format!(
-                "restore copy-back should complete within {timeout:?}; last observed state: {}",
+                "restore copy-back should complete within {timeout:?}; tier_gets={tier_gets}, op_log={op_log:?}; last observed state: {}",
                 last_state.unwrap_or_else(|| "no object info observed".to_string())
             ));
         }
@@ -2063,10 +2066,10 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
 
 /// backlog#1148 ilm-8: the RestoreObject API surface on a transitioned object.
 ///
-/// POST restore(days=1) is accepted and immediately flips the object to
-/// `x-amz-restore: ongoing-request="true"` (the mock tier's injected GET
-/// latency keeps the background copy-back in flight); a second POST during
-/// that window is rejected with 409 `RestoreAlreadyInProgress`; once the
+/// POST restore(days=1) is accepted and flips the object to
+/// `x-amz-restore: ongoing-request="true"` while the mock tier GET barrier
+/// proves the background copy-back has reached the remote read; a second POST
+/// during that window is rejected with 409 `RestoreAlreadyInProgress`; once the
 /// copy-back completes the object reports `ongoing-request="false"` with a
 /// future expiry-date; and a full GET is then served from the local restored
 /// copy (the mock tier records no further `get` calls).
@@ -2107,9 +2110,7 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         .await
         .expect("object should transition before the restore API runs");
 
-    // Slow the tier GET so the background copy-back stays in flight long
-    // enough to observe the ongoing state and the conflict rejection.
-    backend.set_latency(Some(Duration::from_millis(1500))).await;
+    let get_barrier = backend.arm_get_barrier().await;
 
     let restore_request = || RestoreRequest {
         days: Some(1),
@@ -2133,15 +2134,18 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         .await
         .expect("restore request should be accepted");
 
-    // The accepted restore is immediately visible as ongoing (the metadata is
-    // written synchronously before the copy-back is spawned).
+    get_barrier.wait_until_paused().await;
+
+    // The barrier proves the detached copy-back reached the tier GET and is
+    // still paused, so the ongoing state and conflict rejection are not timing
+    // assumptions about task scheduling.
     let ongoing = ecstore
         .get_object_info(bucket.as_str(), object, &ObjectOptions::default())
         .await
         .expect("Failed to load object info during restore");
     assert!(
         ongoing.restore_ongoing,
-        "x-amz-restore must report ongoing-request=true right after the restore is accepted"
+        "x-amz-restore must report ongoing-request=true while the copy-back tier GET is paused"
     );
 
     // A second restore while one is in flight is rejected.
@@ -2154,9 +2158,11 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         "unexpected rejection for a repeated restore: {err:?}"
     );
 
+    get_barrier.release();
+
     // Completion: ongoing flips to false and a future expiry-date appears.
-    let completed = wait_for_restore_completion(&ecstore, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
-    backend.clear_faults().await;
+    let completed =
+        wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
     let completed = completed.unwrap_or_else(|err| panic!("{err}"));
 
     let now_secs = std::time::SystemTime::now()
@@ -2219,10 +2225,9 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
         .await
         .expect("object should transition before the concurrent restores run");
 
-    // Keep the winner's copy-back in flight while the loser's accept runs, so
-    // the loser cannot slip into the already-restored path after a completed
-    // copy-back.
-    backend.set_latency(Some(Duration::from_millis(1500))).await;
+    // Hold the accepted copy-back at the tier GET until both accept attempts
+    // return, so the loser cannot observe an already-restored object.
+    let get_barrier = backend.arm_get_barrier().await;
 
     let tier_gets_before_restore = backend.get_count().await;
 
@@ -2267,10 +2272,13 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
         "the losing concurrent restore must be rejected as already in progress: {rejection:?}"
     );
 
+    get_barrier.wait_until_paused().await;
+    get_barrier.release();
+
     // Let the single accepted copy-back complete, then verify the tier saw
     // exactly one restore read — a second GET means a double copy-back.
-    let completed = wait_for_restore_completion(&ecstore, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
-    backend.clear_faults().await;
+    let completed =
+        wait_for_restore_completion(&ecstore, &backend, bucket.as_str(), object, RESTORE_COPY_BACK_WAIT_TIMEOUT).await;
     completed.unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(
         backend.get_count().await - tier_gets_before_restore,
