@@ -460,8 +460,15 @@ pub(crate) async fn delete_confirmed_transition_candidate_exact_with_lease_idemp
             "confirmed versioned transition candidate requires a non-empty remote version",
         ));
     }
+    #[cfg(test)]
+    if obj_name == "remote/empty-guard-probe" {
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     delete_object_from_remote_tier_with_lease_idempotent_inner(obj_name, rv_id, lease, true, false).await
 }
+
+#[cfg(test)]
+static CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) async fn delete_confirmed_transition_candidate_exact_with_manager_and_identity(
     obj_name: &str,
@@ -555,11 +562,11 @@ mod test {
     use crate::client::signer_error::invalid_utf8_header_error;
 
     use super::{
-        ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, RemoteDeleteBreaker, RemoteTierDeleteOutcome,
-        delete_confirmed_transition_candidate_exact_with_manager_and_identity, delete_object_from_remote_tier_idempotent,
-        delete_object_from_remote_tier_idempotent_with_manager_and_identity, is_remote_tier_not_found_error,
-        is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook, should_record_remote_delete_failure,
-        transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED,
+        RemoteDeleteBreaker, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_manager_and_identity,
+        delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
+        is_remote_tier_not_found_error, is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook,
+        should_record_remote_delete_failure, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
     };
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use rustfs_filemeta::TransitionVersionState;
@@ -767,7 +774,9 @@ mod test {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
+    #[serial_test::serial]
     async fn confirmed_transition_cleanup_deletes_exact_provider_token() {
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
         let manager = crate::services::tier::tier::TierConfigMgr::new();
         let backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
         let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
@@ -795,7 +804,7 @@ mod test {
         );
 
         let err = delete_confirmed_transition_candidate_exact_with_manager_and_identity(
-            "remote/object",
+            "remote/empty-guard-probe",
             "",
             "WARM",
             identity,
@@ -805,6 +814,11 @@ mod test {
         .expect_err("confirmed versioned cleanup must reject an empty token");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(backend.remove_count().await, 1);
+        assert_eq!(
+            CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "empty remote versions must be rejected before exact cleanup dispatch"
+        );
     }
 
     #[test]
