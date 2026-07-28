@@ -199,6 +199,32 @@ mod tests {
         .expect("healthy temp shard should verify");
         assert_eq!(verified, 1);
 
+        for trailing in [vec![0xa5], vec![0xa5; 17]] {
+            let mut oversized = encoded.to_vec();
+            oversized.extend_from_slice(&trailing);
+            disk.write_all(RUSTFS_META_TMP_BUCKET, path, Bytes::from(oversized))
+                .await
+                .expect("oversized temp shard should be staged");
+            let err = verify_written_bitrot_shards(
+                &[Some(disk.clone())],
+                None,
+                BitrotSelfVerifyTarget {
+                    operation: "put_object",
+                    bucket: "bucket",
+                    object: "object",
+                    part_number: None,
+                    volume: RUSTFS_META_TMP_BUCKET,
+                    path,
+                    logical_shard_size,
+                    shard_size,
+                    write_quorum: 1,
+                },
+            )
+            .await
+            .expect_err("disk shard with trailing bytes must not be committed");
+            assert!(err.to_string().contains("trailing data"));
+        }
+
         let mut corrupt = encoded.to_vec();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0x01;
@@ -224,5 +250,41 @@ mod tests {
         .await
         .expect_err("corrupt no-parity temp shard must not be committed");
         assert!(err.to_string().contains("bitrot self-verify failed"));
+    }
+
+    #[tokio::test]
+    async fn no_parity_inline_self_verify_rejects_trailing_bytes() {
+        let (_temp_dirs, disks, _set_disks) = hermetic_set_disks_for_pool_with_default_parity(1, 0, 0).await;
+        let shard_size = 16usize;
+        let payload = b"inline bitrot payload";
+        let encoded = encode_streaming_shard(payload, shard_size).await;
+        let disks = disks.into_iter().map(Some).collect::<Vec<_>>();
+
+        for trailing in [vec![0xa5], vec![0xa5; 17]] {
+            let mut oversized = encoded.to_vec();
+            oversized.extend_from_slice(&trailing);
+            let parts = [FileInfo {
+                data: Some(Bytes::from(oversized)),
+                ..Default::default()
+            }];
+            let err = verify_written_bitrot_shards(
+                &disks,
+                Some(&parts),
+                BitrotSelfVerifyTarget {
+                    operation: "put_object",
+                    bucket: "bucket",
+                    object: "inline-object",
+                    part_number: None,
+                    volume: RUSTFS_META_TMP_BUCKET,
+                    path: "unused-for-inline",
+                    logical_shard_size: payload.len(),
+                    shard_size,
+                    write_quorum: 1,
+                },
+            )
+            .await
+            .expect_err("inline shard with trailing bytes must not be committed");
+            assert!(err.to_string().contains("trailing data"));
+        }
     }
 }

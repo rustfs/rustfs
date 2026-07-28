@@ -1289,8 +1289,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        if !opts.no_lock && object_lock_guard.is_none() {
+            object_lock_guard = Some(
+                self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
+                    .await?,
+            );
+        }
+        let upload_guard = self
+            .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)
+            .await?;
+
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
-        let (mut fi, mut files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
+        let (mut fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
         let has_layout_candidate = range_seek_rollout_enabled
             && fi
                 .data_dir
@@ -1303,22 +1313,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         &token,
                     )
                 });
-        let upload_guard = if has_layout_candidate {
-            if object_lock_guard.is_none() {
-                object_lock_guard = Some(
-                    self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
-                        .await?,
-                );
-            }
-            let guard = self
-                .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)
-                .await?;
-            (fi, files_metas) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
-            guard
-        } else {
-            None
-        };
-        let quorum_validated_layout_token = upload_guard.as_ref().and_then(|_| {
+        let quorum_validated_layout_token = if has_layout_candidate {
             fi.data_dir
                 .filter(|data_dir| !data_dir.is_nil())
                 .map(|data_dir| data_dir.to_string())
@@ -1329,7 +1324,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         token,
                     )
                 })
-        });
+        } else {
+            None
+        };
         rustfs_utils::http::metadata_compat::remove_str(
             &mut fi.metadata,
             crate::object_api::ENCRYPTED_PART_LAYOUT_CANDIDATE_SUFFIX,
@@ -1356,6 +1353,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // let disks = Self::shuffle_disks(&disks, &fi.erasure.distribution);
 
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
+        self.recover_part_transactions(&part_path, read_quorum, write_quorum)
+            .await
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
 
         let part_meta_paths = uploaded_parts
             .iter()
@@ -1713,12 +1713,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
-        if !opts.no_lock && object_lock_guard.is_none() {
-            object_lock_guard = Some(
-                self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
-                    .await?,
-            );
-        }
         // Phase 2 (backlog#899): fence the commit on lock loss before any destructive
         // step. If the refresh heartbeat has observed a refresh-quorum loss, another
         // writer may have re-acquired this object's lock; proceeding would race a
@@ -2181,6 +2175,201 @@ mod tests {
                 ..Default::default()
             }],
         )
+    }
+
+    async fn assert_quorum_minus_one_retry_preserves_completable_part(
+        disk_count: usize,
+        parity: usize,
+        success_indices: &[usize],
+    ) {
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(disk_count, 0, parity).await;
+        let bucket = format!("multipart-retry-{disk_count}-{}", success_indices[0]);
+        let object = "object";
+        make_bucket_on_all(&disk_stores, &bucket).await;
+
+        let payload = vec![0x41; 1 << 20];
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, &bucket, object, &payload, &ObjectOptions::default()).await;
+        let (upload_meta, _) = set_disks
+            .check_upload_id_exists(&bucket, object, &upload_id, false)
+            .await
+            .expect("staged upload metadata should be readable");
+        let upload_path = SetDisks::get_upload_id_dir(&bucket, object, &upload_id);
+        let write_quorum = upload_meta.write_quorum(set_disks.default_write_quorum());
+        assert_eq!(success_indices.len() + 1, write_quorum);
+        let part_path = format!(
+            "{}/{}/part.1",
+            upload_path,
+            upload_meta.data_dir.expect("multipart upload should have a data directory")
+        );
+        let acknowledged_meta = disk_stores[0]
+            .read_all(RUSTFS_META_MULTIPART_BUCKET, &format!("{part_path}.meta"))
+            .await
+            .expect("acknowledged part metadata should be readable");
+        let retry_path = format!("{}/part.1", Uuid::new_v4());
+
+        let mut retry_disks = vec![None; disk_stores.len()];
+        for &index in success_indices {
+            disk_stores[index]
+                .write_all(RUSTFS_META_TMP_BUCKET, &retry_path, Bytes::from_static(b"retry shard"))
+                .await
+                .expect("retry shard should be staged");
+            retry_disks[index] = Some(disk_stores[index].clone());
+        }
+
+        let err = set_disks
+            .rename_part(
+                &retry_disks,
+                RUSTFS_META_TMP_BUCKET,
+                &retry_path,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &part_path,
+                acknowledged_meta,
+                write_quorum,
+                None,
+            )
+            .await
+            .expect_err("quorum-minus-one renamed shards must remain below write quorum");
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
+
+        for (index, disk) in disk_stores.iter().enumerate() {
+            assert!(
+                disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &part_path).await.is_ok(),
+                "old acknowledged shard on disk {index} must survive"
+            );
+        }
+
+        set_disks
+            .clone()
+            .complete_multipart_upload(&bucket, object, &upload_id, parts, &ObjectOptions::default())
+            .await
+            .expect("the old acknowledged part should remain completable");
+        let mut reader = set_disks
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed object should be readable");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("completed object should stream fully");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn upload_part_retry_quorum_failure_preserves_old_part_across_ec_geometries() {
+        assert_quorum_minus_one_retry_preserves_completable_part(4, 2, &[0, 1]).await;
+        assert_quorum_minus_one_retry_preserves_completable_part(4, 2, &[2, 3]).await;
+        assert_quorum_minus_one_retry_preserves_completable_part(6, 2, &[0, 1, 2]).await;
+        assert_quorum_minus_one_retry_preserves_completable_part(6, 2, &[3, 4, 5]).await;
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_recovers_interrupted_part_retry() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(6, 0, 2).await;
+        let bucket = "multipart-retry-recovery";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let payload = vec![0x42; 1 << 20];
+        let (upload_id, parts) =
+            stage_upload_with_create_opts(&set_disks, bucket, object, &payload, &ObjectOptions::default()).await;
+        let (upload_meta, _) = set_disks
+            .check_upload_id_exists(bucket, object, &upload_id, false)
+            .await
+            .expect("staged upload metadata should be readable");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        let part_path = format!(
+            "{}/{}/part.1",
+            upload_path,
+            upload_meta.data_dir.expect("multipart upload should have a data directory")
+        );
+        let retry_meta = Bytes::from_static(b"interrupted retry metadata");
+
+        for (index, disk) in disk_stores.iter().enumerate().take(3) {
+            let retry_path = format!("{}/part.1", Uuid::new_v4());
+            disk.write_all(RUSTFS_META_TMP_BUCKET, &retry_path, Bytes::from_static(b"interrupted retry shard"))
+                .await
+                .expect("retry shard should be staged");
+            disk.prepare_part_transaction(
+                RUSTFS_META_TMP_BUCKET,
+                &retry_path,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &part_path,
+                retry_meta.clone(),
+            )
+            .await
+            .expect("part transaction should be prepared");
+            disk.rename_part(
+                RUSTFS_META_TMP_BUCKET,
+                &retry_path,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &part_path,
+                retry_meta.clone(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("retry shard {index} should be published: {err}"));
+        }
+
+        set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload_id, parts, &ObjectOptions::default())
+            .await
+            .expect("completion should roll back the interrupted quorum-minus-one retry");
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed object should be readable");
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("completed object should stream fully");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn rename_part_quorum_failure_without_old_part_removes_new_shards() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(4, 0, 2).await;
+        let src_path = format!("{}/part.1", Uuid::new_v4());
+        let dst_path = format!("{}/part.1", Uuid::new_v4());
+
+        let mut retry_disks = vec![None; disk_stores.len()];
+        for index in [0, 1] {
+            disk_stores[index]
+                .write_all(RUSTFS_META_TMP_BUCKET, &src_path, Bytes::from_static(b"new shard"))
+                .await
+                .expect("new shard should be staged");
+            retry_disks[index] = Some(disk_stores[index].clone());
+        }
+
+        let err = set_disks
+            .rename_part(
+                &retry_disks,
+                RUSTFS_META_TMP_BUCKET,
+                &src_path,
+                RUSTFS_META_MULTIPART_BUCKET,
+                &dst_path,
+                Bytes::from_static(b"retry metadata"),
+                3,
+                None,
+            )
+            .await
+            .expect_err("two renamed shards must remain below write quorum");
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
+        for (index, disk) in disk_stores.iter().enumerate() {
+            assert!(
+                matches!(disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &dst_path).await, Err(DiskError::FileNotFound)),
+                "failed first upload must not leave a destination on disk {index}"
+            );
+        }
     }
 
     async fn make_multipart_lock_test_set_disks() -> Arc<SetDisks> {

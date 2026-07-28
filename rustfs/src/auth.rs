@@ -452,7 +452,7 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InvalidRequest, "invalid token2"));
     }
 
-    if !cred.is_service_account() && cred.is_temp() && token != cred.session_token {
+    if !cred.is_service_account() && cred.is_temp() && !constant_time_eq(token, &cred.session_token) {
         return Err(s3_error!(InvalidRequest, "invalid token3"));
     }
 
@@ -1801,9 +1801,10 @@ mod tests {
     #[test]
     fn test_constant_time_eq() {
         assert!(constant_time_eq("test", "test"));
-        assert!(!constant_time_eq("test", "Test"));
-        assert!(!constant_time_eq("test", "test1"));
-        assert!(!constant_time_eq("test1", "test"));
+        assert!(!constant_time_eq("Test", "test"), "first-byte mismatch must fail");
+        assert!(!constant_time_eq("tesu", "test"), "last-byte mismatch must fail");
+        assert!(!constant_time_eq("test", "test1"), "longer candidate must fail");
+        assert!(!constant_time_eq("test1", "test"), "shorter candidate must fail");
         assert!(!constant_time_eq("", "test"));
         assert!(constant_time_eq("", ""));
 
@@ -1813,6 +1814,18 @@ mod tests {
         let key3 = "AKIAIOSFODNN7EXAMPLF";
         assert!(constant_time_eq(key1, key2));
         assert!(!constant_time_eq(key1, key3));
+    }
+
+    #[test]
+    fn session_token_comparison_uses_constant_time_helper() {
+        let source = include_str!("auth.rs");
+        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        let ordinary_comparison = ["token ", "!=", " cred.session_token"].concat();
+        assert!(
+            !production.contains(&ordinary_comparison),
+            "temporary session tokens must not use ordinary string comparison"
+        );
+        assert!(production.contains("!constant_time_eq(token, &cred.session_token)"));
     }
 
     #[test]
