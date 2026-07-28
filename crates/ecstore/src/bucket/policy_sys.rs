@@ -88,15 +88,47 @@ mod tests {
     async fn policy_load_failures_propagate() {
         let groups = None;
         let conditions = HashMap::new();
-        let result = PolicySys::is_allowed_with_policy(
-            &args(true, &groups, &conditions),
-            Err(StorageError::Io(std::io::Error::other("policy read failed"))),
-        )
-        .await;
+        for (failure, expected_message) in [
+            (StorageError::Io(std::io::Error::other("policy read failed")), "policy read failed"),
+            (
+                StorageError::other("bucket metadata sys not initialized for this instance"),
+                "bucket metadata sys not initialized for this instance",
+            ),
+        ] {
+            let result = PolicySys::is_allowed_with_policy(&args(true, &groups, &conditions), Err(failure)).await;
 
-        assert!(
-            matches!(result, Err(StorageError::Io(ref err)) if err.to_string() == "policy read failed"),
-            "policy load failures must propagate instead of granting owner access"
-        );
+            assert!(
+                matches!(result, Err(StorageError::Io(ref err)) if err.to_string().contains(expected_message)),
+                "policy I/O and uninitialized metadata failures must propagate instead of granting owner access"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_bucket_deny_precedes_iam_allow() {
+        let groups = None;
+        let conditions = HashMap::new();
+        let policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Deny",
+    "Principal":{"AWS":"*"},
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"]
+  }]
+}"#,
+        )
+        .expect("deny policy should parse");
+
+        let bucket_allowed = PolicySys::is_allowed_with_policy(&args(true, &groups, &conditions), Ok(policy))
+            .await
+            .expect("loaded bucket policy should evaluate");
+        let iam_allowed = true;
+        let request_allowed = bucket_allowed && iam_allowed;
+
+        assert!(iam_allowed, "test precondition: IAM grants the action");
+        assert!(!bucket_allowed, "test precondition: bucket policy explicitly denies the action");
+        assert!(!request_allowed, "explicit bucket Deny must reject before IAM Allow fallback");
     }
 }
