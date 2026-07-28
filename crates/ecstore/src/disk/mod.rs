@@ -38,6 +38,16 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const HEALING_MARKER_PATH: &str = "healing.bin";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
+pub const PART_TRANSACTION_NEW_META: &str = "new.meta";
+pub const PART_TRANSACTION_OLD_META: &str = "old.meta";
+pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";
+
+pub fn part_transaction_path(part_path: &str) -> String {
+    match part_path.rsplit_once('/') {
+        Some((parent, name)) => format!("{parent}/.{name}.rustfs-txn"),
+        None => format!(".{part_path}.rustfs-txn"),
+    }
+}
 
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
@@ -61,6 +71,12 @@ pub type DiskStore = Arc<Disk>;
 
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PartTransactionAction {
+    Commit,
+    Rollback,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MmapCopyStageMetrics {
@@ -381,6 +397,35 @@ impl DiskAPI for Disk {
         }
     }
 
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: Bytes,
+    ) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
+                    .await
+            }
+        }
+    }
+
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.settle_part_transaction(volume, path, action).await,
+            Disk::Remote(remote_disk) => remote_disk.settle_part_transaction(volume, path, action).await,
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         match self {
@@ -659,6 +704,19 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
+    async fn prepare_part_transaction(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _dst_volume: &str,
+        _dst_path: &str,
+        _meta: Bytes,
+    ) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn settle_part_transaction(&self, _volume: &str, _path: &str, _action: PartTransactionAction) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
     // VerifyFile
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;

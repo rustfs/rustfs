@@ -21,7 +21,11 @@
 
 use crate::swift::errors::SwiftError;
 use hmac::{Hmac, KeyInit, Mac};
+use ipnetwork::IpNetwork;
+use percent_encoding::percent_decode_str;
 use sha1::Sha1;
+use std::net::IpAddr;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha1 = Hmac<Sha1>;
@@ -50,12 +54,12 @@ impl TempURLParams {
         let mut ip_range = None;
 
         for param in query.split('&') {
-            let parts: Vec<&str> = param.split('=').collect();
-            if parts.len() == 2 {
-                match parts[0] {
-                    "temp_url_sig" => sig = Some(parts[1].to_string()),
-                    "temp_url_expires" => expires = parts[1].parse().ok(),
-                    "temp_url_ip_range" => ip_range = Some(parts[1].to_string()),
+            if let Some((name, value)) = param.split_once('=') {
+                let value = percent_decode_str(value).decode_utf8().ok()?;
+                match name {
+                    "temp_url_sig" => sig = Some(value.into_owned()),
+                    "temp_url_expires" => expires = value.parse().ok(),
+                    "temp_url_ip_range" => ip_range = Some(value.into_owned()),
                     _ => {}
                 }
             }
@@ -97,9 +101,22 @@ impl TempURL {
     /// # Returns
     /// Hex-encoded HMAC-SHA1 signature
     pub fn generate_signature(&self, method: &str, expires: u64, path: &str) -> Result<String, SwiftError> {
+        self.generate_signature_with_ip_range(method, expires, path, None)
+    }
+
+    /// Generate a TempURL signature, optionally binding it to an IP range.
+    pub fn generate_signature_with_ip_range(
+        &self,
+        method: &str,
+        expires: u64,
+        path: &str,
+        ip_range: Option<&str>,
+    ) -> Result<String, SwiftError> {
         // Construct message for HMAC
-        // Format: "{METHOD}\n{expires}\n{path}"
-        let message = format!("{}\n{}\n{}", method.to_uppercase(), expires, path);
+        let message = match ip_range {
+            Some(ip_range) => format!("ip={}\n{}\n{}\n{}", ip_range, method.to_uppercase(), expires, path),
+            None => format!("{}\n{}\n{}", method.to_uppercase(), expires, path),
+        };
 
         // Calculate HMAC-SHA1
         let mut mac = HmacSha1::new_from_slice(self.key.as_bytes())
@@ -127,7 +144,13 @@ impl TempURL {
     /// # Returns
     /// - `Ok(())` if signature is valid and not expired
     /// - `Err(SwiftError::Unauthorized)` if invalid or expired
-    pub fn validate_request(&self, method: &str, path: &str, params: &TempURLParams) -> Result<(), SwiftError> {
+    pub fn validate_request(
+        &self,
+        method: &str,
+        path: &str,
+        params: &TempURLParams,
+        client_ip: Option<IpAddr>,
+    ) -> Result<(), SwiftError> {
         // 1. Check expiration first (fast path for expired URLs)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -139,17 +162,25 @@ impl TempURL {
         }
 
         // 2. Generate expected signature
-        let expected_sig = self.generate_signature(method, params.temp_url_expires, path)?;
+        let expected_sig =
+            self.generate_signature_with_ip_range(method, params.temp_url_expires, path, params.temp_url_ip_range.as_deref())?;
 
         // 3. Constant-time comparison to prevent timing attacks
         if !constant_time_compare(params.temp_url_sig.as_bytes(), expected_sig.as_bytes()) {
             return Err(SwiftError::Unauthorized("Invalid TempURL signature".to_string()));
         }
 
-        // 4. TODO: Validate IP range if specified (future enhancement)
-        // if let Some(ip_range) = &params.temp_url_ip_range {
-        //     validate_ip_range(client_ip, ip_range)?;
-        // }
+        if let Some(ip_range) = &params.temp_url_ip_range {
+            let client_ip =
+                client_ip.ok_or_else(|| SwiftError::Unauthorized("Trusted client address unavailable".to_string()))?;
+            let allowed = IpAddr::from_str(ip_range)
+                .map(|ip| ip == client_ip)
+                .or_else(|_| IpNetwork::from_str(ip_range).map(|network| network.contains(client_ip)))
+                .map_err(|_| SwiftError::Unauthorized("Invalid TempURL IP range".to_string()))?;
+            if !allowed {
+                return Err(SwiftError::Unauthorized("Client address is outside the TempURL IP range".to_string()));
+            }
+        }
 
         Ok(())
     }
@@ -308,7 +339,7 @@ mod tests {
         // Should validate successfully
         assert!(
             tempurl
-                .validate_request("GET", "/v1/AUTH_test/container/object", &params)
+                .validate_request("GET", "/v1/AUTH_test/container/object", &params, None)
                 .is_ok()
         );
     }
@@ -331,7 +362,7 @@ mod tests {
         };
 
         // Should reject expired URL
-        let result = tempurl.validate_request("GET", "/v1/AUTH_test/container/object", &params);
+        let result = tempurl.validate_request("GET", "/v1/AUTH_test/container/object", &params, None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), SwiftError::Unauthorized(_)));
     }
@@ -349,7 +380,7 @@ mod tests {
         };
 
         // Should reject invalid signature
-        let result = tempurl.validate_request("GET", "/v1/AUTH_test/container/object", &params);
+        let result = tempurl.validate_request("GET", "/v1/AUTH_test/container/object", &params, None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), SwiftError::Unauthorized(_)));
     }
@@ -372,7 +403,7 @@ mod tests {
         };
 
         // Try to validate with PUT method
-        let result = tempurl.validate_request("PUT", "/v1/AUTH_test/container/object", &params);
+        let result = tempurl.validate_request("PUT", "/v1/AUTH_test/container/object", &params, None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), SwiftError::Unauthorized(_)));
     }
@@ -421,6 +452,14 @@ mod tests {
         assert_eq!(params.temp_url_sig, "abc123");
         assert_eq!(params.temp_url_expires, 1609459200);
         assert_eq!(params.temp_url_ip_range.as_deref(), Some("192.168.1.0/24"));
+    }
+
+    #[test]
+    fn test_parse_percent_encoded_ipv6_range() {
+        let query = "temp_url_sig=abc123&temp_url_expires=1609459200&temp_url_ip_range=2001%3Adb8%3A%3A%2F32";
+        let params = TempURLParams::from_query(query).expect("encoded IPv6 TempURL parameters");
+
+        assert_eq!(params.temp_url_ip_range.as_deref(), Some("2001:db8::/32"));
     }
 
     #[test]
@@ -474,5 +513,104 @@ mod tests {
             .generate_signature("GET", 1440619048, "/v1/AUTH_account/container/object")
             .unwrap();
         assert_eq!(sig, sig2);
+    }
+
+    #[test]
+    fn ip_bound_signature_matches_openstack_message_format() {
+        let tempurl = TempURL::new("mykey".to_string());
+        let signature = tempurl
+            .generate_signature_with_ip_range("GET", 1648082711, "/v1/AUTH_account/container/object", Some("1.2.3.0/24"))
+            .expect("IP-bound signature generation");
+
+        assert_eq!(signature, "8698990d811e64cff1c8a2151340874fd5bda0c5");
+    }
+
+    fn ip_bound_params(tempurl: &TempURL, ip_range: &str) -> TempURLParams {
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_secs()
+            + 3600;
+        let signature = tempurl
+            .generate_signature_with_ip_range("GET", expires, "/v1/AUTH_test/container/object", Some(ip_range))
+            .expect("IP-bound signature generation");
+        TempURLParams {
+            temp_url_sig: signature,
+            temp_url_expires: expires,
+            temp_url_ip_range: Some(ip_range.to_string()),
+        }
+    }
+
+    #[test]
+    fn ip_bound_tempurl_accepts_ipv4_inside_range_and_rejects_outside() {
+        let tempurl = TempURL::new("mykey".to_string());
+        let params = ip_bound_params(&tempurl, "192.0.2.0/24");
+
+        assert!(
+            tempurl
+                .validate_request(
+                    "GET",
+                    "/v1/AUTH_test/container/object",
+                    &params,
+                    Some("192.0.2.42".parse().expect("IPv4 address")),
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            tempurl.validate_request(
+                "GET",
+                "/v1/AUTH_test/container/object",
+                &params,
+                Some("198.51.100.42".parse().expect("IPv4 address")),
+            ),
+            Err(SwiftError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn ip_bound_tempurl_accepts_ipv6_inside_range_and_rejects_outside() {
+        let tempurl = TempURL::new("mykey".to_string());
+        let params = ip_bound_params(&tempurl, "2001:db8::/32");
+
+        assert!(
+            tempurl
+                .validate_request(
+                    "GET",
+                    "/v1/AUTH_test/container/object",
+                    &params,
+                    Some("2001:db8::42".parse().expect("IPv6 address")),
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            tempurl.validate_request(
+                "GET",
+                "/v1/AUTH_test/container/object",
+                &params,
+                Some("2001:db9::42".parse().expect("IPv6 address")),
+            ),
+            Err(SwiftError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn ip_bound_tempurl_rejects_missing_client_ip_and_invalid_range() {
+        let tempurl = TempURL::new("mykey".to_string());
+        let params = ip_bound_params(&tempurl, "192.0.2.0/24");
+        assert!(matches!(
+            tempurl.validate_request("GET", "/v1/AUTH_test/container/object", &params, None),
+            Err(SwiftError::Unauthorized(_))
+        ));
+
+        let invalid_params = ip_bound_params(&tempurl, "not-a-network");
+        assert!(matches!(
+            tempurl.validate_request(
+                "GET",
+                "/v1/AUTH_test/container/object",
+                &invalid_params,
+                Some("192.0.2.42".parse().expect("IPv4 address")),
+            ),
+            Err(SwiftError::Unauthorized(_))
+        ));
     }
 }

@@ -233,6 +233,46 @@ pub struct RenamePartResponse {
     pub error: ::core::option::Option<Error>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PreparePartTransactionRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub src_volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub src_path: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub dst_volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub dst_path: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub meta: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PreparePartTransactionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SettlePartTransactionRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub rollback: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SettlePartTransactionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<Error>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenameFileRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
@@ -1600,6 +1640,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "CheckParts"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn prepare_part_transaction(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PreparePartTransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::PreparePartTransactionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/PreparePartTransaction");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "PreparePartTransaction"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn rename_part(
             &mut self,
             request: impl tonic::IntoRequest<super::RenamePartRequest>,
@@ -1613,6 +1668,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "RenamePart"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn settle_part_transaction(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SettlePartTransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::SettlePartTransactionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/SettlePartTransaction");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "SettlePartTransaction"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn rename_file(
@@ -2726,10 +2796,18 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::CheckPartsRequest>,
         ) -> std::result::Result<tonic::Response<super::CheckPartsResponse>, tonic::Status>;
+        async fn prepare_part_transaction(
+            &self,
+            request: tonic::Request<super::PreparePartTransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::PreparePartTransactionResponse>, tonic::Status>;
         async fn rename_part(
             &self,
             request: tonic::Request<super::RenamePartRequest>,
         ) -> std::result::Result<tonic::Response<super::RenamePartResponse>, tonic::Status>;
+        async fn settle_part_transaction(
+            &self,
+            request: tonic::Request<super::SettlePartTransactionRequest>,
+        ) -> std::result::Result<tonic::Response<super::SettlePartTransactionResponse>, tonic::Status>;
         async fn rename_file(
             &self,
             request: tonic::Request<super::RenameFileRequest>,
@@ -3432,6 +3510,34 @@ pub mod node_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/node_service.NodeService/PreparePartTransaction" => {
+                    #[allow(non_camel_case_types)]
+                    struct PreparePartTransactionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::PreparePartTransactionRequest> for PreparePartTransactionSvc<T> {
+                        type Response = super::PreparePartTransactionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::PreparePartTransactionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::prepare_part_transaction(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PreparePartTransactionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/node_service.NodeService/RenamePart" => {
                     #[allow(non_camel_case_types)]
                     struct RenamePartSvc<T: NodeService>(pub Arc<T>);
@@ -3451,6 +3557,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RenamePartSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/SettlePartTransaction" => {
+                    #[allow(non_camel_case_types)]
+                    struct SettlePartTransactionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::SettlePartTransactionRequest> for SettlePartTransactionSvc<T> {
+                        type Response = super::SettlePartTransactionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::SettlePartTransactionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::settle_part_transaction(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SettlePartTransactionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

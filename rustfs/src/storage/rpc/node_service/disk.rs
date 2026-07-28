@@ -18,7 +18,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::verify_tonic_mutation_body_digest;
+use crate::storage::storage_api::{PartTransactionAction, verify_tonic_mutation_body_digest};
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
@@ -1032,6 +1032,78 @@ impl NodeService {
             }
         } else {
             Ok(Response::new(RenamePartResponse {
+                success: false,
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
+            }))
+        }
+    }
+
+    pub(super) async fn handle_prepare_part_transaction(
+        &self,
+        request: Request<PreparePartTransactionRequest>,
+    ) -> Result<Response<PreparePartTransactionResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_prepare_part_transaction_request_body(request.get_ref()),
+            "prepare_part_transaction",
+        )?;
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            match disk
+                .prepare_part_transaction(
+                    &request.src_volume,
+                    &request.src_path,
+                    &request.dst_volume,
+                    &request.dst_path,
+                    request.meta,
+                )
+                .await
+            {
+                Ok(()) => Ok(Response::new(PreparePartTransactionResponse {
+                    success: true,
+                    error: None,
+                })),
+                Err(err) => Ok(Response::new(PreparePartTransactionResponse {
+                    success: false,
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(Response::new(PreparePartTransactionResponse {
+                success: false,
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
+            }))
+        }
+    }
+
+    pub(super) async fn handle_settle_part_transaction(
+        &self,
+        request: Request<SettlePartTransactionRequest>,
+    ) -> Result<Response<SettlePartTransactionResponse>, Status> {
+        verify_disk_mutation_digest(
+            &request,
+            rustfs_protos::canonical_settle_part_transaction_request_body(request.get_ref()),
+            "settle_part_transaction",
+        )?;
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let action = if request.rollback {
+                PartTransactionAction::Rollback
+            } else {
+                PartTransactionAction::Commit
+            };
+            match disk.settle_part_transaction(&request.volume, &request.path, action).await {
+                Ok(()) => Ok(Response::new(SettlePartTransactionResponse {
+                    success: true,
+                    error: None,
+                })),
+                Err(err) => Ok(Response::new(SettlePartTransactionResponse {
+                    success: false,
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(Response::new(SettlePartTransactionResponse {
                 success: false,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
