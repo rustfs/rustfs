@@ -45,15 +45,15 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
-            anchors: strings(["all healed data rename attempts failed"]),
+            anchors: strings(["heal rename incomplete"]),
             ..base(
                 "heal-rename-failed",
                 P1Unavailable,
                 "heal",
                 "heal 数据落位失败",
-                contains("all healed data rename attempts failed"),
-                "heal 数据落位(rename)全部失败。",
-                "检查盘写权限与空间。",
+                contains("heal rename incomplete"),
+                "heal 数据落位(rename)未在全部目标盘完成。",
+                "检查失败目标盘的写权限与空间,修复后重跑 heal。",
             )
         },
         Rule {

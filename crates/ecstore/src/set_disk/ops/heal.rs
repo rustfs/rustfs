@@ -19,6 +19,71 @@ use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
+const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
+
+#[cfg(test)]
+static HEAL_RENAME_FAILURES: std::sync::Mutex<Vec<(String, String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct HealRenameFailureScope {
+    bucket: String,
+    object: String,
+}
+
+#[cfg(test)]
+impl HealRenameFailureScope {
+    fn install(bucket: &str, object: &str, disk_indexes: &[usize]) -> Self {
+        let mut failures = HEAL_RENAME_FAILURES
+            .lock()
+            .expect("heal rename failure registry should not poison");
+        assert!(
+            !failures
+                .iter()
+                .any(|(registered_bucket, registered_object, _)| { registered_bucket == bucket && registered_object == object }),
+            "heal rename failures must be installed once per object"
+        );
+        failures.extend(
+            disk_indexes
+                .iter()
+                .map(|index| (bucket.to_string(), object.to_string(), *index)),
+        );
+        Self {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HealRenameFailureScope {
+    fn drop(&mut self) {
+        HEAL_RENAME_FAILURES
+            .lock()
+            .expect("heal rename failure registry should not poison")
+            .retain(|(bucket, object, _)| bucket != &self.bucket || object != &self.object);
+    }
+}
+
+#[cfg(test)]
+fn should_fail_heal_rename(bucket: &str, object: &str, disk_index: usize) -> bool {
+    let mut failures = HEAL_RENAME_FAILURES
+        .lock()
+        .expect("heal rename failure registry should not poison");
+    if let Some(position) = failures
+        .iter()
+        .position(|entry| entry == &(bucket.to_string(), object.to_string(), disk_index))
+    {
+        failures.swap_remove(position);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn should_fail_heal_rename(_bucket: &str, _object: &str, _disk_index: usize) -> bool {
+    false
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PartFailureSummary {
@@ -659,8 +724,12 @@ impl SetDisks {
                             }
                         }
                         // Rename from tmp location to the actual location.
+                        // MinIO stops on the first RenameData error. RustFS intentionally
+                        // continues per target, but reports any residue after all attempts
+                        // so successful repairs survive and failed targets remain retryable.
                         let mut rename_attempts = 0usize;
                         let mut rename_successes = 0usize;
+                        let mut healed_disks = vec![None; out_dated_disks.len()];
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
                                 rename_attempts += 1;
@@ -669,9 +738,18 @@ impl SetDisks {
                                 // Attempt a rename now from healed data to final location.
                                 parts_metadata[index].set_healing();
 
-                                let rename_result = disk
-                                    .rename_data(RUSTFS_META_TMP_BUCKET, &tmp_id, parts_metadata[index].clone(), bucket, object)
-                                    .await;
+                                let rename_result = if should_fail_heal_rename(bucket, object, index) {
+                                    Err(DiskError::Unexpected)
+                                } else {
+                                    disk.rename_data(
+                                        RUSTFS_META_TMP_BUCKET,
+                                        &tmp_id,
+                                        parts_metadata[index].clone(),
+                                        bucket,
+                                        object,
+                                    )
+                                    .await
+                                };
 
                                 if let Err(err) = &rename_result {
                                     warn!(
@@ -690,6 +768,7 @@ impl SetDisks {
                                     );
                                 } else {
                                     rename_successes += 1;
+                                    healed_disks[index] = Some(disk.clone());
                                     if parts_metadata[index].is_remote() {
                                         let rm_data_dir =
                                             parts_metadata[index].data_dir.expect("operation should succeed").to_string();
@@ -734,14 +813,17 @@ impl SetDisks {
                             .await
                             .map_err(DiskError::other)?;
 
-                        if rename_attempts > 0 && rename_successes == 0 {
+                        self.record_healed_capacity_scope(&healed_disks);
+
+                        if rename_successes < rename_attempts {
                             return Ok((
                                 result,
-                                Some(DiskError::other(format!("all healed data rename attempts failed for {bucket}/{object}"))),
+                                Some(DiskError::other(format!(
+                                    "{HEAL_RENAME_INCOMPLETE}: {rename_successes} of {rename_attempts} targets committed for \
+                                     {bucket}/{object}"
+                                ))),
                             ));
                         }
-
-                        self.record_healed_capacity_scope(&out_dated_disks);
 
                         // The object is healthy here; sweep any data dirs left behind
                         // by pre-#3510 unversioned overwrites, which the dangling paths
@@ -1312,11 +1394,13 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 #[cfg(test)]
 mod heal_result_report_tests {
     use super::SetDisks;
+    use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope};
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
-    use crate::disk::{DiskOption, DiskStore, new_disk};
+    use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, new_disk};
     use crate::object_api::{ObjectOptions, PutObjReader};
+    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::{config::storageclass, store::init_format::save_format_file};
@@ -1404,6 +1488,171 @@ mod heal_result_report_tests {
                 .expect("test storage class should resolve for one local drive"),
         );
         (dir, set)
+    }
+
+    async fn non_trash_tmp_entries(temp_dirs: &[TempDir]) -> Vec<String> {
+        let mut entries = Vec::new();
+        for dir in temp_dirs {
+            let tmp = dir.path().join(RUSTFS_META_TMP_BUCKET);
+            let mut read_dir = match tokio::fs::read_dir(&tmp).await {
+                Ok(read_dir) => read_dir,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => panic!("tmp directory should be readable: {err}"),
+            };
+            while let Some(entry) = read_dir.next_entry().await.expect("tmp entry should be readable") {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name != ".trash" {
+                    entries.push(name);
+                }
+            }
+        }
+        entries
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_rename_outcome_matrix_reports_partial_and_retries_failed_targets() {
+        for (case, failed_attempts, expect_error) in [
+            ("ok-ok", Vec::new(), false),
+            ("ok-err", vec![1], true),
+            ("err-ok", vec![0], true),
+            ("err-err", vec![0, 1], true),
+        ] {
+            let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = format!("heal-rename-{case}");
+            let object = "object.bin";
+            for disk in &disks {
+                disk.make_volume(&bucket).await.expect("bucket volume should be created");
+            }
+
+            let payload = vec![0x5a; 1024 * 1024];
+            let mut reader = PutObjReader::from_vec(payload);
+            set.put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("source object should be written");
+            let source = disks[2]
+                .read_version("", &bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("source metadata should be readable");
+            let data_dir = source.data_dir.expect("non-inline source should have a data directory");
+            let tmp_entries_before_heal = non_trash_tmp_entries(&temp_dirs).await;
+            let target_slots = {
+                let mut slots = [source.erasure.distribution[0] - 1, source.erasure.distribution[1] - 1];
+                slots.sort_unstable();
+                slots
+            };
+            let failed_slots = failed_attempts
+                .iter()
+                .map(|attempt| target_slots[*attempt])
+                .collect::<Vec<_>>();
+            let failed_physical_indexes = [0, 1]
+                .into_iter()
+                .filter(|index| failed_slots.contains(&(source.erasure.distribution[*index] - 1)))
+                .collect::<Vec<_>>();
+
+            for index in [0, 1] {
+                tokio::fs::remove_file(
+                    temp_dirs[index]
+                        .path()
+                        .join(&bucket)
+                        .join(object)
+                        .join(data_dir.to_string())
+                        .join("part.1"),
+                )
+                .await
+                .expect("target shard should be removed before heal");
+            }
+
+            let failure_scope = HealRenameFailureScope::install(&bucket, object, &failed_slots);
+            let (first_result, first_error) = set
+                .heal_object(
+                    &bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        no_lock: true,
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("heal should report its per-target rename outcome");
+            drop(failure_scope);
+
+            assert_eq!(first_error.is_some(), expect_error, "{case}: aggregate status must match target outcomes");
+            if let Some(error) = first_error {
+                let error = error.to_string();
+                assert!(
+                    error.contains(HEAL_RENAME_INCOMPLETE),
+                    "{case}: partial/all failure must have an explicit retryable status: {error}"
+                );
+                assert!(
+                    error.contains(&format!("{} of 2 targets committed", 2 - failed_slots.len())),
+                    "{case}: aggregate status must distinguish partial from all-target failure: {error}"
+                );
+            }
+            for index in [0, 1] {
+                let expected = if failed_physical_indexes.contains(&index) {
+                    DriveState::Missing
+                } else {
+                    DriveState::Ok
+                };
+                assert_eq!(
+                    first_result.after.drives[index].state,
+                    expected.to_string(),
+                    "{case}: after.drives must reflect the actual rename outcome at index {index}"
+                );
+                assert_eq!(
+                    temp_dirs[index]
+                        .path()
+                        .join(&bucket)
+                        .join(object)
+                        .join(data_dir.to_string())
+                        .join("part.1")
+                        .exists(),
+                    !failed_physical_indexes.contains(&index),
+                    "{case}: tmp cleanup must neither delete committed shards nor expose failed targets"
+                );
+            }
+            let tmp_entries_after_heal = non_trash_tmp_entries(&temp_dirs).await;
+            assert!(
+                tmp_entries_after_heal
+                    .iter()
+                    .all(|entry| tmp_entries_before_heal.contains(entry)),
+                "{case}: first heal must not leave a new temporary shard: {tmp_entries_after_heal:?}"
+            );
+
+            if !failed_slots.is_empty() {
+                let (retry_result, retry_error) = set
+                    .heal_object(
+                        &bucket,
+                        object,
+                        "",
+                        &HealOpts {
+                            no_lock: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("second heal should retry failed targets");
+                assert!(retry_error.is_none(), "{case}: second heal should complete remaining targets");
+                for index in [0, 1] {
+                    assert_eq!(
+                        retry_result.after.drives[index].state,
+                        DriveState::Ok.to_string(),
+                        "{case}: second heal must converge target {index}"
+                    );
+                }
+                let tmp_entries_after_retry = non_trash_tmp_entries(&temp_dirs).await;
+                assert!(
+                    tmp_entries_after_retry
+                        .iter()
+                        .all(|entry| tmp_entries_before_heal.contains(entry)),
+                    "{case}: retry must not leave a new temporary shard: {tmp_entries_after_retry:?}"
+                );
+            }
+        }
     }
 
     // Regression for #955: an offline disk must contribute exactly one drive
