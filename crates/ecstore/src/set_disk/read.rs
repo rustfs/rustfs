@@ -231,7 +231,10 @@ impl SetDisks {
             })
             .collect();
 
-        processor.execute_batch_with_quorum(tasks, required_reads).await
+        processor
+            .execute_batch_with_quorum(tasks, required_reads)
+            .await
+            .map_err(Into::into)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
