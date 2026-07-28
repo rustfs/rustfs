@@ -2771,7 +2771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_multipart_upload_rejects_unauthorized_request() {
+    async fn abort_multipart_upload_fails_closed_when_policy_metadata_is_unavailable() {
         let fs = FS::new();
         let mut req = build_request(
             AbortMultipartUploadInput::builder()
@@ -2787,12 +2787,12 @@ mod tests {
         let err = fs
             .abort_multipart_upload(&mut req)
             .await
-            .expect_err("missing credentials should reject access");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            .expect_err("unavailable policy metadata must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
-    async fn complete_multipart_upload_rejects_unauthorized_request() {
+    async fn complete_multipart_upload_fails_closed_when_policy_metadata_is_unavailable() {
         let fs = FS::new();
         let mut req = build_request(
             CompleteMultipartUploadInput::builder()
@@ -2809,8 +2809,8 @@ mod tests {
         let err = fs
             .complete_multipart_upload(&mut req)
             .await
-            .expect_err("missing credentials should reject access");
-        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            .expect_err("unavailable policy metadata must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
