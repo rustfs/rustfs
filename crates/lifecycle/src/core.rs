@@ -34,6 +34,7 @@ const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_EXPIRY_COMPUTED: &str = "lifecycle_expiry_computed";
 const EVENT_LIFECYCLE_DEBUG_DAY_SECS: &str = "lifecycle_debug_day_secs";
 const EVENT_LIFECYCLE_NONCURRENT_EXPIRY_SKIPPED: &str = "lifecycle_noncurrent_expiry_skipped";
+const METRIC_LIFECYCLE_INVALID_MOD_TIME_TOTAL: &str = "rustfs_lifecycle_invalid_mod_time_total";
 const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at least one rule";
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
 const _ERR_XML_NOT_WELL_FORMED: &str =
@@ -202,6 +203,21 @@ fn lifecycle_rule_prefix(rule: &LifecycleRule) -> Option<&str> {
     }
 
     filter.and.as_ref().and_then(|and| and.prefix.as_deref())
+}
+
+fn lifecycle_mod_time(obj: &ObjectOpts) -> Option<OffsetDateTime> {
+    let reason = match obj.mod_time {
+        None => "missing",
+        Some(mod_time) if mod_time < OffsetDateTime::UNIX_EPOCH => "before_unix_epoch",
+        Some(mod_time) if mod_time == OffsetDateTime::UNIX_EPOCH => "unix_epoch",
+        Some(mod_time) => return Some(mod_time),
+    };
+    metrics::counter!(
+        METRIC_LIFECYCLE_INVALID_MOD_TIME_TOTAL,
+        "reason" => reason
+    )
+    .increment(1);
+    None
 }
 
 #[async_trait::async_trait]
@@ -434,14 +450,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
     }
 
     async fn predict_expiration(&self, obj: &ObjectOpts) -> Event {
-        let mod_time = match obj.mod_time {
-            Some(time) => {
-                if time.unix_timestamp() == 0 {
-                    return Event::default();
-                }
-                time
-            }
-            None => return Event::default(),
+        let Some(mod_time) = lifecycle_mod_time(obj) else {
+            return Event::default();
         };
 
         if obj.delete_marker || !(obj.is_latest || obj.version_id.is_none_or(|v| v.is_nil())) {
@@ -495,19 +505,9 @@ impl Lifecycle for BucketLifecycleConfiguration {
             obj.name, obj.mod_time, obj.successor_mod_time, now, obj.is_latest, obj.delete_marker
         );
 
-        // Gracefully handle missing mod_time instead of panicking
-        let mod_time = match obj.mod_time {
-            Some(t) => t,
-            None => {
-                debug!("eval_inner: mod_time is None for object={}, returning default event", obj.name);
-                return Event::default();
-            }
-        };
-
-        if mod_time.unix_timestamp() == 0 {
-            debug!("eval_inner: mod_time is 0, returning default event");
+        let Some(mod_time) = lifecycle_mod_time(obj) else {
             return Event::default();
-        }
+        };
 
         if let Some(restore_expires) = obj.restore_expires
             && restore_expires.unix_timestamp() != 0
@@ -1082,6 +1082,8 @@ impl Default for TransitionOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use s3s::dto::{LifecycleRuleFilter, TransitionStorageClass};
     use serial_test::serial;
     use std::sync::Arc;
@@ -1095,6 +1097,99 @@ mod tests {
                 temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, test);
             });
         });
+    }
+
+    #[test]
+    fn eval_inner_reports_invalid_mod_time_without_expiring_object() {
+        let lifecycle = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-after-one-day".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime should build");
+
+        let actions = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let now = OffsetDateTime::from_unix_timestamp(10 * 86_400).expect("fixed timestamp should be valid");
+                let mut opts = ObjectOpts {
+                    name: "legacy-object".to_string(),
+                    is_latest: true,
+                    ..Default::default()
+                };
+                let mut actions = Vec::new();
+                for mod_time in [
+                    None,
+                    Some(OffsetDateTime::UNIX_EPOCH),
+                    Some(OffsetDateTime::UNIX_EPOCH - Duration::nanoseconds(1)),
+                    Some(OffsetDateTime::UNIX_EPOCH + Duration::nanoseconds(1)),
+                ] {
+                    opts.mod_time = mod_time;
+                    actions.push((
+                        lifecycle.eval_inner(&opts, now, 0).await.action,
+                        lifecycle.predict_expiration(&opts).await.action,
+                    ));
+                }
+                actions
+            })
+        });
+
+        assert_eq!(
+            actions,
+            [
+                (IlmAction::NoneAction, IlmAction::NoneAction),
+                (IlmAction::NoneAction, IlmAction::NoneAction),
+                (IlmAction::NoneAction, IlmAction::NoneAction),
+                (IlmAction::DeleteAction, IlmAction::DeleteAction)
+            ]
+        );
+
+        let invalid_mod_time_metrics = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(composite, _unit, _description, value)| {
+                (composite.kind() == MetricKind::Counter && composite.key().name() == METRIC_LIFECYCLE_INVALID_MOD_TIME_TOTAL)
+                    .then(|| {
+                        let reason = composite
+                            .key()
+                            .labels()
+                            .find(|label| label.key() == "reason")
+                            .map(|label| label.value().to_string())
+                            .expect("invalid mod_time metric should have a reason");
+                        (reason, value)
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_mod_time_metrics.len(), 3);
+        assert!(
+            invalid_mod_time_metrics
+                .iter()
+                .all(|(_, value)| matches!(value, DebugValue::Counter(2)))
+        );
+        assert!(invalid_mod_time_metrics.iter().any(|(reason, _)| reason == "missing"));
+        assert!(invalid_mod_time_metrics.iter().any(|(reason, _)| reason == "unix_epoch"));
+        assert!(
+            invalid_mod_time_metrics
+                .iter()
+                .any(|(reason, _)| reason == "before_unix_epoch")
+        );
     }
 
     #[tokio::test]

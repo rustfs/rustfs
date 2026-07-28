@@ -214,7 +214,16 @@ pub struct StaticConfig {
     /// Key identifier (name) for the single configured key
     pub key_id: String,
     /// Base64-encoded 32-byte AES-256 key material (zeroed on drop)
+    #[serde(skip_serializing, default)]
     pub secret_key: String,
+}
+
+impl Drop for StaticConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+
+        self.secret_key.zeroize();
+    }
 }
 
 impl fmt::Debug for StaticConfig {
@@ -1052,6 +1061,21 @@ mod tests {
         let serialized = serde_json::to_string(&config).expect("kms config should serialize for persistence");
 
         assert!(serialized.contains("persisted-token-secret"));
+    }
+
+    #[test]
+    fn static_kms_config_serialization_does_not_expose_key_material() {
+        use base64::Engine as _;
+
+        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let config = KmsConfig::static_kms("static-key".to_string(), encoded_key.clone());
+
+        let serialized = serde_json::to_string(&config).expect("static KMS config should serialize");
+
+        assert!(
+            !serialized.contains(&encoded_key),
+            "persisted static KMS configuration must not contain plaintext key material"
+        );
     }
 
     #[test]
