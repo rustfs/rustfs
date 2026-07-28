@@ -2178,11 +2178,70 @@ mod tests {
             .expect("multipart upload should complete");
     }
 
+    async fn assert_get_blocks_delete_at_part_boundary(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &'static str,
+        range: Option<HTTPRangeSpec>,
+        expected: Vec<u8>,
+    ) {
+        use crate::set_disk::read::get_part_boundary_barrier;
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt as _;
+
+        let barrier = get_part_boundary_barrier::arm(bucket, object, 0);
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, range, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("GET should return a body reader");
+        let body_complete = Arc::new(Notify::new());
+        let body_complete_task = Arc::clone(&body_complete);
+        let allow_reader_drop = Arc::new(Notify::new());
+        let allow_reader_drop_task = Arc::clone(&allow_reader_drop);
+        let expected_len = expected.len();
+        let read = tokio::spawn(async move {
+            let mut body = vec![0_u8; expected_len];
+            reader.stream.read_exact(&mut body).await?;
+            body_complete_task.notify_one();
+            allow_reader_drop_task.notified().await;
+            Ok::<_, std::io::Error>(body)
+        });
+        barrier.wait_until_paused().await;
+
+        let delete_set = Arc::clone(set_disks);
+        let delete_bucket = bucket.to_string();
+        let delete_started = Arc::new(Notify::new());
+        let delete_started_task = Arc::clone(&delete_started);
+        let mut delete = tokio::spawn(async move {
+            delete_started_task.notify_one();
+            delete_set
+                .delete_object(&delete_bucket, object, ObjectOptions::default())
+                .await
+        });
+        delete_started.notified().await;
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished(), "DELETE must wait behind the streaming GET read lock");
+
+        barrier.release();
+        body_complete.notified().await;
+        let delete_result = tokio::time::timeout(Duration::from_secs(2), &mut delete).await;
+        allow_reader_drop.notify_one();
+        delete_result
+            .expect("DELETE must acquire the lock after the exact Content-Length without waiting for reader drop")
+            .expect("DELETE task should not panic")
+            .expect("DELETE should proceed after GET delivers its exact Content-Length");
+        let body = read
+            .await
+            .expect("GET task should not panic")
+            .expect("GET stream should deliver its exact Content-Length");
+        assert_eq!(body.len(), expected.len(), "successful GET body must match the requested length");
+        assert_eq!(body, expected, "DELETE must not truncate or mix the multipart snapshot");
+    }
+
     #[tokio::test]
     #[serial]
     async fn multipart_get_keeps_delete_blocked_at_part_boundary_in_both_lock_modes() {
         use crate::set_disk::read::get_part_boundary_barrier;
-        use http::HeaderMap;
         use tokio::io::AsyncReadExt as _;
 
         for enabled in ["false", "true"] {
@@ -2201,44 +2260,20 @@ mod tests {
                     let second = vec![0x42; 64 * 1024];
                     let expected: Vec<u8> = first.iter().chain(&second).copied().collect();
                     put_two_part_object(&set_disks, &bucket, object, &first, &second).await;
+                    assert_get_blocks_delete_at_part_boundary(&set_disks, &bucket, object, None, expected).await;
 
-                    let barrier = get_part_boundary_barrier::arm(&bucket, object, 0);
-                    let mut reader = set_disks
-                        .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
-                        .await
-                        .expect("GET should return a body reader");
-                    let content_length = usize::try_from(reader.object_info.size).expect("object size should fit usize");
-                    let read = tokio::spawn(async move {
-                        let mut body = Vec::new();
-                        reader.stream.read_to_end(&mut body).await.map(|_| body)
-                    });
-                    barrier.wait_until_paused().await;
-
-                    let delete_set = Arc::clone(&set_disks);
-                    let delete_bucket = bucket.clone();
-                    let delete_started = Arc::new(Notify::new());
-                    let delete_started_task = Arc::clone(&delete_started);
-                    let delete = tokio::spawn(async move {
-                        delete_started_task.notify_one();
-                        delete_set
-                            .delete_object(&delete_bucket, object, ObjectOptions::default())
-                            .await
-                    });
-                    delete_started.notified().await;
-                    tokio::task::yield_now().await;
-                    assert!(!delete.is_finished(), "DELETE must wait behind the streaming GET read lock");
-
-                    barrier.release();
-                    let body = read
-                        .await
-                        .expect("GET task should not panic")
-                        .expect("GET stream should reach EOF");
-                    assert_eq!(body.len(), content_length, "successful GET body must match Content-Length");
-                    assert_eq!(body, expected, "DELETE must not truncate or mix the multipart snapshot");
-                    delete
-                        .await
-                        .expect("DELETE task should not panic")
-                        .expect("DELETE should proceed after GET reaches EOF");
+                    let range_object = "range-object";
+                    put_two_part_object(&set_disks, &bucket, range_object, &first, &second).await;
+                    let range_start = i64::try_from(first.len() - 4096).expect("range start should fit i64");
+                    let range_end = i64::try_from(first.len() + 4095).expect("range end should fit i64");
+                    let range = HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: range_start,
+                        end: range_end,
+                    };
+                    let range_expected = first[first.len() - 4096..].iter().chain(&second[..4096]).copied().collect();
+                    assert_get_blocks_delete_at_part_boundary(&set_disks, &bucket, range_object, Some(range), range_expected)
+                        .await;
 
                     let cancelled_object = "cancelled-object";
                     put_two_part_object(&set_disks, &bucket, cancelled_object, &first, &second).await;

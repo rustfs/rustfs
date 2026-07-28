@@ -357,6 +357,7 @@ impl Drop for ObjectLockDiagGuard {
 struct SetDiskLockGuardedReader {
     inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
     guard: Option<ObjectLockDiagGuard>,
+    remaining: Option<usize>,
 }
 
 impl AsyncRead for SetDiskLockGuardedReader {
@@ -364,8 +365,23 @@ impl AsyncRead for SetDiskLockGuardedReader {
         let had_capacity = buf.remaining() > 0;
         let filled_before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if had_capacity && matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before {
-            self.guard.take();
+        match &poll {
+            Poll::Ready(Ok(())) if buf.filled().len() > filled_before => {
+                let produced = buf.filled().len() - filled_before;
+                if let Some(remaining) = self.remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(produced);
+                    if *remaining == 0 {
+                        self.guard.take();
+                    }
+                }
+            }
+            Poll::Ready(Ok(())) if had_capacity => {
+                self.guard.take();
+            }
+            Poll::Ready(Err(_)) => {
+                self.guard.take();
+            }
+            _ => {}
         }
         poll
     }
@@ -377,15 +393,17 @@ fn finish_set_disk_read_lock(
     bucket: &str,
     object: &str,
 ) -> GetObjectReader {
-    if reader.buffered_body.is_some() {
+    if reader.buffered_body.is_some() || reader.object_info.size == 0 {
         release_materialized_read_lock(bucket, object, read_lock_guard);
         return reader;
     }
 
     if let Some(guard) = read_lock_guard {
+        let remaining = usize::try_from(reader.object_info.size).ok();
         reader.stream = Box::new(SetDiskLockGuardedReader {
             inner: reader.stream,
             guard: Some(guard),
+            remaining,
         });
     }
     reader

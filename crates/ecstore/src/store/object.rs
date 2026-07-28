@@ -89,6 +89,7 @@ impl PreparedGetObjectReader {
 struct LockGuardedReader {
     inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
     guard: Option<ObjectLockDiagGuard>,
+    remaining: Option<usize>,
 }
 
 impl AsyncRead for LockGuardedReader {
@@ -96,8 +97,23 @@ impl AsyncRead for LockGuardedReader {
         let had_capacity = buf.remaining() > 0;
         let filled_before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if had_capacity && matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before {
-            self.guard.take();
+        match &poll {
+            Poll::Ready(Ok(())) if buf.filled().len() > filled_before => {
+                let produced = buf.filled().len() - filled_before;
+                if let Some(remaining) = self.remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(produced);
+                    if *remaining == 0 {
+                        self.guard.take();
+                    }
+                }
+            }
+            Poll::Ready(Ok(())) if had_capacity => {
+                self.guard.take();
+            }
+            Poll::Ready(Err(_)) => {
+                self.guard.take();
+            }
+            _ => {}
         }
         poll
     }
@@ -641,14 +657,16 @@ impl ECStore {
     }
 
     fn attach_read_lock_guard(mut reader: GetObjectReader, guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
-        if reader.buffered_body.is_some() {
+        if reader.buffered_body.is_some() || reader.object_info.size == 0 {
             return reader;
         }
 
         if let Some(guard) = guard {
+            let remaining = usize::try_from(reader.object_info.size).ok();
             reader.stream = Box::new(LockGuardedReader {
                 inner: reader.stream,
                 guard: Some(guard),
+                remaining,
             });
         }
 
@@ -2649,8 +2667,11 @@ mod tests {
                 ObjectLockDiagMode::Read,
             );
             let reader = GetObjectReader {
-                stream: Box::new(Cursor::new(Vec::<u8>::new())),
-                object_info: ObjectInfo::default(),
+                stream: Box::new(Cursor::new(vec![1])),
+                object_info: ObjectInfo {
+                    size: 1,
+                    ..Default::default()
+                },
                 buffered_body: None,
                 body_source: Default::default(),
             };
@@ -2690,7 +2711,10 @@ mod tests {
             );
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
-                object_info: ObjectInfo::default(),
+                object_info: ObjectInfo {
+                    size: 3,
+                    ..Default::default()
+                },
                 buffered_body: None,
                 body_source: Default::default(),
             };
@@ -2747,7 +2771,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn reader_lock_is_released_after_stream_eof_in_both_optimization_states() {
+    async fn reader_lock_is_released_after_exact_content_length_without_extra_eof_poll() {
         for enabled in ["false", "true"] {
             temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some(enabled))], async {
                 let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
@@ -2768,19 +2792,26 @@ mod tests {
                 );
                 let reader = GetObjectReader {
                     stream: Box::new(Cursor::new(vec![1, 2, 3])),
-                    object_info: ObjectInfo::default(),
+                    object_info: ObjectInfo {
+                        size: 3,
+                        ..Default::default()
+                    },
                     buffered_body: None,
                     body_source: Default::default(),
                 };
 
                 let mut reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
-                let mut output = Vec::new();
-                reader.stream.read_to_end(&mut output).await.expect("reader should reach EOF");
-                assert_eq!(output, vec![1, 2, 3]);
+                let mut output = [0_u8; 3];
+                reader
+                    .stream
+                    .read_exact(&mut output)
+                    .await
+                    .expect("reader should deliver the exact content length");
+                assert_eq!(output, [1, 2, 3]);
 
                 lock.get_write_lock(key, "writer", Duration::from_secs(1))
                     .await
-                    .expect("EOF should release the read lock before the reader is dropped");
+                    .expect("the final response byte should release the read lock without an extra EOF poll");
                 drop(reader);
             })
             .await;

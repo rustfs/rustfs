@@ -55,6 +55,12 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
 test-group = 'ecstore-serial-flaky'
 
+# This regression test builds three multipart objects on a four-disk set and
+# coordinates live GET/DELETE races under both lock modes.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(multipart_get_keeps_delete_blocked_at_part_boundary_in_both_lock_modes)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the durable manual-transition checkpoint test across nextest's
 # process boundary; it mutates bucket lifecycle metadata and is not quarantined.
 [[profile.default.overrides]]
@@ -134,6 +140,10 @@ test-group = 'e2e-reliability'
 # no retries, just serialized 4-disk cross-disk-commit IO.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
+test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(multipart_get_keeps_delete_blocked_at_part_boundary_in_both_lock_modes)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the durable manual-transition checkpoint test under the ci profile
