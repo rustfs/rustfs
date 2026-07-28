@@ -2236,6 +2236,82 @@ fn parse_transition_version_id(remote_version: &str) -> std::result::Result<Opti
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct ObjectTaggingCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct ObjectTaggingCommitBarrier {
+    state: Arc<ObjectTaggingCommitBarrierState>,
+}
+
+#[cfg(test)]
+static OBJECT_TAGGING_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<ObjectTaggingCommitBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl ObjectTaggingCommitBarrier {
+    fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(ObjectTaggingCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            ..Default::default()
+        });
+        let mut slot = OBJECT_TAGGING_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("object tagging commit barrier mutex should not poison");
+        assert!(slot.is_none(), "object tagging commit barrier must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("object tagging should reach the deterministic commit barrier");
+    }
+
+    fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObjectTaggingCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = OBJECT_TAGGING_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("object tagging commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_object_tagging_commit(bucket: &str, object: &str) {
+    let barrier = OBJECT_TAGGING_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("object tagging commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
 mod transition_upload_completion_tests {
     use super::*;
 
@@ -2430,6 +2506,47 @@ mod transition_version_id_tests {
             "opaque-version-token"
         );
         assert!(parse_transition_version_id("not-a-uuid").is_err());
+    }
+}
+
+impl SetDisks {
+    async fn update_object_tags_locked(
+        &self,
+        operation: &'static str,
+        bucket: &str,
+        object: &str,
+        tags: &str,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let object_lock_guard = if opts.no_lock {
+            None
+        } else {
+            Some(self.acquire_write_lock_diag(operation, bucket, object).await?)
+        };
+        // Force the full quorum fanout (allow_early_stop=false): `disks` is the
+        // write target below, and an early-stop subset would only carry read
+        // quorum, failing write quorum on update_object_meta (backlog#872).
+        let (mut fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
+
+        fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
+
+        #[cfg(test)]
+        pause_object_tagging_commit(bucket, object).await;
+        // Fence the read-modify-write before any disk can merge metadata derived
+        // from this read after another writer has reacquired the same key.
+        if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: operation,
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+
+        self.update_object_meta(bucket, object, fi.clone(), disks.as_slice()).await?;
+
+        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
 }
 
@@ -4106,32 +4223,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        // Acquire write-lock for tag update (metadata write)
-        // if !opts.no_lock {
-        //     let guard_opt = self
-        //         .namespace_lock
-        //         .lock_guard(object, &self.locker_owner, Duration::from_secs(5), Duration::from_secs(10))
-        //         .await?;
-        //     if guard_opt.is_none() {
-        //         return Err(Error::other("can not get lock. please retry".to_string()));
-        //     }
-        //     _lock_guard = guard_opt;
-        // }
-        // Force the full quorum fanout (allow_early_stop=false): `disks` is the
-        // write target below, and an early-stop subset would only carry read
-        // quorum, failing write quorum on update_object_meta (backlog#872).
-        let (mut fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
-
-        fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
-
-        self.update_object_meta(bucket, object, fi.clone(), disks.as_slice()).await?;
-
-        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
+        self.update_object_tags_locked("put_object_tags", bucket, object, tags, opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.put_object_tags(bucket, object, "", opts).await
+        self.update_object_tags_locked("delete_object_tags", bucket, object, "", opts)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -5879,11 +5978,13 @@ mod transition_upload_integrity_tests {
         fn drop(&mut self) {
             let previous = self.previous.clone();
             let handle = tokio::runtime::Handle::current();
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
+            std::thread::spawn(move || {
+                handle.block_on(async {
                     runtime_sources::set_setup_type(previous).await;
                 });
-            });
+            })
+            .join()
+            .expect("setup type restore thread should not panic");
         }
     }
 
@@ -6288,8 +6389,7 @@ mod transition_upload_integrity_tests {
         let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
-        let previous_setup_type = runtime_sources::current_setup_type().await;
-        runtime_sources::set_setup_type(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
         let mut opts = transition_options(&original, tier_name);
         opts.no_lock = false;
         let barrier = TransitionCommitBarrier::install_before_lock_lost_check(bucket, object);
@@ -6313,7 +6413,6 @@ mod transition_upload_integrity_tests {
             matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
             "unexpected transition lock-lost error: {error:?}"
         );
-        runtime_sources::set_setup_type(previous_setup_type).await;
         assert_eq!(backend.put_count().await, 1);
         assert_eq!(
             backend.remove_count().await,
@@ -6644,6 +6743,63 @@ mod transition_upload_integrity_tests {
         assert_eq!(backend.exact_remove_count(), 1);
         assert_eq!(backend.object_count().await, 0);
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial]
+    async fn tagging_lock_lost_before_metadata_write_fails_closed() {
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| Arc::new(LockLostRefreshClient::new(Arc::clone(&refresh_calls))) as Arc<dyn LockClient>)
+            .collect();
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "tagging-lock-lost-bucket";
+        let object = "object.bin";
+        write_source(&set_disks, &disk_stores, bucket, object, b"tagging source").await;
+
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let barrier = ObjectTaggingCommitBarrier::install(bucket, object);
+        let tagging_set = Arc::clone(&set_disks);
+        let tagging = tokio::spawn(async move {
+            tagging_set
+                .put_object_tags(bucket, object, "must=not-commit", &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            refresh_calls.load(Ordering::SeqCst) > 0,
+            "test must drive the real distributed-lock heartbeat before the tagging commit fence"
+        );
+        barrier.release();
+
+        let error = tagging
+            .await
+            .expect("tagging task should not panic")
+            .expect_err("tagging must fail after its namespace lock loses refresh quorum");
+        assert!(
+            matches!(error, StorageError::NamespaceLockQuorumUnavailable { .. }),
+            "unexpected tagging lock-lost error: {error:?}"
+        );
+        let (fi, _, _) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                false,
+                false,
+            )
+            .await
+            .expect("source metadata should remain readable");
+        assert!(
+            !fi.metadata.contains_key(AMZ_OBJECT_TAGGING),
+            "a stale tagging writer must not write metadata after refresh-quorum loss"
+        );
     }
 
     #[tokio::test]
@@ -7128,6 +7284,217 @@ mod put_object_tags_early_stop_regression_tests {
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod object_tagging_namespace_lock_tests {
+    use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
+    use super::*;
+    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use tokio::io::AsyncReadExt as _;
+
+    #[derive(Clone, Copy, Debug)]
+    enum CompetingMutation {
+        Put,
+        Delete,
+    }
+
+    async fn read_body(set_disks: &SetDisks, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), opts)
+            .await?
+            .stream
+            .read_to_end(&mut body)
+            .await?;
+        Ok(body)
+    }
+
+    #[tokio::test]
+    async fn tagging_honors_an_inherited_namespace_write_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "tag-lock-inherited";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let mut reader = PutObjReader::from_vec(b"body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("object should be written");
+
+        let outer_lock = set_disks
+            .new_ns_lock(bucket, object)
+            .await
+            .expect("outer namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer namespace write lock should be acquired");
+        set_disks
+            .put_object_tags(
+                bucket,
+                object,
+                "lock=inherited",
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tagging should not reacquire an inherited namespace lock");
+        drop(outer_lock);
+
+        assert_eq!(
+            set_disks
+                .get_object_tags(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("persisted tags should remain readable"),
+            "lock=inherited"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tagging_serializes_with_put_and_delete_for_versioned_and_unversioned_objects() {
+        for versioned in [false, true] {
+            for mutation in [CompetingMutation::Put, CompetingMutation::Delete] {
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = format!("tag-lock-{}-{mutation:?}", if versioned { "versioned" } else { "plain" }).to_lowercase();
+                let object = "object";
+                for disk in &disk_stores {
+                    disk.make_volume(&bucket).await.expect("bucket volume should be created");
+                }
+
+                let object_opts = ObjectOptions {
+                    versioned,
+                    ..Default::default()
+                };
+                let original_body = b"original body".to_vec();
+                let mut original_reader = PutObjReader::from_vec(original_body.clone());
+                let original = set_disks
+                    .put_object(&bucket, object, &mut original_reader, &object_opts)
+                    .await
+                    .expect("original object should be written");
+                let original_version = original.version_id.map(|version| version.to_string());
+                set_disks
+                    .put_object_tags(&bucket, object, "stage=initial", &object_opts)
+                    .await
+                    .expect("initial tags should be written");
+
+                let barrier = ObjectTaggingCommitBarrier::install(&bucket, object);
+                let tagging_set = Arc::clone(&set_disks);
+                let tagging_bucket = bucket.clone();
+                let tagging_opts = object_opts.clone();
+                let tagging = tokio::spawn(async move {
+                    match mutation {
+                        CompetingMutation::Put => {
+                            tagging_set
+                                .put_object_tags(&tagging_bucket, object, "stage=before-mutation", &tagging_opts)
+                                .await
+                        }
+                        CompetingMutation::Delete => tagging_set.delete_object_tags(&tagging_bucket, object, &tagging_opts).await,
+                    }
+                });
+                barrier.wait_until_paused().await;
+
+                let mutation_set = Arc::clone(&set_disks);
+                let mutation_bucket = bucket.clone();
+                let mutation_opts = object_opts.clone();
+                let (mutation_started_tx, mutation_started_rx) = tokio::sync::oneshot::channel();
+                let competing = tokio::spawn(async move {
+                    mutation_started_tx
+                        .send(())
+                        .expect("tagging test should wait for the competing mutation");
+                    match mutation {
+                        CompetingMutation::Put => {
+                            let mut replacement = PutObjReader::from_vec(b"replacement body".to_vec());
+                            mutation_set
+                                .put_object(&mutation_bucket, object, &mut replacement, &mutation_opts)
+                                .await
+                                .map(Some)
+                        }
+                        CompetingMutation::Delete => mutation_set
+                            .delete_object(&mutation_bucket, object, mutation_opts)
+                            .await
+                            .map(|_| None),
+                    }
+                });
+                mutation_started_rx
+                    .await
+                    .expect("competing mutation should reach the namespace operation while tagging is paused");
+
+                barrier.release();
+                tagging
+                    .await
+                    .expect("tagging task should not panic")
+                    .expect("tagging should commit before the queued mutation");
+                let competing_result = competing
+                    .await
+                    .expect("competing mutation task should not panic")
+                    .expect("competing mutation should commit after tagging releases the lock");
+
+                match mutation {
+                    CompetingMutation::Put => {
+                        let replacement = competing_result.expect("put mutation should return the replacement object");
+                        let current = set_disks
+                            .get_object_info(&bucket, object, &object_opts)
+                            .await
+                            .expect("replacement metadata should remain readable");
+                        assert_eq!(
+                            read_body(&set_disks, &bucket, object, &object_opts)
+                                .await
+                                .expect("replacement version should remain readable"),
+                            b"replacement body"
+                        );
+                        assert_eq!(current.etag, replacement.etag, "tagging must not restore the previous version's ETag");
+                        assert!(
+                            current.user_tags.is_empty(),
+                            "a tag update ordered before the replacement must not leak onto the replacement version"
+                        );
+                    }
+                    CompetingMutation::Delete if versioned => {
+                        let old_version_opts = ObjectOptions {
+                            versioned: true,
+                            version_id: original_version,
+                            ..Default::default()
+                        };
+                        assert_eq!(
+                            read_body(&set_disks, &bucket, object, &old_version_opts)
+                                .await
+                                .expect("the version hidden by the delete marker should remain readable"),
+                            original_body
+                        );
+                        let old_version = set_disks
+                            .get_object_info(&bucket, object, &old_version_opts)
+                            .await
+                            .expect("the historical version metadata should remain readable");
+                        assert!(
+                            old_version.user_tags.is_empty(),
+                            "delete-tagging ordered before the delete marker must persist on the historical version"
+                        );
+                        for disk in &disk_stores {
+                            let current = disk
+                                .read_version("", &bucket, object, "", &ReadOptions::default())
+                                .await
+                                .expect("the current delete marker should remain visible on every disk");
+                            assert!(current.deleted);
+                        }
+                    }
+                    CompetingMutation::Delete => {
+                        let error = read_body(&set_disks, &bucket, object, &object_opts)
+                            .await
+                            .expect_err("unversioned deletion must not be undone by a stale tagging write");
+                        assert!(
+                            is_err_object_not_found(&error) || is_err_version_not_found(&error),
+                            "unexpected error after unversioned delete: {error:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
