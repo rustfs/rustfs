@@ -69,6 +69,13 @@ struct HealWalkCollector {
 }
 
 impl HealWalkCollector {
+    fn lock_objects(&self) -> disk::error::Result<std::sync::MutexGuard<'_, Vec<HealWalkObject>>> {
+        self.objects.lock().map_err(|_| {
+            self.cancel.cancel();
+            DiskError::FileCorrupt
+        })
+    }
+
     /// Expand one resolved entry into its versions and record it. Cancels the
     /// walk once EITHER page bound (distinct object names OR expanded versions)
     /// is met — always at a sorted object-key boundary so a heavily-versioned
@@ -105,7 +112,9 @@ impl HealWalkCollector {
 
         let added = versions.len();
         let (objs_len, ver_total) = {
-            let mut objects = self.objects.lock().unwrap();
+            let Ok(mut objects) = self.lock_objects() else {
+                return;
+            };
             objects.push(HealWalkObject {
                 name: entry.name,
                 versions,
@@ -239,7 +248,10 @@ impl SetDisks {
             Err(err) => return Err(err),
         }
 
-        let objects = std::mem::take(&mut *collector.objects.lock().unwrap());
+        let objects = {
+            let mut objects = collector.lock_objects()?;
+            std::mem::take(&mut *objects)
+        };
         let truncated = collector.truncated.load(Ordering::SeqCst);
         Ok(finalize_heal_walk_page(objects, forward_to, truncated))
     }
@@ -309,5 +321,29 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(next_forward, None, "a complete final page must not carry a resume cursor");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn poisoned_collector_state_cancels_the_walk() {
+        let collector = Arc::new(HealWalkCollector {
+            bucket: "bucket".to_string(),
+            batch_objects: 2,
+            version_budget: 2,
+            objects: Mutex::new(Vec::new()),
+            version_total: AtomicUsize::new(0),
+            truncated: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+        });
+        let poison_target = Arc::clone(&collector);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.objects.lock().expect("fresh mutex should lock");
+            panic!("poison heal collector");
+        })
+        .join();
+
+        let error = collector.lock_objects().expect_err("poisoned collection must fail closed");
+        assert_eq!(error, DiskError::FileCorrupt);
+        assert!(collector.cancel.is_cancelled(), "a poisoned page collector must cancel its walk");
+        assert!(collector.objects.lock().is_err(), "poisoned state must remain fail-closed");
     }
 }
